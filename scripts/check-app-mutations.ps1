@@ -39,7 +39,7 @@ foreach($case in $cases) {
         "pid=$($process.Id)" | Tee-Object -FilePath ($base+'.log') -Append
         if(!$process.WaitForExit(60000)){Stop-Process -Id $process.Id; throw "Mutant timed out: $($case.Name)"}
         $output=[IO.File]::ReadAllText($base+'.out')+[IO.File]::ReadAllText($base+'.err')
-        if($process.ExitCode -ne 101 -or $output -notmatch 'test result: FAILED' -or $output -notmatch 'assertion|panicked.*must|panicked.*winner') {
+        if($process.ExitCode -ne 101 -or $output -notmatch 'test result: FAILED' -or $output -notmatch 'assertion|winner paused before bind|fallback must not permanently|same-drive relative path must resolve') {
             throw "Mutant did not compile and assertion-fail: $($case.Name), exit=$($process.ExitCode)"
         }
         "assertion_failed=$($case.Name) exit=$($process.ExitCode)" | Tee-Object -FilePath $summary -Append
