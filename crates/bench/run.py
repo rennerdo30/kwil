@@ -1,6 +1,7 @@
 """Bounded fresh-process measurements and fail-closed OS baseline gate (stdlib only)."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -59,7 +60,10 @@ def check(current, baseline):
     for metric, (direction, limit) in LIMITS.items():
         value = current["medians"][metric]
         before = baseline["medians"].get(metric)
-        if before is None or before <= 0:
+        if not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
+            errors.append(f"invalid measurement: {metric}")
+            continue
+        if before is None or not isinstance(before, (float, int)) or not math.isfinite(before) or before <= 0:
             errors.append(f"missing/invalid baseline: {metric}")
             continue
         if limit is not None and ((direction == "max" and value > limit) or (direction == "min" and value < limit)):
@@ -115,6 +119,9 @@ def main():
     if a.baseline:
         if a.text_only:
             raise RuntimeError("a gate cannot omit startup")
+        errors = check(result, result)
+        if errors:
+            raise RuntimeError("\n".join(errors))
         if not a.baseline.is_file():
             raise RuntimeError("baseline missing; results saved, reviewed explicit seeding required")
         errors = check(result, json.loads(a.baseline.read_text(encoding="utf-8-sig")))

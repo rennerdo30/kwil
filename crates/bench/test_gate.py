@@ -34,6 +34,13 @@ class GateTests(unittest.TestCase):
         del bad["medians"]["jump_ms"]
         self.assertTrue(run.check(self.base, bad))
 
+    def test_nonfinite_and_zero_cannot_bypass_gate(self):
+        for value in (float("nan"), float("inf"), 0):
+            bad = copy.deepcopy(self.base)
+            bad["medians"]["index_gb_s"] = value
+            self.assertTrue(run.check(bad, self.base))
+            self.assertTrue(run.check(self.base, bad))
+
 
 if __name__ == "__main__":
     unittest.main()

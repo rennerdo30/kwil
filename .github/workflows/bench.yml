@@ -30,6 +30,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+      - name: X11 runtime libraries for the real window smoke
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-0
       - uses: Swatinem/rust-cache@v2
         with:
           add-rust-environment-hash-key: false
@@ -38,7 +41,7 @@ jobs:
       - name: Build measurement binaries
         run: cargo build --release --locked -j 4 -p kwil-bench --features harness -p kwil --features frame-harness
       - name: Cache generated fixtures
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: fixtures
           key: bench-fixtures-v1-${{ matrix.os }}-${{ hashFiles('crates/bench/src/fixtures.rs') }}
@@ -66,6 +69,13 @@ jobs:
           py=.bench-venv/bin/python
           [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
           "$py" crates/bench/test_gate.py
+      - name: Real terminal startup trace (Linux PTY)
+        if: runner.os == 'Linux'
+        run: .bench-venv/bin/python crates/bench/tui_smoke.py target/release/kwil fixtures/log-1g.log results/tui-trace.txt
+      - name: Hidden terminal startup trace (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./crates/bench/tui_smoke.ps1
       - name: Median-of-five hard and regression gates
         shell: bash
         run: |
@@ -78,7 +88,7 @@ jobs:
           fi
       - name: Retain raw samples, medians and commit even on gate failure
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bench-${{ matrix.os }}
           path: results
