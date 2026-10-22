@@ -347,7 +347,7 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
                     }
                     continue;
                 }
-                Event::Text(t) if t.as_ref().iter().all(u8::is_ascii_whitespace) => continue,
+                Event::Text(t) if t.iter().all(u8::is_ascii_whitespace) => continue,
                 Event::DocType(_) => return Err(error("tmTheme DTDs/entities are unsupported; remove the DOCTYPE")),
                 _ => return Ok(event),
             }
