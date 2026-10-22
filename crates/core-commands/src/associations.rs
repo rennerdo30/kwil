@@ -9,11 +9,25 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MacDocumentRole {
+    Viewer,
+    Editor,
+}
+#[cfg(target_os = "macos")]
+impl MacDocumentRole {
+    fn mask(self) -> u32 {
+        match self {
+            Self::Viewer => 2,
+            Self::Editor => 4,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Location {
     WindowsValue { subkey: String, name: String },
     UserFile(PathBuf),
-    MacRole { uti: String },
+    MacRole { uti: String, role: MacDocumentRole },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredValue {
@@ -183,7 +197,9 @@ pub fn plan(
                     ));
                 }
                 if content_types.insert(uti.to_owned()) {
-                    desired.push((Location::MacRole { uti: uti.into() }, StoredValue::text(bundle_id)));
+                    for role in [MacDocumentRole::Viewer, MacDocumentRole::Editor] {
+                        desired.push((Location::MacRole { uti: uti.into(), role }, StoredValue::text(bundle_id)));
+                    }
                 }
             }
             AssociationPlatform::Linux { .. } => {
@@ -219,7 +235,7 @@ pub fn plan(
         notes.push("Registers per-user ProgIDs and Open With under HKCU\\Software\\Classes. Default Apps choice stays with the user. Rollback removes owned values only; empty registry containers may remain.".into());
     }
     if matches!(request.platform, AssociationPlatform::MacOS { .. }) {
-        notes.push("Changes the Launch Services editor role for an already declared content type. Bundle discovery belongs to packaging; no public reversible standalone bundle-registration API is used.".into());
+        notes.push("Changes Launch Services viewer and editor roles with separate previous-handler receipts. Bundle discovery belongs to packaging; no public reversible standalone bundle-registration API is used.".into());
     }
     let mut changes = Vec::new();
     for (location, after) in desired {
@@ -229,6 +245,11 @@ pub fn plan(
         };
         if matches!(location, Location::MacRole { .. }) && before.is_none() {
             return Err(err("cannot reversibly change a Launch Services role with no prior handler"));
+        }
+        if matches!(location, Location::MacRole { .. })
+            && before.as_ref().is_some_and(|v| v.kind != 0 || !v.as_text().is_ok_and(|s| identifier(s, false)))
+        {
+            return Err(err("prior Launch Services handler cannot be restored safely"));
         }
         if before.as_ref() != Some(&after) {
             changes.push(Change { location, before, after: Some(after) });
@@ -652,24 +673,25 @@ fn mac_role(location: &Location, new: Option<&StoredValue>) -> Result<Option<Sto
         let p = unsafe { CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as isize, 0x08000100, 0) };
         if p.is_null() { Err(err("cannot create Core Foundation string")) } else { Ok(StringRef(p)) }
     }
-    let Location::MacRole { uti } = location else {
+    let Location::MacRole { uti, role } = location else {
         return Err(err("expected Launch Services content type"));
     };
     if !identifier(uti, false) {
         return Err(err("invalid content type"));
     }
     let uti = string(uti)?;
-    // Editor role only; viewer/shell roles and unrelated defaults are untouched.
+    // Each role has its own receipt. Never set kLSRolesAll: it would overwrite
+    // other role handlers without preserving their distinct prior values.
     if let Some(new) = new {
         let bundle = new.as_text()?;
         if !identifier(bundle, false) {
             return Err(err("invalid bundle identifier"));
         }
         let bundle = string(bundle)?;
-        let status = unsafe { LSSetDefaultRoleHandlerForContentType(uti.0, 4, bundle.0) };
+        let status = unsafe { LSSetDefaultRoleHandlerForContentType(uti.0, role.mask(), bundle.0) };
         return if status == 0 { Ok(None) } else { Err(err(format!("Launch Services failed: {status}"))) };
     }
-    let p = unsafe { LSCopyDefaultRoleHandlerForContentType(uti.0, 4) };
+    let p = unsafe { LSCopyDefaultRoleHandlerForContentType(uti.0, role.mask()) };
     if p.is_null() {
         return Ok(None);
     }
@@ -778,5 +800,28 @@ mod tests {
         let writes = adapter.writes;
         assert!(apply(&mut adapter, &p).is_err());
         assert_eq!(adapter.writes, writes);
+    }
+    #[test]
+    fn mac_roles_restore_distinct_handlers_and_refuse_missing_prior_default() {
+        let mut adapter = Fake::default();
+        let mut req = request();
+        req.platform = AssociationPlatform::MacOS { bundle_id: "dev.renner.kwil".into() };
+        req.default_choice = DefaultChoice::MakeDefault;
+        req.types[0].content_type = Some("public.plain-text".into());
+        assert!(plan(&mut adapter, &req).is_err());
+        assert_eq!(adapter.writes, 0);
+        for (role, handler) in [(MacDocumentRole::Viewer, "other.viewer"), (MacDocumentRole::Editor, "other.editor")] {
+            adapter
+                .write(&Location::MacRole { uti: "public.plain-text".into(), role }, Some(&StoredValue::text(handler)))
+                .unwrap();
+        }
+        let before = adapter.values.clone();
+        let plan = plan(&mut adapter, &req).unwrap();
+        assert_eq!(plan.changes().len(), 2);
+        let mut receipt = apply(&mut adapter, &plan).unwrap();
+        assert!(rollback(&mut adapter, &mut receipt).is_empty());
+        for (location, value) in before {
+            assert_eq!(adapter.read(&location).unwrap(), Some(value));
+        }
     }
 }
