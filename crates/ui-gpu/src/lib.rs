@@ -103,6 +103,63 @@ struct Gfx {
     pixels: Vec<u32>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UnboundKey {
+    Quit,
+    Edit(input::Action),
+    Ignore,
+}
+
+#[cfg(test)]
+mod input_dispatch_tests {
+    use super::*;
+    use kwil_core_commands::{Binding, Preset, keymap::KeymapEngine, vim::VimResult};
+
+    #[test]
+    fn gui_tombstones_suppress_selection_quit_and_chord_fallbacks() {
+        let bindings = ["shift+left", "ctrl+q", "ctrl+k ctrl+q"].map(|keys| Binding {
+            keys: keys.into(),
+            command: String::new(),
+            context: None,
+            mode: None,
+        });
+        let mut keys = KeymapEngine::new(Preset::VsCode, &bindings).unwrap();
+        for (key, mods) in [
+            (Key::Named(NamedKey::ArrowLeft), ModifiersState::SHIFT),
+            (Key::Character("q".into()), ModifiersState::CONTROL),
+        ] {
+            assert_eq!(keys.feed_with_selection(input::chord(&key, mods).unwrap()), VimResult::Unbound);
+            assert_eq!(App::unbound_key(&keys, &key, None, mods), UnboundKey::Ignore);
+        }
+        assert_eq!(keys.feed_with_selection("ctrl+k".parse().unwrap()), VimResult::Pending);
+        assert_eq!(keys.feed_with_selection("ctrl+q".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("q".into()), None, ModifiersState::CONTROL),
+            UnboundKey::Ignore
+        );
+        assert_eq!(keys.feed_with_selection("界".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("界".into()), Some("界"), ModifiersState::empty()),
+            UnboundKey::Edit(input::Action::Text("界".into()))
+        );
+        assert_eq!(keys.feed_with_selection("cmd+s".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("s".into()), Some("s"), ModifiersState::SUPER),
+            UnboundKey::Ignore
+        );
+        let mut keys = KeymapEngine::new(Preset::NotepadPlusPlus, &[]).unwrap();
+        assert!(
+            matches!(keys.feed_with_selection("ctrl+shift+up".parse().unwrap()), VimResult::Command(call) if call.id == "edit.moveLineUp")
+        );
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
+        assert_eq!(keys.feed_with_selection("ctrl+q".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("q".into()), None, ModifiersState::CONTROL),
+            UnboundKey::Quit
+        );
+    }
+}
+
 struct App {
     view: View,
     opts: GuiOptions,
@@ -412,20 +469,16 @@ impl App {
                         return;
                     }
                     VimResult::Unbound => {
-                        if self.mods.control_key()
-                            && matches!(&ev.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
-                        {
-                            if !ev.repeat {
-                                self.request_close(el, self.close_pending && self.mods.shift_key());
+                        match Self::unbound_key(keys, &ev.logical_key, ev.text.as_deref(), self.mods) {
+                            UnboundKey::Quit => {
+                                if !ev.repeat {
+                                    self.request_close(el, self.close_pending && self.mods.shift_key());
+                                }
                             }
-                            return;
+                            UnboundKey::Edit(action) => self.edit(action),
+                            UnboundKey::Ignore => {}
                         }
-                        if keys.mode() != kwil_core_commands::Mode::Insert {
-                            return;
-                        }
-                        if self.mods.control_key() || self.mods.super_key() || self.mods.alt_key() {
-                            return;
-                        }
+                        return;
                     }
                 }
             }
@@ -433,6 +486,24 @@ impl App {
         if let Some(action) = input::translate(&ev.logical_key, ev.text.as_deref(), self.mods, self.composing) {
             self.edit(action);
         }
+    }
+
+    fn unbound_key(
+        keys: &kwil_core_commands::keymap::KeymapEngine,
+        key: &Key,
+        text: Option<&str>,
+        mods: ModifiersState,
+    ) -> UnboundKey {
+        if keys.suppresses_fallback() {
+            return UnboundKey::Ignore;
+        }
+        if mods.control_key() && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("q")) {
+            return UnboundKey::Quit;
+        }
+        if keys.mode() != kwil_core_commands::Mode::Insert || mods.control_key() || mods.super_key() || mods.alt_key() {
+            return UnboundKey::Ignore;
+        }
+        input::translate(key, text, mods, false).map_or(UnboundKey::Ignore, UnboundKey::Edit)
     }
 
     fn edit(&mut self, action: input::Action) {
