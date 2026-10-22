@@ -25,7 +25,7 @@ Crate versions were checked on crates.io on 2026-10-23.
 
 Kwil is a text editor, not an IDE and not an AI editor. Not planned: AI features, chat, agents, LSP/IDE features, git panels, debuggers, terminals inside the editor, remote/SSH editing and collaboration.
 
-Maybe later, only if speed stays intact: plugins (v2, as WASM components), split views, folding, bookmarks, macros, inline markdown rendering and a settings UI.
+Maybe later, only if speed stays intact: plugins (v2, as WASM components), split views, folding, bookmarks, macros and inline markdown rendering. (A settings screen moved into v1: owner, 2026-10-23, KW-46.)
 
 ## 2. Principles
 
@@ -230,7 +230,21 @@ Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, str
 - v1 bundles ~30 common languages. The rest load as prebuilt grammar libraries on first use, which also keeps clean builds fast.
 
 ### Settings and keymaps
-One TOML settings file that reloads live; no settings UI in v1. Every action is a command with an id, so it can be bound and found in the palette.
+One TOML settings file that reloads live and stays the source of truth. Every action is a command with an id, so it can be bound and found in the palette.
+
+**Settings screen (owner, 2026-10-23, KW-46: "proper settings menu", "register extensions for example"):** a native settings screen in the GUI (a navigable list in the TUI) with categories, search, a description and default for each setting, and reset. It edits the TOML file live; an "Open settings file" button stays for power users. It opens on the first frame after the key. Pages include **Keymap** (pick the preset, rebind by pressing keys, conflicts shown) and **File types**:
+- **Register extensions:** register Kwil for chosen extensions in the OS. Per user, no admin rights, reversible: Windows `HKCU\Software\Classes` (ProgIDs, "Open with", optional default), macOS Launch Services, Linux `.desktop` plus `xdg-mime`.
+- **Extension → language mapping** for highlighting (KW-47).
+
+### Highlight any file type (owner, 2026-10-23, KW-47)
+Every file gets highlighting. Detection order:
+1. the user's extension mapping;
+2. modelines (`vim: ft=`, `-*- mode -*-`);
+3. shebang and first line;
+4. file name and extension tables;
+5. content sniffing.
+
+A language picker in the status bar and palette sets any language for any file. Unknown types get a generic highlighter (strings, numbers, common comment styles, brackets) instead of plain text. Languages beyond the bundled set load on first use as prebuilt, permissively licensed grammar libraries. Detection never costs more than a bounded first-line read on the startup path.
 
 Keymaps (owner, 2026-10-23, KW-2): the keymap is configurable and ships with three presets, chosen by one setting (`keymap = "vscode" | "notepad++" | "vim"`). Any binding can be overridden in the same file.
 - **VS Code** (default): the common VS Code shortcuts (Ctrl+D selects the next match).
@@ -311,7 +325,7 @@ debug = "line-tables-only"
 | M5 Compare | Diff views |
 | M6 Polish & ship | Themes, remote-mode measurements on RDP and VNC, installers (MSI/winget, dmg/Homebrew, AppImage/Flatpak), GitHub Actions releases, auto-update, platform integration and accessibility |
 
-Work packages are tracked on Pair Desk, project `kwil`, grouped by milestone: one item per feature area, with its spec section and done criteria. M0 is KW-1; the spec work packages are KW-9 to KW-36; owner wishes are KW-3 (keymaps), KW-4/KW-6 (releases), KW-5 (auto-update), KW-7 (format), KW-8 (hex view), KW-37 (themes), KW-38 (logo), KW-39 (native window controls), KW-40 (less RAM than file size) and KW-41 (log watcher).
+Work packages are tracked on Pair Desk, project `kwil`, grouped by milestone: one item per feature area, with its spec section and done criteria. M0 is KW-1; the spec work packages are KW-9 to KW-36; owner wishes are KW-3 (keymaps), KW-4/KW-6 (releases), KW-5 (auto-update), KW-7 (format), KW-8 (hex view), KW-37 (themes), KW-38 (logo), KW-39 (native window controls), KW-40 (less RAM than file size), KW-41 (log watcher), KW-46 (settings screen, register extensions) and KW-47 (highlight any file type).
 
 ## 12. Owner decisions and open questions
 
