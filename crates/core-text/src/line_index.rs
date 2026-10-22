@@ -27,6 +27,10 @@ struct ChunkResult {
 }
 
 impl LineIndex {
+    /// Resident sparse checkpoints, used in conservative undo accounting.
+    pub fn memory_bytes(&self) -> usize {
+        (self.checkpoints.capacity() + self.rank_checkpoints.capacity()) * std::mem::size_of::<(u64, u64)>()
+    }
     /// Continues an append-only file from its previously indexed length.
     /// `bytes` is the complete new view; only `bytes[from_len..]` is scanned.
     /// The caller must ensure the old prefix is unchanged. Truncation or

@@ -322,6 +322,33 @@ pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
     Ok(tree)
 }
 
+/// A clipboard/other document may have its own resident add budget. Import
+/// only foreign in-memory leaves into this buffer's capped/spilling storage;
+/// originals, disk blocks and this buffer's own leaves remain shared.
+pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>) -> io::Result<Tree> {
+    let Some(node) = tree else { return Ok(None) };
+    match &node.kind {
+        Kind::Leaf(piece) => {
+            if let Storage::Memory { bytes, budget: source } = piece.storage.as_ref()
+                && !Arc::ptr_eq(source, budget)
+            {
+                added(&bytes[piece.start as usize..piece.end as usize], budget)
+            } else {
+                Ok(Some(node))
+            }
+        }
+        Kind::Branch(left, right) => {
+            let a = import_added(Some(left.clone()), budget)?;
+            let b = import_added(Some(right.clone()), budget)?;
+            if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, left)) && b.as_ref().is_some_and(|b| Arc::ptr_eq(b, right)) {
+                Ok(Some(node))
+            } else {
+                Ok(join(a, b))
+            }
+        }
+    }
+}
+
 /// Offset immediately after the `nth` newline (one-based).
 pub(crate) fn after_break(mut node: &Node, mut nth: u64) -> Result<u64, ReadError> {
     let mut offset = 0;

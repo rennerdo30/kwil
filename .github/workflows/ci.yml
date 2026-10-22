@@ -56,6 +56,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Prove Unix save permissions reject broken preservation
+        if: runner.os != 'Windows'
+        shell: pwsh
+        run: ./crates/view-model/scripts/fail-first.ps1 -UnixOnly
       # The release profile (thin LTO, 1 codegen unit) is built only by the
       # release workflow; the smoke test uses the debug binary from the tests.
       - name: Smoke test

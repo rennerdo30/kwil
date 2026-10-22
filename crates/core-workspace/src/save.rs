@@ -1,6 +1,7 @@
 //! Worker-only atomic save. Write and sync a same-directory temp before
 //! touching the original name. Payloads stream directly from immutable pieces.
 use kwil_core_text::{Buffer, Snapshot, TextFile};
+use std::ops::Range;
 use std::{
     fs::{self, File, OpenOptions},
     io,
@@ -15,6 +16,7 @@ pub struct SaveRequest {
     /// referenced by undo are already pinned by their previous save.
     pub original: Option<TextFile>,
     pub revision: u64,
+    pub trim_trailing_whitespace: bool,
 }
 
 pub struct SavedSnapshot {
@@ -25,6 +27,7 @@ pub struct SavedSnapshot {
     /// Windows security descriptor preservation is best effort; failures are
     /// returned to the frontend as warnings, never hidden.
     pub warnings: Vec<String>,
+    pub trimmed_rows: Option<Range<u64>>,
 }
 
 /// Opening worker entry point, also conservatively cleans recognized orphan
@@ -67,12 +70,24 @@ impl Drop for Temporary {
 }
 
 pub fn save_snapshot(request: SaveRequest) -> io::Result<SavedSnapshot> {
-    save_with(request, |snapshot, file| snapshot.write_to(file))
+    if request.trim_trailing_whitespace {
+        save_with_operations(request, write_trimmed, replace)
+    } else {
+        save_with(request, |snapshot, file| snapshot.write_to(file))
+    }
 }
 
 fn save_with(
     request: SaveRequest,
     write: impl FnOnce(&Snapshot, &mut File) -> io::Result<()>,
+) -> io::Result<SavedSnapshot> {
+    save_with_operations(request, |s, f| write(s, f).map(|_| None), replace)
+}
+
+fn save_with_operations(
+    request: SaveRequest,
+    write: impl FnOnce(&Snapshot, &mut File) -> io::Result<Option<Range<u64>>>,
+    replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
 ) -> io::Result<SavedSnapshot> {
     let path = std::path::absolute(&request.path)?;
     let parent = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "save path has no parent"))?;
@@ -96,7 +111,7 @@ fn save_with(
         Err(e) => return Err(save_error(&path, e)),
     };
     let mut temp = Temporary::new(parent).map_err(|e| save_error(&path, e))?;
-    write(&request.snapshot, temp.file.as_mut().unwrap()).map_err(|e| save_error(&path, e))?;
+    let trimmed_rows = write(&request.snapshot, temp.file.as_mut().unwrap()).map_err(|e| save_error(&path, e))?;
     let mut warnings = Vec::new();
     if let Some(metadata) = &metadata {
         preserve_metadata(&path, &temp.path, metadata, &mut warnings)?;
@@ -105,8 +120,14 @@ fn save_with(
     temp.file.take();
     // Do not pin an unrelated source when Save As targets a different path.
     let original = request.original.filter(|f| f.path() == path);
+    let original = if original.is_none() && metadata.is_some() {
+        Some(TextFile::open_saved_version(&path).map_err(io::Error::from)?)
+    } else {
+        original
+    };
     let pin = original.as_ref().map(TextFile::pin_original_for_save).transpose()?;
-    if let Err(error) = replace(&temp.path, &path) {
+    let backup = pin.as_ref().and_then(|pin| pin.backup_path());
+    if let Err(error) = replace(&temp.path, &path, backup.as_deref()) {
         if let Some(pin) = pin
             && let Err(rollback) = pin.rollback()
         {
@@ -128,9 +149,74 @@ fn save_with(
         .map_err(|e| io::Error::new(e.kind(), format!("file replaced, but directory sync failed: {e}")))?;
     // Indexing/rebase preparation stays on this same worker. No UI-thread
     // scan or read from the original pathname can occur during completion.
-    let file = TextFile::open(&path).map_err(io::Error::from)?;
+    let file = TextFile::open_saved_version(&path).map_err(io::Error::from)?;
     let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
-    Ok(SavedSnapshot { path, file, snapshot: buffer.snapshot(), revision: request.revision, warnings })
+    Ok(SavedSnapshot { path, file, snapshot: buffer.snapshot(), revision: request.revision, warnings, trimmed_rows })
+}
+
+fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io::Write) -> io::Result<()> {
+    for chunk in snapshot.chunks(range)? {
+        writer.write_all(chunk.map_err(io::Error::other)?)?;
+    }
+    Ok(())
+}
+
+/// Scan and emit immutable source ranges. Trailing runs are offsets, even a
+/// gigabyte of spaces/tabs costs two integers, not a buffer or per-line edits.
+fn write_trimmed(snapshot: &Snapshot, writer: &mut File) -> io::Result<Option<Range<u64>>> {
+    let mut trail = None;
+    let mut cr = false;
+    let mut offset = 0_u64;
+    let mut from = 0;
+    let mut row = 0;
+    let mut changed: Option<Range<u64>> = None;
+    let mut emit_trim = |start: u64, end: u64, line_end: u64, row: u64, from: &mut u64| -> io::Result<()> {
+        if start < end {
+            write_range(snapshot, *from..start, writer)?;
+            write_range(snapshot, end..line_end, writer)?;
+            *from = line_end;
+            if let Some(changed) = &mut changed {
+                changed.end = row + 1;
+            } else {
+                changed = Some(row..row + 1);
+            }
+        }
+        Ok(())
+    };
+    for chunk in snapshot.chunks(0..snapshot.len())? {
+        for &byte in chunk.map_err(io::Error::other)? {
+            if cr && byte != b'\n' {
+                trail = None;
+                cr = false;
+            }
+            match byte {
+                b' ' | b'\t' => {
+                    trail.get_or_insert(offset);
+                }
+                b'\r' => {
+                    cr = trail.is_some();
+                }
+                b'\n' => {
+                    if let Some(start) = trail {
+                        emit_trim(start, if cr { offset - 1 } else { offset }, offset + 1, row, &mut from)?;
+                    }
+                    trail = None;
+                    cr = false;
+                    row += 1;
+                }
+                _ => {
+                    trail = None;
+                    cr = false;
+                }
+            }
+            offset += 1;
+        }
+    }
+    if let Some(start) = trail {
+        emit_trim(start, if cr { offset - 1 } else { offset }, offset, row, &mut from)?;
+    }
+    write_range(snapshot, from..snapshot.len(), writer)?;
+    Ok(changed)
 }
 
 fn save_error(path: &Path, error: io::Error) -> io::Error {
@@ -153,7 +239,7 @@ fn preserve_metadata(_: &Path, temp: &Path, original: &fs::Metadata, _: &mut Vec
     fs::set_permissions(temp, original.permissions())
 }
 #[cfg(unix)]
-fn replace(temp: &Path, destination: &Path) -> io::Result<()> {
+fn replace(temp: &Path, destination: &Path, _: Option<&Path>) -> io::Result<()> {
     fs::rename(temp, destination)
 }
 
@@ -203,13 +289,27 @@ fn preserve_metadata(path: &Path, temp: &Path, _: &fs::Metadata, warnings: &mut 
 }
 
 #[cfg(windows)]
-fn replace(temp: &Path, destination: &Path) -> io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+fn replace(temp: &Path, destination: &Path, backup: Option<&Path>) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW};
+    if let Some(backup) = backup {
+        // SAFETY: terminated same-directory paths, synchronous OS primitive.
+        if unsafe {
+            ReplaceFileW(
+                wide(destination).as_ptr(),
+                wide(temp).as_ptr(),
+                wide(backup).as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
     // SAFETY: terminated paths, synchronous operation; no pointers retained.
-    if unsafe {
-        MoveFileExW(wide(temp).as_ptr(), wide(destination).as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
-    } == 0
-    {
+    if unsafe { MoveFileExW(wide(temp).as_ptr(), wide(destination).as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -269,7 +369,13 @@ mod tests {
             Self(path)
         }
         fn request(&self, original: TextFile, buffer: &Buffer) -> SaveRequest {
-            SaveRequest { path: self.path(), snapshot: buffer.snapshot(), original: Some(original), revision: 1 }
+            SaveRequest {
+                path: self.path(),
+                snapshot: buffer.snapshot(),
+                original: Some(original),
+                revision: 1,
+                trim_trailing_whitespace: false,
+            }
         }
     }
     impl Drop for Fixture {
@@ -320,6 +426,87 @@ mod tests {
         .unwrap();
         assert!(error.to_string().contains("simulated write failure"));
         assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+        assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_replace_keeps_destination_present_and_intact() {
+        let f = Fixture::new();
+        let path = f.path();
+        fs::write(&path, b"original").unwrap();
+        let original = open_for_editing(&path).unwrap();
+        let mut b = Buffer::from_file(original.clone()).unwrap();
+        b.insert(0, b"edit ").unwrap();
+        let error = save_with_operations(
+            f.request(original.clone(), &b),
+            |s, f| s.write_to(f).map(|_| None),
+            |_, destination, backup| {
+                assert_eq!(
+                    fs::read(destination).unwrap(),
+                    b"original",
+                    "destination must exist until the OS replacement call"
+                );
+                assert!(
+                    backup.is_none_or(|path| !path.exists()),
+                    "a reserved backing must not rename the destination away"
+                );
+                Err(io::Error::other("simulated replacement failure"))
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("simulated replacement failure"));
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(original.bytes().unwrap(), b"original");
+        assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn repeated_small_saves_keep_versions_mapped_and_release_backings() {
+        let f = Fixture::new();
+        let path = f.path();
+        fs::write(&path, b"line\n".repeat(2048)).unwrap();
+        let mut original = open_for_editing(&path).unwrap();
+        let mut b = Buffer::from_file(original.clone()).unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            workers.push(b.snapshot());
+            b.insert(0, b"x").unwrap();
+            let saved = save_snapshot(f.request(original, &b)).unwrap();
+            assert_eq!(
+                saved.file.resident_original_bytes(),
+                0,
+                "save versions below 64 MiB must not allocate resident file copies"
+            );
+            b.checkpoint_current(saved.snapshot).unwrap();
+            original = saved.file;
+        }
+        b.set_undo_memory_limit(0);
+        drop(workers);
+        assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+        assert_eq!(b.len(), (5 * 2048) + 16);
+    }
+
+    #[test]
+    fn mapped_original_saves_and_snapshot_outlives_the_editor() {
+        let f = Fixture::large();
+        let path = f.path();
+        let mut file = File::create(&path).unwrap();
+        file.set_len(64 << 20).unwrap();
+        file.write_all(b"old\r\n").unwrap();
+        drop(file);
+        let original = open_for_editing(&path).unwrap();
+        let mut b = Buffer::from_file(original.clone()).unwrap();
+        b.insert(3, b" edited").unwrap();
+        let worker = b.snapshot();
+        let saved = save_snapshot(f.request(original.clone(), &b)).unwrap();
+        assert_eq!(saved.file.len(), (64 << 20) + 7);
+        drop((b, original, saved));
+        let prefix: Vec<_> = worker.chunks(0..12).unwrap().flat_map(|chunk| chunk.unwrap().to_vec()).collect();
+        assert_eq!(prefix, b"old edited\r\n");
+        #[cfg(windows)]
+        assert_eq!(fs::read_dir(&f.0).unwrap().count(), 3, "worker must retain old mapping and marker");
+        drop(worker);
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
     }
 

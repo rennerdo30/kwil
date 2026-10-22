@@ -16,10 +16,11 @@ pub(super) struct SaveBacking {
 impl Drop for SaveBacking {
     fn drop(&mut self) {
         if self.delete_on_drop {
-            if let Some(path) = &self.backup {
-                let _ = fs::remove_file(path);
-            }
-            if let Some(path) = &self.marker {
+            let removed = self.backup.as_ref().is_none_or(|path| match fs::remove_file(path) {
+                Ok(()) => true,
+                Err(e) => e.kind() == io::ErrorKind::NotFound,
+            });
+            if removed && let Some(path) = &self.marker {
                 let _ = fs::remove_file(path);
             }
         }
@@ -41,6 +42,12 @@ impl OriginalSavePin {
             && let Some(backing) = guard.as_mut()
         {
             backing.delete_on_drop = true;
+            #[cfg(windows)]
+            if let Some(path) = &backing.backup {
+                use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+                // SAFETY: the completed OS replacement owns this old backing.
+                let _ = unsafe { SetFileAttributesW(wide(path).as_ptr(), backing.attributes | FILE_ATTRIBUTE_HIDDEN) };
+            }
         }
         self.complete = true;
     }
@@ -48,6 +55,11 @@ impl OriginalSavePin {
         let result = self.restore();
         self.complete = true;
         result
+    }
+    /// The reserved name is created only by ReplaceFileW, never by renaming
+    /// away the destination in application code.
+    pub fn backup_path(&self) -> Option<PathBuf> {
+        self.file.shared.save_backing.lock().ok()?.as_ref()?.backup.clone()
     }
     fn restore(&self) -> io::Result<()> {
         if !self.owns {
@@ -58,8 +70,16 @@ impl OriginalSavePin {
         if let Some(backing) = guard.as_ref()
             && let Some(path) = &backing.backup
         {
-            // rename refuses to overwrite a concurrent writer's destination.
-            fs::rename(path, &self.file.shared.path)?;
+            if path.exists() {
+                if self.file.shared.path.exists() {
+                    return Err(io::Error::other(
+                        "replacement left both destination and recovery backing; preserve backing for comparison",
+                    ));
+                }
+                // Recovery from an OS-level partial failure, never the normal
+                // save path. Refuse to overwrite a concurrent destination.
+                fs::rename(path, &self.file.shared.path)?;
+            }
             use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
             // SAFETY: a terminated OS path, no pointer retained by Windows.
             let _ = unsafe { SetFileAttributesW(wide(&self.file.shared.path).as_ptr(), backing.attributes) };
@@ -87,7 +107,7 @@ impl TextFile {
     pub fn pin_original_for_save(&self) -> io::Result<OriginalSavePin> {
         let mut guard = self.shared.save_backing.lock().map_err(|_| io::Error::other("save pin lock poisoned"))?;
         if guard.is_some() {
-            return Ok(OriginalSavePin { file: self.clone(), owns: false, complete: false });
+            return Err(io::Error::other("original is already pinned; reopen the current saved path"));
         }
         let now = File::open(&self.shared.path)?;
         if self.shared.stamp.state(&Stamp::read(&now)?) != FileState::Unchanged {
@@ -95,9 +115,7 @@ impl TextFile {
         }
         #[cfg(windows)]
         let backing = {
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
-            };
+            use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let parent = self.shared.path.parent().ok_or_else(|| io::Error::other("save path has no parent"))?;
             // SAFETY: valid terminated OS path.
@@ -139,12 +157,6 @@ impl TextFile {
                     Err(e) => return Err(e),
                 }
             };
-            if let Err(error) = fs::rename(&self.shared.path, &backup) {
-                let _ = fs::remove_file(marker);
-                return Err(error);
-            }
-            // SAFETY: owned backup path; preserve all existing attributes.
-            let _ = unsafe { SetFileAttributesW(wide(&backup).as_ptr(), attributes | FILE_ATTRIBUTE_HIDDEN) };
             SaveBacking { backup: Some(backup), marker: Some(marker), delete_on_drop: false, attributes }
         };
         #[cfg(not(windows))]
@@ -244,4 +256,80 @@ fn process_gone(pid: u32) -> bool {
         CloseHandle(handle);
     }
     false
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    #[test]
+    fn stale_cleanup_checks_pid_identity_marker_and_recovery_path() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kwil-pin-cleanup-{}-{id}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("file.txt");
+        fs::write(&path, b"old").unwrap();
+        let file = TextFile::open(&path).unwrap();
+        let pin = file.pin_original_for_save().unwrap();
+        pin.rollback().unwrap();
+        assert_eq!(file.bytes().unwrap(), b"old");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let pin = file.pin_original_for_save().unwrap();
+        let replacement = dir.join("replacement");
+        fs::write(&replacement, b"new").unwrap();
+        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+        let backup_path = pin.backup_path().unwrap();
+        // SAFETY: valid unique paths owned by this test, synchronous call.
+        assert_ne!(
+            unsafe {
+                ReplaceFileW(
+                    wide(&path).as_ptr(),
+                    wide(&replacement).as_ptr(),
+                    wide(&backup_path).as_ptr(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        pin.commit();
+        assert_eq!(cleanup_stale_save_backups(&path).unwrap(), 0, "a live owner is never reaped");
+        let (backup, marker) = {
+            let mut g = file.shared.save_backing.lock().unwrap();
+            let b = g.as_mut().unwrap();
+            b.delete_on_drop = false;
+            (b.backup.clone().unwrap(), b.marker.clone().unwrap())
+        };
+        drop(file); // Simulate a crash: marker/backing survive, handles do not.
+        let dead = u32::MAX - 1;
+        assert!(process_gone(dead));
+        let orphan = dir.join(format!(".kwil-old-{dead}-{id}"));
+        let owner = dir.join(format!(".kwil-old-{dead}-{id}.owner"));
+        fs::rename(&backup, &orphan).unwrap();
+        fs::rename(&marker, &owner).unwrap();
+        let mut contents = fs::read_to_string(&owner).unwrap().lines().map(str::to_owned).collect::<Vec<_>>();
+        contents[1] = dead.to_string();
+        fs::write(&owner, contents.join("\n")).unwrap();
+        let unrelated = dir.join(".kwil-old-unrelated");
+        fs::write(&unrelated, b"foreign").unwrap();
+        let fake_marker = dir.join(".kwil-old-fake.owner");
+        fs::write(&fake_marker, b"not a kwil marker").unwrap();
+        fs::remove_file(&path).unwrap();
+        let other = dir.join("other.txt");
+        fs::write(&other, b"other").unwrap();
+        assert_eq!(cleanup_stale_save_backups(&other).unwrap(), 0, "preserve a crash-gap original for recovery");
+        fs::write(&path, b"new").unwrap();
+        let saved_marker = fs::read_to_string(&owner).unwrap();
+        let mut mismatched = contents.clone();
+        mismatched[3] = "0".into();
+        fs::write(&owner, mismatched.join("\n")).unwrap();
+        assert_eq!(cleanup_stale_save_backups(&path).unwrap(), 0, "identity mismatch must refuse deletion");
+        fs::write(&owner, saved_marker).unwrap();
+        assert_eq!(cleanup_stale_save_backups(&path).unwrap(), 1);
+        assert!(!orphan.exists() && !owner.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"foreign");
+        assert!(fake_marker.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

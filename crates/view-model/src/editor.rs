@@ -138,22 +138,38 @@ struct State {
     cursors: Vec<Cursor>,
     primary: usize,
     revision: u64,
+    box_column: Option<u64>,
 }
 struct HistoryEntry {
     before: State,
     after: State,
+    edited: Range<u64>,
+    structural: bool,
 }
 
 #[derive(Clone)]
 enum Insert {
     Bytes(Arc<[u8]>),
     Pieces(Snapshot, Range<u64>),
+    Padded(u64, Arc<[u8]>),
 }
 impl Insert {
     fn len(&self) -> u64 {
         match self {
             Self::Bytes(b) => b.len() as u64,
             Self::Pieces(_, r) => r.end - r.start,
+            Self::Padded(p, b) => p + b.len() as u64,
+        }
+    }
+    fn apply(&self, buffer: &mut Buffer, at: u64) -> io::Result<()> {
+        match self {
+            Self::Bytes(bytes) => buffer.insert(at, bytes),
+            Self::Pieces(source, range) => buffer.insert_snapshot_range(at, source, range.clone()),
+            Self::Padded(padding, bytes) => {
+                static SPACES: [u8; 64 << 10] = [b' '; 64 << 10];
+                buffer.insert(at, &SPACES[..*padding as usize])?;
+                buffer.insert(at + padding, bytes)
+            }
         }
     }
 }
@@ -196,6 +212,7 @@ pub struct Editor {
     language: Option<String>,
     comment_override: Option<String>,
     saving: bool,
+    box_column: Option<u64>,
 }
 
 impl Editor {
@@ -219,6 +236,7 @@ impl Editor {
             language: None,
             comment_override: None,
             saving: false,
+            box_column: None,
         }
     }
     pub fn document(&self) -> &Document {
@@ -243,8 +261,10 @@ impl Editor {
     /// Scanning a column is bounded to 64 KiB; long-line frontends can use
     /// byte_position/line_range and their bounded horizontal layout instead.
     pub fn position_at(&self, offset: u64) -> io::Result<(u64, u64)> {
-        let s = self.document.snapshot();
-        Ok((text::row(&s, offset)?, text::column(&s, offset, self.settings.editor.tab_size)?))
+        kwil_core_text::with_checked_read_batch(|| {
+            let s = self.document.snapshot();
+            Ok((text::row(&s, offset)?, text::column(&s, offset, self.settings.editor.tab_size)?))
+        })
     }
     pub fn byte_position(&self, offset: u64) -> io::Result<(u64, u64)> {
         self.document
@@ -296,12 +316,18 @@ impl Editor {
                 .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown" | "mkd"))
     }
     fn state(&self) -> State {
-        State { cursors: self.cursors.clone(), primary: self.primary, revision: self.document.revision }
+        State {
+            cursors: self.cursors.clone(),
+            primary: self.primary,
+            revision: self.document.revision,
+            box_column: self.box_column,
+        }
     }
     fn restore(&mut self, state: State) {
         self.cursors = state.cursors;
         self.primary = state.primary;
         self.document.revision = state.revision;
+        self.box_column = state.box_column;
     }
     fn end_burst(&mut self) {
         self.burst = None;
@@ -320,6 +346,7 @@ impl Editor {
         self.end_burst();
         self.cursors = cursors;
         self.primary = primary;
+        self.box_column = None;
         self.normalize();
         self.finish_damage(old, None)
     }
@@ -461,12 +488,7 @@ impl Editor {
         for edit in plan.iter().rev() {
             let result = (|| {
                 self.document.buffer.delete(edit.range.clone())?;
-                match &edit.insert {
-                    Insert::Bytes(bytes) => self.document.buffer.insert(edit.range.start, bytes),
-                    Insert::Pieces(source, range) => {
-                        self.document.buffer.insert_snapshot_range(edit.range.start, source, range.clone())
-                    }
-                }
+                edit.insert.apply(&mut self.document.buffer, edit.range.start)
             })();
             if let Err(error) = result {
                 self.document.buffer.cancel();
@@ -499,12 +521,18 @@ impl Editor {
         }
         self.normalize();
         self.document.changed();
+        self.box_column = None;
         let after = self.state();
+        let structural = snapshot.line_count() != self.document.buffer.line_count();
         self.redo.clear();
         if coalesce {
-            self.undo.back_mut().unwrap().after = after;
+            let entry = self.undo.back_mut().unwrap();
+            entry.after = after;
+            entry.edited.start = entry.edited.start.min(first_row);
+            entry.edited.end = entry.edited.end.max(last_row + 1);
+            entry.structural |= structural;
         } else {
-            self.undo.push_back(HistoryEntry { before, after });
+            self.undo.push_back(HistoryEntry { before, after, edited: first_row..last_row + 1, structural });
         }
         self.trim_history();
         self.burst = typing.map(|at| (at, self.cursors.clone()));
@@ -536,6 +564,7 @@ impl Editor {
         let mut cursors = self.cursors.clone();
         let mut changed = false;
         let mut first_row = u64::MAX;
+        let mut last_row = 0;
         self.end_burst();
         self.document.buffer.begin();
         for edit in edits {
@@ -544,13 +573,9 @@ impl Editor {
                     return Ok(());
                 };
                 first_row = first_row.min(text::row(&s, edit.range.start)?);
+                last_row = last_row.max(text::row(&s, edit.range.end)?);
                 self.document.buffer.delete(edit.range.clone())?;
-                match &edit.insert {
-                    Insert::Bytes(b) => self.document.buffer.insert(edit.range.start, b)?,
-                    Insert::Pieces(s, r) => {
-                        self.document.buffer.insert_snapshot_range(edit.range.start, s, r.clone())?
-                    }
-                }
+                edit.insert.apply(&mut self.document.buffer, edit.range.start)?;
                 for c in &mut cursors {
                     c.anchor = transform(c.anchor, std::slice::from_ref(&edit), false);
                     c.head = transform(c.head, std::slice::from_ref(&edit), false);
@@ -571,10 +596,16 @@ impl Editor {
         self.cursors = cursors;
         self.normalize();
         self.document.changed();
+        self.box_column = None;
         self.redo.clear();
-        self.undo.push_back(HistoryEntry { before, after: self.state() });
+        self.undo.push_back(HistoryEntry {
+            before,
+            after: self.state(),
+            edited: first_row..last_row + 1,
+            structural: s.line_count() != self.document.buffer.line_count(),
+        });
         self.trim_history();
-        self.finish_damage(old, Some(first_row..self.top + self.rows as u64))
+        self.finish_damage(old, Some(first_row..last_row + 1))
     }
     pub fn set_undo_memory_limit(&mut self, bytes: usize) {
         self.document.set_undo_memory_limit(bytes);
@@ -582,7 +613,7 @@ impl Editor {
     }
 
     pub fn insert_text(&mut self, text: &str, at: Duration) -> io::Result<Damage> {
-        self.insert_bytes(text.as_bytes(), Some(at))
+        kwil_core_text::with_checked_read_batch(|| self.insert_bytes(text.as_bytes(), Some(at)))
     }
     fn insert_bytes(&mut self, bytes: &[u8], at: Option<Duration>) -> io::Result<Damage> {
         let continuing = at.is_some_and(|at| {
@@ -591,8 +622,26 @@ impl Editor {
             })
         });
         let data: Arc<[u8]> = Arc::from(bytes);
-        let edits =
-            self.cursors.iter().map(|c| Edit { range: c.selection(), insert: Insert::Bytes(data.clone()) }).collect();
+        let snapshot = self.document.snapshot();
+        let edits = self
+            .cursors
+            .iter()
+            .map(|c| {
+                let padding = if let Some(column) = self.box_column {
+                    column.saturating_sub(text::column(&snapshot, c.selection().start, self.settings.editor.tab_size)?)
+                } else {
+                    0
+                };
+                Ok(Edit {
+                    range: c.selection(),
+                    insert: if padding > 0 {
+                        Insert::Padded(padding, data.clone())
+                    } else {
+                        Insert::Bytes(data.clone())
+                    },
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let d = self.apply(edits, at, true)?;
         if !bytes.is_empty() {
             if self.mode == Mode::Insert {
@@ -675,19 +724,29 @@ impl Editor {
         if !changed {
             return Ok(Damage::default());
         }
+        let mut edited = self.top..self.top + self.rows as u64;
         if redo {
             if let Some(entry) = self.redo.pop_back() {
+                if !entry.structural {
+                    edited = entry.edited.clone();
+                }
                 self.restore(entry.after.clone());
                 self.undo.push_back(entry);
             }
         } else if let Some(entry) = self.undo.pop_back() {
+            if !entry.structural {
+                edited = entry.edited.clone();
+            }
             self.restore(entry.before.clone());
             self.redo.push_back(entry);
         }
-        self.finish_damage(old, Some(self.top..self.top + self.rows as u64))
+        self.finish_damage(old, Some(edited))
     }
 
     pub fn move_cursors(&mut self, motion: Motion, count: u32, extend: bool) -> io::Result<Damage> {
+        kwil_core_text::with_checked_read_batch(|| self.move_cursors_checked(motion, count, extend))
+    }
+    fn move_cursors_checked(&mut self, motion: Motion, count: u32, extend: bool) -> io::Result<Damage> {
         let old = self.cursor_rows()?;
         self.end_burst();
         let s = self.document.snapshot();
@@ -712,6 +771,7 @@ impl Editor {
             c.desired_column = desired;
         }
         self.normalize();
+        self.box_column = None;
         self.finish_damage(old, None)
     }
 
@@ -740,6 +800,9 @@ impl Editor {
     }
 
     pub fn column_selection(&mut self, a_row: u64, a_col: u64, h_row: u64, h_col: u64) -> io::Result<Damage> {
+        if a_col.max(h_col) > text::WINDOW {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "box column exceeds bounded text window"));
+        }
         let s = self.document.snapshot();
         let a_row = a_row.min(s.line_count() - 1);
         let h_row = h_row.min(s.line_count() - 1);
@@ -756,7 +819,9 @@ impl Editor {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        self.set_cursors(cursors, (h_row - start) as usize)
+        let damage = self.set_cursors(cursors, (h_row - start) as usize)?;
+        self.box_column = Some(a_col.min(h_col));
+        Ok(damage)
     }
 
     pub fn select_all(&mut self) -> io::Result<Damage> {
@@ -800,18 +865,40 @@ impl Editor {
         let needle = text::read(&s, range.clone(), text::WINDOW)?;
         let mut left = budget;
         let mut found = None;
+        let mut prefix = vec![0; needle.len()];
+        for i in 1..needle.len() {
+            let mut matched = prefix[i - 1];
+            while matched > 0 && needle[i] != needle[matched] {
+                matched = prefix[matched - 1];
+            }
+            if needle[i] == needle[matched] {
+                matched += 1;
+            }
+            prefix[i] = matched;
+        }
         for scan in [range.end..s.len(), 0..range.start] {
             let mut at = scan.start;
+            let mut matched = 0;
             while at < scan.end && left > 0 {
                 let end = (at + text::WINDOW).min(scan.end).min(at + left);
                 let bytes = text::read(&s, at..end, text::WINDOW)?;
-                for (i, candidate) in bytes.windows(needle.len()).enumerate() {
-                    let start = at + i as u64;
-                    if candidate == needle
-                        && !self
-                            .cursors
-                            .iter()
-                            .any(|c| c.selection().start < start + needle.len() as u64 && start < c.selection().end)
+                for (i, byte) in bytes.into_iter().enumerate() {
+                    left -= 1;
+                    while matched > 0 && byte != needle[matched] {
+                        matched = prefix[matched - 1];
+                    }
+                    if byte == needle[matched] {
+                        matched += 1;
+                    }
+                    if matched != needle.len() {
+                        continue;
+                    }
+                    let start = at + i as u64 + 1 - needle.len() as u64;
+                    matched = prefix[matched - 1];
+                    if !self
+                        .cursors
+                        .iter()
+                        .any(|c| c.selection().start < start + needle.len() as u64 && start < c.selection().end)
                     {
                         found = Some(start);
                         break;
@@ -820,9 +907,7 @@ impl Editor {
                 if found.is_some() {
                     break;
                 }
-                let consumed = (end - at).saturating_sub(needle.len().saturating_sub(1) as u64).max(1);
-                at += consumed;
-                left = left.saturating_sub(consumed);
+                at = end;
             }
             if found.is_some() {
                 break;
@@ -1121,6 +1206,9 @@ impl Editor {
         repeated.begin();
         for _ in 0..count.max(1) {
             repeated.insert_snapshot_range(repeated.len(), &joined, 0..joined.len())?;
+            if data.linewise && text::byte(&joined, joined.len().saturating_sub(1))? != Some(b'\n') {
+                repeated.insert(repeated.len(), self.document.line_ending.bytes())?;
+            }
         }
         repeated.commit();
         let source = repeated.snapshot();
@@ -1129,7 +1217,11 @@ impl Editor {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let range = if let Some(after) = after {
+                let range = if data.linewise {
+                    let r = text::line_full(&s, text::row(&s, c.head)?)?;
+                    let at = if after == Some(true) { r.end } else { r.start };
+                    at..at
+                } else if let Some(after) = after {
                     let at = if data.linewise {
                         let r = text::line_full(&s, text::row(&s, c.head)?)?;
                         if after { r.end } else { r.start }
@@ -1142,7 +1234,21 @@ impl Editor {
                 } else {
                     c.selection()
                 };
-                let insert = if count == 1 && data.ranges.len() == self.cursors.len() && !data.linewise {
+                let insert = if data.linewise
+                    && after == Some(true)
+                    && range.start == s.len()
+                    && !s.is_empty()
+                    && text::byte(&s, s.len() - 1)? != Some(b'\n')
+                {
+                    let mut prefixed = Buffer::empty();
+                    prefixed.begin();
+                    prefixed.insert(0, self.document.line_ending.bytes())?;
+                    prefixed.insert_snapshot_range(prefixed.len(), &source, 0..source.len())?;
+                    prefixed.commit();
+                    let snapshot = prefixed.snapshot();
+                    let len = snapshot.len();
+                    Insert::Pieces(snapshot, 0..len)
+                } else if count == 1 && data.ranges.len() == self.cursors.len() && !data.linewise {
                     Insert::Pieces(data.snapshot.clone(), data.ranges[i].clone())
                 } else {
                     Insert::Pieces(source.clone(), 0..source.len())
@@ -1172,23 +1278,36 @@ impl Editor {
         let forward = bracket == Some(open);
         let mut depth = 1;
         let start = at;
-        while if forward { at + 1 < s.len() } else { at > 0 } {
-            at = if forward { at + 1 } else { at - 1 };
-            if at.abs_diff(start) > budget {
-                break;
+        let bounds = if forward {
+            start.saturating_add(1)..start.saturating_add(budget).saturating_add(1).min(s.len())
+        } else {
+            start.saturating_sub(budget)..start
+        };
+        let mut edge = if forward { bounds.start } else { bounds.end };
+        while if forward { edge < bounds.end } else { edge > bounds.start } {
+            let window = if forward {
+                edge..(edge + text::WINDOW).min(bounds.end)
+            } else {
+                edge.saturating_sub(text::WINDOW).max(bounds.start)..edge
+            };
+            let bytes = text::read(&s, window.clone(), text::WINDOW)?;
+            for step in 0..bytes.len() {
+                let i = if forward { step } else { bytes.len() - 1 - step };
+                let b = bytes[i];
+                if b == if forward { open } else { close } {
+                    depth += 1;
+                }
+                if b == if forward { close } else { open } {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    at = window.start + i as u64;
+                    let anchor = if extend { self.primary_cursor().anchor } else { at };
+                    let damage = self.set_cursors(vec![Cursor { anchor, head: at, desired_column: None }], 0)?;
+                    return Ok(CommandResult { damage, status: CommandStatus::Applied });
+                }
             }
-            let b = text::byte(&s, at)?;
-            if b == Some(if forward { open } else { close }) {
-                depth += 1;
-            }
-            if b == Some(if forward { close } else { open }) {
-                depth -= 1;
-            }
-            if depth == 0 {
-                let anchor = if extend { self.primary_cursor().anchor } else { at };
-                let damage = self.set_cursors(vec![Cursor { anchor, head: at, desired_column: None }], 0)?;
-                return Ok(CommandResult { damage, status: CommandStatus::Applied });
-            }
+            edge = if forward { window.end } else { window.start };
         }
         Ok(CommandResult {
             damage: Damage { status: true, ..Damage::default() },

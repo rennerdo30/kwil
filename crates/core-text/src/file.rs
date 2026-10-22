@@ -173,6 +173,22 @@ struct Shared {
     read_generation: AtomicU64,
 }
 
+/// Weak bookkeeping never keeps an obsolete mapping/backing alive. Source
+/// identity is the Arc allocation, so even equal filenames are distinguished.
+#[derive(Clone)]
+pub(crate) struct OriginalRef {
+    file: std::sync::Weak<Shared>,
+    cost: usize,
+}
+impl OriginalRef {
+    pub fn same_object(&self, other: &Self) -> bool {
+        self.file.ptr_eq(&other.file)
+    }
+    pub fn retained_bytes(&self) -> usize {
+        if self.file.strong_count() == 0 { 0 } else { self.cost }
+    }
+}
+
 /// An open file. The first screen is readable at once; the line index
 /// fills in on a background thread.
 ///
@@ -205,6 +221,23 @@ impl TextFile {
     }
 
     fn open_with_mapper(path: &Path, map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>) -> Result<Self, OpenError> {
+        Self::open_with_policy(path, false, map)
+    }
+
+    /// Saved originals remain file-backed even below the normal mapping
+    /// threshold, so undo never retains another full resident copy per save.
+    pub fn open_saved_version(path: &Path) -> Result<Self, OpenError> {
+        Self::open_with_policy(path, true, |file| {
+            // SAFETY: saved versions obey TextFile's checked mapped-view contract.
+            unsafe { memmap2::Mmap::map(file) }
+        })
+    }
+
+    fn open_with_policy(
+        path: &Path,
+        map_small: bool,
+        map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>,
+    ) -> Result<Self, OpenError> {
         let path = std::path::absolute(path)?;
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
@@ -217,7 +250,7 @@ impl TextFile {
         let mut f = options.open(&path)?;
         let stamp = Stamp::read(&f)?;
         let len = stamp.len;
-        let bytes = if len < MAP_THRESHOLD {
+        let bytes = if len == 0 || !map_small && len < MAP_THRESHOLD {
             let mut v = Vec::with_capacity(len as usize);
             // Bound the read even if the file grows after metadata was read.
             (&mut f).take(len).read_to_end(&mut v)?;
@@ -270,6 +303,23 @@ impl TextFile {
 
     pub fn path(&self) -> &Path {
         &self.shared.path
+    }
+
+    pub fn resident_original_bytes(&self) -> usize {
+        match &self.shared.bytes {
+            Bytes::Owned(bytes) => bytes.len(),
+            Bytes::Mapped(_) => 0,
+        }
+    }
+
+    pub(crate) fn history_backing_ref(&self) -> OriginalRef {
+        // The one initially opened resident original is baseline. Saved
+        // versions are mapped; their sparse index/handles/path are charged
+        // once per snapshot, not once per piece of that same original.
+        let cost = std::mem::size_of::<Shared>()
+            + self.shared.path.as_os_str().len() * 4
+            + self.index().map_or(0, LineIndex::memory_bytes);
+        OriginalRef { file: Arc::downgrade(&self.shared), cost }
     }
 
     /// Reopens append-only growth. Existing checkpoints are cloned and only
