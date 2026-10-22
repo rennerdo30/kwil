@@ -151,8 +151,9 @@ To deliberately update the initialized baseline:
 
 1. Run the workflow on the intended reviewed source. A missing or incompatible
    baseline fails closed; samples are retained if execution reached measurement.
-2. Download both `bench-<runner>` artifacts. Check their source commit, raw
+2. Download both `bench-<runner>-attempt-<n>` artifacts. Check their source commit, raw
    samples, hard limits and frame results. Investigate any slowdown first.
+   Attempt-specific names retain earlier samples when a workflow is rerun.
 3. Commit the exact result JSON files to `bench-baseline` in a separate checkout
    (identity through environment; explicit-ref push). Never copy owner-PC numbers
    into a hosted baseline or mix runner OS/images. Record the reason and source

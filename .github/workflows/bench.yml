@@ -116,7 +116,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bench-${{ matrix.os }}
+          name: bench-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: results
           if-no-files-found: error
       - name: Preserve completed fixtures even when a performance gate fails
