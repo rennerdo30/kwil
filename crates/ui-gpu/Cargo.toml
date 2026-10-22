@@ -5,17 +5,45 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:pollster"]
+frame-harness = []
+
 [dependencies]
 kwil-view-model = { path = "../view-model" }
 winit = "0.30.13"
 softbuffer = "0.4.8"
 fontdue = "0.9.5"
 raw-window-handle = "0.6.2"
+kwil-core-commands = { path = "../core-commands" }
+swash = "0.2.10"
+fontdb = "0.24.0"
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
+pollster = { version = "1.0.1", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2.21.0"
+wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "vulkan", "gles"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "metal"] }
 
 [target.'cfg(windows)'.dependencies]
+wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "dx12"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
 ] }
