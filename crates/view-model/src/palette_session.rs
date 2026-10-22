@@ -262,7 +262,7 @@ mod tests {
         while !session.model().results_are_fresh() {
             assert!(
                 receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_ok(),
-                "pending command query was cancelled by tab metadata"
+                "assertion: pending command query was cancelled by tab metadata"
             );
             session.worker_ready();
         }

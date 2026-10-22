@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn accepted_frontend_actions_keep_clipboard_and_navigation_adapters() {
         for id in ["edit.copy", "edit.cut", "edit.paste", "navigation.goToLine", "file.save", "view.zoomIn"] {
-            assert!(!model_vim_command(id), "{id} must retain its frontend adapter");
+            assert!(!model_vim_command(id), "assertion: {id} must retain its frontend adapter");
         }
         assert!(model_vim_command("mode.insert"));
         assert!(model_vim_command("motion.wordForward"));
