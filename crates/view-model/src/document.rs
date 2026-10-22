@@ -105,6 +105,14 @@ impl Document {
         self.saved_revision
     }
 
+    /// Reserve an identity absent from the undo chain and skip it for future
+    /// edits. A guessed `revision + 1` can be the very next editing revision.
+    pub(crate) fn mark_unsaved(&mut self) {
+        let next = self.next_revision.checked_add(1).expect("document revision identity exhausted");
+        self.saved_revision = self.next_revision;
+        self.next_revision = next;
+    }
+
     pub fn set_undo_memory_limit(&mut self, bytes: usize) {
         self.buffer.set_undo_memory_limit(bytes);
     }

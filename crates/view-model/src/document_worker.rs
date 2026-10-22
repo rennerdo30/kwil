@@ -1001,7 +1001,10 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
     } else {
         tab.saved_revision
     };
-    document.next_revision = revision.checked_add(2).ok_or_else(|| io::Error::other("Recovery revision overflow"))?;
+    document.next_revision = revision
+        .max(document.saved_revision)
+        .checked_add(2)
+        .ok_or_else(|| io::Error::other("Recovery revision overflow"))?;
     // Restore newline policy from a bounded sample before interactive editing.
     let mut previous = 0;
     'sample: for chunk in snapshot.chunks(0..snapshot.len().min(64 << 10))? {
@@ -1028,7 +1031,7 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
             }
             _ => {
                 document.path = None;
-                document.saved_revision = revision.wrapping_add(1);
+                document.mark_unsaved();
             }
         }
     }
@@ -1180,6 +1183,23 @@ mod tests {
         let mut actual = Vec::new();
         editor.document().snapshot().write_to(&mut actual).unwrap();
         assert_eq!(actual, b"restored");
+    }
+
+    #[test]
+    fn restored_unsaved_marker_stays_outside_future_edit_and_undo_revisions() {
+        let scratch = Scratch::new();
+        let mut tab = recovery_tab(None);
+        tab.saved_revision = 100;
+        fixture_journal(&scratch.0, &tab, b"retained recovery");
+        let (document, _, _) = recover_document(scratch.0.join("1.kwj"), &tab).unwrap();
+        assert!(document.next_revision > tab.saved_revision);
+        let mut editor = crate::Editor::new(document);
+        editor.execute("edit.insert", &crate::CommandArgs { text: Some("!".into()), ..Default::default() }, 1).unwrap();
+        assert!(editor.document().is_dirty());
+        editor.execute("edit.undo", &Default::default(), 1).unwrap();
+        assert!(editor.document().is_dirty());
+        editor.execute("edit.redo", &Default::default(), 1).unwrap();
+        assert!(editor.document().is_dirty());
     }
 
     #[test]

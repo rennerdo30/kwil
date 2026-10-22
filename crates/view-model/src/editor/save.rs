@@ -89,8 +89,7 @@ impl Editor {
             } else {
                 // Disk contains a transformed version not represented by the
                 // live undo chain. Never label its untrimmed source clean.
-                self.document.saved_revision = self.document.next_revision;
-                self.document.next_revision += 1;
+                self.document.mark_unsaved();
             }
         } else {
             if current {

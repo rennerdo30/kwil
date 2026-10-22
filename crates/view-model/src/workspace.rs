@@ -459,7 +459,7 @@ impl Workspace {
                     if let Some(editor) = view.editor_mut() {
                         editor.document.path = None;
                         editor.document.original = None;
-                        editor.document.saved_revision = editor.document.revision.wrapping_add(1);
+                        editor.document.mark_unsaved();
                     }
                     view.set_notice("Closed backing cannot be verified; use Save As".into());
                 }
@@ -1433,7 +1433,7 @@ impl Workspace {
                     if let Some(editor) = view.editor_mut() {
                         editor.document.path = None;
                         editor.document.original = None;
-                        editor.document.saved_revision = editor.document.revision.wrapping_add(1);
+                        editor.document.mark_unsaved();
                     }
                     notice = format!("Save metadata conflict: {error}; recovered contents require Save As");
                 }
@@ -2072,6 +2072,19 @@ mod tests {
         assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 15);
         assert!(workspace.editor().unwrap().document().is_dirty());
         assert!(workspace.status_text().contains("Save As"));
+        edit(&mut workspace, "!");
+        assert!(
+            workspace.editor().unwrap().document().is_dirty(),
+            "assertion: further edits must not reach the unsaved marker"
+        );
+        workspace.execute("edit.undo", &Default::default(), 1).unwrap();
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        workspace.execute("edit.redo", &Default::default(), 1).unwrap();
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        workspace.file_command("file.saveAll").unwrap();
+        assert!(workspace.file_prompt().is_some(), "assertion: Save All must request an unnamed recovery path");
+        workspace.cancel_file_prompt();
+        assert!(workspace.close(reopening, false).is_err());
     }
 
     #[test]
