@@ -491,9 +491,12 @@ impl App {
                 Key::Named(NamedKey::F10) => Some("file.nextTab"),
                 Key::Named(NamedKey::F9) => Some("file.previousTab"),
                 Key::Named(NamedKey::F8) => Some("file.close"),
+                Key::Named(NamedKey::F6) => Some("view.commandPalette"),
+                Key::Named(NamedKey::F2) => Some("view.zoomIn"),
                 _ => None,
             };
             if let Some(command) = command {
+                if self.dispatch_palette(command) || self.dispatch_zoom(command) { return; }
                 self.dispatch_file(command);
                 return;
             }
