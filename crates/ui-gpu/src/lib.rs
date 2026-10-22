@@ -29,7 +29,7 @@ const STATUS_BG: u32 = 0x080d18;
 const STATUS_FG: u32 = 0x8fe3ff;
 const GUTTER_COLS: usize = 9;
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct GuiOptions {
     /// Agent and test runs: the window is DWM-cloaked (composed but never
     /// shown), unfocused and has no taskbar entry (Windows only).

@@ -72,6 +72,8 @@ any spike. It writes bounded buffered chunks to ignored `fixtures/`:
 CI generates all fixtures once per OS/generator-source cache key. A completion
 stamp is written only after successful full generation. Change the generator
 version and baseline fixture version together when changing fixture semantics.
+Completed fixtures are cached even when the performance gate fails, so the
+deliberate slowdown and baseline bootstrap do not trigger regeneration each run.
 Locally generate only the log unless another fixture is specifically needed:
 
 ```powershell
@@ -98,6 +100,8 @@ The fixture generator is bounded by the caller's launch timeout.
 and manual dispatch. Public GitHub-hosted `windows-2025` and `ubuntu-24.04` runners
 are required by the repository rule, which supersedes the older self-hosted text
 in the spec/issue. Linux uses Xvfb for actual window creation/presents.
+Both OSes also smoke the TUI trace in a real terminal (Linux PTY and hidden
+Windows console). These functional smokes are separate from GUI launch budgets.
 
 The runner warms the mapped file cache using a 1 MiB buffer, then measures a
 median of **five fresh processes**, separately for text, GUI file and GUI empty.

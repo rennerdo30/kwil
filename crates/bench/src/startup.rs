@@ -1,7 +1,7 @@
 //! Process creation time includes the executable loader, unlike Instant::now at main.
 use std::sync::Mutex;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Trace {
     first: Mutex<Option<f64>>,
     index: Mutex<Option<f64>>,

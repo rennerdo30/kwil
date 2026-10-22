@@ -115,7 +115,10 @@ def main():
     print(json.dumps(result["medians"], indent=2))
     if not a.text_only:
         # Separate process, after startup samples; never pollutes launch timing.
-        print(run([app, "--gui", "--hidden", "--frame-script", log]).stdout)
+        frames = run([app, "--gui", "--hidden", "--frame-script", log]).stdout
+        print(frames)
+        result["frames"] = json.loads(frames)
+        a.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     if a.baseline:
         if a.text_only:
             raise RuntimeError("a gate cannot omit startup")
