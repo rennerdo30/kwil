@@ -157,12 +157,25 @@ pub fn report_gui_failure(error: &impl std::fmt::Display) {
     let _ = writeln!(std::io::stdout(), "{error}");
 }
 
-pub fn show_error(message: &str, hidden: bool) {
+pub fn standard_streams() -> crate::startup::StandardStreams {
+    use crate::startup::StandardStreams;
     use std::io::IsTerminal;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-    if hidden || gui_child() || std::io::stderr().is_terminal() {
-        return;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    if std::io::stderr().is_terminal() {
+        StandardStreams::Terminal
+    } else if [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].into_iter().any(|kind| {
+        let handle = unsafe { GetStdHandle(kind) };
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE
+    }) {
+        StandardStreams::Redirected
+    } else {
+        StandardStreams::Absent
     }
+}
+
+pub fn show_error(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
     let title: Vec<u16> = "Kwil".encode_utf16().chain(Some(0)).collect();
     unsafe { MessageBoxW(std::ptr::null_mut(), message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR) };
