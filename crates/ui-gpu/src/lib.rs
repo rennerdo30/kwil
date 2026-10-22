@@ -1055,7 +1055,38 @@ fn draw_row(
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, GUTTER_FG, GUTTER_BG);
         draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, FG, BG);
         if let Some(source) = view.line_source(r) {
-            let cells = text::cells(text, w.saturating_sub(gutter + BAR) / cw, font.tab_size());
+            let columns = w.saturating_sub(gutter + BAR) / cw;
+            let first = spans.partition_point(|span| span.range.end <= source.start as usize);
+            let last = spans.partition_point(|span| span.range.start < source.end as usize);
+            let row_spans = &spans[first..last.max(first)];
+            if row_spans.is_empty() {
+                return;
+            }
+            // Draw whole ASCII coloured runs, never one String per cell.
+            if text.iter().take(columns).all(|byte| (32..127).contains(byte)) {
+                for span in row_spans {
+                    let start = span.range.start.saturating_sub(source.start as usize).min(text.len()).min(columns);
+                    let end = span.range.end.saturating_sub(source.start as usize).min(text.len()).min(columns);
+                    if start >= end {
+                        continue;
+                    }
+                    let x = gutter + start * cw;
+                    fill(buf, w, Rect { x, y, w: (end - start) * cw, h: ch }, BG);
+                    draw_text(
+                        buf,
+                        w,
+                        font,
+                        x,
+                        y,
+                        &text[start..end],
+                        end - start,
+                        kwil_view_model::highlight_session::syntax_rgb(span.class),
+                        BG,
+                    );
+                }
+                return;
+            }
+            let cells = text::cells(text, columns, font.tab_size());
             // The existing RTL renderer owns visual placement for the whole
             // paragraph; logical cell overlays must not disturb that ordering.
             if !cells.iter().any(|cell| shaping::needs_bidi(&cell.text)) {

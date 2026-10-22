@@ -96,3 +96,19 @@ No terminal/native palette-action capture, 100k-file latency measurement, full s
 Proof: mouse-context compiled/assertion-failed PID67988 in `E:/Development/_cache/kwil-palette-frontends-proof-c6281d21d48446c2ae9d1ef089490f21`; overlay-copy, paste and tab-publication independently compiled/assertion-failed PIDs45100/49576/11140 in `E:/Development/_cache/kwil-palette-frontends-proof-57185a6fbba94c3b80c8b181f6a8fdf2`. Source restore hashes are checked. The first overlay proof was rejected by the harness because its custom panic text omitted the word assertion; the retained log still shows compilation and the intended failure. A later empty selection executed zero cases and is not evidence; the script now refuses zero selected cases.
 
 Restored frontend palette tests: 6 passed PID38512. Restored tab publication: 1 passed PID18620. Strict three-crate all-target/all-feature Clippy PID18824 and formatting/diff checks pass. All owned processes exited. Go-to dispatch is source corrected; no accepted GUI action/native artifact or 100k-file latency result is claimed.
+
+### Viewport highlighting integration
+
+`684de1e` connects a shared `HighlightSession` to GUI/TUI worker events. Cached absolute row windows avoid extra source reads for styling. Disjoint visible windows remain bounded across giant-line gaps. The syntax worker also retires frontend source handles through a fixed eight-slot queue; there is no per-edit thread. GUI highlight updates damage only rows whose local styles changed. ASCII colouring draws runs; the TUI retains selection backgrounds and horizontal byte positions.
+
+Four independent compiling faults were detected: oversized merged windows, all-row damage, source destruction on the caller, and missing terminal foreground styling. Proof: `E:/Development/_cache/kwil-highlight-integration-proof-92d7b5dad0514595a33c54e289520f88`, PIDs79132/50836/38616/57384, each exit101 with intended assertion; source hashes restored. An earlier malformed let-chain mutant did not compile and is not evidence. Restored session tests3 PID74700, source retirement1 PID9536, terminal rendering1 PID73636 pass. Strict three-crate Clippy PID70780 and formatting pass; the final ASCII run adjustment is a later source change awaiting native inspection.
+
+Limits remain explicit: initial wiring uses automatic detection and built-in dark syntax colours. Language picker/settings mapping and active theme application are not yet wired. Logical-cell recolouring is skipped for RTL paragraphs to preserve their existing visual shaping; full RTL editor mapping remains open. GUI native pixels, latency and cross-platform acceptance are not established by these tests.
+
+### Palette R2 corrections
+
+`08a5c3b` / `d033846` preserve pending non-tab queries during tab metadata updates and retain GUI clipboard adapters for accepted Vim Copy/Cut/Paste. A condition-variable regression deliberately holds matching pending during refresh. Two independent compiling assertion failures are retained in `E:/Development/_cache/kwil-palette-frontends-proof-201ac392d14f42a49df31bcea3662f42`, PIDs53204/60660. Restored host5 tests PID62452 pass. Earlier custom assertion text caused one harness rejection; that run is not counted. R3 source review and accepted native GUI actions remain open.
+
+### Reopen reservations R4
+
+`f46df0e` stages named cached reopens through a bounded native-admission worker request before consuming history/cache. Provisional reservations survive ordinary registry refresh until the addressed UI receipt. Evidence: `E:/AgentData/scratch/kwil/kw20-reopen-r4/` (workspace27, worker14, fail-first cases, one compiling provisional-reservation mutant, exact restoration, strict VM Clippy and fmt). Independent R4 review is running. No native, latency or full-v1 acceptance is claimed.
