@@ -121,6 +121,7 @@ impl View {
     /// Call when the background index finished: line counts and scrolling
     /// become available.
     pub fn index_ready(&mut self) -> Damage {
+        let installing = self.editor.is_none();
         if self.editor.is_none()
             && let (Some(path), Some(file)) = (&self.path, &self.file)
             && file.index().is_some()
@@ -151,7 +152,11 @@ impl View {
             }
         }
         self.reload();
-        Damage { status: true, ..Damage::default() }
+        Damage {
+            status: true,
+            rows: if installing && self.editor.is_some() && self.rows > 0 { vec![0] } else { Vec::new() },
+            ..Damage::default()
+        }
     }
 
     pub fn set_notice(&mut self, notice: String) -> Damage {
@@ -336,6 +341,17 @@ mod viewer_tests {
         let mut v = View::new(Some((path, file)));
         v.set_rows(10);
         v
+    }
+
+    #[test]
+    fn index_completion_damages_newly_available_caret() {
+        let mut view = view_with_lines("late-caret", 10);
+        // The frontend has drawn the viewer while the index worker ran.
+        view.editor = None;
+        let damage = view.index_ready();
+        assert!(view.editor().is_some());
+        assert!(damage.full || damage.rows.contains(&0));
+        assert!(damage.status);
     }
 
     #[test]
