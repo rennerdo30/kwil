@@ -1411,6 +1411,7 @@ dependencies = [
  "fontdb",
  "fontdue",
  "kwil-core-commands",
+ "kwil-core-workspace",
  "kwil-view-model",
  "pollster",
  "raw-window-handle",
@@ -1429,6 +1430,7 @@ name = "kwil-ui-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "kwil-core-workspace",
  "kwil-view-model",
  "ratatui",
 ]

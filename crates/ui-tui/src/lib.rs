@@ -7,7 +7,7 @@
 //! SSH.
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
-use kwil_view_model::{Notify, View};
+use kwil_view_model::{CommandArgs, CommandStatus, Notify, View};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -19,6 +19,7 @@ enum Msg {
     IndexDone,
     Notice(String),
     InputClosed,
+    Saved(std::io::Result<kwil_core_workspace::SavedSnapshot>),
 }
 
 pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
@@ -35,7 +36,11 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
         });
     }
     let mut terminal = ratatui::init();
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
+    )?;
     {
         let t = tx.clone();
         std::thread::spawn(move || {
@@ -63,10 +68,28 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
         on_first_frame(Box::new(move |msg| {
             let _ = t.send(Msg::Notice(msg));
         }));
-        drop(tx);
+        let started = std::time::Instant::now();
+        let mut closing = false;
         while let Ok(msg) = rx.recv() {
             let changed = match msg {
                 Msg::InputClosed => break,
+                Msg::Saved(saved) => {
+                    if let Some(editor) = view.editor_mut() {
+                        match editor.finish_save(saved) {
+                            Ok(result) => {
+                                view.refresh_after_edit(result.damage);
+                                if closing && view.editor().is_some_and(|editor| !editor.document().is_dirty()) {
+                                    break;
+                                }
+                                view.set_notice("Saved".into());
+                            }
+                            Err(error) => {
+                                view.set_notice(format!("Save failed: {error}"));
+                            }
+                        }
+                    }
+                    true
+                }
                 Msg::IndexDone => {
                     view.index_ready();
                     true
@@ -79,10 +102,51 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     view.set_rows(h.saturating_sub(1) as usize);
                     true
                 }
-                Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => match key(&mut view, k) {
-                    KeyResult::Quit => break,
-                    KeyResult::Changed(c) => c,
-                },
+                Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                    match key(&mut view, k, started.elapsed()) {
+                        KeyResult::Quit => {
+                            if view.editor().is_some_and(|editor| editor.document().is_dirty())
+                                && !(closing && k.modifiers.contains(KeyModifiers::SHIFT))
+                            {
+                                closing = true;
+                                view.set_notice(
+                                    "Unsaved changes: Ctrl+S to save; Ctrl+Shift+Q to discard; Esc to cancel".into(),
+                                );
+                                true
+                            } else {
+                                break;
+                            }
+                        }
+                        KeyResult::Save => {
+                            if let Some(editor) = view.editor_mut() {
+                                match editor.save_request(None) {
+                                    Ok(request) => {
+                                        let sender = tx.clone();
+                                        std::thread::spawn(move || {
+                                            let _ =
+                                                sender.send(Msg::Saved(kwil_core_workspace::save_snapshot(request)));
+                                        });
+                                        view.set_notice("Saving…".into());
+                                    }
+                                    Err(error) => {
+                                        view.set_notice(error.to_string());
+                                    }
+                                }
+                            }
+                            true
+                        }
+                        KeyResult::Cancel => {
+                            closing = false;
+                            view.set_notice(String::new());
+                            true
+                        }
+                        KeyResult::Changed(c) => c,
+                    }
+                }
+                Msg::Input(Event::Paste(text)) => {
+                    execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
+                    true
+                }
                 Msg::Input(Event::Mouse(m)) => match m.kind {
                     MouseEventKind::ScrollDown => view.scroll(3) != Default::default(),
                     MouseEventKind::ScrollUp => view.scroll(-3) != Default::default(),
@@ -99,31 +163,75 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
         Ok(())
     })();
 
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
 
 enum KeyResult {
     Quit,
+    Save,
+    Cancel,
     Changed(bool),
 }
 
-fn key(view: &mut View, k: KeyEvent) -> KeyResult {
+fn key(view: &mut View, k: KeyEvent, elapsed: std::time::Duration) -> KeyResult {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    let page = view.rows().max(1) as i64;
-    let d = match k.code {
-        KeyCode::Char('q') if ctrl => return KeyResult::Quit,
-        KeyCode::Esc => return KeyResult::Quit,
-        KeyCode::Down => view.scroll(1),
-        KeyCode::Up => view.scroll(-1),
-        KeyCode::PageDown | KeyCode::Char(' ') => view.scroll(page),
-        KeyCode::PageUp => view.scroll(-page),
-        KeyCode::End if ctrl => view.scroll_to_end(),
-        KeyCode::Home if ctrl => view.scroll_to_start(),
+    let command = match k.code {
+        KeyCode::Char('q' | 'Q') if ctrl => return KeyResult::Quit,
+        KeyCode::Char('s' | 'S') if ctrl => return KeyResult::Save,
+        KeyCode::Esc => return KeyResult::Cancel,
+        KeyCode::Char('z' | 'Z') if ctrl && k.modifiers.contains(KeyModifiers::SHIFT) => "edit.redo",
+        KeyCode::Char('z') if ctrl => "edit.undo",
+        KeyCode::Char('y') if ctrl => "edit.redo",
+        KeyCode::Char('a') if ctrl => "edit.selectAll",
+        KeyCode::Down => "motion.down",
+        KeyCode::Up => "motion.up",
+        KeyCode::Left if ctrl => "motion.wordBackward",
+        KeyCode::Right if ctrl => "motion.wordForward",
+        KeyCode::Left => "motion.left",
+        KeyCode::Right => "motion.right",
+        KeyCode::PageDown => "motion.pageDown",
+        KeyCode::PageUp => "motion.pageUp",
+        KeyCode::End if ctrl => "motion.lastLine",
+        KeyCode::Home if ctrl => "motion.firstLine",
+        KeyCode::End => "motion.lineEnd",
+        KeyCode::Home => "motion.smartHome",
+        KeyCode::Enter => "edit.newline",
+        KeyCode::Backspace if ctrl => "edit.deleteWordBackward",
+        KeyCode::Delete if ctrl => "edit.deleteWordForward",
+        KeyCode::Backspace => "edit.backspace",
+        KeyCode::Delete => "edit.delete",
+        KeyCode::Tab => "edit.indent",
+        KeyCode::BackTab => "edit.outdent",
+        KeyCode::Char(c) if !ctrl && !k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) => {
+            return KeyResult::Changed(execute(view, "edit.insert", Some(c.to_string()), false, elapsed));
+        }
         _ => return KeyResult::Changed(false),
     };
-    KeyResult::Changed(d != Default::default())
+    KeyResult::Changed(execute(view, command, None, k.modifiers.contains(KeyModifiers::SHIFT), elapsed))
+}
+
+fn execute(view: &mut View, id: &str, text: Option<String>, extend: bool, at: std::time::Duration) -> bool {
+    match view.execute(id, &CommandArgs { text, extend, at, ..Default::default() }, 1) {
+        Ok(result) => match result.status {
+            CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
+                view.set_notice(message);
+            }
+            CommandStatus::IndexNotReady => {
+                view.set_notice("Indexing: editing will be available when ready".into());
+            }
+            _ => {}
+        },
+        Err(error) => {
+            view.set_notice(error.to_string());
+        }
+    }
+    true
 }
 
 fn draw(f: &mut ratatui::Frame, view: &View) {
@@ -144,4 +252,42 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
         status,
         Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
     );
+    if let Some(editor) = view.editor() {
+        if let Ok((row, column)) = editor.position_at(editor.primary_cursor().head) {
+            if row >= view.top() && row - view.top() < view.rows() as u64 && column + 8 < area.width as u64 {
+                f.set_cursor_position((area.x + 8 + column as u16, area.y + (row - view.top()) as u16));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn press(view: &mut View, code: KeyCode, modifiers: KeyModifiers, seconds: u64) {
+        key(view, KeyEvent::new(code, modifiers), Duration::from_secs(seconds));
+    }
+
+    #[test]
+    fn typing_space_newline_navigation_and_undo_edit_the_document() {
+        let mut view = View::new(None);
+        view.set_rows(8);
+        press(&mut view, KeyCode::Char('a'), KeyModifiers::NONE, 0);
+        press(&mut view, KeyCode::Char(' '), KeyModifiers::NONE, 0);
+        press(&mut view, KeyCode::Char('b'), KeyModifiers::NONE, 0);
+        assert_eq!(view.line(0), Some(b"a b".as_slice()));
+        press(&mut view, KeyCode::Enter, KeyModifiers::NONE, 1);
+        press(&mut view, KeyCode::Char('X'), KeyModifiers::NONE, 2);
+        assert_eq!(view.line(1), Some(b"X".as_slice()));
+        press(&mut view, KeyCode::Char('z'), KeyModifiers::CONTROL, 3);
+        assert_eq!(view.line(1), Some(b"".as_slice()));
+        press(&mut view, KeyCode::Char('y'), KeyModifiers::CONTROL, 4);
+        assert_eq!(view.line(1), Some(b"X".as_slice()));
+        press(&mut view, KeyCode::Left, KeyModifiers::SHIFT, 5);
+        assert!(!view.editor().unwrap().primary_cursor().is_caret());
+        press(&mut view, KeyCode::Char('Y'), KeyModifiers::NONE, 6);
+        assert_eq!(view.line(1), Some(b"Y".as_slice()));
+    }
 }

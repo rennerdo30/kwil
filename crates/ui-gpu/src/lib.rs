@@ -7,7 +7,9 @@
 //! Scrolling moves existing pixels and draws only the newly exposed rows.
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
+mod clipboard;
 mod font;
+mod hit;
 mod input;
 mod scrollbar;
 
@@ -22,7 +24,6 @@ pub mod text;
 mod trace;
 pub use remote::RenderPolicy;
 
-use font::Font;
 use kwil_core_commands::settings::Settings;
 
 use softbuffer::{Context, Surface};
@@ -240,7 +241,8 @@ impl App {
             self.apply(damage);
         } else if self.horizontal != offset {
             self.horizontal = offset;
-            self.apply(Damage { full: true, ..Damage::default() });
+            let damage = self.view.set_horizontal_window(offset, 64 << 10);
+            self.apply(damage);
         }
     }
 
@@ -345,9 +347,23 @@ impl App {
         };
         let args =
             CommandArgs { text, at: self.started.elapsed(), extend: self.mods.shift_key(), ..Default::default() };
-        match self.view.execute(id, &args, 1) {
+        let result = if matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
+            let hwnd = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
+            self.view
+                .editor_mut()
+                .map(|editor| editor.execute_with_clipboard(id, &args, 1, Some(&mut clipboard::SystemClipboard(hwnd))))
+                .unwrap_or_else(|| self.view.execute(id, &args, 1))
+                .map(|mut result| {
+                    result.damage = self.view.refresh_after_edit(result.damage);
+                    result
+                })
+        } else {
+            self.view.execute(id, &args, 1)
+        };
+        match result {
             Ok(result) => {
                 self.apply(result.damage);
+                self.keep_caret_visible();
                 let notice = match result.status {
                     CommandStatus::Applied => return,
                     CommandStatus::SaveRequested => {
@@ -364,6 +380,28 @@ impl App {
                 let damage = self.view.set_notice(error.to_string());
                 self.apply(damage);
             }
+        }
+    }
+
+    fn keep_caret_visible(&mut self) {
+        let Some(editor) = self.view.editor() else {
+            return;
+        };
+        let Ok((row, byte)) = editor.byte_position(editor.primary_cursor().head) else {
+            return;
+        };
+        if row < self.view.top() || row - self.view.top() >= self.view.rows() as u64 {
+            return;
+        }
+        let line = self.view.line((row - self.view.top()) as usize).unwrap_or_default();
+        let cells = text::cells(line, self.columns() as usize, self.settings.editor.tab_size as usize);
+        let last_byte = cells.last().map_or(0, |cell| cell.bytes.end as u64);
+        let last_column = cells.last().map_or(0, |cell| cell.column + cell.width);
+        if byte < self.horizontal
+            || byte > self.horizontal + last_byte
+            || (byte == self.horizontal + last_byte && last_column >= self.columns() as usize)
+        {
+            self.scroll_bar(false, byte);
         }
     }
 
@@ -413,14 +451,25 @@ impl App {
             return;
         };
         let row = self.view.top() + (self.pointer.1 / font.ch).min(self.view.rows().saturating_sub(1)) as u64;
-        let column = (self.pointer.0.saturating_sub(GUTTER_COLS * font.cw) / font.cw) as u64 + self.horizontal;
-        let result = self.view.execute(
-            "navigation.goToLine",
-            &CommandArgs { line: Some(row + 1), column: Some(column + 1), extend, ..Default::default() },
-            1,
-        );
+        let screen_row = row.saturating_sub(self.view.top()) as usize;
+        let column = self.pointer.0.saturating_sub(GUTTER_COLS * font.cw) / font.cw;
+        let columns = self.columns() as usize;
+        let bytes = self.view.line(screen_row).unwrap_or_default();
+        let cells = text::cells(bytes, columns, self.settings.editor.tab_size as usize);
+        let byte = hit::byte_at(&cells, column);
+        let Some(editor) = self.view.editor_mut() else {
+            return;
+        };
+        let result = editor.line_range(row).and_then(|range| {
+            let offset = (range.start + self.horizontal + byte as u64).min(range.end);
+            let anchor = if extend { editor.primary_cursor().anchor } else { offset };
+            editor.set_cursors(vec![kwil_view_model::Cursor { anchor, head: offset, desired_column: None }], 0)
+        });
         match result {
-            Ok(result) => self.apply(result.damage),
+            Ok(damage) => {
+                let damage = self.view.refresh_after_edit(damage);
+                self.apply(damage);
+            }
             Err(error) => {
                 let damage = self.view.set_notice(error.to_string());
                 self.apply(damage);
@@ -434,9 +483,13 @@ impl App {
         }
         let (w, h) = self.size;
         for r in 0..self.view.rows() {
-            if let Some(line) = self.view.line(r) {
-                self.widest = self.widest.max(line.len() as u64);
-            }
+            let length = self
+                .view
+                .editor()
+                .and_then(|editor| editor.line_range(self.view.top() + r as u64).ok())
+                .map(|range| range.end - range.start)
+                .unwrap_or_else(|| self.view.line(r).map_or(0, |line| line.len() as u64));
+            self.widest = self.widest.max(length);
         }
         let bars = self.bars();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return };
@@ -548,7 +601,7 @@ impl App {
     }
 }
 
-fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, horizontal: u64) {
+fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, _horizontal: u64) {
     let (cw, ch) = (font.cw, font.ch);
     let y = r * ch;
     let gutter = GUTTER_COLS * cw;
@@ -557,7 +610,6 @@ fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, h
     if let Some(text) = view.line(r) {
         let num = format!("{:>7} ", view.line_number(r));
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, GUTTER_FG, GUTTER_BG);
-        let text = text.get((horizontal as usize).min(text.len())..).unwrap_or_default();
         draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, FG, BG);
     }
 }
@@ -572,13 +624,14 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
     if let (Ok(range), Ok(selections), Some(line)) =
         (editor.line_range(absolute_row), editor.selection_ranges(absolute_row), view.line(row))
     {
-        for cell in text::cells(line, columns.saturating_add(horizontal as usize), 4) {
-            let source = range.start + cell.bytes.start as u64..range.start + cell.bytes.end as u64;
+        for cell in text::cells(line, columns, font.tab_size()) {
+            let source =
+                range.start + horizontal + cell.bytes.start as u64..range.start + horizontal + cell.bytes.end as u64;
             if !selections.iter().any(|selection| selection.start < source.end && source.start < selection.end) {
                 continue;
             }
-            let start = (cell.column as u64).saturating_sub(horizontal) as usize;
-            let end = (cell.column as u64 + cell.width as u64).saturating_sub(horizontal).min(columns as u64) as usize;
+            let start = cell.column;
+            let end = (cell.column + cell.width).min(columns);
             if end <= start {
                 continue;
             }
@@ -591,14 +644,16 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
         }
     }
     for cursor in editor.cursors() {
-        if let Ok((cursor_row, column)) = editor.position_at(cursor.head) {
-            if cursor_row == absolute_row && column >= horizontal && column - horizontal < columns as u64 {
-                fill(
-                    buf,
-                    w,
-                    Rect { x: gutter + (column - horizontal) as usize * font.cw, y: row * font.ch, w: 2, h: font.ch },
-                    STATUS_FG,
-                );
+        if let Ok((cursor_row, byte)) = editor.byte_position(cursor.head) {
+            if cursor_row == absolute_row && byte >= horizontal {
+                let line = view.line(row).unwrap_or_default();
+                let cells = text::cells(line, columns, font.tab_size());
+                let local = byte - horizontal;
+                let column = hit::column_at(&cells, local.min(usize::MAX as u64) as usize);
+                if column >= columns {
+                    continue;
+                }
+                fill(buf, w, Rect { x: gutter + column * font.cw, y: row * font.ch, w: 2, h: font.ch }, STATUS_FG);
             }
         }
     }
