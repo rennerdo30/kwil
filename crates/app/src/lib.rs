@@ -2,6 +2,7 @@
 
 mod file_argument;
 pub mod frontend;
+mod instance;
 mod startup;
 #[cfg(windows)]
 mod windows;
@@ -174,14 +175,6 @@ fn run_app(console_launcher: bool) -> ExitCode {
         eprintln!("kwil: {error}");
         return ExitCode::from(2);
     }
-    let external_ready = || {
-        let requests = requests.clone();
-        Box::new(move |open: kwil_ui_gpu::ExternalOpen| {
-            if !requests.files.is_empty() {
-                open(requests);
-            }
-        }) as Box<dyn FnOnce(kwil_ui_gpu::ExternalOpen)>
-    };
     let on_first_frame = |_gui: bool| -> Box<dyn FnOnce(Notify)> {
         Box::new(move |notify: Notify| {
             #[cfg(windows)]
@@ -204,6 +197,36 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
     #[allow(unused_mut)]
     let mut use_gui = frontend == Frontend::Gui;
+    // Hidden verification runs never join or claim the owner's live instance.
+    let endpoint = if args.hidden {
+        None
+    } else {
+        match instance::endpoint() {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                eprintln!("kwil: instance setup failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    if let Some(endpoint) = &endpoint {
+        match instance::try_forward(endpoint, &requests) {
+            Ok(true) => {
+                #[cfg(windows)]
+                if use_gui && !console_launcher {
+                    // The existing UI accepted the request. Complete the console
+                    // launch handshake without constructing a second window.
+                    windows::first_frame();
+                }
+                return ExitCode::SUCCESS;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("kwil: cannot contact the running instance: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     #[cfg(windows)]
     if console_launcher && use_gui {
         match windows::launch_gui() {
@@ -219,6 +242,37 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         }
     }
+    let instance_owner = match endpoint {
+        Some(endpoint) => match instance::claim(endpoint, &requests) {
+            Ok(instance::Start::Primary(owner)) => Some(owner),
+            Ok(instance::Start::Forwarded) => {
+                #[cfg(windows)]
+                if use_gui {
+                    windows::first_frame();
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("kwil: cannot own an editor instance: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let external_ready = || {
+        if let Some(owner) = &instance_owner {
+            owner.ready(requests.clone())
+        } else {
+            let requests = requests.clone();
+            Box::new(move |open: kwil_ui_gpu::ExternalOpen| {
+                if !requests.files.is_empty()
+                    && let Err(error) = open(requests)
+                {
+                    eprintln!("kwil: initial file delivery failed: {error}");
+                }
+            }) as Box<dyn FnOnce(kwil_ui_gpu::ExternalOpen)>
+        }
+    };
     if use_gui {
         let view = match make_view() {
             Ok(v) => v,
