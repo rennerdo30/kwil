@@ -9,8 +9,10 @@ does not own the document or undo history. `None` means no edit.
 
 For a selection in a huge file, read only the selected bytes and call
 `format_selection` with their original byte offset and line. JSON requires a
-complete value; markup requires one complete element; generic tidy works on
-arbitrary text. Selection results add no final newline. Other languages and
+complete value; markup requires one complete element. Generic selections require
+the full admitted snapshot (`format` with a range) so the tokenizer can observe
+the opening literal. `format_selection` lacks this context and returns no edit
+with a clear notice for generic selections. Selection results add no final newline. Other languages and
 external commands report “not supported for a selection”.
 
 Input defaults to at most 16 MiB and output to at most 64 MiB. Callers can lower
@@ -50,20 +52,42 @@ input ceiling; a lower output limit is checked after its serialization.
 - CSS splits blocks and declarations outside strings/comments/parentheses.
   Character and hex escapes (including their terminator whitespace), strings,
   URLs and comments are atomic; escaped punctuation never becomes structure.
+  Function recognition follows [CSS Syntax 3 ident-like tokens](https://www.w3.org/TR/css-syntax-3/#consume-ident-like-token):
+  escapes are decoded only for recognition, while original identifier/URL bytes
+  are emitted. Other function spans remain verbatim too.
   SQL uppercases a small reserved-keyword set and separates top-level clauses.
   Both preserve quoted text/comments and validate balanced delimiters, not the
   full language grammar. SQL also preserves bracket and dollar-quoted content.
   SQL retains original whitespace separators so newline-concatenated literals
   remain concatenated, and supports nested block comments.
   These are lexical formatters, not dialect rewrites or syntax repair tools.
-- Generic tidy has independently optional trailing-whitespace trimming,
-  line-ending normalization (first file ending wins), final newline, and
-  reindent. Reindent is off by default: when enabled, it converts tab stops and
-  spaces while preserving visual columns, avoiding guesses at language nesting.
-  Syntax-aware formatters never globally trim/normalize literal content.
-  Markdown aliases, reStructuredText, Makefiles and patches retain all bytes:
-  no parser currently proves their whitespace safe. In particular, Markdown
-  hard breaks and fenced/indented code are untouched even with tidy flags set.
+- Generic tidy runs **only** for tokenized types: Python, JavaScript/TypeScript,
+  Rust, Go, C/C++, C#, Java, Shell (sh/bash/zsh/ksh), Ruby, PHP, Lua, Kotlin and
+  Swift, including their extension aliases. Tokenizers identify quoted, raw,
+  triple-quoted, template, heredoc/nowdoc and long-bracket literals and comments.
+  Literal/comment interiors, line endings and uncertain suffixes stay byte-exact.
+  Tokenization keeps one span at a time, with bounded heredoc/delimiter storage.
+  It never retains a document-sized token list or mask.
+- Outside those spans, optional tidy steps trim trailing spaces, normalize line
+  endings (first **structural** ending wins), add a final newline, and convert
+  tab stops while preserving visual columns. Reindent is off by default and is
+  always skipped for Python's semantic indentation and for selections. Final
+  newline is skipped if EOF is inside an uncertain/unterminated span. YAML always
+  retains its exact EOF bytes. Structured formatters never globally trim literals.
+- These are conservative lexical scanners, not full language parsers. Nested
+  interpolation, regex/division ambiguity, JSX, continuation syntax and other
+  unproven constructs protect the remaining suffix, rather than guessing a closing
+  delimiter. Code before that suffix can still be tidied. PHP inline HTML and
+  Ruby trailing data are protected. Comments are preserved too (trimming them is
+  allowed by policy, but not needed).
+- Types without a tokenizer, including unknown extensions, CSV/data, Markdown,
+  reStructuredText, Makefiles and patches, receive **no edits**, including EOF.
+  Status: "No safe formatter for this file type. Configure an external formatter,
+  or use 'Trim trailing whitespace' explicitly."
+- `trim_trailing_whitespace` is the separate `edit.trimTrailingWhitespace` worker
+  operation. Its palette title and result notice warn that it **may change
+  literals**. It trims even literal/heredoc whitespace only when explicitly
+  invoked; it preserves indentation, every line ending and final-newline style.
 
 ## Configured external formatter
 
@@ -78,13 +102,21 @@ resumes only its owned initial thread. Unix establishes a new process group
 before exec, observes exit without reaping, kills the group and then reaps its
 leader (preventing process-group ID reuse). Descendants are stopped on success
 as well as failure. Errors include the child PID. No windows are shown on Windows.
+On macOS, XNU can return EPERM for a zombie-only group. On that error only,
+bounded libproc enumeration verifies that our reserved group has no live members
+before accepting it. Inspection errors or live members remain fatal. ESRCH means
+the group is empty. The leader is reaped after this decision and the consumed group
+ID is never signalled again after reap.
+References: [XNU group zombie filter](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c),
+[libproc enumeration](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c).
 
 Stdout is capped, stderr is checked at 64 KiB, and only bounded stdout is read
 into memory. Disk size checks occur every 10 ms on the worker; a process can
 temporarily write beyond the limit between checks. Unix commands that deliberately
 detach into another session/group are outside process-group containment. The timeout
 covers the child execution after spawn, not OS process-creation latency.
-Successful stdout is retained verbatim (with the optional final newline).
+Successful stdout is retained verbatim. The optional final newline applies only
+to known-safe structured types; a generic external formatter owns its EOF bytes.
 
 ## Dependencies (crates.io checked 2026-10-23)
 
@@ -117,6 +149,11 @@ admission guard, proves all contracts fail, and restores the implementation in
 this owned worktree, runs the review regressions (12 failures and one idempotence
 control), and restores sources in `finally`. The wrapper/grandchild fixture has
 a six-second natural lifetime, so even the broken-copy run leaves no live fixture.
+`verify-round2-fail-first.ps1` restores broken CSS recognition, disables literal
+protection, makes explicit trim an identity and disables descendant containment.
+Nine defect tests must fail; the unknown-type control passes. Sources are restored
+in `finally`, and the success descendant fixture is allowed to exit naturally
+before its mutation assertion fails.
 
 One-shot measurement (run only when authorized):
 

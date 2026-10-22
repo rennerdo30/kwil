@@ -7,6 +7,7 @@
 
 mod external;
 mod languages;
+mod literals;
 mod process_tree;
 
 pub use external::ExternalFormatter;
@@ -123,26 +124,6 @@ pub fn format(
         return Err(FormatError::new("Format", "not supported for a selection", line_at(input, range.start)));
     }
     let offset = line_at(input, range.start) - 1;
-    // These tidy-only formats have semantic whitespace, including embedded code
-    // and EOF. Without a parser proving a region safe, retain its exact bytes.
-    let preserve_tidy = language == Language::Yaml
-        || (language == Language::Generic
-            && matches!(
-                file_type.trim_start_matches('.').to_ascii_lowercase().as_str(),
-                "markdown"
-                    | "md"
-                    | "mdown"
-                    | "mkd"
-                    | "mkdn"
-                    | "commonmark"
-                    | "mdx"
-                    | "rst"
-                    | "restructuredtext"
-                    | "makefile"
-                    | "make"
-                    | "diff"
-                    | "patch"
-            ));
     let mut notices = Vec::new();
     let result = (|| {
         let formatted = if let Some(command) = settings.external.get(file_type) {
@@ -161,16 +142,27 @@ pub fn format(
                         "YAML: tidy only, no structural YAML formatting yet; indentation and trailing whitespace preserved to protect scalar semantics"
                             .into(),
                     );
-                    tidy(fragment, settings, true)?
+                    fragment.to_owned()
                 }
-                Language::Generic => tidy(fragment, settings, preserve_tidy)?,
+                Language::Generic => {
+                    if let Some(kind) = literals::kind(file_type) {
+                        literals::tidy(text, range.clone(), selected, kind, settings)?
+                    } else {
+                        notices.push(NO_SAFE_FORMATTER.into());
+                        fragment.to_owned()
+                    }
+                }
             }
         };
         // Syntax-aware formatters preserve all literal whitespace. Only generic
         // tidy trims; normalizing structured literals would change their values.
         let mut output = Output::new(settings.max_output_bytes);
         output.push(&formatted)?;
-        if !selected && !preserve_tidy && settings.final_newline && !formatted.ends_with(['\n', '\r']) {
+        if !selected
+            && !matches!(language, Language::Yaml | Language::Generic)
+            && settings.final_newline
+            && !formatted.ends_with(['\n', '\r'])
+        {
             output.push(ending(text))?;
         }
         let bytes = output.text.into_bytes();
@@ -217,6 +209,24 @@ pub fn format_selection(
     let end = start_byte
         .checked_add(input.len())
         .ok_or_else(|| FormatError::new("Format", "selection offset overflow", start_line))?;
+    if language == Language::Generic {
+        check_size(input.len(), settings)?;
+        let text =
+            std::str::from_utf8(input).map_err(|_| FormatError::new("Format", "input is not UTF-8", start_line))?;
+        let mut output = Output::new(settings.max_output_bytes);
+        output.push(text)?;
+        // This entry point has no surrounding literal context. `format` with
+        // the complete admitted snapshot can safely tokenize a generic selection.
+        return Ok(FormatResult {
+            bytes: output.text.into_bytes(),
+            replacement: None,
+            notices: vec![if literals::kind(file_type).is_none() {
+                NO_SAFE_FORMATTER.into()
+            } else {
+                "No safe formatter for this selection without full document literal context. Use Format document or 'Trim trailing whitespace' explicitly.".into()
+            }],
+        });
+    }
     let mut result = format(input, language, file_type, Some(0..input.len()), settings).map_err(|mut e| {
         e.line = e.line.saturating_add(start_line.saturating_sub(1));
         e.message = format!("{} (document line {})", e.message, e.line);
@@ -276,13 +286,16 @@ impl Output {
     }
 }
 
-fn tidy(text: &str, settings: &Settings, preserve: bool) -> Result<String, FormatError> {
+const NO_SAFE_FORMATTER: &str = "No safe formatter for this file type. Configure an external formatter, or use 'Trim trailing whitespace' explicitly.";
+
+/// Explicit `edit.trimTrailingWhitespace` worker operation. This deliberately
+/// ignores literal syntax; callers must display its notice before invocation.
+/// It preserves leading whitespace, every line ending and EOF style.
+pub fn trim_trailing_whitespace(input: &[u8], settings: &Settings) -> Result<FormatResult, FormatError> {
+    check_size(input.len(), settings)?;
+    let text = std::str::from_utf8(input)
+        .map_err(|e| FormatError::new("Trim", "input is not UTF-8", line_at(input, e.valid_up_to())))?;
     let mut out = Output::new(settings.max_output_bytes);
-    if preserve {
-        out.push(text)?;
-        return Ok(out.text);
-    }
-    let eol = ending(text);
     let mut start = 0;
     let bytes = text.as_bytes();
     while start < bytes.len() {
@@ -294,37 +307,16 @@ fn tidy(text: &str, settings: &Settings, preserve: bool) -> Result<String, Forma
                 next += 1;
             }
         }
-        let line = &text[start..end];
-        let line = if settings.trim_trailing_whitespace { line.trim_end_matches([' ', '\t']) } else { line };
-        if settings.reindent {
-            let leading = line.len() - line.trim_start_matches([' ', '\t']).len();
-            let mut columns = 0;
-            for b in line[..leading].bytes() {
-                columns += if b == b'\t' { settings.indent.width() - columns % settings.indent.width() } else { 1 };
-            }
-            match settings.indent {
-                Indent::Spaces(_) => {
-                    for _ in 0..columns {
-                        out.push(" ")?;
-                    }
-                }
-                Indent::Tabs { width } => {
-                    for _ in 0..columns / width {
-                        out.push("\t")?;
-                    }
-                    for _ in 0..columns % width {
-                        out.push(" ")?;
-                    }
-                }
-            }
-            out.push(&line[leading..])?;
-        } else {
-            out.push(line)?;
-        }
+        out.push(text[start..end].trim_end_matches([' ', '\t']))?;
         if next > end {
-            out.push(if settings.normalize_line_endings { eol } else { &text[end..next] })?;
+            out.push(&text[end..next])?;
         }
         start = next;
     }
-    Ok(out.text)
+    let bytes = out.text.into_bytes();
+    Ok(FormatResult {
+        replacement: (bytes != input).then_some(0..input.len()),
+        bytes,
+        notices: vec!["Trim trailing whitespace may change literals, heredocs, and Markdown hard breaks.".into()],
+    })
 }

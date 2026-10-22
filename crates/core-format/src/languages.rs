@@ -556,6 +556,70 @@ fn css_url_end(text: &str, open: usize) -> Result<usize, FormatError> {
     Err(FormatError::new("CSS", "unterminated url", line_at(b, open)))
 }
 
+fn css_function_end(text: &str, open: usize) -> Result<usize, FormatError> {
+    let b = text.as_bytes();
+    let mut i = open + 1;
+    let mut depth = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i = css_escape_end(text, i),
+            b'\'' | b'"' => i = quoted_end(text, i, b[i], false, "CSS")?,
+            b'/' if text[i..].starts_with("/*") => {
+                i = text[i + 2..]
+                    .find("*/")
+                    .map(|n| i + n + 4)
+                    .ok_or_else(|| FormatError::new("CSS", "unterminated function comment", line_at(b, open)))?;
+            }
+            b'(' => {
+                depth += 1;
+                if depth > 128 {
+                    return Err(FormatError::new("CSS", "function nesting exceeds 128", line_at(b, open)));
+                }
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+            _ => i += text[i..].chars().next().unwrap().len_utf8(),
+        }
+    }
+    Err(FormatError::new("CSS", "unterminated function", line_at(b, open)))
+}
+
+// CSS Syntax 3, consume an ident-like token: compare the decoded identifier,
+// but always emit the original slice. No identifier-sized allocation is needed.
+fn css_is_url(identifier: &str) -> bool {
+    let b = identifier.as_bytes();
+    let mut i = 0;
+    for expected in b"url" {
+        if i == b.len() {
+            return false;
+        }
+        let value = if b[i] == b'\\' {
+            let start = i + 1;
+            i = css_escape_end(identifier, i);
+            if b.get(start).is_some_and(u8::is_ascii_hexdigit) {
+                let end = (start..i).take_while(|&n| b[n].is_ascii_hexdigit()).last().unwrap() + 1;
+                u32::from_str_radix(&identifier[start..end], 16).unwrap()
+            } else {
+                identifier[start..i].chars().next().map_or(0, |c| c as u32)
+            }
+        } else {
+            let c = identifier[i..].chars().next().unwrap();
+            i += c.len_utf8();
+            c as u32
+        };
+        if value > 127 || (value as u8).to_ascii_lowercase() != *expected {
+            return false;
+        }
+    }
+    i == b.len()
+}
+
 fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatError> {
     let kind = if sql { "SQL" } else { "CSS" };
     let eol = ending(text);
@@ -627,8 +691,8 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
                     break;
                 }
             }
-            if text[start..i].eq_ignore_ascii_case("url") && b.get(i) == Some(&b'(') {
-                i = css_url_end(text, i)?;
+            if b.get(i) == Some(&b'(') {
+                i = if css_is_url(&text[start..i]) { css_url_end(text, i)? } else { css_function_end(text, i)? };
             }
             // Escapes and URLs are atomic data, never structural punctuation.
             quoted = true;

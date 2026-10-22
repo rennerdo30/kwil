@@ -92,7 +92,9 @@ fn sql_golden() {
 
 #[test]
 fn generic_golden() {
-    golden("  a  \r\n\tb \n", "  a\r\n\tb\r\n", Language::Generic);
+    let a = format(b"  a  \r\n\tb \n", Language::Generic, "rust", None, &Settings::default()).unwrap();
+    assert_eq!(a.bytes, b"  a\r\n\tb\r\n");
+    assert_eq!(format(&a.bytes, Language::Generic, "rust", None, &Settings::default()).unwrap().replacement, None);
 }
 
 #[test]
@@ -106,13 +108,13 @@ fn generic_optional_steps_and_visual_indent() {
         trim_trailing_whitespace: false,
         ..Settings::default()
     };
-    let a = format(input, Language::Generic, "", None, &s).unwrap();
+    let a = format(input, Language::Generic, "rust", None, &s).unwrap();
     assert_eq!(a.bytes, b"     x \r\n    y\n");
-    assert_eq!(format(&a.bytes, Language::Generic, "", None, &s).unwrap().bytes, a.bytes);
+    assert_eq!(format(&a.bytes, Language::Generic, "rust", None, &s).unwrap().bytes, a.bytes);
     let s = Settings { reindent: false, ..s };
-    assert_eq!(format(input, Language::Generic, "", None, &s).unwrap().bytes, input);
+    assert_eq!(format(input, Language::Generic, "rust", None, &s).unwrap().bytes, input);
     let s = Settings { reindent: true, indent: Indent::Tabs { width: 4 }, ..s };
-    assert_eq!(format(b"     x", Language::Generic, "", None, &s).unwrap().bytes, b"\t x");
+    assert_eq!(format(b"     x", Language::Generic, "rust", None, &s).unwrap().bytes, b"\t x");
 }
 
 #[test]
@@ -139,7 +141,7 @@ fn malformed_input_has_line_number() {
 }
 
 fn selection(input: &str, range: Range<usize>, lang: Language) -> FormatResult {
-    format(input.as_bytes(), lang, "", Some(range), &Settings::default()).unwrap()
+    format(input.as_bytes(), lang, "rust", Some(range), &Settings::default()).unwrap()
 }
 
 #[test]

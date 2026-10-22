@@ -8,7 +8,7 @@ fn main() {
             std::io::stdout().write_all(&b).unwrap();
         }
         Some("sleep") => std::thread::sleep(std::time::Duration::from_secs(2)),
-        Some("wrapper") => {
+        Some(mode @ ("wrapper" | "wrapper-success")) => {
             let receipt = std::env::args().nth(2).unwrap();
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command.args(["grandchild", &receipt]);
@@ -17,9 +17,21 @@ fn main() {
                 use std::os::windows::process::CommandExt;
                 command.creation_flags(0x0800_0000);
             }
+            // The success fixture intentionally exits before its child: the
+            // formatter's containment must stop it. Natural lifetime is bounded.
+            #[allow(clippy::zombie_processes)]
             let mut child = command.spawn().unwrap();
             eprintln!("owned grandchild PID {}", child.id());
-            child.wait().unwrap();
+            if mode == "wrapper" {
+                child.wait().unwrap();
+            } else {
+                let start = std::time::Instant::now();
+                while !std::path::Path::new(&receipt).with_extension("pid").exists() {
+                    assert!(start.elapsed() < std::time::Duration::from_secs(2), "grandchild readiness timeout");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                std::io::stdout().write_all(b"formatted\n").unwrap();
+            }
         }
         Some("grandchild") => {
             let path = std::path::PathBuf::from(std::env::args().nth(2).unwrap());

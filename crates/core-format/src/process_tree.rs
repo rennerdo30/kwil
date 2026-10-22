@@ -41,12 +41,57 @@ impl Tree {
         // Only the group established for this exact child; never our own group.
         if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
+            if error.raw_os_error() != Some(libc::ESRCH)
+                && !(error.raw_os_error() == Some(libc::EPERM) && group_has_no_live_members(pgid)?)
+            {
                 return Err(error);
             }
         }
         Ok(())
     }
+}
+
+// EPERM normally means containment failed, and must not be ignored. XNU also
+// returns it when killpg's zombie filter leaves no signalable processes. Inspect
+// only our reserved group, before external::run reaps its leader. An empty or
+// zombie-only group cannot fork between the inspection and the reap.
+#[cfg(target_os = "macos")]
+fn group_has_no_live_members(pgid: libc::pid_t) -> io::Result<bool> {
+    let mut pids: [libc::pid_t; 4096] = [0; 4096];
+    unsafe { *libc::__error() = 0 };
+    let count = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), std::mem::size_of_val(&pids) as i32) };
+    if count < 0 || (count == 0 && io::Error::last_os_error().raw_os_error() != Some(0)) {
+        return Err(io::Error::last_os_error());
+    }
+    if count as usize >= pids.len() {
+        return Err(io::Error::other("formatter group inspection exceeded PID capacity"));
+    }
+    for &pid in &pids[..count as usize] {
+        if pid == 0 {
+            continue;
+        }
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as i32;
+        let read = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+        };
+        if read == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            continue; // It exited between enumeration and inspection.
+        }
+        if read != size {
+            return Err(io::Error::other("cannot inspect formatter group member"));
+        }
+        if info.pbi_pgid == pgid as u32 && info.pbi_status != libc::SZOMB {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn group_has_no_live_members(_pgid: libc::pid_t) -> io::Result<bool> {
+    // Other supported kernels report ESRCH for an empty group. Keep EPERM fatal.
+    Ok(false)
 }
 
 #[cfg(windows)]
