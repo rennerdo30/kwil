@@ -48,10 +48,11 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-text"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "memchr",
  "memmap2",
+ "windows-sys",
 ]
 
 [[package]]

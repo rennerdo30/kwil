@@ -7,5 +7,5 @@
 mod file;
 mod line_index;
 
-pub use file::{IndexProgress, TextFile};
+pub use file::{FileKind, FileState, IndexProgress, OpenError, ReadError, TextFile};
 pub use line_index::LineIndex;

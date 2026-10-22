@@ -7,3 +7,4 @@ publish = false
 
 [dependencies]
 kwil-core-text = { path = "../core-text" }
+notify = "8.2.0"
