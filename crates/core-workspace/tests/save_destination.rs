@@ -339,7 +339,7 @@ fn unix_parent_permission_errors_propagate_where_enforced() {
     let fixture = Fixture::new();
     let parent = fixture.path("private");
     fs::create_dir(&parent).unwrap();
-    fs::set_permissions(&parent, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o0)).unwrap();
     let result = resolve_save_destination(&parent.join("new"));
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
     match result {
