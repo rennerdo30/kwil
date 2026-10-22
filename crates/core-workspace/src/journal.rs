@@ -1006,12 +1006,12 @@ fn service_loop(
                 entry.finishing = true;
             }
         }
-        if let Some(token) = order.pop_front() {
-            if let Some(entry) = entries.get_mut(&token) {
-                match entry.advance() {
-                    Ok(()) => order.push_back(token),
-                    Err(e) => entries.remove(&token).unwrap().complete(Err(e)),
-                }
+        if let Some(token) = order.pop_front()
+            && let Some(entry) = entries.get_mut(&token)
+        {
+            match entry.advance() {
+                Ok(()) => order.push_back(token),
+                Err(e) => entries.remove(&token).unwrap().complete(Err(e)),
             }
         }
         let mut remove = Vec::new();
