@@ -16,6 +16,7 @@ use std::{
 };
 
 mod commands;
+mod hex;
 mod save;
 
 const MAX_CURSORS: usize = 4096;
