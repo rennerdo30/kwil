@@ -547,3 +547,94 @@ fn horizontal_windows_have_per_row_utf8_boundaries() {
     view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
     assert_eq!(String::from_utf8(bytes).unwrap(), "aX界z\nab界z");
 }
+
+#[test]
+fn kw48_unicode_grid_cap_keeps_every_hit_insertion_valid() {
+    let source = format!("A{}Z", "\u{301}".repeat(12_800));
+    let cells = grid::cells(source.as_bytes(), 100, 4);
+    assert!(!cells.is_empty());
+    for cell in &cells {
+        for hit in [cell.bytes.start, cell.bytes.end] {
+            assert!(source.is_char_boundary(hit), "hit {hit} splits a scalar");
+            let mut e = editor(source.as_bytes());
+            at(&mut e, hit as u64);
+            type_text(&mut e, "X", 0);
+            assert!(String::from_utf8(bytes(&e)).is_ok(), "insertion at {hit} corrupts UTF-8");
+        }
+        assert!(!cell.text.starts_with("\\x"), "valid source must not become an escape");
+    }
+    let invalid = grid::cells(b"A\xff\xc0\xafZ", 100, 4);
+    assert_eq!(invalid[1].bytes, 1..2);
+    assert_eq!(invalid[2].bytes, 2..3);
+    assert_eq!(invalid[3].bytes, 3..4);
+    assert_eq!(invalid[3].text, "\\xAF");
+}
+
+#[test]
+fn kw48_unicode_vertical_motions_follow_display_columns() {
+    for (prefix, column) in [("界", 2), ("e\u{301}", 1), ("👩‍💻", 2), ("a\t", 4)] {
+        let source = format!("{prefix}Z\nabcdefgh\n{prefix}Z");
+        let mut e = editor(source.as_bytes());
+        at(&mut e, prefix.len() as u64);
+        e.move_cursors(Motion::Down, 1, false).unwrap();
+        assert_eq!(e.primary_cursor().head, prefix.len() as u64 + 2 + column, "{prefix}");
+        e.move_cursors(Motion::Up, 1, false).unwrap();
+        assert_eq!(e.primary_cursor().head, prefix.len() as u64);
+        e.add_cursor_vertical(true).unwrap();
+        assert_eq!(e.primary_cursor().head, prefix.len() as u64 + 2 + column);
+        at(&mut e, prefix.len() as u64);
+        e.set_viewport(0, 2);
+        e.move_cursors(Motion::PageDown, 1, true).unwrap();
+        assert_eq!(e.primary_cursor().head, (2 * prefix.len() + 11) as u64);
+        assert_eq!(e.primary_cursor().anchor, prefix.len() as u64);
+    }
+}
+
+#[test]
+fn kw48_unicode_box_selection_uses_grid_clusters_and_preserves_bytes() {
+    let mut e = editor("界Z\ne\u{301}QZ\n👩‍💻Z\na\tZ\nabZ".as_bytes());
+    e.column_selection(0, 0, 4, 2).unwrap();
+    type_text(&mut e, "X", 0);
+    assert_eq!(String::from_utf8(bytes(&e)).unwrap(), "XZ\nXZ\nXZ\nX\tZ\nXZ");
+    let mut e = editor(b"\xffZ\nabcdZ");
+    e.column_selection(0, 0, 1, 4).unwrap();
+    type_text(&mut e, "X", 0);
+    assert_eq!(bytes(&e), b"XZ\nXZ");
+    e.undo().unwrap();
+    assert_eq!(bytes(&e), b"\xffZ\nabcdZ");
+}
+
+#[test]
+fn kw48_unicode_model_columns_match_grid_and_snap_inside_clusters() {
+    let source = "界e\u{301}👩‍💻\tZ";
+    let e = editor(source.as_bytes());
+    for cell in grid::cells(source.as_bytes(), 100, 4) {
+        assert_eq!(e.position_at(cell.bytes.start as u64).unwrap(), (0, cell.column as u64));
+        assert_eq!(e.position_at(cell.bytes.end as u64).unwrap(), (0, (cell.column + cell.width) as u64));
+        for column in cell.column..cell.column + cell.width {
+            assert_eq!(e.offset_at(0, column as u64).unwrap(), cell.bytes.start as u64);
+        }
+    }
+    assert_eq!(e.position_at(4).unwrap(), (0, 2)); // scalar boundary inside e + acute
+    let e = editor(b"A\xff\xc0Z");
+    assert_eq!(e.position_at(3).unwrap(), (0, 9));
+    assert_eq!(e.offset_at(0, 8).unwrap(), 2);
+}
+
+#[test]
+fn kw48_unicode_column_window_rejects_unresolved_giant_lines() {
+    let source = "a".repeat(70_000);
+    let e = editor(source.as_bytes());
+    assert_eq!(e.position_at(5_000).unwrap(), (0, 5_000));
+    assert_eq!(e.offset_at(0, 5_000).unwrap(), 5_000);
+    assert!(e.position_at(69_999).is_err());
+    assert!(e.offset_at(0, 69_999).is_err());
+    assert!(e.offset_at(0, u64::MAX).is_err());
+    // The last inspected grapheme may continue beyond the byte window.
+    let source = format!("a{}Z", "\u{301}".repeat(35_000));
+    let e = editor(source.as_bytes());
+    assert!(e.offset_at(0, 1).is_err());
+    let source = format!("{}界Z", "a".repeat(65_534));
+    let e = editor(source.as_bytes());
+    assert!(e.offset_at(0, 65_536).is_err());
+}

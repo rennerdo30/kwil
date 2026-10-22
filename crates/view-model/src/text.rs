@@ -1,5 +1,5 @@
-//! Bounded text primitives. Columns count Unicode scalars, with tab stops.
-//! Invalid UTF-8 is a one-byte character and is never normalized by edits.
+//! Bounded text primitives. Display columns share the frontend grid traversal.
+//! Invalid UTF-8 stays byte-exact and occupies one four-column escape per byte.
 
 use kwil_core_text::Snapshot;
 use std::{io, ops::Range};
@@ -95,36 +95,76 @@ pub(crate) fn line_full(s: &Snapshot, row: u64) -> io::Result<Range<u64>> {
 
 pub(crate) fn column(s: &Snapshot, at: u64, tab: u8) -> io::Result<u64> {
     let bounds = line(s, row(s, at)?)?;
-    let mut p = bounds.start;
-    if at - p > WINDOW {
-        return Err(io::Error::other("column exceeds bounded text window"));
+    let target = at.min(bounds.end) - bounds.start;
+    if target == 0 {
+        return Ok(0);
     }
-    let mut col = 0;
-    while p < at.min(bounds.end) {
-        let (c, end) = character(s, p)?;
-        col = if c == '\t' { col + u64::from(tab.max(1)) - col % u64::from(tab.max(1)) } else { col + 1 };
-        p = end;
+    if target > WINDOW {
+        return Err(column_limit());
     }
-    Ok(col)
+    let (bytes, complete) = column_bytes(s, bounds)?;
+    let mut found = None;
+    crate::grid::visit(&bytes, tab as usize, |_, range, col, width| {
+        if target <= range.start as u64 {
+            found = Some(col as u64);
+            return false;
+        }
+        if !complete && range.end == bytes.len() {
+            return false;
+        }
+        if target <= range.end as u64 {
+            found = Some(if target == range.end as u64 { (col + width) as u64 } else { col as u64 });
+            return false;
+        }
+        true
+    });
+    found.ok_or_else(column_limit)
 }
 
 pub(crate) fn at_column(s: &Snapshot, row: u64, target: u64, tab: u8) -> io::Result<u64> {
     let bounds = line(s, row)?;
-    let mut p = bounds.start;
-    let mut col = 0;
-    while p < bounds.end && col < target {
-        if p - bounds.start >= WINDOW {
-            return Err(io::Error::other("column exceeds bounded text window"));
-        }
-        let (c, end) = character(s, p)?;
-        let next_col = if c == '\t' { col + u64::from(tab.max(1)) - col % u64::from(tab.max(1)) } else { col + 1 };
-        if next_col > target {
-            break;
-        }
-        p = end;
-        col = next_col;
+    if target == 0 {
+        return Ok(bounds.start);
     }
-    Ok(p)
+    let (bytes, complete) = column_bytes(s, bounds.clone())?;
+    let mut found = None;
+    crate::grid::visit(&bytes, tab as usize, |_, range, col, width| {
+        if target == col as u64 {
+            found = Some(range.start);
+            return false;
+        }
+        if !complete && range.end == bytes.len() {
+            return false;
+        }
+        if target <= (col + width) as u64 {
+            found = Some(if target == (col + width) as u64 { range.end } else { range.start });
+            return false;
+        }
+        true
+    });
+    match found {
+        Some(offset) => Ok(bounds.start + offset as u64),
+        None if complete => Ok(bounds.end),
+        None => Err(column_limit()),
+    }
+}
+
+fn column_limit() -> io::Error {
+    io::Error::other("column exceeds bounded text window")
+}
+
+fn column_bytes(s: &Snapshot, bounds: Range<u64>) -> io::Result<(Vec<u8>, bool)> {
+    let end = bounds.end.min(bounds.start.saturating_add(WINDOW));
+    let mut bytes = read(s, bounds.start..end, WINDOW)?;
+    let complete = end == bounds.end;
+    if !complete {
+        // Keep three bytes of lookahead inside the read budget to align scalars.
+        // The last grapheme can continue beyond this window, so queries must
+        // stop before using its width rather than mistake this cap for EOL.
+        let end = crate::grid::boundary(&bytes, bytes.len() - 3);
+        bytes.truncate(end);
+    }
+    Ok((bytes, complete))
 }
 
 fn class(c: char) -> u8 {

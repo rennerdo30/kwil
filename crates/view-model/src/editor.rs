@@ -1,5 +1,5 @@
-//! Frontend-independent editing. Offsets are bytes; user columns are Unicode
-//! scalar/tab-stop columns. Large bulk commands can move this model to a worker.
+//! Frontend-independent editing. Offsets are bytes; user columns share the
+//! frontend grapheme/tab grid. Large bulk commands can move this model to a worker.
 
 use crate::{Damage, Document, text};
 use kwil_core_commands::{
@@ -239,7 +239,7 @@ impl Editor {
     pub fn rows(&self) -> usize {
         self.rows
     }
-    /// Zero-based row and display column (Unicode scalars and configured tab stops).
+    /// Zero-based row and display column (graphemes and configured tab stops).
     /// Scanning a column is bounded to 64 KiB; long-line frontends can use
     /// byte_position/line_range and their bounded horizontal layout instead.
     pub fn position_at(&self, offset: u64) -> io::Result<(u64, u64)> {

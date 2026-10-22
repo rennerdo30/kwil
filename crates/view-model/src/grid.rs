@@ -38,51 +38,65 @@ pub struct Cell {
 pub fn cells(bytes: &[u8], columns: usize, tab_size: usize) -> Vec<Cell> {
     let columns = columns.min(4096);
     let limit = bytes.len().min(columns.saturating_mul(256).min(64 * 1024));
-    let bytes = &bytes[..limit];
+    let bytes = &bytes[..boundary(bytes, limit)];
     let mut result = Vec::new();
+    visit(bytes, tab_size, |grapheme, range, column, width| {
+        if column + width > columns {
+            return false;
+        }
+        let text = match grapheme {
+            Some("\t") => "\t".to_owned(),
+            Some(g) if !g.chars().any(char::is_control) => {
+                let mut end = g.len().min(256);
+                while !g.is_char_boundary(end) {
+                    end -= 1;
+                }
+                g[..end].to_owned()
+            }
+            _ => format!("\\x{:02X}", bytes[range.start]),
+        };
+        result.push(Cell { text, column, width, bytes: range });
+        column + width < columns
+    });
+    result
+}
+
+/// Shared allocation-free traversal for drawing and model columns. Callers
+/// provide a bounded byte slice; false stops before visiting another cluster.
+/// None denotes one invalid original byte, displayed as a four-column escape.
+pub(crate) fn visit(
+    bytes: &[u8],
+    tab_size: usize,
+    mut visitor: impl FnMut(Option<&str>, std::ops::Range<usize>, usize, usize) -> bool,
+) {
     let (mut offset, mut column) = (0, 0);
-    while offset < bytes.len() && column < columns {
+    while offset < bytes.len() {
         let (valid, bad) = match std::str::from_utf8(&bytes[offset..]) {
             Ok(s) => (s, false),
             Err(e) => (std::str::from_utf8(&bytes[offset..offset + e.valid_up_to()]).unwrap(), true),
         };
         for g in valid.graphemes(true) {
-            let (text, width) = if g == "\t" {
-                (g.to_owned(), tab_size.max(1) - column % tab_size.max(1))
+            let width = if g == "\t" {
+                tab_size.max(1) - column % tab_size.max(1)
             } else if g.chars().any(char::is_control) {
-                (format!("\\x{:02X}", g.as_bytes()[0]), 4)
+                4
             } else {
-                let mut end = g.len().min(256);
-                while !g.is_char_boundary(end) {
-                    end -= 1;
-                }
-                (g[..end].to_owned(), UnicodeWidthStr::width(g).max(1))
+                UnicodeWidthStr::width(g).max(1)
             };
-            if column + width > columns {
-                return result;
+            if !visitor(Some(g), offset..offset + g.len(), column, width) {
+                return;
             }
-            result.push(Cell { text, column, width, bytes: offset..offset + g.len() });
             column += width;
             offset += g.len();
-            if column >= columns {
-                return result;
-            }
         }
         if bad && offset < bytes.len() {
-            if column + 4 > columns {
-                break;
+            if !visitor(None, offset..offset + 1, column, 4) {
+                return;
             }
-            result.push(Cell {
-                text: format!("\\x{:02X}", bytes[offset]),
-                column,
-                width: 4,
-                bytes: offset..offset + 1,
-            });
             column += 4;
             offset += 1;
         }
     }
-    result
 }
 
 #[cfg(test)]
