@@ -139,7 +139,40 @@ impl App {
     fn palette_action(&mut self, action: kwil_core_commands::palette::PaletteAction) {
         use kwil_core_commands::palette::PaletteAction;
         match action {
-            PaletteAction::Command(command) => self.edit(input::Action::Command(command)),
+            PaletteAction::Command(command) => {
+                use kwil_core_commands::vim::VimResult;
+                let result = self.keys.as_mut().map(|keys| keys.invoke_named(command));
+                match result {
+                    Some(VimResult::Command(call))
+                        if self.settings.keymap == kwil_core_commands::Preset::Vim
+                            && !call.id.starts_with("file.")
+                            && !call.id.starts_with("view.") =>
+                    {
+                        if let Some(editor) = self.view.editor_mut() {
+                            match editor.execute_vim(&call) {
+                                Ok(result) => {
+                                    let damage = self.view.refresh_after_edit(result.damage);
+                                    self.apply(damage);
+                                    self.keep_caret_visible();
+                                    self.command_status(result.status);
+                                }
+                                Err(error) => {
+                                    let damage = self.view.set_notice(error.to_string());
+                                    self.apply(damage);
+                                }
+                            }
+                        }
+                    }
+                    Some(VimResult::Error(error)) => {
+                        let damage = self.view.set_notice(error);
+                        self.apply(damage);
+                    }
+                    Some(VimResult::Pending) => {
+                        self.apply(Damage { status: true, ..Default::default() });
+                    }
+                    _ => self.edit(input::Action::Command(command)),
+                }
+            }
             PaletteAction::OpenFile(path) => {
                 if let Err(error) = self.view.open_path(path) {
                     self.view.set_notice(error.to_string());

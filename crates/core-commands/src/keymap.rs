@@ -285,6 +285,25 @@ impl KeymapEngine {
             vim.cancel_input();
         }
     }
+    /// Dispatch a palette/menu command through the same Vim state transition as
+    /// an explicit binding. Counts/operators from an earlier chord never leak.
+    pub fn invoke_named(&mut self, id: &str) -> crate::vim::VimResult {
+        use crate::vim::{Argument, Invocation, VimResult};
+        let Some(command) = command(id) else { return VimResult::Error(format!("Unknown command: {id}")) };
+        self.cancel_pending();
+        self.fallback_suppressed = false;
+        if let Some(vim) = &mut self.vim {
+            return vim.invoke(command.id);
+        }
+        VimResult::Command(Invocation {
+            id: command.id,
+            count: 1,
+            explicit_count: false,
+            motion: None,
+            register: None,
+            argument: Argument::None,
+        })
+    }
     pub fn feed(&mut self, key: KeyChord) -> crate::vim::VimResult {
         use crate::vim::{Argument, Invocation, VimResult};
         self.fallback_suppressed = false;

@@ -10,6 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
 mod file_prompt;
+mod palette_ui;
 mod tabs;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -18,6 +19,8 @@ use ratatui::widgets::Paragraph;
 use std::sync::mpsc;
 
 enum Msg {
+    PaletteRoot(Result<std::path::PathBuf, String>),
+    PaletteReady,
     Input(Event),
     Document(kwil_view_model::document_worker::DocumentResult),
     OpenExternal,
@@ -69,6 +72,7 @@ pub fn run_with_external_open(
         });
     }
 
+    let mut palette: Option<kwil_view_model::palette_session::PaletteSession> = None;
     let result = (|| -> std::io::Result<()> {
         let size = terminal.size()?;
         let geometry = tabs::geometry(&view, size.width, size.height, Settings::default().tabs.layout);
@@ -85,6 +89,18 @@ pub fn run_with_external_open(
         on_external_ready(external_open);
         let settings_sender = tx.clone();
         std::thread::spawn(move || {
+            let root = match std::env::var_os("KWIL_WORKSPACE_ROOT") {
+                Some(path) => {
+                    let path = std::path::PathBuf::from(path);
+                    if path.is_absolute() {
+                        Ok(path)
+                    } else {
+                        Err("Palette workspace root must be absolute".to_owned())
+                    }
+                }
+                None => std::env::current_dir().map_err(|error| error.to_string()),
+            };
+            let _ = settings_sender.send(Msg::PaletteRoot(root));
             let settings = std::env::current_exe()
                 .ok()
                 .and_then(|exe| Settings::path(&exe).ok())
@@ -97,9 +113,47 @@ pub fn run_with_external_open(
         let mut horizontal = 0u64;
         let mut settings = Settings::default();
         let mut keys = KeymapEngine::new(settings.keymap, &settings.bindings).expect("bundled keymap");
+        let mut input_identity = (view.active_id(), view.input_epoch());
         while let Ok(msg) = rx.recv() {
             let user_input = matches!(&msg, Msg::Input(_));
             let changed = match msg {
+                Msg::PaletteRoot(root) => {
+                    match root.and_then(|root| {
+                        let sender = tx.clone();
+                        kwil_view_model::palette_session::PaletteSession::new(
+                            root,
+                            std::sync::Arc::new(move || {
+                                let _ = sender.send(Msg::PaletteReady);
+                            }),
+                        )
+                        .map_err(|error| error.to_string())
+                    }) {
+                        Ok(host) => {
+                            palette = Some(host);
+                            false
+                        }
+                        Err(error) => {
+                            view.set_notice(format!("Palette: {error}"));
+                            true
+                        }
+                    }
+                }
+                Msg::PaletteReady => {
+                    let mut changed = false;
+                    if let Some(host) = &mut palette {
+                        changed |= host.worker_ready();
+                        if let Some(report) = host.take_discovery_report()
+                            && (report.errors > 0 || report.end != kwil_core_workspace::catalogue::WalkEnd::Complete)
+                        {
+                            view.set_notice(format!(
+                                "File catalogue: {} files, {} skipped; {:?}",
+                                report.files, report.errors, report.end
+                            ));
+                            changed = true;
+                        }
+                    }
+                    changed
+                }
                 Msg::InputClosed => break,
                 Msg::Settings(next) => {
                     if let Ok(next_keys) = KeymapEngine::new(next.keymap, &next.bindings) {
@@ -142,12 +196,18 @@ pub fn run_with_external_open(
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                     let intent = if view.file_prompt().is_some() {
                         file_prompt::key(&mut view, k)
+                    } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
+                        palette_ui::key(&mut view, host, k, &mut keys, started.elapsed(), settings.keymap)
                     } else if view.close_pending() && k.code == KeyCode::Esc {
                         KeyResult::Cancel
                     } else {
                         key(&mut view, k, started.elapsed(), &mut keys, settings.keymap)
                     };
                     match intent {
+                        KeyResult::Palette(query) => {
+                            palette_ui::open(&mut view, palette.as_mut(), &mut keys, query);
+                            true
+                        }
                         KeyResult::Quit => {
                             let discard = view.close_pending() && k.modifiers.contains(KeyModifiers::SHIFT);
                             if let Err(error) = view.request_window_close(discard) {
@@ -203,12 +263,26 @@ pub fn run_with_external_open(
                         }
                         view.prompt_notice();
                         true
+                    } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
+                        let _ = palette_ui::input(
+                            &mut view,
+                            host,
+                            &mut keys,
+                            kwil_view_model::palette_session::PaletteInput::Text(&text),
+                            started.elapsed(),
+                            settings.keymap,
+                        );
+                        true
                     } else if keys.mode() == kwil_core_commands::Mode::Insert {
                         execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
                         true
                     } else {
                         false
                     }
+                }
+                Msg::Input(Event::Mouse(m)) if palette.as_ref().is_some_and(|host| host.model().is_open()) => {
+                    let size = terminal.size()?;
+                    palette_ui::mouse(palette.as_mut().unwrap(), &m, Rect::new(0, 0, size.width, size.height))
                 }
                 Msg::Input(Event::Mouse(m))
                     if {
@@ -225,6 +299,7 @@ pub fn run_with_external_open(
                 },
                 Msg::Input(_) => false,
             };
+            palette_ui::sync_input_identity(&view, &mut keys, &mut input_identity);
             if changed {
                 if user_input {
                     view.checkpoint_session();
@@ -234,23 +309,38 @@ pub fn run_with_external_open(
                 if view.rows() != geometry.body.height {
                     view.set_rows(geometry.body.height);
                 }
-                keep_visible(
-                    &mut view,
-                    &mut horizontal,
-                    geometry.body.width.saturating_sub(8),
-                    settings.editor.tab_size as usize,
-                );
+                if !palette.as_ref().is_some_and(|host| host.model().is_open()) {
+                    keep_visible(
+                        &mut view,
+                        &mut horizontal,
+                        geometry.body.width.saturating_sub(8),
+                        settings.editor.tab_size as usize,
+                    );
+                }
                 // ratatui diffs against the previous frame and writes only
                 // the changed cells.
                 if let Some(editor) = view.editor_mut() {
                     editor.settings = settings.clone();
                 }
-                terminal.draw(|f| tabs::draw(f, &view, settings.tabs.layout))?;
+                terminal.draw(|f| {
+                    tabs::draw(f, &view, settings.tabs.layout);
+                    if let Some(host) = &palette {
+                        palette_ui::draw(f, host.model());
+                    }
+                })?;
             }
         }
         Ok(())
     })();
 
+    if let Some(host) = &mut palette {
+        let handles = host.stop();
+        std::thread::spawn(move || {
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+    }
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
@@ -267,6 +357,7 @@ enum KeyResult {
     Cancel,
     Changed(bool),
     File(&'static str),
+    Palette(&'static str),
 }
 
 /// Close only for the successful completion of the requested revision.
@@ -380,67 +471,7 @@ fn key(
         match keys.feed_with_selection(chord) {
             VimResult::Pending => return KeyResult::Changed(false),
             VimResult::Command(call) => {
-                if matches!(call.id, "view.zoomIn" | "view.zoomOut" | "view.zoomReset") {
-                    view.set_notice("Terminal font size is controlled by your terminal; use its zoom shortcuts".into());
-                    return KeyResult::Changed(true);
-                }
-                if call.id == "file.save" {
-                    return KeyResult::Save(None);
-                }
-                if call.id == "file.quit" {
-                    return KeyResult::Quit;
-                }
-                if call.id == "file.saveAndQuit" {
-                    return KeyResult::SaveAndQuit;
-                }
-                if matches!(
-                    call.id,
-                    "file.new"
-                        | "file.open"
-                        | "file.saveAs"
-                        | "file.saveAll"
-                        | "file.close"
-                        | "file.closeAll"
-                        | "file.reopenClosed"
-                        | "file.recent"
-                        | "file.nextTab"
-                        | "file.previousTab"
-                        | "file.restoreSession"
-                ) {
-                    return KeyResult::File(call.id);
-                }
-                if preset == Preset::Vim {
-                    if let Some(editor) = view.editor_mut() {
-                        match editor.execute_vim(&call) {
-                            Ok(result) => {
-                                view.refresh_after_edit(result.damage);
-                                match result.status {
-                                    CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
-                                        view.set_notice(message);
-                                    }
-                                    CommandStatus::IndexNotReady => {
-                                        view.set_notice("Indexing: editing will be available when ready".into());
-                                    }
-                                    CommandStatus::SaveRequested => return KeyResult::Save(None),
-                                    CommandStatus::Applied => {}
-                                }
-                            }
-                            Err(error) => {
-                                view.set_notice(error.to_string());
-                            }
-                        }
-                    } else {
-                        view.set_notice("Indexing: editing will be available when ready".into());
-                    }
-                    return KeyResult::Changed(true);
-                }
-                return KeyResult::Changed(execute(
-                    view,
-                    call.id,
-                    None,
-                    k.modifiers.contains(KeyModifiers::SHIFT),
-                    elapsed,
-                ));
+                return invoke(view, call, k.modifiers.contains(KeyModifiers::SHIFT), elapsed, preset);
             }
             VimResult::Error(error) => {
                 view.set_notice(error);
@@ -492,6 +523,73 @@ fn key(
         _ => return KeyResult::Changed(false),
     };
     KeyResult::Changed(execute(view, command, None, k.modifiers.contains(KeyModifiers::SHIFT), elapsed))
+}
+
+fn invoke(
+    view: &mut View,
+    call: kwil_core_commands::vim::Invocation,
+    extend: bool,
+    elapsed: std::time::Duration,
+    preset: Preset,
+) -> KeyResult {
+    if let Some(query) = palette_ui::command_query(call.id) {
+        return KeyResult::Palette(query);
+    }
+    if matches!(call.id, "view.zoomIn" | "view.zoomOut" | "view.zoomReset") {
+        view.set_notice("Terminal font size is controlled by your terminal; use its zoom shortcuts".into());
+        return KeyResult::Changed(true);
+    }
+    if call.id == "file.save" {
+        return KeyResult::Save(None);
+    }
+    if call.id == "file.quit" {
+        return KeyResult::Quit;
+    }
+    if call.id == "file.saveAndQuit" {
+        return KeyResult::SaveAndQuit;
+    }
+    if matches!(
+        call.id,
+        "file.new"
+            | "file.open"
+            | "file.saveAs"
+            | "file.saveAll"
+            | "file.close"
+            | "file.closeAll"
+            | "file.reopenClosed"
+            | "file.recent"
+            | "file.nextTab"
+            | "file.previousTab"
+            | "file.restoreSession"
+    ) {
+        return KeyResult::File(call.id);
+    }
+    if preset == Preset::Vim {
+        if let Some(editor) = view.editor_mut() {
+            match editor.execute_vim(&call) {
+                Ok(result) => {
+                    view.refresh_after_edit(result.damage);
+                    match result.status {
+                        CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
+                            view.set_notice(message);
+                        }
+                        CommandStatus::IndexNotReady => {
+                            view.set_notice("Indexing: editing will be available when ready".into());
+                        }
+                        CommandStatus::SaveRequested => return KeyResult::Save(None),
+                        CommandStatus::Applied => {}
+                    }
+                }
+                Err(error) => {
+                    view.set_notice(error.to_string());
+                }
+            }
+        } else {
+            view.set_notice("Indexing: editing will be available when ready".into());
+        }
+        return KeyResult::Changed(true);
+    }
+    KeyResult::Changed(execute(view, call.id, None, extend, elapsed))
 }
 
 fn chord(event: KeyEvent) -> Option<kwil_core_commands::KeyChord> {
