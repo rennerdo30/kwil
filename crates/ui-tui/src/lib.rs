@@ -19,7 +19,7 @@ use std::sync::mpsc;
 enum Msg {
     Input(Event),
     Document(kwil_view_model::document_worker::DocumentResult),
-    OpenExternal(kwil_core_workspace::instance::OpenFiles),
+    OpenExternal,
     Notice(String),
     InputClosed,
     Settings(Box<Settings>),
@@ -29,7 +29,7 @@ pub fn run(view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Resu
     run_with_external_open(view, on_first_frame, Box::new(|_| {}))
 }
 
-pub type ExternalOpen = Box<dyn Fn(kwil_core_workspace::instance::OpenFiles) + Send>;
+pub use kwil_view_model::document_worker::ExternalOpen;
 pub fn run_with_external_open(
     view: View,
     on_first_frame: Box<dyn FnOnce(Notify)>,
@@ -37,6 +37,12 @@ pub fn run_with_external_open(
 ) -> std::io::Result<()> {
     let mut view = Workspace::new(view)?;
     let (tx, rx) = mpsc::channel::<Msg>();
+    let external_sender = tx.clone();
+    let (external_open, external_inbox) = kwil_view_model::document_worker::external_open_channel(move || {
+        external_sender
+            .send(Msg::OpenExternal)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TUI closed"))
+    });
     let mut terminal = ratatui::init();
     crossterm::execute!(
         std::io::stdout(),
@@ -74,10 +80,7 @@ pub fn run_with_external_open(
         on_first_frame(Box::new(move |msg| {
             let _ = t.send(Msg::Notice(msg));
         }));
-        let external_sender = tx.clone();
-        on_external_ready(Box::new(move |path| {
-            let _ = external_sender.send(Msg::OpenExternal(path));
-        }));
+        on_external_ready(external_open);
         let settings_sender = tx.clone();
         std::thread::spawn(move || {
             let settings = std::env::current_exe()
@@ -116,9 +119,15 @@ pub fn run_with_external_open(
                     }
                     true
                 }
-                Msg::OpenExternal(request) => {
-                    if let Err(error) = view.open_files(request) {
-                        view.set_notice(format!("Open failed: {error}"));
+                Msg::OpenExternal => {
+                    let requests = external_inbox.drain();
+                    if requests.is_empty() {
+                        continue;
+                    }
+                    for request in requests {
+                        if let Err(error) = view.open_files(request) {
+                            view.set_notice(format!("Open failed: {error}"));
+                        }
                     }
                     true
                 }

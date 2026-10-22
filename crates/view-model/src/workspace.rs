@@ -183,6 +183,16 @@ impl Workspace {
         self.start_document_worker_at(None, complete)
     }
 
+    /// Hidden/native harnesses require a caller-selected absolute root. Missing
+    /// and malformed overrides reach the worker as invalid explicit paths.
+    pub fn start_isolated_document_worker(
+        &mut self,
+        complete: impl Fn(DocumentResult) + Send + 'static,
+    ) -> io::Result<()> {
+        let root = std::env::var_os("KWIL_WORKSPACE_ROOT").map(PathBuf::from).unwrap_or_default();
+        self.start_document_worker_at(Some(root), complete)
+    }
+
     /// Tests and embedders can select an isolated recovery location explicitly.
     pub fn start_document_worker_at(
         &mut self,
@@ -497,6 +507,7 @@ impl Workspace {
             "file.restoreSession" => {
                 if let Some(prepared) = self.files.deferred_recovery.take() {
                     self.install_prepared(*prepared);
+                    self.files.storage_ready = self.files.deferred_recovery.is_none();
                 }
             }
             "file.reopenClosed" => {
@@ -770,7 +781,9 @@ impl Workspace {
             || !self.closed_views.is_empty()
         {
             self.files.deferred_recovery = Some(Box::new(prepared));
-            self.set_notice("Recovery retained: close tabs before Restore Session; active work is unchanged".into());
+            let reason =
+                if self.closed_views.is_empty() { "tab limit reached" } else { "reopen recently closed tabs first" };
+            self.set_notice(format!("Recovery retained: {reason}; then Restore Session. Active work is unchanged"));
             return;
         }
         let old_tabs = self.session.tabs().to_vec();
@@ -823,6 +836,20 @@ impl Workspace {
                 self.session.tabs().iter().find(|t| t.path.is_some() && t.path == view.path).map(|t| t.id)
             {
                 if !dirty {
+                    if let Some((line, column, extend)) = view.pending_goto
+                        && let Some(recovered) = self.views.get_mut(&existing)
+                    {
+                        let _ = recovered.execute(
+                            "navigation.goToLine",
+                            &crate::CommandArgs {
+                                line: Some(line),
+                                column: Some(column),
+                                extend,
+                                ..Default::default()
+                            },
+                            1,
+                        );
+                    }
                     mapping.insert(tab.id, existing);
                     if tab.id == old_active {
                         active = Some(existing);

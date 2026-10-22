@@ -74,7 +74,7 @@ impl std::fmt::Display for GuiError {
 
 enum UserEvent {
     Document(kwil_view_model::document_worker::DocumentResult),
-    OpenExternal(kwil_core_workspace::instance::OpenFiles),
+    OpenExternal,
     Notice(String),
     GlyphReady(shaping::Tile, u64),
     SettingsReady(Box<Settings>),
@@ -111,17 +111,6 @@ enum UnboundKey {
     Ignore,
 }
 
-#[cfg(test)]
-fn cancel_save_prompt(path: &mut Option<String>, close_pending: &mut bool) {
-    *path = None;
-    *close_pending = false;
-}
-
-#[cfg(test)]
-fn submitted_save_path(prompt: &mut Option<String>) -> Option<std::path::PathBuf> {
-    if prompt.as_ref().is_some_and(|path| !path.trim().is_empty()) { prompt.take().map(Into::into) } else { None }
-}
-
 fn command_notice(status: CommandStatus) -> Option<String> {
     match status {
         CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => Some(message),
@@ -137,26 +126,34 @@ mod input_dispatch_tests {
 
     #[test]
     fn cancelling_save_as_cancels_its_close_intent() {
-        let mut path = Some("unfinished.txt".into());
-        let mut close_pending = true;
-        cancel_save_prompt(&mut path, &mut close_pending);
-        assert!(path.is_none());
-        assert!(!close_pending, "a later ordinary save must not close the window");
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.file_command("file.saveAndQuit").unwrap();
+        workspace.file_prompt_mut().unwrap().text = "unfinished.txt".into();
+        file_prompt::cancel(&mut workspace);
+        assert!(workspace.file_prompt().is_none());
+        assert!(!workspace.close_pending(), "a later ordinary save must not close the window");
     }
 
     #[test]
     fn blank_save_submission_keeps_the_input_destination_and_cancel_intent() {
         for value in ["", "   ", "\t"] {
-            let mut prompt = Some(value.to_owned());
-            let mut close_pending = true;
-            assert!(submitted_save_path(&mut prompt).is_none());
-            assert_eq!(prompt.as_deref(), Some(value));
-            prompt.as_mut().unwrap().push_str("日本語.txt");
-            assert!(submitted_save_path(&mut prompt).is_some());
-            assert!(prompt.is_none());
-            prompt = Some(String::new());
-            cancel_save_prompt(&mut prompt, &mut close_pending);
-            assert!(!close_pending);
+            let mut workspace = Workspace::new(View::new(None)).unwrap();
+            workspace
+                .execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1)
+                .unwrap();
+            workspace.request_window_close(false).unwrap();
+            workspace.file_command("file.save").unwrap();
+            workspace.file_prompt_mut().unwrap().text = value.into();
+            file_prompt::submit(&mut workspace);
+            assert_eq!(workspace.file_prompt().unwrap().text, value);
+            assert!(workspace.close_pending());
+            let mut prompt = Some(workspace.file_prompt().unwrap().text.clone());
+            assert!(input::commit("日本語.txt".into(), &mut prompt, false).is_none());
+            workspace.file_prompt_mut().unwrap().text = prompt.unwrap();
+            assert!(workspace.file_prompt().unwrap().text.ends_with("日本語.txt"));
+            assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 4);
+            file_prompt::cancel(&mut workspace);
+            assert!(!workspace.close_pending());
         }
     }
 
@@ -227,6 +224,8 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
     on_external_ready: Option<Box<dyn FnOnce(ExternalOpen)>>,
+    external_open: Option<ExternalOpen>,
+    external_inbox: kwil_view_model::document_worker::ExternalOpenInbox,
     font_thread: Option<std::thread::JoinHandle<Option<Font>>>,
     font: Option<Font>,
     gfx: Option<Gfx>,
@@ -274,7 +273,7 @@ pub fn run_with_events(
     run_with_external_open(view, opts, on_first_frame, on_event, Box::new(|_| {}))
 }
 
-pub type ExternalOpen = Box<dyn Fn(kwil_core_workspace::instance::OpenFiles) + Send>;
+pub use kwil_view_model::document_worker::ExternalOpen;
 
 /// The launcher can wire CLI/IPC requests without owning a frontend event loop.
 pub fn run_with_external_open(
@@ -291,6 +290,12 @@ pub fn run_with_external_open(
         EventLoop::<UserEvent>::with_user_event().build().map_err(|e| GuiError::Unavailable(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    let open_proxy = proxy.clone();
+    let (external_open, external_inbox) = kwil_view_model::document_worker::external_open_channel(move || {
+        open_proxy
+            .send_event(UserEvent::OpenExternal)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GUI closed"))
+    });
     let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     let mut app = App {
         view,
@@ -298,6 +303,8 @@ pub fn run_with_external_open(
         proxy,
         on_first_frame: Some(on_first_frame),
         on_external_ready: Some(on_external_ready),
+        external_open: Some(external_open),
+        external_inbox,
         font_thread,
         font: None,
         gfx: None,
@@ -429,16 +436,14 @@ impl App {
         if self.save_path.is_some() {
             match &ev.logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    self.view.cancel_file_prompt();
+                    file_prompt::cancel(&mut self.view);
                     self.sync_file_ui();
                 }
                 Key::Named(NamedKey::Enter) => {
                     self.update_file_prompt();
-                    if let Err(error) = self.view.submit_file_prompt() {
-                        self.view.set_notice(error.to_string());
-                    }
+                    let damage = file_prompt::submit(&mut self.view);
                     self.sync_file_ui();
-                    self.apply(Damage { full: true, status: true, ..Default::default() });
+                    self.apply(damage);
                     return;
                 }
                 Key::Named(NamedKey::Backspace) => {
@@ -1205,9 +1210,15 @@ impl ApplicationHandler<UserEvent> for App {
         }
         trace::mark("first frame presented");
         let document_proxy = self.proxy.clone();
-        if let Err(error) = self.view.start_document_worker(move |result| {
+        let complete = move |result| {
             let _ = document_proxy.send_event(UserEvent::Document(result));
-        }) {
+        };
+        let worker = if self.opts.hidden {
+            self.view.start_isolated_document_worker(complete)
+        } else {
+            self.view.start_document_worker(complete)
+        };
+        if let Err(error) = worker {
             let damage = self.view.set_notice(format!("File worker: {error}"));
             self.apply(damage);
         }
@@ -1246,10 +1257,7 @@ impl ApplicationHandler<UserEvent> for App {
             }));
         }
         if let Some(callback) = self.on_external_ready.take() {
-            let proxy = self.proxy.clone();
-            callback(Box::new(move |path| {
-                let _ = proxy.send_event(UserEvent::OpenExternal(path));
-            }));
+            callback(self.external_open.take().unwrap());
         }
     }
 
@@ -1266,9 +1274,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 damage
             }
-            UserEvent::OpenExternal(request) => {
-                if let Err(error) = self.view.open_files(request) {
-                    self.view.set_notice(format!("Open failed: {error}"));
+            UserEvent::OpenExternal => {
+                let requests = self.external_inbox.drain();
+                if requests.is_empty() {
+                    return;
+                }
+                for request in requests {
+                    if let Err(error) = self.view.open_files(request) {
+                        self.view.set_notice(format!("Open failed: {error}"));
+                    }
                 }
                 self.sync_file_ui();
                 Damage { full: true, status: true, ..Default::default() }

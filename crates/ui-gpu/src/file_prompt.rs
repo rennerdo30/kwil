@@ -1,6 +1,21 @@
 //! File/tab actions stay outside editor command dispatch and renderer geometry.
 use super::*;
 
+pub(super) fn cancel(workspace: &mut Workspace) -> Damage {
+    workspace.cancel_file_prompt();
+    workspace.set_notice(String::new())
+}
+
+pub(super) fn submit(workspace: &mut Workspace) -> Damage {
+    let opens_tab = workspace.file_prompt().is_some_and(|p| {
+        matches!(p.kind, kwil_view_model::FilePromptKind::Open | kwil_view_model::FilePromptKind::Recent)
+    });
+    if let Err(error) = workspace.submit_file_prompt() {
+        workspace.set_notice(error.to_string());
+    }
+    Damage { full: opens_tab && workspace.file_prompt().is_none(), status: true, ..Default::default() }
+}
+
 impl App {
     pub(super) fn dispatch_file(&mut self, command: &str) -> bool {
         match self.view.file_command(command) {
