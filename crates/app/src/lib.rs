@@ -77,6 +77,13 @@ pub fn run_console() -> ExitCode {
 }
 
 fn run_app(console_launcher: bool) -> ExitCode {
+    if let Err(e) = kwil_update::recover_on_startup() {
+        let message = format!("kwil: {e}");
+        eprintln!("{message}");
+        #[cfg(windows)]
+        windows::show_error(&message, std::env::args_os().any(|arg| arg == "--hidden"));
+        return ExitCode::FAILURE;
+    }
     #[cfg(not(windows))]
     let _ = console_launcher;
     let args = match parse_args() {

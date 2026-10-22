@@ -26,8 +26,18 @@ All cargo commands used `CARGO_TARGET_DIR=E:/Development/_cache/cargo-target/kwi
 - `.com --hidden <unique temporary file with spaces>`: launcher PID 64932 returned exit 0 after GUI first-frame acknowledgement; its recorded GUI child PID 23512 remained alive, DWM cloak attribute was 1, then was closed. Temporary file removed.
 - An earlier smoke harness waited for inherited stderr EOF after launcher exit. The GUI held that handle, so the harness blocked; closed recorded descendant PID 66156 and corrected the harness to read the PID line instead. This was a harness error, not a launcher exit failure.
 
-## Pending, not acceptance
+## Approved paired-update follow-up (2026-10-23)
 
-Paired update implementation is blocked on a design decision sent to the coordinator: use a staged, locked transaction with rollback and recovery, or introduce permanent stubs/version-directory indirection. Two independent PE paths cannot be replaced by one atomic filesystem operation. `crates/update` is unchanged; **do not release this branch**. The release documentation records this gate.
+Starting commit for this follow-up: `d6e0e1817b26e7c0815ca116dca1f698c10ed5a3`. The owner approved staging, a shared startup/update lock, backups, rollback and journal recovery. The earlier paired-update gate is resolved by `crates/update/src/transaction.rs`; this is transactional with recovery, not crash-atomic.
 
-No updater transaction tests, release builds, actual service/SSH sessions, native macOS/Linux launches, or full local workspace tests ran. Service and SSH behavior is covered through injected inputs. Three-OS CI starts with the PR and is handed to the parent; this delegated task does not watch or poll PRs.
+- Eleven new filesystem tests cover the five requested cases plus missing backups, committed recovery, exe-only migration, interrupted rename/rollback retries and an incomplete committed pair, and concurrent recovery during lock upgrade. Temp folder names include PID, a per-process counter and time.
+- Fail-first: the initial eight tests all failed with deliberately disabled transaction/startup operations. The ninth (rename/rollback retry) failed with startup recovery disabled. The tenth caught a real incomplete-commit recovery failure before its correction. The eleventh caught a real lock-upgrade race: another startup could finish recovery before the first took the exclusive lock. Both now require a restart. All eleven pass after restoration/fixes.
+- The exe-only migration assertion also failed before changing install order to add the recovery-capable console before retiring the only exe.
+- `cargo test --locked -j 4 -p kwil-update`: 13 passed (11 new plus 2 existing).
+- `cargo test --locked -j 4 -p kwil --features windows-console`: 27 passed, one one-shot measurement ignored.
+- Workspace clippy and feature-enabled app clippy with `-D warnings`, and formatting: passed.
+- Native Windows mapped-image recovery: isolated copies of real GUI/console PEs with distinct appended old/new markers, synced backup hashes and an interrupted journal. Hidden GUI entry PID 73088 restored both old hashes while its new image was mapped and exited 1 with the restart message. Restart PID 8332 printed the version and exited 0.
+- Final hidden first-frame integration smoke after adding startup recovery: launcher PID 76688 returned 0, GUI child PID 40832 reached its first frame with DWM cloak=1, then was closed by its recorded PID.
+- Cross-process Windows lock smoke: a .NET process held the actual file lock; hidden console PID 9284 exited 1 with `lock unavailable`. After releasing it, console PID 55096 printed the version and exited 0. All recorded PIDs exited within their 10 s timeouts; the isolated smoke folder was removed after verifying its resolved path stayed under the branch cache directory.
+
+No full local workspace tests, release build/download, actual SSH/service sessions, power-loss simulation, or native Linux/macOS runs were performed. Three-OS CI is handed to the parent; this delegated task does not watch or poll PRs. No tags or releases are created.
