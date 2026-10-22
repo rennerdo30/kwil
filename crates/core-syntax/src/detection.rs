@@ -275,6 +275,11 @@ pub(crate) fn log_class(token: &[u8]) -> Option<crate::Class> {
     }
 }
 fn sniff(line: &str) -> Option<(Language, bool)> {
+    // Check bracketed timestamps before JSON's opening-array heuristic.
+    // A timestamp contains colons/dashes and cannot be a JSON array value.
+    if timestamp_prefix(line.as_bytes()) {
+        return Some((Language::Generic, true));
+    }
     let bytes = line.as_bytes();
     let after_open = line.get(1..).unwrap_or("").trim_start();
     if line.starts_with('{') && (after_open.is_empty() || after_open.starts_with(['"', '}']))
@@ -295,7 +300,7 @@ fn sniff(line: &str) -> Option<(Language, bool)> {
     // sections. Inspect only this already-bounded first line, never a file scan.
     let level_prefix = line.trim_start_matches(['[', '(', ' ']);
     let level_prefix = level_prefix.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
-    if timestamp_prefix(line.as_bytes()) || log_class(level_prefix.as_bytes()).is_some() {
+    if log_class(level_prefix.as_bytes()).is_some() {
         return Some((Language::Generic, true));
     }
     if line.starts_with('[')
