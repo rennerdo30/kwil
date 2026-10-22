@@ -129,6 +129,7 @@ struct FileFlow {
     restore_session: Option<bool>,
     hot_exit: bool,
     manual_guard: bool,
+    history_wait: Option<DocumentId>,
     exit_without_metadata: bool,
 }
 
@@ -345,6 +346,7 @@ impl Workspace {
             // the worker may retire its journal. Preserve intent until then.
             self.checkpoint_session();
             self.persist_snapshot();
+            self.files.history_wait = Some(id);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Preserving closed-tab history; repeat close after recovery finishes",
@@ -361,6 +363,9 @@ impl Workspace {
             ));
         }
         self.files.metadata_durable = false;
+        if self.files.history_wait == Some(id) {
+            self.files.history_wait = None;
+        }
         if let Some(view) = self.views.remove(&id) {
             self.input_epoch = self.input_epoch.wrapping_add(1);
             self.closed_views.insert(id, view);
@@ -589,6 +594,7 @@ impl Workspace {
         self.files.exit = false;
         self.files.hot_exit = false;
         self.files.manual_guard = false;
+        self.files.history_wait = None;
         self.files.exit_without_metadata = false;
     }
     pub fn cancel_file_prompt(&mut self) {
@@ -807,7 +813,7 @@ impl Workspace {
             }
             "file.close" => {
                 self.files.quit = false;
-                self.files.close = [self.active_id()].into();
+                self.files.close = [self.files.history_wait.unwrap_or(self.active_id())].into();
                 self.advance_close(false)?;
             }
             "file.closeAll" => {
@@ -1203,6 +1209,7 @@ impl Workspace {
             && !self.files.hot_exit
             && self.files.prompt.is_none()
             && !self.files.manual_guard
+            && self.files.history_wait.is_none()
             && let Err(error) = self.advance_close(false)
         {
             self.set_notice(error.to_string());
