@@ -80,3 +80,11 @@ not full palette action or performance acceptance.
 Evidence: `E:/Development/_cache/kwil-palette-native-20261023/` contains the copied
 binary, identity, build/check logs, probe script, isolated profiles and captures.
 No agent-launched window appeared on the owner's desktop.
+
+### Terminal palette routing and input identity (2026-10-23)
+
+Product commit `f0bb765` adds the terminal palette controller and `KeymapEngine::invoke_named`; GUI palette commands use the same Vim transition. Query typing/paste stays in the palette even in Vim Normal mode. Named commands cancel earlier operators/counts. Worker matching/discovery remains in `PaletteSession`.
+
+Validation: TUI library 19 passed before adding the two controller regressions (PID73776); all three palette tests passed afterward (PID79016). Strict GUI/TUI all-target/all-feature Clippy passed (PID72872). Initial syntax and needless-return failures were corrected, not counted as passing checks. The latest GUI prefix helper from PR21 was merged at `9d43cfd`; its two integrated tests pass (PID27388). Formatting and diff checks pass. Every recorded process exited.
+
+No terminal/native palette-action capture, 100k-file latency measurement, full suite or full-v1 acceptance ran for these commits. Read-only palette and final tabs/session reviews are active. Existing native screenshot evidence remains pinned to `6d660f2`.
