@@ -98,7 +98,7 @@ impl HexView {
             .enumerate()
             .map(|(index, chunk)| HexRow { offset: range.start + index as u64 * BYTES_PER_ROW, bytes: chunk.to_vec() })
             .collect();
-        if rows.len() < self.rows && range.end % BYTES_PER_ROW == 0 {
+        if rows.len() < self.rows && range.end.is_multiple_of(BYTES_PER_ROW) {
             rows.push(HexRow { offset: range.end, bytes: Vec::new() });
         }
         rows
