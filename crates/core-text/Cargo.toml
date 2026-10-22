@@ -6,6 +6,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+chardetng = "1.0.0"
+encoding_rs = "0.8.42"
+simdutf8 = "0.1.5"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 
