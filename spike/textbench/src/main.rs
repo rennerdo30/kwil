@@ -13,6 +13,15 @@ const JUMP_LINE: u64 = 15_000_000;
 const INDEX_THREADS: usize = 8;
 
 fn main() {
+    // KWIL_WS_LIMIT_MB caps this process's working set hard, which makes
+    // it behave like a machine with less RAM than the file (KW-40).
+    #[cfg(windows)]
+    if let Some(mb) = std::env::var("KWIL_WS_LIMIT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        use windows_sys::Win32::System::Memory::{QUOTA_LIMITS_HARDWS_MAX_ENABLE, QUOTA_LIMITS_HARDWS_MIN_DISABLE, SetProcessWorkingSetSizeEx};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let ok = unsafe { SetProcessWorkingSetSizeEx(GetCurrentProcess(), 1 << 20, mb << 20, QUOTA_LIMITS_HARDWS_MAX_ENABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE) };
+        assert!(ok != 0, "working-set limit refused");
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("gen") => generate(Path::new(&args[2]), args[3].parse().expect("megabytes")),
