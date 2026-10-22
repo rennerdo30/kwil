@@ -1,0 +1,14 @@
+[package]
+name = "textbench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+kwil-core-text = { path = "../../crates/core-text" }
+qem = "0.8.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
