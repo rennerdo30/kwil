@@ -19,6 +19,7 @@ Crate versions were checked on crates.io on 2026-10-23.
 - Tabs, a command palette, a fuzzy file finder and keyboard shortcuts.
 - The basics every editor has, nothing more: undo/redo, multiple cursors, column selection, go to line, encodings, line endings, auto-indent, comment toggle, word wrap, zoom, recent files, and restoring unsaved work after a crash or close.
 - Windows, macOS and Linux. GUI and TUI in one binary, chosen automatically (§6).
+- Owner additions (2026-10-23): hex view for any file, "Format document" for any file type, releases built by GitHub Actions, and auto-update from GitHub Releases (§7).
 
 ### Not in v1 (on purpose)
 
@@ -200,6 +201,12 @@ Undo/redo, multiple cursors (click, Ctrl+D next match), column selection, line m
 ### Compare
 Two files, or a buffer vs. its saved version. Line diff with `imara-diff 0.2` (histogram/Myers; used by gitoxide and Helix), word-level refinement with `similar 3.2`, and an option to ignore whitespace. Large files are diffed in the background.
 
+### Hex view (owner, 2026-10-23, KW-8)
+"Open as hex" and "Toggle hex view" for any file: an offset column, 16 bytes per row in hex, and an ASCII column. It uses the same mapped file and viewport model as text, so multi-GB binaries open instantly (row = offset / 16, no line index needed). Files detected as binary on open offer hex view. The viewer comes in M1 and byte editing in M2. It works in the GUI and the TUI.
+
+### Format document (owner, 2026-10-23, KW-7)
+"Format document" and "Format selection" for any file type. Built-in in-process formatters cover JSON, XML/HTML, YAML, TOML, CSS and SQL. Every other type gets the generic tidy steps (re-indent, trim trailing whitespace, normalize line endings), and an external formatter can be configured per type, run on a worker with a timeout. Formatting runs on a worker and applies as one undo step. A file-type picker lets any file be treated as any type.
+
 ### Markdown
 Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, strikethrough). Rendered natively by our renderer, without a webview (a webview would cost startup time and memory). Code blocks are highlighted with the same syntax engine. Images are decoded lazily on a worker.
 
@@ -216,6 +223,10 @@ Keymaps (owner, 2026-10-23, KW-2): the keymap is configurable and ships with thr
 - **VS Code** (default): the common VS Code shortcuts (Ctrl+D selects the next match).
 - **Notepad++:** the Notepad++ shortcuts (Ctrl+D duplicates the line, Ctrl+G goes to a line).
 - **Vim:** modal editing with normal, insert and visual modes. It covers the common motions, operators with counts, text objects, registers, `.` repeat, `/` search and the `:w`, `:q` and `:s` commands. Full Vim compatibility (vimscript, plugins) is not a goal.
+
+### Releases and updates (owner, 2026-10-23, KW-4, KW-5)
+- Releases are built by a tag-triggered GitHub Actions workflow on self-hosted runners. It produces signed artifacts for every platform as a **draft** GitHub Release; only the owner publishes.
+- Auto-update checks GitHub Releases on a worker at most once a day, never on the startup path. Updates are verified (signature plus checksum) and applied on the next start or on request. It can be turned off (`update.check = false`) and has stable and prerelease channels. Package-manager installs leave updates to their manager.
 
 ### Platform
 - Windows 10/11 (x64, ARM64): native title-bar integration, high DPI, IME, a portable mode (settings next to the exe), and an "Open with kwil" shell entry.
@@ -279,13 +290,15 @@ debug = "line-tables-only"
 
 | Milestone | Content |
 |---|---|
-| M0 Spike (1–2 weeks) | Renderer A vs. B, text engine vs. `qem` baseline, startup measured on all three platforms; decision record |
-| M1 Viewer | Instant open of any file, damage-only rendering and scroll copy, remote-mode detection, GUI/TUI auto-select, go to line, encodings |
+| M0 Spike (1–2 weeks), KW-1 | Renderer A vs. B, text engine vs. `qem` baseline, startup measured on all three platforms; decision record |
+| M1 Viewer | Instant open of any file, damage-only rendering and scroll copy, remote-mode detection, GUI/TUI auto-select, TUI, go to line, encodings, hex viewer |
 | M2 Editor | Piece tree editing, cursors, undo, save, tabs, session restore |
-| M3 Find & palette | Search/replace, find in files, command palette, file finder, keymaps |
-| M4 Language | Tree-sitter highlighting, markdown preview |
+| M3 Find & palette | Search/replace, find in files, command palette, file finder, keymaps with VS Code / Notepad++ / Vim presets, settings |
+| M4 Language | Tree-sitter highlighting, markdown preview, format document |
 | M5 Compare | Diff views |
-| M6 Polish & ship | Themes, remote-mode measurements on RDP and VNC, installers (MSI/winget, dmg/Homebrew, AppImage/Flatpak) |
+| M6 Polish & ship | Themes, remote-mode measurements on RDP and VNC, installers (MSI/winget, dmg/Homebrew, AppImage/Flatpak), GitHub Actions releases, auto-update, platform integration and accessibility |
+
+Work packages are tracked on Pair Desk, project `kwil`, grouped by milestone: one item per feature area, with its spec section and done criteria. M0 is KW-1; the spec work packages are KW-9 to KW-36; owner wishes are KW-3 (keymaps), KW-4/KW-6 (releases), KW-5 (auto-update), KW-7 (format) and KW-8 (hex view).
 
 ## 12. Owner decisions and open questions
 
