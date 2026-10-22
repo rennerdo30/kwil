@@ -27,31 +27,43 @@ input ceiling; a lower output limit is checked after its serialization.
   JSON status error with a line number rather than being silently deleted.
 - XML/HTML retain attribute spelling, mixed text, whitespace-only text elements,
   `xml:space` subtrees and HTML raw `pre`/`script`/`style`/`textarea` blocks.
-  Only element-only layout whitespace is changed. HTML inline containers stay
-  verbatim. This is a conservative explicit-tag formatter, not an HTML5 repair
+  XML changes only element-only layout whitespace. HTML reindents only existing
+  whitespace between known block elements from the HTML Standard's rendering
+  list. Adjacent tags never gain whitespace. Inline, custom, unknown and mixed
+  containers stay verbatim, as do containers with inline style attributes.
+  This is a conservative explicit-tag formatter, not an HTML5 repair
   parser: omitted end tags and DTD internal subsets report errors. It does not
   validate namespaces, entities or complete XML/HTML semantics.
 - TOML uses `toml_edit` and changes whitespace-only decoration around `=` and
   inline tables. Comments, values, ordering and multiline strings stay intact.
+  Structural endings are restored separately from raw string content.
 - YAML reports **"tidy only, no structural YAML formatting yet"** in its result
   notice (coordinator-approved scope, 2026-10-23). No YAML dependency is added.
   `pretty_yaml` 0.6.0 (MIT) and `yaml-edit` 0.3.5 (Apache-2.0) exist; a follow-up
   will evaluate semantic safety on anchors, multi-documents, block scalars and
   comments before adoption. Leading and
   trailing whitespace are preserved because indentation and block scalars are
-  semantic. Optional line-ending normalization and final newline still work.
+  semantic. EOF bytes and all line endings are retained too: without a YAML
+  parser there is no proof that even those tidy operations preserve scalars.
   It does not parse or validate YAML; malformed YAML is retained rather than
   repaired or claimed valid.
 - CSS splits blocks and declarations outside strings/comments/parentheses.
+  Character and hex escapes (including their terminator whitespace), strings,
+  URLs and comments are atomic; escaped punctuation never becomes structure.
   SQL uppercases a small reserved-keyword set and separates top-level clauses.
   Both preserve quoted text/comments and validate balanced delimiters, not the
   full language grammar. SQL also preserves bracket and dollar-quoted content.
+  SQL retains original whitespace separators so newline-concatenated literals
+  remain concatenated, and supports nested block comments.
   These are lexical formatters, not dialect rewrites or syntax repair tools.
 - Generic tidy has independently optional trailing-whitespace trimming,
   line-ending normalization (first file ending wins), final newline, and
   reindent. Reindent is off by default: when enabled, it converts tab stops and
   spaces while preserving visual columns, avoiding guesses at language nesting.
   Syntax-aware formatters never globally trim/normalize literal content.
+  Markdown aliases, reStructuredText, Makefiles and patches retain all bytes:
+  no parser currently proves their whitespace safe. In particular, Markdown
+  hard breaks and fenced/indented code are untouched even with tidy flags set.
 
 ## Configured external formatter
 
@@ -60,13 +72,17 @@ argument vector and timeout in `(0, 120s]`. There is no shell, interpolation or
 auto-discovery. A caller may explicitly configure a shell if it wants one.
 The child receives stdin and writes stdout through anonymous private temporary
 files, so neither blocked pipes nor inherited pipe handles can hang the worker.
-The exact launched child PID is tracked, killed and reaped on timeout or output
-overflow. Errors include that PID. No windows are shown on Windows.
+The exact launched child PID is tracked and reaped on timeout or output overflow.
+Windows starts it suspended, assigns a private kill-on-close Job Object, then
+resumes only its owned initial thread. Unix establishes a new process group
+before exec, observes exit without reaping, kills the group and then reaps its
+leader (preventing process-group ID reuse). Descendants are stopped on success
+as well as failure. Errors include the child PID. No windows are shown on Windows.
 
 Stdout is capped, stderr is checked at 64 KiB, and only bounded stdout is read
 into memory. Disk size checks occur every 10 ms on the worker; a process can
-temporarily write beyond the limit between checks. Commands must terminate
-their own descendants; only the directly owned child is killed. The timeout
+temporarily write beyond the limit between checks. Unix commands that deliberately
+detach into another session/group are outside process-group containment. The timeout
 covers the child execution after spawn, not OS process-creation latency.
 Successful stdout is retained verbatim (with the optional final newline).
 
@@ -77,10 +93,17 @@ Successful stdout is retained verbatim (with the optional final newline).
 | serde_json | 1.0.154 / 2026-10-11 | Tested JSON validation without reserializing values; MIT OR Apache-2.0 |
 | toml_edit | 0.25.17+spec-1.1.0 / 2026-10-09 | Required TOML comment/value preservation; MIT OR Apache-2.0 |
 | tempfile | 3.27.0 / 2026-03-11 | Secure anonymous cross-platform subprocess spools and cleanup; MIT OR Apache-2.0 |
+| windows-sys | 0.61.2 / 2025-10-06 | Windows-only Job Object and suspended-thread APIs; MIT OR Apache-2.0 |
+| libc | 0.2.191 / 2026-10-16 | Unix-only waitid/killpg; MIT OR Apache-2.0 |
 
 No derive macros, async runtime or UI dependencies. Existing workspace lockfile
 already contains these versions; enabling TOML display adds `toml_writer`.
 Compile cost is recorded with the verification evidence in the PR.
+The two platform dependencies were already locked by the workspace; this adds
+no crate versions. Current releases were checked through the crates.io API on
+2026-10-23. Process API references: [Windows jobs](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects),
+[owned thread enumeration](https://learn.microsoft.com/en-us/windows/win32/toolhelp/traversing-the-thread-list),
+[Rust process groups](https://doc.rust-lang.org/std/os/unix/process/trait.CommandExt.html#tymethod.process_group).
 
 ## Verification
 
@@ -90,6 +113,10 @@ a fresh helper process and uses independent anonymous temporary files.
 `verify-fail-first.ps1` temporarily substitutes an identity formatter and disabled
 admission guard, proves all contracts fail, and restores the implementation in
 `finally`. Run it only with no other reader of this worktree.
+`verify-review-fail-first.ps1` copies the broken PR base's implementation into
+this owned worktree, runs the review regressions (12 failures and one idempotence
+control), and restores sources in `finally`. The wrapper/grandchild fixture has
+a six-second natural lifetime, so even the broken-copy run leaves no live fixture.
 
 One-shot measurement (run only when authorized):
 

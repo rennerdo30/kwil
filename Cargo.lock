@@ -1121,9 +1121,11 @@ dependencies = [
 name = "kwil-core-format"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tempfile",
  "toml_edit",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

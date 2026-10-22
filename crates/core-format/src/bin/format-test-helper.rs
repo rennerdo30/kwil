@@ -8,6 +8,26 @@ fn main() {
             std::io::stdout().write_all(&b).unwrap();
         }
         Some("sleep") => std::thread::sleep(std::time::Duration::from_secs(2)),
+        Some("wrapper") => {
+            let receipt = std::env::args().nth(2).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["grandchild", &receipt]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
+            let mut child = command.spawn().unwrap();
+            eprintln!("owned grandchild PID {}", child.id());
+            child.wait().unwrap();
+        }
+        Some("grandchild") => {
+            let path = std::path::PathBuf::from(std::env::args().nth(2).unwrap());
+            let file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path).unwrap();
+            file.lock().unwrap();
+            std::fs::write(path.with_extension("pid"), std::process::id().to_string()).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(6));
+        }
         Some("exit") => std::process::exit(2),
         Some("invalid") => std::io::stdout().write_all(&[255]).unwrap(),
         Some("flood") => std::io::stdout().write_all(&[b'x'; 2048]).unwrap(),

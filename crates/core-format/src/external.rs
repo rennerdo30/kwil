@@ -30,16 +30,11 @@ pub fn run(text: &str, config: &ExternalFormatter, cap: usize) -> Result<String,
         .stdin(Stdio::from(input))
         .stdout(output.try_clone().map_err(io_error)?)
         .stderr(error.try_clone().map_err(io_error)?);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let mut child = command.spawn().map_err(io_error)?;
+    let (mut child, mut tree) = crate::process_tree::Tree::spawn(&mut command).map_err(io_error)?;
     let pid = child.id();
     let start = Instant::now();
     loop {
-        let status = child.try_wait();
+        let status = tree.finished(&mut child);
         let sizes = output.metadata().and_then(|o| error.metadata().map(|e| (o.len(), e.len())));
         let failure = match &sizes {
             Ok((out, err)) if *out > cap as u64 || *err > 64 * 1024 => Some("output exceeds configured limit"),
@@ -49,8 +44,9 @@ pub fn run(text: &str, config: &ExternalFormatter, cap: usize) -> Result<String,
             _ => None,
         };
         if let Some(message) = failure {
-            // Only this exact child PID is ever terminated. Reap it before return.
-            let killed = child.kill();
+            let killed = tree.terminate();
+            // Also covers a containment API failure for the immediate child.
+            let _ = child.kill();
             let waited = child.wait();
             return Err(FormatError::new(
                 "External",
@@ -58,7 +54,12 @@ pub fn run(text: &str, config: &ExternalFormatter, cap: usize) -> Result<String,
                 1,
             ));
         }
-        if let Some(status) = status.map_err(io_error)? {
+        if status.map_err(io_error)? {
+            // A wrapper may exit before its descendants. Stop the group before
+            // reaping its leader (Unix PID reservation) or reading stdout.
+            let stopped = tree.terminate();
+            let status = child.wait().map_err(io_error)?;
+            stopped.map_err(io_error)?;
             if !status.success() {
                 return Err(FormatError::new("External", format!("formatter exited with {status} (PID {pid})"), 1));
             }

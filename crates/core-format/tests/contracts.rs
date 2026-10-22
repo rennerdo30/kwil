@@ -47,7 +47,7 @@ fn xml_golden() {
 fn html_golden_and_raw_blocks() {
     golden(
         "<div><p>Hello <b>world</b> !</p><pre> x  \n y </pre><script>if (a < b) { x++; }</script><style>a { color: red; }</style><br></div>",
-        "<div>\n  <p>Hello <b>world</b> !</p>\n  <pre> x  \n y </pre>\n  <script>if (a < b) { x++; }</script>\n  <style>a { color: red; }</style>\n  <br>\n</div>\n",
+        "<div><p>Hello <b>world</b> !</p><pre> x  \n y </pre><script>if (a < b) { x++; }</script><style>a { color: red; }</style><br></div>\n",
         Language::Html,
     );
 }

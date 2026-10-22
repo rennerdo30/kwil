@@ -100,7 +100,72 @@ pub fn toml(text: &str) -> Result<String, FormatError> {
         }
     }
     Formatter.visit_document_mut(&mut doc);
-    Ok(doc.to_string())
+    let eol = toml_first_structural_ending(text);
+    Ok(toml_structural_endings(&doc.to_string(), eol))
+}
+
+fn toml_string_end(text: &str, start: usize) -> usize {
+    let b = text.as_bytes();
+    let quote = b[start];
+    let triple = b.get(start..start + 3).is_some_and(|s| s == [quote; 3]);
+    let mut i = start + if triple { 3 } else { 1 };
+    while i < b.len() {
+        if quote == b'"' && b[i] == b'\\' {
+            i = (i + 2).min(b.len());
+        } else if triple && b.get(i..i + 3).is_some_and(|s| s == [quote; 3]) {
+            i += 3;
+            while b.get(i) == Some(&quote) {
+                i += 1;
+            }
+            break;
+        } else if !triple && b[i] == quote {
+            i += 1;
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn toml_first_structural_ending(text: &str) -> &'static str {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => i = toml_string_end(text, i),
+            b'#' => i = text[i..].find(['\r', '\n']).map_or(b.len(), |n| i + n),
+            b'\r' | b'\n' => return ending(&text[i..]),
+            _ => i += 1,
+        }
+    }
+    "\n"
+}
+
+// toml_edit emits structural LF, but retains raw string representations. Only
+// restore line endings outside strings and comments; literal bytes stay raw.
+fn toml_structural_endings(text: &str, eol: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        if matches!(b[i], b'\'' | b'"') {
+            i = toml_string_end(text, i);
+            out.push_str(&text[start..i]);
+        } else if b[i] == b'#' {
+            i = text[i..].find(['\r', '\n']).map_or(b.len(), |n| i + n);
+            out.push_str(&text[start..i]);
+        } else if matches!(b[i], b'\r' | b'\n') {
+            i += if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            out.push_str(eol);
+        } else {
+            let c = text[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
 }
 
 fn quoted_end(text: &str, start: usize, quote: u8, doubled: bool, kind: &str) -> Result<usize, FormatError> {
@@ -147,7 +212,9 @@ pub fn markup(text: &str, html: bool, selection: bool, settings: &Settings) -> R
         }
         if !text[i..].starts_with('<') {
             let end = text[i..].find('<').map_or(text.len(), |n| i + n);
-            if !text[i..end].trim().is_empty() || (!text[i..end].contains(['\n', '\r']) && end > i) {
+            if !text[i..end].bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                || (!text[i..end].contains(['\n', '\r']) && end > i)
+            {
                 if let Some(&parent) = stack.last() {
                     tags[parent].preserve = true;
                 } else if !text[i..end].trim().is_empty() {
@@ -241,11 +308,12 @@ pub fn markup(text: &str, html: bool, selection: bool, settings: &Settings) -> R
                         | "wbr"
                 ));
         let index = tags.len();
-        let protected =
-            matches!(lower.as_str(), "pre" | "script" | "style" | "textarea") || inside.contains("xml:space");
+        let protected = matches!(lower.as_str(), "pre" | "script" | "style" | "textarea")
+            || inside.contains("xml:space")
+            || (html && (!html_block(&lower) || inside.to_ascii_lowercase().contains("style")));
         tags.push(Tag { start, end: i, name, closing, leaf, pair: None, preserve: protected });
         if html
-            && matches!(lower.as_str(), "a" | "b" | "i" | "em" | "strong" | "span" | "code" | "small" | "sub" | "sup")
+            && protected
             && let Some(&parent) = stack.last()
         {
             tags[parent].preserve = true;
@@ -300,29 +368,101 @@ pub fn markup(text: &str, html: bool, selection: bool, settings: &Settings) -> R
     let mut out = Output::new(settings.max_output_bytes);
     let mut depth: usize = 0;
     let mut t = 0;
+    let mut previous_end = 0;
+    let mut previous_block = false;
     while t < tags.len() {
         let tag = &tags[t];
         if tag.closing {
             depth -= 1;
         }
-        if !out.text.is_empty() {
-            out.push(eol)?;
+        if html {
+            let gap = &text[previous_end..tag.start];
+            // Never create a text node. Only reindent existing whitespace
+            // between known block elements; inline/custom/mixed subtrees skip
+            // this path and are copied as one exact source span.
+            if previous_block
+                && html_block(&tag.name.to_ascii_lowercase())
+                && !gap.is_empty()
+                && gap.bytes().all(|b| b.is_ascii_whitespace())
+            {
+                out.push(eol)?;
+                out.indent(depth, settings)?;
+            } else {
+                out.push(gap)?;
+            }
+        } else {
+            if !out.text.is_empty() {
+                out.push(eol)?;
+            }
+            out.indent(depth, settings)?;
         }
-        out.indent(depth, settings)?;
         if tag.preserve
             && let Some(end) = tag.pair
         {
             out.push(&text[tag.start..tags[end].end])?;
+            previous_end = tags[end].end;
+            previous_block = html_block(&tag.name.to_ascii_lowercase());
             t = end + 1;
             continue;
         }
         out.push(&text[tag.start..tag.end])?;
+        previous_end = tag.end;
+        previous_block = html_block(&tag.name.to_ascii_lowercase());
         if !tag.closing && !tag.leaf {
             depth += 1;
         }
         t += 1;
     }
+    if html {
+        out.push(&text[previous_end..])?;
+    }
     Ok(out.text)
+}
+
+// HTML Standard, rendering section "Flow content" / "Sections and headings".
+// Deliberately exclude pre, inline, replaced, table, raw and unknown elements.
+fn html_block(name: &str) -> bool {
+    matches!(
+        name,
+        "html"
+            | "body"
+            | "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "center"
+            | "dd"
+            | "details"
+            | "dialog"
+            | "dir"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hgroup"
+            | "hr"
+            | "legend"
+            | "li"
+            | "main"
+            | "menu"
+            | "nav"
+            | "ol"
+            | "p"
+            | "section"
+            | "summary"
+            | "ul"
+    )
 }
 
 fn validate_xml_attributes(inside: &str, name: &str, closing: bool) -> Result<(), &'static str> {
@@ -377,6 +517,45 @@ pub fn sql(text: &str, settings: &Settings) -> Result<String, FormatError> {
     lexical(text, settings, true)
 }
 
+fn css_escape_end(text: &str, start: usize) -> usize {
+    let b = text.as_bytes();
+    let mut i = start + 1;
+    if b.get(i).is_some_and(u8::is_ascii_hexdigit) {
+        for _ in 0..6 {
+            if !b.get(i).is_some_and(u8::is_ascii_hexdigit) {
+                break;
+            }
+            i += 1;
+        }
+        // A hex escape consumes one optional whitespace character (CRLF is one).
+        if b.get(i) == Some(&b'\r') && b.get(i + 1) == Some(&b'\n') {
+            i += 2;
+        } else if b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+    } else if i < b.len() {
+        i += text[i..].chars().next().unwrap().len_utf8();
+        if b.get(i - 1) == Some(&b'\r') && b.get(i) == Some(&b'\n') {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn css_url_end(text: &str, open: usize) -> Result<usize, FormatError> {
+    let b = text.as_bytes();
+    let mut i = open + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i = css_escape_end(text, i),
+            b'\'' | b'"' => i = quoted_end(text, i, b[i], false, "CSS")?,
+            b')' => return Ok(i + 1),
+            _ => i += text[i..].chars().next().unwrap().len_utf8(),
+        }
+    }
+    Err(FormatError::new("CSS", "unterminated url", line_at(b, open)))
+}
+
 fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatError> {
     let kind = if sql { "SQL" } else { "CSS" };
     let eol = ending(text);
@@ -384,11 +563,15 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
     let mut i = 0;
     let mut stack = Vec::new();
     let mut pending_space = false;
+    let mut whitespace_start = 0;
     let mut newline = false;
     let mut depth: usize = 0;
     let b = text.as_bytes();
     while i < b.len() {
         if b[i].is_ascii_whitespace() {
+            if !pending_space {
+                whitespace_start = i;
+            }
             pending_space = true;
             i += 1;
             continue;
@@ -405,12 +588,24 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
         } else {
             None
         };
-        let quoted = matches!(b[i], b'\'' | b'"' | b'`') || bracket || dollar.is_some();
+        let mut quoted = matches!(b[i], b'\'' | b'"' | b'`') || bracket || dollar.is_some();
         if comment {
-            i = text[i + 2..]
-                .find("*/")
-                .map(|n| i + 2 + n + 2)
-                .ok_or_else(|| FormatError::new(kind, "unterminated comment", line_at(b, i)))?;
+            let mut nesting = 1;
+            i += 2;
+            while i < b.len() && nesting > 0 {
+                if sql && text[i..].starts_with("/*") {
+                    nesting += 1;
+                    i += 2;
+                } else if text[i..].starts_with("*/") {
+                    nesting -= 1;
+                    i += 2;
+                } else {
+                    i += text[i..].chars().next().unwrap().len_utf8();
+                }
+            }
+            if nesting != 0 {
+                return Err(FormatError::new(kind, "unterminated comment", line_at(b, start)));
+            }
         } else if line_comment {
             i = text[i..].find(['\r', '\n']).map_or(text.len(), |n| i + n);
         } else if let Some(delimiter) = dollar {
@@ -421,6 +616,22 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
                 .ok_or_else(|| FormatError::new(kind, "unterminated dollar-quoted string", line_at(b, start)))?;
         } else if quoted {
             i = quoted_end(text, i, if bracket { b']' } else { b[i] }, sql, kind)?;
+        } else if !sql && (b[i] == b'\\' || b[i] == b'-' || b[i] >= 128 || b[i].is_ascii_alphanumeric() || b[i] == b'_')
+        {
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i = css_escape_end(text, i);
+                } else if b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'-') || b[i] >= 128 {
+                    i += text[i..].chars().next().unwrap().len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if text[start..i].eq_ignore_ascii_case("url") && b.get(i) == Some(&b'(') {
+                i = css_url_end(text, i)?;
+            }
+            // Escapes and URLs are atomic data, never structural punctuation.
+            quoted = true;
         } else if b[i].is_ascii_alphabetic() || b[i] == b'_' {
             i += 1;
             while b.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$')) {
@@ -482,7 +693,9 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
             out.push(eol)?;
             out.indent(depth, settings)?;
         } else if pending_space && !out.text.is_empty() {
-            out.push(" ")?;
+            // SQL newline-separated literals concatenate. Keep every original
+            // separator (also across comments) instead of collapsing to a space.
+            out.push(if sql { &text[whitespace_start..start] } else { " " })?;
         }
         newline = false;
         pending_space = false;

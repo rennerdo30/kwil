@@ -7,6 +7,7 @@
 
 mod external;
 mod languages;
+mod process_tree;
 
 pub use external::ExternalFormatter;
 use std::{collections::BTreeMap, fmt, ops::Range};
@@ -122,6 +123,26 @@ pub fn format(
         return Err(FormatError::new("Format", "not supported for a selection", line_at(input, range.start)));
     }
     let offset = line_at(input, range.start) - 1;
+    // These tidy-only formats have semantic whitespace, including embedded code
+    // and EOF. Without a parser proving a region safe, retain its exact bytes.
+    let preserve_tidy = language == Language::Yaml
+        || (language == Language::Generic
+            && matches!(
+                file_type.trim_start_matches('.').to_ascii_lowercase().as_str(),
+                "markdown"
+                    | "md"
+                    | "mdown"
+                    | "mkd"
+                    | "mkdn"
+                    | "commonmark"
+                    | "mdx"
+                    | "rst"
+                    | "restructuredtext"
+                    | "makefile"
+                    | "make"
+                    | "diff"
+                    | "patch"
+            ));
     let mut notices = Vec::new();
     let result = (|| {
         let formatted = if let Some(command) = settings.external.get(file_type) {
@@ -142,14 +163,14 @@ pub fn format(
                     );
                     tidy(fragment, settings, true)?
                 }
-                Language::Generic => tidy(fragment, settings, false)?,
+                Language::Generic => tidy(fragment, settings, preserve_tidy)?,
             }
         };
         // Syntax-aware formatters preserve all literal whitespace. Only generic
         // tidy trims; normalizing structured literals would change their values.
         let mut output = Output::new(settings.max_output_bytes);
         output.push(&formatted)?;
-        if !selected && settings.final_newline && !formatted.ends_with(['\n', '\r']) {
+        if !selected && !preserve_tidy && settings.final_newline && !formatted.ends_with(['\n', '\r']) {
             output.push(ending(text))?;
         }
         let bytes = output.text.into_bytes();
@@ -255,8 +276,12 @@ impl Output {
     }
 }
 
-fn tidy(text: &str, settings: &Settings, yaml: bool) -> Result<String, FormatError> {
+fn tidy(text: &str, settings: &Settings, preserve: bool) -> Result<String, FormatError> {
     let mut out = Output::new(settings.max_output_bytes);
+    if preserve {
+        out.push(text)?;
+        return Ok(out.text);
+    }
     let eol = ending(text);
     let mut start = 0;
     let bytes = text.as_bytes();
@@ -270,8 +295,8 @@ fn tidy(text: &str, settings: &Settings, yaml: bool) -> Result<String, FormatErr
             }
         }
         let line = &text[start..end];
-        let line = if settings.trim_trailing_whitespace && !yaml { line.trim_end_matches([' ', '\t']) } else { line };
-        if settings.reindent && !yaml {
+        let line = if settings.trim_trailing_whitespace { line.trim_end_matches([' ', '\t']) } else { line };
+        if settings.reindent {
             let leading = line.len() - line.trim_start_matches([' ', '\t']).len();
             let mut columns = 0;
             for b in line[..leading].bytes() {
