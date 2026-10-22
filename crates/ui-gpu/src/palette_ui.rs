@@ -346,7 +346,7 @@ mod tests {
     use super::*;
     #[test]
     fn dismissed_overlay_blocks_scroll_copy_until_restored() {
-        assert!(palette_blocks_copy(false, true), "accepted actions still have displayed popup pixels");
+        assert!(palette_blocks_copy(false, true), "assertion: accepted actions still have displayed popup pixels");
         assert!(palette_blocks_copy(true, false));
         assert!(!palette_blocks_copy(false, false));
     }
