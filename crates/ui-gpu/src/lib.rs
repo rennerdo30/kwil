@@ -116,7 +116,6 @@ struct App {
     pending: Damage,
     error: Option<GuiError>,
     horizontal: u64,
-    widest: u64,
     pointer: (usize, usize),
     drag: Option<(bool, usize)>,
     started: std::time::Instant,
@@ -184,7 +183,6 @@ pub fn run_with_events(
         pending: Damage::default(),
         error: None,
         horizontal: 0,
-        widest: 0,
         pointer: (0, 0),
         drag: None,
         started: std::time::Instant::now(),
@@ -230,6 +228,8 @@ impl App {
 
     fn bars(&self) -> (scrollbar::Bar, scrollbar::Bar) {
         let height = self.size.1.saturating_sub(self.ch() + BAR);
+        let (page, total) =
+            horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize);
         (
             scrollbar::Bar::new(
                 0,
@@ -238,34 +238,12 @@ impl App {
                 self.view.line_count().unwrap_or(self.view.rows() as u64),
                 self.view.top(),
             ),
-            scrollbar::Bar::new(
-                0,
-                self.size.0.saturating_sub(BAR),
-                self.page_bytes(),
-                self.widest.max(self.page_bytes()),
-                self.horizontal,
-            ),
+            scrollbar::Bar::new(0, self.size.0.saturating_sub(BAR), page, total, self.horizontal),
         )
     }
 
     fn page_bytes(&self) -> u64 {
-        let columns = self.columns() as usize;
-        let mut longest = (0, columns as u64);
-        for row in 0..self.view.rows() {
-            let Some(line) = self.view.line(row) else {
-                continue;
-            };
-            let length = self
-                .view
-                .editor()
-                .and_then(|editor| editor.line_range(self.view.top() + row as u64).ok())
-                .map_or(line.len() as u64, |range| range.end - range.start);
-            if length >= longest.0 {
-                let cells = text::cells(line, columns, self.settings.editor.tab_size as usize);
-                longest = (length, cells.last().map_or(1, |cell| cell.bytes.end as u64).max(1));
-            }
-        }
-        longest.1.max(1)
+        horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize).0
     }
 
     fn scroll_bar(&mut self, vertical: bool, offset: u64) {
@@ -613,15 +591,6 @@ impl App {
             return true;
         }
         let (w, h) = self.size;
-        for r in 0..self.view.rows() {
-            let length = self
-                .view
-                .editor()
-                .and_then(|editor| editor.line_range(self.view.top() + r as u64).ok())
-                .map(|range| range.end - range.start)
-                .unwrap_or_else(|| self.view.line(r).map_or(0, |line| line.len() as u64));
-            self.widest = self.widest.max(length);
-        }
         let bars = self.bars();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
         if w == 0 || h < font.ch {
@@ -762,6 +731,81 @@ impl App {
         }
         true
     }
+}
+
+fn horizontal_extent(view: &View, columns: usize, tab_size: usize) -> (u64, u64) {
+    // The scroll offset is a source-byte column, not a display column. Find
+    // each visible row's last screen in those same units, even if a shorter
+    // byte row occupies more grid columns (tabs, escapes and wide glyphs).
+    // Use the row that needs the greatest byte offset for both range and page.
+    // Reading its suffix independently of the current window keeps the thumb
+    // and right endpoint stable as the window approaches EOF.
+    let columns = columns.clamp(1, 4096);
+    let limit = columns.saturating_mul(256).min(64 << 10);
+    let snapshot = view.editor().map(|editor| editor.document().snapshot());
+    let (mut maximum, mut page) = (0, columns as u64);
+    for row in 0..view.rows() {
+        let Some(line) = view.line(row) else { continue };
+        let (end, visible) = if let Some((snapshot, range)) =
+            snapshot.as_ref().zip(view.editor().and_then(|editor| editor.line_range(view.top() + row as u64).ok()))
+        {
+            let length = range.end - range.start;
+            let wanted = range.end.saturating_sub(limit as u64).max(range.start);
+            let context = wanted.saturating_sub(3).max(range.start);
+            // Only one bounded suffix is held at a time; neither the rest of
+            // this line nor any offscreen row is scanned or materialized.
+            let tail = (|| -> std::io::Result<Vec<u8>> {
+                let mut tail = Vec::with_capacity((range.end - context) as usize);
+                for chunk in snapshot.chunks(context..range.end)? {
+                    tail.extend_from_slice(chunk.map_err(std::io::Error::other)?);
+                }
+                Ok(tail)
+            })();
+            match tail {
+                Ok(tail) => {
+                    let mut first = (wanted - context) as usize;
+                    while kwil_view_model::grid::boundary(&tail, first) != first {
+                        first += 1;
+                    }
+                    let end = context - range.start
+                        + first as u64
+                        + horizontal_suffix_start(&tail[first..], columns, tab_size) as u64;
+                    (end, length.saturating_sub(end).max(1))
+                }
+                // A failed source read must not hide an already known range.
+                Err(_) => (length.saturating_sub(1), 1),
+            }
+        } else {
+            // Before the index is ready only the bounded loaded rows are known.
+            let end = horizontal_suffix_start(line, columns, tab_size) as u64;
+            (view.line_offset(row) + end, (line.len() as u64 - end).max(1))
+        };
+        if end > maximum || (end == maximum && visible < page) {
+            maximum = end;
+            page = visible;
+        }
+    }
+    (page, maximum.saturating_add(page))
+}
+
+fn horizontal_suffix_start(bytes: &[u8], columns: usize, tab_size: usize) -> usize {
+    // Binary search only within a grid-sized suffix. Every candidate starts
+    // at a safe scalar boundary; the final fitting suffix reaches the end.
+    let (mut left, mut right) = (0, bytes.len());
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let start = kwil_view_model::grid::boundary(bytes, mid);
+        let cells = text::cells(&bytes[start..], columns, tab_size);
+        if cells.last().map_or(0, |cell| cell.bytes.end) == bytes.len() - start {
+            right = start;
+        } else {
+            left = mid + 1;
+            while kwil_view_model::grid::boundary(bytes, left) != left {
+                left += 1;
+            }
+        }
+    }
+    left
 }
 
 fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, _horizontal: u64) {
