@@ -10,6 +10,8 @@ use std::path::PathBuf;
 mod document;
 mod editor;
 pub mod grid;
+mod workspace;
+pub use workspace::Workspace;
 #[cfg(test)]
 mod tests;
 mod text;

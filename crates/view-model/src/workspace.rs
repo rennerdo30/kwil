@@ -35,8 +35,15 @@ impl Workspace {
     }
 
     pub fn open(&mut self, mut view: View) -> io::Result<DocumentId> {
+        if self.session.active().is_some() {
+            self.sync_active();
+        }
         if let Some(path) = &view.path {
-            view.path = Some(std::path::absolute(path)?);
+            let path = std::path::absolute(path)?;
+            view.path = Some(path.clone());
+            if let Some(editor) = view.editor_mut() {
+                editor.document.path = Some(path);
+            }
         }
         let id = self.session.open(view.path.clone())?;
         // Reopening an already-open path activates its existing unsaved view.
