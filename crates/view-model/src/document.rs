@@ -101,6 +101,10 @@ impl Document {
         self.revision
     }
 
+    pub fn saved_revision(&self) -> u64 {
+        self.saved_revision
+    }
+
     pub fn set_undo_memory_limit(&mut self, bytes: usize) {
         self.buffer.set_undo_memory_limit(bytes);
     }
