@@ -321,6 +321,9 @@ fn run(config: ThemeWorkerConfig, shared: Arc<Shared>, wake: impl Fn(), before_p
     let mut reload = 0;
     let mut themes = builtins();
     let mut last_written: Option<CachedTheme> = None;
+    // A displayed hover preview must never become the fallback for a missing
+    // committed source. Seed this independently from the validated startup view.
+    let mut last_committed = shared.state.lock().unwrap_or_else(|p| p.into_inner()).snapshot.active.clone();
     let mut reload_errors = Vec::new();
     let mut import_errors = Vec::new();
     loop {
@@ -372,7 +375,7 @@ fn run(config: ThemeWorkerConfig, shared: Arc<Shared>, wake: impl Fn(), before_p
         let active = find(wanted.session.active_id());
         let committed = find(wanted.session.committed_id());
         if active.is_none() || committed.is_none() {
-            diagnostic(&mut diagnostics, "selected theme is unavailable; retaining last valid active theme/cache");
+            diagnostic(&mut diagnostics, "selected theme is unavailable; retaining last valid committed theme/cache");
         }
         // Never publish an obsolete completion. All slow work is outside the
         // mutex; requests can always replace the desired slot promptly.
@@ -381,6 +384,7 @@ fn run(config: ThemeWorkerConfig, shared: Arc<Shared>, wake: impl Fn(), before_p
             continue;
         }
         if let Some(theme) = committed {
+            last_committed = theme.clone();
             let cached = CachedTheme { selection: wanted.session.selection().clone(), theme: (*theme).clone() };
             if last_written.as_ref() != Some(&cached) {
                 match theme_cache::encode(&cached)
@@ -397,16 +401,12 @@ fn run(config: ThemeWorkerConfig, shared: Arc<Shared>, wake: impl Fn(), before_p
             if s.desired.revision != wanted.revision {
                 false
             } else {
-                let (active, session) = if let Some(active) = active {
-                    (active, wanted.session)
-                } else {
-                    (s.snapshot.active.clone(), s.snapshot.session.clone())
-                };
+                let active = active.unwrap_or_else(|| last_committed.clone());
                 s.snapshot = Arc::new(ThemeSnapshot {
                     revision: wanted.revision,
                     catalogue: themes.clone().into(),
                     active,
-                    session,
+                    session: wanted.session,
                     diagnostics: diagnostics.into(),
                 });
                 true

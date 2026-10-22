@@ -50,7 +50,9 @@ built-ins plus at most 254 user `.toml` files. A directory scan visits at most
 1,024 entries, without recursion. Oversized catalogues reject the whole reload
 and keep the previous catalogue; malformed changed files keep their last good
 theme and report a diagnostic. Removed files leave the catalogue. An unavailable
-selected theme retains the previous active snapshot/cache with an error.
+selected theme retains the last valid committed theme/cache with an error.
+That committed fallback is separate from the displayed hover preview; cancel
+always publishes the cancelled session, even after its source has been removed.
 
 ## Startup and worker seams
 
@@ -101,6 +103,9 @@ The binary cache is capped at 256 KiB. It has magic, a fixed schema version,
 exact payload length and an FNV-1a corruption checksum (not an authenticity
 signature), followed by bounded UTF-8 strings, IDs, colours and syntax records.
 All lengths, tags, duplicate scopes and trailing bytes are checked before use.
+The startup reader opens without following final symlinks, uses nonblocking
+Unix opens, and validates the opened handle before reading. FIFO/device/symlink
+cache paths cannot cause a blocking FIFO open before the type check.
 The worker writes committed state, never hover previews. It uses an exclusive
 same-directory temp file, sync and atomic replacement (MoveFileExW on Windows,
 rename plus directory sync on Unix). Failures are surfaced; no target is
@@ -164,6 +169,7 @@ Only run after the coordinator grants the shared Cargo lane:
 
 ```powershell
 pwsh -NoProfile -File crates/core-commands/tests/check-theme-mutations.ps1
+pwsh -NoProfile -File crates/core-commands/tests/check-theme-r1-mutations.ps1
 cargo test --locked --offline -j 4 -p kwil-core-commands --lib theme -- --test-threads=1
 cargo test --locked --offline -j 4 -p kwil-core-workspace --lib watcher::tests -- --test-threads=1
 ```
@@ -178,3 +184,11 @@ and a separate suspension before snapshot admission, so one guard cannot mask
 the other's defect. Native watcher events in these focused filesystem tests are
 not editor/player/renderer validation. Full suites, benchmarks, native GUI/TUI
 captures, OS follow UI behavior and remote present budgets are parent gates.
+
+R1 adds native partial-style inheritance and committed-source-deletion during
+preview contracts. Separate mutants target the committed colour fallback and
+cancelled-session publication. A Unix-only subprocess contract checks direct
+FIFOs, symlink FIFOs and symlinks to valid regular caches; each owned child has
+a two-second timeout and is killed/reaped on timeout. Two independent Unix
+mutants remove nonblocking and no-follow flags respectively. Windows execution
+cannot validate those Unix cases; the runner reports them as NOT RUN there.

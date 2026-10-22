@@ -114,7 +114,7 @@ pub struct SyntaxStyle {
     pub font_style: Option<u8>,
 }
 impl SyntaxStyle {
-    fn overlay(&mut self, other: &Self) {
+    pub(crate) fn overlay(&mut self, other: &Self) {
         if other.foreground.is_some() {
             self.foreground = other.foreground;
         }

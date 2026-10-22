@@ -286,3 +286,31 @@ fn theme_worker_keeps_startup_cache_when_source_is_invalid_contract() {
     assert!(!snapshot.diagnostics.is_empty());
     assert_eq!(theme_cache::read_active_cache(&f.config().active_cache).unwrap(), Some(cached));
 }
+
+#[test]
+fn theme_worker_cancel_after_committed_source_deletion_restores_committed_contract() {
+    let f = Fixture::new();
+    fs::create_dir(f.config().user_directory).unwrap();
+    let path = f.config().user_directory.join("committed.toml");
+    fs::write(&path, b"version=1\nname='Committed A'\nbase='dark'").unwrap();
+    let selection = ThemeSelection::Named(ThemeId::user("committed").unwrap());
+    let (worker, rx) = f.start(selection.clone());
+    let original = wait(&worker, &rx, 1);
+    assert_eq!(original.active.name(), "Committed A");
+    let committed_session = original.session.clone();
+    let cache_before = fs::read(f.config().active_cache).unwrap();
+    let revision = worker.request(ThemeRequest::Preview(ThemeId::Light)).unwrap();
+    assert_eq!(wait(&worker, &rx, revision).active.name(), "light");
+    fs::remove_file(&path).unwrap();
+    let revision = worker.request(ThemeRequest::Reload).unwrap();
+    let deleted = wait(&worker, &rx, revision);
+    assert_eq!(deleted.active.name(), "light", "a valid preview can continue until cancel");
+    assert!(!deleted.catalogue.iter().any(|t| t.id == ThemeId::User("committed".into())));
+    let revision = worker.request(ThemeRequest::Cancel).unwrap();
+    let cancelled = wait(&worker, &rx, revision);
+    assert_eq!(cancelled.active.name(), "Committed A", "cancel must not keep the displayed preview as fallback");
+    assert_eq!(cancelled.session, committed_session, "cancelled session must publish even when its source is missing");
+    assert_eq!(cancelled.session.selection(), &selection);
+    assert!(!cancelled.diagnostics.is_empty());
+    assert_eq!(fs::read(f.config().active_cache).unwrap(), cache_before, "deletion/cancel must not persist a preview");
+}
