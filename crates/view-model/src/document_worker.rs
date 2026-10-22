@@ -136,6 +136,7 @@ struct Storage {
     service: JournalService,
     journals: HashMap<DocumentId, JournalState>,
     order: HashMap<DocumentId, u64>,
+    durable_session: Session,
 }
 
 struct JournalState {
@@ -285,9 +286,9 @@ impl DocumentWorker {
                                 });
                             }
                             let result = storage
-                                .as_ref()
+                                .as_mut()
                                 .ok_or_else(|| io::Error::other("Session recovery is unavailable"))
-                                .and_then(|s| session::store_session(&s.root.join("session.kws"), &session));
+                                .and_then(|s| persist_session(s, &session));
                             complete(DocumentResult::Persisted(result));
                         }
                         DocumentRequest::SessionTimer => {
@@ -513,6 +514,13 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
                 .and_then(|s| s.parse::<u64>().ok())
                 .filter(|n| *n > 0)
                 .ok_or_else(|| io::Error::other("Invalid recovery document identity"))?;
+            // Only orphan scanning honors retirement. Explicit metadata wins
+            // after a crash before replacement, or an intentional reopen.
+            if !session.tabs().iter().chain(session.closed()).any(|tab| tab.id == DocumentId(id))
+                && is_retired(&root, DocumentId(id))?
+            {
+                continue;
+            }
             if paths.len() >= session::MAX_TABS + session::MAX_CLOSED {
                 return Err(io::Error::other("Recovery journal limit"));
             }
@@ -563,10 +571,57 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
         };
         documents.push((tab.id, result));
     }
+    let durable_session = session::load_session(&root.join("session.kws"))?;
     Ok((
         PreparedWorkspace { session, documents },
-        Storage { root, _ownership: ownership, service, journals, order: HashMap::new() },
+        Storage { root, _ownership: ownership, service, journals, order: HashMap::new(), durable_session },
     ))
+}
+
+/// Retire only identities proven evicted from prior durable closed history.
+/// These small markers retain all journal data; cleanup policy is separate.
+fn retire_evicted(storage: &Storage, next: &Session) -> io::Result<()> {
+    use std::io::Write;
+    for tab in storage.durable_session.closed() {
+        if next.tabs().iter().chain(next.closed()).any(|current| current.id == tab.id) {
+            continue;
+        }
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(storage.root.join(format!("{}.retired", tab.id.0)))?;
+        marker.write_all(b"kwil-retired-v1\n")?;
+        marker.sync_all()?;
+    }
+    // Directory synchronization is available on Unix. Windows marker sync_all
+    // precedes the atomic write-through session replacement below.
+    #[cfg(unix)]
+    std::fs::File::open(&storage.root)?.sync_all()?;
+    Ok(())
+}
+
+fn is_retired(root: &std::path::Path, id: DocumentId) -> io::Result<bool> {
+    use std::io::Read;
+    let path = root.join(format!("{}.retired", id.0));
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::with_capacity(32);
+    file.take(32).read_to_end(&mut bytes)?;
+    if bytes != b"kwil-retired-v1\n" {
+        return Err(io::Error::other("Incomplete recovery retirement marker; journal retained"));
+    }
+    Ok(true)
+}
+
+fn persist_session(storage: &mut Storage, next: &Session) -> io::Result<()> {
+    retire_evicted(storage, next)?;
+    session::store_session(&storage.root.join("session.kws"), next)?;
+    storage.durable_session = next.clone();
+    Ok(())
 }
 
 fn seed_journal(
@@ -833,7 +888,17 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
     buffer.set_undo_memory_limit(0);
     let revision = recovered.summary().revision;
     let mut document = Document::new();
-    document.buffer = buffer;
+    // Replay stays spill-only. Import immutable disk pieces into a fresh normal
+    // interactive budget without copying bytes or keeping replay undo history.
+    let snapshot = buffer.snapshot();
+    let mut interactive = Buffer::empty();
+    interactive.set_undo_memory_limit(0);
+    interactive.insert_snapshot_range(0, &snapshot, 0..snapshot.len())?;
+    interactive.set_undo_memory_limit(
+        usize::try_from(kwil_core_commands::settings::Settings::default().undo.memory_limit_bytes)
+            .unwrap_or(usize::MAX),
+    );
+    document.buffer = interactive;
     document.path = tab.path.clone();
     // Recovery is dirty even when metadata lagged behind the journal.
     document.revision = revision;
@@ -845,7 +910,57 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
         tab.saved_revision
     };
     document.next_revision = revision.checked_add(2).ok_or_else(|| io::Error::other("Recovery revision overflow"))?;
+    // Restore newline policy from a bounded sample before interactive editing.
+    let mut previous = 0;
+    'sample: for chunk in snapshot.chunks(0..snapshot.len().min(64 << 10))? {
+        for &byte in chunk.map_err(io::Error::other)? {
+            if byte == b'\n' {
+                if previous == b'\r' {
+                    document.line_ending = crate::DocumentLineEnding::CrLf;
+                }
+                break 'sample;
+            }
+            previous = byte;
+        }
+    }
+    if !document.is_dirty()
+        && let Some(path) = &tab.path
+    {
+        let disk = kwil_core_workspace::open_for_editing(path).and_then(|file| index(path.clone(), file));
+        match disk {
+            Ok(mut disk) if snapshots_equal(&snapshot, &disk.snapshot())? => {
+                disk.revision = document.revision;
+                disk.saved_revision = document.saved_revision;
+                disk.next_revision = document.next_revision;
+                document = disk;
+            }
+            _ => {
+                document.path = None;
+                document.saved_revision = revision.wrapping_add(1);
+            }
+        }
+    }
     Ok((document, recovered, base.ok_or_else(|| io::Error::other("Missing recovery base"))?))
+}
+
+fn snapshots_equal(a: &kwil_core_text::Snapshot, b: &kwil_core_text::Snapshot) -> io::Result<bool> {
+    use std::io::Read;
+    if a.len() != b.len() {
+        return Ok(false);
+    }
+    let mut left = SnapshotReader::new(a.clone());
+    let mut right = SnapshotReader::new(b.clone());
+    let (mut aa, mut bb) = ([0u8; 64 << 10], [0u8; 64 << 10]);
+    loop {
+        let n = left.read(&mut aa)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        right.read_exact(&mut bb[..n])?;
+        if aa[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 fn resume(service: &JournalService, mut recovered: RecoveredJournal) -> io::Result<JournalSession> {
@@ -1028,6 +1143,21 @@ mod tests {
         session::store_session(&scratch.0.join("session.kws"), &prior).unwrap();
         let (_, state) = prepare_root(scratch.0.clone()).unwrap();
         storage = state;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(scratch.0.join("session.session-lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(
+            persist_session(&mut storage, &next).is_err(),
+            "metadata failure after marker must not acknowledge durability"
+        );
+        assert_eq!(storage.durable_session, prior);
+        assert_eq!(session::load_session(&scratch.0.join("session.kws")).unwrap(), prior);
+        drop(lock);
         persist_session(&mut storage, &next).unwrap();
         drop(storage);
         let (prepared, state) = prepare_root(scratch.0.clone()).unwrap();

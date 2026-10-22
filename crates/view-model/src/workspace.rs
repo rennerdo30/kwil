@@ -337,6 +337,16 @@ impl Workspace {
         if !discard && dirty {
             return Err(io::Error::other("Unsaved changes: save or explicitly discard before closing"));
         }
+        if self.session.closed().len() == kwil_core_workspace::session::MAX_CLOSED
+            && self.files.storage_ready
+            && !self.files.metadata_durable
+        {
+            // An eviction must be proven by prior durable closed metadata before
+            // the worker may retire its journal. Preserve intent until then.
+            self.checkpoint_session();
+            self.persist_snapshot();
+            return Err(io::Error::other("Preserving closed-tab history; repeat close after recovery finishes"));
+        }
         // Prepare the replacement before mutating the last tab.
         self.sync_active();
         if discard && let Some(tab) = self.session.tab_mut(id) {
@@ -696,7 +706,8 @@ impl Workspace {
         }
         let path = path.map(std::path::absolute).transpose()?;
         if let Some(path) = &path
-            && self.session.tabs().iter().any(|tab| tab.id != id && tab.path.as_ref() == Some(path))
+            && (self.session.tabs().iter().any(|tab| tab.id != id && tab.path.as_ref() == Some(path))
+                || self.files.saves.iter().any(|(document, save)| *document != id && save.path.as_ref() == Some(path)))
         {
             self.cancel_close_intent();
             return Err(io::Error::other("Save As target is open in another tab"));
@@ -1199,7 +1210,7 @@ impl Workspace {
             Ok(result) => {
                 self.files.saves.remove(&document);
                 may_close = current && view.editor().is_some_and(|editor| !editor.document().is_dirty());
-                let notice = match result.status {
+                let mut notice = match result.status {
                     CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
                         warning = true;
                         message
@@ -1213,7 +1224,19 @@ impl Workspace {
                     damage.status = true;
                 }
                 if let Some(path) = &view.path {
-                    let _ = self.session.set_path(document, path.clone());
+                    if let Err(error) = self.session.set_path(document, path.clone()) {
+                        // Admission reserves destinations, but a stale or inconsistent
+                        // metadata result must still fail visibly and never close.
+                        may_close = false;
+                        warning = true;
+                        view.path = None;
+                        if let Some(editor) = view.editor_mut() {
+                            editor.document.path = None;
+                            editor.document.original = None;
+                            editor.document.saved_revision = editor.document.revision.wrapping_add(1);
+                        }
+                        notice = format!("Save metadata conflict: {error}; recovered contents require Save As");
+                    }
                 }
                 notice
             }
@@ -1319,11 +1342,18 @@ impl Workspace {
         self.input_epoch = self.input_epoch.wrapping_add(1);
         self.session = prepared.session;
         for (id, document) in prepared.documents {
-            let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap();
+            let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap().clone();
             let mut view = View::new(None);
             view.path = tab.path.clone();
             match document {
                 Ok(document) => {
+                    if document.path != tab.path {
+                        view.path.clone_from(&document.path);
+                        self.session.tab_mut(id).unwrap().path.clone_from(&document.path);
+                        view.set_notice(
+                            "Recovered file changed on disk; original recovery retained. Use Save As".into(),
+                        );
+                    }
                     let mut editor = Editor::new(document);
                     let len = editor.document().snapshot().len();
                     let _ = editor.set_cursors(
@@ -1588,6 +1618,24 @@ mod tests {
         assert!(!workspace.files.saves.contains_key(&second));
         assert!(workspace.files.queue.is_empty());
         assert_eq!(request.path, path);
+    }
+
+    #[test]
+    fn closed_history_eviction_waits_for_its_prior_metadata_to_be_durable() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        for _ in 0..kwil_core_workspace::session::MAX_CLOSED {
+            workspace.close(workspace.active_id(), true).unwrap();
+        }
+        let oldest = workspace.session.closed().back().unwrap().id;
+        workspace.files.storage_ready = true;
+        let current = workspace.active_id();
+        assert!(workspace.close(current, true).is_err());
+        assert_eq!(workspace.session.closed().back().unwrap().id, oldest);
+        assert!(workspace.view(current).is_some());
+        assert!(workspace.files.persist_inflight);
+        workspace.files.metadata_durable = true;
+        workspace.close(current, true).unwrap();
+        assert!(!workspace.session.closed().iter().any(|tab| tab.id == oldest));
     }
 
     #[test]
