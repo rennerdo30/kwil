@@ -14,6 +14,7 @@ pub mod hex;
 pub mod highlight_session;
 pub mod highlighting;
 pub mod palette_session;
+pub mod settings_session;
 mod workspace;
 pub use workspace::{FilePrompt, FilePromptKind, TabAction, TabArea, TabGeometry, TabMetrics, TabSlot, Workspace};
 pub mod document_worker;
