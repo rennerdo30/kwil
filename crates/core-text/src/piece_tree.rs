@@ -3,6 +3,7 @@
 
 use crate::{ReadError, TextFile};
 use memchr::memchr_iter;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Range;
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(crate) const ADD_BLOCK: usize = 64 * 1024;
 const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
 pub(crate) type Tree = Option<Arc<Node>>;
+pub(crate) type OriginalUses = BTreeMap<usize, (crate::file::OriginalRef, u64)>;
 
 /// Shared across all versions, so keeping worker snapshots cannot bypass
 /// the resident add-byte cap. The OS page cache of spilled blocks is separate.
@@ -322,24 +324,27 @@ pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
     Ok(tree)
 }
 
-/// A clipboard/other document may have its own resident add budget. Import
-/// only foreign in-memory leaves into this buffer's capped/spilling storage;
-/// originals, disk blocks and this buffer's own leaves remain shared.
-pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>) -> io::Result<Tree> {
+/// Import foreign original ranges and resident add blocks into the destination
+/// cap. Its own originals/add blocks and immutable spill blocks remain shared.
+pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>, originals: &OriginalUses) -> io::Result<Tree> {
     let Some(node) = tree else { return Ok(None) };
     match &node.kind {
         Kind::Leaf(piece) => {
-            if let Storage::Memory { bytes, budget: source } = piece.storage.as_ref()
-                && !Arc::ptr_eq(source, budget)
-            {
+            let foreign = match piece.storage.as_ref() {
+                Storage::Memory { budget: source, .. } => !Arc::ptr_eq(source, budget),
+                Storage::Original(file) => !originals.contains_key(&file.history_backing_ref().id()),
+                Storage::Disk(_) => false,
+            };
+            if foreign {
+                let bytes = piece.storage.bytes().map_err(io::Error::other)?;
                 added(&bytes[piece.start as usize..piece.end as usize], budget)
             } else {
                 Ok(Some(node))
             }
         }
         Kind::Branch(left, right) => {
-            let a = import_added(Some(left.clone()), budget)?;
-            let b = import_added(Some(right.clone()), budget)?;
+            let a = import_added(Some(left.clone()), budget, originals)?;
+            let b = import_added(Some(right.clone()), budget, originals)?;
             if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, left)) && b.as_ref().is_some_and(|b| Arc::ptr_eq(b, right)) {
                 Ok(Some(node))
             } else {
@@ -347,6 +352,31 @@ pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>) -> io::Result<Tr
             }
         }
     }
+}
+
+/// Exact source byte ownership from cached metrics, with no file reads.
+pub(crate) fn original_uses(tree: &Tree, range: Range<u64>) -> OriginalUses {
+    let mut result = OriginalUses::new();
+    let mut stack = tree.as_ref().map(|node| vec![(node.as_ref(), 0_u64)]).unwrap_or_default();
+    while let Some((node, offset)) = stack.pop() {
+        if offset >= range.end || offset + node.metrics.bytes <= range.start {
+            continue;
+        }
+        match &node.kind {
+            Kind::Branch(left, right) => {
+                stack.push((right, offset + left.metrics.bytes));
+                stack.push((left, offset));
+            }
+            Kind::Leaf(piece) => {
+                if let Storage::Original(file) = &*piece.storage {
+                    let source = file.history_backing_ref();
+                    let bytes = (range.end - offset).min(node.metrics.bytes) - range.start.saturating_sub(offset);
+                    result.entry(source.id()).or_insert((source, 0)).1 += bytes;
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Offset immediately after the `nth` newline (one-based).

@@ -1,4 +1,4 @@
-param([switch]$UnixOnly)
+param([switch]$UnixOnly,[string[]]$Only)
 # Each defect is compiled in a disposable source copy. No source mutation,
 # worktree switching, full workspace tests, timing loops or cache cleanup.
 $ErrorActionPreference = 'Stop'
@@ -19,6 +19,7 @@ $commit = & git -C $source rev-parse HEAD
 Get-ChildItem -LiteralPath (Join-Path $copy 'crates/core-text/src'),(Join-Path $copy 'crates/view-model/src'),(Join-Path $copy 'crates/core-workspace/src') -Recurse -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash) $($_.Path.Substring($copy.Length))" } | Add-Content -LiteralPath $summary
 
 function Mutate([string]$name,[string]$file,[string]$before,[string]$after,[string]$package,[string[]]$tests,[switch]$Ignored) {
+    if ($Only -and $name -notin $Only) { return }
     $path = Join-Path $copy $file
     $original = [IO.File]::ReadAllText($path)
     if (-not $original.Contains($before)) { throw "Missing mutation anchor: $name" }
@@ -79,7 +80,10 @@ Mutate 'tab-columns' 'crates/view-model/src/grid.rs' 'tab_size.max(1) - column %
 Mutate 'drop-pending-goto' 'crates/view-model/src/lib.rs' 'self.pending_goto = Some((line, args.column.unwrap_or(1), args.extend));' 'self.pending_goto = None;' 'kwil-view-model' @('tests::view_defers_goto_and_caches_bounded_long_line_windows')
 Mutate 'full-undo-damage' 'crates/view-model/src/editor.rs' 'edited = entry.edited.clone();' 'edited = self.top..self.top + self.rows as u64;' 'kwil-view-model' @('tests::linewise_put_at_unterminated_eof_and_precise_undo_damage')
 Mutate 'disable-coalescing' 'crates/core-text/src/buffer.rs' 'self.history.record(before, self.snapshot(), coalesce);' 'self.history.record(before, self.snapshot(), false);' 'kwil-core-text' @('buffer::editing_contract_tests::batch_cancel_coalescing_shared_ranges_and_checkpoint_keep_history')
-Mutate 'foreign-budget-bypass' 'crates/core-text/src/buffer.rs' 'let inserted = piece_tree::import_added(inserted, &self.added)?;' 'let inserted = inserted;' 'kwil-core-text' @('buffer::editing_contract_tests::foreign_snapshot_paste_obeys_destination_resident_budget')
+Mutate 'foreign-budget-bypass' 'crates/core-text/src/buffer.rs' 'let inserted = piece_tree::import_added(inserted, &self.added, &self.snapshot.originals)?;' 'let inserted = inserted;' 'kwil-core-text' @('buffer::editing_contract_tests::foreign_snapshot_paste_obeys_destination_resident_budget')
+Mutate 'retain-foreign-original' 'crates/core-text/src/piece_tree.rs' 'Storage::Original(file) => !originals.contains_key(&file.history_backing_ref().id()),' 'Storage::Original(file) => false,' 'kwil-core-text' @('buffer::editing_contract_tests::tiny_foreign_original_pastes_release_resident_sources_under_zero_caps')
+Mutate 'keep-deleted-originals' 'crates/core-text/src/buffer.rs' 'if !removed.is_empty() {' 'if false && !removed.is_empty() {' 'kwil-core-text' @('buffer::editing_contract_tests::deleting_last_original_byte_prunes_all_source_bookkeeping')
+Mutate 'copy-own-original' 'crates/core-text/src/piece_tree.rs' 'Storage::Original(file) => !originals.contains_key(&file.history_backing_ref().id()),' 'Storage::Original(file) => true,' 'kwil-core-text' @('buffer::editing_contract_tests::immutable_slice_concat_keep_own_original_shared_and_counted_once')
 Mutate 'keep-invalid-cache' 'crates/core-text/src/file/read_batch.rs' 'admission.invalid |= admission.generation != file.shared.read_generation.load(Ordering::Relaxed);' 'admission.invalid |= false;' 'kwil-core-text' @('file::read_batch::tests::live_check_invalidates_outer_nested_and_fresh_commands','file::read_batch::tests::pin_generation_and_unwind_never_revive_nested_admission')
 Mutate 'ignore-write-failure' 'crates/core-workspace/src/save.rs' 'let trimmed_rows = write(&request.snapshot, temp.file.as_mut().unwrap()).map_err(|e| save_error(&path, e))?;' 'let trimmed_rows = write(&request.snapshot, temp.file.as_mut().unwrap()).unwrap_or(None);' 'kwil-core-workspace' @('save::tests::failed_write_leaves_original_and_no_temp')
 Mutate 'ignore-readonly' 'crates/core-workspace/src/save.rs' 'if m.permissions().readonly() {' 'if false && m.permissions().readonly() {' 'kwil-core-workspace' @('save::tests::read_only_error_is_clear')

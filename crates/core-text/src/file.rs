@@ -181,8 +181,8 @@ pub(crate) struct OriginalRef {
     cost: usize,
 }
 impl OriginalRef {
-    pub fn same_object(&self, other: &Self) -> bool {
-        self.file.ptr_eq(&other.file)
+    pub fn id(&self) -> usize {
+        self.file.as_ptr() as usize
     }
     pub fn retained_bytes(&self) -> usize {
         if self.file.strong_count() == 0 { 0 } else { self.cost }
