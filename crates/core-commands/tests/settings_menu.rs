@@ -271,6 +271,12 @@ fn capture_preserves_modifiers_and_escape_cancels() {
     assert_eq!(capture.finish().unwrap(), "ctrl+k ctrl+s");
     capture.press("escape".parse().unwrap()).unwrap();
     assert!(capture.finish().is_err());
+    for chord in ["shift+escape", "ctrl+escape"] {
+        capture.press(chord.parse().unwrap()).unwrap();
+        assert!(capture.finish().is_ok(), "modified Escape must remain captured");
+        assert_eq!(capture.finish().unwrap(), chord);
+        capture.cancel();
+    }
 }
 
 #[test]

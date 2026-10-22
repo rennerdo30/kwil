@@ -623,9 +623,9 @@ impl SettingsSession {
                     SettingValue::Integer(v) => v.to_string(),
                     SettingValue::Float(v) => v.to_string(),
                     SettingValue::Text(v) => v,
-                    // One literal string per line; no shell parsing or TOML
-                    // parser runs on a keystroke. Typed API covers embedded LF.
-                    SettingValue::Strings(v) if !v.iter().any(|s| s.contains('\n')) => v.join("\n"),
+                    // Escaped line entries round-trip embedded controls and
+                    // backslashes without shell or TOML parsing on keystrokes.
+                    SettingValue::Strings(v) => crate::settings_panels::encode_args(&v),
                     _ => return Err("use the typed document panel for this value".into()),
                 };
                 self.editing = Some(Editing { id: row.spec.id, kind: row.spec.kind, input: TextInput::new(text)? });
@@ -645,11 +645,9 @@ impl SettingsSession {
             SettingKind::Integer => SettingValue::Integer(text.parse().map_err(|_| "enter a whole number")?),
             SettingKind::Float => SettingValue::Float(text.parse().map_err(|_| "enter a number")?),
             SettingKind::Text => SettingValue::Text(text.clone()),
-            SettingKind::Strings => SettingValue::Strings(if text.is_empty() {
-                Vec::new()
-            } else {
-                text.split('\n').map(str::to_owned).collect()
-            }),
+            SettingKind::Strings => {
+                SettingValue::Strings(crate::settings_panels::decode_args(text).map_err(|e| e.to_string())?)
+            }
             _ => return Err("setting requires a typed panel".into()),
         };
         self.menu
@@ -961,6 +959,18 @@ mod tests {
                 .iter()
                 .any(|b| b.command == "file.save" && b.keys == "ctrl+c")
         );
+    }
+
+    #[test]
+    fn settings_list_paste_normalizes_crlf_and_round_trips_explicit_controls() {
+        let (mut session, _) = fixture(Some("[search]\ninclude=[]\n"));
+        select(&mut session, "search.include");
+        session.input(SettingsInput::Accept).unwrap();
+        session.input(SettingsInput::Text("*.rs\r\n*.toml\\r")).unwrap();
+        session.input(SettingsInput::Accept).unwrap();
+        assert_eq!(session.document().unwrap().settings().search.include, ["*.rs", "*.toml\r"]);
+        session.input(SettingsInput::Accept).unwrap();
+        assert_eq!(session.input_text(), "*.rs\n*.toml\\r");
     }
 
     #[test]

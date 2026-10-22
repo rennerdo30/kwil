@@ -1041,7 +1041,7 @@ pub struct KeyCapture {
 }
 impl KeyCapture {
     pub fn press(&mut self, key: KeyChord) -> Result<(), SettingsError> {
-        if key.key == Key::Named(NamedKey::Escape) {
+        if key.key == Key::Named(NamedKey::Escape) && key.modifiers == Default::default() {
             self.keys.clear();
             return Ok(());
         }

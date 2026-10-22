@@ -956,7 +956,7 @@ impl App {
             if panel.menu().is_some() {
                 self.palette_area = settings_ui::draw(panel, pixels, (w, h), font);
             } else {
-                self.palette_area = settings_ui::loading(pixels, (w, h), font);
+                self.palette_area = settings_ui::loading(panel, pixels, (w, h), font);
             }
             if let Some(area) = self.palette_area {
                 damage.push(area);
@@ -1658,7 +1658,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_file_ui();
                     self.apply(Damage { full: true, status: true, ..Default::default() });
                 }
-                self.settings_epoch = self.settings_epoch.wrapping_add(1);
                 if self.settings_open() {
                     self.palette_redraw();
                 }

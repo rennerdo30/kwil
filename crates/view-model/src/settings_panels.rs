@@ -329,7 +329,7 @@ impl SettingsPanelController {
         let rows = self.rows(doc)?;
         self.selection = self.selection.min(rows.len().saturating_sub(1));
         if matches!(input, PanelInput::Cancel)
-            || matches!(input, PanelInput::Capture(k) if k.key == Key::Named(NamedKey::Escape))
+            || matches!(input, PanelInput::Capture(k) if k.key == Key::Named(NamedKey::Escape) && k.modifiers == Default::default())
         {
             self.state = State::Browse;
             return Ok(None);
@@ -646,7 +646,7 @@ fn entry_action(panel: SettingsPanel, edit: &EntryEdit) -> Result<PanelEdit, Set
         SettingsPanel::Keymap => return Err(error("keymap requires key capture")),
     })
 }
-fn encode_args(args: &[String]) -> String {
+pub(crate) fn encode_args(args: &[String]) -> String {
     args.iter()
         .map(|arg| {
             if arg.is_empty() {
@@ -657,12 +657,13 @@ fn encode_args(args: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-fn decode_args(text: &str) -> Result<Vec<String>, SettingsError> {
+pub(crate) fn decode_args(text: &str) -> Result<Vec<String>, SettingsError> {
     if text.is_empty() {
         return Ok(Vec::new());
     }
     text.split('\n')
         .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if line == "\\e" {
                 return Ok(String::new());
             }
@@ -688,6 +689,26 @@ fn decode_args(text: &str) -> Result<Vec<String>, SettingsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_crlf_lists_preserve_explicit_control_escapes() {
+        assert_eq!(decode_args("*.rs\r\n*.toml").unwrap(), ["*.rs", "*.toml"]);
+        let values = vec!["literal\r".into(), "line\nbreak".into(), "C:\\tools".into(), String::new()];
+        assert_eq!(decode_args(&encode_args(&values).replace('\n', "\r\n")).unwrap(), values);
+    }
+
+    #[test]
+    fn settings_capture_accepts_modified_escape() {
+        let doc = SettingsDocument::parse("").unwrap();
+        for chord in ["shift+escape", "ctrl+escape"] {
+            let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+            press(&mut panel, &doc, PanelInput::Accept);
+            press(&mut panel, &doc, key(chord));
+            assert_eq!(panel.window(&doc, 0, 1).unwrap().capture.as_deref(), Some(chord));
+            press(&mut panel, &doc, key("escape"));
+            assert!(!panel.is_capturing());
+        }
+    }
 
     fn press(panel: &mut SettingsPanelController, doc: &SettingsDocument, input: PanelInput<'_>) -> Option<PanelEdit> {
         panel.input(doc, input).unwrap()

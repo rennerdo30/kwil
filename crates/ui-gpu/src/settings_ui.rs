@@ -28,7 +28,12 @@ pub(super) fn panel(size: (usize, usize), cw: usize, ch: usize) -> Option<Rect> 
     Some(Rect { x: (size.0 - w) / 2, y: ((size.1 - h) / 2 / ch) * ch, w, h })
 }
 
-pub(super) fn loading(pixels: &mut [u32], size: (usize, usize), font: &mut Font) -> Option<Rect> {
+pub(super) fn loading(
+    host: &SettingsSession,
+    pixels: &mut [u32],
+    size: (usize, usize),
+    font: &mut Font,
+) -> Option<Rect> {
     let area = panel(size, font.cw, font.ch)?;
     fill(pixels, size.0, area, STATUS_BG);
     let (cw, ch) = (font.cw, font.ch);
@@ -38,11 +43,24 @@ pub(super) fn loading(pixels: &mut [u32], size: (usize, usize), font: &mut Font)
         font,
         area.x + cw,
         area.y + ch,
-        b"Loading settings...",
+        host.last_error().unwrap_or("Loading settings...").as_bytes(),
         area.w / cw - 2,
         STATUS_FG,
         STATUS_BG,
     );
+    if host.last_error().is_some() {
+        draw_text(
+            pixels,
+            size.0,
+            font,
+            area.x + cw,
+            area.y + 3 * ch,
+            b"Ctrl+O Open settings file to repair   Esc Close",
+            area.w / cw - 2,
+            STATUS_FG,
+            STATUS_BG,
+        );
+    }
     Some(area)
 }
 
