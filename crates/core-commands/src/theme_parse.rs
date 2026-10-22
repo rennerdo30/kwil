@@ -203,36 +203,36 @@ fn import_value(format: ImportFormat, base: Scheme, v: Value) -> Result<Theme, T
         Some(_) => return Err(error("unsupported theme type")),
     });
     theme.name = name;
-    if format == ImportFormat::VsCodeJson {
-        if let Some(colors) = root.remove("colors") {
-            for (key, value) in object(colors)? {
-                let role = match key.as_str() {
-                    "editor.background" => UiRole::Background,
-                    "editor.foreground" => UiRole::Foreground,
-                    "editorGutter.background" => UiRole::GutterBackground,
-                    "editorLineNumber.foreground" => UiRole::GutterForeground,
-                    "statusBar.background" => UiRole::StatusBackground,
-                    "statusBar.foreground" => UiRole::StatusForeground,
-                    "editor.selectionBackground" => UiRole::Selection,
-                    "editorCursor.foreground" => UiRole::Cursor,
-                    "editor.lineHighlightBackground" => UiRole::LineHighlight,
-                    "editorWhitespace.foreground" => UiRole::Whitespace,
-                    "tab.inactiveBackground" => UiRole::TabBackground,
-                    "tab.inactiveForeground" => UiRole::TabForeground,
-                    "tab.activeBackground" => UiRole::ActiveTabBackground,
-                    "tab.activeForeground" => UiRole::ActiveTabForeground,
-                    "quickInput.background" => UiRole::PanelBackground,
-                    "quickInput.foreground" => UiRole::PanelForeground,
-                    "focusBorder" => UiRole::Border,
-                    "textLink.foreground" => UiRole::Accent,
-                    "editor.findMatchBackground" => UiRole::SearchMatch,
-                    "diffEditor.insertedTextBackground" => UiRole::Added,
-                    "diffEditor.removedTextBackground" => UiRole::Removed,
-                    "errorForeground" => UiRole::Error,
-                    _ => return Err(error(format!("unsupported VS Code UI colour: {key}"))),
-                };
-                theme.ui.set(role, Rgba::parse(&string(value)?)?);
-            }
+    if format == ImportFormat::VsCodeJson
+        && let Some(colors) = root.remove("colors")
+    {
+        for (key, value) in object(colors)? {
+            let role = match key.as_str() {
+                "editor.background" => UiRole::Background,
+                "editor.foreground" => UiRole::Foreground,
+                "editorGutter.background" => UiRole::GutterBackground,
+                "editorLineNumber.foreground" => UiRole::GutterForeground,
+                "statusBar.background" => UiRole::StatusBackground,
+                "statusBar.foreground" => UiRole::StatusForeground,
+                "editor.selectionBackground" => UiRole::Selection,
+                "editorCursor.foreground" => UiRole::Cursor,
+                "editor.lineHighlightBackground" => UiRole::LineHighlight,
+                "editorWhitespace.foreground" => UiRole::Whitespace,
+                "tab.inactiveBackground" => UiRole::TabBackground,
+                "tab.inactiveForeground" => UiRole::TabForeground,
+                "tab.activeBackground" => UiRole::ActiveTabBackground,
+                "tab.activeForeground" => UiRole::ActiveTabForeground,
+                "quickInput.background" => UiRole::PanelBackground,
+                "quickInput.foreground" => UiRole::PanelForeground,
+                "focusBorder" => UiRole::Border,
+                "textLink.foreground" => UiRole::Accent,
+                "editor.findMatchBackground" => UiRole::SearchMatch,
+                "diffEditor.insertedTextBackground" => UiRole::Added,
+                "diffEditor.removedTextBackground" => UiRole::Removed,
+                "errorForeground" => UiRole::Error,
+                _ => return Err(error(format!("unsupported VS Code UI colour: {key}"))),
+            };
+            theme.ui.set(role, Rgba::parse(&string(value)?)?);
         }
     }
     let rules = root.remove(if format == ImportFormat::VsCodeJson { "tokenColors" } else { "settings" });
