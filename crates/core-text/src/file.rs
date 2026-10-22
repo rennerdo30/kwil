@@ -69,6 +69,31 @@ pub enum FileKind {
     Binary,
 }
 
+/// A read was refused before touching the file's bytes.
+#[derive(Debug)]
+pub enum ReadError {
+    Changed(FileState),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed(state) => write!(f, "file changed on disk ({state:?}); reopen before reading"),
+            Self::Io(e) => write!(f, "cannot check file before reading: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Changed(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Stamp {
     len: u64,
@@ -144,10 +169,11 @@ struct Shared {
 /// fills in on a background thread.
 ///
 /// Mapped views are not immutable snapshots of external writers. Frontends
-/// must call check() on watcher events and before region reads after waking
-/// (including indexing workers). On any change stop reading the old view and
-/// reopen; growth alone may use reopen_grown(). Checking cannot close the
-/// TOCTOU race with an uncooperative writer truncating during a read. A future
+/// must call check() on watcher events. Read entry points also check on the
+/// thread doing the read, including indexing workers. On any change stop
+/// reading the old view and reopen; growth alone may use reopen_grown().
+/// Checking cannot close the TOCTOU race with an uncooperative writer
+/// truncating during a read. A future
 /// positioned-read source is needed for that stronger guarantee on Unix.
 #[derive(Clone)]
 pub struct TextFile {
@@ -222,7 +248,7 @@ impl TextFile {
         }
         if let Some(index) = self.index() {
             let mut index = index.clone();
-            index.extend(next.bytes(), self.len());
+            index.extend(next.bytes().map_err(io::Error::other)?, self.len());
             let _ = next.shared.index.set(index);
             next.shared.scanned.store(next.len(), Ordering::Relaxed);
         }
@@ -230,42 +256,58 @@ impl TextFile {
     }
 
     /// Bounded binary heuristic, sampled once on first use (at most 128 KiB).
-    /// Like bytes(), call check() before using this after a wake-up on a map.
-    pub fn kind(&self) -> FileKind {
-        *self.shared.kind.get_or_init(|| detect_kind(self.bytes()))
+    /// Validates even when the classification is already cached.
+    pub fn kind(&self) -> Result<FileKind, ReadError> {
+        let bytes = self.bytes()?;
+        Ok(*self.shared.kind.get_or_init(|| detect_kind(bytes)))
     }
 
-    /// Raw view; call check() before mapped-region reads after a wake-up.
-    pub fn bytes(&self) -> &[u8] {
-        self.shared.bytes.as_slice()
+    /// Checks metadata and identity before exposing a region. Do not retain
+    /// this slice across a wake-up; the check cannot prevent a concurrent
+    /// external truncation while the slice is being read.
+    pub fn bytes(&self) -> Result<&[u8], ReadError> {
+        match self.check().map_err(ReadError::Io)? {
+            FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
+            state => Err(ReadError::Changed(state)),
+        }
     }
 
     pub fn len(&self) -> u64 {
-        self.bytes().len() as u64
+        self.shared.stamp.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bytes().is_empty()
+        self.len() == 0
     }
 
-    /// Builds the line index on a new thread; `done` runs when it is ready
-    /// (frontends use it to wake their event loop).
+    /// Checks and builds on a new thread; `done` reports readiness or refusal
+    /// (frontends use either outcome to wake their event loop).
     pub fn index_in_background(
         &self,
         threads: usize,
-        done: impl FnOnce() + Send + 'static,
+        done: impl FnOnce(Result<(), ReadError>) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        self.index_in_background_after(threads, done, || {})
+    }
+
+    fn index_in_background_after(
+        &self,
+        threads: usize,
+        done: impl FnOnce(Result<(), ReadError>) + Send + 'static,
+        before: impl FnOnce() + Send + 'static,
     ) -> std::thread::JoinHandle<()> {
         let this = self.clone();
         std::thread::spawn(move || {
-            this.build_index(threads);
-            done();
+            before();
+            done(this.build_index(threads).map(|_| ()));
         })
     }
 
     /// Builds the line index on the calling thread (no-op when built).
-    pub fn build_index(&self, threads: usize) -> &LineIndex {
+    pub fn build_index(&self, threads: usize) -> Result<&LineIndex, ReadError> {
+        let bytes = self.bytes()?;
         let s = &self.shared;
-        s.index.get_or_init(|| LineIndex::build(s.bytes.as_slice(), DEFAULT_EVERY, threads, &s.scanned))
+        Ok(s.index.get_or_init(|| LineIndex::build(bytes, DEFAULT_EVERY, threads, &s.scanned)))
     }
 
     pub fn index(&self) -> Option<&LineIndex> {
@@ -278,16 +320,17 @@ impl TextFile {
 
     /// Up to `count` lines from the start, without the index. Used to paint
     /// the first screen before any full pass.
-    pub fn first_lines(&self, count: usize) -> Vec<&[u8]> {
-        lines_from(self.bytes(), 0, count)
+    pub fn first_lines(&self, count: usize) -> Result<Vec<&[u8]>, ReadError> {
+        Ok(lines_from(self.bytes()?, 0, count))
     }
 
     /// Up to `count` lines starting at `line`. `None` until the index is
     /// ready (callers keep showing what they have).
-    pub fn lines(&self, line: u64, count: usize) -> Option<Vec<&[u8]>> {
-        let index = self.index()?;
-        let start = index.line_start(self.bytes(), line)?;
-        Some(lines_from(self.bytes(), start as usize, count))
+    pub fn lines(&self, line: u64, count: usize) -> Result<Option<Vec<&[u8]>>, ReadError> {
+        let bytes = self.bytes()?;
+        let Some(index) = self.index() else { return Ok(None) };
+        let Some(start) = index.line_start(bytes, line) else { return Ok(None) };
+        Ok(Some(lines_from(bytes, start as usize, count)))
     }
 }
 
@@ -297,8 +340,12 @@ fn detect_kind(bytes: &[u8]) -> FileKind {
     }
     const SAMPLE: usize = 64 << 10;
     let first_end = bytes.len().min(SAMPLE);
+    // For even file lengths both samples are aligned to UTF-16 code units.
     let last_start = first_end.max(bytes.len().saturating_sub(SAMPLE));
     let samples = [&bytes[..first_end], &bytes[last_start..]];
+    if bytes.len().is_multiple_of(2) && (looks_utf16(&samples, true) || looks_utf16(&samples, false)) {
+        return FileKind::Text;
+    }
     let mut controls = 0;
     let mut total = 0;
     for sample in samples {
@@ -310,6 +357,21 @@ fn detect_kind(bytes: &[u8]) -> FileKind {
     }
     // Tabs, LF, CR, form feed and vertical tab are valid text whitespace.
     if controls * 100 > total * 10 { FileKind::Binary } else { FileKind::Text }
+}
+
+fn looks_utf16(samples: &[&[u8]], little_endian: bool) -> bool {
+    let (mut total, mut high_nuls, mut low_nuls, mut printable) = (0, 0, 0, 0);
+    for pair in samples.iter().flat_map(|sample| sample.as_chunks::<2>().0) {
+        let (low, high) = if little_endian { (pair[0], pair[1]) } else { (pair[1], pair[0]) };
+        total += 1;
+        high_nuls += usize::from(high == 0);
+        low_nuls += usize::from(low == 0);
+        let unit = u16::from_le_bytes([low, high]);
+        printable += usize::from(char::from_u32(unit as u32).is_some_and(|c| !c.is_control() || c.is_whitespace()));
+    }
+    // Require a clear alternating-NUL signal and mostly printable code units.
+    // This is a bounded heuristic, not an encoding validation pass.
+    total >= 4 && high_nuls * 2 >= total && low_nuls * 10 <= total && printable * 10 >= total * 9
 }
 
 /// Splits up to `count` lines from `start`, without line endings.
@@ -376,7 +438,7 @@ mod tests {
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b" line\n").unwrap();
         assert_eq!(file.check().unwrap(), FileState::Grown { new_len: 13 });
         // Small-file owned bytes remain a stable snapshot.
-        assert_eq!(file.bytes(), b"partial");
+        assert_eq!(file.shared.bytes.as_slice(), b"partial");
     }
 
     #[test]
@@ -430,12 +492,12 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.file(b"first\npartial");
         let file = TextFile::open(&path).unwrap();
-        file.build_index(1);
+        file.build_index(1).unwrap();
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b" end\nnext").unwrap();
         let grown = file.reopen_grown().unwrap();
         assert!(grown.index().is_some(), "index must be carried forward eagerly");
         assert_eq!(grown.index().unwrap().line_count(), 3);
-        assert_eq!(grown.lines(1, 5).unwrap(), vec![b"partial end".as_slice(), b"next"]);
+        assert_eq!(grown.lines(1, 5).unwrap().unwrap(), vec![b"partial end".as_slice(), b"next"]);
         assert_eq!(grown.progress().scanned, grown.len());
         assert_eq!(grown.check().unwrap(), FileState::Unchanged);
         assert_eq!(file.index().unwrap().line_count(), 2);
@@ -463,13 +525,13 @@ mod tests {
         let mapped = TextFile::open(&path).unwrap();
         assert!(matches!(mapped.shared.bytes, Bytes::Mapped(_)));
         assert_eq!(mapped.check().unwrap(), FileState::Unchanged);
-        mapped.build_index(2);
+        mapped.build_index(2).unwrap();
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"\nappended").unwrap();
         assert_eq!(mapped.check().unwrap(), FileState::Grown { new_len: MAP_THRESHOLD + 9 });
         let grown = mapped.reopen_grown().unwrap();
         assert!(matches!(grown.shared.bytes, Bytes::Mapped(_)));
         assert_eq!(grown.index().unwrap().line_count(), 2);
-        assert_eq!(grown.lines(1, 1).unwrap(), vec![b"appended".as_slice()]);
+        assert_eq!(grown.lines(1, 1).unwrap().unwrap(), vec![b"appended".as_slice()]);
     }
 
     #[test]
@@ -485,8 +547,107 @@ mod tests {
         ] {
             let path = dir.file(bytes);
             let file = TextFile::open(&path).unwrap();
-            assert_eq!(file.kind(), FileKind::Text, "{bytes:?}");
+            assert_eq!(file.kind().unwrap(), FileKind::Text, "{bytes:?}");
             assert_eq!(file.shared.kind.get(), Some(&FileKind::Text));
+        }
+    }
+
+    fn delayed_index_change(replace: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = TempDir(root.join(format!("kw9-delay-{}-{replace}", std::process::id())));
+        std::fs::create_dir(&dir.0).unwrap();
+        let path = dir.file(b"one\ntwo\n");
+        if replace {
+            File::options().write(true).open(&path).unwrap().set_len(MAP_THRESHOLD).unwrap();
+        }
+        let file = TextFile::open(&path).unwrap();
+        assert_eq!(file.check().unwrap(), FileState::Unchanged);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = file.index_in_background_after(
+            1,
+            move |result| done_tx.send(result).unwrap(),
+            move || {
+                ready_tx.send(()).unwrap();
+                go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+        );
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let expected = if replace {
+            std::fs::rename(&path, dir.0.join("old")).unwrap();
+            std::fs::write(&path, b"new\n").unwrap();
+            FileState::Replaced
+        } else {
+            // Windows forbids truncating a live map. Use owned bytes for the
+            // identical check gate without attempting an unsafe SIGBUS test.
+            File::options().write(true).open(&path).unwrap().set_len(1).unwrap();
+            FileState::Truncated
+        };
+        go_tx.send(()).unwrap();
+        let result = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(result, Err(ReadError::Changed(state)) if state == expected), "{result:?}");
+        assert!(file.index().is_none());
+        assert_eq!(file.progress().scanned, 0);
+    }
+
+    #[test]
+    fn delayed_index_refuses_truncation() {
+        delayed_index_change(false);
+    }
+
+    #[test]
+    fn delayed_index_refuses_mapped_replacement() {
+        delayed_index_change(true);
+    }
+
+    #[test]
+    fn kind_checks_even_when_cached() {
+        let dir = TempDir::new();
+        let path = dir.file(b"hello\n");
+        let file = TextFile::open(&path).unwrap();
+        assert_eq!(file.kind().unwrap(), FileKind::Text);
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(file.kind(), Err(ReadError::Changed(FileState::Replaced))));
+    }
+
+    #[test]
+    fn region_reads_refuse_changes() {
+        let dir = TempDir::new();
+        let path = dir.file(b"hello\n");
+        let file = TextFile::open(&path).unwrap();
+        file.build_index(1).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(file.bytes(), Err(ReadError::Changed(FileState::Replaced))));
+        assert!(matches!(file.first_lines(1), Err(ReadError::Changed(FileState::Replaced))));
+        assert!(matches!(file.lines(0, 1), Err(ReadError::Changed(FileState::Replaced))));
+        assert!(matches!(file.build_index(1), Err(ReadError::Changed(FileState::Replaced))));
+    }
+
+    #[test]
+    fn kind_detects_bomless_utf16_le() {
+        let bytes: Vec<_> = "Hello world!\r\nCafé\t日本語".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(detect_kind(&bytes), FileKind::Text);
+    }
+
+    #[test]
+    fn kind_detects_bomless_utf16_be() {
+        let text = "Hello world!\r\nCafé\t日本語".repeat(4096);
+        let bytes: Vec<_> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        assert_eq!(detect_kind(&bytes), FileKind::Text);
+    }
+
+    #[test]
+    fn kind_preserves_legacy_minified_and_binary_cases() {
+        assert_eq!(detect_kind(b"caf\xe9\tstra\xdfe\n"), FileKind::Text);
+        let js = b"(()=>{const value=42;return value+1;})();".repeat(4096);
+        assert_eq!(detect_kind(&js), FileKind::Text);
+        for bytes in [b"abc\0def".as_slice(), b"\0\0\0\0\0\0\0\0", b"a\0\x01\0\x02\0\x03\0", b"h\0e\0l\0l\0o"] {
+            assert_eq!(detect_kind(bytes), FileKind::Binary, "{bytes:?}");
         }
     }
 
@@ -495,15 +656,15 @@ mod tests {
         let dir = TempDir::new();
         for bytes in [b"abc\0def".as_slice(), b"\x01\x02\x03abc", &[b'a'; 99].map(|_| 1)] {
             let path = dir.file(bytes);
-            assert_eq!(TextFile::open(&path).unwrap().kind(), FileKind::Binary);
+            assert_eq!(TextFile::open(&path).unwrap().kind().unwrap(), FileKind::Binary);
         }
         let mut bytes = vec![b'a'; 3 * (64 << 10)];
         bytes[64 << 10] = 0; // Unsampled middle must not cause a full scan.
         let path = dir.file(&bytes);
-        assert_eq!(TextFile::open(&path).unwrap().kind(), FileKind::Text);
+        assert_eq!(TextFile::open(&path).unwrap().kind().unwrap(), FileKind::Text);
         *bytes.last_mut().unwrap() = 0;
         let path = dir.file(&bytes);
-        assert_eq!(TextFile::open(&path).unwrap().kind(), FileKind::Binary);
+        assert_eq!(TextFile::open(&path).unwrap().kind().unwrap(), FileKind::Binary);
     }
 
     /// Every line start via the sparse index matches a naive split, across

@@ -48,9 +48,20 @@ impl FileWatcher {
         debounce: Duration,
         mut callback: impl FnMut(io::Result<FileEvent>) + Send + 'static,
     ) -> io::Result<Self> {
-        // Resolve parents so backend paths and caller paths share one spelling.
-        // Do not resolve the file itself: a symlink/path replacement matters.
-        let paths: BTreeSet<PathBuf> = paths.iter().map(|p| watch_path(p)).collect::<io::Result<_>>()?;
+        // Resolve existing files as well as parents (including caller casing).
+        // Keep the lexical path too so replacing a symlink still invalidates it.
+        let mut watched = BTreeSet::new();
+        for path in paths {
+            watched.insert(watch_path(path)?);
+            match path.canonicalize() {
+                Ok(resolved) => {
+                    watched.insert(resolved);
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let paths = watched;
         let parents: BTreeSet<_> = paths.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
         let (tx, rx) = mpsc::sync_channel(256);
         let overflow = Arc::new(AtomicBool::new(false));
@@ -119,6 +130,10 @@ impl Drop for FileWatcher {
 fn watch_path(path: &Path) -> io::Result<PathBuf> {
     let absolute = std::path::absolute(path)?;
     let name = absolute.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "watch a file path"))?;
+    // Resolve existing file casing; preserve symlink replacement detection.
+    if std::fs::symlink_metadata(&absolute).is_ok_and(|m| !m.file_type().is_symlink()) {
+        return absolute.canonicalize();
+    }
     Ok(absolute.parent().expect("absolute file parent").canonicalize()?.join(name))
 }
 
@@ -129,7 +144,29 @@ fn changes(event: &Event, watched: &BTreeSet<PathBuf>) -> Vec<FileEvent> {
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Any | EventKind::Other => FileEventKind::Modified,
         _ => return Vec::new(), // In particular, reads must never trigger feedback.
     };
-    event.paths.iter().filter(|p| watched.contains(*p)).map(|path| FileEvent { path: path.clone(), kind }).collect()
+    // Return the stable watched spelling, even for a removed or renamed file
+    // that can no longer be canonicalised after rotation.
+    watched
+        .iter()
+        .filter(|path| event.paths.iter().any(|p| same_path(p, path)))
+        .map(|path| FileEvent { path: path.clone(), kind })
+        .collect()
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        // Windows and default macOS volumes ignore case. Keep matching after
+        // rotation, when canonicalising the event's old path is impossible.
+        a.as_os_str().to_string_lossy().to_lowercase() == b.as_os_str().to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +228,58 @@ mod tests {
         append();
         wait_modified();
         drop(watcher); // Joins without needing another disk event or timer.
+    }
+
+    #[test]
+    fn watcher_matches_case_variants_after_removal() {
+        let dir = TempDir::new();
+        let path = watch_path(&dir.0.join("mixed.log")).unwrap();
+        let event = Event::new(EventKind::Remove(RemoveKind::File)).add_path(path.with_file_name("MIXED.LOG"));
+        let result = changes(&event, &BTreeSet::from([path.clone()]));
+        #[cfg(any(windows, target_os = "macos"))]
+        assert_eq!(result, vec![FileEvent { path, kind: FileEventKind::Removed }]);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        assert!(result.is_empty(), "case-sensitive platforms must keep distinct file names");
+    }
+
+    #[test]
+    fn watcher_accepts_existing_file_with_different_case() {
+        let dir = TempDir::new();
+        let path = dir.0.join("mixed.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let requested = path.with_file_name("MIXED.LOG");
+        if !requested.exists() {
+            eprintln!("skipped: fixture filesystem is case-sensitive");
+            return;
+        }
+        assert_eq!(watch_path(&requested).unwrap(), path.canonicalize().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let watcher = FileWatcher::new(&[requested], Duration::from_millis(20), move |event| {
+            let _ = tx.send(event);
+        })
+        .unwrap();
+        let append = || {
+            let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writer.write_all(b"two\n").unwrap();
+            writer.sync_all().unwrap();
+        };
+        let wait_modified = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let event = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap().unwrap();
+                if event.kind == FileEventKind::Modified {
+                    break;
+                }
+            }
+        };
+        append();
+        wait_modified();
+        std::fs::rename(&path, dir.0.join("old")).unwrap();
+        std::fs::write(&path, b"new\n").unwrap();
+        wait_modified();
+        append();
+        wait_modified();
+        drop(watcher);
     }
 
     #[test]

@@ -92,8 +92,12 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
     if let Some(file) = view.file() {
         let p = proxy.clone();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-        file.index_in_background(threads, move || {
-            let _ = p.send_event(UserEvent::IndexDone);
+        file.index_in_background(threads, move |result| {
+            let event = match result {
+                Ok(()) => UserEvent::IndexDone,
+                Err(e) => UserEvent::Notice(e.to_string()),
+            };
+            let _ = p.send_event(event);
         });
     }
     let mut app = App {
