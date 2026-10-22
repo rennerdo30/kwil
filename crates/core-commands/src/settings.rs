@@ -531,7 +531,7 @@ fn replace_settings_file(temp: &Path, path: &Path, exists: bool) -> std::io::Res
 
 #[derive(Debug)]
 pub enum SettingsWorkerEvent {
-    Loaded { source: Option<String>, document: crate::settings_ui::SettingsDocument },
+    Loaded { source: Option<String>, document: Box<crate::settings_ui::SettingsDocument> },
     Saved { request: u64, source: String },
     Error { request: Option<u64>, message: String },
 }
@@ -603,7 +603,7 @@ impl SettingsWorker {
                     Ok((source, document)) => {
                         if last.as_ref() != Some(&source) {
                             *last = Some(source.clone());
-                            callback(SettingsWorkerEvent::Loaded { source, document });
+                            callback(SettingsWorkerEvent::Loaded { source, document: Box::new(document) });
                         }
                     }
                     Err(e) => callback(SettingsWorkerEvent::Error { request: None, message: e.to_string() }),

@@ -90,6 +90,9 @@ fn scoped_rebind_and_command_reset_restore_preset_without_destroying_custom_data
     );
     assert!(doc.source().contains("future='keep' # owner"));
     assert_eq!(doc.keymap_rows().unwrap().len(), COMMANDS.len());
+    let once = doc.source().to_owned();
+    doc.reset_command("file.save", false).unwrap();
+    assert_eq!(doc.source(), once, "repeated reset must not grow duplicate binding tables");
 }
 
 #[test]

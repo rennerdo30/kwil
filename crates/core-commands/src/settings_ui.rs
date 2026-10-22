@@ -86,7 +86,7 @@ pub struct SettingSpec {
     read: fn(&Settings) -> SettingValue,
 }
 impl SettingSpec {
-    pub fn current(&self, settings: &Settings) -> SettingValue {
+    fn current(&self, settings: &Settings) -> SettingValue {
         (self.read)(settings)
     }
     pub fn default_value(&self) -> SettingValue {
@@ -434,6 +434,14 @@ impl SettingsDocument {
     pub fn report(&self) -> &SettingsReport {
         &self.report
     }
+    pub fn current_value(&self, id: &str) -> Result<SettingValue, SettingsError> {
+        let spec = SCHEMA.iter().find(|s| s.id == id).ok_or_else(|| error("unknown settings field"))?;
+        Ok(if id == "file_types" {
+            SettingValue::StringMap(self.file_types.clone())
+        } else {
+            spec.current(self.settings())
+        })
+    }
     pub fn file_types(&self) -> &BTreeMap<String, String> {
         &self.file_types
     }
@@ -633,8 +641,8 @@ impl SettingsDocument {
             .into_iter()
             .filter(|b| {
                 !row.defaults.iter().any(|d| {
-                    b.context == d.context
-                        && b.mode == d.mode
+                    d.context.is_none_or(|c| b.context == Some(c))
+                        && d.mode.is_none_or(|m| b.mode == Some(m))
                         && b.keys.parse::<KeySequence>().ok() == d.keys.parse::<KeySequence>().ok()
                 })
             })
@@ -704,7 +712,25 @@ impl SettingsDocument {
             }
             let tables = doc["bindings"].as_array_of_tables_mut().expect("checked array of tables");
             for b in bindings {
-                // Append a higher priority entry; earlier custom data is untouched.
+                // Update only the command in the last matching selector, keeping
+                // key spelling, comments and unknown fields. New selectors append.
+                let sequence = b.keys.parse::<KeySequence>().map_err(|e| error(e.to_string()))?;
+                let existing = (0..tables.len()).rev().find(|&i| {
+                    let table = tables.get(i).expect("binding table");
+                    table.get("keys").and_then(Item::as_str).and_then(|s| s.parse::<KeySequence>().ok()).as_ref()
+                        == Some(&sequence)
+                        && table.get("context").and_then(Item::as_str) == b.context.map(context_name)
+                        && table.get("mode").and_then(Item::as_str) == b.mode.map(mode_name)
+                });
+                if let Some(i) = existing {
+                    let table = tables.get_mut(i).expect("binding table");
+                    let mut command = Value::from(b.command);
+                    if let Some(old) = table.get("command").and_then(Item::as_value) {
+                        *command.decor_mut() = old.decor().clone();
+                    }
+                    table.insert("command", Item::Value(command));
+                    continue;
+                }
                 let mut table = Table::new();
                 table["keys"] = toml_edit::value(b.keys);
                 table["command"] = toml_edit::value(b.command);
