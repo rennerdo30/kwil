@@ -181,7 +181,7 @@ benchmark or full workspace test suite ran locally. Exact input provenance is in
 that target directory. Native macOS/Linux and full workspace evidence belongs to
 CI; the parent still owns independent review and merge.
 
-## Review round 5 source candidate (2026-10-23)
+## Review round 5 (2026-10-23)
 
 Base: `4540af270c4e3b08387549f6f66c0d2ebbde9360`, same isolated `fix-7b`.
 Three new P1 findings extend the conservative admission policy:
@@ -198,12 +198,40 @@ Three new P1 findings extend the conservative admission policy:
   the comment closes and expose raw strings hidden from a physical-byte scan.
 
 All **53 earlier contracts** remain unchanged. Three new tests and
-`verify-round5-fail-first.ps1` are prepared against unchanged `4540af2`.
+`verify-round5-fail-first.ps1` run against unchanged `4540af2`.
 `FAILURE-MATRIX.md` now maps all R1-R5 findings to their preservation boundaries
 and tests. The pending finite block is fail-first, restored focused formatter
 tests, workspace Clippy and fmt, with exact hash/mtime provenance.
 
-**Validation pending parent Cargo grant after settings/parent:** no Cargo, test,
-Clippy, full suite or native process has started for this source candidate.
-Standalone rustfmt passed (PID **65760**, exit 0); `git diff --check` passed.
-This source candidate is not a passing claim or permission to merge.
+Exact source candidate: `84365ebfe9df7104e536db76facf3d882ec53154`. After the
+explicit parent lane grant, the finite block completed serially:
+
+- Fail-first against `4540af2`: **0 passed, 3 failed**, PID **43016**, expected
+  exit 101. The exact `:from`, Oracle alternative-quote and spliced-comment
+  fixtures demonstrate keyword exposure or removed literal spaces on old code.
+  The script inherited `CARGO_NET_OFFLINE=true` and used `--locked -j 4`.
+- Both sources were restored byte-identical, checked against the pre-run SHA256
+  receipt before testing the fixed implementation. The test log records a fresh
+  compile after restoration; no source timestamp/cache bypass was used.
+- `cargo test -p kwil-core-format --offline --locked -j 4`: **56/56 passed**,
+  including all53 earlier contracts, PID **72492**, exit 0.
+- Per the parent's bounded R5 grant, targeted crate Clippy replaced another local
+  workspace rerun: `cargo clippy -p kwil-core-format --all-targets --offline
+  --locked -j 4 -- -D warnings` passed, PID **48944**, exit 0. Package fmt passed,
+  PID **34880**, exit 0. `git diff --check` passed; source worktree was clean
+  before the evidence update.
+- Confirmed source CI for `84365eb`: fmt plus Linux, Windows and macOS all passed
+  in [run 39848161191](https://github.com/rennerdo30/kwil/actions/runs/39848161191).
+  Those jobs run the full workspace Clippy/tests and include the macOS external
+  formatter success/descendant contract; green CI is not independent approval.
+
+All owned Cargo processes exited; existing lock/reap contracts prove descendants
+stopped. The lane was returned directly to parent `codex-kw-48-editor-ui` with
+exact PIDs/results before this docs-only update; no more Cargo runs followed.
+
+The brief-specified target/cache was retained without wipe or bypass. Logs
+`round5-red.log`, `round5-green.log`, `round5-clippy.log` identify their tested
+commit on the first line; `round5-source-provenance.json` records input hashes and
+timestamps under `E:/Development/_cache/cargo-target/kwil-kw-7-format`.
+No local full workspace suite, native GUI/TUI/macOS/Linux execution, benchmark or
+owner acceptance ran. The parent retains independent review and merge.
