@@ -177,10 +177,12 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
     let query = text_window(&window.query, host.panel_query_cursor(), columns.saturating_sub(2));
     let query_cursor = query.cursor;
     line(1, format!("/ {}", query.text), false);
-    if window.confirmation.is_empty() {
+    if window.proposal.is_none() {
         for (index, row) in window.rows.iter().enumerate() {
             line(index as u16 + 2, format!("{}: {}  {}", row.title, row.value, row.source), row.selected);
         }
+    } else if window.confirmation.is_empty() {
+        line(2, "No conflicts remain; Enter applies, Esc cancels".into(), true);
     } else {
         let first = window.confirmation_index.saturating_sub(visible / 2);
         for (index, conflict) in window.confirmation.iter().enumerate().skip(first).take(visible) {
@@ -204,7 +206,7 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
     } else if let Some(capture) = &window.capture {
         line(area.height - 4, format!("Keys: {}", if capture.is_empty() { "Press keys..." } else { capture }), true);
         line(area.height - 3, "Enter accepts a captured chord; Esc cancels".into(), false);
-    } else if !window.confirmation.is_empty() {
+    } else if window.proposal.is_some() {
         line(area.height - 4, format!("New: {}", window.proposal.as_deref().unwrap_or("preset bindings")), true);
         if let Some(conflict) = window.confirmation.get(window.confirmation_index) {
             line(area.height - 3, format!("Replace: {}", conflict_label(conflict)), false);
@@ -216,7 +218,7 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
     line(area.height - 2, host.status().into(), false);
     line(
         area.height - 1,
-        if window.confirmation.is_empty() {
+        if window.proposal.is_none() {
             "Enter edit/apply  Delete reset/remove  Esc back"
         } else {
             "Up/Down review conflicts  Enter replace  Esc cancel"
@@ -288,6 +290,27 @@ mod tests {
         assert!(screen.contains("ctrl+c -> edit.copy (Exact)"), "confirmation must name what will be replaced");
         key(&mut host, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(host.panel_window(0, 0).unwrap().unwrap().confirmation_index, 1);
+        host.edit_document(|doc| {
+            for keys in ["ctrl+c", "ctrl+c ctrl+x"] {
+                doc.rebind(
+                    kwil_core_commands::Binding {
+                        keys: keys.into(),
+                        command: String::new(),
+                        context: None,
+                        mode: None,
+                    },
+                    true,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        key(&mut host, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(host.panel_window(0, 0).unwrap().unwrap().confirmation.is_empty());
+        terminal.draw(|frame| draw(frame, &host)).unwrap();
+        let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("No conflicts remain"), "a changed review still awaits explicit confirmation");
+        assert!(screen.contains("file.save <- ctrl+c"));
         key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         host.stop().shutdown().unwrap();
         drop(host);

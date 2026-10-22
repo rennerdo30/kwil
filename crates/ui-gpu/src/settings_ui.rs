@@ -91,6 +91,53 @@ fn compound_row(window: &PanelWindow, slot: usize) -> Option<usize> {
     (index < window.total).then_some(index)
 }
 
+struct ConfirmationView {
+    rows: Vec<(String, bool)>,
+    details: Vec<String>,
+}
+
+fn confirmation_view(window: &PanelWindow, layout: Layout) -> Option<ConfirmationView> {
+    let proposal = format!("Proposed: {}", window.proposal.as_deref()?);
+    if window.confirmation.is_empty() {
+        return Some(ConfirmationView {
+            rows: vec![("No conflicts remain; Enter applies, Esc cancels".into(), true)],
+            details: vec![proposal],
+        });
+    }
+    let selected = window.confirmation_index.min(window.confirmation.len() - 1);
+    let first = layout.first(selected, window.confirmation.len());
+    let rows = window
+        .confirmation
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(layout.visible)
+        .map(|(index, conflict)| {
+            (
+                format!(
+                    "{}/{} {} -> {} ({:?})",
+                    index + 1,
+                    window.confirmation.len(),
+                    conflict.keys,
+                    conflict.command,
+                    conflict.kind
+                ),
+                index == selected,
+            )
+        })
+        .collect();
+    let current = &window.confirmation[selected];
+    Some(ConfirmationView {
+        rows,
+        details: vec![
+            proposal,
+            format!("Conflict {}/{} keys: {}", selected + 1, window.confirmation.len(), current.keys),
+            format!("Command: {}", current.command),
+            format!("Kind: {:?}", current.kind),
+        ],
+    })
+}
+
 /// Keep both staged fields visible on the full card. Tiny cards show the active
 /// field first; its caret must never be clipped behind an inactive field.
 fn edit_fields(window: &PanelWindow, width: usize, slots: usize) -> (Vec<String>, Option<(usize, usize)>) {
@@ -343,28 +390,42 @@ pub(super) fn draw(host: &SettingsSession, pixels: &mut [u32], size: (usize, usi
                 );
             }
             Ok(Some(window)) => {
-                for (slot, row) in window.rows.iter().enumerate() {
-                    let source = if row.source.is_empty() { String::new() } else { format!(" [{}]", row.source) };
-                    let conflicts = if row.conflicts.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" !{} conflict(s)", row.conflicts.len())
-                    };
-                    let text = if let Some(command) = row.command {
-                        format!("{}: {}{source}{conflicts} ({command})", row.title, row.value)
-                    } else if row.add {
-                        format!("+ {}", row.title)
-                    } else {
-                        format!("{}: {}{source}", row.title, row.value)
-                    };
-                    line(
-                        slot + 3,
-                        rail,
-                        columns + 2 - rail,
-                        &text,
-                        FG,
-                        if row.selected { tabs::ACTIVE } else { STATUS_BG },
-                    );
+                let confirmation = confirmation_view(window, layout);
+                if let Some(confirmation) = &confirmation {
+                    for (slot, (text, selected)) in confirmation.rows.iter().enumerate() {
+                        line(
+                            slot + 3,
+                            rail,
+                            columns + 2 - rail,
+                            text,
+                            FG,
+                            if *selected { tabs::ACTIVE } else { STATUS_BG },
+                        );
+                    }
+                } else {
+                    for (slot, row) in window.rows.iter().enumerate() {
+                        let source = if row.source.is_empty() { String::new() } else { format!(" [{}]", row.source) };
+                        let conflicts = if row.conflicts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" !{} conflict(s)", row.conflicts.len())
+                        };
+                        let text = if let Some(command) = row.command {
+                            format!("{}: {}{source}{conflicts} ({command})", row.title, row.value)
+                        } else if row.add {
+                            format!("+ {}", row.title)
+                        } else {
+                            format!("{}: {}{source}", row.title, row.value)
+                        };
+                        line(
+                            slot + 3,
+                            rail,
+                            columns + 2 - rail,
+                            &text,
+                            FG,
+                            if row.selected { tabs::ACTIVE } else { STATUS_BG },
+                        );
+                    }
                 }
                 let first_detail = 3 + layout.visible;
                 let slots = (rows - 2).saturating_sub(first_detail);
@@ -373,12 +434,8 @@ pub(super) fn draw(host: &SettingsSession, pixels: &mut [u32], size: (usize, usi
                 if let Some((row, column)) = edit_caret {
                     caret = Some((first_detail + row, rail + 1 + column));
                 }
-                if !window.confirmation.is_empty() {
-                    details
-                        .push(format!("Replace {} conflict(s)? Enter accepts; Esc cancels", window.confirmation.len()));
-                    for conflict in &window.confirmation {
-                        details.push(format!("{}: {} ({:?})", conflict.keys, conflict.command, conflict.kind));
-                    }
+                if let Some(confirmation) = confirmation {
+                    details = confirmation.details;
                 } else if let Some(keys) = &window.capture {
                     details.push(if keys.is_empty() {
                         "Press first shortcut (Enter is a key); Esc cancels".into()
@@ -445,8 +502,8 @@ pub(super) fn draw(host: &SettingsSession, pixels: &mut [u32], size: (usize, usi
         rows - 1,
         0,
         columns + 2,
-        if window.is_some_and(|window| !window.confirmation.is_empty()) {
-            "Enter: replace conflicts   Esc: cancel (keep existing shortcuts)"
+        if window.is_some_and(|window| window.proposal.is_some()) {
+            "Tab / Shift+Tab: review conflicts   Home / End: first / last   Enter: replace   Esc: cancel"
         } else if host.panel_is_capturing() {
             "Press keys: first Enter binds Enter; next Enter accepts; second chord finishes; Esc cancels"
         } else if host.panel_is_editing() {
@@ -767,6 +824,107 @@ mod tests {
         assert!(panel.input(&doc, escape).unwrap().is_none());
         assert!(!panel.is_editing());
         assert_eq!(doc.source(), original);
+    }
+
+    #[test]
+    fn settings_gui_confirmation_review_scrolls_to_current_conflict() {
+        let doc = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+c ctrl+x'\ncommand='file.open'\n").unwrap();
+        let original = doc.source().to_owned();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        panel.input(&doc, PanelInput::Accept).unwrap();
+        panel
+            .input(
+                &doc,
+                routed_panel(&Key::Character("c".into()), None, ModifiersState::CONTROL, mode(true, true, true)),
+            )
+            .unwrap();
+        panel
+            .input(
+                &doc,
+                routed_panel(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), mode(true, true, true)),
+            )
+            .unwrap();
+        let first = panel.window(&doc, 0, 0).unwrap();
+        assert!(first.confirmation.len() >= 2);
+        let layout = Layout::new(79, 7); // One conflict at a time must still expose every entry.
+        let editing = mode(true, true, false);
+        let check = |window: &PanelWindow, expected: usize| {
+            let view = confirmation_view(window, layout).unwrap();
+            assert_eq!(view.rows.len(), 1);
+            assert!(view.rows[0].1);
+            let conflict = &window.confirmation[expected];
+            assert_eq!(
+                view.rows[0].0,
+                format!(
+                    "{}/{} {} -> {} ({:?})",
+                    expected + 1,
+                    window.confirmation.len(),
+                    conflict.keys,
+                    conflict.command,
+                    conflict.kind
+                )
+            );
+            assert_eq!(view.details[0], format!("Proposed: {}", window.proposal.as_deref().unwrap()));
+            assert!(view.details[0].contains("file.save <- ctrl+c"));
+            assert_eq!(
+                view.details[1],
+                format!("Conflict {}/{} keys: {}", expected + 1, window.confirmation.len(), conflict.keys)
+            );
+            assert_eq!(view.details[2], format!("Command: {}", conflict.command));
+            assert_eq!(view.details[3], format!("Kind: {:?}", conflict.kind));
+        };
+        check(&first, 0);
+        for expected in 1..first.confirmation.len() {
+            let next = routed_panel(&Key::Named(NamedKey::Tab), None, ModifiersState::empty(), editing);
+            assert!(panel.input(&doc, next).unwrap().is_none());
+            check(&panel.window(&doc, 0, 0).unwrap(), expected);
+        }
+        let previous = routed_panel(&Key::Named(NamedKey::Tab), None, ModifiersState::SHIFT, editing);
+        assert!(panel.input(&doc, previous).unwrap().is_none());
+        check(&panel.window(&doc, 0, 0).unwrap(), first.confirmation.len() - 2);
+        for (key, expected) in [(NamedKey::Home, 0), (NamedKey::End, first.confirmation.len() - 1)] {
+            assert!(
+                panel
+                    .input(&doc, routed_panel(&Key::Named(key), None, ModifiersState::empty(), editing))
+                    .unwrap()
+                    .is_none()
+            );
+            check(&panel.window(&doc, 0, 0).unwrap(), expected);
+        }
+        assert_eq!(doc.source(), original, "review navigation must not accept the proposal");
+        panel.input(&doc, routed_panel(&Key::Named(NamedKey::Escape), None, ModifiersState::empty(), editing)).unwrap();
+        assert!(confirmation_view(&panel.window(&doc, 0, 0).unwrap(), layout).is_none());
+        assert_eq!(doc.source(), original);
+    }
+
+    #[test]
+    fn settings_gui_confirmation_keeps_empty_conflicts_pending() {
+        let doc = SettingsDocument::parse("").unwrap();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        panel.input(&doc, PanelInput::Accept).unwrap();
+        panel.input(&doc, PanelInput::Capture("ctrl+o".parse().unwrap())).unwrap();
+        panel.input(&doc, PanelInput::Accept).unwrap();
+        assert!(panel.is_confirming());
+        let mut changed = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+o'\ncommand=''\n").unwrap();
+        let before = changed.source().to_owned();
+        let editing = mode(true, true, false);
+        let enter = routed_panel(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), editing);
+        assert!(panel.input(&changed, enter).unwrap_err().to_string().contains("conflicts changed"));
+        let window = panel.window(&changed, 0, 0).unwrap();
+        assert!(window.confirmation.is_empty());
+        assert!(window.proposal.is_some());
+        let view = confirmation_view(&window, Layout::new(79, 7)).expect("proposal still awaits explicit Enter");
+        assert_eq!(view.rows, [("No conflicts remain; Enter applies, Esc cancels".into(), true)]);
+        assert!(view.details[0].contains("file.save <- ctrl+o"));
+        assert_eq!(changed.source(), before);
+        assert!(panel.input(&changed, PanelInput::Next).unwrap().is_none());
+        assert!(panel.is_confirming());
+        let edit = panel.input(&changed, enter).unwrap().expect("second explicit Enter applies reviewed proposal");
+        edit.apply(&mut changed).unwrap();
+        assert_ne!(changed.source(), before);
+        assert!(confirmation_view(&panel.window(&changed, 0, 0).unwrap(), Layout::new(79, 7)).is_none());
     }
 
     #[test]

@@ -1201,6 +1201,33 @@ mod tests {
     }
 
     #[test]
+    fn settings_panel_capacity_rejects_add_before_save_and_never_traps_cancel() {
+        let source = format!("[file_types]\n{}", (0..4095).map(|n| format!("ext{n}='rust'\n")).collect::<String>());
+        let (mut session, requests) = fixture(Some(&source));
+        activate_panel(&mut session, "file_types");
+        session.panel_input(PanelInput::Text("no matching mapping")).unwrap();
+        session.panel_input(PanelInput::Accept).unwrap();
+        session.panel_input(PanelInput::Text("another")).unwrap();
+        session.panel_input(PanelInput::Accept).unwrap();
+        session.panel_input(PanelInput::Text("rust")).unwrap();
+        let result = session.panel_input(PanelInput::Accept);
+        assert!(result.is_err(), "candidate exceeding panel row capacity must be refused");
+        assert_eq!(session.document().unwrap().file_types().len(), 4095);
+        assert!(requests.lock().unwrap().is_empty(), "refused panel additions cannot autosave");
+        // The raw settings file/typed API may independently exceed this UI's
+        // capacity. Keep an unconditional escape route in that case too.
+        session.edit_document(|doc| doc.map_extension("another", Some("rust"))).unwrap();
+        assert!(session.panel_window(0, 1).is_err());
+        assert!(session.panel_input(PanelInput::Cancel).is_ok(), "Escape must remain available for an invalid panel");
+        assert!(!session.panel_is_editing(), "Escape must cancel a draft even when rows cannot be built");
+        assert!(session.panel_input(PanelInput::Cancel).is_ok(), "Escape must clear an invalid panel query");
+        assert_eq!(session.panel_query_cursor(), 0);
+        session.panel_input(PanelInput::Cancel).unwrap();
+        assert!(session.panel().is_none());
+        assert!(session.is_open());
+    }
+
+    #[test]
     fn settings_panel_absolute_selection_builds_rows_once() {
         let source = format!("[file_types]\n{}", (0..32).map(|n| format!("ext{n}='rust'\n")).collect::<String>());
         let (mut session, _) = fixture(Some(&source));

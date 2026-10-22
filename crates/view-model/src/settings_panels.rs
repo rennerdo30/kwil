@@ -280,7 +280,9 @@ impl SettingsPanelController {
     }
     pub fn search(&mut self, doc: &SettingsDocument, query: &str) -> Result<(), SettingsError> {
         let text = Text::new(query.into())?;
-        self.rows(doc)?;
+        if !query.is_empty() {
+            self.rows(doc)?;
+        }
         self.query = text;
         self.selection = 0;
         self.state = State::Browse;
@@ -352,15 +354,16 @@ impl SettingsPanelController {
         })
     }
     pub fn input(&mut self, doc: &SettingsDocument, input: PanelInput<'_>) -> Result<Option<PanelEdit>, SettingsError> {
-        // Validate document bounds even while editing a row from an earlier snapshot.
-        let rows = self.rows(doc)?;
-        self.selection = self.selection.min(rows.len().saturating_sub(1));
         if matches!(input, PanelInput::Cancel)
             || matches!(input, PanelInput::Capture(k) if k.key == Key::Named(NamedKey::Escape) && k.modifiers == Default::default())
         {
             self.state = State::Browse;
             return Ok(None);
         }
+        // Cancellation must remain available even after an external settings
+        // change makes this bounded panel impossible to construct.
+        let rows = self.rows(doc)?;
+        self.selection = self.selection.min(rows.len().saturating_sub(1));
         match &mut self.state {
             State::Confirm(edit, approved) => {
                 match input {
@@ -383,6 +386,7 @@ impl SettingsPanelController {
                     edit.confirm(actual);
                     let mut candidate = doc.clone();
                     edit.apply(&mut candidate)?;
+                    self.rows(&candidate)?;
                     self.state = State::Browse;
                     return Ok(Some(edit));
                 }
@@ -494,6 +498,7 @@ impl SettingsPanelController {
         let mut candidate = doc.clone();
         match edit.apply(&mut candidate) {
             Ok(()) => {
+                self.rows(&candidate)?;
                 self.state = State::Browse;
                 Ok(Some(edit))
             }
