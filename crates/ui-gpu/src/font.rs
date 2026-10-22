@@ -31,6 +31,8 @@ pub struct Font {
     sender: Option<std::sync::mpsc::SyncSender<TileKey>>,
     unicode_bytes: usize,
     pub tab_size: usize,
+    retry_rows: std::collections::HashSet<usize>,
+    canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Font {
@@ -68,6 +70,8 @@ impl Font {
             sender: None,
             unicode_bytes: 0,
             tab_size: 4,
+            retry_rows: Default::default(),
+            canceled: Default::default(),
         })
     }
 
@@ -78,10 +82,14 @@ impl Font {
         let (tx, rx) = std::sync::mpsc::sync_channel::<TileKey>(256);
         let (px, cw, ch, baseline, generation) = (self.px, self.cw, self.ch, self.baseline, self.generation);
         self.sender = Some(tx);
+        let canceled = self.canceled.clone();
         std::thread::spawn(move || {
             // Discovery is lazy even on this worker: ASCII-only files never scan fonts.
             let mut raster = None;
             for key in rx {
+                if canceled.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let raster = raster.get_or_insert_with(|| Rasterizer::new(&family, px, cw, ch, baseline));
                 ready(raster.rasterize(key), generation);
             }
@@ -90,8 +98,27 @@ impl Font {
     pub fn tab_size(&self) -> usize {
         self.tab_size
     }
+    pub fn invalidate_rows(&mut self) {
+        for rows in self.waiting.values_mut() {
+            rows.clear();
+        }
+        self.retry_rows.clear();
+    }
+    pub fn scroll_rows(&mut self, delta: i64, visible: usize) {
+        for rows in self.waiting.values_mut() {
+            move_rows(rows, delta, self.ch, visible);
+        }
+        let mut retry = self.retry_rows.drain().collect();
+        move_rows(&mut retry, delta, self.ch, visible);
+        self.retry_rows.extend(retry);
+    }
+    #[cfg(feature = "frame-harness")]
+    pub fn pending_glyphs(&self) -> usize {
+        self.waiting.len() + self.retry_rows.len()
+    }
     pub fn accept(&mut self, tile: Tile) -> Vec<usize> {
-        let rows = self.waiting.remove(&tile.key).unwrap_or_default();
+        let mut rows = self.waiting.remove(&tile.key).unwrap_or_default();
+        rows.extend(self.retry_rows.drain());
         let bytes = tile.pixels.len() * 4;
         if self.unicode_bytes + bytes > 8 * 1024 * 1024 {
             self.unicode.clear();
@@ -110,6 +137,8 @@ impl Font {
             } else if let Some(tx) = &self.sender {
                 if tx.try_send(key.clone()).is_ok() {
                     self.waiting.insert(key.clone(), vec![y]);
+                } else {
+                    self.retry_rows.insert(y);
                 }
             }
         }
@@ -144,4 +173,33 @@ pub(crate) fn blend(bg: u32, fg: u32, a: u8) -> u32 {
         ((b * (255 - a) + f * a) / 255) << s
     };
     ch(16) | ch(8) | ch(0)
+}
+impl Drop for Font {
+    fn drop(&mut self) {
+        self.canceled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+fn move_rows(rows: &mut Vec<usize>, delta: i64, ch: usize, visible: usize) {
+    let shift = delta * ch as i64;
+    rows.retain_mut(|y| {
+        let next = *y as i64 - shift;
+        if (0..(visible * ch) as i64).contains(&next) {
+            *y = next as usize;
+            true
+        } else {
+            false
+        }
+    });
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn deferred_glyph_damage_follows_scroll_copy() {
+        let mut rows = vec![0, 40, 100, 180];
+        move_rows(&mut rows, 2, 20, 10);
+        assert_eq!(rows, vec![0, 60, 140]);
+        move_rows(&mut rows, -3, 20, 10);
+        assert_eq!(rows, vec![60, 120]);
+    }
 }

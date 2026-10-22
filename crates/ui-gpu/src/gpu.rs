@@ -10,6 +10,54 @@ pub(crate) struct Gpu {
     size: (usize, usize),
 }
 impl Gpu {
+    pub fn invalidate(&mut self) {
+        self.size = (0, 0);
+    }
+    #[cfg(feature = "frame-harness")]
+    pub fn matches(&self, pixels: &[u32]) -> Result<bool, String> {
+        let texture = self.texture.as_ref().ok_or("backing not initialized")?;
+        let (w, h) = self.size;
+        let stride = (w * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kwil harness readback"),
+            size: (stride * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            copy(texture, 0, 0),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride as u32),
+                    rows_per_image: Some(h as u32),
+                },
+            },
+            extent(w, h),
+        );
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(5)) })
+            .map_err(|e| e.to_string())?;
+        rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        let bytes = buffer.slice(..).get_mapped_range().map_err(|e| e.to_string())?;
+        let equal = (0..h).all(|y| {
+            (0..w).all(|x| {
+                let p = pixels[y * w + x];
+                let i = y * stride + x * 4;
+                bytes[i..i + 4] == [(p >> 16) as u8, (p >> 8) as u8, p as u8, 255]
+            })
+        });
+        drop(bytes);
+        buffer.unmap();
+        Ok(equal)
+    }
     pub fn init() -> Result<Self, String> {
         #[cfg(windows)]
         let backends = wgpu::Backends::DX12;

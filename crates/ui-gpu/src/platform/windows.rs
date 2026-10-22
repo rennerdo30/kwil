@@ -70,6 +70,11 @@ impl Native {
         if target.is_null() {
             (state.send)(UserEvent::Notice("File drop registration unavailable".into()));
         }
+        #[cfg(feature = "frame-harness")]
+        println!(
+            "kwil-native subclass={subclass} session_notifications={session} ole={ole} drop_target={}",
+            !target.is_null()
+        );
         Self { hwnd, state, ole, target, session, subclass }
     }
     pub fn theme(&self, dark: bool, remote: bool) {
@@ -236,7 +241,8 @@ unsafe extern "system" fn drop_files(
             use std::os::windows::ffi::OsStringExt;
             let path = PathBuf::from(std::ffi::OsString::from_wide(&path[..len as usize]));
             unsafe {
-                ((&(*t).state).send)(UserEvent::DroppedFile(path));
+                let target = &*t;
+                (target.state.send)(UserEvent::DroppedFile(path));
             }
         }
         unsafe {
