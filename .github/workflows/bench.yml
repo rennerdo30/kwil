@@ -6,6 +6,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      diagnostic_aa:
+        description: Also collect hosted A/A evidence (never grants production acceptance)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -84,11 +89,13 @@ jobs:
           KWIL_FIXTURES: ${{ github.workspace }}/fixtures
         run: cargo bench --locked -j 4 -p kwil-bench --features harness --bench text -- --sample-count 9 --sample-size 1
       - name: Gate contract tests
+        id: protocol
         shell: bash
         run: |
           py=.bench-venv/bin/python
           [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
           "$py" crates/bench/test_gate.py
+          "$py" crates/bench/test_diagnostic_aa.py
       - name: Real terminal startup trace (Linux PTY)
         if: runner.os == 'Linux'
         run: .bench-venv/bin/python crates/bench/tui_smoke.py target/release/kwil fixtures/log-1g.log results/tui-trace.txt
@@ -97,6 +104,7 @@ jobs:
         shell: pwsh
         run: ./crates/bench/tui_smoke.ps1
       - name: Median-of-nine hard and regression gates
+        id: gate
         shell: bash
         run: |
           py=.bench-venv/bin/python
@@ -106,6 +114,30 @@ jobs:
           else
             "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --runs 9 --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
           fi
+      - name: DIAGNOSTIC ONLY - nine paired A/A rounds with identical executables
+        id: aa
+        if: >-
+          ${{ !cancelled() && steps.protocol.outcome == 'success' &&
+          (inputs.diagnostic_aa == true ||
+           (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'bench-aa')) }}
+        shell: bash
+        env:
+          PRODUCTION_GATE_OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          py=.bench-venv/bin/python
+          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
+          if [ '${{ runner.os }}' = Linux ]; then
+            xvfb-run -a "$py" crates/bench/diagnostic_aa.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/diagnostic-aa-${{ matrix.os }}.json
+          else
+            "$py" crates/bench/diagnostic_aa.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/diagnostic-aa-${{ matrix.os }}.json
+          fi
+      - name: Retain separately labelled A/A diagnostic evidence
+        if: always() && steps.aa.outcome != 'skipped' && steps.aa.outcome != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnostic-only-aa-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: results/diagnostic-aa-${{ matrix.os }}.json
+          if-no-files-found: error
       - name: Retain the exact trusted baseline inputs
         if: always()
         shell: bash

@@ -134,6 +134,36 @@ are uploaded on success or failure. Tests inject slow timings to check every
 hard limit, regression direction, paired calibration, memory growth and
 missing/mismatched baseline rejection.
 
+### Separate hosted A/A diagnostic
+
+The parent approved a bounded A/A investigation after run 39838683508 failed
+Linux startup/index regression limits while Windows passed. Add the `bench-aa`
+label to PR #9 once, or manually dispatch with `diagnostic_aa=true`. The normal
+production gate still runs and retains its own outcome. The additional step
+runs even after that gate fails, provided the focused protocol checks passed;
+it cannot turn the failed job green. Subsequent pushes do not repeat A/A merely
+because the label remains present. To request another deliberate diagnostic,
+remove and re-add the label.
+
+Both A/A roles execute the **same executable paths**. SHA-256 is recorded for
+app and harness in both roles and checked again after sampling. Nine paired
+rounds retain the production order: text, file startup, empty startup for each
+role; A/B and B/A alternate. Every child records its PID, command, raw output,
+parent wall time, process CPU time and native resource counters. Linux uses
+`wait4` for that exact child's rusage (faults, context switches, I/O and peak
+RSS), with a pidfd-based timeout that cannot target a reused PID. Windows keeps
+a handle to the started process and reads `GetProcessTimes` and
+`GetProcessIoCounters` after exit. Windows counters are not Unix rusage and
+are labelled separately. CPU time sums all threads, so it can exceed wall time;
+these counters alone do not establish scheduling or frequency as the cause.
+
+The `diagnostic-only-aa-<runner>-attempt-<n>` artifact has a separate schema,
+`diagnostic_only=true`, `acceptance_eligible=false`, partial child records on
+failure and the production gate's unchanged outcome. Its A/B ratios are evidence,
+never an acceptance waiver or a baseline update. The script rejects ordinary
+local invocation; no owner-PC A/A campaign is authorized. Native collector and
+negative protocol checks run on hosted CI, without local Cargo-lane use.
+
 The parent approved paired timing comparison on 2026-10-23 after
 [run 39830020650](https://github.com/rennerdo30/kwil/actions/runs/39830020650)
 measured unchanged baseline code at 10.96 GB/s versus its stored 17.35 GB/s;
