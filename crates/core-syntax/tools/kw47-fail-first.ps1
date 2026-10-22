@@ -11,6 +11,15 @@ $evidence = Join-Path $root ('fixtures/kw47-evidence/fail-first-' + [guid]::NewG
 New-Item -ItemType Directory -Path $evidence -Force | Out-Null
 "commit=$commit" | Set-Content -LiteralPath (Join-Path $evidence 'summary.log')
 
+function Refresh-SourceInputs([string]$source) {
+    # Cargo's shared path-package artifacts can otherwise treat a copied file's
+    # preserved (older) mtime as fresh and reuse a DIFFERENT mutant's library.
+    # Invalidate only these owned crate inputs, retaining all dependency cache.
+    foreach ($file in @('crates/core-syntax/src/lib.rs', 'crates/view-model/src/highlighting.rs', 'crates/core-syntax/tests/kw47.rs')) {
+        [IO.File]::SetLastWriteTimeUtc((Join-Path $source $file), [DateTime]::UtcNow)
+    }
+}
+
 function Mutant([string]$name, [string]$file, [string]$before, [string]$after, [string]$package, [string]$test, [string]$integration = '') {
     if ($Only -and $name -notin $Only) { return }
     $copy = Join-Path $evidence $name
@@ -22,6 +31,7 @@ function Mutant([string]$name, [string]$file, [string]$before, [string]$after, [
     $original = [IO.File]::ReadAllText($path)
     if (-not $original.Contains($before)) { throw "Missing mutation anchor: $name" }
     [IO.File]::WriteAllText($path, $original.Replace($before, $after))
+    Refresh-SourceInputs $copy
     $log = Join-Path $evidence "$name.log"
     "commit=$commit mutant=$name source_copy=$copy test=$test" | Set-Content -LiteralPath $log
     Get-FileHash -LiteralPath $path -Algorithm SHA256 | ForEach-Object { "mutated_source_sha256=$($_.Hash)" } | Add-Content -LiteralPath $log
@@ -54,6 +64,7 @@ function Mutant([string]$name, [string]$file, [string]$before, [string]$after, [
     "EXPECTED RED: $name / $test" | Tee-Object -FilePath (Join-Path $evidence 'summary.log') -Append
 }
 
+try {
 Mutant 'precedence' 'crates/core-syntax/src/detection.rs' 'if let Some(language) = picker {' 'if let Some(language) = None::<Language> {' 'kwil-core-syntax' 'detection_precedence' 'kw47'
 Mutant 'generic' 'crates/core-syntax/src/engine.rs' 'Ok(Highlights { revision, requested, queried, spans, mode, incremental })' 'Ok(Highlights { revision, requested, queried, spans: Vec::new(), mode, incremental })' 'kwil-core-syntax' 'generic_real_spans' 'kw47'
 Mutant 'bounded-read' 'crates/core-syntax/src/detection.rs' 'FIRST_LINE_LIMIT: usize = 64 * 1024' 'FIRST_LINE_LIMIT: usize = 128 * 1024' 'kwil-core-syntax' 'bounded_first_line_read' 'kw47'
@@ -67,4 +78,5 @@ Mutant 'prior-highlights' 'crates/view-model/src/highlighting.rs' 'self.previous
 Mutant 'stop-retirement' 'crates/view-model/src/highlighting.rs' 'state.stopped = true;' 'state.stopped = true; drop(state.pending.take());' 'kwil-view-model' 'highlighting::tests::cancel_and_drop_retire_pending_on_worker'
 Mutant 'generic-margin' 'crates/core-syntax/src/engine.rs' 'self.config.margin_bytes' '0' 'kwil-core-syntax' 'generic_large_source_reads_only_margin' 'kw47'
 Mutant 'timestamp-log' 'crates/core-syntax/src/detection.rs' 'timestamp_prefix(line.as_bytes())' 'false' 'kwil-core-syntax' 'log_filename_timestamp_and_level_detection' 'kw47'
+} finally { Refresh-SourceInputs $root }
 Write-Output "Fail-first evidence: $evidence"
