@@ -66,4 +66,5 @@ Mutant 'result-cap' 'crates/view-model/src/highlighting.rs' 'highlights.spans.le
 Mutant 'prior-highlights' 'crates/view-model/src/highlighting.rs' 'self.previous = Some(update);' 'self.previous = None;' 'kwil-view-model' 'highlighting::tests::errors_keep_prior_highlights_and_state_rejects_stale'
 Mutant 'stop-retirement' 'crates/view-model/src/highlighting.rs' 'state.stopped = true;' 'state.stopped = true; drop(state.pending.take());' 'kwil-view-model' 'highlighting::tests::cancel_and_drop_retire_pending_on_worker'
 Mutant 'generic-margin' 'crates/core-syntax/src/engine.rs' 'self.config.margin_bytes' '0' 'kwil-core-syntax' 'generic_large_source_reads_only_margin' 'kw47'
+Mutant 'timestamp-log' 'crates/core-syntax/src/detection.rs' 'timestamp_prefix(line.as_bytes())' 'false' 'kwil-core-syntax' 'log_filename_timestamp_and_level_detection' 'kw47'
 Write-Output "Fail-first evidence: $evidence"

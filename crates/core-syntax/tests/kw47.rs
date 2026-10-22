@@ -163,3 +163,32 @@ fn generic_large_source_reads_only_margin() {
     assert_eq!(source.0.lock().unwrap().iter().map(|r| r.len()).sum::<usize>(), 32 + 8192);
     assert!(source.0.lock().unwrap().iter().all(|r| r.start >= 900_000_000 - 4096 && r.end <= 900_000_032 + 4096));
 }
+
+#[test]
+fn log_filename_timestamp_and_level_detection() {
+    for path in ["server.log", "server.LOG", "server.log.1", "server.log.2026-10-23", "log"] {
+        let d = detected(path, "unclassified words");
+        assert!(d.log_levels, "{path}");
+        assert_eq!(d.language, Language::Generic);
+        assert_eq!(d.origin, Origin::Filename);
+    }
+    for line in [
+        "2026-10-23T05:57:00Z ready",
+        "2026/10/23 05:57:00.123 ready",
+        "[2026-10-23 05:57:00] ready",
+        "05:57:00 ready",
+        "Oct 23 05:57:00 host process: ready",
+        "Oct  3 05:57:00 host: ready",
+        "[INFO] ready",
+        "WARN ready",
+    ] {
+        let d = detected("unknown", line);
+        assert!(d.log_levels, "{line}");
+        assert_eq!(d.language, Language::Generic);
+        assert_eq!(d.origin, Origin::Content);
+    }
+    assert!(!detected("server.log.gz", "unclassified words").log_levels);
+    assert!(!detected("unknown", "25:00:00 invalid time").log_levels);
+    assert!(!detected("unknown", "2026-10-23 not a timestamp").log_levels);
+    assert_eq!(detected("unknown", "[section] # comment").language, Language::Ini);
+}

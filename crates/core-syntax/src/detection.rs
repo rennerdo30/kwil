@@ -146,7 +146,7 @@ impl Detector {
         if let Some(language) = crate::detect(path, b"") {
             return Ok(selected(language, DetectionOrigin::Filename));
         }
-        if basename.eq_ignore_ascii_case("log") || basename.to_ascii_lowercase().ends_with(".log") {
+        if log_filename(basename) {
             return Ok(Detection { language: Language::Generic, origin: DetectionOrigin::Filename, log_levels: true });
         }
         if let Some((language, log_levels)) = sniff(line) {
@@ -291,7 +291,17 @@ fn sniff(line: &str) -> Option<(Language, bool)> {
     if line.starts_with('<') && bytes.get(1).is_some_and(u8::is_ascii_alphabetic) && line.contains('>') {
         return Some((Language::Xml, false));
     }
-    if line.starts_with('[') && line.find(']').is_some_and(|i| i > 1)
+    // Timestamped records and bracketed levels are logs rather than INI
+    // sections. Inspect only this already-bounded first line, never a file scan.
+    let level_prefix = line.trim_start_matches(['[', '(', ' ']);
+    let level_prefix = level_prefix.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+    if timestamp_prefix(line.as_bytes()) || log_class(level_prefix.as_bytes()).is_some() {
+        return Some((Language::Generic, true));
+    }
+    if line.starts_with('[')
+        && line.find(']').is_some_and(|i| {
+            i > 1 && line[i + 1..].trim().starts_with(['#', ';']) || i > 1 && line[i + 1..].trim().is_empty()
+        })
         || line.split_once('=').is_some_and(|(key, _)| {
             !key.trim().is_empty()
                 && key.trim().bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
@@ -303,4 +313,59 @@ fn sniff(line: &str) -> Option<(Language, bool)> {
         return Some((Language::Generic, true));
     }
     None
+}
+
+fn log_filename(basename: &str) -> bool {
+    let name = basename.to_ascii_lowercase();
+    if name == "log" || name.ends_with(".log") {
+        return true;
+    }
+    // Numeric/date rotations are still logs. Compressed suffixes belong to the
+    // separate compression worker; never interpret compressed bytes as text.
+    name.rsplit_once(".log.").is_some_and(|(_, suffix)| {
+        !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+    })
+}
+
+fn clock_prefix(bytes: &[u8]) -> bool {
+    if bytes.len() < 8
+        || bytes[2] != b':'
+        || bytes[5] != b':'
+        || ![0, 1, 3, 4, 6, 7].into_iter().all(|i| bytes[i].is_ascii_digit())
+    {
+        return false;
+    }
+    let pair = |i| (bytes[i] - b'0') * 10 + bytes[i + 1] - b'0';
+    pair(0) <= 23 && pair(3) <= 59 && pair(6) <= 60 && bytes.get(8).is_none_or(|b| !b.is_ascii_digit())
+}
+
+fn timestamp_prefix(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"[").unwrap_or(bytes);
+    // Time-only logs, ISO 8601 and common slash-separated application dates.
+    if clock_prefix(bytes) {
+        return true;
+    }
+    if bytes.len() >= 19
+        && matches!(bytes[4], b'-' | b'/')
+        && bytes[7] == bytes[4]
+        && matches!(bytes[10], b'T' | b't' | b' ')
+        && [0, 1, 2, 3, 5, 6, 8, 9].into_iter().all(|i| bytes[i].is_ascii_digit())
+        && clock_prefix(&bytes[11..])
+    {
+        return true;
+    }
+    // RFC 3164 style syslog (Oct 23 05:57:00 ...), including a single-digit day.
+    if bytes.len() >= 14
+        && [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"]
+            .iter()
+            .any(|month| bytes[..3].eq_ignore_ascii_case(*month))
+        && bytes[3] == b' '
+    {
+        let rest = &bytes[4..];
+        let spaces = rest.iter().take_while(|b| **b == b' ').count();
+        let rest = &rest[spaces..];
+        let day = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        return (1..=2).contains(&day) && rest.get(day) == Some(&b' ') && clock_prefix(&rest[day + 1..]);
+    }
+    false
 }
