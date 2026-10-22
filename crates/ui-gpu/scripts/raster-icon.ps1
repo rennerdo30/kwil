@@ -1,4 +1,4 @@
-# Rasterize the existing owner-authored SVG; no runtime SVG/image dependency.
+# Rasterize the existing Kwil SVG; no runtime SVG/image dependency.
 param([string]$ToolRoot = ('E:/Development/_cache/kwil-icon-tool-' + [Guid]::NewGuid()))
 $ErrorActionPreference='Stop'
 $repo=(Resolve-Path "$PSScriptRoot/../../..").Path
