@@ -138,6 +138,27 @@ commit. The red run must specifically show an index budget/regression failure,
 then the final head must pass the same workflow. Run links and local numbers are
 recorded in the PR and KW-33.
 
+### Acceptance evidence
+
+- Baseline seed: [hosted run 39827665077](https://github.com/rennerdo30/kwil/actions/runs/39827665077),
+  source merge `c2530a2699c6afa5744bf33f9b36f98e6eb8bf13`; exact result files
+  stored on `bench-baseline` at `8dadd5d76ea71ea67c2c3c703619897171b56721`.
+  Both OS hard-limit checks, TUI traces and viewer scenarios passed before the
+  expected missing-baseline failure.
+- [Deliberate delayed-index red run](https://github.com/rennerdo30/kwil/actions/runs/39828494393),
+  head `5a668071755e281b8f60440c519fd93400e1ddad`: one second in actual
+  `LineIndex::build`, Linux **0.9831 GB/s**, Windows **0.8954 GB/s**, both below
+  the **1 GB/s hard limit**. The delay is removed in `190753b`.
+- Initial local light check (three samples, b1b5c55 text operations before main
+  integration): fresh-process open **0.1636 ms**, index **6.8656 GB/s**, jump
+  **0.0086 ms**, private **3.9336 MiB**. Separate three-sample Divan medians:
+  open **0.06609 ms**, index **6.695 GB/s**, jump **0.001799 ms**.
+- Final local viewer smoke before main integration: hidden GUI first frame
+  **62.755 ms**, index done **129.760 ms**; idle **0 + 0** presents, scroll
+  **20** partial presents, **19,456,000** copied pixels, **1,024,000** damaged
+  pixels. Hidden Windows TUI trace exited successfully. Full suites, cold cache,
+  low-RAM stress and native RDP/VNC were not run locally.
+
 ## Slots for integration after other packages merge
 
 - **TODO KW-22:** literal search, 1 GiB, target 300 ms / hard 1 s.
