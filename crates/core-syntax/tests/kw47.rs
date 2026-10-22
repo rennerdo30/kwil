@@ -56,6 +56,8 @@ fn detection_precedence() {
     assert!(detected("server.log", "hello").log_levels);
     assert_eq!(detected("unknown", "unclassified words").language, Language::Generic);
     assert_eq!(detected("script", "#!/usr/bin/perl").language, Language::Generic);
+    assert_eq!(detected("script", "#!/usr/bin/env -u python ruby").language, Language::Ruby);
+    assert_eq!(detected("script", "#!/usr/bin/env NODE_ENV=python bash").language, Language::Bash);
     assert_eq!(Language::from_id("nonexistent"), None);
     assert_eq!(Language::ALL.len(), 32);
     assert_eq!(Language::CATALOGUE.len(), 33);

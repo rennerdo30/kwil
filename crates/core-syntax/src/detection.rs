@@ -45,7 +45,7 @@ pub enum DetectionOrigin {
     Generic,
 }
 
-/// Logs retain the Generic language identity and use a log-level overlay.
+/// Logs retain the Generic language identity, whose lexer recognizes levels.
 /// This does not claim an audited tree-sitter log grammar exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Detection {
@@ -217,8 +217,24 @@ fn first_line_language(line: &str) -> Option<Language> {
     if let Some(rest) = line.strip_prefix("#!") {
         let mut tokens = rest.split_whitespace();
         let program = tokens.next()?.rsplit('/').next()?;
-        let interpreter =
-            if program == "env" { tokens.find(|s| !s.starts_with('-') && !s.contains('='))? } else { program };
+        let interpreter = if program == "env" {
+            loop {
+                let token = tokens.next()?;
+                match token {
+                    // These options consume a value; it is not an interpreter.
+                    "-u" | "--unset" | "-C" | "--chdir" => {
+                        tokens.next()?;
+                    }
+                    "--" => break tokens.next()?,
+                    "-i" | "--ignore-environment" | "-S" | "--split-string" => {}
+                    value if value.starts_with("--unset=") || value.starts_with("--chdir=") || value.contains('=') => {}
+                    value if value.starts_with('-') => return None,
+                    value => break value,
+                }
+            }
+        } else {
+            program
+        };
         let interpreter = interpreter.rsplit('/').next()?;
         return Some(match interpreter {
             "python" | "python2" | "python3" => Language::Python,
