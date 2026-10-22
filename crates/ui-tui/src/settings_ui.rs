@@ -18,6 +18,10 @@ fn value_text(value: &SettingValue) -> String {
     }
 }
 
+fn conflict_label(conflict: &kwil_core_commands::settings_ui::KeyConflict) -> String {
+    format!("{} -> {} ({:?})", conflict.keys, conflict.command, conflict.kind)
+}
+
 pub(super) fn key(host: &mut SettingsSession, event: KeyEvent) -> bool {
     if host.panel().is_some() {
         if host.panel_is_capturing() {
@@ -173,8 +177,19 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
     let query = text_window(&window.query, host.panel_query_cursor(), columns.saturating_sub(2));
     let query_cursor = query.cursor;
     line(1, format!("/ {}", query.text), false);
-    for (index, row) in window.rows.iter().enumerate() {
-        line(index as u16 + 2, format!("{}: {}  {}", row.title, row.value, row.source), row.selected);
+    if window.confirmation.is_empty() {
+        for (index, row) in window.rows.iter().enumerate() {
+            line(index as u16 + 2, format!("{}: {}  {}", row.title, row.value, row.source), row.selected);
+        }
+    } else {
+        let first = window.confirmation_index.saturating_sub(visible / 2);
+        for (index, conflict) in window.confirmation.iter().enumerate().skip(first).take(visible) {
+            line(
+                (index - first) as u16 + 2,
+                format!("{}/{} {}", index + 1, window.confirmation.len(), conflict_label(conflict)),
+                index == window.confirmation_index,
+            );
+        }
     }
     let mut caret = Some((area.x + 3 + query_cursor as u16, area.y + 1));
     if let Some(edit) = &window.edit_text {
@@ -190,17 +205,25 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
         line(area.height - 4, format!("Keys: {}", if capture.is_empty() { "Press keys..." } else { capture }), true);
         line(area.height - 3, "Enter accepts a captured chord; Esc cancels".into(), false);
     } else if !window.confirmation.is_empty() {
-        line(
-            area.height - 4,
-            format!("Conflicts: {}  Enter move binding  Esc cancel", window.confirmation.len()),
-            true,
-        );
+        line(area.height - 4, format!("New: {}", window.proposal.as_deref().unwrap_or("preset bindings")), true);
+        if let Some(conflict) = window.confirmation.get(window.confirmation_index) {
+            line(area.height - 3, format!("Replace: {}", conflict_label(conflict)), false);
+        }
     } else if let Some(row) = window.rows.iter().find(|row| row.selected) {
         line(area.height - 4, row.description.clone(), false);
         line(area.height - 3, format!("Default: {}", row.default), false);
     }
     line(area.height - 2, host.status().into(), false);
-    line(area.height - 1, "Enter edit/apply  Delete reset/remove  Esc back".into(), false);
+    line(
+        area.height - 1,
+        if window.confirmation.is_empty() {
+            "Enter edit/apply  Delete reset/remove  Esc back"
+        } else {
+            "Up/Down review conflicts  Enter replace  Esc cancel"
+        }
+        .into(),
+        false,
+    );
     if let Some(caret) = caret {
         frame.set_cursor_position(caret);
     }
@@ -220,7 +243,7 @@ mod tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("settings.toml");
-        std::fs::write(&path, "").unwrap();
+        std::fs::write(&path, "[[bindings]]\nkeys='ctrl+c ctrl+x'\ncommand='file.open'\n").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut host = SettingsSession::start(
             path,
@@ -252,6 +275,20 @@ mod tests {
         key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(host.panel().is_none());
         assert!(host.is_open(), "second Escape returns to settings, not the document");
+        host.input(SettingsInput::Accept).unwrap();
+        host.panel_input(PanelInput::Text("file.save")).unwrap();
+        key(&mut host, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        key(&mut host, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        key(&mut host, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let window = host.panel_window(0, 0).unwrap().unwrap();
+        assert!(window.confirmation.len() >= 2);
+        terminal.draw(|frame| draw(frame, &host)).unwrap();
+        let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("file.save <- ctrl+c"), "confirmation must retain the proposed binding");
+        assert!(screen.contains("ctrl+c -> edit.copy (Exact)"), "confirmation must name what will be replaced");
+        key(&mut host, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(host.panel_window(0, 0).unwrap().unwrap().confirmation_index, 1);
+        key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         host.stop().shutdown().unwrap();
         drop(host);
         std::fs::remove_dir_all(directory).unwrap();

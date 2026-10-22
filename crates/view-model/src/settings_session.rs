@@ -495,12 +495,7 @@ impl SettingsSession {
             if panel.is_editing() {
                 return Err("finish or cancel the panel edit before selecting another row".into());
             }
-            let window = panel.window(doc, 0, 0).map_err(|e| e.to_string())?;
-            let target = index.min(window.total.saturating_sub(1));
-            for _ in 0..window.selection.abs_diff(target) {
-                let input = if target > window.selection { PanelInput::Next } else { PanelInput::Previous };
-                panel.input(doc, input).map_err(|e| e.to_string())?;
-            }
+            panel.select(doc, index).map_err(|e| e.to_string())?;
             Ok(())
         })();
         self.finish_action(result)
@@ -1203,6 +1198,17 @@ mod tests {
                 .iter()
                 .any(|b| b.command == "file.save" && b.keys == "ctrl+c")
         );
+    }
+
+    #[test]
+    fn settings_panel_absolute_selection_builds_rows_once() {
+        let source = format!("[file_types]\n{}", (0..32).map(|n| format!("ext{n}='rust'\n")).collect::<String>());
+        let (mut session, _) = fixture(Some(&source));
+        activate_panel(&mut session, "file_types");
+        crate::settings_panels::take_row_builds();
+        session.panel_select(usize::MAX).unwrap();
+        assert_eq!(crate::settings_panels::take_row_builds(), 1, "absolute selection must build the panel once");
+        assert_eq!(session.panel_window(0, 0).unwrap().unwrap().selection, 32);
     }
 
     #[test]

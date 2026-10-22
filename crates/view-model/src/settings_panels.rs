@@ -26,6 +26,12 @@ use unicode_segmentation::UnicodeSegmentation;
 pub const PANEL_INPUT_LIMIT: usize = 64 * 1024;
 /// Refuse larger panels explicitly. A viewport is separately bounded by this cap.
 pub const PANEL_ROW_LIMIT: usize = 4096;
+#[cfg(test)]
+thread_local! { static ROW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn take_row_builds() -> usize {
+    ROW_BUILDS.with(|count| count.replace(0))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum PanelInput<'a> {
@@ -148,6 +154,8 @@ pub struct PanelWindow {
     pub capture: Option<String>,
     pub edit_text: Option<PanelEditText>,
     pub confirmation: Vec<KeyConflict>,
+    pub confirmation_index: usize,
+    pub proposal: Option<String>,
 }
 
 #[derive(Clone)]
@@ -226,10 +234,11 @@ pub struct SettingsPanelController {
     query: Text,
     selection: usize,
     state: State,
+    confirmation_index: usize,
 }
 impl SettingsPanelController {
     pub fn new(panel: SettingsPanel, doc: &SettingsDocument) -> Result<Self, SettingsError> {
-        let result = Self { panel, query: Text::default(), selection: 0, state: State::Browse };
+        let result = Self { panel, query: Text::default(), selection: 0, state: State::Browse, confirmation_index: 0 };
         result.rows(doc)?;
         Ok(result)
     }
@@ -238,6 +247,14 @@ impl SettingsPanelController {
     }
     pub fn selected(&self) -> usize {
         self.selection
+    }
+    /// Select an absolute row with one bounded validation/filter pass.
+    pub fn select(&mut self, doc: &SettingsDocument, index: usize) -> Result<(), SettingsError> {
+        if self.is_editing() {
+            return Err(error("finish or cancel the panel edit before selecting another row"));
+        }
+        self.selection = index.min(self.rows(doc)?.len().saturating_sub(1));
+        Ok(())
     }
     pub fn query(&self) -> &str {
         &self.query.value
@@ -307,6 +324,16 @@ impl SettingsPanelController {
             capture,
             edit_text,
             confirmation,
+            confirmation_index: self.confirmation_index,
+            proposal: match &self.state {
+                State::Confirm(PanelEdit::Rebind { binding, .. }, _) => {
+                    Some(format!("{} <- {} [{:?}/{:?}]", binding.command, binding.keys, binding.context, binding.mode))
+                }
+                State::Confirm(PanelEdit::ResetCommand { command, .. }, _) => {
+                    Some(format!("Reset {command} to preset"))
+                }
+                _ => None,
+            },
             rows: rows
                 .into_iter()
                 .enumerate()
@@ -336,10 +363,20 @@ impl SettingsPanelController {
         }
         match &mut self.state {
             State::Confirm(edit, approved) => {
+                match input {
+                    PanelInput::Next => {
+                        self.confirmation_index = (self.confirmation_index + 1).min(approved.len().saturating_sub(1))
+                    }
+                    PanelInput::Previous => self.confirmation_index = self.confirmation_index.saturating_sub(1),
+                    PanelInput::Home => self.confirmation_index = 0,
+                    PanelInput::End => self.confirmation_index = approved.len().saturating_sub(1),
+                    _ => {}
+                }
                 if matches!(input, PanelInput::Accept) {
                     let actual = edit.conflicts(doc)?;
                     if actual != *approved {
                         *approved = actual;
+                        self.confirmation_index = 0;
                         return Err(error("shortcut conflicts changed; review and confirm again"));
                     }
                     let mut edit = edit.clone();
@@ -465,12 +502,15 @@ impl SettingsPanelController {
                 if conflicts.is_empty() {
                     return Err(failure);
                 }
+                self.confirmation_index = 0;
                 self.state = State::Confirm(edit, conflicts);
                 Ok(None)
             }
         }
     }
     fn rows(&self, doc: &SettingsDocument) -> Result<Vec<Row>, SettingsError> {
+        #[cfg(test)]
+        ROW_BUILDS.with(|count| count.set(count.get() + 1));
         let mut rows = Vec::new();
         match self.panel {
             SettingsPanel::Keymap => {
@@ -779,6 +819,27 @@ mod tests {
         press(&mut panel, &doc, key("alt+f9"));
         assert!(press(&mut panel, &doc, key("escape")).is_none());
         assert!(!panel.is_editing());
+    }
+
+    #[test]
+    fn settings_confirmation_exposes_proposal_and_navigates_each_conflict() {
+        let doc = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+c ctrl+x'\ncommand='file.open'\n").unwrap();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        press(&mut panel, &doc, PanelInput::Accept);
+        press(&mut panel, &doc, key("ctrl+c"));
+        press(&mut panel, &doc, PanelInput::Accept);
+        let window = panel.window(&doc, 0, 1).unwrap();
+        assert!(window.confirmation.len() >= 2);
+        assert!(window.proposal.as_deref().unwrap().contains("file.save <- ctrl+c"));
+        assert_eq!(window.confirmation_index, 0);
+        press(&mut panel, &doc, PanelInput::Next);
+        assert_eq!(panel.window(&doc, 0, 0).unwrap().confirmation_index, 1);
+        press(&mut panel, &doc, PanelInput::End);
+        assert_eq!(panel.window(&doc, 0, 0).unwrap().confirmation_index, window.confirmation.len() - 1);
+        press(&mut panel, &doc, PanelInput::Home);
+        assert_eq!(panel.window(&doc, 0, 0).unwrap().confirmation_index, 0);
+        assert_eq!(doc.settings().bindings[0].keys, "ctrl+c ctrl+x", "review navigation cannot apply changes");
     }
 
     #[test]
