@@ -87,13 +87,13 @@ fn measure_kwil(path: &Path) {
     let t0 = Instant::now();
     let file = kwil_core_text::TextFile::open(path).unwrap();
     let t_open = t0.elapsed();
-    let first: usize = file.first_lines(SCREEN).iter().map(|l| l.len()).sum();
+    let first: usize = file.first_lines(SCREEN).unwrap().iter().map(|l| l.len()).sum();
     let t_first = t0.elapsed();
     let t1 = Instant::now();
-    let lines = file.build_index(INDEX_THREADS).line_count();
+    let lines = file.build_index(INDEX_THREADS).unwrap().line_count();
     let t_index = t1.elapsed();
     let t2 = Instant::now();
-    let jump = file.lines(JUMP_LINE, SCREEN).unwrap();
+    let jump = file.lines(JUMP_LINE, SCREEN).unwrap().unwrap();
     let t_jump = t2.elapsed();
     let sample = String::from_utf8_lossy(jump[0]).into_owned();
     report("kwil", file.len(), t_open, t_first, t_index, t_jump, lines as usize, first, &sample);

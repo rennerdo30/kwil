@@ -126,8 +126,14 @@ impl View {
             self.lines = vec![b"No file open. Usage: kwil <file>".to_vec()];
             return;
         };
-        let lines = file.lines(self.top, self.rows).unwrap_or_else(|| file.first_lines(self.rows));
-        self.lines = lines.into_iter().map(|l| l.to_vec()).collect();
+        let lines = file.lines(self.top, self.rows).and_then(|lines| match lines {
+            Some(lines) => Ok(lines),
+            None => file.first_lines(self.rows),
+        });
+        match lines {
+            Ok(lines) => self.lines = lines.into_iter().map(|l| l.to_vec()).collect(),
+            Err(e) => self.notice = e.to_string(),
+        }
     }
 
     pub fn status_text(&self) -> String {
@@ -157,7 +163,7 @@ mod tests {
         let text: String = (0..n).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&path, text).unwrap();
         let file = TextFile::open(&path).unwrap();
-        file.build_index(2);
+        file.build_index(2).unwrap();
         let mut v = View::new(Some((path, file)));
         v.set_rows(10);
         v
