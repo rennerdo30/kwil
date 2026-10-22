@@ -17,7 +17,9 @@ use std::{
 
 mod commands;
 mod hex;
+pub(crate) mod receipts;
 mod save;
+use receipts::{EditKind, ReceiptState, Recipe, Transition};
 
 const MAX_CURSORS: usize = 4096;
 const BURST_GAP: Duration = Duration::from_millis(500);
@@ -145,6 +147,7 @@ struct HistoryEntry {
     after: State,
     edited: Range<u64>,
     structural: bool,
+    transition: Transition,
 }
 
 #[derive(Clone)]
@@ -213,6 +216,7 @@ pub struct Editor {
     comment_override: Option<String>,
     saving: bool,
     box_column: Option<u64>,
+    receipts: ReceiptState,
 }
 
 impl Editor {
@@ -237,6 +241,7 @@ impl Editor {
             comment_override: None,
             saving: false,
             box_column: None,
+            receipts: ReceiptState::default(),
         }
     }
     pub fn document(&self) -> &Document {
@@ -454,6 +459,7 @@ impl Editor {
         typing: Option<Duration>,
         caret_at_end: bool,
     ) -> io::Result<Damage> {
+        self.admit_edit()?;
         edits.retain(|e| !e.range.is_empty() || e.insert.len() > 0);
         if edits.is_empty() {
             return Ok(Damage::default());
@@ -478,12 +484,14 @@ impl Editor {
         let before = self.state();
         let first_row = text::row(&snapshot, plan[0].range.start)?;
         let last_row = text::row(&snapshot, plan.last().unwrap().range.end)?;
+        let recipe = Recipe::explicit(&plan);
+        let merged_recipe = self.undo.back().and_then(|entry| entry.transition.recipe.coalesced(&recipe));
         let coalesce = typing.is_some_and(|at| {
             self.join_insert
                 || self.burst.as_ref().is_some_and(|(previous, cursors)| {
                     *cursors == self.cursors && at.checked_sub(*previous).is_some_and(|gap| gap <= BURST_GAP)
                 })
-        }) && !self.undo.is_empty();
+        }) && merged_recipe.is_some();
         self.document.buffer.begin();
         for edit in plan.iter().rev() {
             let result = (|| {
@@ -523,6 +531,7 @@ impl Editor {
         self.document.changed();
         self.box_column = None;
         let after = self.state();
+        let transition = Transition { before: snapshot.clone(), after: self.document.snapshot(), recipe };
         let structural = snapshot.line_count() != self.document.buffer.line_count();
         self.redo.clear();
         if coalesce {
@@ -531,10 +540,19 @@ impl Editor {
             entry.edited.start = entry.edited.start.min(first_row);
             entry.edited.end = entry.edited.end.max(last_row + 1);
             entry.structural |= structural;
+            entry.transition.after = transition.after.clone();
+            entry.transition.recipe = merged_recipe.unwrap();
         } else {
-            self.undo.push_back(HistoryEntry { before, after, edited: first_row..last_row + 1, structural });
+            self.undo.push_back(HistoryEntry {
+                before: before.clone(),
+                after,
+                edited: first_row..last_row + 1,
+                structural,
+                transition: transition.clone(),
+            });
         }
-        self.trim_history();
+        self.charge_model_history();
+        self.publish(transition, before.revision, self.document.revision, EditKind::Edit);
         self.burst = typing.map(|at| (at, self.cursors.clone()));
         if typing.is_some() {
             self.join_insert = self.mode == Mode::Insert;
@@ -557,7 +575,13 @@ impl Editor {
 
     /// Streaming bulk edits arrive in descending original offsets. Only one
     /// line's recipe and the cursor set are resident, even for select-all.
-    fn apply_descending(&mut self, edits: impl Iterator<Item = io::Result<Option<Edit>>>) -> io::Result<Damage> {
+    fn apply_descending<I>(&mut self, edits: I) -> io::Result<Damage>
+    where
+        I: DoubleEndedIterator<Item = io::Result<Option<Edit>>> + Clone + Send + Sync + 'static,
+    {
+        self.admit_edit()?;
+        let recipe_seed = edits.clone();
+        let mut replacement_count = 0;
         let before = self.state();
         let old = self.cursor_rows()?;
         let s = self.document.snapshot();
@@ -582,6 +606,7 @@ impl Editor {
                     c.desired_column = None;
                 }
                 changed = true;
+                replacement_count += 1;
                 Ok(())
             })();
             if let Err(error) = result {
@@ -598,13 +623,20 @@ impl Editor {
         self.document.changed();
         self.box_column = None;
         self.redo.clear();
+        let transition = Transition {
+            before: s.clone(),
+            after: self.document.snapshot(),
+            recipe: Recipe::bulk(recipe_seed, replacement_count),
+        };
         self.undo.push_back(HistoryEntry {
-            before,
+            before: before.clone(),
             after: self.state(),
             edited: first_row..last_row + 1,
             structural: s.line_count() != self.document.buffer.line_count(),
+            transition: transition.clone(),
         });
-        self.trim_history();
+        self.charge_model_history();
+        self.publish(transition, before.revision, self.document.revision, EditKind::Edit);
         self.finish_damage(old, Some(first_row..last_row + 1))
     }
     pub fn set_undo_memory_limit(&mut self, bytes: usize) {
@@ -717,6 +749,8 @@ impl Editor {
         self.history(true)
     }
     fn history(&mut self, redo: bool) -> io::Result<Damage> {
+        self.admit_edit()?;
+        let before_revision = self.document.revision;
         let old = self.cursor_rows()?;
         self.end_burst();
         self.trim_history();
@@ -731,6 +765,7 @@ impl Editor {
                     edited = entry.edited.clone();
                 }
                 self.restore(entry.after.clone());
+                self.publish(entry.transition.clone(), before_revision, self.document.revision, EditKind::Redo);
                 self.undo.push_back(entry);
             }
         } else if let Some(entry) = self.undo.pop_back() {
@@ -738,6 +773,7 @@ impl Editor {
                 edited = entry.edited.clone();
             }
             self.restore(entry.before.clone());
+            self.publish(entry.transition.clone(), before_revision, self.document.revision, EditKind::Undo);
             self.redo.push_back(entry);
         }
         self.finish_damage(old, Some(edited))
@@ -1030,8 +1066,11 @@ impl Editor {
         }
         self.cursors = before.clone();
         for (c, old) in self.cursors.iter_mut().zip(before) {
+            // A selection ending at the following line start belongs to its
+            // first selected byte. A caret at that boundary owns the next line.
+            let owner = old.selection().start;
             for (range, delta) in &cursor_moves {
-                if range.contains(&old.head) || old.head == range.end && old.head == s.len() {
+                if range.contains(&owner) || old.is_caret() && owner == range.end && owner == s.len() {
                     c.head = (old.head as i128 + delta).clamp(0, self.document.buffer.len() as i128) as u64;
                     c.anchor = (old.anchor as i128 + delta).clamp(0, self.document.buffer.len() as i128) as u64;
                     break;
@@ -1069,7 +1108,7 @@ impl Editor {
             }
         }
         let settings = self.settings.editor.clone();
-        let edits = ranges.into_iter().rev().flat_map(|r| r.rev()).map(|row| {
+        let edits = ranges.into_iter().rev().flat_map(|r| r.rev()).map(move |row| {
             let bounds = text::line(&s, row)?;
             let bytes = text::read(&s, bounds.start..bounds.end.min(bounds.start + text::WINDOW), text::WINDOW)?;
             let white = bytes.iter().position(|b| !matches!(b, b' ' | b'\t')).unwrap_or(bytes.len());
@@ -1123,7 +1162,7 @@ impl Editor {
             return Ok(Damage::default());
         }
         let s = self.document.snapshot();
-        let edits = (0..s.line_count()).rev().map(|row| {
+        let edits = (0..s.line_count()).rev().map(move |row| {
             let bounds = text::line(&s, row)?;
             let mut end = bounds.end;
             while end > bounds.start {
