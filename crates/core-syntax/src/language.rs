@@ -4,13 +4,16 @@ use crate::Grammar;
 macro_rules! languages {
     ($(($variant:ident, $id:literal, $feature:literal, $module:ident, $ext:literal, $names:literal, $keywords:literal, $line:literal, $open:literal, $close:literal)),* $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub enum Language { $($variant),* }
+        pub enum Language { Generic, $($variant),* }
         impl Language {
+            /// The audited 32 grammar identities. Generic has no grammar.
             pub const ALL: &'static [Self] = &[$(Self::$variant),*];
-            pub fn id(self) -> &'static str { match self { $(Self::$variant => $id),* } }
-            pub(crate) fn lexical(self) -> Lexical { match self { $(Self::$variant => Lexical { keywords: $keywords, line: $line, open: $open, close: $close }),* } }
-            pub fn extensions(self) -> &'static str { match self { $(Self::$variant => $ext),* } }
-            pub fn filenames(self) -> &'static str { match self { $(Self::$variant => $names),* } }
+            /// Typed picker catalogue, independent of enabled grammar features.
+            pub const CATALOGUE: &'static [Self] = &[Self::Generic, $(Self::$variant),*];
+            pub fn id(self) -> &'static str { match self { Self::Generic => "generic", $(Self::$variant => $id),* } }
+            pub(crate) fn lexical(self) -> Lexical { match self { Self::Generic => Lexical { keywords: "", line: "", open: "/*", close: "*/" }, $(Self::$variant => Lexical { keywords: $keywords, line: $line, open: $open, close: $close }),* } }
+            pub fn extensions(self) -> &'static str { match self { Self::Generic => "", $(Self::$variant => $ext),* } }
+            pub fn filenames(self) -> &'static str { match self { Self::Generic => "", $(Self::$variant => $names),* } }
             pub fn bundled(self) -> Option<Grammar> { match self { $(
                 #[cfg(feature = $feature)]
                 Self::$variant => Some(Grammar { language: $module::language().into(), highlights: bundled_query(self, &$module::HIGHLIGHTS_QUERY) }),

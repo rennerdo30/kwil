@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+kwil-core-syntax = { path = "../core-syntax" }
 kwil-core-text = { path = "../core-text" }
 kwil-core-commands = { path = "../core-commands" }
 kwil-core-workspace = { path = "../core-workspace" }

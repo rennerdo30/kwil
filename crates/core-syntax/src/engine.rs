@@ -117,6 +117,14 @@ impl Engine {
         &self.timings
     }
 
+    /// A document identity change must invalidate trees even if revisions and
+    /// languages coincide. Call only on the owning worker: tree disposal can be
+    /// expensive. Grammar/query state is reusable across documents.
+    pub fn reset_document(&mut self) {
+        self.tree = None;
+        self.revision = None;
+    }
+
     /// `edit` must describe the change from `previous_revision` to `revision`.
     /// A missing/mismatched base safely triggers a fresh parse. An unchanged
     /// snapshot may request another viewport with the same revision and no edit.
@@ -152,7 +160,9 @@ impl Engine {
         let mut incremental = false;
         let mut mode = Mode::Lexical;
         // Tree-sitter offsets are u32. Huge sources never enter its parser.
-        let parse = source.len() <= self.config.parse_limit && source.len() < u32::MAX as usize;
+        let parse = language != Language::Generic
+            && source.len() <= self.config.parse_limit
+            && source.len() < u32::MAX as usize;
         if parse && self.language != Some(language) {
             self.tree = None;
             self.revision = None;
