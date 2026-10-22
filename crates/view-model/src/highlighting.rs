@@ -471,6 +471,25 @@ mod tests {
             assert!(chunk.len() <= 1024 && !chunk.is_empty());
             offset += chunk.len();
         }
+        // Add-storage pieces are already 64 KiB, so they alone cannot expose
+        // a missing adapter cap. An original file is one larger shared piece.
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kwil-syntax-chunks-{}-{}.txt",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, vec![b'a'; 128 * 1024]).unwrap();
+        {
+            let file = kwil_core_text::TextFile::open(&path).unwrap();
+            file.build_index(1).unwrap();
+            let original = Buffer::from_file(file).unwrap();
+            let source = SnapshotTextSource::new(original.snapshot());
+            let chunk = source.chunk(0, usize::MAX).unwrap();
+            assert!(matches!(chunk, Cow::Borrowed(_)));
+            assert_eq!(chunk.len(), SOURCE_CHUNK_BYTES);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
