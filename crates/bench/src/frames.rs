@@ -12,11 +12,17 @@ pub enum Step {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ROW: Region = (0, 90, 10, 5);
+    const STATUS: Region = (0, 95, 10, 5);
+    fn scroll(stats: &mut Stats, regions: &[Region], copy: u64, full: bool) {
+        stats.enter(Step::Scroll);
+        stats.expect_scroll(10, 100, 5, true);
+        stats.present(regions, copy, full, Instant::now());
+    }
     fn scrolled() -> Stats {
         let mut stats = Stats::default();
-        stats.enter(Step::Scroll);
         for _ in 0..20 {
-            stats.present(10, 100, false, 10, Instant::now());
+            scroll(&mut stats, &[ROW, STATUS], 900, false);
         }
         stats
     }
@@ -25,15 +31,62 @@ mod tests {
         assert!(scrolled().report().is_ok());
         let mut broken = scrolled();
         broken.enter(Step::Idle);
-        broken.present(10, 0, false, 10, Instant::now());
+        broken.present(&[ROW], 0, false, Instant::now());
         assert!(broken.report().is_err());
     }
     #[test]
     fn missing_scroll_and_full_present_cannot_pass() {
         assert!(Stats::default().report().is_err());
         let mut broken = scrolled();
-        broken.present(10, 100, true, 10, Instant::now());
+        scroll(&mut broken, &[ROW, STATUS], 900, true);
         assert!(broken.report().is_err());
+    }
+
+    #[test]
+    fn missing_exposed_row_or_status_cannot_reduce_both_sides_of_the_contract() {
+        for (label, remaining) in [("exposed row", STATUS), ("status", ROW)] {
+            let mut broken = Stats::default();
+            for _ in 0..20 {
+                scroll(&mut broken, &[remaining], 900, false);
+            }
+            assert!(broken.report().is_err(), "missing {label} falsely passed");
+        }
+    }
+
+    #[test]
+    fn one_missing_copy_cannot_hide_in_a_positive_total() {
+        let mut broken = Stats::default();
+        for i in 0..20 {
+            scroll(&mut broken, &[ROW, STATUS], if i == 19 { 0 } else { 900 }, false);
+        }
+        assert!(broken.report().is_err());
+    }
+
+    #[test]
+    fn wrong_location_or_compensating_copy_sizes_cannot_pass() {
+        let mut wrong_region = Stats::default();
+        let mut wrong_copy = Stats::default();
+        for i in 0..20 {
+            // Same damaged area and total copied area as the valid scenario.
+            scroll(&mut wrong_region, &[(0, 0, 10, 5), STATUS], 900, false);
+            scroll(&mut wrong_copy, &[ROW, STATUS], if i % 2 == 0 { 800 } else { 1000 }, false);
+        }
+        assert!(wrong_region.report().is_err());
+        assert!(wrong_copy.report().is_err());
+    }
+
+    #[test]
+    fn unsupported_native_copy_requires_the_moved_region_as_damage() {
+        for omit_moved in [false, true] {
+            let mut stats = Stats::default();
+            for _ in 0..20 {
+                stats.enter(Step::Scroll);
+                stats.expect_scroll(10, 100, 5, false);
+                let regions = if omit_moved { vec![ROW, STATUS] } else { vec![(0, 0, 10, 90), ROW, STATUS] };
+                stats.present(&regions, 0, false, Instant::now());
+            }
+            assert_eq!(stats.report().is_ok(), !omit_moved);
+        }
     }
 
     #[test]
@@ -107,8 +160,18 @@ pub struct Stats {
     copy: u64,
     damage: u64,
     full: u64,
-    expected_damage: u64,
+    actions: u64,
+    violations: u64,
+    expected: Option<ExpectedScroll>,
     frames_us: Vec<u64>,
+}
+
+/// x, y, width, height of an actual successful present rectangle.
+pub type Region = (usize, usize, usize, usize);
+
+struct ExpectedScroll {
+    regions: Vec<Region>,
+    copy: u64,
 }
 
 impl Stats {
@@ -121,16 +184,39 @@ impl Stats {
         };
     }
 
-    pub fn present(&mut self, damage: u64, copy: u64, full: bool, expected_damage: u64, started: Instant) {
+    /// Called at the scripted action boundary, before asking the view for damage.
+    /// Expectations depend only on one downward line step and viewport geometry.
+    pub fn expect_scroll(&mut self, width: usize, height: usize, row_height: usize, native_copy: bool) {
+        self.actions += 1;
+        if self.expected.is_some() || width == 0 || row_height == 0 || height / row_height < 3 {
+            self.violations += 1;
+            return;
+        }
+        let rows = height.saturating_sub(row_height) / row_height;
+        let kept_height = (rows - 1) * row_height;
+        let mut regions = vec![(0, kept_height, width, row_height), (0, height - row_height, width, row_height)];
+        if !native_copy {
+            regions.push((0, 0, width, kept_height));
+        }
+        regions.sort_unstable();
+        self.expected =
+            Some(ExpectedScroll { regions, copy: if native_copy { (width * kept_height) as u64 } else { 0 } });
+    }
+
+    pub fn present(&mut self, regions: &[Region], copy: u64, full: bool, started: Instant) {
         match self.phase {
             1 => self.idle += 1,
             3 => self.idle_after += 1,
             2 => {
                 self.scroll += 1;
                 self.copy += copy;
-                self.damage += damage;
+                self.damage += regions.iter().map(|&(_, _, w, h)| (w * h) as u64).sum::<u64>();
                 self.full += u64::from(full);
-                self.expected_damage += expected_damage;
+                let mut actual = regions.to_vec();
+                actual.sort_unstable();
+                if !self.expected.take().is_some_and(|e| e.regions == actual && e.copy == copy) {
+                    self.violations += 1;
+                }
                 self.frames_us.push(started.elapsed().as_micros() as u64);
             }
             _ => {}
@@ -155,8 +241,8 @@ impl Stats {
                 "viewer frame contract: idle must present zero, each scroll exactly once without a full present".into(),
             );
         }
-        if cfg!(windows) && (self.copy == 0 || self.damage != self.expected_damage) {
-            return Err("Windows scroll must copy and damage only exposed rows plus status".into());
+        if self.actions != 20 || self.expected.is_some() || self.violations != 0 {
+            return Err("each scripted scroll must match independent viewport rectangles and exact copy area".into());
         }
         // TODO(KW-11): native Wayland/X11 copy; currently their copied area is presented as damage.
         // TODO(KW-16): typing scenario, one line + status, keystroke-to-pixels p99.

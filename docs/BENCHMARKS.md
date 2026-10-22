@@ -66,7 +66,12 @@ present completes within 20 ms. CPU p99 is still recorded. The UI remains event-
 damage and successful native screen copies feed the statistics; a model-only
 damage test cannot pass this gate. p99 is reported from the 20 measured CPU frame
 durations (nearest rank = maximum); this is not input-to-display latency.
-Windows enforces copy + exposed row + status. **TODO KW-11:** Linux native copy;
+At each scripted scroll event, before asking the view for damage, the harness
+derives the exposed-row rectangle, status rectangle and exact copy area from
+the viewport width, height and line height. Each successful present must match
+those independent rectangles and copy area. Missing rows/status, misplaced
+damage, missing copies and compensating copy sizes cannot pass through equal
+aggregate totals. Windows enforces copy + exposed row + status. **TODO KW-11:** Linux native copy;
 the current viewer presents the moved region as damage there. No real RDP/VNC
 wire measurement is claimed (KW-30).
 
@@ -172,6 +177,20 @@ recorded in the PR and KW-33.
 
 ### Acceptance evidence
 
+- **Package acceptance is partial; KW-33 remains open.** This package gates the
+  original text/viewer APIs only. Typing and keystroke-to-pixels p99, search,
+  diff, palette and single-instance budgets need coordinator integration in the
+  slots below. Reported CPU frame p99 does not fulfill the input latency budget.
+- The parent approved a reviewed-main refresh after KW-16/KW-25 integration:
+  `bench-baseline` commit `081a4df` stores the exact nine-pair results from
+  [run 39834499282](https://github.com/rennerdo30/kwil/actions/runs/39834499282)
+  and pins reference source `2a297eb`. No hard limit or >10% threshold changed.
+- [Run 39836398983](https://github.com/rennerdo30/kwil/actions/runs/39836398983)
+  passed Windows; Linux failed open+first-screen at 0.051217 ms versus
+  0.044938 ms (+14%). Candidate/reference production measurement source was
+  unchanged; six of nine corresponding measurements were within 4%, while two
+  candidate measurements were 23–25% slower. This is retained as a failed run,
+  not discarded or used to waive the threshold.
 - [Paired-protocol deliberate delayed-index red run](https://github.com/rennerdo30/kwil/actions/runs/39832069461),
   head `f4fd7d305efd8a46275e1938b083b2335257636e`: the actual one-second
   index delay fails both OSes. Linux reaches **1.0026 GB/s**, above the hard

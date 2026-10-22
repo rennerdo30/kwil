@@ -290,12 +290,10 @@ impl App {
         }
         #[cfg(feature = "frame-harness")]
         if self.opts.frame_script {
-            let expected = (w * ch * (p.rows.len() + usize::from(p.status))) as u64;
             self.frame_stats.present(
-                damage.iter().map(|r| (r.w * r.h) as u64).sum(),
+                &damage.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>(),
                 copy_px,
                 p.full,
-                expected,
                 started,
             );
             if p.scroll != 0
@@ -495,6 +493,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.frame_stats.enter(step);
                 match step {
                     Step::Scroll => {
+                        self.frame_stats.expect_scroll(self.size.0, self.size.1, self.ch(), cfg!(windows));
                         let d = self.view.scroll(1);
                         self.apply(d);
                     }
