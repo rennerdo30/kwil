@@ -1,5 +1,6 @@
 param(
     [string]$Evidence = ('E:/Development/_cache/kwil-kw11-fail-first-' + [Guid]::NewGuid()),
+    [string]$Only,
     [int]$TimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
@@ -8,6 +9,12 @@ Set-Location (Resolve-Path "$PSScriptRoot/../../..")
 New-Item -ItemType Directory -Path $Evidence -Force | Out-Null
 $commit = git rev-parse HEAD
 $cases = @(
+    @{ Package='kwil-ui-gpu'; File='crates/ui-gpu/src/shaping.rs'; Filter='shaping::tests::cursive_positions_preserve_joins_and_mark_offsets'; Anchor='total - before - advance'; Mutant='before'; Count=1 },
+    @{ Package='kwil-ui-gpu'; File='crates/ui-gpu/src/lib.rs'; Filter='font::tests::glyph_arrival_between_queued_scroll_and_paint_damages_moved_row'; Anchor='            font.scroll_rows(d.scroll, rows);'; Mutant='            let _ = (d.scroll, rows);'; Count=1 },
+    @{ Package='kwil-ui-gpu'; File='crates/ui-gpu/src/font.rs'; Filter='font::tests::queued_scroll_preserves_fixed_status_glyph_damage'; Anchor='        if *y >= visible * ch {'; Mutant='        if false && *y >= visible * ch {'; Count=1 },
+    @{ Package='kwil-ui-gpu'; File='crates/ui-gpu/src/shaping.rs'; Filter='shaping::tests::hebrew_arabic_and_marks_are_in_visual_cluster_order'; Anchor='if levels[range.start].is_rtl()'; Mutant='if false'; Count=1 },
+    @{ Package='kwil-ui-gpu'; File='crates/ui-gpu/src/shaping.rs'; Filter='shaping::tests::mixed_latin_rtl_and_digits_keep_directional_runs'; Anchor='if levels[range.start].is_rtl()'; Mutant='if false'; Count=1 },
+    @{ Package='kwil-ui-gpu'; File='crates/ui-gpu/src/shaping.rs'; Filter='shaping::tests::rtl_ligature_anchors_use_full_cluster_end'; Anchor='self.columns - self.before(end)'; Mutant='self.before(start)'; Count=1 },
     @{ File='crates/ui-gpu/src/font.rs'; Package='kwil-ui-gpu'; Filter='font::tests::deferred_glyph_damage_follows_scroll_copy'; Anchor='    let shift ='; Mutant="    return;`n    let shift ="; Count=1 },
     @{ File='crates/view-model/src/grid.rs'; Package='kwil-view-model'; Filter='grid::tests::cjk_and_combining_and_emoji_use_grid_columns'; Anchor='    let limit ='; Mutant="    return Vec::new();`n    let limit ="; Count=1 },
     @{ File='crates/view-model/src/grid.rs'; Package='kwil-view-model'; Filter='grid::tests::tabs_follow_configured_stops'; Anchor='    let limit ='; Mutant="    return Vec::new();`n    let limit ="; Count=1 },
@@ -38,7 +45,7 @@ function Invoke-Focused($package, $filter, $label, [switch]$AllFeatures) {
     return @{ Exit=$process.ExitCode; Output=$output }
 }
 # Each original contract must pass before its deliberately compiling mutant.
-foreach ($case in $cases) {
+foreach ($case in $cases | Where-Object {-not $Only -or $_.Filter -eq $Only}) {
     $path = Join-Path $PWD $case.File
     $source = [IO.File]::ReadAllText($path)
     if (([regex]::Matches($source, [regex]::Escape($case.Anchor))).Count -ne 1) {

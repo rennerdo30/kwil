@@ -377,27 +377,7 @@ impl App {
         if d == Damage::default() {
             return;
         }
-        let p = &mut self.pending;
-        p.full |= d.full;
-        p.status |= d.status;
-        if !p.full {
-            // Rows already queued move with a further scroll.
-            if d.scroll != 0 {
-                let rows = self.view.rows() as i64;
-                p.rows = p
-                    .rows
-                    .iter()
-                    .map(|&r| r as i64 - d.scroll)
-                    .filter(|r| (0..rows).contains(r))
-                    .map(|r| r as usize)
-                    .collect();
-            }
-            p.scroll += d.scroll;
-            p.rows.extend(d.rows);
-            if p.scroll.unsigned_abs() as usize >= self.view.rows() {
-                p.full = true;
-            }
-        }
+        queue_damage(&mut self.pending, d, self.view.rows(), self.font.as_mut());
         if let Some(g) = &self.gfx {
             self.redraw_requested = true;
             g.window.request_redraw();
@@ -724,7 +704,6 @@ impl App {
             damage.push(Rect { x: 0, y: 0, w, h });
         } else {
             if p.scroll != 0 {
-                font.scroll_rows(p.scroll, rows);
                 let d = p.scroll.unsigned_abs() as usize;
                 let keep = (rows - d) * ch;
                 if p.scroll > 0 {
@@ -1025,6 +1004,42 @@ fn draw_text(
         return;
     }
     let cells = text::cells(text, max_cols.min(4096), font.tab_size());
+    // Digits and neutral spaces belong to the same directional paragraph as
+    // surrounding RTL text. Splitting them through the ASCII path loses UAX9
+    // ordering. Keep all-ASCII and LTR-only mixed text on their existing paths.
+    if cells.iter().any(|c| shaping::needs_bidi(&c.text)) {
+        let mut paragraph = String::new();
+        for c in &cells {
+            if c.text == "\t" {
+                paragraph.extend(std::iter::repeat_n(' ', c.width));
+            } else {
+                paragraph.push_str(&c.text);
+            }
+        }
+        let columns = cells.iter().map(|c| c.width).sum();
+        let key = shaping::TileKey { text: paragraph, columns, fg, bg };
+        if let Some(tile) = font.unicode_tile(key, y) {
+            copy_tile(buf, stride, x, y, columns * cw, ch, tile);
+            return;
+        }
+        // The first CPU frame still shows ASCII while the lazy font worker is
+        // unavailable; the resolved mixed paragraph replaces these placeholders.
+        for c in &cells {
+            if c.text == "\t" {
+                continue;
+            }
+            if c.text.is_ascii() {
+                for (j, b) in c.text.bytes().enumerate() {
+                    if b != b' ' {
+                        copy_tile(buf, stride, x + (c.column + j) * cw, y, cw, ch, font.tile(b, fg, bg));
+                    }
+                }
+            } else {
+                copy_tile(buf, stride, x + c.column * cw, y, cw, ch, font.tile(b'?', fg, bg));
+            }
+        }
+        return;
+    }
     let mut i = 0;
     while i < cells.len() {
         let c = &cells[i];
@@ -1251,13 +1266,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
-                let rows = font.accept(tile);
-                let ch = font.ch;
-                Damage {
-                    status: rows.iter().any(|y| *y / ch >= self.view.rows()),
-                    rows: rows.into_iter().map(|y| y / ch).filter(|r| *r < self.view.rows()).collect(),
-                    ..Default::default()
-                }
+                glyph_damage(font, tile, self.view.rows())
             }
             UserEvent::SessionChanged(detected) => {
                 #[cfg(feature = "gpu")]
@@ -1322,6 +1331,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::FontReady(None) => {
                 self.font_loading = false;
+                if self.font_reload_pending {
+                    self.font_reload_pending = false;
+                    self.reload_font();
+                    return;
+                }
+                // Keep the already usable ASCII font, including its own primary
+                // family, and enable deferred Unicode even if the requested font
+                // never loaded. Repaint Unicode/tab rows using that surviving font.
+                self.activate_unicode(true);
                 self.view.set_notice("Configured font is unavailable".into())
             }
             UserEvent::DroppedFile(path) => {
@@ -1444,6 +1462,45 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
+    }
+}
+
+fn queue_damage(p: &mut Damage, d: Damage, rows: usize, font: Option<&mut Font>) {
+    // Waiters must move when the scroll is queued, before a GlyphReady event
+    // can consume them. Moving them only at paint loses that interleaving.
+    if let Some(font) = font {
+        if d.full {
+            font.invalidate_rows();
+        } else if d.scroll != 0 {
+            font.scroll_rows(d.scroll, rows);
+        }
+    }
+    p.full |= d.full;
+    p.status |= d.status;
+    if !p.full {
+        if d.scroll != 0 {
+            p.rows = p
+                .rows
+                .iter()
+                .map(|&r| r as i64 - d.scroll)
+                .filter(|r| (0..rows as i64).contains(r))
+                .map(|r| r as usize)
+                .collect();
+        }
+        p.scroll += d.scroll;
+        p.rows.extend(d.rows);
+        if p.scroll.unsigned_abs() as usize >= rows {
+            p.full = true;
+        }
+    }
+}
+fn glyph_damage(font: &mut Font, tile: shaping::Tile, rows: usize) -> Damage {
+    let ys = font.accept(tile);
+    let ch = font.ch;
+    Damage {
+        status: ys.iter().any(|y| *y / ch >= rows),
+        rows: ys.into_iter().map(|y| y / ch).filter(|r| *r < rows).collect(),
+        ..Default::default()
     }
 }
 

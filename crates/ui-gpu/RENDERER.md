@@ -37,6 +37,18 @@ are cached (4096 entries); loaded fallback font data is capped at 16 faces / 64 
 and Unicode pixel tiles at 8 MiB. Missing or over-budget faces show a visible box.
 The queue is bounded; temporarily full queues retry their affected rows. Deferred
 glyph damage follows copied scroll pixels. Old font workers cancel after DPI changes.
+Waiter coordinates move when a scroll is queued, so a glyph arriving before paint
+invalidates the moved row. Status waiters remain fixed. An unavailable configured font
+leaves the usable primary font in place and reactivates its Unicode worker instead of
+leaving permanent placeholders.
+
+RTL spans use Unicode bidirectional levels, directional/script/font itemization and
+visual cluster anchors. ASCII digits and neutral spaces stay in the same mixed RTL
+paragraph; pure ASCII and LTR-only mixed text keep their existing fast paths. Cursive
+fallback uses the shaper's advances across each item, fitting the complete item to its
+reserved grid span so proportional fallback does not split Arabic joins. Intra-cluster
+mark order is preserved. Public `text::cells` retains its logical byte/grid mapping;
+input integration must account for the renderer's resolved visual order for RTL.
 
 ## What the compositor receives
 
@@ -89,6 +101,7 @@ the existing grid/ASCII path. Alternative stacks were not benchmarked.
 | pollster 1.0.1 | 2026-07-10 | 0.07 s |
 | unicode-width 0.2.2 | 2025-10-06 | Already cached/shared; not timed anew |
 | unicode-segmentation 1.13.3 | 2026-06-01 | Already cached/shared; not timed anew |
+| unicode-bidi 0.3.18 | 2024-12-16 | 0.65 s in the first focused test dependency build |
 | x11-dl 2.21.0 | 2023-01-18 | Existing Linux transitive dependency; not measured on Windows |
 
 These are overlapping Cargo unit durations, not additive clean-build wall times.
