@@ -12,6 +12,8 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, path::PathBuf};
 
+pub mod worker;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MacDocumentRole {
     Viewer,
