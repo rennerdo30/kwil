@@ -77,6 +77,16 @@ class GateTests(unittest.TestCase):
         wrong["runner"] = "ubuntu-24.04"
         self.assertTrue(run.check(self.base, self.base, wrong))
 
+    def test_linux_tick_phase_cannot_create_a_startup_regression(self):
+        for phase in (0.1, 3.5, 9.8):
+            raw = {"launch": 2 + phase, "first_frame": 40 + phase, "index_done": 90 + phase}
+            corrected = run.correct_trace(raw, {"mode": "parent_launch", "offset_ms": phase})
+            self.assertAlmostEqual(corrected["first_frame"], 40)
+            self.assertAlmostEqual(corrected["index_done"], 90)
+            self.assertEqual(corrected["clock"]["raw_os_marks"], raw)
+        with self.assertRaises(RuntimeError):
+            run.correct_trace({"launch": 1, "first_frame": 2, "index_done": 3}, {"offset_ms": 5})
+
 
 if __name__ == "__main__":
     unittest.main()

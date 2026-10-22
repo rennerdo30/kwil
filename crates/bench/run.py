@@ -8,6 +8,7 @@ import re
 import statistics
 import subprocess
 import sys
+import time
 
 SCHEMA = 1
 LIMITS = {
@@ -23,8 +24,20 @@ LIMITS = {
 
 
 def run(args, **kwargs):
-    with subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env={**os.environ, "KWIL_NO_UPDATE": "1"}, **kwargs) as child:
+    command = [str(a) for a in args]
+    env = {**os.environ, "KWIL_NO_UPDATE": "1"}
+    linux_trace = sys.platform == "linux" and "--trace-startup" in command
+    launched_ns = time.clock_gettime_ns(time.CLOCK_BOOTTIME) if linux_trace else None
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, encoding="utf-8", errors="replace", env=env, **kwargs) as child:
+        clock = {"mode": "os_creation", "offset_ms": 0.0}
+        if linux_trace:
+            returned_ns = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+            stat = Path(f"/proc/{child.pid}/stat").read_text()
+            ticks = int(stat.rsplit(")", 1)[1].split()[19])
+            os_start_ns = ticks * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+            clock = {"mode": "parent_launch", "offset_ms": (launched_ns - os_start_ns) / 1e6,
+                     "spawn_span_ms": (returned_ns - launched_ns) / 1e6}
         print(f"started PID {child.pid}: {args[0]}", file=sys.stderr)
         try:
             out, err = child.communicate(timeout=60)
@@ -34,23 +47,35 @@ def run(args, **kwargs):
             raise
         if child.returncode:
             raise RuntimeError(f"{args}: exit {child.returncode}\n{out}\n{err}")
-        return subprocess.CompletedProcess(args, child.returncode, out, err)
+        completed = subprocess.CompletedProcess(args, child.returncode, out, err)
+        completed.launch_clock = clock
+        return completed
+
+
+def correct_trace(marks, clock):
+    # Linux stat floors creation to a 10 ms tick on hosted kernels. Subtract
+    # that common offset to express all marks since the high-resolution parent
+    # launch request. This includes spawn overhead, so it is conservative.
+    corrected = {k: value - clock["offset_ms"] for k, value in marks.items()}
+    if corrected["launch"] < 0 or corrected["first_frame"] < corrected["launch"] or corrected["index_done"] < corrected["launch"]:
+        raise RuntimeError(f"invalid process clock: {corrected}")
+    corrected["clock"] = {**clock, "raw_os_marks": marks}
+    return corrected
 
 
 def trace(app, file=None):
     args = [app, "--gui", "--hidden", "--trace-startup"]
     if file:
         args.append(file)
-    output = run(args).stderr
+    completed = run(args)
+    output = completed.stderr
     marks = {}
     for name in ("launch", "first_frame", "index_done"):
         match = re.search(rf"^t_{name}=([0-9.]+) ms$", output, re.M)
         if not match:
             raise RuntimeError(f"missing t_{name}: {output}")
         marks[name] = float(match[1])
-    if marks["first_frame"] < marks["launch"] or marks["index_done"] < marks["launch"]:
-        raise RuntimeError(f"invalid process clock: {marks}")
-    return marks
+    return correct_trace(marks, completed.launch_clock)
 
 
 def check(current, baseline, reference=None):
@@ -89,14 +114,16 @@ def sample(bin_dir, log, text_only):
         empty_trace = trace(app)
         result.update(startup_file_ms=file_trace["first_frame"],
                       startup_empty_ms=empty_trace["first_frame"],
-                      startup_index_ms=file_trace["index_done"])
+                      startup_index_ms=file_trace["index_done"],
+                      startup_traces={"file": file_trace, "empty": empty_trace})
     return result
 
 
 def summarize(samples, runner, commit):
     return {"schema": SCHEMA, "runner": runner, "fixture": "v1", "commit": commit,
             "runs": len(samples), "samples": samples,
-            "medians": {k: statistics.median(s[k] for s in samples) for k in samples[0]}}
+            "medians": {k: statistics.median(s[k] for s in samples) for k, v in samples[0].items()
+                        if isinstance(v, (int, float))}}
 
 
 def main():

@@ -47,6 +47,16 @@ The flag suppresses automatic update startup. It works with `--gui --hidden` and
 `--tui` in an interactive terminal. TUI cleanup restores the terminal before exit.
 It never turns a failed present into a successful startup measurement.
 
+For Linux CI, the parent records CLOCK_BOOTTIME immediately before Popen and
+reads that child's `/proc/<pid>/stat` start tick. It subtracts the difference
+between this precise launch boundary and the kernel's floored creation tick
+from the raw trace marks. That cancels the shared 10 ms quantization error.
+Gated ages conservatively include process-spawn overhead; they measure launch
+request to the child's actual timestamp, not time until Python reads the pipe.
+The original OS marks, correction and spawn interval remain in each sample.
+The standalone flag still prints the OS process-age marks. Windows uses its
+precise process FILETIME without correction.
+
 The `frame-harness` app feature links the scenario seam. `--frame-script` starts a
 bounded script worker only after the first frame and index: settle, idle 500 ms,
 20 scroll steps, idle 500 ms, exit. Each step waits for a successful present
@@ -107,7 +117,7 @@ Both OSes also smoke the TUI trace in a real terminal (Linux PTY and hidden
 Windows console). These functional smokes are separate from GUI launch budgets.
 
 The runner builds candidate and pinned baseline code before sampling, warms the
-mapped file cache using a 1 MiB buffer, then measures **five fresh processes per
+mapped file cache using a 1 MiB buffer, then measures **nine fresh processes per
 version**, separately for text, GUI file and GUI empty. Samples are interleaved;
 the version measured first alternates each round. Every numeric budget retains
 its hard limit. Timings fail on **cost >110% of the baseline-code median measured
