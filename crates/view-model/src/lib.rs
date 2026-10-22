@@ -149,8 +149,9 @@ impl View {
 mod tests {
     use super::*;
 
-    fn view_with_lines(n: usize) -> View {
-        let dir = std::env::temp_dir().join(format!("kwil-vm-test-{}-{n}", std::process::id()));
+    fn view_with_lines(name: &str, n: usize) -> View {
+        // One file per test: tests run in parallel and must not share it.
+        let dir = std::env::temp_dir().join(format!("kwil-vm-test-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.txt");
         let text: String = (0..n).map(|i| format!("line {i}\n")).collect();
@@ -164,7 +165,7 @@ mod tests {
 
     #[test]
     fn scroll_reports_copy_and_exposed_rows() {
-        let mut v = view_with_lines(100);
+        let mut v = view_with_lines("scroll", 100);
         let d = v.scroll(3);
         assert_eq!(d.scroll, 3);
         assert_eq!(d.rows, vec![7, 8, 9]);
@@ -177,7 +178,7 @@ mod tests {
 
     #[test]
     fn scroll_clamps_and_jumps_redraw_fully() {
-        let mut v = view_with_lines(100);
+        let mut v = view_with_lines("clamp", 100);
         // 100 lines + the empty line after the last newline = 101.
         let d = v.scroll_to_end();
         assert!(d.full);
