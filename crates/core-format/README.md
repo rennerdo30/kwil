@@ -60,6 +60,9 @@ input ceiling; a lower output limit is checked after its serialization.
   full language grammar. SQL also preserves bracket and dollar-quoted content.
   SQL retains original whitespace separators so newline-concatenated literals
   remain concatenated, and supports nested block comments.
+  A `#` outside a literal/comment is refused with a dialect explanation: MySQL
+  treats it as a comment, while other dialects use it in operators/identifiers.
+  A configured external formatter can handle the selected dialect explicitly.
   These are lexical formatters, not dialect rewrites or syntax repair tools.
 - Generic tidy runs **only** for tokenized types: Python, JavaScript/TypeScript,
   Rust, Go, C/C++, C#, Java, Shell (sh/bash/zsh/ksh), Ruby, PHP, Lua, Kotlin and
@@ -78,8 +81,15 @@ input ceiling; a lower output limit is checked after its serialization.
   interpolation, regex/division ambiguity, JSX, continuation syntax and other
   unproven constructs protect the remaining suffix, rather than guessing a closing
   delimiter. Code before that suffix can still be tidied. PHP inline HTML and
-  Ruby trailing data are protected. Comments are preserved too (trimming them is
-  allowed by policy, but not needed).
+  attributes and Ruby trailing data are protected. PHP heredoc spans stop at the
+  closing label, so following expression literals are tokenized normally.
+  JS/TS comments terminate at U+2028/U+2029 as well as CR/LF. Shell uses only LF
+  as a structural ending: bare CR and the CR in CRLF retain their argument bytes.
+  Comments are preserved too (trimming them is allowed by policy, but not needed).
+  Boundary references: [PHP heredoc expressions](https://www.php.net/manual/en/language.types.string.php#language.types.string.syntax.heredoc),
+  [PHP attributes](https://www.php.net/manual/en/language.attributes.syntax.php),
+  [ECMAScript comments](https://tc39.es/ecma262/multipage/ecmascript-language-lexical-grammar.html#sec-comments),
+  [MySQL comments](https://dev.mysql.com/doc/refman/8.4/en/comments.html).
 - Types without a tokenizer, including unknown extensions, CSV/data, Markdown,
   reStructuredText, Makefiles and patches, receive **no edits**, including EOF.
   Status: "No safe formatter for this file type. Configure an external formatter,
@@ -154,6 +164,9 @@ protection, makes explicit trim an identity and disables descendant containment.
 Nine defect tests must fail; the unknown-type control passes. Sources are restored
 in `finally`, and the success descendant fixture is allowed to exit naturally
 before its mutation assertion fails.
+`verify-round3-fail-first.ps1` runs the six round-3 boundary regressions against
+the unchanged `f9dff6f` tokenizer and SQL implementation. All six must fail; both
+sources are restored in `finally`. Obtain the shared Cargo lane before running it.
 
 One-shot measurement (run only when authorized):
 

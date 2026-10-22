@@ -641,6 +641,16 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
             continue;
         }
         let start = i;
+        if sql && b[i] == b'#' {
+            // MySQL starts a line comment here; other dialects use # in
+            // operators or temporary identifiers. Without a selected dialect,
+            // refusing the edit is safer than exposing comment text as code.
+            return Err(FormatError::new(
+                "SQL",
+                "ambiguous '#' token; configure an external formatter for this dialect",
+                line_at(b, i),
+            ));
+        }
         let comment = text[i..].starts_with("/*");
         let line_comment = sql && text[i..].starts_with("--");
         let bracket = sql && b[i] == b'[';

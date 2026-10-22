@@ -88,3 +88,47 @@ performance measurement, GUI/TUI/undo integration or owner acceptance. macOS CI
 must pass the new contract that first formats successfully with a zombie-only
 leader, then successfully formats and stops a live descendant. The parent owns
 CI monitoring, independent review and merge; this implementation job does not merge.
+
+## Review round 3 (2026-10-23)
+
+Base: `f9dff6f0a3dc48aa516b4ba60d9149b4a69029dd`, same isolated `fix-7b`.
+No broader source scope, native run, benchmark, cache wipe or full suite.
+
+- PHP heredoc/nowdoc ends at its closing label token, so a following expression's
+  opening quote is scanned rather than hidden by an entire-line span. Indented
+  labels and labels followed by a Unicode identifier continuation are covered.
+- PHP `#[...]` attributes are preserved as an uncertain suffix, instead of being
+  mistaken for hash comments that hide a multiline string opener.
+- JS/TS line comments end at U+2028/U+2029 as well as CR/LF; subsequent template
+  literals retain all whitespace. Both Unicode separators and JS/TS aliases are
+  covered.
+- Shell treats only LF as structural: bare CR and CRLF's CR retain their argument
+  bytes. CR is also excluded from shell comment-word boundaries, so a following
+  hash cannot hide an opening quote. Existing heredoc contents stay exact.
+- SQL `#` outside a recognized literal/comment reports an explicit dialect error
+  and applies no edit, rather than exposing MySQL comment contents as SQL. Other
+  dialects' hash operators/temp names are refused too, without guessing a dialect.
+
+**Fail first:** `verify-round3-fail-first.ps1` copies only the unchanged broken
+base's `literals.rs`/`languages.rs`, runs the six new tests, and restores both
+files in `finally`. **0 passed, 6 failed**, exit 101, owned cargo PID **54164**.
+Failures show literal spaces removed in both PHP cases and JS templates, Shell's
+final LF replaced by CR, SQL hash-comment text exposed as code, and reindent
+changing a PHP string with all tidy options enabled.
+
+**Restored source:** `cargo test -p kwil-core-format -j 4`: **49/49 pass**
+(20 contracts, all 13 round-1, all 10 round-2, 6 round-3), PID **79212**, exit 0.
+Clippy's identical-branches warning prompted an equivalent combined PHP guard;
+the final round-3 selection then passed **6/6**, PID **58884**, exit 0.
+`cargo clippy --workspace --all-targets --locked -j 4 -- -D warnings` passed,
+PID **40928**, exit 0. `cargo fmt --all --check` and `git diff --check` passed.
+All Cargo invocations were serial, after explicit KW-48 lane release; the lane
+was returned immediately after checks. Owned Cargo processes exited and the
+existing external-process lock/reap contracts passed; no fixture was left live.
+
+Cache: retained existing target artifacts under
+`E:/Development/_cache/cargo-target/kwil-kw-7-format`; only changed inputs compiled.
+Logs `round3-red.log`, `round3-green.log`, `round3-final.log`, `round3-clippy.log`
+in that directory identify the tested base plus edits on their first line.
+No native macOS/Linux, full workspace tests, GUI/TUI/undo integration or owner
+acceptance ran locally. The parent owns the new CI result, review and merge.

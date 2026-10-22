@@ -56,7 +56,10 @@ pub fn tidy(
     let mut eol = None;
     let mut eof_protected = false;
     while start < range.end {
-        let end = (start..range.end).find(|&i| matches!(b[i], b'\r' | b'\n')).unwrap_or(range.end);
+        // Shell's lexer splits commands on LF. CR (including the CR in CRLF)
+        // is an ordinary argument byte, not a structural line ending.
+        let end =
+            (start..range.end).find(|&i| b[i] == b'\n' || kind != Kind::Shell && b[i] == b'\r').unwrap_or(range.end);
         let mut next = end;
         if next < range.end {
             next += 1;
@@ -121,7 +124,8 @@ pub fn tidy(
         }
         start = next;
     }
-    if !selected && settings.final_newline && !eof_protected && !text.ends_with(['\r', '\n']) {
+    let final_ending = text.ends_with('\n') || kind != Kind::Shell && text.ends_with('\r');
+    if !selected && settings.final_newline && !eof_protected && !final_ending {
         out.push(eol.unwrap_or("\n"))?;
     }
     Ok(out.text)
@@ -138,7 +142,13 @@ impl Scanner<'_> {
     }
 
     fn line_end(&self, at: usize) -> usize {
-        self.text[at..].find(['\r', '\n']).map_or(self.text.len(), |n| at + n)
+        self.text[at..]
+            .find(|c| match self.kind {
+                Kind::Shell => c == '\n',
+                Kind::JavaScript => matches!(c, '\r' | '\n' | '\u{2028}' | '\u{2029}'),
+                _ => matches!(c, '\r' | '\n'),
+            })
+            .map_or(self.text.len(), |n| at + n)
     }
 
     fn after_line(&self, at: usize) -> usize {
@@ -292,25 +302,32 @@ impl Scanner<'_> {
                     return self.uncertain();
                 }
                 let end = self.line_end(body);
-                let line = &self.text[body..end];
+                let original = &self.text[body..end];
                 let line = if self.kind == Kind::Php || (self.kind == Kind::Ruby && strip) {
-                    line.trim_start_matches([' ', '\t'])
+                    original.trim_start_matches([' ', '\t'])
                 } else if strip {
-                    line.trim_start_matches('\t')
+                    original.trim_start_matches('\t')
                 } else {
-                    line
+                    original
                 };
                 let closes = if self.kind == Kind::Php {
                     line.strip_prefix(delimiter).is_some_and(|rest| {
-                        rest.as_bytes().first().is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+                        rest.as_bytes().first().is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_' && *c < 128)
                     })
                 } else {
                     line == delimiter
                 };
-                body = self.after_line(body);
                 if closes {
+                    if self.kind == Kind::Php {
+                        // PHP permits expressions immediately after the closing
+                        // label. Resume scanning at its token boundary so a
+                        // following string opener cannot be hidden by this span.
+                        return body + original.len() - line.len() + delimiter.len();
+                    }
+                    body = self.after_line(body);
                     break;
                 }
+                body = self.after_line(body);
             }
         }
         body
@@ -328,14 +345,15 @@ impl Iterator for Scanner<'_> {
             let k = self.kind;
             let line_start = start == 0 || matches!(b[start - 1], b'\r' | b'\n');
             let hash_comment = matches!(k, Kind::Python | Kind::Ruby | Kind::Php)
-                || (k == Kind::Shell
-                    && (start == 0 || b[start - 1].is_ascii_whitespace() || b";|&()".contains(&b[start - 1])));
+                || (k == Kind::Shell && (start == 0 || b" \t\n;|&()".contains(&b[start - 1])));
             let slash_comments = !matches!(k, Kind::Python | Kind::Shell | Kind::Ruby | Kind::Lua);
             let end = if k == Kind::Php
-                && start == 0
-                && !rest.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("<?php"))
-                && !rest.starts_with("<?=")
+                && (rest.starts_with("#[")
+                    || (start == 0
+                        && !rest.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("<?php"))
+                        && !rest.starts_with("<?=")))
             {
+                // Inline output and attributes may contain multiline literals.
                 self.uncertain()
             } else if c == b'#' && hash_comment || slash_comments && rest.starts_with("//") {
                 // A spliced line comment can hide literal delimiters on the next
