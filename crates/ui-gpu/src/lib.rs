@@ -1591,12 +1591,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.checkpoint_session();
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
-                if !text.is_empty()
-                    && self
-                        .ime_destination
-                        .as_ref()
-                        .is_none_or(|destination| matches!(destination, ime::Destination::Cancelled))
-                {
+                if ime::starts_composition(self.composing, &text) {
                     self.ime_destination = Some(ime::capture(&self.view, self.insert_mode()));
                 }
                 // An empty preedit can precede Commit. Keep its captured destination.
@@ -1606,15 +1601,19 @@ impl ApplicationHandler<UserEvent> for App {
                 self.composing = false;
                 let destination =
                     self.ime_destination.take().unwrap_or_else(|| ime::capture(&self.view, self.insert_mode()));
-                let damage = ime::commit(&mut self.view, destination, text, self.started.elapsed());
+                let (damage, follow_active) = ime::commit(&mut self.view, destination, text, self.started.elapsed());
                 self.sync_file_ui();
                 self.apply(damage);
+                if follow_active {
+                    self.keep_caret_visible();
+                }
                 self.view.checkpoint_session();
             }
             WindowEvent::Ime(Ime::Disabled) => {
                 self.composing = false;
                 self.ime_destination = Some(ime::Destination::Cancelled);
             }
+            WindowEvent::Ime(Ime::Enabled) => ime::reset(&mut self.composing, &mut self.ime_destination),
             WindowEvent::Focused(false) => {
                 self.drag = None;
                 self.selecting = false;

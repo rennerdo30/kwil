@@ -360,6 +360,7 @@ impl Workspace {
                 "Closed-tab history contains unsaved work; recover it before closing another tab",
             ));
         }
+        self.files.metadata_durable = false;
         if let Some(view) = self.views.remove(&id) {
             self.input_epoch = self.input_epoch.wrapping_add(1);
             self.closed_views.insert(id, view);
@@ -1685,6 +1686,28 @@ mod tests {
         workspace.files.metadata_durable = true;
         workspace.close(current, true).unwrap();
         assert!(!workspace.session.closed().iter().any(|tab| tab.id == oldest));
+    }
+
+    #[test]
+    fn close_all_invalidates_each_success_so_batch_eviction_waits_at_sixty_four() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        for _ in 1..kwil_core_workspace::session::MAX_TABS {
+            workspace.open(View::new(None)).unwrap();
+        }
+        let original: Vec<_> = workspace.session.tabs().iter().map(|tab| tab.id).collect();
+        workspace.files.storage_ready = true;
+        workspace.files.metadata_durable = true;
+        assert_eq!(workspace.file_command("file.closeAll").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(workspace.session.closed().len(), kwil_core_workspace::session::MAX_CLOSED);
+        assert_eq!(
+            workspace.session.tabs().len(),
+            kwil_core_workspace::session::MAX_TABS - kwil_core_workspace::session::MAX_CLOSED
+        );
+        assert_eq!(workspace.files.close.front(), Some(&original[64]));
+        workspace.document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
+        assert_eq!(workspace.files.close.front(), Some(&original[64]));
+        assert!(original[..64].iter().all(|id| workspace.session.closed().iter().any(|tab| tab.id == *id)));
+        assert!(original[64..].iter().all(|id| workspace.view(*id).is_some()));
     }
 
     #[test]
