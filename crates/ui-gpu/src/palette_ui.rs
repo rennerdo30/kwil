@@ -294,21 +294,8 @@ impl App {
     }
 
     fn palette_paste(&mut self) {
-        use kwil_view_model::Clipboard;
         let hwnd = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
-        let result = (|| -> std::io::Result<Option<String>> {
-            let Some(data) = clipboard::SystemClipboard(hwnd).get()? else { return Ok(None) };
-            let length = data
-                .ranges
-                .iter()
-                .try_fold(0u64, |total, range| total.checked_add(range.end.saturating_sub(range.start)));
-            if length.is_none_or(|length| length > kwil_core_commands::palette::MAX_QUERY_BYTES as u64) {
-                return Err(std::io::Error::other("Palette paste exceeds the 4 KiB query limit"));
-            }
-            let mut bytes = Vec::new();
-            data.write_to(&mut bytes)?;
-            String::from_utf8(bytes).map(Some).map_err(std::io::Error::other)
-        })();
+        let result = clipboard::SystemClipboard(hwnd).get_text(kwil_core_commands::palette::MAX_QUERY_BYTES);
         match result {
             Ok(Some(text)) => self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text)),
             Ok(None) => {}

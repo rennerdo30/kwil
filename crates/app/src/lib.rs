@@ -286,6 +286,10 @@ fn run_app(console_launcher: bool) -> ExitCode {
         match kwil_ui_gpu::run_with_external_open(view, opts, on_first_frame(true), Box::new(|_| {}), external_ready())
         {
             Ok(()) => return ExitCode::SUCCESS,
+            Err(e @ kwil_ui_gpu::GuiError::Settings(_)) => {
+                presentation.report(&format!("kwil: {e}"), |message| eprintln!("{message}"), dialog);
+                return ExitCode::FAILURE;
+            }
             #[cfg(windows)]
             Err(e) if windows::gui_child() => {
                 windows::report_gui_failure(&e);

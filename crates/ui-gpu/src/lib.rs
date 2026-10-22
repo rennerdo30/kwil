@@ -66,6 +66,9 @@ pub enum GuiError {
     /// to the terminal UI.
     Unavailable(String),
     NoFont,
+    /// The window closed, but accepted settings could not be durably drained.
+    /// This is not a display failure and must not launch another frontend.
+    Settings(String),
 }
 
 impl std::fmt::Display for GuiError {
@@ -73,6 +76,7 @@ impl std::fmt::Display for GuiError {
         match self {
             GuiError::Unavailable(e) => write!(f, "no window available: {e}"),
             GuiError::NoFont => write!(f, "no monospace font found"),
+            GuiError::Settings(error) => write!(f, "settings save failed during exit: {error}"),
         }
     }
 }
@@ -379,7 +383,12 @@ pub fn run_with_external_open(
     let result = event_loop.run_app(&mut app);
     if let Some(panel) = &mut app.settings_panel {
         let shutdown = panel.stop();
-        std::thread::spawn(move || shutdown.shutdown());
+        // The interactive event loop has ended. Keep the process alive while
+        // the settings worker drains accepted/coalesced changes off that loop.
+        std::thread::spawn(move || shutdown.shutdown())
+            .join()
+            .map_err(|_| GuiError::Settings("settings shutdown worker panicked".into()))?
+            .map_err(GuiError::Settings)?;
     }
     if let Some(palette) = &mut app.palette {
         let handles = palette.stop();
@@ -518,6 +527,10 @@ impl App {
                 Key::Named(NamedKey::F2) => Some("view.zoomIn"),
                 _ => None,
             };
+            if matches!(ev.logical_key, Key::Named(NamedKey::F3)) {
+                self.apply(Damage { full: true, status: true, ..Default::default() });
+                return;
+            }
             if let Some(command) = command {
                 if self.dispatch_settings(command) || self.dispatch_palette(command) || self.dispatch_zoom(command) {
                     return;
@@ -869,10 +882,7 @@ impl App {
                 damage.push(tabs::rect(geometry.chrome));
             }
         }
-        if palette_dirty
-            && !palette_open
-            && let Some(area) = self.palette_area.take()
-        {
+        if palette_dirty && let Some(area) = self.palette_area.take() {
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             tabs::draw(self.chrome_frame.as_ref().unwrap(), pixels, w, font);
             p.status = true;
@@ -1574,6 +1584,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
                 self.palette_dirty |= self.palette.as_ref().is_some_and(|palette| palette.model().is_open());
+                self.palette_dirty |= self.settings_panel.as_ref().is_some_and(|panel| panel.is_open());
                 if matches!(tile.key.bg, tabs::ACTIVE | tabs::INACTIVE) {
                     font.accept(tile);
                     self.chrome_dirty = true;

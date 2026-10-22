@@ -4,7 +4,8 @@ $proof = Join-Path $EvidenceRoot ('kwil-settings-frontends-proof-' + [guid]::New
 New-Item -ItemType Directory -Path $proof | Out-Null
 $cases = @(
     @{ Name='missing-file'; File='crates/view-model/src/settings_session.rs'; Old='if !self.is_dirty() && self.source_exists() {'; New='if !self.is_dirty() {'; Package='kwil-view-model'; Test='settings_file_creation_waits_for_ack_and_navigation_keeps_search_separate' },
-    @{ Name='terminal-accept'; File='crates/ui-tui/src/settings_ui.rs'; Old='KeyCode::Enter => Some(SettingsInput::Accept),'; New='KeyCode::Enter => None,'; Package='kwil-ui-tui'; Test='terminal_settings_keyboard_edits_persist_and_render_without_replacing_search' }
+    @{ Name='terminal-accept'; File='crates/ui-tui/src/settings_ui.rs'; Old='KeyCode::Enter => Some(SettingsInput::Accept),'; New='KeyCode::Enter => None,'; Package='kwil-ui-tui'; Test='terminal_settings_keyboard_edits_persist_and_render_without_replacing_search' },
+    @{ Name='terminal-caret'; File='crates/ui-tui/src/settings_ui.rs'; Old='frame.set_cursor_position(cursor);'; New='let _ = cursor;'; Package='kwil-ui-tui'; Test='terminal_settings_keyboard_edits_persist_and_render_without_replacing_search' }
 )
 foreach ($case in $cases) {
     $path = Join-Path $PWD $case.File

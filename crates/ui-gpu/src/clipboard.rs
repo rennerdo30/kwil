@@ -62,6 +62,14 @@ impl Clipboard for SystemClipboard {
     }
 
     fn get(&mut self) -> io::Result<Option<ClipboardData>> {
+        self.get_text(LIMIT)?.map(|text| ClipboardData::text(text.as_bytes())).transpose()
+    }
+}
+
+#[cfg(windows)]
+impl SystemClipboard {
+    /// Refuse oversized native allocations before decoding or building an edit.
+    pub(super) fn get_text(&mut self, limit: usize) -> io::Result<Option<String>> {
         unsafe {
             use windows_sys::Win32::System::{DataExchange::*, Memory::*};
             if OpenClipboard(self.0 as _) == 0 {
@@ -84,8 +92,8 @@ impl Clipboard for SystemClipboard {
                 return Err(io::Error::last_os_error());
             }
             let size = GlobalSize(memory);
-            if size > LIMIT * 2 {
-                return Err(io::Error::other("Clipboard exceeds 16 MiB text limit"));
+            if limit.checked_add(1).and_then(|n| n.checked_mul(2)).is_none_or(|maximum| size > maximum) {
+                return Err(io::Error::other(format!("Clipboard exceeds the {limit}-byte text limit")));
             }
             let pointer = GlobalLock(memory) as *const u16;
             if pointer.is_null() {
@@ -96,8 +104,18 @@ impl Clipboard for SystemClipboard {
             let text = String::from_utf16(&wide[..end]);
             GlobalUnlock(memory);
             let text = text.map_err(|_| io::Error::other("Clipboard contains invalid UTF-16"))?;
-            Ok(Some(ClipboardData::text(text.as_bytes())?))
+            if text.len() > limit {
+                return Err(io::Error::other(format!("Clipboard exceeds the {limit}-byte text limit")));
+            }
+            Ok(Some(text))
         }
+    }
+}
+
+#[cfg(not(windows))]
+impl SystemClipboard {
+    pub(super) fn get_text(&mut self, _limit: usize) -> io::Result<Option<String>> {
+        Err(io::Error::other("System clipboard unavailable on this backend"))
     }
 }
 

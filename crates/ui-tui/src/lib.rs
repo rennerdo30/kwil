@@ -272,17 +272,20 @@ pub fn run_with_external_open(
                             if let Some(panel) = &mut settings_panel {
                                 panel.open();
                                 panel.clear_error();
-                                settings_file_pending = true;
-                                if let Err(error) = panel.input(kwil_view_model::settings_session::SettingsInput::Save)
-                                {
-                                    view.set_notice(format!("Settings: {error}"));
-                                    settings_file_pending = false;
-                                } else if panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
+                                if panel.menu().is_none() || panel.source_exists() || panel.has_conflict() {
                                     let path = panel.path().to_path_buf();
                                     panel.close();
                                     settings_file_pending = false;
                                     if let Err(error) = view.open_path(path) {
                                         view.set_notice(format!("Open settings: {error}"));
+                                    }
+                                } else {
+                                    settings_file_pending = true;
+                                    if let Err(error) =
+                                        panel.input(kwil_view_model::settings_session::SettingsInput::Save)
+                                    {
+                                        view.set_notice(format!("Settings: {error}"));
+                                        settings_file_pending = false;
                                     }
                                 }
                             }
@@ -455,10 +458,12 @@ pub fn run_with_external_open(
     if let Some(host) = &mut highlighting {
         host.stop();
     }
-    if let Some(panel) = &mut settings_panel {
+    let settings_shutdown = if let Some(panel) = &mut settings_panel {
         let shutdown = panel.stop();
-        std::thread::spawn(move || shutdown.shutdown());
-    }
+        Some(std::thread::spawn(move || shutdown.shutdown()))
+    } else {
+        None
+    };
 
     if let Some(host) = &mut palette {
         let handles = host.stop();
@@ -474,6 +479,12 @@ pub fn run_with_external_open(
         crossterm::event::DisableBracketedPaste
     );
     ratatui::restore();
+    if let Some(shutdown) = settings_shutdown {
+        shutdown
+            .join()
+            .map_err(|_| std::io::Error::other("settings shutdown worker panicked"))?
+            .map_err(std::io::Error::other)?;
+    }
     result
 }
 

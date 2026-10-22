@@ -8,7 +8,8 @@ pub(super) fn value_text(value: &SettingValue) -> String {
     match value {
         SettingValue::Bool(value) => if *value { "[x] On" } else { "[ ] Off" }.into(),
         SettingValue::Integer(value) => value.to_string(),
-        SettingValue::Float(value) => value.to_string(),
+        // Floating schema fields are stored as f32 font preferences.
+        SettingValue::Float(value) => (*value as f32).to_string(),
         SettingValue::Text(value) => display_text(value),
         SettingValue::Strings(values) => values.iter().map(|s| display_text(s)).collect::<Vec<_>>().join(", "),
         SettingValue::StringMap(values) => format!("{} entries", values.len()),
@@ -209,11 +210,7 @@ impl App {
             panel.open();
             if id == "view.settingsFile" {
                 panel.clear_error();
-                self.settings_file_pending = true;
-                if let Err(error) = panel.input(SettingsInput::Save) {
-                    self.settings_file_pending = false;
-                    self.view.set_notice(format!("Settings: {error}"));
-                } else if panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
+                if panel.menu().is_none() || panel.source_exists() || panel.has_conflict() {
                     let path = panel.path().to_path_buf();
                     panel.close();
                     self.settings_file_pending = false;
@@ -222,6 +219,14 @@ impl App {
                     }
                     self.sync_file_ui();
                     self.apply(Damage { full: true, status: true, ..Default::default() });
+                } else {
+                    // Only a successful Loaded(None) confirms absence. Invalid
+                    // TOML and conflicts must remain directly repairable as text.
+                    self.settings_file_pending = true;
+                    if let Err(error) = panel.input(SettingsInput::Save) {
+                        self.settings_file_pending = false;
+                        self.view.set_notice(format!("Settings: {error}"));
+                    }
                 }
             }
         } else {
@@ -258,6 +263,21 @@ impl App {
         let panel = self.settings_panel.as_ref().unwrap();
         let text_mode = panel.is_editing() || panel.is_searching();
         let command = self.mods.control_key() || self.mods.super_key();
+        if command && matches!(&event.logical_key, Key::Character(key) if key.eq_ignore_ascii_case("v")) {
+            let epoch = self.settings_epoch;
+            let hwnd = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
+            match clipboard::SystemClipboard(hwnd).get_text(kwil_view_model::settings_session::SETTINGS_INPUT_LIMIT) {
+                Ok(Some(text)) if epoch == self.settings_epoch && self.settings_open() => {
+                    self.settings_input(SettingsInput::Text(&text))
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let damage = self.view.set_notice(format!("Settings paste: {error}"));
+                    self.apply(damage);
+                }
+            }
+            return true;
+        }
         if command && matches!(&event.logical_key, Key::Character(key) if key.eq_ignore_ascii_case("o")) {
             self.dispatch_settings("view.settingsFile");
             return true;

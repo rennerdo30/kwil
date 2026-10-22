@@ -1,14 +1,14 @@
 //! Navigable settings panel; filesystem work belongs to SettingsSession.
 use super::*;
 use kwil_core_commands::settings_ui::SettingValue;
-use kwil_view_model::palette_session::display_text;
+use kwil_view_model::palette_session::{display_text, text_window};
 use kwil_view_model::settings_session::{SettingsInput, SettingsSession};
 
 fn value_text(value: &SettingValue) -> String {
     match value {
         SettingValue::Bool(value) => if *value { "On" } else { "Off" }.into(),
         SettingValue::Integer(value) => value.to_string(),
-        SettingValue::Float(value) => value.to_string(),
+        SettingValue::Float(value) => (*value as f32).to_string(),
         SettingValue::Text(value) => display_text(value),
         SettingValue::Strings(values) => values.iter().map(|s| display_text(s)).collect::<Vec<_>>().join(", "),
         SettingValue::StringMap(values) => format!("{} entries", values.len()),
@@ -70,6 +70,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
     let area =
         Rect { x: screen.x + (screen.width - width) / 2, y: screen.y + (screen.height - height) / 2, width, height };
     let style = Style::default().fg(Color::Rgb(214, 228, 240)).bg(Color::Rgb(8, 13, 24));
+    let columns = width as usize - 2;
+    let mut caret = None;
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(style), area);
     let mut line = |row: u16, text: String, selected| {
@@ -80,13 +82,28 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
         );
     };
     line(0, "Settings".into(), false);
-    line(1, host.search_text().into(), true);
+    let search = text_window(host.search_text(), host.input_cursor(), columns);
+    line(1, search.text, true);
+    if host.is_searching() {
+        caret = Some((area.x + 1 + search.cursor as u16, area.y + 1));
+    }
     let rows = host.rows();
     let visible = (height - 6) as usize;
     let first = host.selected().saturating_sub(visible - 1);
     for (index, row) in rows.iter().enumerate().skip(first).take(visible) {
         let value = if index == host.selected() && host.is_editing() {
-            host.input_text().to_owned()
+            let prefix = format!("{}: ", row.spec.title);
+            let prefix_cells = kwil_view_model::grid::cells(prefix.as_bytes(), columns, 4)
+                .iter()
+                .map(|cell| cell.width)
+                .sum::<usize>();
+            let available = columns.saturating_sub(prefix_cells);
+            let input = text_window(host.input_text(), host.input_cursor(), available);
+            caret = Some((
+                area.x + 1 + (prefix_cells + input.cursor).min(columns - 1) as u16,
+                area.y + (index - first + 2) as u16,
+            ));
+            input.text
         } else {
             value_text(&row.current)
         };
@@ -98,6 +115,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
     }
     line(height - 2, host.status().into(), false);
     line(height - 1, "Enter: edit  /: search  Delete: reset  Ctrl+S: save  Esc: back".into(), false);
+    if let Some(cursor) = caret {
+        frame.set_cursor_position(cursor);
+    }
 }
 
 #[cfg(test)]
@@ -151,7 +171,27 @@ mod tests {
         assert!(screen.contains("tabs.layout"));
         assert!(screen.contains("vertical"));
         assert!(screen.contains("Default:"));
-        host.stop().shutdown();
+        host.input(SettingsInput::Search).unwrap();
+        host.input(SettingsInput::Text(&format!("{}TAIL", "a".repeat(200)))).unwrap();
+        terminal.draw(|frame| draw(frame, &host)).unwrap();
+        let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("TAIL"), "the end of a long settings query must remain visible");
+        assert!(terminal.backend().cursor_visible());
+        assert_eq!(terminal.get_cursor_position().unwrap(), ratatui::layout::Position::new(96, 2));
+        host.input(SettingsInput::Cancel).unwrap();
+        host.input(SettingsInput::Search).unwrap();
+        host.input(SettingsInput::Text("font.family")).unwrap();
+        host.input(SettingsInput::Accept).unwrap();
+        host.input(SettingsInput::Accept).unwrap();
+        host.input(SettingsInput::End).unwrap();
+        host.input(SettingsInput::Text(&format!("{}VALUE_END", "b".repeat(200)))).unwrap();
+        terminal.draw(|frame| draw(frame, &host)).unwrap();
+        let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("VALUE_END"), "the end of a settings value must remain visible");
+        assert!(terminal.backend().cursor_visible());
+        assert_eq!(terminal.get_cursor_position().unwrap(), ratatui::layout::Position::new(96, 3));
+        host.input(SettingsInput::Cancel).unwrap();
+        host.stop().shutdown().unwrap();
         drop(host);
         std::fs::remove_dir_all(directory).unwrap();
     }
