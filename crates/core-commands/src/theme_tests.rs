@@ -186,3 +186,18 @@ fn theme_id_cannot_escape_import_directory_contract() {
     }
     assert!(ThemeId::User("../escape".into()).validate().is_err());
 }
+
+#[test]
+fn native_partial_style_inherits_builtin_properties_contract() {
+    let italic =
+        theme_parse::parse_toml(b"version=1\nname='Partial'\nbase='dark'\n[syntax.string]\nfont_style='italic'")
+            .unwrap();
+    assert_eq!(italic.style("string").foreground, Some(Rgba::rgb(0xa8d7a0)));
+    assert_eq!(italic.style("string.quoted").foreground, Some(Rgba::rgb(0xa8d7a0)));
+    assert_eq!(italic.style("string").font_style, Some(2));
+    let reset =
+        theme_parse::parse_toml(b"version=1\nname='Reset'\nbase='dark'\n[syntax.string]\nfont_style=''").unwrap();
+    assert_eq!(reset.style("string").foreground, Some(Rgba::rgb(0xa8d7a0)));
+    assert_eq!(reset.style("string").font_style, Some(0));
+    assert_eq!(theme_parse::parse_toml(theme_parse::to_toml(&italic).unwrap().as_bytes()).unwrap(), italic);
+}

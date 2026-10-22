@@ -21,12 +21,27 @@ pub struct CachedTheme {
 /// Missing cache means built-in fallback, never source parsing. Other failures
 /// are explicit so the host can retain its built-in and surface a later notice.
 pub fn read_active_cache(path: &Path) -> Result<Option<CachedTheme>, ThemeError> {
-    let file = match fs::File::open(path) {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // Type validation after a blocking FIFO open is too late on the startup
+    // path. These flags also close the final-component symlink replacement race.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match options.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_CACHE_BYTES as u64 {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_CACHE_BYTES as u64 {
         return Err(error("invalid or oversized theme cache"));
     }
     let mut bytes = Vec::new();

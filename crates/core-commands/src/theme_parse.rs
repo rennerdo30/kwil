@@ -49,14 +49,12 @@ pub(crate) fn parse_toml(bytes: &[u8]) -> Result<Theme, ThemeError> {
         theme.ui.set(role, Rgba::parse(&color)?);
     }
     for (scope, style) in native.syntax {
-        theme.syntax.insert(
-            scope,
-            SyntaxStyle {
-                foreground: style.foreground.map(|c| Rgba::parse(&c)).transpose()?,
-                background: style.background.map(|c| Rgba::parse(&c)).transpose()?,
-                font_style: style.font_style.map(|s| font_flags(&s)).transpose()?,
-            },
-        );
+        let supplied = SyntaxStyle {
+            foreground: style.foreground.map(|c| Rgba::parse(&c)).transpose()?,
+            background: style.background.map(|c| Rgba::parse(&c)).transpose()?,
+            font_style: style.font_style.map(|s| font_flags(&s)).transpose()?,
+        };
+        theme.syntax.entry(scope).or_default().overlay(&supplied);
     }
     theme.validate()?;
     Ok(theme)
