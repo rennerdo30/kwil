@@ -6,4 +6,5 @@ license.workspace = true
 publish = false
 
 [dependencies]
+pulldown-cmark = { version = "0.13.5", default-features = false }
 
