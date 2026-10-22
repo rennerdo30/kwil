@@ -565,6 +565,32 @@ fn multiple_line_moves_preserve_all_cursors_and_redo_positions() {
 }
 
 #[test]
+fn line_move_selection_end_boundary_owns_selected_line_and_restores_orientation() {
+    for reverse in [false, true] {
+        let mut e = editor(b"a\nb\nc");
+        let original =
+            Cursor { anchor: if reverse { 4 } else { 2 }, head: if reverse { 2 } else { 4 }, desired_column: None };
+        e.set_cursors(vec![original.clone()], 0).unwrap();
+        e.move_lines(false).unwrap();
+        assert_eq!(bytes(&e), b"b\na\nc");
+        let moved = Cursor { anchor: original.anchor - 2, head: original.head - 2, desired_column: None };
+        assert_eq!(e.cursors(), std::slice::from_ref(&moved));
+        e.undo().unwrap();
+        assert_eq!(e.cursors(), &[original]);
+        e.redo().unwrap();
+        assert_eq!(e.cursors(), &[moved]);
+        e.move_lines(true).unwrap();
+        assert_eq!(bytes(&e), b"a\nb\nc");
+        assert_eq!(e.primary_cursor().selection(), 2..4);
+    }
+    let mut e = editor(b"a\nb\nc");
+    at(&mut e, 4);
+    e.move_lines(false).unwrap();
+    assert_eq!(bytes(&e), b"a\nc\nb");
+    assert_eq!(e.primary_cursor().head, 2);
+}
+
+#[test]
 fn vim_insert_session_and_repeat_do_not_merge_unrelated_changes() {
     let mut e = editor(b"ab");
     let mut parser = Vim::default();
@@ -674,6 +700,166 @@ fn whole_document_line_move_and_clipboard_reuse_keep_original_pieces_owned() {
     assert_eq!(bytes(&e), content);
     drop((e, clipboard));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn observe(e: &mut Editor) -> std::sync::Arc<std::sync::Mutex<Vec<EditReceipt>>> {
+    let receipts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = receipts.clone();
+    e.set_edit_observer(Some(Box::new(move |receipt| {
+        sink.lock().unwrap().push(receipt);
+        Ok(())
+    })))
+    .unwrap();
+    receipts
+}
+fn replay_receipts(initial: &[u8], receipts: Vec<EditReceipt>) -> Vec<u8> {
+    // Exercise the public worker API, using a deliberately simple independent
+    // byte-vector oracle only for these small test documents.
+    let initial = initial.to_vec();
+    std::thread::spawn(move || {
+        let mut bytes = initial;
+        let mut previous_revision = receipts.first().map_or(0, |r| r.before_revision);
+        for (index, receipt) in receipts.iter().enumerate() {
+            assert_eq!(receipt.sequence, index as u64 + 1);
+            assert_eq!(receipt.before_revision, previous_revision);
+            let mut before = Vec::new();
+            receipt.before.write_to(&mut before).unwrap();
+            assert_eq!(bytes, before);
+            let mut count = 0;
+            receipt
+                .for_each_replacement(&mut |replacement| {
+                    let mut insert = Vec::new();
+                    replacement.insert.write_to(&mut insert)?;
+                    assert_eq!(insert.len() as u64, replacement.insert.len());
+                    assert_eq!(replacement.insert.is_empty(), insert.is_empty());
+                    bytes.splice(replacement.range.start as usize..replacement.range.end as usize, insert);
+                    count += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(count, receipt.replacement_count());
+            let mut after = Vec::new();
+            receipt.after.write_to(&mut after).unwrap();
+            assert_eq!(bytes, after, "receipt {} {:?}", receipt.sequence, receipt.kind);
+            previous_revision = receipt.after_revision;
+        }
+        bytes
+    })
+    .join()
+    .unwrap()
+}
+
+#[test]
+fn receipts_multicursor_coalesced_undo_redo_are_exact() {
+    let initial = b"abcdef\nmore words\nend";
+    let mut e = editor(initial);
+    let receipts = observe(&mut e);
+    e.set_cursors(vec![Cursor { anchor: 1, head: 4, desired_column: None }, Cursor::caret(8), Cursor::caret(20)], 1)
+        .unwrap();
+    type_text(&mut e, "XY", 0);
+    type_text(&mut e, "Z", 20);
+    e.undo().unwrap();
+    assert_eq!(bytes(&e), initial);
+    e.redo().unwrap();
+    e.delete(true, true).unwrap();
+    e.undo().unwrap();
+    let receipts = std::mem::take(&mut *receipts.lock().unwrap());
+    assert_eq!(receipts.len(), 6);
+    assert_eq!(receipts[2].kind, EditKind::Undo);
+    assert_eq!(receipts[2].replacement_count(), 3);
+    assert_eq!(replay_receipts(initial, receipts), bytes(&e));
+}
+
+#[test]
+fn receipts_bulk_lines_and_vim_operations_replay_atomically() {
+    let initial = b"one  \n  two\t\nthree\n";
+    let mut e = editor(initial);
+    e.set_language(Some("rust".into()));
+    let receipts = observe(&mut e);
+    e.select_all().unwrap();
+    e.indent(false).unwrap();
+    e.indent(true).unwrap();
+    e.toggle_comment().unwrap();
+    e.undo().unwrap();
+    e.redo().unwrap();
+    e.trim_trailing_whitespace().unwrap();
+    at(&mut e, 0);
+    let mut parser = Vim::default();
+    vim(&mut e, &mut parser, "dwciw");
+    type_text(&mut e, "ok", 50);
+    escape(&mut e, &mut parser);
+    e.undo().unwrap();
+    e.redo().unwrap();
+    e.move_lines(true).unwrap();
+    e.duplicate_lines().unwrap();
+    let receipts = std::mem::take(&mut *receipts.lock().unwrap());
+    assert!(receipts.iter().any(|r| r.replacement_count() >= 3));
+    assert_eq!(replay_receipts(initial, receipts), bytes(&e));
+}
+
+#[test]
+fn receipts_backpressure_retains_save_completion_and_stale_save_settles() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "kwil-receipt-save-{}-{}.txt",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut e = editor(b"a  \nb\t\nlast ");
+    e.settings.editor.trim_trailing_whitespace_on_save = true;
+    let accepting = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let gate = accepting.clone();
+    let sink = accepted.clone();
+    e.set_edit_observer(Some(Box::new(move |receipt| {
+        if gate.load(Ordering::Relaxed) {
+            sink.lock().unwrap().push(receipt);
+            Ok(())
+        } else {
+            Err(receipt)
+        }
+    })))
+    .unwrap();
+    type_text(&mut e, "X", 0);
+    assert!(e.has_pending_edit_receipt());
+    assert_eq!(e.next_edit_sequence(), 2);
+    assert_eq!(e.undo().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(e.indent(false).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(e.insert_text("blocked", Duration::ZERO).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert!(e.set_edit_observer(None).is_err());
+    let request = e.save_request(Some(path.clone())).unwrap();
+    let saved = kwil_core_workspace::save_snapshot(request);
+    assert_eq!(e.finish_save(saved).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert!(e.has_pending_save_completion());
+    accepting.store(true, Ordering::Relaxed);
+    e.flush_edit_receipt().unwrap();
+    assert_eq!(e.delete(false, false).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    e.finish_pending_save().unwrap().unwrap();
+    assert!(!e.has_pending_save_completion());
+    assert!(!e.document().is_dirty());
+    e.undo().unwrap();
+    e.redo().unwrap();
+    // Concurrent ordinary/stale-trim completions never publish phantom edits.
+    let request = e.save_request(None).unwrap();
+    type_text(&mut e, "  ", 1000);
+    let count = accepted.lock().unwrap().len();
+    e.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+    assert_eq!(accepted.lock().unwrap().len(), count);
+    let request = e.save_request(None).unwrap();
+    type_text(&mut e, "!", 2000);
+    let count = accepted.lock().unwrap().len();
+    e.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+    assert_eq!(accepted.lock().unwrap().len(), count);
+    let receipts = std::mem::take(&mut *accepted.lock().unwrap());
+    assert_eq!(receipts[1].kind, EditKind::WorkerTrim);
+    assert_eq!(receipts[1].replacement_count(), 3);
+    assert_eq!(replay_receipts(b"a  \nb\t\nlast ", receipts), bytes(&e));
+    drop(e);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

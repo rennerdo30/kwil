@@ -392,6 +392,12 @@ impl Buffer {
         self.history.depth()
     }
 
+    /// Charge frontend-independent cursor/recipe metadata against the same
+    /// cap as roots. Replaces the latest charge, then evicts oldest entries.
+    pub fn charge_latest_model_history(&mut self, bytes: usize) {
+        self.history.charge_latest_model(bytes);
+    }
+
     /// Rebase the current version onto an equivalent, reopened saved original.
     /// Caller must establish byte equivalence and finish any pending batch.
     /// History and already issued snapshots retain their old backing objects.
@@ -494,6 +500,20 @@ impl Buffer {
 #[cfg(test)]
 mod editing_contract_tests {
     use super::*;
+
+    #[test]
+    fn model_metadata_charge_is_idempotent_and_obeys_history_cap() {
+        let mut buffer = Buffer::empty();
+        buffer.insert(0, b"abc").unwrap();
+        let roots = buffer.undo_memory_bytes();
+        buffer.charge_latest_model_history(4096);
+        assert_eq!(buffer.undo_memory_bytes(), roots + 4096);
+        buffer.charge_latest_model_history(1024);
+        assert_eq!(buffer.undo_memory_bytes(), roots + 1024);
+        buffer.set_undo_memory_limit(roots + 1023);
+        assert_eq!(buffer.history_depth(), (0, 0));
+        assert_eq!(buffer.undo_memory_bytes(), 0);
+    }
     struct OriginalsFixture(std::path::PathBuf);
     impl OriginalsFixture {
         fn new() -> Self {

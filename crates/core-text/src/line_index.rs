@@ -221,7 +221,9 @@ mod tests {
                 }
             }
         }
-        let path = dir.join(format!("rank-long-line-{}.bin", std::process::id()));
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path =
+            dir.join(format!("rank-long-line-{}-{}.bin", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let mut cleanup = RemoveFile(None);
         let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
         cleanup.0 = Some(path);

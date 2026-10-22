@@ -33,9 +33,19 @@ impl Editor {
     /// Concurrent edits stay dirty; their original pieces were pinned by save.
     /// A byte-equivalent current version rebases in O(1), preserving history.
     pub fn finish_save(&mut self, result: io::Result<SavedSnapshot>) -> io::Result<CommandResult> {
-        self.saving = false;
-        let saved = result?;
+        let saved = match result {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.saving = false;
+                return Err(error);
+            }
+        };
         let current = self.document.revision == saved.revision;
+        if current && saved.trimmed_rows.is_some() && self.flush_edit_receipt().is_err() {
+            self.receipts.deferred_save = Some(saved);
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "save completion awaits journal admission"));
+        }
+        self.saving = false;
         let mut damage = Damage { status: true, ..Damage::default() };
         if let Some(rows) = saved.trimmed_rows {
             if current {
@@ -53,18 +63,27 @@ impl Editor {
                     }
                     cursor.desired_column = None;
                 }
+                let transition = Transition {
+                    before: source,
+                    after: saved.snapshot.clone(),
+                    recipe: Recipe::Trim(
+                        saved.trim_deletions.ok_or_else(|| io::Error::other("trim completion lacks deletion spool"))?,
+                    ),
+                };
                 self.document.buffer.install_worker_edit(saved.snapshot)?;
                 self.document.changed();
                 self.box_column = None;
                 self.normalize();
                 self.redo.clear();
                 self.undo.push_back(HistoryEntry {
-                    before,
+                    before: before.clone(),
                     after: self.state(),
                     edited: rows.clone(),
                     structural: false,
+                    transition: transition.clone(),
                 });
-                self.trim_history();
+                self.charge_model_history();
+                self.publish(transition, before.revision, self.document.revision, EditKind::WorkerTrim);
                 self.document.saved_revision = self.document.revision;
                 damage = self.finish_damage(old, Some(rows))?;
             } else {
@@ -87,5 +106,13 @@ impl Editor {
             CommandStatus::Message(saved.warnings.join("; "))
         };
         Ok(CommandResult { damage, status })
+    }
+
+    pub fn has_pending_save_completion(&self) -> bool {
+        self.receipts.deferred_save.is_some()
+    }
+    /// Retry a retained transformed completion after journal queue admission.
+    pub fn finish_pending_save(&mut self) -> io::Result<Option<CommandResult>> {
+        self.receipts.deferred_save.take().map(|saved| self.finish_save(Ok(saved))).transpose()
     }
 }
