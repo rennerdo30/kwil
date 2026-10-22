@@ -26,6 +26,7 @@ pub struct HighlightSession {
     rejected: Option<HighlightRequest>,
     in_flight: bool,
     source: Option<Arc<dyn kwil_core_syntax::TextSource>>,
+    snapshot: Option<Arc<SnapshotTextSource>>,
     path: Arc<std::path::PathBuf>,
     mappings: Arc<[LanguageMapping]>,
     results: Vec<Arc<PublishedHighlights>>,
@@ -43,6 +44,7 @@ impl HighlightSession {
             rejected: None,
             in_flight: false,
             source: None,
+            snapshot: None,
             path: Arc::new(Default::default()),
             mappings: Arc::from([]),
             results: Vec::new(),
@@ -53,6 +55,9 @@ impl HighlightSession {
     /// O(visible rows), cached metadata only. Requests never contain a whole
     /// line merely because its suffix is visible far from its start.
     pub fn update(&mut self, view: &Workspace) -> bool {
+        if self.worker.is_none() {
+            return false;
+        }
         let Some(editor) = view.editor() else { return false };
         let windows = windows(
             (0..view.rows())
@@ -68,6 +73,9 @@ impl HighlightSession {
         if self.identity.as_ref() == Some(&next) {
             return false;
         }
+        // Release duplicate typed handles while `source` still owns this same
+        // object, BEFORE retirement can race with the worker's destruction.
+        self.snapshot = None;
         // A rejected request shares this source; release that extra handle
         // before handing the last frontend reference to the worker.
         self.rejected = None;
@@ -92,7 +100,9 @@ impl HighlightSession {
         self.results.clear();
         // Retire superseded handles off the input thread, including rejected
         // requests the syntax worker never accepted.
-        self.source = Some(Arc::new(SnapshotTextSource::new(editor.document().snapshot())));
+        let source = Arc::new(SnapshotTextSource::from_editor(editor));
+        self.source = Some(source.clone());
+        self.snapshot = Some(source);
         self.path = Arc::new(next.path.clone());
         self.identity = Some(next);
         self.in_flight = false;
@@ -118,6 +128,7 @@ impl HighlightSession {
                 visible: self.pending.pop_front()?,
                 previous_revision: None,
                 edit: None,
+                snapshot: self.snapshot.clone(),
             })
         });
         let Some(request) = request else { return };
@@ -199,9 +210,10 @@ impl HighlightSession {
         if let Some(worker) = self.worker.take() {
             let source = self.source.take();
             let rejected = self.rejected.take();
+            let snapshot = self.snapshot.take();
             std::thread::spawn(move || {
                 let _ = worker.shutdown();
-                drop((source, rejected));
+                drop((source, rejected, snapshot));
             });
         }
     }
@@ -247,6 +259,74 @@ mod tests {
         sync::mpsc,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn frontend_typing_preserves_incremental_tree() {
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        view.set_rows(3);
+        view.execute(
+            "edit.insert",
+            &CommandArgs { text: Some("fn main() { let n = 1; }\n".into()), ..Default::default() },
+            1,
+        )
+        .unwrap();
+        view.editor_mut().unwrap().document.path = Some("incremental.rs".into());
+        let (sender, receiver) = mpsc::channel();
+        let mut host = HighlightSession::new(move || {
+            let _ = sender.send(());
+        })
+        .unwrap();
+        let drain = |host: &mut HighlightSession, view: &Workspace| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.in_flight || !host.pending.is_empty() || host.rejected.is_some() {
+                receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+                host.worker_ready(view);
+            }
+        };
+        host.update(&view);
+        drain(&mut host, &view);
+        assert_eq!(host.results[0].highlights.mode, Mode::TreeSitter);
+        let cursors = view.editor().unwrap().cursors().to_vec();
+        view.editor_mut().unwrap().set_cursors(cursors, 0).unwrap();
+        let accepting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = accepting.clone();
+        let observed = calls.clone();
+        view.editor_mut()
+            .unwrap()
+            .set_edit_observer(Some(Box::new(move |receipt| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if gate.load(std::sync::atomic::Ordering::Relaxed) { Ok(()) } else { Err(receipt) }
+            })))
+            .unwrap();
+        view.execute("edit.insert", &CommandArgs { text: Some("// next".into()), ..Default::default() }, 1).unwrap();
+        host.update(&view);
+        drain(&mut host, &view);
+        assert!(host.results[0].highlights.incremental, "frontend typing must retain and edit its prior tree");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(view.editor().unwrap().has_pending_edit_receipt());
+        assert_eq!(view.editor().unwrap().next_edit_sequence(), 2);
+        assert_eq!(view.editor_mut().unwrap().undo().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        accepting.store(true, std::sync::atomic::Ordering::Relaxed);
+        view.editor_mut().unwrap().flush_edit_receipt().unwrap();
+        for command in ["edit.undo", "edit.redo"] {
+            view.execute(command, &CommandArgs::default(), 1).unwrap();
+            host.update(&view);
+            drain(&mut host, &view);
+            assert!(host.results[0].highlights.incremental, "{command} must stage its exact transaction");
+        }
+        for _ in 0..2 {
+            view.execute("edit.insert", &CommandArgs { text: Some(" ".into()), ..Default::default() }, 1).unwrap();
+        }
+        host.update(&view);
+        drain(&mut host, &view);
+        assert!(!host.results[0].highlights.incremental, "missing transaction chain must reset");
+        view.execute("edit.insert", &CommandArgs { text: Some(" ".into()), ..Default::default() }, 1).unwrap();
+        host.update(&view);
+        drain(&mut host, &view);
+        assert!(host.results[0].highlights.incremental, "incremental parsing resumes after a reset");
+        host.worker.take().unwrap().shutdown().unwrap();
+    }
 
     #[test]
     fn save_as_path_changes_invalidate_detection_without_an_edit() {

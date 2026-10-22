@@ -83,6 +83,7 @@ pub struct Engine {
     language: Option<Language>,
     tree: Option<Tree>,
     revision: Option<u64>,
+    staged_revision: Option<u64>,
     #[cfg(feature = "measure")]
     timings: Timings,
     // Drop provider-owned prebuilt library handles after parsers, queries and trees.
@@ -107,6 +108,7 @@ impl Engine {
             language: None,
             tree: None,
             revision: None,
+            staged_revision: None,
             #[cfg(feature = "measure")]
             timings: Timings::default(),
         })
@@ -123,6 +125,32 @@ impl Engine {
     pub fn reset_document(&mut self) {
         self.tree = None;
         self.revision = None;
+        self.staged_revision = None;
+        self.parser.reset();
+    }
+
+    /// Stream exact, sequential edits on the owning worker before ONE parse.
+    /// No edit vector or whole-document envelope is needed. A failed producer
+    /// invalidates the partially edited tree; a missing base never visits it.
+    pub fn stage_edits(
+        &mut self,
+        language: Language,
+        previous_revision: u64,
+        revision: u64,
+        produce: impl FnOnce(&mut dyn FnMut(InputEdit)) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
+        if self.language != Some(language) || self.revision != Some(previous_revision) || self.tree.is_none() {
+            self.reset_document();
+            return Ok(false);
+        }
+        self.revision = None;
+        self.staged_revision = None;
+        if let Err(error) = produce(&mut |edit| self.tree.as_mut().unwrap().edit(&edit)) {
+            self.reset_document();
+            return Err(error);
+        }
+        self.staged_revision = Some(revision);
+        Ok(true)
     }
 
     /// `edit` must describe the change from `previous_revision` to `revision`.
@@ -133,6 +161,24 @@ impl Engine {
         reason = "Borrowed equivalent of Request avoids allocating an Arc for synchronous callers"
     )]
     pub fn highlight(
+        &mut self,
+        source: &dyn TextSource,
+        language: Language,
+        revision: u64,
+        previous_revision: Option<u64>,
+        edit: Option<&InputEdit>,
+        requested: Range<usize>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Highlights, Error> {
+        let result = self.highlight_inner(source, language, revision, previous_revision, edit, requested, cancelled);
+        if result.is_err() {
+            self.reset_document();
+        }
+        result
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "Worker-owned borrowed request")]
+    fn highlight_inner(
         &mut self,
         source: &dyn TextSource,
         language: Language,
@@ -164,8 +210,8 @@ impl Engine {
             && source.len() <= self.config.parse_limit
             && source.len() < u32::MAX as usize;
         if parse && self.language != Some(language) {
-            self.tree = None;
-            self.revision = None;
+            self.reset_document();
+            self.language = None;
             self.query = None;
             if let Some(grammar) = self.provider.grammar(language)? {
                 self.parser.set_language(&grammar.language).map_err(|e| Error::Grammar(e.to_string()))?;
@@ -178,14 +224,18 @@ impl Engine {
             mode = Mode::TreeSitter;
             let unchanged = self.revision == Some(revision) && edit.is_none() && self.tree.is_some();
             if !unchanged {
-                incremental = self.tree.is_some() && self.revision == previous_revision && edit.is_some();
+                let staged = self.staged_revision == Some(revision);
+                incremental = self.tree.is_some() && (staged || (self.revision == previous_revision && edit.is_some()));
                 #[cfg(feature = "measure")]
                 let edit_start = std::time::Instant::now();
                 if incremental {
-                    self.tree.as_mut().unwrap().edit(edit.unwrap());
+                    if !staged {
+                        self.tree.as_mut().unwrap().edit(edit.unwrap());
+                    }
                 } else {
                     self.tree = None;
                 }
+                self.staged_revision = None;
                 #[cfg(feature = "measure")]
                 {
                     self.timings.edit = edit_start.elapsed();
@@ -247,8 +297,7 @@ impl Engine {
             }
             spans
         } else {
-            self.tree = None;
-            self.revision = None;
+            self.reset_document();
             lexer::highlight(source, language, queried.clone(), requested.clone(), cancelled)?
         };
         if cancelled() {
@@ -377,4 +426,83 @@ fn flatten(raw: Vec<(Span, usize)>) -> Vec<Span> {
         previous = at;
     }
     out
+}
+
+#[cfg(all(test, feature = "lang-rust"))]
+mod transaction_tests {
+    use super::*;
+    use crate::Point;
+
+    fn insertion(at: usize, len: usize) -> InputEdit {
+        InputEdit {
+            start_byte: at,
+            old_end_byte: at,
+            new_end_byte: at + len,
+            start_position: Point::new(0, at),
+            old_end_position: Point::new(0, at),
+            new_end_position: Point::new(0, at + len),
+        }
+    }
+    #[test]
+    fn staged_exact_edits_parse_once_and_equal_fresh() {
+        let before = b"fn main() { let n = 1; }".to_vec();
+        let after = b"/*fn main() { let n = 1; }*/".to_vec();
+        let mut engine = Engine::new(Config::default()).unwrap();
+        engine.highlight(&before, Language::Rust, 1, None, None, 0..before.len(), &|| false).unwrap();
+        assert!(
+            engine
+                .stage_edits(Language::Rust, 1, 2, |emit| {
+                    emit(insertion(before.len(), 2));
+                    emit(insertion(0, 2));
+                    Ok(())
+                })
+                .unwrap()
+        );
+        let result = engine.highlight(&after, Language::Rust, 2, None, None, 0..after.len(), &|| false).unwrap();
+        let mut fresh = Engine::new(Config::default()).unwrap();
+        let expected = fresh.highlight(&after, Language::Rust, 2, None, None, 0..after.len(), &|| false).unwrap();
+        assert!(result.incremental);
+        assert_eq!(result.spans, expected.spans);
+        assert_eq!(
+            engine.tree.as_ref().unwrap().root_node().to_sexp(),
+            fresh.tree.as_ref().unwrap().root_node().to_sexp()
+        );
+        assert_eq!(result.spans, vec![Span { range: 0..after.len(), class: Class::Comment }]);
+    }
+
+    #[test]
+    fn staged_failure_cancellation_gap_and_language_change_invalidate_tree() {
+        let source = b"fn main() {}".to_vec();
+        let mut engine = Engine::new(Config::default()).unwrap();
+        let seed = |engine: &mut Engine| {
+            engine.highlight(&source, Language::Rust, 1, None, None, 0..source.len(), &|| false).unwrap();
+        };
+        seed(&mut engine);
+        assert!(
+            engine
+                .stage_edits(Language::Rust, 1, 2, |emit| {
+                    emit(insertion(0, 2));
+                    Err(Error::Io(std::io::Error::other("recipe failed")))
+                })
+                .is_err()
+        );
+        assert!(engine.tree.is_none(), "failed edit stream must dispose its partially edited tree");
+        seed(&mut engine);
+        assert!(engine.stage_edits(Language::Rust, 1, 2, |_| Ok(())).unwrap());
+        assert!(matches!(
+            engine.highlight(&source, Language::Rust, 2, None, None, 0..source.len(), &|| true),
+            Err(Error::Cancelled)
+        ));
+        assert!(engine.tree.is_none(), "cancelled staged parse must dispose its tree");
+        seed(&mut engine);
+        assert!(!engine.stage_edits(Language::Rust, 99, 2, |_| panic!("gap must not enumerate edits")).unwrap());
+        seed(&mut engine);
+        assert!(
+            !engine
+                .stage_edits(Language::Generic, 1, 2, |_| panic!("language change must not enumerate edits"))
+                .unwrap()
+        );
+        let result = engine.highlight(&source, Language::Rust, 2, None, None, 0..source.len(), &|| false).unwrap();
+        assert!(!result.incremental);
+    }
 }

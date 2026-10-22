@@ -29,6 +29,7 @@
 //! `with_provider` exposes the existing prebuilt grammar seam. A provider must
 //! verify permissive licence/version/hash/ABI provenance and retain its library
 //! handles. No downloader or unverified grammar catalogue is implied here.
+use crate::editor::receipts::{EditKind, EditReceipt, SyntaxEdit};
 use kwil_core_syntax::detection::Detector;
 pub use kwil_core_syntax::detection::{Detection, DetectionOrigin, LanguageMapping};
 pub use kwil_core_syntax::{Class, Language, Mode, Span};
@@ -56,11 +57,79 @@ const RETIRE_CAPACITY: usize = 8;
 /// on the worker; it borrows the first piece intersecting the requested range.
 pub struct SnapshotTextSource {
     snapshot: Snapshot,
+    sequence: u64,
+    revision: u64,
+    edit: Option<SyntaxEdit>,
 }
 impl SnapshotTextSource {
     pub fn new(snapshot: Snapshot) -> Self {
-        Self { snapshot }
+        Self { snapshot, sequence: 0, revision: 0, edit: None }
     }
+    pub(crate) fn from_editor(editor: &crate::Editor) -> Self {
+        let (sequence, edit) = editor.syntax_edit();
+        Self { snapshot: editor.document().snapshot(), sequence, revision: editor.document().revision(), edit }
+    }
+}
+
+/// Convert serialized replacements without replaying bytes or materializing an
+/// intermediate document. Sparse positions count LF rows and BYTE columns.
+/// Undo visits ascending intermediate offsets: map them back to the old source,
+/// then forward through the last restored endpoint (including cross-row edits).
+fn input_edits(
+    receipt: &EditReceipt,
+    cancelled: &dyn Fn() -> bool,
+    emit: &mut dyn FnMut(InputEdit),
+) -> Result<(), Error> {
+    use kwil_core_syntax::Point;
+    fn point(snapshot: &Snapshot, offset: u64) -> io::Result<Point> {
+        let (row, column) = snapshot
+            .offset_to_line_col(offset)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("syntax offset outside snapshot"))?;
+        Ok(Point::new(
+            usize::try_from(row).map_err(io::Error::other)?,
+            usize::try_from(column).map_err(io::Error::other)?,
+        ))
+    }
+    fn tail(point: Point, old: Point, new: Point) -> Point {
+        Point::new(
+            new.row + point.row - old.row,
+            if point.row == old.row { new.column + point.column - old.column } else { point.column },
+        )
+    }
+    let inverse = receipt.kind == EditKind::Undo;
+    let mut shift = 0_i128;
+    let mut old_anchor = Point::new(0, 0);
+    let mut new_anchor = Point::new(0, 0);
+    let result = receipt.for_each_replacement(&mut |replacement| {
+        if cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "syntax cancelled"));
+        }
+        let base = |offset: u64| -> io::Result<u64> {
+            u64::try_from(offset as i128 - if inverse { shift } else { 0 }).map_err(io::Error::other)
+        };
+        let start = point(&receipt.before, base(replacement.range.start)?)?;
+        let end = point(&receipt.before, base(replacement.range.end)?)?;
+        let start_position = if inverse { tail(start, old_anchor, new_anchor) } else { start };
+        let old_end_position = if inverse { tail(end, old_anchor, new_anchor) } else { end };
+        let inserted_start = point(&receipt.after, replacement.insert.range.start)?;
+        let inserted_end = point(&receipt.after, replacement.insert.range.end)?;
+        let new_end_position = tail(inserted_end, inserted_start, start_position);
+        emit(InputEdit {
+            start_byte: usize::try_from(replacement.range.start).map_err(io::Error::other)?,
+            old_end_byte: usize::try_from(replacement.range.end).map_err(io::Error::other)?,
+            new_end_byte: usize::try_from(replacement.range.start + replacement.insert.len())
+                .map_err(io::Error::other)?,
+            start_position,
+            old_end_position,
+            new_end_position,
+        });
+        shift += replacement.insert.len() as i128 - (replacement.range.end - replacement.range.start) as i128;
+        old_anchor = end;
+        new_anchor = new_end_position;
+        Ok(())
+    });
+    if cancelled() { Err(Error::Cancelled) } else { result.map_err(Error::Io) }
 }
 impl TextSource for SnapshotTextSource {
     fn len(&self) -> usize {
@@ -115,6 +184,9 @@ pub struct HighlightRequest {
     pub visible: Range<usize>,
     pub previous_revision: Option<u64>,
     pub edit: Option<InputEdit>,
+    /// Optional exact transaction metadata. Must share the same Arc as `source`,
+    /// so rejected frontend handles retire with that source, never on the UI.
+    pub snapshot: Option<Arc<SnapshotTextSource>>,
 }
 
 #[derive(Debug)]
@@ -170,7 +242,8 @@ struct Shared {
 
 /// One active + one latest pending job, eight retirement slots and one result.
 /// At most eighteen accepted job handles including a draining retire batch,
-/// plus sixteen standalone source handles across queued/draining retirement.
+/// plus sixteen standalone source handles across queued/draining retirement and
+/// one worker-owned prior snapshot. Transaction recipes share these lifetimes.
 pub struct HighlightWorker {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -221,6 +294,7 @@ impl HighlightWorker {
                 let mut document = None;
                 let mut settings: Option<Arc<[LanguageMapping]>> = None;
                 let mut detector = None;
+                let mut previous: Option<Arc<SnapshotTextSource>> = None;
                 loop {
                     let (job, retired, sources, stopped) = {
                         let mut state = worker.state.lock().unwrap();
@@ -261,6 +335,7 @@ impl HighlightWorker {
                         // 0 are unrelated snapshots, even with identical languages.
                         if document != Some(key.document_id) {
                             engine.reset_document();
+                            previous = None;
                             document = Some(key.document_id);
                         }
                         if settings.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &request.mappings)) {
@@ -274,6 +349,31 @@ impl HighlightWorker {
                             request.source.as_ref(),
                             &cancelled,
                         )?;
+                        if let Some(snapshot) = &request.snapshot {
+                            match (&previous, &snapshot.edit) {
+                                (Some(old), _) if old.sequence == snapshot.sequence && old.revision == key.revision => {
+                                }
+                                (Some(old), Some(edit))
+                                    if old.sequence.checked_add(1) == Some(snapshot.sequence)
+                                        && old.revision == edit.before_revision
+                                        && key.revision == edit.after_revision =>
+                                {
+                                    engine.stage_edits(
+                                        detection.language,
+                                        edit.before_revision,
+                                        edit.after_revision,
+                                        |emit| {
+                                            input_edits(
+                                                &edit.receipt(old.snapshot.clone(), snapshot.snapshot.clone()),
+                                                &cancelled,
+                                                emit,
+                                            )
+                                        },
+                                    )?;
+                                }
+                                _ => engine.reset_document(),
+                            }
+                        }
                         let highlights = engine.highlight(
                             request.source.as_ref(),
                             detection.language,
@@ -288,6 +388,12 @@ impl HighlightWorker {
                         }
                         Ok(Arc::new(PublishedHighlights { key, detection, highlights }))
                     })();
+                    if result.is_ok() && !cancelled() {
+                        previous = request.snapshot.clone();
+                    } else {
+                        engine.reset_document();
+                        previous = None;
+                    }
                     let (publish, old_result) = {
                         let mut state = worker.state.lock().unwrap();
                         if !cancelled() && !state.stopped {
@@ -383,6 +489,137 @@ mod tests {
         time::Duration,
     };
 
+    fn assert_exact_points(receipt: &EditReceipt) {
+        use kwil_core_syntax::Point;
+        fn position(bytes: &[u8], offset: usize) -> Point {
+            let prefix = &bytes[..offset];
+            Point::new(
+                prefix.iter().filter(|&&b| b == b'\n').count(),
+                prefix.iter().rposition(|&b| b == b'\n').map_or(offset, |lf| offset - lf - 1),
+            )
+        }
+        let mut edits = Vec::new();
+        input_edits(receipt, &|| false, &mut |edit| edits.push(edit)).unwrap();
+        let mut bytes = Vec::new();
+        receipt.before.write_to(&mut bytes).unwrap();
+        let mut index = 0;
+        receipt
+            .for_each_replacement(&mut |replacement| {
+                let edit = &edits[index];
+                assert_eq!(edit.start_byte, replacement.range.start as usize);
+                assert_eq!(edit.old_end_byte, replacement.range.end as usize);
+                assert_eq!(edit.start_position, position(&bytes, edit.start_byte), "start {index} {:?}", receipt.kind);
+                assert_eq!(
+                    edit.old_end_position,
+                    position(&bytes, edit.old_end_byte),
+                    "old end {index} {:?}",
+                    receipt.kind
+                );
+                let mut insert = Vec::new();
+                replacement.insert.write_to(&mut insert)?;
+                bytes.splice(edit.start_byte..edit.old_end_byte, insert);
+                assert_eq!(
+                    edit.new_end_position,
+                    position(&bytes, edit.new_end_byte),
+                    "new end {index} {:?}",
+                    receipt.kind
+                );
+                index += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(index, edits.len());
+        let mut expected = Vec::new();
+        receipt.after.write_to(&mut expected).unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn exact_transaction_points_cover_utf8_cross_rows_multicursor_undo_redo_and_bulk() {
+        std::thread::spawn(|| {
+            use crate::{Cursor, Document, Editor};
+            let mut document = Document::new();
+            document.buffer.insert(0, "α one\nβ two\nγ three\nfn end() {}\n".as_bytes()).unwrap();
+            let mut editor = Editor::new(document);
+            let mut previous = editor.document().snapshot();
+            let mut sequence = 0;
+            let mut check = |editor: &Editor| {
+                let current = SnapshotTextSource::from_editor(editor);
+                assert_eq!(current.sequence, sequence + 1);
+                let receipt = current
+                    .edit
+                    .as_ref()
+                    .expect("exact recipe retained")
+                    .receipt(previous.clone(), current.snapshot.clone());
+                assert_exact_points(&receipt);
+                previous = current.snapshot;
+                sequence = current.sequence;
+                // Highlighting must never install or advance a journal observer.
+                assert_eq!(editor.next_edit_sequence(), 1);
+            };
+            editor
+                .set_cursors(
+                    vec![Cursor { anchor: 2, head: 9, desired_column: None }, Cursor::caret(16), Cursor::caret(26)],
+                    0,
+                )
+                .unwrap();
+            editor.insert_text("界\nx", Duration::ZERO).unwrap();
+            check(&editor);
+            editor.insert_text("é", Duration::from_millis(20)).unwrap();
+            check(&editor);
+            editor.undo().unwrap();
+            check(&editor);
+            editor.redo().unwrap();
+            check(&editor);
+            editor.select_all().unwrap();
+            editor.indent(false).unwrap();
+            check(&editor);
+            editor.undo().unwrap();
+            check(&editor);
+            editor.redo().unwrap();
+            check(&editor);
+            editor.replace_byte_range(0..5, b"\n").unwrap();
+            check(&editor);
+            editor.undo().unwrap();
+            check(&editor);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn exact_trim_spool_points_and_inverse_remain_worker_owned() {
+        std::thread::spawn(|| {
+            let mut document = crate::Document::new();
+            document.buffer.insert(0, "α  \nβ\t\nlast ".as_bytes()).unwrap();
+            let mut editor = crate::Editor::new(document);
+            editor.settings.editor.trim_trailing_whitespace_on_save = true;
+            let path = std::env::temp_dir().join(format!("kwil-syntax-trim-{}.txt", std::process::id()));
+            let before = editor.document().snapshot();
+            let request = editor.save_request(Some(path.clone())).unwrap();
+            editor.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+            let trimmed = SnapshotTextSource::from_editor(&editor);
+            let receipt = trimmed.edit.as_ref().unwrap().receipt(before.clone(), trimmed.snapshot.clone());
+            assert_eq!(receipt.kind, EditKind::WorkerTrim);
+            assert_eq!(receipt.replacement_count(), 3);
+            assert_exact_points(&receipt);
+            editor.undo().unwrap();
+            let undone = SnapshotTextSource::from_editor(&editor);
+            assert_exact_points(
+                &undone.edit.as_ref().unwrap().receipt(trimmed.snapshot.clone(), undone.snapshot.clone()),
+            );
+            editor.redo().unwrap();
+            let redone = SnapshotTextSource::from_editor(&editor);
+            assert_exact_points(
+                &redone.edit.as_ref().unwrap().receipt(undone.snapshot.clone(), redone.snapshot.clone()),
+            );
+            drop((receipt, trimmed, undone, redone, before, editor));
+            std::fs::remove_file(path).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
     fn key(id: u64, revision: u64, generation: u64) -> HighlightKey {
         HighlightKey { document_id: DocumentId(id), revision, viewport_generation: generation }
     }
@@ -396,6 +633,7 @@ mod tests {
             mappings: Arc::from([]),
             previous_revision: None,
             edit: None,
+            snapshot: None,
         }
     }
     fn worker(config: Config) -> (HighlightWorker, mpsc::Receiver<()>) {

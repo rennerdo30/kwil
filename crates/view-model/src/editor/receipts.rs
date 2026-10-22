@@ -174,9 +174,72 @@ pub(super) struct ReceiptState {
     observer: Option<EditObserver>,
     pending: Option<EditReceipt>,
     sequence: u64,
+    syntax_sequence: u64,
+    latest: Option<LatestEdit>,
     pub deferred_save: Option<SavedSnapshot>,
 }
+// One metadata slot, independent of journal admission. Explicit recipes contain
+// at most MAX_CURSORS shapes (24 bytes each), never snapshots or added bytes.
+// Bulk factories and trim spools are borrowed from capped history on demand;
+// retaining them here could destroy snapshots or unlink spools on the UI.
+struct LatestEdit {
+    before_revision: u64,
+    after_revision: u64,
+    kind: EditKind,
+    explicit: Option<Arc<Vec<Shape>>>,
+}
+pub(crate) struct SyntaxEdit {
+    pub before_revision: u64,
+    pub after_revision: u64,
+    kind: EditKind,
+    recipe: Recipe,
+}
+impl SyntaxEdit {
+    pub(crate) fn receipt(&self, before: Snapshot, after: Snapshot) -> EditReceipt {
+        EditReceipt {
+            sequence: 0, // Syntax serials are deliberately separate from journal sequences.
+            before_revision: self.before_revision,
+            after_revision: self.after_revision,
+            before,
+            after,
+            kind: self.kind,
+            recipe: self.recipe.clone(),
+            inverse: self.kind == EditKind::Undo,
+        }
+    }
+}
 impl Editor {
+    /// Constant metadata work only. No recipe iteration, source reads or I/O.
+    /// Missing/evicted history explicitly means that syntax must reset.
+    pub(crate) fn syntax_edit(&self) -> (u64, Option<SyntaxEdit>) {
+        let descriptor = (|| {
+            let latest = self.receipts.latest.as_ref()?;
+            if latest.after_revision != self.document.revision {
+                return None;
+            }
+            let recipe = if let Some(shapes) = &latest.explicit {
+                Recipe::Explicit(shapes.clone())
+            } else {
+                let entry = if latest.kind == EditKind::Undo { self.redo.back()? } else { self.undo.back()? };
+                let (before, after) = if latest.kind == EditKind::Undo {
+                    (entry.after.revision, entry.before.revision)
+                } else {
+                    (entry.before.revision, entry.after.revision)
+                };
+                if (before, after) != (latest.before_revision, latest.after_revision) {
+                    return None;
+                }
+                entry.transition.recipe.clone()
+            };
+            Some(SyntaxEdit {
+                before_revision: latest.before_revision,
+                after_revision: latest.after_revision,
+                kind: latest.kind,
+                recipe,
+            })
+        })();
+        (self.receipts.syntax_sequence, descriptor)
+    }
     pub(super) fn admit_edit(&mut self) -> io::Result<()> {
         if self.compound.is_some() {
             return Ok(());
@@ -213,6 +276,17 @@ impl Editor {
         }
     }
     pub(super) fn publish(&mut self, transition: Transition, before: u64, after: u64, kind: EditKind) {
+        self.receipts.syntax_sequence =
+            self.receipts.syntax_sequence.checked_add(1).expect("syntax sequence exhausted");
+        self.receipts.latest = Some(LatestEdit {
+            before_revision: before,
+            after_revision: after,
+            kind,
+            explicit: match &transition.recipe {
+                Recipe::Explicit(shapes) => Some(shapes.clone()),
+                _ => None,
+            },
+        });
         let Some(observer) = &mut self.receipts.observer else {
             return;
         };
