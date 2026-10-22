@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "source_head": "8a315ff2e3e0dd3659de01e033f1f36e18de2384",
-  "source_merge": "c2530a2699c6afa5744bf33f9b36f98e6eb8bf13",
-  "run": "https://github.com/rennerdo30/kwil/actions/runs/39827665077",
-  "note": "Pinned baseline code for parent-approved paired timing comparisons; stored OS medians unchanged."
+  "source_head": "2a297eb814064f68144c91a8df665855fe1eace2",
+  "source_merge": "75cbc9e7ab5029b8b0c3dee0b57ff91ef243f784",
+  "run": "https://github.com/rennerdo30/kwil/actions/runs/39834499282",
+  "note": "Parent-approved reviewed-main baseline after KW-16/KW-25 integration; all hard limits and the >10% rule unchanged."
 }

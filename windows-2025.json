@@ -2,74 +2,861 @@
   "schema": 1,
   "runner": "windows-2025",
   "fixture": "v1",
-  "commit": "c2530a2699c6afa5744bf33f9b36f98e6eb8bf13",
-  "runs": 5,
+  "commit": "75cbc9e7ab5029b8b0c3dee0b57ff91ef243f784",
+  "runs": 9,
   "samples": [
     {
-      "index_gb_s": 5.091854843451837,
-      "index_ms": 210.87439999999998,
-      "jump_ms": 0.12300000000000001,
+      "index_gb_s": 5.22748348127001,
+      "index_ms": 205.4032,
+      "jump_ms": 0.0917,
       "lines": 20353527,
-      "open_first_ms": 0.1972,
-      "private_mb": 4.1640625,
-      "startup_file_ms": 88.85,
-      "startup_empty_ms": 41.019,
-      "startup_index_ms": 232.727
+      "open_first_ms": 0.2092,
+      "private_mb": 4.5,
+      "startup_file_ms": 119.504,
+      "startup_empty_ms": 37.836,
+      "startup_index_ms": 248.61,
+      "startup_traces": {
+        "file": {
+          "launch": 10.298,
+          "first_frame": 119.504,
+          "index_done": 248.61,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.298,
+              "first_frame": 119.504,
+              "index_done": 248.61
+            }
+          }
+        },
+        "empty": {
+          "launch": 9.985,
+          "first_frame": 37.836,
+          "index_done": 37.877,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 9.985,
+              "first_frame": 37.836,
+              "index_done": 37.877
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 4.445839573428024,
-      "index_ms": 241.51610000000002,
-      "jump_ms": 0.0892,
+      "index_gb_s": 5.204925775618609,
+      "index_ms": 206.2934,
+      "jump_ms": 0.1278,
       "lines": 20353527,
-      "open_first_ms": 0.19369999999999998,
-      "private_mb": 4.1015625,
-      "startup_file_ms": 90.961,
-      "startup_empty_ms": 36.037,
-      "startup_index_ms": 236.726
+      "open_first_ms": 0.204,
+      "private_mb": 4.796875,
+      "startup_file_ms": 88.803,
+      "startup_empty_ms": 42.772,
+      "startup_index_ms": 237.853,
+      "startup_traces": {
+        "file": {
+          "launch": 10.194,
+          "first_frame": 88.803,
+          "index_done": 237.853,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.194,
+              "first_frame": 88.803,
+              "index_done": 237.853
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.364,
+          "first_frame": 42.772,
+          "index_done": 42.818,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.364,
+              "first_frame": 42.772,
+              "index_done": 42.818
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 5.301957529701063,
-      "index_ms": 202.518,
-      "jump_ms": 0.1182,
+      "index_gb_s": 4.894757179449659,
+      "index_ms": 219.3657,
+      "jump_ms": 0.1673,
       "lines": 20353527,
-      "open_first_ms": 0.1955,
+      "open_first_ms": 0.2047,
       "private_mb": 4.12109375,
-      "startup_file_ms": 103.053,
-      "startup_empty_ms": 35.013,
-      "startup_index_ms": 244.484
+      "startup_file_ms": 90.15,
+      "startup_empty_ms": 37.931,
+      "startup_index_ms": 235.97,
+      "startup_traces": {
+        "file": {
+          "launch": 9.985,
+          "first_frame": 90.15,
+          "index_done": 235.97,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 9.985,
+              "first_frame": 90.15,
+              "index_done": 235.97
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.326,
+          "first_frame": 37.931,
+          "index_done": 37.975,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.326,
+              "first_frame": 37.931,
+              "index_done": 37.975
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 5.0302182440317385,
-      "index_ms": 213.45829999999998,
-      "jump_ms": 0.1164,
+      "index_gb_s": 4.921648749971926,
+      "index_ms": 218.1671,
+      "jump_ms": 0.1462,
       "lines": 20353527,
-      "open_first_ms": 0.251,
-      "private_mb": 4.77734375,
-      "startup_file_ms": 89.52,
-      "startup_empty_ms": 36.829,
-      "startup_index_ms": 235.853
+      "open_first_ms": 0.3108,
+      "private_mb": 4.36328125,
+      "startup_file_ms": 94.131,
+      "startup_empty_ms": 37.097,
+      "startup_index_ms": 239.053,
+      "startup_traces": {
+        "file": {
+          "launch": 10.085,
+          "first_frame": 94.131,
+          "index_done": 239.053,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.085,
+              "first_frame": 94.131,
+              "index_done": 239.053
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.119,
+          "first_frame": 37.097,
+          "index_done": 37.139,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.119,
+              "first_frame": 37.097,
+              "index_done": 37.139
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 5.356231832945154,
-      "index_ms": 200.4659,
-      "jump_ms": 0.11220000000000001,
+      "index_gb_s": 5.220496664447989,
+      "index_ms": 205.6781,
+      "jump_ms": 0.12689999999999999,
       "lines": 20353527,
-      "open_first_ms": 0.194,
+      "open_first_ms": 0.2041,
       "private_mb": 4.11328125,
-      "startup_file_ms": 92.087,
-      "startup_empty_ms": 35.669,
-      "startup_index_ms": 242.388
+      "startup_file_ms": 123.221,
+      "startup_empty_ms": 37.668,
+      "startup_index_ms": 246.873,
+      "startup_traces": {
+        "file": {
+          "launch": 10.365,
+          "first_frame": 123.221,
+          "index_done": 246.873,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.365,
+              "first_frame": 123.221,
+              "index_done": 246.873
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.606,
+          "first_frame": 37.668,
+          "index_done": 37.711,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.606,
+              "first_frame": 37.668,
+              "index_done": 37.711
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 5.190774612072757,
+      "index_ms": 206.85580000000002,
+      "jump_ms": 0.12789999999999999,
+      "lines": 20353527,
+      "open_first_ms": 0.22,
+      "private_mb": 4.23046875,
+      "startup_file_ms": 97.914,
+      "startup_empty_ms": 37.207,
+      "startup_index_ms": 249.629,
+      "startup_traces": {
+        "file": {
+          "launch": 10.153,
+          "first_frame": 97.914,
+          "index_done": 249.629,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.153,
+              "first_frame": 97.914,
+              "index_done": 249.629
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.52,
+          "first_frame": 37.207,
+          "index_done": 37.249,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.52,
+              "first_frame": 37.207,
+              "index_done": 37.249
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 4.86734578839362,
+      "index_ms": 220.6011,
+      "jump_ms": 0.1207,
+      "lines": 20353527,
+      "open_first_ms": 0.2056,
+      "private_mb": 4.2890625,
+      "startup_file_ms": 121.312,
+      "startup_empty_ms": 43.762,
+      "startup_index_ms": 237.54,
+      "startup_traces": {
+        "file": {
+          "launch": 10.306,
+          "first_frame": 121.312,
+          "index_done": 237.54,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.306,
+              "first_frame": 121.312,
+              "index_done": 237.54
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.442,
+          "first_frame": 43.762,
+          "index_done": 43.811,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.442,
+              "first_frame": 43.762,
+              "index_done": 43.811
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 4.830373688197739,
+      "index_ms": 222.2896,
+      "jump_ms": 0.1453,
+      "lines": 20353527,
+      "open_first_ms": 0.2111,
+      "private_mb": 4.1796875,
+      "startup_file_ms": 88.431,
+      "startup_empty_ms": 39.599,
+      "startup_index_ms": 240.01,
+      "startup_traces": {
+        "file": {
+          "launch": 10.098,
+          "first_frame": 88.431,
+          "index_done": 240.01,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.098,
+              "first_frame": 88.431,
+              "index_done": 240.01
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.472,
+          "first_frame": 39.599,
+          "index_done": 39.651,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.472,
+              "first_frame": 39.599,
+              "index_done": 39.651
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 5.176440640297432,
+      "index_ms": 207.4286,
+      "jump_ms": 0.1314,
+      "lines": 20353527,
+      "open_first_ms": 0.2161,
+      "private_mb": 4.1953125,
+      "startup_file_ms": 93.122,
+      "startup_empty_ms": 37.356,
+      "startup_index_ms": 263.749,
+      "startup_traces": {
+        "file": {
+          "launch": 10.269,
+          "first_frame": 93.122,
+          "index_done": 263.749,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.269,
+              "first_frame": 93.122,
+              "index_done": 263.749
+            }
+          }
+        },
+        "empty": {
+          "launch": 10.378,
+          "first_frame": 37.356,
+          "index_done": 37.394,
+          "clock": {
+            "mode": "os_creation",
+            "offset_ms": 0.0,
+            "raw_os_marks": {
+              "launch": 10.378,
+              "first_frame": 37.356,
+              "index_done": 37.394
+            }
+          }
+        }
+      }
     }
   ],
   "medians": {
-    "index_gb_s": 5.091854843451837,
-    "index_ms": 210.87439999999998,
-    "jump_ms": 0.1164,
+    "index_gb_s": 5.176440640297432,
+    "index_ms": 207.4286,
+    "jump_ms": 0.12789999999999999,
     "lines": 20353527,
-    "open_first_ms": 0.1955,
-    "private_mb": 4.12109375,
-    "startup_file_ms": 90.961,
-    "startup_empty_ms": 36.037,
-    "startup_index_ms": 236.726
+    "open_first_ms": 0.2092,
+    "private_mb": 4.23046875,
+    "startup_file_ms": 94.131,
+    "startup_empty_ms": 37.836,
+    "startup_index_ms": 240.01
+  },
+  "reference": {
+    "schema": 1,
+    "runner": "windows-2025",
+    "fixture": "v1",
+    "commit": "8a315ff2e3e0dd3659de01e033f1f36e18de2384",
+    "runs": 9,
+    "samples": [
+      {
+        "index_gb_s": 4.888225898529902,
+        "index_ms": 219.65879999999999,
+        "jump_ms": 0.1104,
+        "lines": 20353527,
+        "open_first_ms": 0.2014,
+        "private_mb": 3.42578125,
+        "startup_file_ms": 95.123,
+        "startup_empty_ms": 39.607,
+        "startup_index_ms": 241.945,
+        "startup_traces": {
+          "file": {
+            "launch": 15.023,
+            "first_frame": 95.123,
+            "index_done": 241.945,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 15.023,
+                "first_frame": 95.123,
+                "index_done": 241.945
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.948,
+            "first_frame": 39.607,
+            "index_done": 39.651,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.948,
+                "first_frame": 39.607,
+                "index_done": 39.651
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 5.241178206295319,
+        "index_ms": 204.8665,
+        "jump_ms": 0.136,
+        "lines": 20353527,
+        "open_first_ms": 0.21139999999999998,
+        "private_mb": 3.94921875,
+        "startup_file_ms": 89.036,
+        "startup_empty_ms": 36.023,
+        "startup_index_ms": 246.139,
+        "startup_traces": {
+          "file": {
+            "launch": 10.094,
+            "first_frame": 89.036,
+            "index_done": 246.139,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.094,
+                "first_frame": 89.036,
+                "index_done": 246.139
+              }
+            }
+          },
+          "empty": {
+            "launch": 9.852,
+            "first_frame": 36.023,
+            "index_done": 36.066,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 9.852,
+                "first_frame": 36.023,
+                "index_done": 36.066
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 5.241451962795293,
+        "index_ms": 204.85580000000002,
+        "jump_ms": 0.1327,
+        "lines": 20353527,
+        "open_first_ms": 0.298,
+        "private_mb": 3.67578125,
+        "startup_file_ms": 90.477,
+        "startup_empty_ms": 37.012,
+        "startup_index_ms": 248.193,
+        "startup_traces": {
+          "file": {
+            "launch": 9.97,
+            "first_frame": 90.477,
+            "index_done": 248.193,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 9.97,
+                "first_frame": 90.477,
+                "index_done": 248.193
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.02,
+            "first_frame": 37.012,
+            "index_done": 37.048,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.02,
+                "first_frame": 37.012,
+                "index_done": 37.048
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 5.229808087110392,
+        "index_ms": 205.31189999999998,
+        "jump_ms": 0.1346,
+        "lines": 20353527,
+        "open_first_ms": 0.2024,
+        "private_mb": 3.875,
+        "startup_file_ms": 86.586,
+        "startup_empty_ms": 38.179,
+        "startup_index_ms": 238.46,
+        "startup_traces": {
+          "file": {
+            "launch": 10.072,
+            "first_frame": 86.586,
+            "index_done": 238.46,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.072,
+                "first_frame": 86.586,
+                "index_done": 238.46
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.484,
+            "first_frame": 38.179,
+            "index_done": 38.218,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.484,
+                "first_frame": 38.179,
+                "index_done": 38.218
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 5.278691646354713,
+        "index_ms": 203.4106,
+        "jump_ms": 0.13870000000000002,
+        "lines": 20353527,
+        "open_first_ms": 0.2349,
+        "private_mb": 4.234375,
+        "startup_file_ms": 119.408,
+        "startup_empty_ms": 37.228,
+        "startup_index_ms": 238.084,
+        "startup_traces": {
+          "file": {
+            "launch": 10.145,
+            "first_frame": 119.408,
+            "index_done": 238.084,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.145,
+                "first_frame": 119.408,
+                "index_done": 238.084
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.088,
+            "first_frame": 37.228,
+            "index_done": 37.272,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.088,
+                "first_frame": 37.228,
+                "index_done": 37.272
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 4.951738159779452,
+        "index_ms": 216.8414,
+        "jump_ms": 0.1224,
+        "lines": 20353527,
+        "open_first_ms": 0.248,
+        "private_mb": 3.5859375,
+        "startup_file_ms": 89.925,
+        "startup_empty_ms": 37.242,
+        "startup_index_ms": 240.284,
+        "startup_traces": {
+          "file": {
+            "launch": 10.059,
+            "first_frame": 89.925,
+            "index_done": 240.284,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.059,
+                "first_frame": 89.925,
+                "index_done": 240.284
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.425,
+            "first_frame": 37.242,
+            "index_done": 37.283,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.425,
+                "first_frame": 37.242,
+                "index_done": 37.283
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 5.235032617121795,
+        "index_ms": 205.107,
+        "jump_ms": 0.1296,
+        "lines": 20353527,
+        "open_first_ms": 0.2028,
+        "private_mb": 3.890625,
+        "startup_file_ms": 88.006,
+        "startup_empty_ms": 38.129,
+        "startup_index_ms": 251.303,
+        "startup_traces": {
+          "file": {
+            "launch": 10.127,
+            "first_frame": 88.006,
+            "index_done": 251.303,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.127,
+                "first_frame": 88.006,
+                "index_done": 251.303
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.173,
+            "first_frame": 38.129,
+            "index_done": 38.169,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.173,
+                "first_frame": 38.129,
+                "index_done": 38.169
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 5.245838522213456,
+        "index_ms": 204.68449999999999,
+        "jump_ms": 0.12079999999999999,
+        "lines": 20353527,
+        "open_first_ms": 0.2076,
+        "private_mb": 3.8125,
+        "startup_file_ms": 91.693,
+        "startup_empty_ms": 37.131,
+        "startup_index_ms": 236.185,
+        "startup_traces": {
+          "file": {
+            "launch": 10.572,
+            "first_frame": 91.693,
+            "index_done": 236.185,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.572,
+                "first_frame": 91.693,
+                "index_done": 236.185
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.5,
+            "first_frame": 37.131,
+            "index_done": 37.174,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.5,
+                "first_frame": 37.131,
+                "index_done": 37.174
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 5.279166590868976,
+        "index_ms": 203.3923,
+        "jump_ms": 0.128,
+        "lines": 20353527,
+        "open_first_ms": 0.2144,
+        "private_mb": 3.90234375,
+        "startup_file_ms": 89.995,
+        "startup_empty_ms": 38.915,
+        "startup_index_ms": 237.724,
+        "startup_traces": {
+          "file": {
+            "launch": 10.064,
+            "first_frame": 89.995,
+            "index_done": 237.724,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.064,
+                "first_frame": 89.995,
+                "index_done": 237.724
+              }
+            }
+          },
+          "empty": {
+            "launch": 10.669,
+            "first_frame": 38.915,
+            "index_done": 38.95,
+            "clock": {
+              "mode": "os_creation",
+              "offset_ms": 0.0,
+              "raw_os_marks": {
+                "launch": 10.669,
+                "first_frame": 38.915,
+                "index_done": 38.95
+              }
+            }
+          }
+        }
+      }
+    ],
+    "medians": {
+      "index_gb_s": 5.241178206295319,
+      "index_ms": 204.8665,
+      "jump_ms": 0.1296,
+      "lines": 20353527,
+      "open_first_ms": 0.21139999999999998,
+      "private_mb": 3.875,
+      "startup_file_ms": 89.995,
+      "startup_empty_ms": 37.242,
+      "startup_index_ms": 240.284
+    }
+  },
+  "frames": {
+    "idle_presents": 0,
+    "idle_after_presents": 0,
+    "scroll_presents": 20,
+    "scroll_copy_px": 19456000,
+    "scroll_damage_px": 1024000,
+    "scroll_full_presents": 0,
+    "scroll_p99_ms": 26.535
+  },
+  "stored_baseline": {
+    "schema": 1,
+    "runner": "windows-2025",
+    "fixture": "v1",
+    "commit": "c2530a2699c6afa5744bf33f9b36f98e6eb8bf13",
+    "runs": 5,
+    "samples": [
+      {
+        "index_gb_s": 5.091854843451837,
+        "index_ms": 210.87439999999998,
+        "jump_ms": 0.12300000000000001,
+        "lines": 20353527,
+        "open_first_ms": 0.1972,
+        "private_mb": 4.1640625,
+        "startup_file_ms": 88.85,
+        "startup_empty_ms": 41.019,
+        "startup_index_ms": 232.727
+      },
+      {
+        "index_gb_s": 4.445839573428024,
+        "index_ms": 241.51610000000002,
+        "jump_ms": 0.0892,
+        "lines": 20353527,
+        "open_first_ms": 0.19369999999999998,
+        "private_mb": 4.1015625,
+        "startup_file_ms": 90.961,
+        "startup_empty_ms": 36.037,
+        "startup_index_ms": 236.726
+      },
+      {
+        "index_gb_s": 5.301957529701063,
+        "index_ms": 202.518,
+        "jump_ms": 0.1182,
+        "lines": 20353527,
+        "open_first_ms": 0.1955,
+        "private_mb": 4.12109375,
+        "startup_file_ms": 103.053,
+        "startup_empty_ms": 35.013,
+        "startup_index_ms": 244.484
+      },
+      {
+        "index_gb_s": 5.0302182440317385,
+        "index_ms": 213.45829999999998,
+        "jump_ms": 0.1164,
+        "lines": 20353527,
+        "open_first_ms": 0.251,
+        "private_mb": 4.77734375,
+        "startup_file_ms": 89.52,
+        "startup_empty_ms": 36.829,
+        "startup_index_ms": 235.853
+      },
+      {
+        "index_gb_s": 5.356231832945154,
+        "index_ms": 200.4659,
+        "jump_ms": 0.11220000000000001,
+        "lines": 20353527,
+        "open_first_ms": 0.194,
+        "private_mb": 4.11328125,
+        "startup_file_ms": 92.087,
+        "startup_empty_ms": 35.669,
+        "startup_index_ms": 242.388
+      }
+    ],
+    "medians": {
+      "index_gb_s": 5.091854843451837,
+      "index_ms": 210.87439999999998,
+      "jump_ms": 0.1164,
+      "lines": 20353527,
+      "open_first_ms": 0.1955,
+      "private_mb": 4.12109375,
+      "startup_file_ms": 90.961,
+      "startup_empty_ms": 36.037,
+      "startup_index_ms": 236.726
+    }
   }
 }

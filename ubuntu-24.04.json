@@ -2,74 +2,897 @@
   "schema": 1,
   "runner": "ubuntu-24.04",
   "fixture": "v1",
-  "commit": "c2530a2699c6afa5744bf33f9b36f98e6eb8bf13",
-  "runs": 5,
+  "commit": "75cbc9e7ab5029b8b0c3dee0b57ff91ef243f784",
+  "runs": 9,
   "samples": [
     {
-      "index_gb_s": 18.232509745148924,
-      "index_ms": 58.891608999999995,
-      "jump_ms": 0.019599,
+      "index_gb_s": 13.076528396261175,
+      "index_ms": 82.11214799999999,
+      "jump_ms": 0.019219,
       "lines": 20353527,
-      "open_first_ms": 0.042563,
-      "private_mb": 1.453125,
-      "startup_file_ms": 235.604,
-      "startup_empty_ms": 36.344,
-      "startup_index_ms": 282.372
+      "open_first_ms": 0.047793,
+      "private_mb": 1.421875,
+      "startup_file_ms": 234.990044,
+      "startup_empty_ms": 27.215973,
+      "startup_index_ms": 364.84804399999996,
+      "startup_traces": {
+        "file": {
+          "launch": 1.683044,
+          "first_frame": 234.990044,
+          "index_done": 364.84804399999996,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 1.498956,
+            "spawn_span_ms": 0.438312,
+            "raw_os_marks": {
+              "launch": 3.182,
+              "first_frame": 236.489,
+              "index_done": 366.347
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.6249729999999998,
+          "first_frame": 27.215973,
+          "index_done": 27.240973,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 6.116027,
+            "spawn_span_ms": 0.427225,
+            "raw_os_marks": {
+              "launch": 7.741,
+              "first_frame": 33.332,
+              "index_done": 33.357
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 17.086410793697066,
-      "index_ms": 62.84186,
-      "jump_ms": 0.018417,
+      "index_gb_s": 8.296687785603336,
+      "index_ms": 129.41813199999999,
+      "jump_ms": 0.018097,
       "lines": 20353527,
-      "open_first_ms": 0.048112,
+      "open_first_ms": 0.045478,
+      "private_mb": 1.40625,
+      "startup_file_ms": 22.660800000000002,
+      "startup_empty_ms": 27.089021999999996,
+      "startup_index_ms": 87.6728,
+      "startup_traces": {
+        "file": {
+          "launch": 1.6278000000000006,
+          "first_frame": 22.660800000000002,
+          "index_done": 87.6728,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 6.8142,
+            "spawn_span_ms": 0.44382,
+            "raw_os_marks": {
+              "launch": 8.442,
+              "first_frame": 29.475,
+              "index_done": 94.487
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.6380219999999994,
+          "first_frame": 27.089021999999996,
+          "index_done": 27.108022000000002,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 5.512978,
+            "spawn_span_ms": 0.486405,
+            "raw_os_marks": {
+              "launch": 7.151,
+              "first_frame": 32.602,
+              "index_done": 32.621
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 14.869054185253415,
+      "index_ms": 72.21319,
+      "jump_ms": 0.018117,
+      "lines": 20353527,
+      "open_first_ms": 0.045328,
       "private_mb": 1.4921875,
-      "startup_file_ms": 31.521,
-      "startup_empty_ms": 35.918,
-      "startup_index_ms": 82.662
+      "startup_file_ms": 33.362449,
+      "startup_empty_ms": 28.024910000000002,
+      "startup_index_ms": 83.220449,
+      "startup_traces": {
+        "file": {
+          "launch": 1.5884489999999998,
+          "first_frame": 33.362449,
+          "index_done": 83.220449,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 6.675551,
+            "spawn_span_ms": 0.429699,
+            "raw_os_marks": {
+              "launch": 8.264,
+              "first_frame": 40.038,
+              "index_done": 89.896
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.70091,
+          "first_frame": 28.024910000000002,
+          "index_done": 28.04991,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 0.73509,
+            "spawn_span_ms": 0.441676,
+            "raw_os_marks": {
+              "launch": 2.436,
+              "first_frame": 28.76,
+              "index_done": 28.785
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 17.348003994166955,
-      "index_ms": 61.894258,
-      "jump_ms": 0.018307,
+      "index_gb_s": 5.804605502819754,
+      "index_ms": 184.981018,
+      "jump_ms": 0.017405999999999998,
       "lines": 20353527,
-      "open_first_ms": 0.065027,
+      "open_first_ms": 0.044377,
+      "private_mb": 1.4921875,
+      "startup_file_ms": 25.951481,
+      "startup_empty_ms": 27.665672,
+      "startup_index_ms": 81.84248099999999,
+      "startup_traces": {
+        "file": {
+          "launch": 1.5774810000000006,
+          "first_frame": 25.951481,
+          "index_done": 81.84248099999999,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 8.094519,
+            "spawn_span_ms": 0.418352,
+            "raw_os_marks": {
+              "launch": 9.672,
+              "first_frame": 34.046,
+              "index_done": 89.937
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.623672,
+          "first_frame": 27.665672,
+          "index_done": 27.692672,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 1.227328,
+            "spawn_span_ms": 0.425272,
+            "raw_os_marks": {
+              "launch": 2.851,
+              "first_frame": 28.893,
+              "index_done": 28.92
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 15.327333961029606,
+      "index_ms": 70.054051,
+      "jump_ms": 0.018619,
+      "lines": 20353527,
+      "open_first_ms": 0.046501,
       "private_mb": 1.49609375,
-      "startup_file_ms": 41.121,
-      "startup_empty_ms": 31.08,
-      "startup_index_ms": 78.347
+      "startup_file_ms": 30.935765,
+      "startup_empty_ms": 27.062799,
+      "startup_index_ms": 79.732765,
+      "startup_traces": {
+        "file": {
+          "launch": 1.5857649999999999,
+          "first_frame": 30.935765,
+          "index_done": 79.732765,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 1.101235,
+            "spawn_span_ms": 0.418082,
+            "raw_os_marks": {
+              "launch": 2.687,
+              "first_frame": 32.037,
+              "index_done": 80.834
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.6547990000000001,
+          "first_frame": 27.062799,
+          "index_done": 27.085798999999998,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 0.808201,
+            "spawn_span_ms": 0.47958,
+            "raw_os_marks": {
+              "launch": 2.463,
+              "first_frame": 27.871,
+              "index_done": 27.894
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 17.4038186351247,
-      "index_ms": 61.695761000000005,
-      "jump_ms": 0.015894000000000002,
+      "index_gb_s": 15.147353161358819,
+      "index_ms": 70.886433,
+      "jump_ms": 0.01967,
       "lines": 20353527,
-      "open_first_ms": 0.051066,
-      "private_mb": 1.453125,
-      "startup_file_ms": 40.026,
-      "startup_empty_ms": 36.596,
-      "startup_index_ms": 72.811
+      "open_first_ms": 0.048673,
+      "private_mb": 1.4921875,
+      "startup_file_ms": 28.735205,
+      "startup_empty_ms": 27.908458,
+      "startup_index_ms": 81.519205,
+      "startup_traces": {
+        "file": {
+          "launch": 1.611205,
+          "first_frame": 28.735205,
+          "index_done": 81.519205,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": -0.179205,
+            "spawn_span_ms": 0.435368,
+            "raw_os_marks": {
+              "launch": 1.432,
+              "first_frame": 28.556,
+              "index_done": 81.34
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.631458,
+          "first_frame": 27.908458,
+          "index_done": 27.929458,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 1.759542,
+            "spawn_span_ms": 0.506935,
+            "raw_os_marks": {
+              "launch": 3.391,
+              "first_frame": 29.668,
+              "index_done": 29.689
+            }
+          }
+        }
+      }
     },
     {
-      "index_gb_s": 17.04838566318542,
-      "index_ms": 62.982023999999996,
-      "jump_ms": 0.018688,
+      "index_gb_s": 14.70344161744428,
+      "index_ms": 73.026565,
+      "jump_ms": 0.019309,
       "lines": 20353527,
-      "open_first_ms": 0.049935,
+      "open_first_ms": 0.046651,
+      "private_mb": 1.44921875,
+      "startup_file_ms": 28.903426,
+      "startup_empty_ms": 27.781261999999998,
+      "startup_index_ms": 80.506426,
+      "startup_traces": {
+        "file": {
+          "launch": 1.5774260000000009,
+          "first_frame": 28.903426,
+          "index_done": 80.506426,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 6.517574,
+            "spawn_span_ms": 0.419563,
+            "raw_os_marks": {
+              "launch": 8.095,
+              "first_frame": 35.421,
+              "index_done": 87.024
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.6502619999999997,
+          "first_frame": 27.781261999999998,
+          "index_done": 27.806262000000004,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 7.097738,
+            "spawn_span_ms": 0.433615,
+            "raw_os_marks": {
+              "launch": 8.748,
+              "first_frame": 34.879,
+              "index_done": 34.904
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 14.63707879500353,
+      "index_ms": 73.35765900000001,
+      "jump_ms": 0.019028,
+      "lines": 20353527,
+      "open_first_ms": 0.062034,
+      "private_mb": 1.4921875,
+      "startup_file_ms": 23.818398,
+      "startup_empty_ms": 26.877793,
+      "startup_index_ms": 82.072398,
+      "startup_traces": {
+        "file": {
+          "launch": 1.5613980000000003,
+          "first_frame": 23.818398,
+          "index_done": 82.072398,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 1.279602,
+            "spawn_span_ms": 0.401557,
+            "raw_os_marks": {
+              "launch": 2.841,
+              "first_frame": 25.098,
+              "index_done": 83.352
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.6187930000000001,
+          "first_frame": 26.877793,
+          "index_done": 26.897793,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 4.376207,
+            "spawn_span_ms": 0.474797,
+            "raw_os_marks": {
+              "launch": 5.995,
+              "first_frame": 31.254,
+              "index_done": 31.274
+            }
+          }
+        }
+      }
+    },
+    {
+      "index_gb_s": 15.04890198031461,
+      "index_ms": 71.350178,
+      "jump_ms": 0.031728,
+      "lines": 20353527,
+      "open_first_ms": 0.047982000000000004,
       "private_mb": 1.49609375,
-      "startup_file_ms": 38.813,
-      "startup_empty_ms": 34.696,
-      "startup_index_ms": 101.278
+      "startup_file_ms": 22.768214999999998,
+      "startup_empty_ms": 28.403077000000003,
+      "startup_index_ms": 80.760215,
+      "startup_traces": {
+        "file": {
+          "launch": 1.5632149999999996,
+          "first_frame": 22.768214999999998,
+          "index_done": 80.760215,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 4.263785,
+            "spawn_span_ms": 0.403419,
+            "raw_os_marks": {
+              "launch": 5.827,
+              "first_frame": 27.032,
+              "index_done": 85.024
+            }
+          }
+        },
+        "empty": {
+          "launch": 1.651077,
+          "first_frame": 28.403077000000003,
+          "index_done": 28.422077,
+          "clock": {
+            "mode": "parent_launch",
+            "offset_ms": 5.269923,
+            "spawn_span_ms": 0.488998,
+            "raw_os_marks": {
+              "launch": 6.921,
+              "first_frame": 33.673,
+              "index_done": 33.692
+            }
+          }
+        }
+      }
     }
   ],
   "medians": {
-    "index_gb_s": 17.348003994166955,
-    "index_ms": 61.894258,
-    "jump_ms": 0.018417,
+    "index_gb_s": 14.70344161744428,
+    "index_ms": 73.026565,
+    "jump_ms": 0.019028,
     "lines": 20353527,
-    "open_first_ms": 0.049935,
+    "open_first_ms": 0.046651,
     "private_mb": 1.4921875,
-    "startup_file_ms": 40.026,
-    "startup_empty_ms": 35.918,
-    "startup_index_ms": 82.662
+    "startup_file_ms": 28.735205,
+    "startup_empty_ms": 27.665672,
+    "startup_index_ms": 81.84248099999999
+  },
+  "reference": {
+    "schema": 1,
+    "runner": "ubuntu-24.04",
+    "fixture": "v1",
+    "commit": "8a315ff2e3e0dd3659de01e033f1f36e18de2384",
+    "runs": 9,
+    "samples": [
+      {
+        "index_gb_s": 14.482151938843435,
+        "index_ms": 74.142423,
+        "jump_ms": 0.016345000000000002,
+        "lines": 20353527,
+        "open_first_ms": 0.055995,
+        "private_mb": 1.0625,
+        "startup_file_ms": 23.496045000000002,
+        "startup_empty_ms": 27.817937,
+        "startup_index_ms": 83.58404499999999,
+        "startup_traces": {
+          "file": {
+            "launch": 1.582044999999999,
+            "first_frame": 23.496045000000002,
+            "index_done": 83.58404499999999,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 9.271955,
+              "spawn_span_ms": 0.417901,
+              "raw_os_marks": {
+                "launch": 10.854,
+                "first_frame": 32.768,
+                "index_done": 92.856
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.7029369999999995,
+            "first_frame": 27.817937,
+            "index_done": 27.845937,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 3.530063,
+              "spawn_span_ms": 0.435768,
+              "raw_os_marks": {
+                "launch": 5.233,
+                "first_frame": 31.348,
+                "index_done": 31.376
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 14.869966606128765,
+        "index_ms": 72.208759,
+        "jump_ms": 0.018689,
+        "lines": 20353527,
+        "open_first_ms": 0.053611,
+        "private_mb": 1.06640625,
+        "startup_file_ms": 25.048113,
+        "startup_empty_ms": 28.388379,
+        "startup_index_ms": 81.551113,
+        "startup_traces": {
+          "file": {
+            "launch": 1.5611129999999998,
+            "first_frame": 25.048113,
+            "index_done": 81.551113,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 5.808887,
+              "spawn_span_ms": 0.419944,
+              "raw_os_marks": {
+                "launch": 7.37,
+                "first_frame": 30.857,
+                "index_done": 87.36
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.719379,
+            "first_frame": 28.388379,
+            "index_done": 28.415378999999994,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 8.061621,
+              "spawn_span_ms": 0.442429,
+              "raw_os_marks": {
+                "launch": 9.781,
+                "first_frame": 36.45,
+                "index_done": 36.477
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 6.207102654714316,
+        "index_ms": 172.985996,
+        "jump_ms": 0.018868,
+        "lines": 20353527,
+        "open_first_ms": 0.058438,
+        "private_mb": 1.04296875,
+        "startup_file_ms": 29.100956,
+        "startup_empty_ms": 27.300576999999997,
+        "startup_index_ms": 81.151956,
+        "startup_traces": {
+          "file": {
+            "launch": 1.7399559999999998,
+            "first_frame": 29.100956,
+            "index_done": 81.151956,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 3.969044,
+              "spawn_span_ms": 0.459695,
+              "raw_os_marks": {
+                "launch": 5.709,
+                "first_frame": 33.07,
+                "index_done": 85.121
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.6275769999999996,
+            "first_frame": 27.300576999999997,
+            "index_done": 27.323577,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 5.651423,
+              "spawn_span_ms": 0.437851,
+              "raw_os_marks": {
+                "launch": 7.279,
+                "first_frame": 32.952,
+                "index_done": 32.975
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 15.12430221502742,
+        "index_ms": 70.994471,
+        "jump_ms": 0.018046999999999997,
+        "lines": 20353527,
+        "open_first_ms": 0.043055,
+        "private_mb": 1.046875,
+        "startup_file_ms": 25.103986,
+        "startup_empty_ms": 27.698586,
+        "startup_index_ms": 79.209986,
+        "startup_traces": {
+          "file": {
+            "launch": 1.6319860000000004,
+            "first_frame": 25.103986,
+            "index_done": 79.209986,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 5.945014,
+              "spawn_span_ms": 0.43713,
+              "raw_os_marks": {
+                "launch": 7.577,
+                "first_frame": 31.049,
+                "index_done": 85.155
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.6705860000000001,
+            "first_frame": 27.698586,
+            "index_done": 27.721586000000002,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 5.472414,
+              "spawn_span_ms": 0.435177,
+              "raw_os_marks": {
+                "launch": 7.143,
+                "first_frame": 33.171,
+                "index_done": 33.194
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 14.823629701188558,
+        "index_ms": 72.43447499999999,
+        "jump_ms": 0.018318,
+        "lines": 20353527,
+        "open_first_ms": 0.049004,
+        "private_mb": 1.0546875,
+        "startup_file_ms": 30.691269,
+        "startup_empty_ms": 31.394775000000003,
+        "startup_index_ms": 83.04326900000001,
+        "startup_traces": {
+          "file": {
+            "launch": 1.5622689999999997,
+            "first_frame": 30.691269,
+            "index_done": 83.04326900000001,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 1.189731,
+              "spawn_span_ms": 0.414295,
+              "raw_os_marks": {
+                "launch": 2.752,
+                "first_frame": 31.881,
+                "index_done": 84.233
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.6967749999999997,
+            "first_frame": 31.394775000000003,
+            "index_done": 31.413775,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 4.571225,
+              "spawn_span_ms": 0.427956,
+              "raw_os_marks": {
+                "launch": 6.268,
+                "first_frame": 35.966,
+                "index_done": 35.985
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 15.57299266187754,
+        "index_ms": 68.948972,
+        "jump_ms": 0.017617,
+        "lines": 20353527,
+        "open_first_ms": 0.044687,
+        "private_mb": 1.0390625,
+        "startup_file_ms": 30.723318,
+        "startup_empty_ms": 27.689655000000002,
+        "startup_index_ms": 81.924318,
+        "startup_traces": {
+          "file": {
+            "launch": 1.5963180000000001,
+            "first_frame": 30.723318,
+            "index_done": 81.924318,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 6.855682,
+              "spawn_span_ms": 0.428497,
+              "raw_os_marks": {
+                "launch": 8.452,
+                "first_frame": 37.579,
+                "index_done": 88.78
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.6376550000000005,
+            "first_frame": 27.689655000000002,
+            "index_done": 27.711655,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 9.468345,
+              "spawn_span_ms": 0.48321,
+              "raw_os_marks": {
+                "launch": 11.106,
+                "first_frame": 37.158,
+                "index_done": 37.18
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 15.107082629849122,
+        "index_ms": 71.075393,
+        "jump_ms": 0.019499000000000002,
+        "lines": 20353527,
+        "open_first_ms": 0.042244,
+        "private_mb": 1.0625,
+        "startup_file_ms": 24.406624,
+        "startup_empty_ms": 28.114262,
+        "startup_index_ms": 81.04562399999999,
+        "startup_traces": {
+          "file": {
+            "launch": 1.5616240000000001,
+            "first_frame": 24.406624,
+            "index_done": 81.04562399999999,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 7.435376,
+              "spawn_span_ms": 0.421036,
+              "raw_os_marks": {
+                "launch": 8.997,
+                "first_frame": 31.842,
+                "index_done": 88.481
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.643262,
+            "first_frame": 28.114262,
+            "index_done": 28.141262,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 8.278738,
+              "spawn_span_ms": 0.432473,
+              "raw_os_marks": {
+                "launch": 9.922,
+                "first_frame": 36.393,
+                "index_done": 36.42
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 15.023556556141749,
+        "index_ms": 71.47054899999999,
+        "jump_ms": 0.018618,
+        "lines": 20353527,
+        "open_first_ms": 0.054382,
+        "private_mb": 1.0546875,
+        "startup_file_ms": 28.254534,
+        "startup_empty_ms": 26.922836000000004,
+        "startup_index_ms": 79.943534,
+        "startup_traces": {
+          "file": {
+            "launch": 1.553533999999999,
+            "first_frame": 28.254534,
+            "index_done": 79.943534,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 9.206466,
+              "spawn_span_ms": 0.415247,
+              "raw_os_marks": {
+                "launch": 10.76,
+                "first_frame": 37.461,
+                "index_done": 89.15
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.5838359999999998,
+            "first_frame": 26.922836000000004,
+            "index_done": 26.946835999999998,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 8.603164,
+              "spawn_span_ms": 0.476029,
+              "raw_os_marks": {
+                "launch": 10.187,
+                "first_frame": 35.526,
+                "index_done": 35.55
+              }
+            }
+          }
+        }
+      },
+      {
+        "index_gb_s": 15.480442706975705,
+        "index_ms": 69.36118400000001,
+        "jump_ms": 0.018107,
+        "lines": 20353527,
+        "open_first_ms": 0.042444,
+        "private_mb": 1.05859375,
+        "startup_file_ms": 20.983698,
+        "startup_empty_ms": 27.856655000000003,
+        "startup_index_ms": 79.976698,
+        "startup_traces": {
+          "file": {
+            "launch": 1.580698,
+            "first_frame": 20.983698,
+            "index_done": 79.976698,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 3.562302,
+              "spawn_span_ms": 0.432673,
+              "raw_os_marks": {
+                "launch": 5.143,
+                "first_frame": 24.546,
+                "index_done": 83.539
+              }
+            }
+          },
+          "empty": {
+            "launch": 1.622655,
+            "first_frame": 27.856655000000003,
+            "index_done": 27.880654999999997,
+            "clock": {
+              "mode": "parent_launch",
+              "offset_ms": 3.499345,
+              "spawn_span_ms": 0.437641,
+              "raw_os_marks": {
+                "launch": 5.122,
+                "first_frame": 31.356,
+                "index_done": 31.38
+              }
+            }
+          }
+        }
+      }
+    ],
+    "medians": {
+      "index_gb_s": 15.023556556141749,
+      "index_ms": 71.47054899999999,
+      "jump_ms": 0.018318,
+      "lines": 20353527,
+      "open_first_ms": 0.049004,
+      "private_mb": 1.0546875,
+      "startup_file_ms": 25.103986,
+      "startup_empty_ms": 27.817937,
+      "startup_index_ms": 81.151956
+    }
+  },
+  "frames": {
+    "idle_presents": 0,
+    "idle_after_presents": 0,
+    "scroll_presents": 20,
+    "scroll_copy_px": 0,
+    "scroll_damage_px": 20480000,
+    "scroll_full_presents": 0,
+    "scroll_p99_ms": 0.167
+  },
+  "stored_baseline": {
+    "schema": 1,
+    "runner": "ubuntu-24.04",
+    "fixture": "v1",
+    "commit": "c2530a2699c6afa5744bf33f9b36f98e6eb8bf13",
+    "runs": 5,
+    "samples": [
+      {
+        "index_gb_s": 18.232509745148924,
+        "index_ms": 58.891608999999995,
+        "jump_ms": 0.019599,
+        "lines": 20353527,
+        "open_first_ms": 0.042563,
+        "private_mb": 1.453125,
+        "startup_file_ms": 235.604,
+        "startup_empty_ms": 36.344,
+        "startup_index_ms": 282.372
+      },
+      {
+        "index_gb_s": 17.086410793697066,
+        "index_ms": 62.84186,
+        "jump_ms": 0.018417,
+        "lines": 20353527,
+        "open_first_ms": 0.048112,
+        "private_mb": 1.4921875,
+        "startup_file_ms": 31.521,
+        "startup_empty_ms": 35.918,
+        "startup_index_ms": 82.662
+      },
+      {
+        "index_gb_s": 17.348003994166955,
+        "index_ms": 61.894258,
+        "jump_ms": 0.018307,
+        "lines": 20353527,
+        "open_first_ms": 0.065027,
+        "private_mb": 1.49609375,
+        "startup_file_ms": 41.121,
+        "startup_empty_ms": 31.08,
+        "startup_index_ms": 78.347
+      },
+      {
+        "index_gb_s": 17.4038186351247,
+        "index_ms": 61.695761000000005,
+        "jump_ms": 0.015894000000000002,
+        "lines": 20353527,
+        "open_first_ms": 0.051066,
+        "private_mb": 1.453125,
+        "startup_file_ms": 40.026,
+        "startup_empty_ms": 36.596,
+        "startup_index_ms": 72.811
+      },
+      {
+        "index_gb_s": 17.04838566318542,
+        "index_ms": 62.982023999999996,
+        "jump_ms": 0.018688,
+        "lines": 20353527,
+        "open_first_ms": 0.049935,
+        "private_mb": 1.49609375,
+        "startup_file_ms": 38.813,
+        "startup_empty_ms": 34.696,
+        "startup_index_ms": 101.278
+      }
+    ],
+    "medians": {
+      "index_gb_s": 17.348003994166955,
+      "index_ms": 61.894258,
+      "jump_ms": 0.018417,
+      "lines": 20353527,
+      "open_first_ms": 0.049935,
+      "private_mb": 1.4921875,
+      "startup_file_ms": 40.026,
+      "startup_empty_ms": 35.918,
+      "startup_index_ms": 82.662
+    }
   }
 }
