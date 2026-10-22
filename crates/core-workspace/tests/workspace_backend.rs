@@ -332,6 +332,199 @@ fn kw20_seed_readiness_bounded_queue_and_chunked_reader() {
     assert_eq!(summary.revision, 1);
 }
 
+#[test]
+fn kw20_shared_service_interleaves_documents_spills_and_bounds_global_queue() {
+    use std::sync::{Arc, Mutex, mpsc};
+    struct Source {
+        id: u8,
+        left: usize,
+        gate: Option<mpsc::Receiver<()>>,
+        reads: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Read for Source {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(gate) = self.gate.take() {
+                gate.recv_timeout(TIMEOUT).map_err(std::io::Error::other)?;
+            }
+            if self.left == 0 {
+                return Ok(0);
+            }
+            assert!(b.len() <= JOURNAL_CHUNK);
+            self.reads.lock().unwrap().push(self.id);
+            let n = b.len().min(self.left);
+            b[..n].fill(self.id);
+            self.left -= n;
+            Ok(n)
+        }
+    }
+    let temp = Temp::new();
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let (release, gate) = mpsc::sync_channel(1);
+    let (entered_tx, entered) = mpsc::sync_channel(1);
+    struct Entered {
+        inner: Source,
+        entered: Option<mpsc::SyncSender<()>>,
+    }
+    impl Read for Entered {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(tx) = self.entered.take() {
+                let _ = tx.send(());
+            }
+            self.inner.read(b)
+        }
+    }
+    let mut service = JournalService::spawn(Duration::from_secs(60)).unwrap();
+    let a = service
+        .try_create(JournalSeed {
+            path: temp.path("a"),
+            base: base((JOURNAL_CHUNK * 12) as u64),
+            source: Box::new(Entered {
+                inner: Source { id: 1, left: JOURNAL_CHUNK * 12, gate: Some(gate), reads: reads.clone() },
+                entered: Some(entered_tx),
+            }),
+        })
+        .unwrap();
+    entered.recv_timeout(TIMEOUT).unwrap();
+    let mut bbase = base(1);
+    bbase.document = DocumentId(18);
+    let b = service
+        .try_create(JournalSeed {
+            path: temp.path("b"),
+            base: bbase,
+            source: Box::new(Source { id: 2, left: 1, gate: None, reads: reads.clone() }),
+        })
+        .unwrap();
+    a.try_submit(JournalCommand::Begin(JournalEdit {
+        from_revision: 1,
+        to_revision: 2,
+        offset: 0,
+        removed: 0,
+        inserted: 14,
+    }))
+    .unwrap();
+    for _ in 0..14 {
+        a.try_submit(JournalCommand::Bytes(vec![9])).unwrap();
+    }
+    assert!(matches!(
+        a.try_submit(JournalCommand::Commit),
+        Err(std::sync::mpsc::TrySendError::Full(JournalCommand::Commit))
+    ));
+    release.send(()).unwrap();
+    b.ready.recv_timeout(TIMEOUT).unwrap().unwrap();
+    // The second seed was read before the first GB-shaped stream finished.
+    a.try_submit(JournalCommand::Commit).unwrap();
+    let bflush = b.try_flush().unwrap();
+    assert_eq!(bflush.recv_timeout(TIMEOUT).unwrap().unwrap(), 1);
+    service.finish();
+    service.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(a.finished.recv_timeout(TIMEOUT).unwrap().unwrap(), 2);
+    assert_eq!(b.finished.recv_timeout(TIMEOUT).unwrap().unwrap(), 1);
+    let log = reads.lock().unwrap();
+    assert!(log.iter().position(|&id| id == 2).unwrap() < log.iter().rposition(|&id| id == 1).unwrap());
+    drop(log);
+    let mut inserted = Vec::new();
+    let summary = JournalReader::open(&temp.path("a"))
+        .unwrap()
+        .recover(&AtomicBool::new(false), |e| {
+            if let RecoveryEvent::EditBytes(bytes) = e {
+                inserted.extend_from_slice(bytes);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(summary.revision, 2);
+    assert_eq!(inserted, vec![9; 14]);
+    assert!(!temp.path("a.pending").exists());
+    let recovered =
+        RecoveredJournal::open(temp.path("a"), DocumentId(17), &AtomicBool::new(false), |_| Ok(())).unwrap();
+    let mut resumed = JournalService::spawn(Duration::from_secs(60)).unwrap();
+    let handle = resumed.try_resume(recovered).unwrap();
+    assert_eq!(handle.ready.recv_timeout(TIMEOUT).unwrap().unwrap(), 2);
+    resumed.finish();
+    resumed.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+}
+
+#[test]
+fn kw20_shared_service_cancel_pending_seed_never_reports_durability() {
+    use std::sync::mpsc;
+    struct Source {
+        gate: mpsc::Receiver<()>,
+        entered: mpsc::SyncSender<()>,
+    }
+    impl Read for Source {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            self.gate.recv_timeout(TIMEOUT).map_err(std::io::Error::other)?;
+            b.fill(7);
+            Ok(b.len())
+        }
+    }
+    let temp = Temp::new();
+    let (release, gate) = mpsc::sync_channel(1);
+    let (entered_tx, entered) = mpsc::sync_channel(1);
+    let mut service = JournalService::spawn(Duration::from_secs(60)).unwrap();
+    let doc = service
+        .try_create(JournalSeed {
+            path: temp.path("cancelled"),
+            base: base((JOURNAL_CHUNK * 2) as u64),
+            source: Box::new(Source { gate, entered: entered_tx }),
+        })
+        .unwrap();
+    entered.recv_timeout(TIMEOUT).unwrap();
+    assert!(matches!(doc.ready.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    service.cancel();
+    release.send(()).unwrap();
+    service.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert!(doc.ready.recv_timeout(TIMEOUT).unwrap().is_err());
+    assert!(doc.finished.recv_timeout(TIMEOUT).unwrap().is_err());
+    assert!(temp.path("cancelled.pending").exists());
+    assert!(
+        JournalReader::open(&temp.path("cancelled")).unwrap().recover(&AtomicBool::new(false), |_| Ok(())).is_err()
+    );
+}
+
+#[test]
+fn kw20_recovery_finishes_interrupted_pending_merge_without_duplicate_edits() {
+    let temp = Temp::new();
+    let mut worker = create(&temp, b"\xff\xfe");
+    let path = temp.path("journal");
+    let base_end =
+        JournalReader::open(&path).unwrap().recover(&AtomicBool::new(false), |_| Ok(())).unwrap().committed_end;
+    edit(&worker, 1, 2, 2, 0, b"A\0");
+    flush(&worker);
+    worker.finish();
+    worker.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let pending = &bytes[base_end as usize..];
+    fs::write(temp.path("journal.pending"), pending).unwrap();
+    let file = OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(base_end + (pending.len() / 2) as u64).unwrap();
+    drop(file);
+    let mut commits = 0;
+    let recovered = RecoveredJournal::open(path.clone(), DocumentId(17), &AtomicBool::new(false), |e| {
+        if let RecoveryEvent::CommitEdit = e {
+            commits += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(commits, 1);
+    assert_eq!(recovered.summary().revision, 2);
+    assert!(!temp.path("journal.pending").exists());
+    drop(recovered);
+    // A stale pending file may reappear after its deletion was not persisted.
+    // It must not truncate newer edits already durably appended after that merge.
+    let mut worker = JournalWorker::resume(path.clone(), DocumentId(17), Duration::from_secs(60)).unwrap();
+    worker.ready.recv_timeout(TIMEOUT).unwrap().unwrap();
+    edit(&worker, 2, 3, 4, 0, b"B\0");
+    flush(&worker);
+    worker.finish();
+    worker.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    fs::write(temp.path("journal.pending"), pending).unwrap();
+    let recovered = RecoveredJournal::open(path, DocumentId(17), &AtomicBool::new(false), |_| Ok(())).unwrap();
+    assert_eq!(recovered.summary().revision, 3);
+}
+
 #[cfg(unix)]
 #[test]
 fn kw20_unix_stale_recovery_and_replaced_endpoint_is_not_removed() {

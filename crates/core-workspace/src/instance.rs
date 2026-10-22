@@ -410,6 +410,15 @@ mod platform {
             match operation(pipe.0, stop.0.0, INFINITE, |o| unsafe { ConnectNamedPipe(pipe.0, o) }) {
                 Ok(_) => (),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => return Ok(()),
+                Err(e) if matches!(e.raw_os_error(),Some(n) if n==ERROR_NO_DATA as i32 || n==ERROR_BROKEN_PIPE as i32) =>
+                {
+                    // A launcher may disappear before ConnectNamedPipe observes it.
+                    // This is a dead client, not loss of endpoint ownership.
+                    unsafe {
+                        DisconnectNamedPipe(pipe.0);
+                    }
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
             let deadline = Instant::now() + IO_TIMEOUT;
@@ -585,6 +594,7 @@ mod platform {
                 fs::remove_file(&path)?;
             }
             let listener = UnixListener::bind(&path)?;
+            listener.set_nonblocking(true)?;
             let m = fs::symlink_metadata(&path)?;
             let owner = OwnedSocket { path, dev: m.dev(), ino: m.ino(), _lock: lock };
             Ok((listener, owner))
@@ -615,7 +625,11 @@ mod platform {
             if fds[0].revents == 0 {
                 continue;
             }
-            let (mut stream, _) = listener.accept()?;
+            let (mut stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            };
             let deadline = Instant::now() + IO_TIMEOUT;
             let _ = (|| {
                 authenticate(stream.as_raw_fd())?;
