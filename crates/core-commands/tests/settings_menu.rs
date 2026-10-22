@@ -69,6 +69,44 @@ fn rebind_detects_exact_prefix_and_context_conflicts_and_keeps_tombstones() {
     assert!(doc.conflicts(&prefix).unwrap().iter().any(|c| c.kind == ConflictKind::Prefix));
 }
 
+#[test]
+fn replacement_rebind_refuses_unreachable_prefixes_and_more_specific_selectors() {
+    let mut doc = SettingsDocument::parse("").unwrap();
+    let before = doc.source().to_owned();
+    let long = Binding { keys: "ctrl+s ctrl+x".into(), command: "file.open".into(), context: None, mode: None };
+    let error = doc.rebind(long.clone(), true).unwrap_err();
+    assert!(error.0.contains("unreachable shortcut"));
+    assert_eq!(doc.source(), before, "failed replacement must not emit partial unbinds");
+    let source =
+        "[[bindings]]\nkeys='ctrl+c'\ncommand='edit.copy'\ncontext='editor'\nmode='insert'\nfuture='owner' # keep\n";
+    let mut doc = SettingsDocument::parse(source).unwrap();
+    let global = Binding { keys: "ctrl+c".into(), command: "file.open".into(), context: None, mode: None };
+    assert!(doc.rebind(global.clone(), true).is_err());
+    assert_eq!(doc.source(), source);
+    let scoped = Binding { context: Some(Context::Editor), mode: Some(Mode::Insert), ..global };
+    doc.rebind(scoped, true).unwrap();
+    assert!(doc.source().contains("future='owner' # keep"));
+    assert_eq!(
+        doc.settings().keymap().unwrap().resolve(
+            &"ctrl+c".parse::<KeySequence>().unwrap().0,
+            Context::Editor,
+            Mode::Insert
+        ),
+        Resolution::Command("file.open")
+    );
+    let mut doc = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+s'\ncommand=''\n").unwrap();
+    doc.rebind(long, true).unwrap();
+    let map = doc.settings().keymap().unwrap();
+    assert_eq!(
+        map.resolve(&"ctrl+s".parse::<KeySequence>().unwrap().0, Context::Editor, Mode::Insert),
+        Resolution::Pending
+    );
+    assert_eq!(
+        map.resolve(&"ctrl+s ctrl+x".parse::<KeySequence>().unwrap().0, Context::Editor, Mode::Insert),
+        Resolution::Command("file.open")
+    );
+}
+
 fn vim_binding(keys: &str, mode: Option<Mode>) -> Binding {
     Binding { keys: keys.into(), command: "file.save".into(), context: Some(Context::Editor), mode }
 }

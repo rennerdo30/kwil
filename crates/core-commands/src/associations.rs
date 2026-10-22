@@ -226,6 +226,7 @@ pub fn plan(
         linux_snapshot = Some((location.clone(), old.clone()));
         let mut source = old.as_ref().map(StoredValue::as_text).transpose()?.unwrap_or("").to_owned();
         for mime in &content_types {
+            source = change_ini_list(&source, "Removed Associations", mime, "kwil.desktop", None)?;
             source = edit_ini_list(&source, "Added Associations", mime, "kwil.desktop", false)?;
             if request.default_choice == DefaultChoice::MakeDefault {
                 source = edit_ini_list(&source, "Default Applications", mime, "kwil.desktop", true)?;
@@ -343,12 +344,24 @@ fn desktop_escape(s: &str) -> String {
 // Preserve all unrelated lines/comments. Refuse duplicate groups or keys rather
 // than guess which the desktop will use. Change only the selected list value.
 fn edit_ini_list(source: &str, group: &str, key: &str, entry: &str, first: bool) -> Result<String, AssociationError> {
+    change_ini_list(source, group, key, entry, Some(first))
+}
+fn change_ini_list(
+    source: &str,
+    group: &str,
+    key: &str,
+    entry: &str,
+    add: Option<bool>,
+) -> Result<String, AssociationError> {
     let newline = if source.contains("\r\n") { "\r\n" } else { "\n" };
     let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
     let header = format!("[{group}]");
     let groups: Vec<_> = lines.iter().enumerate().filter(|(_, l)| l.trim() == header).map(|(i, _)| i).collect();
     if groups.len() > 1 {
         return Err(err("unsupported duplicate mimeapps group"));
+    }
+    if add.is_none() && groups.is_empty() {
+        return Ok(source.to_owned());
     }
     let start = if let Some(i) = groups.first() {
         *i
@@ -365,6 +378,12 @@ fn edit_ini_list(source: &str, group: &str, key: &str, entry: &str, first: bool)
     if matches.len() > 1 {
         return Err(err("unsupported duplicate mimeapps key"));
     }
+    if add.is_none()
+        && (matches.is_empty()
+            || !lines[matches[0]].split_once('=').expect("matched key").1.split(';').any(|s| s.trim() == entry))
+    {
+        return Ok(source.to_owned());
+    }
     let (index, mut values) = if let Some(i) = matches.first() {
         (
             *i,
@@ -373,17 +392,19 @@ fn edit_ini_list(source: &str, group: &str, key: &str, entry: &str, first: bool)
                 .unwrap()
                 .1
                 .split(';')
-                .filter(|s| !s.is_empty() && *s != entry)
+                .filter(|s| !s.is_empty() && s.trim() != entry)
                 .map(str::to_owned)
                 .collect::<Vec<_>>(),
         )
     } else {
         (end, Vec::new())
     };
-    if first {
-        values.insert(0, entry.into());
-    } else {
-        values.push(entry.into());
+    if let Some(first) = add {
+        if first {
+            values.insert(0, entry.into());
+        } else {
+            values.push(entry.into());
+        }
     }
     let line = format!("{key}={};", values.join(";"));
     if matches.is_empty() {
@@ -826,5 +847,31 @@ mod tests {
         for (location, value) in before {
             assert_eq!(adapter.read(&location).unwrap(), Some(value));
         }
+    }
+    #[test]
+    fn linux_registration_removes_only_chosen_removed_entry_and_rolls_back_exact_bytes() {
+        let mut adapter = Fake::default();
+        let mut req = request();
+        let root = std::env::current_dir().unwrap();
+        req.platform =
+            AssociationPlatform::Linux { data_home: root.join("fake-data"), config_home: root.join("fake-config") };
+        req.types[0].content_type = Some("text/plain".into());
+        let location = Location::UserFile(root.join("fake-config/mimeapps.list"));
+        let original = StoredValue::text(
+            "# owner\n[Removed Associations]\n# preserve this\ntext/plain=other.desktop;kwil.desktop;third.desktop;\napplication/json=kwil.desktop;\n[Default Applications]\ntext/plain=other.desktop;\n",
+        );
+        adapter.write(&location, Some(&original)).unwrap();
+        let p = plan(&mut adapter, &req).unwrap();
+        assert_eq!(adapter.read(&location).unwrap(), Some(original.clone()), "planning cannot mutate state");
+        let mut receipt = apply(&mut adapter, &p).unwrap();
+        let after = adapter.read(&location).unwrap().unwrap();
+        let after = after.as_text().unwrap();
+        assert!(after.contains("text/plain=other.desktop;third.desktop;"));
+        assert!(after.contains("application/json=kwil.desktop;"));
+        assert!(after.contains("# preserve this"));
+        assert!(after.contains("[Added Associations]\ntext/plain=kwil.desktop;"));
+        assert!(after.contains("[Default Applications]\ntext/plain=other.desktop;"));
+        assert!(rollback(&mut adapter, &mut receipt).is_empty());
+        assert_eq!(adapter.read(&location).unwrap(), Some(original));
     }
 }

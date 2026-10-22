@@ -706,8 +706,15 @@ impl SettingsDocument {
                 }
             }
         }
-        changes.extend(row.defaults);
-        self.append_bindings(changes)
+        let defaults = row.defaults;
+        changes.extend(defaults.iter().cloned());
+        let mut edited = self.clone();
+        edited.append_bindings(changes)?;
+        for binding in &defaults {
+            edited.ensure_binding_reachable(binding)?;
+        }
+        *self = edited;
+        Ok(())
     }
     /// Rebind moves this command within the selected context/mode and emits
     /// tombstones for its former effective keys. Conflicts need explicit choice.
@@ -735,8 +742,39 @@ impl SettingsDocument {
             b.context = binding.context.or(b.context);
             b.mode = binding.mode.or(b.mode);
         }
-        old.push(binding);
-        self.append_bindings(old)
+        old.push(binding.clone());
+        let mut edited = self.clone();
+        edited.append_bindings(old)?;
+        edited.ensure_binding_reachable(&binding)?;
+        *self = edited;
+        Ok(())
+    }
+    /// Immediate short bindings and more-specific selectors may keep winning
+    /// after a global override. Refuse the transaction unless the requested
+    /// command is actually reachable throughout its requested scope.
+    fn ensure_binding_reachable(&self, binding: &Binding) -> Result<(), SettingsError> {
+        if binding.command.is_empty() {
+            return Ok(());
+        }
+        let map = self.settings().keymap()?;
+        let sequence = binding.keys.parse::<KeySequence>().map_err(|e| error(e.to_string()))?;
+        for context in [Context::Editor, Context::Palette, Context::Hex, Context::Diff] {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::VisualLine, Mode::Command] {
+                if binding.context.is_some_and(|v| v != context) || binding.mode.is_some_and(|v| v != mode) {
+                    continue;
+                }
+                let prefix_blocked = (1..sequence.0.len())
+                    .any(|len| map.resolve(&sequence.0[..len], context, mode) != Resolution::Pending);
+                if prefix_blocked || map.resolve(&sequence.0, context, mode) != Resolution::Command(&binding.command) {
+                    return Err(error(format!(
+                        "unreachable shortcut in {} / {}: remove the immediate prefix or more-specific binding first",
+                        context_name(context),
+                        mode_name(mode)
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
     fn append_bindings(&mut self, bindings: Vec<Binding>) -> Result<(), SettingsError> {
         self.transaction(|doc| {

@@ -1770,6 +1770,7 @@ name = "kwil-core-commands"
 version = "0.1.0"
 dependencies = [
  "kwil-core-workspace",
+ "libc",
  "serde",
  "toml",
  "toml_edit",
