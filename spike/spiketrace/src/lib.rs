@@ -236,6 +236,18 @@ fn mem() -> (f64, f64) {
 /// which works for off-screen windows. Evidence for the decision record.
 #[cfg(windows)]
 pub fn capture_window_bmp(hwnd: isize, path: &std::path::Path) -> std::io::Result<()> {
+    capture(hwnd, path, true)
+}
+
+/// Captures by reading the window's own DC (the DWM redirection surface).
+/// Right for GDI-presented windows, where `PrintWindow` returns blank.
+#[cfg(windows)]
+pub fn capture_window_dc_bmp(hwnd: isize, path: &std::path::Path) -> std::io::Result<()> {
+    capture(hwnd, path, false)
+}
+
+#[cfg(windows)]
+fn capture(hwnd: isize, path: &std::path::Path, print_window: bool) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{HWND, RECT};
     use windows_sys::Win32::Graphics::Gdi::*;
     use windows_sys::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
@@ -251,7 +263,11 @@ pub fn capture_window_bmp(hwnd: isize, path: &std::path::Path) -> std::io::Resul
         let mdc = CreateCompatibleDC(wdc);
         let bmp = CreateCompatibleBitmap(wdc, w, h);
         let old = SelectObject(mdc, bmp);
-        PrintWindow(hwnd, mdc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+        if print_window {
+            PrintWindow(hwnd, mdc, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+        } else {
+            BitBlt(mdc, 0, 0, w, h, wdc, 0, 0, SRCCOPY);
+        }
         let mut info: BITMAPINFO = std::mem::zeroed();
         info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
         info.bmiHeader.biWidth = w;

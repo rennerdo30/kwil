@@ -1,0 +1,24 @@
+[package]
+name = "renderer-b"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+# Times wgpu device creation on a worker thread (spec §6 claims 50-200 ms).
+gpu-init = ["dep:wgpu", "dep:pollster"]
+
+[dependencies]
+kwil-core-text = { path = "../../crates/core-text" }
+spiketrace = { path = "../spiketrace" }
+winit = "0.30.13"
+softbuffer = "0.4.8"
+fontdue = "0.9.5"
+raw-window-handle = "0.6.2"
+wgpu = { version = "30.0.1", optional = true }
+pollster = { version = "0.4", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
