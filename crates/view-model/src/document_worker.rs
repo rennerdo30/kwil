@@ -65,12 +65,45 @@ impl ExternalOpenInbox {
 }
 
 pub enum DocumentRequest {
-    Prepare { root: Option<PathBuf> },
+    Prepare {
+        root: Option<PathBuf>,
+    },
     Persist(Session),
-    Recover { tab: Tab },
-    Open { document: DocumentId, revision: u64, path: PathBuf },
-    Index { document: DocumentId, revision: u64, path: PathBuf, file: TextFile },
-    Save { document: DocumentId, request: SaveRequest },
+    Recover {
+        tab: Tab,
+    },
+    Open {
+        document: DocumentId,
+        revision: u64,
+        path: PathBuf,
+    },
+    Index {
+        document: DocumentId,
+        revision: u64,
+        path: PathBuf,
+        file: TextFile,
+    },
+    Save {
+        document: DocumentId,
+        request: SaveRequest,
+    },
+    SeedJournal {
+        document: DocumentId,
+        revision: u64,
+        snapshot: kwil_core_text::Snapshot,
+        path: Option<PathBuf>,
+        next_sequence: u64,
+    },
+    Journal {
+        document: DocumentId,
+        receipt: crate::EditReceipt,
+        path: Option<PathBuf>,
+        first_sequence: u64,
+    },
+    FinishJournal {
+        document: DocumentId,
+    },
+    FlushJournals,
 }
 
 pub enum DocumentResult {
@@ -80,6 +113,9 @@ pub enum DocumentResult {
     Opened { document: DocumentId, revision: u64, result: io::Result<(PathBuf, TextFile)> },
     Indexed { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
     Saved { document: DocumentId, revision: u64, result: io::Result<SavedSnapshot> },
+    JournalQueued { document: DocumentId, revision: u64, sequence: u64, result: io::Result<()> },
+    JournalDurable { document: DocumentId, revision: u64, sequence: u64, result: io::Result<()> },
+    JournalClosed { document: DocumentId, result: io::Result<()> },
 }
 
 pub struct PreparedWorkspace {
@@ -91,7 +127,23 @@ struct Storage {
     root: PathBuf,
     _ownership: std::fs::File,
     service: JournalService,
-    journals: HashMap<DocumentId, JournalSession>,
+    journals: HashMap<DocumentId, JournalState>,
+    order: HashMap<DocumentId, u64>,
+}
+
+struct JournalState {
+    handle: JournalSession,
+    revision: u64,
+    sequence: u64,
+    ready: bool,
+    flush: Option<(u64, mpsc::Receiver<io::Result<u64>>)>,
+    needs_flush: bool,
+    failed: bool,
+}
+impl JournalState {
+    fn new(handle: JournalSession, revision: u64, sequence: u64) -> Self {
+        Self { handle, revision, sequence, ready: false, flush: None, needs_flush: true, failed: false }
+    }
 }
 
 pub struct DocumentWorker {
@@ -99,78 +151,189 @@ pub struct DocumentWorker {
 }
 
 impl DocumentWorker {
+    /// The model retains one receipt on Full and centrally gates subsequent
+    /// document mutations. This callback only transfers ownership; no I/O or
+    /// replacement iteration runs on the UI thread.
+    pub fn observer(&self, document: DocumentId, path: Option<PathBuf>, first_sequence: u64) -> crate::EditObserver {
+        let sender = self.tx.clone();
+        Box::new(move |receipt| {
+            match sender.try_send(DocumentRequest::Journal { document, receipt, path: path.clone(), first_sequence }) {
+                Ok(()) => Ok(()),
+                Err(
+                    TrySendError::Full(DocumentRequest::Journal { receipt, .. })
+                    | TrySendError::Disconnected(DocumentRequest::Journal { receipt, .. }),
+                ) => Err(receipt),
+                _ => unreachable!("journal observer submits only journal receipts"),
+            }
+        })
+    }
     pub fn spawn(complete: impl Fn(DocumentResult) + Send + 'static) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(16);
         std::thread::Builder::new().name("kwil-documents".into()).spawn(move || {
             let mut storage: Option<Storage> = None;
-            while let Ok(request) = rx.recv() {
-                match request {
-                    DocumentRequest::Prepare { root } => {
-                        let prepared = prepare(root).map(|(prepared, state)| {
-                            storage = Some(state);
-                            prepared
-                        });
-                        complete(DocumentResult::Prepared(prepared));
+            loop {
+                let waiting = storage.as_ref().is_some_and(|state| {
+                    state.journals.values().any(|journal| {
+                        !journal.failed && (!journal.ready || journal.flush.is_some() || journal.needs_flush)
+                    })
+                });
+                let request = if waiting {
+                    match rx.recv_timeout(Duration::from_millis(25)) {
+                        Ok(request) => Some(request),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
-                    DocumentRequest::Persist(session) => {
-                        let result = storage
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("Session recovery is unavailable"))
-                            .and_then(|s| session::store_session(&s.root.join("session.kws"), &session));
-                        complete(DocumentResult::Persisted(result));
+                } else {
+                    match rx.recv() {
+                        Ok(request) => Some(request),
+                        Err(_) => break,
                     }
-                    DocumentRequest::Recover { tab } => {
-                        let result = (|| {
-                            let storage = storage.as_mut().ok_or_else(|| io::Error::other("Recovery unavailable"))?;
-                            let path = storage.root.join(format!("{}.kwj", tab.id.0));
-                            if path.try_exists()? {
-                                let (document, recovered, _) = recover_document(path, &tab)?;
-                                let handle = resume(&storage.service, recovered)?;
-                                storage.journals.insert(tab.id, handle);
-                                Ok(document)
-                            } else if let Some(path) = &tab.path {
-                                kwil_core_workspace::open_for_editing(path).and_then(|file| index(path.clone(), file))
-                            } else if tab.revision == tab.saved_revision {
-                                Ok(Document::new())
-                            } else {
-                                Err(io::Error::other("Closed document has no complete recovery journal"))
+                };
+                if let Some(request) = request {
+                    match request {
+                        DocumentRequest::Prepare { root } => {
+                            let prepared = prepare(root).map(|(prepared, state)| {
+                                storage = Some(state);
+                                prepared
+                            });
+                            complete(DocumentResult::Prepared(prepared));
+                        }
+                        DocumentRequest::Persist(session) => {
+                            if let Some(storage) = &mut storage {
+                                storage.order.retain(|id, _| {
+                                    session.tabs().iter().chain(session.closed()).any(|tab| tab.id == *id)
+                                });
                             }
-                        })();
-                        complete(DocumentResult::Recovered {
-                            document: tab.id,
-                            revision: tab.revision,
-                            result: result.map(Box::new),
-                        });
-                    }
-                    DocumentRequest::Open { document, revision, path } => {
-                        match kwil_core_workspace::open_for_editing(&path) {
-                            Ok(file) => {
-                                complete(DocumentResult::Opened {
+                            let result = storage
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("Session recovery is unavailable"))
+                                .and_then(|s| session::store_session(&s.root.join("session.kws"), &session));
+                            complete(DocumentResult::Persisted(result));
+                        }
+                        DocumentRequest::Recover { tab } => {
+                            let result = (|| {
+                                let storage =
+                                    storage.as_mut().ok_or_else(|| io::Error::other("Recovery unavailable"))?;
+                                let path = storage.root.join(format!("{}.kwj", tab.id.0));
+                                if path.try_exists()? {
+                                    let (document, recovered, _) = recover_document(path, &tab)?;
+                                    let handle = resume(&storage.service, recovered)?;
+                                    let revision = document.revision();
+                                    storage.journals.insert(tab.id, JournalState::new(handle, revision, 0));
+                                    Ok(document)
+                                } else if let Some(path) = &tab.path {
+                                    kwil_core_workspace::open_for_editing(path)
+                                        .and_then(|file| index(path.clone(), file))
+                                } else if tab.revision == tab.saved_revision {
+                                    Ok(Document::new())
+                                } else {
+                                    Err(io::Error::other("Closed document has no complete recovery journal"))
+                                }
+                            })();
+                            complete(DocumentResult::Recovered {
+                                document: tab.id,
+                                revision: tab.revision,
+                                result: result.map(Box::new),
+                            });
+                        }
+                        DocumentRequest::Open { document, revision, path } => {
+                            match kwil_core_workspace::open_for_editing(&path) {
+                                Ok(file) => {
+                                    complete(DocumentResult::Opened {
+                                        document,
+                                        revision,
+                                        result: Ok((path.clone(), file.clone())),
+                                    });
+                                    let result = index(path, file);
+                                    complete(DocumentResult::Indexed {
+                                        document,
+                                        revision,
+                                        result: result.map(Box::new),
+                                    });
+                                }
+                                Err(error) => {
+                                    complete(DocumentResult::Opened { document, revision, result: Err(error) })
+                                }
+                            }
+                        }
+                        DocumentRequest::Index { document, revision, path, file } => {
+                            complete(DocumentResult::Indexed {
+                                document,
+                                revision,
+                                result: index(path, file).map(Box::new),
+                            });
+                        }
+                        DocumentRequest::Save { document, request } => {
+                            let revision = request.revision;
+                            complete(DocumentResult::Saved {
+                                document,
+                                revision,
+                                result: kwil_core_workspace::save_snapshot(request),
+                            });
+                        }
+                        DocumentRequest::SeedJournal { document, revision, snapshot, path, next_sequence } => {
+                            let result = storage
+                                .as_mut()
+                                .ok_or_else(|| io::Error::other("Recovery unavailable"))
+                                .and_then(|storage| {
+                                    seed_journal(
+                                        storage,
+                                        document,
+                                        revision,
+                                        snapshot,
+                                        path,
+                                        next_sequence.saturating_sub(1),
+                                    )
+                                });
+                            if let Err(error) = result {
+                                complete(DocumentResult::JournalDurable {
                                     document,
                                     revision,
-                                    result: Ok((path.clone(), file.clone())),
+                                    sequence: next_sequence.saturating_sub(1),
+                                    result: Err(error),
                                 });
-                                let result = index(path, file);
-                                complete(DocumentResult::Indexed { document, revision, result: result.map(Box::new) });
                             }
-                            Err(error) => complete(DocumentResult::Opened { document, revision, result: Err(error) }),
+                        }
+                        DocumentRequest::Journal { document, receipt, path, first_sequence } => {
+                            let (revision, sequence) = (receipt.after_revision, receipt.sequence);
+                            let result = storage
+                                .as_mut()
+                                .ok_or_else(|| io::Error::other("Recovery unavailable"))
+                                .and_then(|storage| journal_receipt(storage, document, receipt, path, first_sequence));
+                            complete(DocumentResult::JournalQueued { document, revision, sequence, result });
+                        }
+                        DocumentRequest::FinishJournal { document } => {
+                            let result = if let Some(storage) = &mut storage
+                                && let Some(journal) = storage.journals.remove(&document)
+                            {
+                                submit(&journal.handle, kwil_core_workspace::journal::JournalCommand::Finish).and_then(
+                                    |_| {
+                                        journal
+                                            .handle
+                                            .finished
+                                            .recv_timeout(Duration::from_secs(30))
+                                            .map_err(|_| {
+                                                io::Error::other("Journal close timed out; recovery retained")
+                                            })?
+                                            .map(|_| ())
+                                    },
+                                )
+                            } else {
+                                Ok(())
+                            };
+                            complete(DocumentResult::JournalClosed { document, result });
+                        }
+                        DocumentRequest::FlushJournals => {
+                            if let Some(storage) = &mut storage {
+                                for journal in storage.journals.values_mut() {
+                                    journal.needs_flush = true;
+                                }
+                            }
                         }
                     }
-                    DocumentRequest::Index { document, revision, path, file } => {
-                        complete(DocumentResult::Indexed {
-                            document,
-                            revision,
-                            result: index(path, file).map(Box::new),
-                        });
-                    }
-                    DocumentRequest::Save { document, request } => {
-                        let revision = request.revision;
-                        complete(DocumentResult::Saved {
-                            document,
-                            revision,
-                            result: kwil_core_workspace::save_snapshot(request),
-                        });
-                    }
+                }
+                if let Some(storage) = &mut storage {
+                    poll_journals(storage, &complete);
                 }
             }
             if let Some(mut storage) = storage {
@@ -271,7 +434,8 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             };
             recovered.and_then(|(document, recovered)| {
                 let handle = resume(&service, recovered)?;
-                journals.insert(tab.id, handle);
+                let revision = document.revision();
+                journals.insert(tab.id, JournalState::new(handle, revision, 0));
                 Ok(document)
             })
         } else if let Some(path) = &tab.path {
@@ -283,7 +447,214 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
         };
         documents.push((tab.id, result));
     }
-    Ok((PreparedWorkspace { session, documents }, Storage { root, _ownership: ownership, service, journals }))
+    Ok((
+        PreparedWorkspace { session, documents },
+        Storage { root, _ownership: ownership, service, journals, order: HashMap::new() },
+    ))
+}
+
+fn seed_journal(
+    storage: &mut Storage,
+    document: DocumentId,
+    revision: u64,
+    snapshot: kwil_core_text::Snapshot,
+    path: Option<PathBuf>,
+    sequence: u64,
+) -> io::Result<()> {
+    if storage.journals.contains_key(&document) {
+        return Ok(());
+    }
+    let sequence = *storage.order.entry(document).or_insert(sequence);
+    let journal_path = storage.root.join(format!("{}.kwj", document.0));
+    let handle = if journal_path.try_exists()? {
+        let recovered = RecoveredJournal::open(journal_path, document, &AtomicBool::new(false), |_| Ok(()))?;
+        if recovered.summary().revision != revision || recovered.summary().byte_len != snapshot.len() {
+            return Err(io::Error::other("Journal revision disagrees with reopened document; recovery retained"));
+        }
+        resume(&storage.service, recovered)?
+    } else {
+        let mut seed = kwil_core_workspace::journal::JournalSeed {
+            path: journal_path,
+            base: JournalBase {
+                document,
+                revision,
+                original_path: path,
+                original_identity: [0; 4],
+                codec: b"raw-v1".to_vec(),
+                byte_len: snapshot.len(),
+            },
+            source: Box::new(SnapshotReader::new(snapshot)),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match storage.service.try_create(seed) {
+                Ok(handle) => break handle,
+                Err(TrySendError::Full(value)) if std::time::Instant::now() < deadline => {
+                    seed = *value;
+                    std::thread::park_timeout(Duration::from_millis(2));
+                }
+                Err(_) => return Err(io::Error::other("Journal seed admission failed; edits remain unsaved")),
+            }
+        }
+    };
+    storage.journals.insert(document, JournalState::new(handle, revision, sequence));
+    Ok(())
+}
+
+fn submit(handle: &JournalSession, mut command: kwil_core_workspace::journal::JournalCommand) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match handle.try_submit(command) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(value)) if std::time::Instant::now() < deadline => {
+                command = value;
+                std::thread::park_timeout(Duration::from_millis(2));
+            }
+            Err(_) => return Err(io::Error::other("Journal queue unavailable; current changes are not durable")),
+        }
+    }
+}
+
+struct JournalBytes<'a>(&'a JournalSession);
+impl io::Write for JournalBytes<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for chunk in bytes.chunks(kwil_core_workspace::journal::JOURNAL_CHUNK) {
+            submit(self.0, kwil_core_workspace::journal::JournalCommand::Bytes(chunk.to_vec()))?;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn journal_receipt(
+    storage: &mut Storage,
+    document: DocumentId,
+    receipt: crate::EditReceipt,
+    path: Option<PathBuf>,
+    first_sequence: u64,
+) -> io::Result<()> {
+    use kwil_core_workspace::journal::{JournalBatch, JournalCommand as C, JournalReplacement};
+    seed_journal(
+        storage,
+        document,
+        receipt.before_revision,
+        receipt.before.clone(),
+        path,
+        first_sequence.saturating_sub(1),
+    )?;
+    let journal = storage.journals.get_mut(&document).unwrap();
+    let result = (|| {
+        if journal.failed
+            || journal.sequence.checked_add(1) != Some(receipt.sequence)
+            || journal.revision != receipt.before_revision
+        {
+            return Err(io::Error::other("Journal receipt gap, duplicate or mismatched revision; recovery retained"));
+        }
+        submit(
+            &journal.handle,
+            C::BeginBatch(JournalBatch {
+                from_revision: receipt.before_revision,
+                to_revision: receipt.after_revision,
+                replacements: receipt.replacement_count(),
+            }),
+        )?;
+        receipt.for_each_replacement(&mut |replacement| {
+            submit(
+                &journal.handle,
+                C::BeginReplacement(JournalReplacement {
+                    offset: replacement.range.start,
+                    removed: replacement.range.end - replacement.range.start,
+                    inserted: replacement.insert.len(),
+                }),
+            )?;
+            replacement.insert.write_to(&mut JournalBytes(&journal.handle))?;
+            submit(&journal.handle, C::EndReplacement)
+        })?;
+        submit(&journal.handle, C::CommitBatch)?;
+        journal.revision = receipt.after_revision;
+        journal.sequence = receipt.sequence;
+        journal.needs_flush = true;
+        Ok(())
+    })();
+    if result.is_err() {
+        journal.failed = true;
+    } else {
+        storage.order.insert(document, receipt.sequence);
+    }
+    result
+}
+
+fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
+    for (&document, journal) in &mut storage.journals {
+        if journal.failed {
+            continue;
+        }
+        if !journal.ready {
+            match journal.handle.ready.try_recv() {
+                Ok(Ok(_)) => journal.ready = true,
+                Err(mpsc::TryRecvError::Empty) => continue,
+                outcome => {
+                    journal.failed = true;
+                    let error = match outcome {
+                        Ok(Err(error)) => error,
+                        _ => io::Error::other("Journal seed worker disconnected"),
+                    };
+                    complete(DocumentResult::JournalDurable {
+                        document,
+                        revision: journal.revision,
+                        sequence: journal.sequence,
+                        result: Err(error),
+                    });
+                    continue;
+                }
+            }
+        }
+        if let Some((sequence, receiver)) = journal.flush.take() {
+            match receiver.try_recv() {
+                Ok(Ok(revision)) => {
+                    if sequence == journal.sequence && revision == journal.revision {
+                        complete(DocumentResult::JournalDurable { document, revision, sequence, result: Ok(()) });
+                    } else {
+                        journal.needs_flush = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => journal.flush = Some((sequence, receiver)),
+                outcome => {
+                    journal.failed = true;
+                    let error = match outcome {
+                        Ok(Err(error)) => error,
+                        _ => io::Error::other("Journal flush worker disconnected"),
+                    };
+                    complete(DocumentResult::JournalDurable {
+                        document,
+                        revision: journal.revision,
+                        sequence: journal.sequence,
+                        result: Err(error),
+                    });
+                }
+            }
+        }
+        if journal.needs_flush && journal.flush.is_none() && !journal.failed {
+            match journal.handle.try_flush() {
+                Ok(receiver) => {
+                    journal.flush = Some((journal.sequence, receiver));
+                    journal.needs_flush = false;
+                }
+                Err(TrySendError::Full(_)) => {}
+                Err(_) => {
+                    journal.failed = true;
+                    complete(DocumentResult::JournalDurable {
+                        document,
+                        revision: journal.revision,
+                        sequence: journal.sequence,
+                        result: Err(io::Error::other("Journal flush admission failed")),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, RecoveredJournal, JournalBase)> {

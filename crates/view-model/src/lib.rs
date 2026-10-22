@@ -11,7 +11,7 @@ mod document;
 mod editor;
 pub mod grid;
 mod workspace;
-pub use workspace::{FilePrompt, FilePromptKind, Workspace};
+pub use workspace::{FilePrompt, FilePromptKind, TabAction, TabArea, TabGeometry, TabMetrics, TabSlot, Workspace};
 pub mod document_worker;
 pub use kwil_core_workspace::session::DocumentId as SessionDocumentId;
 #[cfg(test)]

@@ -10,6 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
 mod file_prompt;
+mod tabs;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -70,8 +71,9 @@ pub fn run_with_external_open(
 
     let result = (|| -> std::io::Result<()> {
         let size = terminal.size()?;
-        view.set_rows(size.height.saturating_sub(1) as usize);
-        terminal.draw(|f| file_prompt::draw(f, &view))?;
+        let geometry = tabs::geometry(&view, size.width, size.height, Settings::default().tabs.layout);
+        view.set_rows(geometry.body.height);
+        terminal.draw(|f| tabs::draw(f, &view, Settings::default().tabs.layout))?;
         let document_sender = tx.clone();
         view.start_document_worker(move |result| {
             let _ = document_sender.send(Msg::Document(result));
@@ -135,10 +137,7 @@ pub fn run_with_external_open(
                     view.set_notice(n);
                     true
                 }
-                Msg::Input(Event::Resize(_, h)) => {
-                    view.set_rows(h.saturating_sub(1) as usize);
-                    true
-                }
+                Msg::Input(Event::Resize(_, _)) => true,
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                     let intent = if view.file_prompt().is_some() {
                         file_prompt::key(&mut view, k)
@@ -210,6 +209,14 @@ pub fn run_with_external_open(
                         false
                     }
                 }
+                Msg::Input(Event::Mouse(m))
+                    if {
+                        let size = terminal.size()?;
+                        tabs::mouse(&mut view, &m, size.width, size.height, settings.tabs.layout)
+                    } =>
+                {
+                    true
+                }
                 Msg::Input(Event::Mouse(m)) => match m.kind {
                     MouseEventKind::ScrollDown => view.scroll(3) != Default::default(),
                     MouseEventKind::ScrollUp => view.scroll(-3) != Default::default(),
@@ -221,10 +228,15 @@ pub fn run_with_external_open(
                 if user_input {
                     view.checkpoint_session();
                 }
+                let size = terminal.size()?;
+                let geometry = tabs::geometry(&view, size.width, size.height, settings.tabs.layout);
+                if view.rows() != geometry.body.height {
+                    view.set_rows(geometry.body.height);
+                }
                 keep_visible(
                     &mut view,
                     &mut horizontal,
-                    terminal.size()?.width.saturating_sub(8) as usize,
+                    geometry.body.width.saturating_sub(8),
                     settings.editor.tab_size as usize,
                 );
                 // ratatui diffs against the previous frame and writes only
@@ -232,11 +244,7 @@ pub fn run_with_external_open(
                 if let Some(editor) = view.editor_mut() {
                     editor.settings = settings.clone();
                 }
-                let rows = terminal.size()?.height.saturating_sub(1) as usize;
-                if view.rows() != rows {
-                    view.set_rows(rows);
-                }
-                terminal.draw(|f| file_prompt::draw(f, &view))?;
+                terminal.draw(|f| tabs::draw(f, &view, settings.tabs.layout))?;
             }
         }
         Ok(())
@@ -531,10 +539,15 @@ fn execute(view: &mut View, id: &str, text: Option<String>, extend: bool, at: st
     true
 }
 
+#[cfg(test)]
 fn draw(f: &mut ratatui::Frame, view: &View) {
     let area = f.area();
+    draw_area(f, view, area, true);
+}
+
+fn draw_area(f: &mut ratatui::Frame, view: &View, area: Rect, status: bool) {
     let gutter_style = Style::default().fg(Color::Rgb(0x5b, 0x6b, 0x85));
-    for row in 0..view.rows().min(area.height.saturating_sub(1) as usize) {
+    for row in 0..view.rows().min(area.height.saturating_sub(u16::from(status)) as usize) {
         let y = area.y + row as u16;
         let Some(text) = view.line(row) else { continue };
         let tab = view.editor().map_or(4, |editor| editor.settings.editor.tab_size as usize);
@@ -557,12 +570,14 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
         let line = Line::from(spans);
         f.render_widget(Paragraph::new(line), Rect { x: area.x, y, width: area.width, height: 1 });
     }
-    let status = Paragraph::new(view.status_text())
-        .style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18)));
-    f.render_widget(
-        status,
-        Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
-    );
+    if status {
+        let status = Paragraph::new(view.status_text())
+            .style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18)));
+        f.render_widget(
+            status,
+            Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
+        );
+    }
     if let Some(editor) = view.editor()
         && let Ok((row, byte)) = editor.byte_position(editor.primary_cursor().head)
         && row >= view.top()

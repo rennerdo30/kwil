@@ -10,6 +10,78 @@ use std::{
     path::PathBuf,
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TabArea {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+impl TabArea {
+    pub fn contains(self, x: usize, y: usize) -> bool {
+        x >= self.x && y >= self.y && x < self.x.saturating_add(self.width) && y < self.y.saturating_add(self.height)
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct TabMetrics {
+    pub width: usize,
+    pub height: usize,
+    pub cell_width: usize,
+    pub cell_height: usize,
+    pub scrollbar: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabAction {
+    Activate(DocumentId),
+    Close(DocumentId),
+    PreviousPage,
+    NextPage,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabSlot {
+    pub document: DocumentId,
+    pub area: TabArea,
+    pub close: TabArea,
+    pub active: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabGeometry {
+    pub body: TabArea,
+    pub chrome: TabArea,
+    pub text: TabArea,
+    pub previous: TabArea,
+    pub next: TabArea,
+    pub slots: Vec<TabSlot>,
+    pub first: usize,
+    pub capacity: usize,
+    pub total: usize,
+    pub cell_height: usize,
+}
+impl TabGeometry {
+    pub fn hit(&self, x: usize, y: usize) -> Option<TabAction> {
+        if self.first > 0 && self.previous.contains(x, y) {
+            return Some(TabAction::PreviousPage);
+        }
+        if self.capacity > 0 && self.first + self.capacity < self.total && self.next.contains(x, y) {
+            return Some(TabAction::NextPage);
+        }
+        self.slots.iter().find(|slot| slot.area.contains(x, y)).map(|slot| {
+            if slot.close.contains(x, y) { TabAction::Close(slot.document) } else { TabAction::Activate(slot.document) }
+        })
+    }
+    /// Physical source/destination rectangles; only editor pixels participate.
+    pub fn scroll_copy(&self, delta: i64) -> Option<(TabArea, TabArea)> {
+        let dy = (delta.unsigned_abs() as usize).saturating_mul(self.cell_height);
+        if delta == 0 || dy >= self.text.height || self.text.width == 0 {
+            return None;
+        }
+        let source =
+            TabArea { y: self.text.y + if delta > 0 { dy } else { 0 }, height: self.text.height - dy, ..self.text };
+        let target = TabArea { y: self.text.y + if delta < 0 { dy } else { 0 }, ..source };
+        Some((source, target))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilePromptKind {
     Open,
@@ -75,6 +147,120 @@ impl Workspace {
     }
     pub fn view_mut(&mut self, id: DocumentId) -> Option<&mut View> {
         self.views.get_mut(&id)
+    }
+
+    pub fn tab_title(&self, id: DocumentId) -> String {
+        let Some(tab) = self.session.tabs().iter().find(|t| t.id == id) else { return String::new() };
+        let name = tab
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map_or_else(|| format!("Untitled {}", id.0), |name| name.to_string_lossy().into_owned());
+        let dirty = self
+            .views
+            .get(&id)
+            .and_then(View::editor)
+            .map_or(tab.revision != tab.saved_revision, |editor| editor.document().is_dirty());
+        if dirty { format!("* {name}") } else { name }
+    }
+
+    pub fn tab_geometry(&self, metrics: TabMetrics, layout: kwil_core_commands::settings::TabLayout) -> TabGeometry {
+        use kwil_core_commands::settings::TabLayout;
+        let TabMetrics { width, height, cell_width, cell_height, scrollbar } = metrics;
+        let (cw, ch) = (cell_width.max(1), cell_height.max(1));
+        let content_height = height.saturating_sub(ch);
+        let mut result = TabGeometry {
+            body: TabArea { width, height: content_height, ..Default::default() },
+            chrome: TabArea::default(),
+            text: TabArea::default(),
+            previous: TabArea::default(),
+            next: TabArea::default(),
+            slots: Vec::new(),
+            first: 0,
+            capacity: 0,
+            total: self.session.tabs().len(),
+            cell_height: ch,
+        };
+        let (available, slot_width, slot_height, start_x, start_y) = match layout {
+            TabLayout::Horizontal => {
+                let header = ch.min(content_height);
+                result.chrome = TabArea { width, height: header, ..Default::default() };
+                result.body.y = header;
+                result.body.height = content_height - header;
+                let nav = cw.saturating_mul(2).min(width / 2);
+                result.previous = TabArea { width: nav, height: header, ..Default::default() };
+                result.next = TabArea { x: width - nav, width: nav, height: header, ..Default::default() };
+                let available = width.saturating_sub(2 * nav);
+                let count = (available / cw.saturating_mul(20)).max(1);
+                (if available == 0 || header == 0 { 0 } else { count }, available / count, header, nav, 0)
+            }
+            TabLayout::Vertical => {
+                let side = cw.saturating_mul(26).min(width / 3);
+                result.chrome = TabArea { width: side, height: content_height, ..Default::default() };
+                result.body.x = side;
+                result.body.width = width - side;
+                result.previous = TabArea { width: side / 2, height: ch.min(content_height), ..Default::default() };
+                result.next = TabArea {
+                    x: side / 2,
+                    width: side - side / 2,
+                    height: ch.min(content_height),
+                    ..Default::default()
+                };
+                (if side == 0 { 0 } else { content_height.saturating_sub(ch) / ch }, side, ch, 0, ch)
+            }
+        };
+        result.capacity = available.min(kwil_core_workspace::session::MAX_TABS);
+        let active = self.session.tabs().iter().position(|t| t.id == self.active_id()).unwrap_or(0);
+        if result.capacity > 0 {
+            result.first = active / result.capacity * result.capacity;
+            for (index, tab) in self.session.tabs().iter().enumerate().skip(result.first).take(result.capacity) {
+                let local = index - result.first;
+                let area = TabArea {
+                    x: start_x + if layout == TabLayout::Horizontal { local * slot_width } else { 0 },
+                    y: start_y + if layout == TabLayout::Vertical { local * slot_height } else { 0 },
+                    width: slot_width,
+                    height: slot_height,
+                };
+                let close_width = cw.saturating_mul(3).min(area.width);
+                let close = TabArea { x: area.x + area.width - close_width, width: close_width, ..area };
+                result.slots.push(TabSlot { document: tab.id, area, close, active: tab.id == self.active_id() });
+            }
+        }
+        result.text = TabArea {
+            x: result.body.x,
+            y: result.body.y,
+            width: result.body.width.saturating_sub(scrollbar),
+            height: result.body.height.saturating_sub(scrollbar) / ch * ch,
+        };
+        result
+    }
+
+    pub fn tab_action(&mut self, action: TabAction, geometry: &TabGeometry) -> io::Result<()> {
+        match action {
+            TabAction::Activate(id) => {
+                self.cancel_file_prompt();
+                self.activate(id);
+            }
+            TabAction::Close(id) => {
+                self.cancel_file_prompt();
+                self.files.close = [id].into();
+                self.advance_close(false)?;
+            }
+            TabAction::PreviousPage | TabAction::NextPage => {
+                let index = if action == TabAction::PreviousPage {
+                    geometry.first.saturating_sub(geometry.capacity)
+                } else {
+                    (geometry.first + geometry.capacity).min(geometry.total.saturating_sub(1))
+                };
+                if let Some(tab) = self.session.tabs().get(index) {
+                    let id = tab.id;
+                    self.cancel_file_prompt();
+                    self.activate(id);
+                }
+            }
+        }
+        self.checkpoint_session();
+        Ok(())
     }
 
     pub fn open(&mut self, mut view: View) -> io::Result<DocumentId> {
@@ -542,7 +728,7 @@ impl Workspace {
     }
 
     pub fn request_window_close(&mut self, discard: bool) -> io::Result<()> {
-        if !self.close_pending() {
+        if !self.files.quit && !(discard && !self.files.close.is_empty()) {
             self.files.quit = true;
             self.files.close = self.session.tabs().iter().map(|t| t.id).collect();
         }
@@ -1125,6 +1311,63 @@ mod tests {
     }
 
     #[test]
+    fn window_close_promotes_a_tab_close_prompt_to_cover_all_tabs() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "one");
+        let first = workspace.active_id();
+        workspace.file_command("file.new").unwrap();
+        edit(&mut workspace, "two");
+        let second = workspace.active_id();
+        workspace.file_command("file.close").unwrap();
+        assert_eq!(workspace.files.close.iter().copied().collect::<Vec<_>>(), vec![second]);
+        workspace.request_window_close(false).unwrap();
+        assert_eq!(workspace.active_id(), first);
+        workspace.discard_close_target().unwrap();
+        assert_eq!(workspace.active_id(), second);
+        assert!(!workspace.wants_exit());
+        workspace.cancel_file_prompt();
+    }
+
+    #[test]
+    fn named_save_as_routes_to_new_path_without_overwriting_the_original() {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-named-saveas-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let original = root.join("original.txt");
+        let target = root.join("copy.txt");
+        std::fs::write(&original, b"original").unwrap();
+        let file = kwil_core_workspace::open_for_editing(&original).unwrap();
+        file.build_index(1).unwrap();
+        let mut workspace = Workspace::new(View::new(Some((original.clone(), file)))).unwrap();
+        let document = workspace.active_id();
+        workspace.execute("edit.selectAll", &CommandArgs::default(), 1).unwrap();
+        edit(&mut workspace, "changed");
+        workspace.file_command("file.saveAs").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().kind, FilePromptKind::SaveAs);
+        workspace.file_prompt_mut().unwrap().text = target.to_string_lossy().into();
+        workspace.submit_file_prompt().unwrap();
+        let (owner, request) = take_save(&mut workspace);
+        assert_eq!(owner, document);
+        assert_eq!(request.path, target);
+        let revision = request.revision;
+        workspace.document_result(DocumentResult::Saved {
+            document,
+            revision,
+            result: kwil_core_workspace::save_snapshot(request),
+        });
+        assert_eq!(workspace.editor().unwrap().document().path(), Some(target.as_path()));
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        assert_eq!(std::fs::read(&target).unwrap(), b"changed");
+        drop(workspace);
+        std::fs::remove_file(original).unwrap();
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn tabs_keep_their_text_undo_and_cursor_and_refuse_dirty_close() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         let first = workspace.active_id();
@@ -1159,5 +1402,96 @@ mod tests {
         workspace.close(second, false).unwrap();
         assert_eq!(workspace.session().tabs().len(), 1);
         assert!(workspace.editor().unwrap().document().snapshot().is_empty());
+    }
+
+    #[test]
+    fn recovery_remaps_early_edits_and_their_save_prompt_without_reusing_identity() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "early");
+        workspace.file_command("file.saveAndQuit").unwrap();
+        let old = workspace.active_id();
+        let mut session = Session::default();
+        let restored = session.open(None).unwrap();
+        assert_eq!(restored, old, "the fixture must exercise a real startup identity collision");
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, b"recovered").unwrap();
+        document.revision = 4;
+        document.saved_revision = 3;
+        document.next_revision = 5;
+        session.tab_mut(restored).unwrap().revision = 4;
+        session.tab_mut(restored).unwrap().saved_revision = 3;
+        workspace.install_prepared(crate::document_worker::PreparedWorkspace {
+            session,
+            documents: vec![(restored, Ok(document))],
+        });
+        let early = workspace.active_id();
+        assert_ne!(early, restored);
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 5);
+        assert_eq!(workspace.view(restored).unwrap().editor().unwrap().document().snapshot().len(), 9);
+        assert_eq!(workspace.file_prompt().unwrap().document, early);
+        assert_eq!(workspace.files.close.front().copied(), Some(early));
+        assert!(workspace.close_pending());
+        assert_eq!(workspace.session().tabs().len(), 2);
+        workspace.cancel_file_prompt();
+    }
+
+    #[test]
+    fn tab_geometry_keeps_editor_hits_and_scroll_copy_inside_both_origins() {
+        use kwil_core_commands::settings::TabLayout;
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.file_command("file.new").unwrap();
+        let active = workspace.active_id();
+        for layout in [TabLayout::Horizontal, TabLayout::Vertical] {
+            let geometry = workspace.tab_geometry(
+                TabMetrics { width: 800, height: 400, cell_width: 8, cell_height: 16, scrollbar: 14 },
+                layout,
+            );
+            let expected = if layout == TabLayout::Horizontal { (0, 16) } else { (208, 0) };
+            assert_eq!((geometry.body.x, geometry.body.y), expected);
+            assert!(geometry.body.contains(geometry.text.x, geometry.text.y));
+            assert!(geometry.hit(geometry.text.x, geometry.text.y).is_none(), "text origin must not activate a tab");
+            let slot = geometry.slots.iter().find(|slot| slot.document == active).unwrap();
+            assert_eq!(geometry.hit(slot.area.x, slot.area.y), Some(TabAction::Activate(active)));
+            assert_eq!(geometry.hit(slot.close.x, slot.close.y), Some(TabAction::Close(active)));
+            for delta in [-1, 1] {
+                let (source, target) = geometry.scroll_copy(delta).unwrap();
+                assert_eq!(source.x, geometry.text.x);
+                assert_eq!(target.x, geometry.text.x);
+                assert_eq!(source.width, geometry.text.width);
+                assert_eq!(source.height + 16, geometry.text.height);
+                assert!(geometry.text.contains(source.x, source.y));
+                assert!(geometry.text.contains(target.x, target.y));
+                assert!(source.y + source.height <= geometry.text.y + geometry.text.height);
+                assert!(target.y + target.height <= geometry.text.y + geometry.text.height);
+            }
+        }
+    }
+
+    #[test]
+    fn tab_overflow_virtualizes_labels_and_tiny_windows_have_no_out_of_bounds_hits() {
+        use kwil_core_commands::settings::TabLayout;
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        for _ in 1..128 {
+            workspace.file_command("file.new").unwrap();
+        }
+        for layout in [TabLayout::Horizontal, TabLayout::Vertical] {
+            let geometry = workspace.tab_geometry(
+                TabMetrics { width: 400, height: 200, cell_width: 8, cell_height: 16, scrollbar: 14 },
+                layout,
+            );
+            assert!(geometry.slots.len() < 128);
+            assert!(geometry.slots.iter().any(|slot| slot.document == workspace.active_id()));
+            assert!(geometry.first > 0);
+            let previous = geometry.previous;
+            workspace.tab_action(geometry.hit(previous.x, previous.y).unwrap(), &geometry).unwrap();
+            assert!(
+                workspace.session.tabs().iter().position(|t| t.id == workspace.active_id()).unwrap() < geometry.first
+            );
+            let tiny = workspace
+                .tab_geometry(TabMetrics { width: 0, height: 0, cell_width: 0, cell_height: 0, scrollbar: 14 }, layout);
+            assert_eq!(tiny.body, TabArea::default());
+            assert!(tiny.hit(0, 0).is_none());
+            assert!(tiny.scroll_copy(1).is_none());
+        }
     }
 }

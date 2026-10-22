@@ -76,6 +76,7 @@ impl Gpu {
     }
     /// Upload only new damage; preserve scroll pixels via two texture copies
     /// because overlapping self-copies are not valid WebGPU operations.
+    #[cfg_attr(not(feature = "frame-harness"), allow(dead_code))]
     pub fn update(
         &mut self,
         pixels: &[u32],
@@ -84,6 +85,20 @@ impl Gpu {
         scroll: i64,
         cell_height: usize,
         rows: usize,
+    ) -> bool {
+        self.update_body(pixels, size, rects, scroll, cell_height, rows, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_body(
+        &mut self,
+        pixels: &[u32],
+        size: (usize, usize),
+        rects: &[Rect],
+        scroll: i64,
+        cell_height: usize,
+        rows: usize,
+        body: Option<Rect>,
     ) -> bool {
         let (w, h) = size;
         if w == 0
@@ -112,12 +127,15 @@ impl Gpu {
         let texture = self.texture.as_ref().unwrap();
         let mut encoder = self.device.create_command_encoder(&Default::default());
         if !fresh && scroll != 0 && (scroll.unsigned_abs() as usize) < rows {
+            let body = body.unwrap_or(Rect { x: 0, y: 0, w, h: rows * cell_height });
             let dy = scroll.unsigned_abs() as usize * cell_height;
-            let keep = rows * cell_height - dy;
-            let (from, to) = if scroll > 0 { (dy, 0) } else { (0, dy) };
-            let scratch = self.scratch.as_ref().unwrap();
-            encoder.copy_texture_to_texture(copy(texture, 0, from), copy(scratch, 0, 0), extent(w, keep));
-            encoder.copy_texture_to_texture(copy(scratch, 0, 0), copy(texture, 0, to), extent(w, keep));
+            if body.w > 0 && dy < body.h && body.x + body.w <= w && body.y + body.h <= h {
+                let keep = body.h - dy;
+                let (from, to) = if scroll > 0 { (body.y + dy, body.y) } else { (body.y, body.y + dy) };
+                let scratch = self.scratch.as_ref().unwrap();
+                encoder.copy_texture_to_texture(copy(texture, body.x, from), copy(scratch, 0, 0), extent(body.w, keep));
+                encoder.copy_texture_to_texture(copy(scratch, 0, 0), copy(texture, body.x, to), extent(body.w, keep));
+            }
         }
         self.queue.submit([encoder.finish()]);
         let full = [Rect { x: 0, y: 0, w, h }];
