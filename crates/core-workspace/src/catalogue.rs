@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(report.end, WalkEnd::Complete);
         assert!(paths.contains(&f.0.join("東京.rs")));
         assert!(paths.contains(&f.0.join("nested/keep.txt")));
-        assert!(!paths.contains(&f.0.join("hidden.tmp")));
+        assert!(!paths.contains(&f.0.join("hidden.tmp")), "root gitignore must hide matching files");
         assert!(!paths.contains(&f.0.join("nested/skip.txt")));
         let mut nested = Vec::new();
         walk(&f.0.join("nested"), WalkLimits::default(), &Cancellation::default(), |p| {
@@ -189,7 +189,7 @@ mod tests {
             cancel.cancel();
             ControlFlow::Continue(())
         });
-        assert_eq!(report.end, WalkEnd::Cancelled);
+        assert_eq!(report.end, WalkEnd::Cancelled, "catalogue continued after cancellation");
         assert_eq!(report.files, 1);
         let report =
             walk(&f.0.join("does-not-exist"), WalkLimits::default(), &cancel, |_| panic!("cancelled walk emitted"));
@@ -207,7 +207,7 @@ mod tests {
         let report = walk(&f.0, WalkLimits { max_files: 1, ..WalkLimits::default() }, &Cancellation::default(), |_| {
             ControlFlow::Continue(())
         });
-        assert_eq!(report.files, 1);
+        assert_eq!(report.files, 1, "catalogue file bound exceeded");
         assert_eq!(report.end, WalkEnd::Capacity);
         let report =
             walk(&f.0, WalkLimits { max_path_bytes: 0, ..WalkLimits::default() }, &Cancellation::default(), |_| {
@@ -242,6 +242,6 @@ mod tests {
             ControlFlow::Continue(())
         });
         assert_eq!(report.end, WalkEnd::Capacity);
-        assert_eq!(emitted, [path]);
+        assert_eq!(emitted, [path], "catalogue changed native path identity");
     }
 }
