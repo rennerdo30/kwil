@@ -20,6 +20,30 @@ fn schema_search_navigation_current_default_and_reset() {
 }
 
 #[test]
+fn tabs_layout_is_typed_validated_searchable_and_resets_without_losing_unknown_fields() {
+    assert_eq!(Settings::default().tabs.layout, TabLayout::Horizontal);
+    assert_eq!(Settings::parse("[tabs]\nlayout='vertical'\n").unwrap().settings.tabs.layout, TabLayout::Vertical);
+    assert!(Settings::parse("[tabs]\nlayout='sideways'\n").is_err());
+    assert!(Settings::parse("[tabs]\nlayout=true\n").is_err());
+    let source = "[tabs]\nlayout='vertical' # owner position\nfuture='keep'\n";
+    let mut menu = SettingsMenu::new(SettingsDocument::parse(source).unwrap());
+    menu.search("tabs layout");
+    let row = menu.selected().unwrap();
+    assert_eq!(row.spec.id, "tabs.layout");
+    assert_eq!(row.current, SettingValue::Text("vertical".into()));
+    assert_eq!(row.default, SettingValue::Text("horizontal".into()));
+    assert_eq!(menu.document().report().unknown_keys, vec!["tabs.future"]);
+    assert!(menu.edit_selected(SettingValue::Text("sideways".into())).is_err());
+    assert_eq!(menu.document().source(), source);
+    menu.reset_selected().unwrap();
+    assert_eq!(menu.document().settings().tabs.layout, TabLayout::Horizontal);
+    assert!(menu.document().source().contains("# owner position"));
+    assert!(menu.document().source().contains("future='keep'"));
+    menu.edit_selected(SettingValue::Text("vertical".into())).unwrap();
+    assert_eq!(menu.document().settings().tabs.layout, TabLayout::Vertical);
+}
+
+#[test]
 fn invalid_edit_does_not_change_document_or_unknown_fields() {
     let source = "# owner\nfuture = { enabled = true }\n[editor]\ntab_size = 7 # width\nfuture = 'leave'\n";
     let mut doc = SettingsDocument::parse(source).unwrap();
@@ -67,6 +91,111 @@ fn rebind_detects_exact_prefix_and_context_conflicts_and_keeps_tombstones() {
     assert!(doc.conflicts(&old).unwrap().is_empty(), "tombstones hide inherited bindings");
     let prefix = Binding { keys: "ctrl+c ctrl+x".into(), command: "file.new".into(), context: None, mode: None };
     assert!(doc.conflicts(&prefix).unwrap().iter().any(|c| c.kind == ConflictKind::Prefix));
+}
+
+#[test]
+fn replacement_rebind_refuses_unreachable_prefixes_and_more_specific_selectors() {
+    let mut doc = SettingsDocument::parse("").unwrap();
+    let before = doc.source().to_owned();
+    let long = Binding { keys: "ctrl+s ctrl+x".into(), command: "file.open".into(), context: None, mode: None };
+    let error = doc.rebind(long.clone(), true).unwrap_err();
+    assert!(error.0.contains("unreachable shortcut"));
+    assert_eq!(doc.source(), before, "failed replacement must not emit partial unbinds");
+    let source =
+        "[[bindings]]\nkeys='ctrl+c'\ncommand='edit.copy'\ncontext='editor'\nmode='insert'\nfuture='owner' # keep\n";
+    let mut doc = SettingsDocument::parse(source).unwrap();
+    let global = Binding { keys: "ctrl+c".into(), command: "file.open".into(), context: None, mode: None };
+    assert!(doc.rebind(global.clone(), true).is_err());
+    assert_eq!(doc.source(), source);
+    let scoped = Binding { context: Some(Context::Editor), mode: Some(Mode::Insert), ..global };
+    doc.rebind(scoped, true).unwrap();
+    assert!(doc.source().contains("future='owner' # keep"));
+    assert_eq!(
+        doc.settings().keymap().unwrap().resolve(
+            &"ctrl+c".parse::<KeySequence>().unwrap().0,
+            Context::Editor,
+            Mode::Insert
+        ),
+        Resolution::Command("file.open")
+    );
+    let mut doc = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+s'\ncommand=''\n").unwrap();
+    doc.rebind(long, true).unwrap();
+    let map = doc.settings().keymap().unwrap();
+    assert_eq!(
+        map.resolve(&"ctrl+s".parse::<KeySequence>().unwrap().0, Context::Editor, Mode::Insert),
+        Resolution::Pending
+    );
+    assert_eq!(
+        map.resolve(&"ctrl+s ctrl+x".parse::<KeySequence>().unwrap().0, Context::Editor, Mode::Insert),
+        Resolution::Command("file.open")
+    );
+}
+
+fn vim_binding(keys: &str, mode: Option<Mode>) -> Binding {
+    Binding { keys: keys.into(), command: "file.save".into(), context: Some(Context::Editor), mode }
+}
+
+#[test]
+fn vim_grammar_probe_reports_motion_operator_and_multikey_takeovers() {
+    let mut doc = SettingsDocument::parse("keymap='vim'\n").unwrap();
+    let source = doc.source().to_owned();
+    let motion = doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap();
+    assert_eq!(motion.len(), 1);
+    assert_eq!(motion[0].takeover, VimTakeover::Command("motion.down"));
+    assert_eq!(motion[0].kind, ConflictKind::Exact);
+    assert_eq!(motion[0].consumed_chords, 1);
+    assert!(doc.conflicts(&vim_binding("j", Some(Mode::Normal))).unwrap().iter().any(|c| c.command == "motion.down"));
+    assert!(doc.rebind(vim_binding("j", Some(Mode::Normal)), false).is_err());
+    assert_eq!(doc.source(), source);
+    let operator = doc.vim_grammar_warnings(&vim_binding("d", Some(Mode::Normal))).unwrap();
+    assert_eq!(operator[0].takeover, VimTakeover::Pending);
+    assert_eq!(operator[0].kind, ConflictKind::Prefix);
+    let gg = doc.vim_grammar_warnings(&vim_binding("g g", Some(Mode::Normal))).unwrap();
+    assert_eq!(gg[0].takeover, VimTakeover::Command("motion.firstLine"));
+    assert_eq!(gg[0].kind, ConflictKind::Exact);
+    assert_eq!(gg[0].consumed_chords, 2);
+    let prefix = doc.vim_grammar_warnings(&vim_binding("j x", Some(Mode::Normal))).unwrap();
+    assert_eq!(prefix[0].takeover, VimTakeover::Command("motion.down"));
+    assert_eq!(prefix[0].kind, ConflictKind::Prefix);
+    let failed_sequence = doc.vim_grammar_warnings(&vim_binding("g z", Some(Mode::Normal))).unwrap();
+    assert_eq!(failed_sequence[0].takeover, VimTakeover::Pending);
+    assert_eq!(failed_sequence[0].keys, "g");
+    let visual = doc.vim_grammar_warnings(&vim_binding("d", Some(Mode::Visual))).unwrap();
+    assert_eq!(visual[0].mode, Mode::Visual);
+    assert_eq!(visual[0].takeover, VimTakeover::Command("operator.delete"));
+    assert!(doc.vim_grammar_warnings(&vim_binding("g g g g g g g g g", Some(Mode::Normal))).is_err());
+}
+
+#[test]
+fn vim_grammar_probe_respects_tombstones_explicit_precedence_modes_and_contexts() {
+    let doc =
+        SettingsDocument::parse("keymap='vim'\n[[bindings]]\nkeys='j'\ncommand=''\ncontext='editor'\nmode='normal'\n")
+            .unwrap();
+    assert!(doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap().is_empty());
+    assert!(
+        doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Visual))).unwrap().iter().any(|w| w.mode == Mode::Visual)
+    );
+    let explicit = SettingsDocument::parse(
+        "keymap='vim'\n[[bindings]]\nkeys='j'\ncommand='file.open'\ncontext='editor'\nmode='normal'\n",
+    )
+    .unwrap();
+    assert!(explicit.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap().is_empty());
+    assert!(
+        explicit.conflicts(&vim_binding("j", Some(Mode::Normal))).unwrap().iter().any(|c| c.command == "file.open")
+    );
+    assert!(doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Insert))).unwrap().is_empty());
+    let mut palette = vim_binding("j", Some(Mode::Normal));
+    palette.context = Some(Context::Palette);
+    assert!(doc.vim_grammar_warnings(&palette).unwrap().is_empty());
+    let nonvim = SettingsDocument::parse("").unwrap();
+    assert!(nonvim.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap().is_empty());
+    let native = SettingsDocument::parse("keymap='vim'").unwrap();
+    let mut same = vim_binding("j", Some(Mode::Normal));
+    same.command = "motion.down".into();
+    assert!(native.vim_grammar_warnings(&same).unwrap().is_empty());
+    let mut unbind = vim_binding("j", Some(Mode::Normal));
+    unbind.command.clear();
+    assert!(native.vim_grammar_warnings(&unbind).unwrap().is_empty());
 }
 
 #[test]

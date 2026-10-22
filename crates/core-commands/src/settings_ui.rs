@@ -100,6 +100,20 @@ macro_rules! spec {
 }
 pub const SCHEMA: &[SettingSpec] = &[
     spec!(
+        "tabs.layout",
+        "Tabs layout",
+        Appearance,
+        "Arrange visible file tabs horizontally at the top or vertically on the left.",
+        SettingKind::Choice(&["horizontal", "vertical"]),
+        |s| SettingValue::Text(
+            match s.tabs.layout {
+                crate::settings::TabLayout::Horizontal => "horizontal",
+                crate::settings::TabLayout::Vertical => "vertical",
+            }
+            .into()
+        )
+    ),
+    spec!(
         "bindings",
         "Custom bindings",
         Keymap,
@@ -606,7 +620,45 @@ impl SettingsDocument {
                 conflicts.push(KeyConflict { keys: binding.keys.clone(), command: binding.command.clone(), kind });
             }
         }
+        for warning in self.vim_grammar_warnings(candidate)? {
+            let command = match warning.takeover {
+                VimTakeover::Command(id) => id.to_owned(),
+                VimTakeover::Pending => format!("Vim {} mode pending grammar", mode_name(warning.mode)),
+            };
+            let conflict = KeyConflict { keys: warning.keys, command, kind: warning.kind };
+            if !conflicts.contains(&conflict) {
+                conflicts.push(conflict);
+            }
+        }
         Ok(conflicts)
+    }
+    /// Probe a fresh Normal, Visual or VisualLine parser, at most eight chords
+    /// per mode. No document, active parser, timers or I/O are touched. This
+    /// previews grammar takeovers (including pending operators/counts/prefixes),
+    /// not every possible state after arbitrary earlier Vim input.
+    /// Explicit bindings and applicable tombstones are resolved before grammar,
+    /// following KeymapEngine's continuation/restart rules. Rebinding a key to
+    /// its same complete native command does not warn.
+    pub fn vim_grammar_warnings(&self, candidate: &Binding) -> Result<Vec<VimGrammarWarning>, SettingsError> {
+        if !candidate.command.is_empty() && crate::command(&candidate.command).is_none() {
+            return Err(error("unknown command"));
+        }
+        if candidate.keys.split_whitespace().take(9).count() > 8 {
+            return Err(error("Vim conflict preview supports at most eight chords"));
+        }
+        let sequence = candidate.keys.parse::<KeySequence>().map_err(|e| error(e.to_string()))?;
+        if self.settings().keymap != crate::Preset::Vim
+            || candidate.command.is_empty()
+            || candidate.context.is_some_and(|c| c != Context::Editor)
+        {
+            return Ok(Vec::new());
+        }
+        let map = self.settings().keymap()?;
+        Ok([Mode::Normal, Mode::Visual, Mode::VisualLine]
+            .into_iter()
+            .filter(|mode| candidate.mode.is_none_or(|m| m == *mode))
+            .filter_map(|mode| probe_vim_grammar(&map, &sequence, candidate, mode))
+            .collect())
     }
     /// Includes every registered command, including actions with no shortcut.
     pub fn keymap_rows(&self) -> Result<Vec<CommandBindingRow>, SettingsError> {
@@ -668,8 +720,15 @@ impl SettingsDocument {
                 }
             }
         }
-        changes.extend(row.defaults);
-        self.append_bindings(changes)
+        let defaults = row.defaults;
+        changes.extend(defaults.iter().cloned());
+        let mut edited = self.clone();
+        edited.append_bindings(changes)?;
+        for binding in &defaults {
+            edited.ensure_binding_reachable(binding)?;
+        }
+        *self = edited;
+        Ok(())
     }
     /// Rebind moves this command within the selected context/mode and emits
     /// tombstones for its former effective keys. Conflicts need explicit choice.
@@ -697,8 +756,39 @@ impl SettingsDocument {
             b.context = binding.context.or(b.context);
             b.mode = binding.mode.or(b.mode);
         }
-        old.push(binding);
-        self.append_bindings(old)
+        old.push(binding.clone());
+        let mut edited = self.clone();
+        edited.append_bindings(old)?;
+        edited.ensure_binding_reachable(&binding)?;
+        *self = edited;
+        Ok(())
+    }
+    /// Immediate short bindings and more-specific selectors may keep winning
+    /// after a global override. Refuse the transaction unless the requested
+    /// command is actually reachable throughout its requested scope.
+    fn ensure_binding_reachable(&self, binding: &Binding) -> Result<(), SettingsError> {
+        if binding.command.is_empty() {
+            return Ok(());
+        }
+        let map = self.settings().keymap()?;
+        let sequence = binding.keys.parse::<KeySequence>().map_err(|e| error(e.to_string()))?;
+        for context in [Context::Editor, Context::Palette, Context::Hex, Context::Diff] {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::VisualLine, Mode::Command] {
+                if binding.context.is_some_and(|v| v != context) || binding.mode.is_some_and(|v| v != mode) {
+                    continue;
+                }
+                let prefix_blocked = (1..sequence.0.len())
+                    .any(|len| map.resolve(&sequence.0[..len], context, mode) != Resolution::Pending);
+                if prefix_blocked || map.resolve(&sequence.0, context, mode) != Resolution::Command(&binding.command) {
+                    return Err(error(format!(
+                        "unreachable shortcut in {} / {}: remove the immediate prefix or more-specific binding first",
+                        context_name(context),
+                        mode_name(mode)
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
     fn append_bindings(&mut self, bindings: Vec<Binding>) -> Result<(), SettingsError> {
         self.transaction(|doc| {
@@ -849,6 +939,90 @@ fn valid_language(language: &str) -> bool {
 pub enum ConflictKind {
     Exact,
     Prefix,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VimTakeover {
+    Command(&'static str),
+    Pending,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VimGrammarWarning {
+    pub mode: Mode,
+    /// Canonical consumed prefix, which may be shorter than the candidate.
+    pub keys: String,
+    pub consumed_chords: usize,
+    pub kind: ConflictKind,
+    pub takeover: VimTakeover,
+}
+fn probe_vim_grammar(
+    map: &crate::Keymap,
+    sequence: &KeySequence,
+    candidate: &Binding,
+    mode: Mode,
+) -> Option<VimGrammarWarning> {
+    use crate::vim::{Vim, VimResult};
+    let mut vim = Vim::default();
+    match mode {
+        Mode::Visual => {
+            vim.invoke("mode.visual");
+        }
+        Mode::VisualLine => {
+            vim.invoke("mode.visualLine");
+        }
+        _ => {}
+    }
+    let warning = |consumed: usize, takeover: VimTakeover| VimGrammarWarning {
+        mode,
+        keys: sequence.0[..consumed].iter().map(chord_name).collect::<Vec<_>>().join(" "),
+        consumed_chords: consumed,
+        kind: if takeover == VimTakeover::Pending || consumed < sequence.0.len() {
+            ConflictKind::Prefix
+        } else {
+            ConflictKind::Exact
+        },
+        takeover,
+    };
+    let mut pending = Vec::new();
+    let mut grammar_prefix = None;
+    for (index, &key) in sequence.0.iter().enumerate() {
+        pending.push(key);
+        let mut resolution = map.resolve(&pending, Context::Editor, vim.mode());
+        if resolution == Resolution::Unbound
+            && pending.len() > 1
+            && !map.explicitly_unbound(&pending, Context::Editor, vim.mode())
+        {
+            pending.clear();
+            pending.push(key);
+            resolution = map.resolve(&pending, Context::Editor, vim.mode());
+        }
+        match resolution {
+            Resolution::Command(_) => return grammar_prefix.map(|n| warning(n, VimTakeover::Pending)),
+            Resolution::Pending => continue,
+            Resolution::Unbound => {
+                if map.explicitly_unbound(&pending, Context::Editor, vim.mode()) {
+                    return grammar_prefix.map(|n| warning(n, VimTakeover::Pending));
+                }
+                pending.clear();
+            }
+        }
+        match vim.feed(key) {
+            VimResult::Command(call) => {
+                let consumed = index + 1;
+                return if call.id == candidate.command && consumed == sequence.0.len() {
+                    None
+                } else {
+                    Some(warning(consumed, VimTakeover::Command(call.id)))
+                };
+            }
+            VimResult::Pending => {
+                grammar_prefix = Some(index + 1);
+            }
+            VimResult::Unbound | VimResult::Error(_) => {
+                return grammar_prefix.map(|n| warning(n, VimTakeover::Pending));
+            }
+        }
+    }
+    grammar_prefix.map(|n| warning(n, VimTakeover::Pending))
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyConflict {

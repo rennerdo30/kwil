@@ -1877,6 +1877,7 @@ version = "0.1.0"
 dependencies = [
  "fuzzy-matcher",
  "kwil-core-workspace",
+ "libc",
  "serde",
  "toml",
  "toml_edit",

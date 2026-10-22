@@ -37,7 +37,16 @@ pub enum UpdateChannel {
     Prerelease,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabLayout {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
 group!(RenderSettings { remote: Remote = Remote::Auto, smooth_scrolling: bool = false, cursor_blink: bool = true });
+group!(TabsSettings { layout: TabLayout = TabLayout::Horizontal });
 group!(UpdateSettings { check: bool = true, channel: UpdateChannel = UpdateChannel::Stable });
 group!(FontSettings {
     family: String = "monospace".into(),
@@ -70,6 +79,7 @@ group!(LogSettings { follow: bool = false, detect_levels: bool = true,
 group!(Formatter { executable: String = String::new(), args: Vec<String> = Vec::new(), timeout_ms: u32 = 5000 });
 group!(Settings {
     keymap: Preset = Preset::VsCode, bindings: Vec<Binding> = Vec::new(),
+    tabs: TabsSettings = TabsSettings::default(),
     render: RenderSettings = RenderSettings::default(), update: UpdateSettings = UpdateSettings::default(),
     font: FontSettings = FontSettings::default(), theme: ThemeSettings = ThemeSettings::default(),
     editor: EditorSettings = EditorSettings::default(), files: FilesSettings = FilesSettings::default(),
@@ -185,17 +195,7 @@ impl Settings {
     /// Reads at most 1 MiB of configuration, never a document-sized buffer.
     /// Missing file means defaults; unreadable/malformed files are errors.
     pub fn load(path: &Path) -> Result<SettingsReport, SettingsError> {
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::parse(""),
-            Err(e) => return Err(SettingsError(e.to_string())),
-        };
-        let mut source = String::new();
-        file.take(1024 * 1024 + 1).read_to_string(&mut source).map_err(|e| SettingsError(e.to_string()))?;
-        if source.len() > 1024 * 1024 {
-            return Err(SettingsError("settings exceed 1 MiB".into()));
-        }
-        Self::parse(&source)
+        Self::parse(read_settings_source(path)?.as_deref().unwrap_or(""))
     }
 
     /// A hook, not an active watcher. Register `handle.path().to_path_buf()`
@@ -349,8 +349,10 @@ fn known(path: &str) -> &'static [&'static str] {
             "log",
             "formatters",
             "file_types",
+            "tabs",
         ],
         "render" => &["remote", "smooth_scrolling", "cursor_blink"],
+        "tabs" => &["layout"],
         "update" => &["check", "channel"],
         "font" => &["family", "size", "line_height", "ligatures"],
         "theme" => &["name", "follow_os", "colors"],
@@ -416,11 +418,44 @@ fn unknown(value: &toml::de::DeValue, path: &str, result: &mut Vec<String>) {
 /// Worker-only bounded read, including the exact source used for optimistic
 /// save conflict detection. Missing and empty files remain distinguishable.
 pub fn read_settings_source(path: &Path) -> Result<Option<String>, SettingsError> {
-    let file = match fs::File::open(path) {
+    read_settings_source_with(path, open_settings_regular)
+}
+fn open_settings_regular(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Nonblocking open closes the regular-file -> FIFO race. NOFOLLOW
+        // also rejects symlink replacement between lstat and open.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+fn read_settings_source_with(
+    path: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<fs::File>,
+) -> Result<Option<String>, SettingsError> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && !m.file_type().is_symlink() => {}
+        Ok(_) => return Err(SettingsError("settings must be a regular file, not a symlink or special file".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SettingsError(e.to_string())),
+    }
+    let file = match open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(SettingsError(e.to_string())),
     };
+    let metadata = file.metadata().map_err(|e| SettingsError(e.to_string()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(SettingsError("settings changed to a special file during open".into()));
+    }
     let mut source = String::new();
     file.take(1024 * 1024 + 1).read_to_string(&mut source).map_err(|e| SettingsError(e.to_string()))?;
     if source.len() > 1024 * 1024 {
@@ -434,6 +469,8 @@ pub fn read_settings_source(path: &Path) -> Result<Option<String>, SettingsError
 /// `expected == None` means the path must still be absent. This is optimistic
 /// concurrency, not an OS lock against unrelated editors: the last check and
 /// replacement cannot form a cross-process compare-and-swap.
+/// Replacement errors retain the pending and previous-file survivors; the
+/// error names their recovery paths. Inspect those files before retrying.
 pub fn write_settings_atomic(path: &Path, expected: Option<&str>, source: &str) -> Result<(), SettingsError> {
     atomic_settings_write_with(path, expected, source, replace_settings_file)
 }
@@ -442,7 +479,7 @@ fn atomic_settings_write_with(
     path: &Path,
     expected: Option<&str>,
     source: &str,
-    replace: impl FnOnce(&Path, &Path, bool) -> std::io::Result<()>,
+    replace: impl FnOnce(&Path, &Path, Option<&Path>) -> std::io::Result<()>,
 ) -> Result<(), SettingsError> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -481,13 +518,18 @@ fn atomic_settings_write_with(
         })
         .ok_or_else(|| SettingsError("could not allocate settings temporary file".into()))?
         .map_err(|e| SettingsError(e.to_string()))?;
-    struct Temp(PathBuf);
+    struct Temp {
+        path: PathBuf,
+        cleanup: bool,
+    }
     impl Drop for Temp {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
+            if self.cleanup {
+                let _ = fs::remove_file(&self.path);
+            }
         }
     }
-    let temp = Temp(temp_path);
+    let mut temp = Temp { path: temp_path, cleanup: true };
     let io = |e: std::io::Error| SettingsError(e.to_string());
     file.write_all(source.as_bytes()).map_err(io)?;
     if let Some(m) = &metadata {
@@ -498,24 +540,59 @@ fn atomic_settings_write_with(
     if read_settings_source(path)?.as_deref() != expected {
         return Err(SettingsError("settings changed during save; reload before saving".into()));
     }
-    replace(&temp.0, path, metadata.is_some()).map_err(io)?;
+    // Reserve a unique namespace through the create_new temp above. Never
+    // overwrite a recovery file left by an older run with a recycled PID.
+    let backup_path = temp.path.with_extension("previous");
+    match fs::symlink_metadata(&backup_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(SettingsError(format!("recovery path already exists: {}", backup_path.display()))),
+        Err(e) => return Err(io(e)),
+    }
+    let backup = metadata.as_ref().map(|_| backup_path.as_path());
+    if let Err(e) = replace(&temp.path, path, backup) {
+        // ReplaceFileW 1177 may have moved the original to the backup name;
+        // 1176 without a backup may delete it. Always request a backup, retain
+        // both survivors on ANY error, and restore a missing canonical name by
+        // a no-clobber hard link. An external replacement is never overwritten.
+        temp.cleanup = false;
+        let restored = backup.is_some_and(|backup| fs::hard_link(backup, path).is_ok());
+        return Err(SettingsError(format!(
+            "settings replacement failed: {e}; automatic restore link created: {restored}; recovery files preserved where present: pending={}, previous={}, destination={}; inspect before retrying",
+            temp.path.display(),
+            backup_path.display(),
+            path.display()
+        )));
+    }
+    if backup.is_some() {
+        match fs::remove_file(&backup_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SettingsError(format!(
+                    "settings committed, but previous file remains at {}: {e}",
+                    backup_path.display()
+                )));
+            }
+        }
+    }
     #[cfg(unix)]
     fs::File::open(parent)
         .and_then(|f| f.sync_all())
         .map_err(|e| SettingsError(format!("settings replaced, but directory sync failed: {e}")))?;
     Ok(())
 }
-fn replace_settings_file(temp: &Path, path: &Path, exists: bool) -> std::io::Result<()> {
+fn replace_settings_file(temp: &Path, path: &Path, backup: Option<&Path>) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW};
         let temp: Vec<_> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
         let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let backup: Option<Vec<_>> = backup.map(|p| p.as_os_str().encode_wide().chain(Some(0)).collect());
         // ReplaceFile preserves the destination ACL; never delete it first.
         let ok = unsafe {
-            if exists {
-                ReplaceFileW(path.as_ptr(), temp.as_ptr(), std::ptr::null(), 0, std::ptr::null(), std::ptr::null())
+            if let Some(backup) = backup.as_ref() {
+                ReplaceFileW(path.as_ptr(), temp.as_ptr(), backup.as_ptr(), 0, std::ptr::null(), std::ptr::null())
             } else {
                 MoveFileExW(temp.as_ptr(), path.as_ptr(), MOVEFILE_WRITE_THROUGH)
             }
@@ -524,7 +601,7 @@ fn replace_settings_file(temp: &Path, path: &Path, exists: bool) -> std::io::Res
     }
     #[cfg(not(windows))]
     {
-        let _ = exists;
+        let _ = backup;
         fs::rename(temp, path)
     }
 }
@@ -668,18 +745,35 @@ impl Drop for SettingsWorker {
 #[cfg(test)]
 mod settings_atomic_tests {
     use super::*;
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "kwil-settings-r1-{}-{time}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Only files in this test's create_new directory, never a shared tree.
+            if let Ok(entries) = fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
     #[test]
     fn invalid_stale_and_failed_replacement_preserve_owner_file() {
-        let path = std::env::temp_dir().join(format!("kwil-settings-atomic-{}", std::process::id()));
-        fs::create_dir(&path).unwrap();
-        struct Fixture(PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = fs::remove_file(self.0.join("settings.toml"));
-                let _ = fs::remove_dir(&self.0);
-            }
-        }
-        let _fixture = Fixture(path.clone());
+        let fixture = Fixture::new();
+        let path = &fixture.0;
         let file = path.join("settings.toml");
         let source = "# keep\n[editor]\ntab_size=8\n";
         fs::write(&file, source).unwrap();
@@ -692,10 +786,99 @@ mod settings_atomic_tests {
             .is_err()
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), source);
-        assert_eq!(fs::read_dir(&path).unwrap().count(), 1, "failed writes clean only their own temp");
+        assert_eq!(fs::read_dir(path).unwrap().count(), 2, "replacement errors retain the new source for recovery");
         write_settings_atomic(&file, Some(source), "[editor]\ntab_size=3").unwrap();
         assert_eq!(Settings::load(&file).unwrap().settings.editor.tab_size, 3);
-        fs::remove_file(file).unwrap();
-        fs::remove_dir(path).unwrap();
+    }
+    #[test]
+    fn partial_replacement_errors_preserve_backup_and_new_source_without_clobbering_foreign_file() {
+        let old = "# owner\n[editor]\ntab_size=7\n";
+        let new = "[editor]\ntab_size=2\n";
+        for (code, foreign) in [(1176, false), (1177, false), (1177, true)] {
+            let fixture = Fixture::new();
+            let path = fixture.0.join("settings.toml");
+            fs::write(&path, old).unwrap();
+            let error = atomic_settings_write_with(&path, Some(old), new, |temp, path, backup| {
+                let backup = backup.expect("existing settings replacement must request an explicit backup");
+                assert_eq!(fs::read_to_string(temp).unwrap(), new);
+                if code == 1177 {
+                    fs::rename(path, backup)?;
+                    if foreign {
+                        fs::write(path, "foreign owner edit")?;
+                    }
+                }
+                Err(std::io::Error::from_raw_os_error(code))
+            })
+            .unwrap_err();
+            assert!(error.0.contains("recovery files preserved"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), if foreign { "foreign owner edit" } else { old });
+            let survivors: Vec<_> =
+                fs::read_dir(&fixture.0).unwrap().map(|e| e.unwrap().path()).filter(|p| p != &path).collect();
+            assert!(
+                survivors.iter().any(|p| fs::read_to_string(p).unwrap() == new),
+                "new-source survivor must not be deleted"
+            );
+            if code == 1177 {
+                assert!(
+                    survivors.iter().any(|p| fs::read_to_string(p).unwrap() == old),
+                    "moved original must remain recoverable"
+                );
+            }
+        }
+    }
+    #[test]
+    fn special_settings_path_is_refused_before_open() {
+        let fixture = Fixture::new();
+        let mut opened = false;
+        let error = read_settings_source_with(&fixture.0, |_| {
+            opened = true;
+            Err(std::io::Error::other("must not open special file"))
+        })
+        .unwrap_err();
+        assert!(!opened);
+        assert!(error.0.contains("regular file"));
+    }
+    #[cfg(unix)]
+    fn fifo(path: &Path) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn regular_to_fifo_race_and_worker_shutdown_do_not_block() {
+        use std::{sync::mpsc, time::Duration};
+        let fixture = Fixture::new();
+        let path = fixture.0.join("settings.toml");
+        fs::write(&path, "").unwrap();
+        let worker_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = read_settings_source_with(&worker_path, |path| {
+                fs::remove_file(path)?;
+                fifo(path)?;
+                open_settings_regular(path)
+            });
+            let _ = tx.send(result.map_err(|e| e.0));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2)).expect("FIFO swap read must not block");
+        assert!(result.unwrap_err().contains("special file"));
+        thread.join().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (events, received) = mpsc::channel();
+            let worker = SettingsWorker::start(path, move |event| {
+                let _ = events.send(event);
+            })
+            .unwrap();
+            let event = received.recv_timeout(Duration::from_secs(1));
+            drop(worker);
+            let _ = tx.send(event);
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).expect("worker Drop must not wait for a FIFO writer").unwrap(),
+            SettingsWorkerEvent::Error { .. }
+        ));
+        thread.join().unwrap();
     }
 }
