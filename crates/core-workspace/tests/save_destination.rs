@@ -245,7 +245,21 @@ fn unix_invalid_unicode_path_roundtrips_missing_and_existing() {
     let missing = resolve(&path);
     assert_eq!(missing.requested_path().as_os_str(), path.as_os_str());
     assert_eq!(missing.canonical_path().as_os_str(), path.as_os_str());
-    fs::write(&path, b"x").unwrap();
+    if let Err(error) = fs::write(&path, b"x") {
+        #[cfg(target_os = "macos")]
+        {
+            // The hosted macOS filesystem refuses this filename with EILSEQ.
+            // Preserve the missing-path identity check above and prove that
+            // refusal leaves no file; do not claim an existing-byte roundtrip.
+            assert_eq!(error.raw_os_error(), Some(92), "unexpected fixture creation failure: {error}");
+            assert!(!path.exists());
+            assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+            assert!(paths_may_alias(&path, &path));
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        panic!("native byte-path fixture creation failed: {error}");
+    }
     let existing = resolve(&path);
     assert_eq!(existing.canonical_path().as_os_str(), path.as_os_str());
     equivalent(&missing, &existing);
