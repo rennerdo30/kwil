@@ -210,6 +210,9 @@ Two files, or a buffer vs. its saved version. Line diff with `imara-diff 0.2` (h
 ### Format document (owner, 2026-10-23, KW-7)
 "Format document" and "Format selection" for any file type. Built-in in-process formatters cover JSON, XML/HTML, YAML, TOML, CSS and SQL. Every other type gets the generic tidy steps (re-indent, trim trailing whitespace, normalize line endings), and an external formatter can be configured per type, run on a worker with a timeout. Formatting runs on a worker and applies as one undo step. A file-type picker lets any file be treated as any type.
 
+### Log watcher mode (owner, 2026-10-23, KW-41)
+"Like glogg, only better." Follow mode (`tail -f`) with auto-scroll at the bottom and a pause when the user scrolls up; clean handling of rotation and truncation. A filter pane shows only lines matching one or more regexes (AND/OR/NOT) with live counts; clicking a line jumps to it. Several coloured highlight rules and automatic level detection for common log formats; line marks. Faster than glogg on multi-GB logs: the line index extends on append instead of rescanning, filters stream from workers, hits show in the signal strip, and lines with timestamps support a time-range jump. It works in the TUI too (`kwil --follow app.log`). Filter results are kept as compact line-number runs, never as copied text (principle 7).
+
 ### Markdown
 Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, strikethrough). Rendered natively by our renderer, without a webview (a webview would cost startup time and memory). Code blocks are highlighted with the same syntax engine. Images are decoded lazily on a worker.
 
@@ -296,12 +299,12 @@ debug = "line-tables-only"
 | M0 Spike (1–2 weeks), KW-1 | Renderer A vs. B, text engine vs. `qem` baseline, startup measured on all three platforms; decision record |
 | M1 Viewer | Instant open of any file, damage-only rendering and scroll copy, remote-mode detection, GUI/TUI auto-select, TUI, go to line, encodings, hex viewer |
 | M2 Editor | Piece tree editing, cursors, undo, save, tabs, session restore |
-| M3 Find & palette | Search/replace, find in files, command palette, file finder, keymaps with VS Code / Notepad++ / Vim presets, settings |
+| M3 Find & palette | Search/replace, find in files, command palette, file finder, keymaps with VS Code / Notepad++ / Vim presets, settings, log watcher mode |
 | M4 Language | Tree-sitter highlighting, markdown preview, format document |
 | M5 Compare | Diff views |
 | M6 Polish & ship | Themes, remote-mode measurements on RDP and VNC, installers (MSI/winget, dmg/Homebrew, AppImage/Flatpak), GitHub Actions releases, auto-update, platform integration and accessibility |
 
-Work packages are tracked on Pair Desk, project `kwil`, grouped by milestone: one item per feature area, with its spec section and done criteria. M0 is KW-1; the spec work packages are KW-9 to KW-36; owner wishes are KW-3 (keymaps), KW-4/KW-6 (releases), KW-5 (auto-update), KW-7 (format) and KW-8 (hex view).
+Work packages are tracked on Pair Desk, project `kwil`, grouped by milestone: one item per feature area, with its spec section and done criteria. M0 is KW-1; the spec work packages are KW-9 to KW-36; owner wishes are KW-3 (keymaps), KW-4/KW-6 (releases), KW-5 (auto-update), KW-7 (format), KW-8 (hex view), KW-37 (themes), KW-38 (logo), KW-39 (native window controls), KW-40 (less RAM than file size) and KW-41 (log watcher).
 
 ## 12. Owner decisions and open questions
 
