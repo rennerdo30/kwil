@@ -168,8 +168,10 @@ fn binary_cache_validated_round_trip_contract() {
     wrong_version[8] = 2;
     assert!(theme_cache::decode(&wrong_version).is_err());
     let mut damaged = bytes.clone();
-    let end = damaged.len() - 1;
-    damaged[end] ^= 1;
+    // Change a valid RGBA byte, not a tag that structural validation could
+    // reject independently and thereby mask a missing checksum check.
+    let color_offset = damaged.windows(4).position(|w| w == [17, 34, 51, 68]).unwrap();
+    damaged[color_offset] ^= 1;
     assert!(theme_cache::decode(&damaged).is_err());
     let mut trailing = bytes.clone();
     trailing.push(0);
