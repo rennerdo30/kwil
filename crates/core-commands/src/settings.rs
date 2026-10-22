@@ -347,6 +347,7 @@ fn known(path: &str) -> &'static [&'static str] {
             "syntax",
             "log",
             "formatters",
+            "file_types",
         ],
         "render" => &["remote", "smooth_scrolling", "cursor_blink"],
         "update" => &["check", "channel"],
@@ -404,9 +405,288 @@ fn unknown(value: &toml::de::DeValue, path: &str, result: &mut Vec<String>) {
                         result.extend(fields.into_iter().map(|s| s.replace("bindings[]", &format!("bindings[{i}]"))));
                     }
                 }
-            } else if !matches!(full.as_str(), "theme.colors" | "log.highlight_rules") {
+            } else if !matches!(full.as_str(), "theme.colors" | "log.highlight_rules" | "file_types") {
                 unknown(value, &full, result);
             }
         }
+    }
+}
+
+/// Worker-only bounded read, including the exact source used for optimistic
+/// save conflict detection. Missing and empty files remain distinguishable.
+pub fn read_settings_source(path: &Path) -> Result<Option<String>, SettingsError> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SettingsError(e.to_string())),
+    };
+    let mut source = String::new();
+    file.take(1024 * 1024 + 1).read_to_string(&mut source).map_err(|e| SettingsError(e.to_string()))?;
+    if source.len() > 1024 * 1024 {
+        return Err(SettingsError("settings exceed 1 MiB".into()));
+    }
+    Ok(Some(source))
+}
+
+/// Same-directory write + sync + atomic replacement. Call on a worker.
+/// Refuses invalid documents, symlinks, read-only files and stale snapshots.
+/// `expected == None` means the path must still be absent. This is optimistic
+/// concurrency, not an OS lock against unrelated editors: the last check and
+/// replacement cannot form a cross-process compare-and-swap.
+pub fn write_settings_atomic(path: &Path, expected: Option<&str>, source: &str) -> Result<(), SettingsError> {
+    atomic_settings_write_with(path, expected, source, replace_settings_file)
+}
+
+fn atomic_settings_write_with(
+    path: &Path,
+    expected: Option<&str>,
+    source: &str,
+    replace: impl FnOnce(&Path, &Path, bool) -> std::io::Result<()>,
+) -> Result<(), SettingsError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    crate::settings_ui::SettingsDocument::parse(source)?;
+    if !path.is_absolute() {
+        return Err(SettingsError("settings path must be absolute".into()));
+    }
+    let parent = path.parent().ok_or_else(|| SettingsError("settings path needs a parent".into()))?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && !m.file_type().is_symlink() && !m.permissions().readonly() => Some(m),
+        Ok(_) => return Err(SettingsError("settings path must be a writable regular file, not a symlink".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(SettingsError(e.to_string())),
+    };
+    if read_settings_source(path)?.as_deref() != expected {
+        return Err(SettingsError("settings changed on disk; reload before saving".into()));
+    }
+    fs::create_dir_all(parent).map_err(|e| SettingsError(e.to_string()))?;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (temp_path, mut file) = (0..32)
+        .find_map(|_| {
+            let temp =
+                parent.join(format!(".kwil-settings-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&temp) {
+                Ok(f) => Some(Ok((temp, f))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .ok_or_else(|| SettingsError("could not allocate settings temporary file".into()))?
+        .map_err(|e| SettingsError(e.to_string()))?;
+    struct Temp(PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let temp = Temp(temp_path);
+    let io = |e: std::io::Error| SettingsError(e.to_string());
+    file.write_all(source.as_bytes()).map_err(io)?;
+    if let Some(m) = &metadata {
+        file.set_permissions(m.permissions()).map_err(io)?;
+    }
+    file.sync_all().map_err(io)?;
+    drop(file);
+    if read_settings_source(path)?.as_deref() != expected {
+        return Err(SettingsError("settings changed during save; reload before saving".into()));
+    }
+    replace(&temp.0, path, metadata.is_some()).map_err(io)?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| SettingsError(format!("settings replaced, but directory sync failed: {e}")))?;
+    Ok(())
+}
+fn replace_settings_file(temp: &Path, path: &Path, exists: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW};
+        let temp: Vec<_> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // ReplaceFile preserves the destination ACL; never delete it first.
+        let ok = unsafe {
+            if exists {
+                ReplaceFileW(path.as_ptr(), temp.as_ptr(), std::ptr::null(), 0, std::ptr::null(), std::ptr::null())
+            } else {
+                MoveFileExW(temp.as_ptr(), path.as_ptr(), MOVEFILE_WRITE_THROUGH)
+            }
+        };
+        if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exists;
+        fs::rename(temp, path)
+    }
+}
+
+#[derive(Debug)]
+pub enum SettingsWorkerEvent {
+    Loaded { source: Option<String>, document: crate::settings_ui::SettingsDocument },
+    Saved { request: u64, source: String },
+    Error { request: Option<u64>, message: String },
+}
+enum SettingsRequest {
+    Save { request: u64, expected: Option<String>, source: String },
+    Reload,
+    Stop,
+}
+/// All reads, writes, native watcher setup and parsing run off the UI thread.
+/// The bounded command queue refuses overload. Callbacks should enqueue a UI
+/// event and return promptly. Keep this handle alive; shutdown joins its worker.
+pub struct SettingsWorker {
+    tx: std::sync::mpsc::SyncSender<SettingsRequest>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl SettingsWorker {
+    /// Spawning does no filesystem I/O on the caller. Errors arrive as events.
+    pub fn start(
+        path: PathBuf,
+        mut callback: impl FnMut(SettingsWorkerEvent) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let (tx, rx) = mpsc::sync_channel(32);
+        let events = tx.clone();
+        let worker = std::thread::Builder::new().name("kwil-settings".into()).spawn(move || {
+            if !path.is_absolute() {
+                callback(SettingsWorkerEvent::Error {
+                    request: None,
+                    message: "settings path must be absolute".into(),
+                });
+                return;
+            }
+            let dirty = Arc::new(AtomicBool::new(false));
+            let invalidated = dirty.clone();
+            let watcher = path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("settings path needs parent"))
+                .and_then(|p| fs::create_dir_all(p))
+                .and_then(|_| {
+                    kwil_core_workspace::FileWatcher::new(
+                        std::slice::from_ref(&path),
+                        std::time::Duration::from_millis(40),
+                        move |_| {
+                            invalidated.store(true, Ordering::Release);
+                            let _ = events.try_send(SettingsRequest::Reload);
+                        },
+                    )
+                });
+            let _watcher = match watcher {
+                Ok(w) => w,
+                Err(e) => {
+                    callback(SettingsWorkerEvent::Error {
+                        request: None,
+                        message: format!("live settings watcher unavailable: {e}"),
+                    });
+                    return;
+                }
+            };
+            let mut last: Option<Option<String>> = None;
+            let reload = |last: &mut Option<Option<String>>, callback: &mut dyn FnMut(SettingsWorkerEvent)| {
+                match read_settings_source(&path).and_then(|source| {
+                    crate::settings_ui::SettingsDocument::parse(source.as_deref().unwrap_or(""))
+                        .map(|document| (source, document))
+                }) {
+                    Ok((source, document)) => {
+                        if last.as_ref() != Some(&source) {
+                            *last = Some(source.clone());
+                            callback(SettingsWorkerEvent::Loaded { source, document });
+                        }
+                    }
+                    Err(e) => callback(SettingsWorkerEvent::Error { request: None, message: e.to_string() }),
+                }
+            };
+            reload(&mut last, &mut callback);
+            while let Ok(request) = rx.recv() {
+                match request {
+                    SettingsRequest::Stop => break,
+                    SettingsRequest::Reload => {
+                        dirty.store(false, Ordering::Release);
+                        reload(&mut last, &mut callback);
+                    }
+                    SettingsRequest::Save { request, expected, source } => {
+                        match write_settings_atomic(&path, expected.as_deref(), &source) {
+                            Ok(()) => {
+                                callback(SettingsWorkerEvent::Saved { request, source });
+                                reload(&mut last, &mut callback);
+                            }
+                            Err(e) => {
+                                callback(SettingsWorkerEvent::Error { request: Some(request), message: e.to_string() })
+                            }
+                        }
+                    }
+                }
+                if dirty.swap(false, Ordering::AcqRel) {
+                    reload(&mut last, &mut callback);
+                }
+            }
+        })?;
+        Ok(Self { tx, worker: Some(worker) })
+    }
+    pub fn save(&self, request: u64, expected: Option<String>, source: String) -> Result<(), SettingsError> {
+        if source.len() > 1024 * 1024 || expected.as_ref().is_some_and(|s| s.len() > 1024 * 1024) {
+            return Err(SettingsError("settings exceed 1 MiB".into()));
+        }
+        self.tx
+            .try_send(SettingsRequest::Save { request, expected, source })
+            .map_err(|e| SettingsError(format!("settings queue unavailable: {e}")))
+    }
+    pub fn reload(&self) -> Result<(), SettingsError> {
+        self.tx.try_send(SettingsRequest::Reload).map_err(|e| SettingsError(e.to_string()))
+    }
+    /// Run shutdown away from an interactive event handler: it waits for any
+    /// in-flight OS write, then drops the native watch and joins both workers.
+    pub fn shutdown(mut self) {
+        self.stop();
+    }
+    fn stop(&mut self) {
+        let _ = self.tx.send(SettingsRequest::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+impl Drop for SettingsWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod settings_atomic_tests {
+    use super::*;
+    #[test]
+    fn invalid_stale_and_failed_replacement_preserve_owner_file() {
+        let path = std::env::temp_dir().join(format!("kwil-settings-atomic-{}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        let file = path.join("settings.toml");
+        let source = "# keep\n[editor]\ntab_size=8\n";
+        fs::write(&file, source).unwrap();
+        assert!(write_settings_atomic(&file, Some(source), "[editor]\ntab_size=0").is_err());
+        assert!(write_settings_atomic(&file, Some("stale"), "").is_err());
+        assert!(
+            atomic_settings_write_with(&file, Some(source), "[editor]\ntab_size=3", |_, _, _| Err(
+                std::io::Error::other("injected replace failure")
+            ))
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), source);
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 1, "failed writes clean only their own temp");
+        write_settings_atomic(&file, Some(source), "[editor]\ntab_size=3").unwrap();
+        assert_eq!(Settings::load(&file).unwrap().settings.editor.tab_size, 3);
+        fs::remove_file(file).unwrap();
+        fs::remove_dir(path).unwrap();
     }
 }
