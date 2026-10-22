@@ -70,6 +70,7 @@ crates/
   core-search    in-buffer search, find-in-files, replace transactions
   core-diff      line and word diff, alignment model
   core-markdown  markdown parse into a render model (no drawing)
+  core-format    bounded worker formatters, selection tidy and external formatter hooks
   core-workspace files, sessions, hot exit, file watching, single-instance IPC
   core-commands  command registry, keymaps, settings (shared by both frontends)
   view-model     viewport, layout model, decorations; frontend-independent
@@ -215,7 +216,7 @@ Two files, or a buffer vs. its saved version. Line diff with `imara-diff 0.2` (h
 "Open as hex" and "Toggle hex view" for any file: an offset column, 16 bytes per row in hex, and an ASCII column. It uses the same mapped file and viewport model as text, so multi-GB binaries open instantly (row = offset / 16, no line index needed). Files detected as binary on open offer hex view. The viewer comes in M1 and byte editing in M2. It works in the GUI and the TUI.
 
 ### Format document (owner, 2026-10-23, KW-7)
-"Format document" and "Format selection" for any file type. Built-in in-process formatters cover JSON, XML/HTML, YAML, TOML, CSS and SQL. Every other type gets the generic tidy steps (re-indent, trim trailing whitespace, normalize line endings), and an external formatter can be configured per type, run on a worker with a timeout. Formatting runs on a worker and applies as one undo step. A file-type picker lets any file be treated as any type.
+"Format document" and "Format selection" for any file type. Built-in in-process formatters cover JSON, XML/HTML, YAML, TOML, CSS and SQL. A formatter never changes meaning: constructs it cannot prove safe stay byte-for-byte. Generic tidy (re-indent, trim trailing whitespace, normalize line endings) runs only for types with a literal tokenizer; string and heredoc interiors stay untouched. Types without a tokenizer receive no edits and a status explaining how to configure an external formatter or explicitly invoke "Trim trailing whitespace" (which warns that it may change literals). Final-newline insertion follows the same safety rule and never runs for YAML. An external formatter can be configured per type, run on a worker with a timeout. Formatting runs on a worker and applies as one undo step. A file-type picker lets any file be treated as any type. (Coordinator safety policy, KW-7 review round 2, 2026-10-23.)
 
 ### Log watcher mode (owner, 2026-10-23, KW-41)
 "Like glogg, only better." Follow mode (`tail -f`) with auto-scroll at the bottom and a pause when the user scrolls up; clean handling of rotation and truncation. A filter pane shows only lines matching one or more regexes (AND/OR/NOT) with live counts; clicking a line jumps to it. Several coloured highlight rules and automatic level detection for common log formats; line marks. Faster than glogg on multi-GB logs: the line index extends on append instead of rescanning, filters stream from workers, hits show in the signal strip, and lines with timestamps support a time-range jump. It works in the TUI too (`kwil --follow app.log`). Filter results are kept as compact line-number runs, never as copied text (principle 7).
