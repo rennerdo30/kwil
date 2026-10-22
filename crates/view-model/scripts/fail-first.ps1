@@ -86,6 +86,10 @@ Mutate 'wrong-saved-revision' 'crates/view-model/src/editor/save.rs' 'self.docum
 Mutate 'tab-columns' 'crates/view-model/src/grid.rs' 'tab_size.max(1) - column % tab_size.max(1)' '1' 'kwil-view-model' @('tests::frontend_positions_and_selection_ranges_use_unicode_and_tab_stops')
 Mutate 'drop-pending-goto' 'crates/view-model/src/lib.rs' 'self.pending_goto = Some((line, args.column.unwrap_or(1), args.extend));' 'self.pending_goto = None;' 'kwil-view-model' @('tests::view_defers_goto_and_caches_bounded_long_line_windows')
 Mutate 'full-undo-damage' 'crates/view-model/src/editor.rs' 'edited = entry.edited.clone();' 'edited = self.top..self.top + self.rows as u64;' 'kwil-view-model' @('tests::linewise_put_at_unterminated_eof_and_precise_undo_damage')
+Mutate 'inverse-prefix-scan' 'crates/core-text/src/line_index.rs' 'if self.rank_checkpoints[j].1 > off {
+            (cl, off) = self.rank_checkpoints[j];
+        }
+        let end = self.rank_checkpoints.get(j + 1).map_or(self.len, |&(_, at)| at);' 'let end = self.len;' 'kwil-core-text' @('line_index::tests::inverse_line_lookup_scans_one_byte_rank_block')
 Mutate 'disable-coalescing' 'crates/core-text/src/buffer.rs' 'self.history.record(before, self.snapshot(), coalesce);' 'self.history.record(before, self.snapshot(), false);' 'kwil-core-text' @('buffer::editing_contract_tests::batch_cancel_coalescing_shared_ranges_and_checkpoint_keep_history')
 Mutate 'foreign-budget-bypass' 'crates/core-text/src/piece_tree.rs' 'Storage::Memory { budget: source, .. } => !Arc::ptr_eq(source, budget),' 'Storage::Memory { budget: source, .. } => false,' 'kwil-core-text' @('buffer::editing_contract_tests::foreign_snapshot_paste_obeys_destination_resident_budget')
 Mutate 'retain-foreign-original' 'crates/core-text/src/piece_tree.rs' '!piece.owner.as_ref().is_some_and(|source| Arc::ptr_eq(source, owner))' 'false' 'kwil-core-text' @('buffer::editing_contract_tests::tiny_foreign_original_pastes_release_resident_sources_under_zero_caps')
