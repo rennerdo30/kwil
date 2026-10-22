@@ -2,7 +2,7 @@
 use super::*;
 use kwil_core_commands::settings_ui::{CATEGORIES, SettingValue};
 use kwil_view_model::palette_session::{display_text, text_window};
-use kwil_view_model::settings_panels::{EditColumn, PanelInput, PanelWindow};
+use kwil_view_model::settings_panels::{ConfirmationViewport, EditColumn, PanelInput, PanelWindow};
 use kwil_view_model::settings_session::{SettingsInput, SettingsSession};
 
 /// Drawing and hit testing share the same viewport, including compact cards.
@@ -92,50 +92,48 @@ fn compound_row(window: &PanelWindow, slot: usize) -> Option<usize> {
 }
 
 struct ConfirmationView {
-    rows: Vec<(String, bool)>,
-    details: Vec<String>,
+    viewport: ConfirmationViewport,
+    row: usize,
+    column: usize,
+    width: usize,
 }
 
 fn confirmation_view(window: &PanelWindow, layout: Layout) -> Option<ConfirmationView> {
-    let proposal = format!("Proposed: {}", window.proposal.as_deref()?);
-    if window.confirmation.is_empty() {
-        return Some(ConfirmationView {
-            rows: vec![("No conflicts remain; Enter applies, Esc cancels".into(), true)],
-            details: vec![proposal],
-        });
+    // `line` adds one cell of padding on each side. Wrap for precisely the
+    // columns it can paint, and use the whole body above status and hints.
+    let width = layout.columns.saturating_sub(layout.rail);
+    let viewport = window.confirmation_viewport(width.saturating_sub(2), layout.rows.saturating_sub(5))?;
+    Some(ConfirmationView { viewport, row: 3, column: layout.rail, width })
+}
+
+fn confirmation_page_input(window: &PanelWindow, layout: Layout, forward: bool) -> Option<PanelInput<'static>> {
+    let view = confirmation_view(window, layout)?;
+    let index = if forward {
+        view.viewport.page.saturating_add(1).min(view.viewport.pages.saturating_sub(1))
+    } else {
+        view.viewport.page.saturating_sub(1)
+    };
+    Some(PanelInput::ReviewPage { index, pages: view.viewport.pages })
+}
+
+fn confirmation_hint(columns: usize, page: usize, pages: usize) -> String {
+    let prefix = format!("{}/{} ", page + 1, pages);
+    if columns.saturating_sub(2) < prefix.len() + 8 {
+        return "<> E/Esc".into();
     }
-    let selected = window.confirmation_index.min(window.confirmation.len() - 1);
-    let first = layout.first(selected, window.confirmation.len());
-    let rows = window
-        .confirmation
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(layout.visible)
-        .map(|(index, conflict)| {
-            (
-                format!(
-                    "{}/{} {} -> {} ({:?})",
-                    index + 1,
-                    window.confirmation.len(),
-                    conflict.keys,
-                    conflict.command,
-                    conflict.kind
-                ),
-                index == selected,
-            )
-        })
-        .collect();
-    let current = &window.confirmation[selected];
-    Some(ConfirmationView {
-        rows,
-        details: vec![
-            proposal,
-            format!("Conflict {}/{} keys: {}", selected + 1, window.confirmation.len(), current.keys),
-            format!("Command: {}", current.command),
-            format!("Kind: {:?}", current.kind),
-        ],
-    })
+    let available = columns.saturating_sub(2 + prefix.len());
+    let hint = if available >= 90 {
+        "Left/Right: page  Tab/Shift+Tab: conflict  Home/End: first/last  Enter: apply  Esc: cancel"
+    } else if available >= 26 {
+        "L/R Tab/S-Tab Enter/Esc"
+    } else if available >= 22 {
+        "L/R page Tab Enter/Esc"
+    } else if available >= 8 {
+        "<> E/Esc"
+    } else {
+        "<> E/E"
+    };
+    format!("{prefix}{hint}")
 }
 
 /// Keep both staged fields visible on the full card. Tiny cards show the active
@@ -165,6 +163,8 @@ struct KeyMode {
     capturing: bool,
     editing: bool,
     searching: bool,
+    confirming: bool,
+    repeat: bool,
 }
 enum KeyRoute<'a> {
     Ignore,
@@ -174,6 +174,7 @@ enum KeyRoute<'a> {
     OpenFile,
     AdoptExternal,
     Category(bool),
+    ReviewPage(bool),
 }
 
 fn key_route<'a>(
@@ -183,6 +184,15 @@ fn key_route<'a>(
     composing: bool,
     mode: KeyMode,
 ) -> KeyRoute<'a> {
+    // A held key cannot finish capture, accept a proposal, or advance an
+    // edit through multiple Enter stages. Ordinary text/deletion may repeat.
+    if mode.repeat
+        && (mode.capturing
+            || mode.confirming
+            || matches!(key, Key::Named(NamedKey::Enter | NamedKey::Escape | NamedKey::Tab)))
+    {
+        return KeyRoute::Ignore;
+    }
     // Capture owns *all* chords before application hotkeys or text input.
     if mode.capturing {
         return input::chord(key, mods).map_or(KeyRoute::Ignore, |chord| KeyRoute::Panel(PanelInput::Capture(chord)));
@@ -211,6 +221,12 @@ fn key_route<'a>(
     }
     if mode.compound {
         let input = match key {
+            Key::Named(NamedKey::ArrowLeft | NamedKey::PageUp) if mode.confirming => {
+                return KeyRoute::ReviewPage(false);
+            }
+            Key::Named(NamedKey::ArrowRight | NamedKey::PageDown) if mode.confirming => {
+                return KeyRoute::ReviewPage(true);
+            }
             Key::Named(NamedKey::Escape) if !mode.editing => return KeyRoute::Settings(SettingsInput::Cancel),
             Key::Named(NamedKey::Escape) => Some(PanelInput::Cancel),
             Key::Named(NamedKey::Enter) if mode.editing && mods.shift_key() => Some(PanelInput::Text("\n")),
@@ -320,6 +336,7 @@ pub(super) fn draw(host: &SettingsSession, pixels: &mut [u32], size: (usize, usi
     let window = compound.as_ref().ok().and_then(Option::as_ref);
     let in_panel = host.panel().is_some();
     let mut caret = None;
+    let mut confirmation_paging = None;
     fill(pixels, size.0, area, STATUS_BG);
     let mut line = |row: usize, column: usize, width: usize, text: &str, foreground, background| {
         let y = area.y + row * ch;
@@ -392,15 +409,9 @@ pub(super) fn draw(host: &SettingsSession, pixels: &mut [u32], size: (usize, usi
             Ok(Some(window)) => {
                 let confirmation = confirmation_view(window, layout);
                 if let Some(confirmation) = &confirmation {
-                    for (slot, (text, selected)) in confirmation.rows.iter().enumerate() {
-                        line(
-                            slot + 3,
-                            rail,
-                            columns + 2 - rail,
-                            text,
-                            FG,
-                            if *selected { tabs::ACTIVE } else { STATUS_BG },
-                        );
+                    confirmation_paging = Some((confirmation.viewport.page, confirmation.viewport.pages));
+                    for (slot, text) in confirmation.viewport.lines.iter().enumerate() {
+                        line(confirmation.row + slot, confirmation.column, confirmation.width, text, FG, STATUS_BG);
                     }
                 } else {
                     for (slot, row) in window.rows.iter().enumerate() {
@@ -426,36 +437,36 @@ pub(super) fn draw(host: &SettingsSession, pixels: &mut [u32], size: (usize, usi
                             if row.selected { tabs::ACTIVE } else { STATUS_BG },
                         );
                     }
-                }
-                let first_detail = 3 + layout.visible;
-                let slots = (rows - 2).saturating_sub(first_detail);
-                let width = columns.saturating_sub(rail);
-                let (mut details, edit_caret) = edit_fields(window, width, slots);
-                if let Some((row, column)) = edit_caret {
-                    caret = Some((first_detail + row, rail + 1 + column));
-                }
-                if let Some(confirmation) = confirmation {
-                    details = confirmation.details;
-                } else if let Some(keys) = &window.capture {
-                    details.push(if keys.is_empty() {
-                        "Press first shortcut (Enter is a key); Esc cancels".into()
-                    } else {
-                        format!("Captured: {keys}; Enter accepts, or press second chord")
-                    });
-                } else if let Some(selected) = window.rows.iter().find(|row| row.selected) {
-                    details.push(selected.description.clone());
-                    details.push(format!("Default: {}", selected.default));
-                    details.push(format!(
-                        "Source: {}  Context: {:?}  Mode: {:?}",
-                        selected.source, selected.context, selected.mode
-                    ));
-                    for conflict in &selected.conflicts {
-                        details
-                            .push(format!("Conflict: {} → {} ({:?})", conflict.keys, conflict.command, conflict.kind));
+                    let first_detail = 3 + layout.visible;
+                    let slots = (rows - 2).saturating_sub(first_detail);
+                    let width = columns.saturating_sub(rail);
+                    let (mut details, edit_caret) = edit_fields(window, width, slots);
+                    if let Some((row, column)) = edit_caret {
+                        caret = Some((first_detail + row, rail + 1 + column));
                     }
-                }
-                for (slot, text) in details.iter().take(slots).enumerate() {
-                    line(first_detail + slot, rail, columns + 2 - rail, text, GUTTER_FG, STATUS_BG);
+                    if let Some(keys) = &window.capture {
+                        details.push(if keys.is_empty() {
+                            "Press first shortcut (Enter is a key); Esc cancels".into()
+                        } else {
+                            format!("Captured: {keys}; Enter accepts, or press second chord")
+                        });
+                    } else if let Some(selected) = window.rows.iter().find(|row| row.selected) {
+                        details.push(selected.description.clone());
+                        details.push(format!("Default: {}", selected.default));
+                        details.push(format!(
+                            "Source: {}  Context: {:?}  Mode: {:?}",
+                            selected.source, selected.context, selected.mode
+                        ));
+                        for conflict in &selected.conflicts {
+                            details.push(format!(
+                                "Conflict: {} → {} ({:?})",
+                                conflict.keys, conflict.command, conflict.kind
+                            ));
+                        }
+                    }
+                    for (slot, text) in details.iter().take(slots).enumerate() {
+                        line(first_detail + slot, rail, columns + 2 - rail, text, GUTTER_FG, STATUS_BG);
+                    }
                 }
             }
         }
@@ -498,12 +509,13 @@ pub(super) fn draw(host: &SettingsSession, pixels: &mut [u32], size: (usize, usi
         }
     }
     line(rows - 2, 0, columns + 2, host.status(), STATUS_FG, STATUS_BG);
+    let confirmation_help = confirmation_paging.map(|(page, pages)| confirmation_hint(columns + 2, page, pages));
     line(
         rows - 1,
         0,
         columns + 2,
-        if window.is_some_and(|window| window.proposal.is_some()) {
-            "Tab / Shift+Tab: review conflicts   Home / End: first / last   Enter: replace   Esc: cancel"
+        if let Some(hint) = confirmation_help.as_deref() {
+            hint
         } else if host.panel_is_capturing() {
             "Press keys: first Enter binds Enter; next Enter accepts; second chord finishes; Esc cancels"
         } else if host.panel_is_editing() {
@@ -665,19 +677,39 @@ impl App {
         if !self.settings_open() {
             return false;
         }
-        let panel = self.settings_panel.as_ref().unwrap();
+        let host = self.settings_panel.as_ref().unwrap();
         let mode = KeyMode {
-            compound: panel.panel().is_some(),
-            capturing: panel.panel_is_capturing(),
-            editing: panel.is_editing() || panel.panel_is_editing(),
-            searching: panel.is_searching(),
+            compound: host.panel().is_some(),
+            capturing: host.panel_is_capturing(),
+            editing: host.is_editing() || host.panel_is_editing(),
+            searching: host.is_searching(),
+            confirming: host.panel_is_confirming(),
+            repeat: event.repeat,
         };
         match key_route(&event.logical_key, event.text.as_deref(), self.mods, self.composing, mode) {
             KeyRoute::Panel(input) => self.settings_panel_input(input),
             KeyRoute::Settings(input) => self.settings_input(input),
+            KeyRoute::ReviewPage(forward) => {
+                let (cw, ch) = (self.font.as_ref().map_or(8, |font| font.cw), self.ch());
+                if let Some(area) = panel(self.size, cw, ch) {
+                    let layout = Layout::new(area.w / cw, area.h / ch);
+                    match host.panel_window(0, 0) {
+                        Ok(Some(window)) => {
+                            if let Some(input) = confirmation_page_input(&window, layout, forward) {
+                                self.settings_panel_input(input);
+                            }
+                        }
+                        Err(error) => {
+                            self.view.set_notice(format!("Settings: {error}"));
+                            self.palette_redraw();
+                        }
+                        Ok(None) => {}
+                    }
+                }
+            }
             KeyRoute::Paste => {
                 let epoch = self.settings_epoch;
-                let destination = panel.panel();
+                let destination = host.panel();
                 let hwnd = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
                 match clipboard::SystemClipboard(hwnd).get_text(kwil_view_model::settings_session::SETTINGS_INPUT_LIMIT)
                 {
@@ -734,7 +766,42 @@ mod tests {
     use kwil_view_model::settings_session::SettingsPanel;
 
     fn mode(compound: bool, editing: bool, capturing: bool) -> KeyMode {
-        KeyMode { compound, editing, capturing, searching: false }
+        KeyMode { compound, editing, capturing, searching: false, confirming: false, repeat: false }
+    }
+
+    fn confirming_mode(repeat: bool) -> KeyMode {
+        KeyMode { confirming: true, repeat, ..mode(true, true, false) }
+    }
+
+    /// Match the real line painter's padding, row coordinates and grid cap.
+    /// Prepared text beyond these bounds is not evidence of visible content.
+    fn painted_confirmation(window: &PanelWindow, layout: Layout) -> (String, usize, usize) {
+        let view = confirmation_view(window, layout).expect("pending proposal has a viewport");
+        assert_eq!(view.row, 3);
+        assert_eq!(view.column, layout.rail);
+        assert_eq!(view.width, layout.columns - layout.rail);
+        assert!(view.viewport.lines.len() <= layout.rows - 5);
+        let mut painted = String::new();
+        for (slot, line) in view.viewport.lines.iter().enumerate() {
+            assert!(view.row + slot < layout.rows - 2, "confirmation overlaps status or hints");
+            let text = display_text(line);
+            let visible: String =
+                text::cells(text.as_bytes(), view.width - 2, 4).into_iter().map(|cell| cell.text).collect();
+            assert_eq!(visible, text, "line painter clips confirmation content");
+            painted.push_str(&visible);
+        }
+        (painted, view.viewport.page, view.viewport.pages)
+    }
+
+    fn review_page(panel: &mut SettingsPanelController, doc: &SettingsDocument, key: NamedKey, layout: Layout) {
+        let KeyRoute::ReviewPage(forward) =
+            key_route(&Key::Named(key), None, ModifiersState::empty(), false, confirming_mode(false))
+        else {
+            panic!("review page key escaped confirmation");
+        };
+        let window = panel.window(doc, 0, 0).unwrap();
+        let input = confirmation_page_input(&window, layout, forward).unwrap();
+        assert!(panel.input(doc, input).unwrap().is_none());
     }
 
     fn routed_panel<'a>(key: &Key, text: Option<&'a str>, mods: ModifiersState, mode: KeyMode) -> PanelInput<'a> {
@@ -847,42 +914,44 @@ mod tests {
             .unwrap();
         let first = panel.window(&doc, 0, 0).unwrap();
         assert!(first.confirmation.len() >= 2);
-        let layout = Layout::new(79, 7); // One conflict at a time must still expose every entry.
-        let editing = mode(true, true, false);
-        let check = |window: &PanelWindow, expected: usize| {
-            let view = confirmation_view(window, layout).unwrap();
-            assert_eq!(view.rows.len(), 1);
-            assert!(view.rows[0].1);
+        let layout = Layout::new(79, 7); // Two paintable body rows require actual paging.
+        let editing = confirming_mode(false);
+        let check = |panel: &mut SettingsPanelController, expected: usize| {
+            let window = panel.window(&doc, 0, 0).unwrap();
+            assert_eq!(window.confirmation_index, expected);
+            assert_eq!(window.confirmation_page, 0, "changing conflicts resets its review page");
+            let pages = confirmation_view(&window, layout).unwrap().viewport.pages;
+            assert!(pages > 1);
+            let mut content = String::new();
+            for page in 0..pages {
+                let (painted, actual, count) = painted_confirmation(&panel.window(&doc, 0, 0).unwrap(), layout);
+                assert_eq!((actual, count), (page, pages));
+                content.push_str(&painted);
+                if page + 1 < pages {
+                    review_page(panel, &doc, NamedKey::ArrowRight, layout);
+                }
+            }
             let conflict = &window.confirmation[expected];
-            assert_eq!(
-                view.rows[0].0,
-                format!(
-                    "{}/{} {} -> {} ({:?})",
-                    expected + 1,
-                    window.confirmation.len(),
-                    conflict.keys,
-                    conflict.command,
-                    conflict.kind
-                )
-            );
-            assert_eq!(view.details[0], format!("Proposed: {}", window.proposal.as_deref().unwrap()));
-            assert!(view.details[0].contains("file.save <- ctrl+c"));
-            assert_eq!(
-                view.details[1],
-                format!("Conflict {}/{} keys: {}", expected + 1, window.confirmation.len(), conflict.keys)
-            );
-            assert_eq!(view.details[2], format!("Command: {}", conflict.command));
-            assert_eq!(view.details[3], format!("Kind: {:?}", conflict.kind));
+            assert!(content.contains(&format!("Conflict {}/{}", expected + 1, window.confirmation.len())));
+            assert!(content.contains(&format!("Proposed: {}", window.proposal.as_deref().unwrap())));
+            assert!(content.contains("file.save <- ctrl+c"));
+            assert!(content.contains(&format!("Keys: {}", conflict.keys)));
+            assert!(content.contains(&format!("Command: {}", conflict.command)));
+            assert!(content.contains(&format!("Kind: {:?}", conflict.kind)));
+            review_page(panel, &doc, NamedKey::PageDown, layout);
+            assert_eq!(painted_confirmation(&panel.window(&doc, 0, 0).unwrap(), layout).1, pages - 1);
+            review_page(panel, &doc, NamedKey::PageUp, layout);
+            assert_eq!(painted_confirmation(&panel.window(&doc, 0, 0).unwrap(), layout).1, pages - 2);
         };
-        check(&first, 0);
+        check(&mut panel, 0);
         for expected in 1..first.confirmation.len() {
             let next = routed_panel(&Key::Named(NamedKey::Tab), None, ModifiersState::empty(), editing);
             assert!(panel.input(&doc, next).unwrap().is_none());
-            check(&panel.window(&doc, 0, 0).unwrap(), expected);
+            check(&mut panel, expected);
         }
         let previous = routed_panel(&Key::Named(NamedKey::Tab), None, ModifiersState::SHIFT, editing);
         assert!(panel.input(&doc, previous).unwrap().is_none());
-        check(&panel.window(&doc, 0, 0).unwrap(), first.confirmation.len() - 2);
+        check(&mut panel, first.confirmation.len() - 2);
         for (key, expected) in [(NamedKey::Home, 0), (NamedKey::End, first.confirmation.len() - 1)] {
             assert!(
                 panel
@@ -890,7 +959,7 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            check(&panel.window(&doc, 0, 0).unwrap(), expected);
+            check(&mut panel, expected);
         }
         assert_eq!(doc.source(), original, "review navigation must not accept the proposal");
         panel.input(&doc, routed_panel(&Key::Named(NamedKey::Escape), None, ModifiersState::empty(), editing)).unwrap();
@@ -909,15 +978,15 @@ mod tests {
         assert!(panel.is_confirming());
         let mut changed = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+o'\ncommand=''\n").unwrap();
         let before = changed.source().to_owned();
-        let editing = mode(true, true, false);
+        let editing = confirming_mode(false);
         let enter = routed_panel(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), editing);
         assert!(panel.input(&changed, enter).unwrap_err().to_string().contains("conflicts changed"));
         let window = panel.window(&changed, 0, 0).unwrap();
         assert!(window.confirmation.is_empty());
         assert!(window.proposal.is_some());
-        let view = confirmation_view(&window, Layout::new(79, 7)).expect("proposal still awaits explicit Enter");
-        assert_eq!(view.rows, [("No conflicts remain; Enter applies, Esc cancels".into(), true)]);
-        assert!(view.details[0].contains("file.save <- ctrl+o"));
+        let (painted, _, _) = painted_confirmation(&window, Layout::new(79, 7));
+        assert!(painted.contains("No conflicts remain; Enter applies, Esc cancels"));
+        assert!(painted.contains("file.save <- ctrl+o"));
         assert_eq!(changed.source(), before);
         assert!(panel.input(&changed, PanelInput::Next).unwrap().is_none());
         assert!(panel.is_confirming());
@@ -925,6 +994,132 @@ mod tests {
         edit.apply(&mut changed).unwrap();
         assert_ne!(changed.source(), before);
         assert!(confirmation_view(&panel.window(&changed, 0, 0).unwrap(), Layout::new(79, 7)).is_none());
+    }
+
+    #[test]
+    fn settings_gui_compact_confirmation_paints_complete_fields_and_pages() {
+        let keys = "ctrl+alt+shift+super+f23 ctrl+alt+shift+super+f24";
+        let doc = SettingsDocument::parse(&format!("[[bindings]]\nkeys='{keys}'\ncommand='file.open'\n")).unwrap();
+        let original = doc.source().to_owned();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        panel.input(&doc, PanelInput::Accept).unwrap();
+        for chord in keys.split_whitespace() {
+            panel.input(&doc, PanelInput::Capture(chord.parse().unwrap())).unwrap();
+        }
+        assert!(panel.is_confirming());
+        let (cw, ch) = (8, 18);
+        let area = super::panel((44 * cw, 21 * ch), cw, ch).unwrap();
+        let layout = Layout::new(area.w / cw, area.h / ch);
+        assert_eq!((layout.columns, layout.rows, layout.rail), (40, 19, 0));
+        let hint = confirmation_hint(layout.columns, 0, 17);
+        let painted_hint: String =
+            text::cells(hint.as_bytes(), layout.columns - 2, 4).into_iter().map(|cell| cell.text).collect();
+        assert_eq!(painted_hint, hint, "compact confirmation hints must fit the real painter");
+        assert!(painted_hint.contains("Enter/Esc"));
+        let window = panel.window(&doc, 0, 0).unwrap();
+        let (painted, page, pages) = painted_confirmation(&window, layout);
+        assert_eq!((page, pages), (0, 1), "compact card must use its full 14-row body");
+        let conflict = &window.confirmation[window.confirmation_index];
+        for field in [
+            format!("Proposed: {}", window.proposal.as_deref().unwrap()),
+            format!("Keys: {}", conflict.keys),
+            format!("Command: {}", conflict.command),
+            format!("Kind: {:?}", conflict.kind),
+        ] {
+            assert!(painted.contains(&field), "compact painting lost {field}");
+        }
+        let tiny = Layout::new(12, 7);
+        let mut all_pages = String::new();
+        let pages = painted_confirmation(&window, tiny).2;
+        assert!(pages > 1);
+        for expected in 0..pages {
+            let (painted, page, count) = painted_confirmation(&panel.window(&doc, 0, 0).unwrap(), tiny);
+            assert_eq!((page, count), (expected, pages));
+            all_pages.push_str(&painted);
+            if expected + 1 < pages {
+                review_page(&mut panel, &doc, NamedKey::PageDown, tiny);
+            }
+        }
+        assert!(all_pages.contains(window.proposal.as_deref().unwrap()));
+        assert!(all_pages.contains(&format!("Keys: {}", conflict.keys)));
+        assert!(all_pages.contains(&format!("Command: {}", conflict.command)));
+        assert!(all_pages.contains(&format!("Kind: {:?}", conflict.kind)));
+        for _ in 0..pages {
+            review_page(&mut panel, &doc, NamedKey::ArrowLeft, tiny);
+        }
+        assert_eq!(panel.window(&doc, 0, 0).unwrap().confirmation_page, 0);
+        assert_eq!(doc.source(), original, "paging cannot accept a proposal");
+    }
+
+    #[test]
+    fn settings_gui_repeated_capture_chords_do_not_advance() {
+        let doc = SettingsDocument::parse("").unwrap();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        panel
+            .input(
+                &doc,
+                routed_panel(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), mode(true, false, false)),
+            )
+            .unwrap();
+        let repeated = KeyMode { repeat: true, ..mode(true, true, true) };
+        assert!(matches!(
+            key_route(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), false, repeated),
+            KeyRoute::Ignore
+        ));
+        assert_eq!(panel.window(&doc, 0, 0).unwrap().capture.as_deref(), Some(""));
+        let chord = Key::Character("o".into());
+        panel.input(&doc, routed_panel(&chord, None, ModifiersState::CONTROL, mode(true, true, true))).unwrap();
+        let route = key_route(&chord, None, ModifiersState::CONTROL, false, repeated);
+        if let KeyRoute::Panel(input) = route {
+            panel.input(&doc, input).unwrap();
+        }
+        assert!(panel.is_capturing(), "a held chord must not become the second chord");
+        assert_eq!(panel.window(&doc, 0, 0).unwrap().capture.as_deref(), Some("ctrl+o"));
+        let fresh = routed_panel(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), mode(true, true, true));
+        panel.input(&doc, fresh).unwrap();
+        assert!(panel.is_confirming(), "fresh Enter still finishes capture");
+    }
+
+    #[test]
+    fn settings_gui_repeated_enter_does_not_accept_conflicts_and_text_still_repeats() {
+        let doc = SettingsDocument::parse("").unwrap();
+        let original = doc.source().to_owned();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        panel.input(&doc, PanelInput::Accept).unwrap();
+        panel.input(&doc, PanelInput::Capture("ctrl+o".parse().unwrap())).unwrap();
+        panel.input(&doc, PanelInput::Accept).unwrap();
+        let route =
+            key_route(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), false, confirming_mode(true));
+        if let KeyRoute::Panel(input) = route {
+            assert!(panel.input(&doc, input).unwrap().is_none(), "held Enter accepted a shortcut replacement");
+        } else {
+            assert!(matches!(route, KeyRoute::Ignore));
+        }
+        assert!(panel.is_confirming());
+        assert_eq!(doc.source(), original);
+        let fresh = routed_panel(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), confirming_mode(false));
+        assert!(panel.input(&doc, fresh).unwrap().is_some(), "a fresh physical Enter must accept");
+        let repeated = KeyMode { repeat: true, ..mode(true, true, false) };
+        assert!(matches!(
+            key_route(&Key::Character("x".into()), Some("x"), ModifiersState::empty(), false, repeated),
+            KeyRoute::Panel(PanelInput::Text("x"))
+        ));
+        assert!(matches!(
+            key_route(&Key::Named(NamedKey::Backspace), None, ModifiersState::empty(), false, repeated),
+            KeyRoute::Panel(PanelInput::Backspace)
+        ));
+        assert!(matches!(
+            key_route(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), false, repeated),
+            KeyRoute::Ignore
+        ));
+        let scalar = KeyMode { compound: false, ..repeated };
+        assert!(matches!(
+            key_route(&Key::Character("x".into()), Some("x"), ModifiersState::empty(), false, scalar),
+            KeyRoute::Settings(SettingsInput::Text("x"))
+        ));
     }
 
     #[test]

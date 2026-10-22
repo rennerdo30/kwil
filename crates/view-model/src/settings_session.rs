@@ -473,6 +473,9 @@ impl SettingsSession {
     pub fn panel_is_capturing(&self) -> bool {
         self.panel.as_ref().is_some_and(SettingsPanelController::is_capturing)
     }
+    pub fn panel_is_confirming(&self) -> bool {
+        self.panel.as_ref().is_some_and(SettingsPanelController::is_confirming)
+    }
     /// Includes capture and conflict confirmation as well as mapping text edits.
     pub fn panel_is_editing(&self) -> bool {
         self.panel.as_ref().is_some_and(SettingsPanelController::is_editing)

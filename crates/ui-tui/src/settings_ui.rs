@@ -18,11 +18,10 @@ fn value_text(value: &SettingValue) -> String {
     }
 }
 
-fn conflict_label(conflict: &kwil_core_commands::settings_ui::KeyConflict) -> String {
-    format!("{} -> {} ({:?})", conflict.keys, conflict.command, conflict.kind)
-}
-
-pub(super) fn key(host: &mut SettingsSession, event: KeyEvent) -> bool {
+pub(super) fn key(host: &mut SettingsSession, event: KeyEvent, size: (u16, u16)) -> bool {
+    if event.kind == KeyEventKind::Repeat && (host.panel_is_capturing() || host.panel_is_confirming()) {
+        return true;
+    }
     if host.panel().is_some() {
         if host.panel_is_capturing() {
             if let Some(chord) = super::chord(event) {
@@ -31,6 +30,20 @@ pub(super) fn key(host: &mut SettingsSession, event: KeyEvent) -> bool {
             return true;
         }
         let text;
+        if host.panel_is_confirming()
+            && matches!(event.code, KeyCode::Left | KeyCode::Right | KeyCode::PageUp | KeyCode::PageDown)
+        {
+            let width = size.0.saturating_sub(4).min(110).saturating_sub(2) as usize;
+            let rows = size.1.saturating_sub(2).min(32).saturating_sub(4) as usize;
+            if let Ok(Some(window)) = host.panel_window(0, 0)
+                && let Some(view) = window.confirmation_viewport(width, rows)
+            {
+                let previous = matches!(event.code, KeyCode::Left | KeyCode::PageUp);
+                let index = if previous { view.page.saturating_sub(1) } else { (view.page + 1).min(view.pages - 1) };
+                let _ = host.panel_input(PanelInput::ReviewPage { index, pages: view.pages });
+            }
+            return true;
+        }
         let input = match event.code {
             KeyCode::Esc => Some(PanelInput::Cancel),
             KeyCode::Enter => Some(PanelInput::Accept),
@@ -177,21 +190,20 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
     let query = text_window(&window.query, host.panel_query_cursor(), columns.saturating_sub(2));
     let query_cursor = query.cursor;
     line(1, format!("/ {}", query.text), false);
-    if window.proposal.is_none() {
-        for (index, row) in window.rows.iter().enumerate() {
-            line(index as u16 + 2, format!("{}: {}  {}", row.title, row.value, row.source), row.selected);
+    if let Some(review) = window.confirmation_viewport(columns, area.height.saturating_sub(4) as usize) {
+        for (index, text) in review.lines.iter().enumerate() {
+            line(index as u16 + 2, text.clone(), false);
         }
-    } else if window.confirmation.is_empty() {
-        line(2, "No conflicts remain; Enter applies, Esc cancels".into(), true);
-    } else {
-        let first = window.confirmation_index.saturating_sub(visible / 2);
-        for (index, conflict) in window.confirmation.iter().enumerate().skip(first).take(visible) {
-            line(
-                (index - first) as u16 + 2,
-                format!("{}/{} {}", index + 1, window.confirmation.len(), conflict_label(conflict)),
-                index == window.confirmation_index,
-            );
-        }
+        line(area.height - 2, host.status().into(), false);
+        line(
+            area.height - 1,
+            format!("< > pages {}/{}  Tab conflict  Enter replace  Esc cancel", review.page + 1, review.pages),
+            false,
+        );
+        return;
+    }
+    for (index, row) in window.rows.iter().enumerate() {
+        line(index as u16 + 2, format!("{}: {}  {}", row.title, row.value, row.source), row.selected);
     }
     let mut caret = Some((area.x + 3 + query_cursor as u16, area.y + 1));
     if let Some(edit) = &window.edit_text {
@@ -206,11 +218,6 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
     } else if let Some(capture) = &window.capture {
         line(area.height - 4, format!("Keys: {}", if capture.is_empty() { "Press keys..." } else { capture }), true);
         line(area.height - 3, "Enter accepts a captured chord; Esc cancels".into(), false);
-    } else if window.proposal.is_some() {
-        line(area.height - 4, format!("New: {}", window.proposal.as_deref().unwrap_or("preset bindings")), true);
-        if let Some(conflict) = window.confirmation.get(window.confirmation_index) {
-            line(area.height - 3, format!("Replace: {}", conflict_label(conflict)), false);
-        }
     } else if let Some(row) = window.rows.iter().find(|row| row.selected) {
         line(area.height - 4, row.description.clone(), false);
         line(area.height - 3, format!("Default: {}", row.default), false);
@@ -235,6 +242,9 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
 mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
+    fn key(host: &mut SettingsSession, event: KeyEvent) -> bool {
+        super::key(host, event, (100, 25))
+    }
 
     #[test]
     fn terminal_compound_capture_keeps_modified_escape_and_cancels_in_stages() {
@@ -267,6 +277,10 @@ mod tests {
         assert!(host.panel_is_capturing());
         key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT));
         assert!(host.panel_is_capturing(), "modified Escape is data during capture");
+        let mut repeated = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        repeated.kind = KeyEventKind::Repeat;
+        key(&mut host, repeated);
+        assert!(host.panel_is_capturing(), "held Enter cannot complete a captured shortcut");
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 25)).unwrap();
         terminal.draw(|frame| draw(frame, &host)).unwrap();
         let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
@@ -284,10 +298,35 @@ mod tests {
         key(&mut host, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let window = host.panel_window(0, 0).unwrap().unwrap();
         assert!(window.confirmation.len() >= 2);
+        key(&mut host, repeated);
+        assert!(host.panel_is_confirming(), "held Enter cannot accept a conflict");
         terminal.draw(|frame| draw(frame, &host)).unwrap();
         let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
         assert!(screen.contains("file.save <- ctrl+c"), "confirmation must retain the proposed binding");
-        assert!(screen.contains("ctrl+c -> edit.copy (Exact)"), "confirmation must name what will be replaced");
+        assert!(
+            screen.contains("Keys: ctrl+c") && screen.contains("Command: edit.copy") && screen.contains("Kind: Exact"),
+            "confirmation must name what will be replaced"
+        );
+        let mut compact = ratatui::Terminal::new(ratatui::backend::TestBackend::new(44, 9)).unwrap();
+        let pages = host.panel_window(0, 0).unwrap().unwrap().confirmation_viewport(38, 3).unwrap().pages;
+        assert!(pages > 1);
+        let mut visible = String::new();
+        for page in 0..pages {
+            if page > 0 {
+                super::key(&mut host, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), (44, 9));
+            }
+            assert_eq!(host.panel_window(0, 0).unwrap().unwrap().confirmation_page, page);
+            compact.draw(|frame| draw(frame, &host)).unwrap();
+            for y in 3..6 {
+                for x in 3..41 {
+                    visible.push_str(compact.backend().buffer()[(x, y)].symbol());
+                }
+            }
+        }
+        assert!(
+            visible.contains("Command: edit.copy") && visible.contains("Kind: Exact"),
+            "compact rendering must expose every conflict field through paging"
+        );
         key(&mut host, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(host.panel_window(0, 0).unwrap().unwrap().confirmation_index, 1);
         host.edit_document(|doc| {

@@ -257,7 +257,8 @@ pub fn run_with_external_open(
                         {
                             KeyResult::SettingsFile
                         } else {
-                            KeyResult::Changed(settings_ui::key(panel, k))
+                            let size = terminal.size()?;
+                            KeyResult::Changed(settings_ui::key(panel, k, (size.width, size.height)))
                         }
                     } else if view.file_prompt().is_some() {
                         file_prompt::key(&mut view, k)

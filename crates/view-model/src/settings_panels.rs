@@ -47,6 +47,7 @@ pub enum PanelInput<'a> {
     Accept,
     Cancel,
     Capture(KeyChord),
+    ReviewPage { index: usize, pages: usize },
 }
 
 /// Constructed only after a completed edit or explicit conflict confirmation.
@@ -156,6 +157,51 @@ pub struct PanelWindow {
     pub confirmation: Vec<KeyConflict>,
     pub confirmation_index: usize,
     pub proposal: Option<String>,
+    pub confirmation_page: usize,
+}
+
+pub struct ConfirmationViewport {
+    pub lines: Vec<String>,
+    pub page: usize,
+    pub pages: usize,
+}
+impl PanelWindow {
+    /// Wrap every field before paging, so even a narrow card can expose all
+    /// values rather than silently clipping the command or proposed shortcut.
+    pub fn confirmation_viewport(&self, width: usize, rows: usize) -> Option<ConfirmationViewport> {
+        let proposal = self.proposal.as_ref()?;
+        let mut fields = vec![format!("Proposed: {proposal}")];
+        if let Some(conflict) = self.confirmation.get(self.confirmation_index) {
+            fields.extend([
+                format!("Conflict {}/{}", self.confirmation_index + 1, self.confirmation.len()),
+                format!("Keys: {}", conflict.keys),
+                format!("Command: {}", conflict.command),
+                format!("Kind: {:?}", conflict.kind),
+            ]);
+        } else {
+            fields.push("No conflicts remain; Enter applies, Esc cancels".into());
+        }
+        let width = width.clamp(1, 4096);
+        let rows = rows.clamp(1, 4096);
+        let mut lines = Vec::new();
+        for field in fields {
+            let text = crate::palette_session::display_text(&field);
+            let mut line = String::new();
+            let mut columns = 0;
+            for cell in crate::grid::cells(text.as_bytes(), 4096, 4) {
+                if columns + cell.width > width && !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    columns = 0;
+                }
+                line.push_str(&cell.text);
+                columns += cell.width;
+            }
+            lines.push(line);
+        }
+        let pages = lines.len().div_ceil(rows).max(1);
+        let page = self.confirmation_page.min(pages - 1);
+        Some(ConfirmationViewport { lines: lines.into_iter().skip(page * rows).take(rows).collect(), page, pages })
+    }
 }
 
 #[derive(Clone)]
@@ -235,10 +281,18 @@ pub struct SettingsPanelController {
     selection: usize,
     state: State,
     confirmation_index: usize,
+    confirmation_page: usize,
 }
 impl SettingsPanelController {
     pub fn new(panel: SettingsPanel, doc: &SettingsDocument) -> Result<Self, SettingsError> {
-        let result = Self { panel, query: Text::default(), selection: 0, state: State::Browse, confirmation_index: 0 };
+        let result = Self {
+            panel,
+            query: Text::default(),
+            selection: 0,
+            state: State::Browse,
+            confirmation_index: 0,
+            confirmation_page: 0,
+        };
         result.rows(doc)?;
         Ok(result)
     }
@@ -327,6 +381,7 @@ impl SettingsPanelController {
             edit_text,
             confirmation,
             confirmation_index: self.confirmation_index,
+            confirmation_page: self.confirmation_page,
             proposal: match &self.state {
                 State::Confirm(PanelEdit::Rebind { binding, .. }, _) => {
                     Some(format!("{} <- {} [{:?}/{:?}]", binding.command, binding.keys, binding.context, binding.mode))
@@ -366,7 +421,16 @@ impl SettingsPanelController {
         self.selection = self.selection.min(rows.len().saturating_sub(1));
         match &mut self.state {
             State::Confirm(edit, approved) => {
+                if matches!(input, PanelInput::Next | PanelInput::Previous | PanelInput::Home | PanelInput::End) {
+                    self.confirmation_page = 0;
+                }
                 match input {
+                    PanelInput::ReviewPage { index, pages } => {
+                        if pages == 0 || pages > PANEL_ROW_LIMIT {
+                            return Err(error("invalid confirmation page count"));
+                        }
+                        self.confirmation_page = index.min(pages - 1);
+                    }
                     PanelInput::Next => {
                         self.confirmation_index = (self.confirmation_index + 1).min(approved.len().saturating_sub(1))
                     }
@@ -380,6 +444,7 @@ impl SettingsPanelController {
                     if actual != *approved {
                         *approved = actual;
                         self.confirmation_index = 0;
+                        self.confirmation_page = 0;
                         return Err(error("shortcut conflicts changed; review and confirm again"));
                     }
                     let mut edit = edit.clone();
@@ -508,6 +573,7 @@ impl SettingsPanelController {
                     return Err(failure);
                 }
                 self.confirmation_index = 0;
+                self.confirmation_page = 0;
                 self.state = State::Confirm(edit, conflicts);
                 Ok(None)
             }
@@ -824,6 +890,43 @@ mod tests {
         press(&mut panel, &doc, key("alt+f9"));
         assert!(press(&mut panel, &doc, key("escape")).is_none());
         assert!(!panel.is_editing());
+    }
+
+    #[test]
+    fn settings_confirmation_pages_preserve_long_fields_in_compact_cards() {
+        let doc = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+shift+f11 ctrl+shift+f10'\ncommand='file.open'\n")
+            .unwrap();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        press(&mut panel, &doc, PanelInput::Accept);
+        press(&mut panel, &doc, key("ctrl+shift+f11"));
+        press(&mut panel, &doc, key("ctrl+shift+f10"));
+        assert!(panel.is_confirming());
+        for width in [10, 38, 77] {
+            for rows in [2, 14] {
+                let first = panel.window(&doc, 0, 0).unwrap().confirmation_viewport(width, rows).unwrap();
+                let mut visible = String::new();
+                for page in 0..first.pages {
+                    press(&mut panel, &doc, PanelInput::ReviewPage { index: page, pages: first.pages });
+                    let viewport = panel.window(&doc, 0, 0).unwrap().confirmation_viewport(width, rows).unwrap();
+                    assert_eq!(viewport.page, page);
+                    assert!(viewport.lines.len() <= rows);
+                    for line in viewport.lines {
+                        assert!(
+                            crate::grid::cells(line.as_bytes(), 4096, 4).iter().map(|cell| cell.width).sum::<usize>()
+                                <= width
+                        );
+                        visible.push_str(&line);
+                    }
+                }
+                assert!(visible.contains("file.save <- ctrl+shift+f11 ctrl+shift+f10"));
+                assert!(visible.contains("Keys: ctrl+shift+f11 ctrl+shift+f10"));
+                assert!(visible.contains("Command: file.open"));
+                assert!(visible.contains("Kind: Exact"));
+            }
+        }
+        press(&mut panel, &doc, PanelInput::Home);
+        assert_eq!(panel.window(&doc, 0, 0).unwrap().confirmation_page, 0);
     }
 
     #[test]
