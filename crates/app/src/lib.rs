@@ -301,6 +301,13 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         }
     }
+    if let Err(error) = validate_hidden_tui_root(
+        args.hidden,
+        std::env::var_os("KWIL_WORKSPACE_ROOT").as_deref().map(std::path::Path::new),
+    ) {
+        eprintln!("kwil: {error}");
+        return ExitCode::FAILURE;
+    }
     if !in_terminal {
         eprintln!("kwil: the terminal UI needs an interactive terminal");
         return ExitCode::FAILURE;
@@ -318,5 +325,26 @@ fn run_app(console_launcher: bool) -> ExitCode {
             eprintln!("kwil: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn validate_hidden_tui_root(hidden: bool, root: Option<&std::path::Path>) -> Result<(), &'static str> {
+    if hidden && root.is_none_or(|root| !root.is_absolute()) {
+        Err("hidden terminal runs require an absolute KWIL_WORKSPACE_ROOT; live recovery storage was not accessed")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    #[test]
+    fn hidden_terminal_missing_empty_and_relative_roots_fail_closed() {
+        for root in [None, Some(std::path::Path::new("")), Some(std::path::Path::new("relative"))] {
+            assert!(validate_hidden_tui_root(true, root).is_err());
+        }
+        assert!(validate_hidden_tui_root(false, None).is_ok());
+        assert!(validate_hidden_tui_root(true, Some(&std::env::temp_dir())).is_ok());
     }
 }

@@ -46,13 +46,35 @@ impl FileArgument {
             return Err("the working directory must be absolute".into());
         }
         if !self.path.is_absolute() {
-            self.path = directory.join(self.path);
+            self.path = resolve_relative(&self.path, directory)?;
         }
         if !self.path.is_absolute() {
             return Err("the file path could not be resolved absolutely".into());
         }
         Ok(self)
     }
+}
+
+fn resolve_relative(path: &Path, directory: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut parts = path.components();
+        if let Some(Component::Prefix(prefix)) = parts.next()
+            && let Prefix::Disk(drive) = prefix.kind()
+            && !path.has_root()
+        {
+            if let Some(Component::Prefix(base)) = directory.components().next()
+                && matches!(base.kind(), Prefix::Disk(base_drive) if base_drive.eq_ignore_ascii_case(&drive))
+            {
+                return Ok(directory.join(parts.as_path()));
+            }
+            // GetFullPathNameW uses Windows' per-drive working directory; it
+            // does not open the file or require the target to exist.
+            return std::path::absolute(path).map_err(|error| error.to_string());
+        }
+    }
+    Ok(directory.join(path))
 }
 
 fn numeric_suffix(bytes: &[u8]) -> Result<Option<(usize, u64)>, String> {
@@ -120,6 +142,21 @@ mod tests {
         let parsed = FileArgument::parse(OsString::from_wide(&units), false).unwrap();
         assert_eq!(parsed.path.as_os_str().encode_wide().collect::<Vec<_>>(), units[..4]);
         assert_eq!(parsed.line, Some(9));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cli_drive_relative_paths_resolve_with_positions_without_opening_files() {
+        let result = parse("E:notes.txt:12:3").resolve(Path::new(r"E:\work"));
+        assert!(result.is_ok(), "a same-drive relative path must resolve against its working directory");
+        let file = result.unwrap();
+        assert_eq!(file.path, Path::new(r"E:\work\notes.txt"));
+        assert_eq!((file.line, file.column), (Some(12), Some(3)));
+        let file = parse("e:notes.txt").resolve(Path::new(r"E:\work")).unwrap();
+        assert_eq!(file.path, Path::new(r"E:\work\notes.txt"));
+        let other = parse("C:notes.txt:9").resolve(Path::new(r"E:\work")).unwrap();
+        assert_eq!(other.path, std::path::absolute("C:notes.txt").unwrap());
+        assert_eq!(other.line, Some(9));
     }
 
     #[test]

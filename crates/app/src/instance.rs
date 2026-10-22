@@ -8,11 +8,11 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, TrySendError},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -71,7 +71,7 @@ pub fn claim(endpoint: InstanceEndpoint, files: &OpenFiles) -> io::Result<Start>
             server.shutdown();
             // Another first launch may have won between connect and bind.
             // The peer is still authenticated by send_files.
-            if send_files(&endpoint, files, CONNECT_TIMEOUT).is_ok() { Ok(Start::Forwarded) } else { Err(error) }
+            if forward_after_claim_loss(&endpoint, files).is_ok() { Ok(Start::Forwarded) } else { Err(error) }
         }
         Err(error) => {
             server.shutdown();
@@ -80,12 +80,59 @@ pub fn claim(endpoint: InstanceEndpoint, files: &OpenFiles) -> io::Result<Start>
     }
 }
 
-type Route = Arc<Mutex<Option<ExternalOpen>>>;
+fn forward_after_claim_loss(endpoint: &InstanceEndpoint, files: &OpenFiles) -> io::Result<()> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    retry_pre_admission(
+        |budget| send_files(endpoint, files, budget),
+        || deadline.saturating_duration_since(Instant::now()),
+        || std::thread::park_timeout(Duration::from_millis(2)),
+    )
+}
+
+fn retry_pre_admission(
+    mut attempt: impl FnMut(Duration) -> io::Result<()>,
+    mut remaining: impl FnMut() -> Duration,
+    mut wait: impl FnMut(),
+) -> io::Result<()> {
+    loop {
+        let budget = remaining();
+        if budget.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "Concurrent instance did not become ready"));
+        }
+        match attempt(budget) {
+            Ok(()) => return Ok(()),
+            Err(error) if absent_owner(&error) => wait(),
+            // No replay after a possibly admitted/timed-out request, busy
+            // inbox, malformed protocol or authentication refusal.
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct RouteState {
+    open: Option<ExternalOpen>,
+    generation: u64,
+}
+struct Route {
+    state: Mutex<RouteState>,
+    changed: Condvar,
+}
+impl Route {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(RouteState { open: None, generation: 0 }), changed: Condvar::new() })
+    }
+    fn install(&self, open: ExternalOpen) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.open = Some(open);
+        state.generation = state.generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+}
 
 pub struct Owner {
     server: InstanceServer,
     requests: Rc<RefCell<Option<Receiver<OpenFiles>>>>,
-    route: Route,
+    route: Arc<Route>,
     stopped: Arc<AtomicBool>,
 }
 impl Owner {
@@ -95,7 +142,7 @@ impl Owner {
         Self {
             server,
             requests: Rc::new(RefCell::new(Some(requests))),
-            route: Arc::new(Mutex::new(None)),
+            route: Route::new(),
             stopped: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -112,7 +159,7 @@ impl Owner {
             {
                 eprintln!("kwil: initial file delivery failed: {error}");
             }
-            *route.lock().unwrap_or_else(|error| error.into_inner()) = Some(open);
+            route.install(open);
             if let Some(requests) = requests.borrow_mut().take() {
                 let result = std::thread::Builder::new().name("kwil-open-relay".into()).spawn(move || {
                     for request in requests {
@@ -130,36 +177,45 @@ impl Owner {
 }
 impl Drop for Owner {
     fn drop(&mut self) {
+        let _route = self.route.state.lock().unwrap_or_else(|error| error.into_inner());
         self.stopped.store(true, Ordering::Release);
+        self.route.changed.notify_all();
         self.server.shutdown();
         // Backend shutdown drops the request sender and wakes the blocking relay.
         // No event-loop thread waits on a filesystem operation or thread join.
     }
 }
 
-fn deliver(route: &Route, stopped: &AtomicBool, mut request: OpenFiles) -> bool {
+fn deliver(route: &Arc<Route>, stopped: &AtomicBool, mut request: OpenFiles) -> bool {
     loop {
         if stopped.load(Ordering::Acquire) {
             return false;
         }
-        let result = {
-            let route = route.lock().unwrap_or_else(|error| error.into_inner());
-            match route.as_ref() {
-                Some(open) => open(request),
-                None => return false,
-            }
-        };
+        let mut state = route.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.open.is_none() && !stopped.load(Ordering::Acquire) {
+            state = route.changed.wait(state).unwrap_or_else(|error| error.into_inner());
+        }
+        if stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        let generation = state.generation;
+        let result = state.open.as_ref().unwrap()(request);
         match result {
             Ok(()) => return true,
             Err(TrySendError::Full(retained)) => {
                 request = retained;
+                drop(state);
                 // Only while an accepted action is awaiting bounded capacity.
                 // At idle this worker blocks on recv and has zero timer wakeups.
                 std::thread::park_timeout(Duration::from_millis(2));
             }
-            Err(TrySendError::Disconnected(_)) => {
-                eprintln!("kwil: editor closed before a queued file-open request could be delivered");
-                return false;
+            Err(TrySendError::Disconnected(retained)) => {
+                request = retained;
+                // A failed GUI may be replaced by the TUI. Retain the exact
+                // unadmitted request and sleep until that route or shutdown.
+                while state.generation == generation && !stopped.load(Ordering::Acquire) {
+                    state = route.changed.wait(state).unwrap_or_else(|error| error.into_inner());
+                }
             }
         }
     }
@@ -200,7 +256,8 @@ mod tests {
             assert_eq!(request, original);
             if count.fetch_add(1, Ordering::SeqCst) == 0 { Err(TrySendError::Full(request)) } else { Ok(()) }
         });
-        let route = Arc::new(Mutex::new(Some(open)));
+        let route = Route::new();
+        route.install(open);
         let stopped = AtomicBool::new(false);
         assert!(deliver(&route, &stopped, expected.clone()));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
@@ -216,5 +273,91 @@ mod tests {
         assert!(runtime_root(Some(PathBuf::new()), Some(home.clone())).is_err());
         assert_eq!(runtime_root(None, Some(home.clone())).unwrap(), home);
         assert!(runtime_root(None, None).is_err());
+    }
+
+    #[test]
+    fn instance_claim_race_waits_only_for_unadmitted_absence() {
+        let mut attempts = 0;
+        let result = retry_pre_admission(
+            |_| {
+                attempts += 1;
+                match attempts {
+                    1 => Err(io::Error::from(io::ErrorKind::NotFound)),
+                    2 => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+                    _ => Ok(()),
+                }
+            },
+            || Duration::from_millis(20),
+            || {},
+        );
+        assert!(result.is_ok(), "a winner paused before bind must still receive the request");
+        assert_eq!(attempts, 3, "the winner can own the lock before binding its socket");
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+            let mut attempts = 0;
+            let result = retry_pre_admission(
+                |_| {
+                    attempts += 1;
+                    Err(io::Error::from(kind))
+                },
+                || Duration::from_millis(20),
+                || {},
+            );
+            assert_eq!(result.unwrap_err().kind(), kind);
+            assert_eq!(attempts, 1, "ambiguous or refused requests must not be replayed");
+        }
+        let mut remaining = 2u64;
+        let result = retry_pre_admission(
+            |_| Err(io::Error::from(io::ErrorKind::NotFound)),
+            || {
+                let budget = remaining;
+                remaining = remaining.saturating_sub(1);
+                Duration::from_millis(budget)
+            },
+            || {},
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn instance_disconnected_gui_retains_request_until_tui_route_arrives() {
+        let route = Route::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let expected = OpenFiles {
+            files: vec![kwil_core_workspace::instance::OpenFile {
+                path: std::env::temp_dir().join("fallback-file"),
+                line: Some(20),
+                column: Some(7),
+            }],
+        };
+        let (disconnected, saw_disconnect) = std::sync::mpsc::sync_channel(1);
+        route.install(Box::new(move |request| {
+            let _ = disconnected.try_send(());
+            Err(TrySendError::Disconnected(request))
+        }));
+        let worker_route = route.clone();
+        let worker_stop = stopped.clone();
+        let request = expected.clone();
+        let (complete, completed) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = complete.send(deliver(&worker_route, &worker_stop, request));
+        });
+        let disconnected = saw_disconnect.recv_timeout(Duration::from_secs(2));
+        let (delivered, received) = std::sync::mpsc::sync_channel(1);
+        route.install(Box::new(move |request| {
+            delivered.try_send(request).unwrap();
+            Ok(())
+        }));
+        let result = completed.recv_timeout(Duration::from_secs(2));
+        {
+            let _state = route.state.lock().unwrap();
+            stopped.store(true, Ordering::Release);
+            route.changed.notify_all();
+        }
+        if result.is_ok() {
+            worker.join().unwrap();
+        }
+        assert!(disconnected.is_ok());
+        assert!(result.unwrap(), "fallback must not permanently consume the relay receiver");
+        assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap(), expected);
     }
 }
