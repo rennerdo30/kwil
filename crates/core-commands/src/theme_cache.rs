@@ -82,7 +82,7 @@ pub(crate) fn encode(cached: &CachedTheme) -> Result<Vec<u8>, ThemeError> {
                 color(&mut body, c);
             }
         }
-        body.push(style.font_style.map_or(255, |v| v));
+        body.push(style.font_style.unwrap_or(255));
     }
     if body.len() + HEADER > MAX_CACHE_BYTES {
         return Err(error("theme cache exceeds bound"));

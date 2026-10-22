@@ -127,10 +127,9 @@ impl FileWatcher {
                                     let _ = watcher.unwatch(path);
                                     if std::fs::symlink_metadata(path)
                                         .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                                        && let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive)
                                     {
-                                        if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
-                                            callback(Err(io::Error::other(e)));
-                                        }
+                                        callback(Err(io::Error::other(e)));
                                     }
                                 }
                             }

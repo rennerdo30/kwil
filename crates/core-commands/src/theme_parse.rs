@@ -340,10 +340,10 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
                     if d.version().map_err(|e| error(e.to_string()))?.as_ref() != b"1.0" {
                         return Err(error("only XML 1.0 is supported"));
                     }
-                    if let Some(encoding) = d.encoding() {
-                        if !encoding.map_err(|e| error(e.to_string()))?.eq_ignore_ascii_case(b"utf-8") {
-                            return Err(error("only UTF-8 XML is supported"));
-                        }
+                    if let Some(encoding) = d.encoding()
+                        && !encoding.map_err(|e| error(e.to_string()))?.eq_ignore_ascii_case(b"utf-8")
+                    {
+                        return Err(error("only UTF-8 XML is supported"));
                     }
                     continue;
                 }
