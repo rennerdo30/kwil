@@ -93,6 +93,8 @@ Threading: the UI thread, plus a small fixed pool of worker threads (`std::threa
 
 Legacy encodings (Shift-JIS, Windows-1252, UTF-16, …) are decoded to UTF-8 with `encoding_rs` per viewport and per search chunk, using a sparse decode index built in the background, and encoded back on save. There is never a full decoded copy in RAM (principle 7).
 
+**Known v1 limitation (owner approved 2026-10-23, KW-45):** stateful encodings are not supported in v1. **ISO-2022-JP** files open with a clear "unsupported encoding" message, never as garbled text. Its escape sequences switch the decoder state for unbounded stretches, and `encoding_rs` decoders cannot be checkpointed, so per-viewport decoding would need a full replay from the file start, which principle 7 rules out. All stateless encodings are supported: UTF-8, UTF-16 LE/BE, Windows-1252, Shift_JIS, EUC-JP, GBK/GB18030, Big5, KOI8-R and the rest of `encoding_rs`. A stateful checkpoint representation is the follow-up (KW-45).
+
 **mmap safety:** if another program truncates a mapped file, reading it can crash the process (SIGBUS on Unix). Rule: files under 64 MB (configurable) are read fully into memory, which takes a few ms. Larger files are mapped, watched with `notify`, and re-checked by size and mtime before each region read. If they changed, the editor shows "file changed on disk" instead of reading stale pages.
 
 ### Editing
