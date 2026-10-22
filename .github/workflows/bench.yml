@@ -87,6 +87,24 @@ jobs:
           else
             "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/${{ matrix.os }}.json --baseline baseline/current.json
           fi
+      - name: Check out the baseline code for a paired Linux diagnostic
+        id: reference
+        if: failure() && runner.os == 'Linux' && hashFiles('results/ubuntu-24.04.json') != ''
+        uses: actions/checkout@v7
+        with:
+          # Exact PR head whose merge produced the baseline samples. This
+          # diagnostic never changes the gate or writes a baseline.
+          ref: 8a315ff2e3e0dd3659de01e033f1f36e18de2384
+          path: .bench-reference
+      - name: Measure reference text code on the same Linux runner
+        if: failure() && steps.reference.outcome == 'success'
+        working-directory: .bench-reference
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-reference
+        shell: bash
+        run: |
+          cargo build --release --locked -j 4 -p kwil-bench --features harness
+          "$GITHUB_WORKSPACE/.bench-venv/bin/python" crates/bench/run.py --text-only --bin-dir "$GITHUB_WORKSPACE/target-reference/release" --fixtures "$GITHUB_WORKSPACE/fixtures" --runner ubuntu-24.04 --runs 5 --output "$GITHUB_WORKSPACE/results/reference.json"
       - name: Retain raw samples, medians and commit even on gate failure
         if: always()
         uses: actions/upload-artifact@v7
