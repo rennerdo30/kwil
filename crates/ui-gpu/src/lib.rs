@@ -8,16 +8,17 @@
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
 mod font;
+mod input;
 mod scrollbar;
 
 use font::Font;
-use kwil_view_model::{Damage, Notify, View};
+use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -58,6 +59,7 @@ impl std::fmt::Display for GuiError {
 enum UserEvent {
     IndexDone,
     Notice(String),
+    Saved(std::io::Result<kwil_core_workspace::SavedSnapshot>),
 }
 
 struct Gfx {
@@ -83,6 +85,11 @@ struct App {
     widest: u64,
     pointer: (usize, usize),
     drag: Option<(bool, usize)>,
+    started: std::time::Instant,
+    composing: bool,
+    selecting: bool,
+    close_pending: bool,
+    save_path: Option<String>,
 }
 
 /// Runs the GUI until the window closes. `on_first_frame` runs once the
@@ -122,6 +129,11 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
         widest: 0,
         pointer: (0, 0),
         drag: None,
+        started: std::time::Instant::now(),
+        composing: false,
+        selecting: false,
+        close_pending: false,
+        save_path: None,
     };
     event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
@@ -226,18 +238,134 @@ impl App {
         if ev.state != ElementState::Pressed {
             return;
         }
-        let page = self.view.rows().max(1) as i64;
-        let ctrl = self.mods.control_key();
-        let d = match &ev.logical_key {
-            Key::Named(NamedKey::ArrowDown) => self.view.scroll(1),
-            Key::Named(NamedKey::ArrowUp) => self.view.scroll(-1),
-            Key::Named(NamedKey::PageDown) => self.view.scroll(page),
-            Key::Named(NamedKey::PageUp) => self.view.scroll(-page),
-            Key::Named(NamedKey::End) if ctrl => self.view.scroll_to_end(),
-            Key::Named(NamedKey::Home) if ctrl => self.view.scroll_to_start(),
-            _ => return,
+        if self.save_path.is_some() {
+            match &ev.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.save_path = None;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let path = self.save_path.take().unwrap();
+                    if !path.trim().is_empty() {
+                        self.start_save(Some(path.into()));
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.save_path.as_mut().unwrap().pop();
+                }
+                _ => {
+                    if let Some(text) = ev.text.as_deref().filter(|text| !text.chars().any(char::is_control)) {
+                        self.save_path.as_mut().unwrap().push_str(text);
+                    }
+                }
+            }
+            let notice = self
+                .save_path
+                .as_ref()
+                .map_or_else(String::new, |path| format!("Save as: {path}  (Enter to save, Esc to cancel)"));
+            let damage = self.view.set_notice(notice);
+            self.apply(damage);
+            return;
+        }
+        if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            self.close_pending = false;
+            let damage = self.view.set_notice(String::new());
+            self.apply(damage);
+            return;
+        }
+        if let Some(action) = input::translate(&ev.logical_key, ev.text.as_deref(), self.mods, self.composing) {
+            self.edit(action);
+        }
+    }
+
+    fn edit(&mut self, action: input::Action) {
+        let (id, text) = match action {
+            input::Action::Command(id) => (id, None),
+            input::Action::Text(text) => ("edit.insert", Some(text)),
         };
-        self.apply(d);
+        let args =
+            CommandArgs { text, at: self.started.elapsed(), extend: self.mods.shift_key(), ..Default::default() };
+        match self.view.execute(id, &args, 1) {
+            Ok(result) => {
+                self.apply(result.damage);
+                let notice = match result.status {
+                    CommandStatus::Applied => return,
+                    CommandStatus::SaveRequested => {
+                        self.save();
+                        return;
+                    }
+                    CommandStatus::IndexNotReady => "Indexing: editing will be available when ready".to_string(),
+                    CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => message,
+                };
+                let damage = self.view.set_notice(notice);
+                self.apply(damage);
+            }
+            Err(error) => {
+                let damage = self.view.set_notice(error.to_string());
+                self.apply(damage);
+            }
+        }
+    }
+
+    fn request_close(&mut self, el: &ActiveEventLoop, discard: bool) {
+        if !discard && self.view.editor().is_some_and(|editor| editor.document().is_dirty()) {
+            self.close_pending = true;
+            let damage =
+                self.view.set_notice("Unsaved changes: Ctrl+S to save; Ctrl+Shift+Q to discard; Esc to cancel".into());
+            self.apply(damage);
+        } else {
+            el.exit();
+        }
+    }
+
+    fn save(&mut self) {
+        if self.view.editor().is_some_and(|editor| editor.document().path().is_none()) {
+            self.save_path = Some(String::new());
+            let damage = self.view.set_notice("Save as:  (Enter a path, Enter to save, Esc to cancel)".into());
+            self.apply(damage);
+        } else {
+            self.start_save(None);
+        }
+    }
+
+    fn start_save(&mut self, path: Option<std::path::PathBuf>) {
+        let Some(editor) = self.view.editor_mut() else {
+            return;
+        };
+        match editor.save_request(path) {
+            Ok(request) => {
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let _ = proxy.send_event(UserEvent::Saved(kwil_core_workspace::save_snapshot(request)));
+                });
+                let damage = self.view.set_notice("Saving…".into());
+                self.apply(damage);
+            }
+            Err(error) => {
+                let damage = self.view.set_notice(error.to_string());
+                self.apply(damage);
+            }
+        }
+    }
+
+    fn place_caret(&mut self, extend: bool) {
+        let Some(font) = &self.font else {
+            return;
+        };
+        let row = self.view.top() + (self.pointer.1 / font.ch).min(self.view.rows().saturating_sub(1)) as u64;
+        let column = (self.pointer.0.saturating_sub(GUTTER_COLS * font.cw) / font.cw) as u64 + self.horizontal;
+        let result = self.view.execute(
+            "navigation.goToLine",
+            &CommandArgs { line: Some(row + 1), column: Some(column + 1), extend, ..Default::default() },
+            1,
+        );
+        match result {
+            Ok(result) => self.apply(result.damage),
+            Err(error) => {
+                let damage = self.view.set_notice(error.to_string());
+                self.apply(damage);
+            }
+        }
     }
 
     fn render(&mut self) {
@@ -268,6 +396,7 @@ impl App {
             fill(&mut buf, w, Rect { x: 0, y: 0, w, h }, BG);
             for r in 0..rows {
                 draw_row(&mut buf, w, font, &self.view, r, self.horizontal);
+                draw_editor_marks(&mut buf, w, font, &self.view, r, self.horizontal);
             }
             p.status = true;
             damage.push(Rect { x: 0, y: 0, w, h });
@@ -291,6 +420,7 @@ impl App {
             p.rows.dedup();
             for &r in p.rows.iter().filter(|&&r| r < rows) {
                 draw_row(&mut buf, w, font, &self.view, r, self.horizontal);
+                draw_editor_marks(&mut buf, w, font, &self.view, r, self.horizontal);
                 damage.push(Rect { x: 0, y: r * ch, w, h: ch });
             }
         }
@@ -359,6 +489,48 @@ fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, h
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, GUTTER_FG, GUTTER_BG);
         let text = text.get((horizontal as usize).min(text.len())..).unwrap_or_default();
         draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, FG, BG);
+    }
+}
+
+fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: usize, horizontal: u64) {
+    let Some(editor) = view.editor() else {
+        return;
+    };
+    let absolute_row = view.top() + row as u64;
+    let gutter = GUTTER_COLS * font.cw;
+    let columns = w.saturating_sub(gutter + BAR) / font.cw;
+    if let (Ok(range), Ok(selections), Some(line)) =
+        (editor.line_range(absolute_row), editor.selection_ranges(absolute_row), view.line(row))
+    {
+        for cell in text::cells(line, columns.saturating_add(horizontal as usize), 4) {
+            let source = range.start + cell.bytes.start as u64..range.start + cell.bytes.end as u64;
+            if !selections.iter().any(|selection| selection.start < source.end && source.start < selection.end) {
+                continue;
+            }
+            let start = (cell.column as u64).saturating_sub(horizontal) as usize;
+            let end = (cell.column as u64 + cell.width as u64).saturating_sub(horizontal).min(columns as u64) as usize;
+            if end <= start {
+                continue;
+            }
+            for y in row * font.ch..(row + 1) * font.ch {
+                for x in gutter + start * font.cw..gutter + end * font.cw {
+                    let pixel = &mut buf[y * w + x];
+                    *pixel = ((*pixel & 0xfefefe) >> 1) + 0x183454;
+                }
+            }
+        }
+    }
+    for cursor in editor.cursors() {
+        if let Ok((cursor_row, column)) = editor.position_at(cursor.head) {
+            if cursor_row == absolute_row && column >= horizontal && column - horizontal < columns as u64 {
+                fill(
+                    buf,
+                    w,
+                    Rect { x: gutter + (column - horizontal) as usize * font.cw, y: row * font.ch, w: 2, h: font.ch },
+                    STATUS_FG,
+                );
+            }
+        }
     }
 }
 
@@ -478,6 +650,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        window.set_ime_allowed(true);
         let surface = Context::new(window.clone()).and_then(|c| Surface::new(&c, window.clone()));
         let surface = match surface {
             Ok(s) => s,
@@ -519,17 +692,34 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
             UserEvent::IndexDone => self.view.index_ready(),
             UserEvent::Notice(msg) => self.view.set_notice(msg),
+            UserEvent::Saved(saved) => {
+                let Some(editor) = self.view.editor_mut() else {
+                    return;
+                };
+                match editor.finish_save(saved) {
+                    Ok(result) => {
+                        let damage = self.view.refresh_after_edit(result.damage);
+                        self.apply(damage);
+                        if self.close_pending && self.view.editor().is_some_and(|editor| !editor.document().is_dirty())
+                        {
+                            el.exit();
+                        }
+                        self.view.set_notice("Saved".into())
+                    }
+                    Err(error) => self.view.set_notice(format!("Save failed: {error}")),
+                }
+            }
         };
         self.apply(d);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
         match ev {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => self.request_close(el, false),
             WindowEvent::Resized(sz) => {
                 // The first Resized repeats the creation size.
                 if (sz.width as usize, sz.height as usize) == self.size {
@@ -548,23 +738,44 @@ impl ApplicationHandler<UserEvent> for App {
                     let (v, h) = self.bars();
                     let (bar, pixel) = if vertical { (v, self.pointer.1) } else { (h, self.pointer.0) };
                     self.scroll_bar(vertical, bar.drag(pixel, grab));
+                } else if self.selecting {
+                    self.place_caret(true);
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if state == ElementState::Pressed {
                     self.pointer_down();
+                    if self.drag.is_none()
+                        && self.pointer.0 < self.size.0.saturating_sub(BAR)
+                        && self.pointer.1 < self.bars().0.length
+                    {
+                        self.selecting = true;
+                        self.place_caret(self.mods.shift_key());
+                    }
                 } else {
                     self.drag = None;
+                    self.selecting = false;
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.mods.control_key()
                     && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
                 {
-                    el.exit();
+                    self.request_close(el, self.close_pending && self.mods.shift_key());
                 } else {
                     self.key(&event);
                 }
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.composing = false;
+                self.edit(input::Action::Text(text));
+            }
+            WindowEvent::Ime(Ime::Disabled) => self.composing = false,
+            WindowEvent::Focused(false) => {
+                self.drag = None;
+                self.selecting = false;
+                self.composing = false;
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (horizontal, vertical) = match delta {
