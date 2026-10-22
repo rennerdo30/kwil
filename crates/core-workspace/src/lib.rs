@@ -1,5 +1,7 @@
 //! Files, sessions, hot exit, file watching, single-instance IPC.
 
+pub mod catalogue;
+
 mod save;
 mod watcher;
 

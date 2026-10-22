@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+ignore = "=0.4.33"
 kwil-core-text = { path = "../core-text" }
 notify = "8.2.0"
 

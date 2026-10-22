@@ -3,6 +3,7 @@
 //! No frontend, document buffer, timer or worker is owned by this crate.
 pub mod key;
 pub mod keymap;
+pub mod palette;
 pub mod registry;
 pub mod settings;
 pub mod vim;
