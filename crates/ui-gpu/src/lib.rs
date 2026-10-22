@@ -372,6 +372,10 @@ impl App {
                 match keys.feed(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
+                        if call.id == "file.quit" {
+                            self.request_close(el, false);
+                            return;
+                        }
                         if self.settings.keymap == kwil_core_commands::Preset::Vim {
                             if call.id == "file.save" {
                                 self.save();
@@ -410,6 +414,14 @@ impl App {
                         return;
                     }
                     VimResult::Unbound => {
+                        if self.mods.control_key()
+                            && matches!(&ev.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
+                        {
+                            if !ev.repeat {
+                                self.request_close(el, self.close_pending && self.mods.shift_key());
+                            }
+                            return;
+                        }
                         if keys.mode() != kwil_core_commands::Mode::Insert {
                             return;
                         }
@@ -1010,13 +1022,17 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 match editor.finish_save(saved) {
                     Ok(result) => {
+                        let notice = match result.status {
+                            CommandStatus::Message(message) => message,
+                            _ => "Saved".into(),
+                        };
                         let damage = self.view.refresh_after_edit(result.damage);
                         self.apply(damage);
                         if self.close_pending && self.view.editor().is_some_and(|editor| !editor.document().is_dirty())
                         {
                             el.exit();
                         }
-                        self.view.set_notice("Saved".into())
+                        self.view.set_notice(notice)
                     }
                     Err(error) => self.view.set_notice(format!("Save failed: {error}")),
                 }
@@ -1136,21 +1152,13 @@ impl ApplicationHandler<UserEvent> for App {
                 (self.on_event)(GuiEvent::DroppedFile(path));
             }
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && self.mods.control_key()
-                    && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
-                {
-                    self.request_close(el, self.close_pending && self.mods.shift_key());
-                } else {
-                    self.key(el, &event);
-                }
-            }
+            WindowEvent::KeyboardInput { event, .. } => self.key(el, &event),
             WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.composing = false;
-                self.edit(input::Action::Text(text));
+                if self.keys.as_ref().is_none_or(|keys| keys.mode() == kwil_core_commands::Mode::Insert) {
+                    self.edit(input::Action::Text(text));
+                }
             }
             WindowEvent::Ime(Ime::Disabled) => self.composing = false,
             WindowEvent::Focused(false) => {

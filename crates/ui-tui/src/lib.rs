@@ -101,11 +101,15 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     if let Some(editor) = view.editor_mut() {
                         match editor.finish_save(saved) {
                             Ok(result) => {
+                                let notice = match result.status {
+                                    CommandStatus::Message(message) => message,
+                                    _ => "Saved".into(),
+                                };
                                 view.refresh_after_edit(result.damage);
                                 if closing && view.editor().is_some_and(|editor| !editor.document().is_dirty()) {
                                     break;
                                 }
-                                view.set_notice("Saved".into());
+                                view.set_notice(notice);
                             }
                             Err(error) => {
                                 view.set_notice(format!("Save failed: {error}"));
@@ -171,8 +175,12 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     }
                 }
                 Msg::Input(Event::Paste(text)) => {
-                    execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
-                    true
+                    if keys.mode() == kwil_core_commands::Mode::Insert {
+                        execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
+                        true
+                    } else {
+                        false
+                    }
                 }
                 Msg::Input(Event::Mouse(m)) => match m.kind {
                     MouseEventKind::ScrollDown => view.scroll(3) != Default::default(),

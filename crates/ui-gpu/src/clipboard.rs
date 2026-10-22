@@ -2,6 +2,7 @@ use kwil_view_model::{Clipboard, ClipboardData};
 use std::io;
 
 pub struct SystemClipboard(pub isize);
+#[cfg(windows)]
 const LIMIT: usize = 16 << 20;
 
 #[cfg(windows)]
@@ -103,9 +104,11 @@ impl Clipboard for SystemClipboard {
 #[cfg(not(windows))]
 impl Clipboard for SystemClipboard {
     fn set(&mut self, _data: ClipboardData) -> io::Result<()> {
+        let _ = self.0;
         Err(io::Error::other("System clipboard unavailable on this backend"))
     }
     fn get(&mut self) -> io::Result<Option<ClipboardData>> {
+        let _ = self.0;
         Err(io::Error::other("System clipboard unavailable on this backend"))
     }
 }
