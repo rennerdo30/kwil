@@ -13,6 +13,18 @@ mod scrollbar;
 
 use font::Font;
 use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View};
+#[cfg(feature = "gpu")]
+mod gpu;
+mod platform;
+pub mod remote;
+mod shaping;
+pub mod text;
+mod trace;
+pub use remote::RenderPolicy;
+
+use font::Font;
+use kwil_core_commands::settings::Settings;
+
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -60,13 +72,30 @@ enum UserEvent {
     IndexDone,
     Notice(String),
     Saved(std::io::Result<kwil_core_workspace::SavedSnapshot>),
+    GlyphReady(shaping::Tile, u64),
+    SettingsReady(Settings),
+    FontReady(Option<Font>),
+    SessionChanged(bool),
+    DroppedFile(std::path::PathBuf),
+    #[cfg(feature = "gpu")]
+    GpuReady(Result<gpu::Gpu, String>, f64),
+}
+
+/// Events for the app integration package. A dropped file is a request, never
+/// an implicit replacement of an edited buffer.
+#[derive(Clone, Debug)]
+pub enum GuiEvent {
+    DroppedFile(std::path::PathBuf),
+    RenderPolicyChanged(RenderPolicy),
 }
 
 struct Gfx {
+    native: Option<platform::Native>,
     window: Rc<Window>,
     surface: Surface<Rc<Window>, Rc<Window>>,
     #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: isize,
+    pixels: Vec<u32>,
 }
 
 struct App {
@@ -90,12 +119,31 @@ struct App {
     selecting: bool,
     close_pending: bool,
     save_path: Option<String>,
+    settings: Settings,
+    policy: RenderPolicy,
+    on_event: Box<dyn FnMut(GuiEvent)>,
+    #[cfg(feature = "gpu")]
+    gpu: Option<gpu::Gpu>,
+    #[cfg(feature = "gpu")]
+    gpu_started: bool,
+    font_loading: bool,
+    font_reload_pending: bool,
 }
 
 /// Runs the GUI until the window closes. `on_first_frame` runs once the
 /// first frame is on screen; it receives a `Notify` that shows a message in
 /// the status bar from any thread (used for update notices).
 pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>) -> Result<(), GuiError> {
+    run_with_events(view, opts, on_first_frame, Box::new(|_| {}))
+}
+
+pub fn run_with_events(
+    view: View,
+    opts: GuiOptions,
+    on_first_frame: Box<dyn FnOnce(Notify)>,
+    on_event: Box<dyn FnMut(GuiEvent)>,
+) -> Result<(), GuiError> {
+    trace::mark("gui entry");
     // Font loading runs while the event loop and window are created.
     let font_thread = Some(std::thread::spawn(|| Font::load(15.0)));
     let event_loop =
@@ -134,6 +182,15 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
         selecting: false,
         close_pending: false,
         save_path: None,
+        settings: Settings::default(),
+        policy: RenderPolicy::new(Default::default(), remote::detect()),
+        on_event,
+        #[cfg(feature = "gpu")]
+        gpu: None,
+        #[cfg(feature = "gpu")]
+        gpu_started: false,
+        font_loading: false,
+        font_reload_pending: false,
     };
     event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
@@ -208,6 +265,9 @@ impl App {
     }
 
     fn apply(&mut self, d: Damage) {
+        if d == Damage::default() {
+            return;
+        }
         let p = &mut self.pending;
         p.full |= d.full;
         p.status |= d.status;
@@ -369,6 +429,9 @@ impl App {
     }
 
     fn render(&mut self) {
+        if self.pending == Damage::default() {
+            return;
+        }
         let (w, h) = self.size;
         for r in 0..self.view.rows() {
             if let Some(line) = self.view.line(r) {
@@ -380,14 +443,8 @@ impl App {
         if w == 0 || h < font.ch {
             return;
         }
-        let mut buf = match gfx.surface.buffer_mut() {
-            Ok(b) => b,
-            Err(_) => return,
-        };
+        let mut buf = &mut gfx.pixels;
         let mut p = std::mem::take(&mut self.pending);
-        if buf.age() == 0 {
-            p.full = true;
-        }
         let ch = font.ch;
         let rows = h.saturating_sub(ch + BAR) / ch;
         let mut damage: Vec<Rect> = Vec::new();
@@ -406,12 +463,12 @@ impl App {
                 let keep = (rows - d) * ch;
                 if p.scroll > 0 {
                     buf.copy_within(d * ch * w..(d * ch + keep) * w, 0);
-                    if !screen_copy(gfx.hwnd, w.saturating_sub(BAR), keep, d * ch, 0) {
+                    if !screen_copy(&gfx.window, gfx.hwnd, w.saturating_sub(BAR), keep, d * ch, 0) {
                         damage.push(Rect { x: 0, y: 0, w, h: keep });
                     }
                 } else {
                     buf.copy_within(0..keep * w, d * ch * w);
-                    if !screen_copy(gfx.hwnd, w.saturating_sub(BAR), keep, 0, d * ch) {
+                    if !screen_copy(&gfx.window, gfx.hwnd, w.saturating_sub(BAR), keep, 0, d * ch) {
                         damage.push(Rect { x: 0, y: d * ch, w, h: keep });
                     }
                 }
@@ -474,7 +531,20 @@ impl App {
             damage.extend([vr, hr]);
         }
         let rects: Vec<_> = damage.iter().filter_map(|r| r.to_softbuffer()).collect();
-        let _ = buf.present_with_damage(&rects);
+        #[cfg(feature = "gpu")]
+        if !self.policy.remote() {
+            if let Some(gpu) = &mut self.gpu {
+                gpu.update(buf, (w, h), &damage, p.scroll, ch, rows);
+            }
+        }
+        if !rects.is_empty() {
+            if let Ok(mut target) = gfx.surface.buffer_mut() {
+                // Retain a canonical framebuffer: Wayland/macOS may rotate or
+                // replace buffers. Age never forces re-layout or glyph repaint.
+                target.copy_from_slice(buf);
+                let _ = target.present_with_damage(&rects);
+            }
+        }
     }
 }
 
@@ -573,27 +643,67 @@ fn draw_text(
     bg: u32,
 ) {
     let (cw, ch) = (font.cw, font.ch);
-    for (i, &b) in text.iter().take(max_cols).enumerate() {
-        let x0 = x + i * cw;
-        if x0 + cw > stride {
-            break;
+    // Pure ASCII avoids grapheme allocation and shaping entirely.
+    if text.iter().take(max_cols).all(|b| (32..127).contains(b)) {
+        for (i, &b) in text.iter().take(max_cols).enumerate() {
+            if b != b' ' {
+                copy_tile(buf, stride, x + i * cw, y, cw, ch, font.tile(b, fg, bg));
+            }
         }
-        if b == b' ' {
-            continue; // the background is already filled
+        return;
+    }
+    let cells = text::cells(text, max_cols.min(4096), font.tab_size());
+    let mut i = 0;
+    while i < cells.len() {
+        let c = &cells[i];
+        let x0 = x + c.column * cw;
+        if c.text == "\t" {
+            i += 1;
+            continue;
         }
-        let t = font.tile(b, fg, bg);
-        for ty in 0..ch {
-            let o = (y + ty) * stride + x0;
-            buf[o..o + cw].copy_from_slice(&t[ty * cw..ty * cw + cw]);
+        if c.text.is_ascii() {
+            for (j, b) in c.text.bytes().enumerate() {
+                if b != b' ' {
+                    copy_tile(buf, stride, x0 + j * cw, y, cw, ch, font.tile(b, fg, bg));
+                }
+            }
+            i += 1;
+            continue;
         }
+        let mut end = i + 1;
+        while end < cells.len() && !cells[end].text.is_ascii() {
+            end += 1;
+        }
+        let text = cells[i..end].iter().map(|c| c.text.as_str()).collect::<String>();
+        let columns = cells[i..end].iter().map(|c| c.width).sum();
+        let key = shaping::TileKey { text, columns, fg, bg };
+        if let Some(tile) = font.unicode_tile(key, y) {
+            copy_tile(buf, stride, x0, y, columns * cw, ch, tile);
+        } else {
+            copy_tile(buf, stride, x0, y, cw, ch, font.tile(b'?', fg, bg));
+        }
+        i = end;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn copy_tile(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: usize, tile: &[u32]) {
+    if x + w > stride {
+        return;
+    }
+    for ty in 0..h {
+        let offset = (y + ty) * stride + x;
+        if offset + w > buf.len() {
+            break;
+        }
+        buf[offset..offset + w].copy_from_slice(&tile[ty * w..(ty + 1) * w]);
+    }
+}
 /// Moves window pixels with a screen-to-screen copy so the OS (and RDP) sees
 /// a copy instead of new pixels. Returns false where unsupported; the caller
 /// then presents the moved area as damage.
 #[cfg(windows)]
-fn screen_copy(hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> bool {
+fn screen_copy(_window: &Window, hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> bool {
     use windows_sys::Win32::Graphics::Gdi::{BitBlt, GetDC, ReleaseDC, SRCCOPY};
     unsafe {
         let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
@@ -605,8 +715,16 @@ fn screen_copy(hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> b
 }
 
 #[cfg(not(windows))]
-fn screen_copy(_hwnd: isize, _w: usize, _h: usize, _from_y: usize, _to_y: usize) -> bool {
-    false // KW-11: Wayland/X11 copy paths
+fn screen_copy(window: &Window, _hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        platform::x11_copy(window, w, h, from_y, to_y)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (window, w, h, from_y, to_y);
+        false
+    }
 }
 
 #[cfg(windows)]
@@ -633,6 +751,9 @@ impl ApplicationHandler<UserEvent> for App {
         let mut attrs = Window::default_attributes()
             .with_title("Kwil")
             .with_inner_size(PhysicalSize::new(1280, 800))
+            .with_decorations(true)
+            .with_transparent(false)
+            .with_window_icon(winit::window::Icon::from_rgba(include_bytes!("icon.rgba").to_vec(), 32, 32).ok())
             .with_visible(!self.opts.hidden);
         #[cfg(windows)]
         {
@@ -679,11 +800,50 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
-        self.gfx = Some(Gfx { window, surface, hwnd });
+        self.gfx = Some(Gfx { native: None, window, surface, hwnd, pixels: vec![BG; self.size.0 * self.size.1] });
         self.resize_surface();
         let d = self.view.set_rows(self.text_rows());
         self.apply(d);
         self.render();
+        trace::mark("first frame presented");
+        let proxy = self.proxy.clone();
+        if let Some(font) = self.font.as_mut() {
+            font.enable_unicode("monospace".into(), move |tile, generation| {
+                let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
+            });
+        }
+        // First-frame Unicode placeholders retain grid widths; only now may a
+        // redraw queue lazy fallback work. No fallback lookup precedes the mark.
+        self.apply(Damage {
+            rows: (0..self.view.rows())
+                .filter(|r| self.view.line(*r).is_some_and(|s| s.iter().take(64 * 1024).any(|b| !b.is_ascii())))
+                .collect(),
+            ..Default::default()
+        });
+        let proxy = self.proxy.clone();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.native = Some(platform::Native::register(gfx.hwnd, move |e| {
+                let _ = proxy.send_event(e);
+            }));
+        }
+        self.apply_native_theme();
+        (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = std::env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()))
+                .and_then(|path| Settings::load(&path).map_err(|e| e.to_string()));
+            match result {
+                Ok(report) => {
+                    let _ = proxy.send_event(UserEvent::SettingsReady(report.settings));
+                }
+                Err(message) => {
+                    let _ = proxy.send_event(UserEvent::Notice(format!("Settings: {message}")));
+                    let _ = proxy.send_event(UserEvent::SettingsReady(Settings::default()));
+                }
+            }
+        });
         if let Some(cb) = self.on_first_frame.take() {
             let p = self.proxy.clone();
             cb(Box::new(move |msg| {
@@ -712,6 +872,66 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Err(error) => self.view.set_notice(format!("Save failed: {error}")),
                 }
+            }
+            UserEvent::GlyphReady(tile, generation) => {
+                let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
+                let rows = font.accept(tile);
+                let ch = font.ch;
+                Damage {
+                    status: rows.iter().any(|y| *y / ch >= self.view.rows()),
+                    rows: rows.into_iter().map(|y| y / ch).filter(|r| *r < self.view.rows()).collect(),
+                    ..Default::default()
+                }
+            }
+            UserEvent::SessionChanged(detected) => {
+                self.policy.session_changed(detected);
+                self.apply_native_theme();
+                (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
+                self.start_gpu();
+                return;
+            }
+            UserEvent::SettingsReady(settings) => {
+                self.settings = settings;
+                self.policy = RenderPolicy::new(self.settings.render.clone(), self.policy.detected());
+                self.apply_native_theme();
+                (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
+                self.reload_font();
+                self.start_gpu();
+                return;
+            }
+            UserEvent::FontReady(Some(mut font)) => {
+                self.font_loading = false;
+                if self.font_reload_pending {
+                    self.font_reload_pending = false;
+                    self.reload_font();
+                    return;
+                }
+                font.tab_size = self.settings.editor.tab_size as usize;
+                let proxy = self.proxy.clone();
+                font.enable_unicode(self.settings.font.family.clone(), move |tile, generation| {
+                    let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
+                });
+                self.font = Some(font);
+                self.view.set_rows(self.text_rows())
+            }
+            UserEvent::FontReady(None) => {
+                self.font_loading = false;
+                self.view.set_notice("Configured font is unavailable".into())
+            }
+            UserEvent::DroppedFile(path) => {
+                (self.on_event)(GuiEvent::DroppedFile(path));
+                return;
+            }
+            #[cfg(feature = "gpu")]
+            UserEvent::GpuReady(result, ms) => {
+                if std::env::var_os("KWIL_TRACE_STARTUP").is_some() {
+                    eprintln!("kwil-gpu device_init_ms={ms:.3} onscreen_takeover=false reason=no-damage-present-api");
+                }
+                match result {
+                    Ok(gpu) => self.gpu = Some(gpu),
+                    Err(error) => eprintln!("kwil-gpu unavailable: {error}"),
+                }
+                return;
             }
         };
         self.apply(d);
@@ -757,6 +977,12 @@ impl ApplicationHandler<UserEvent> for App {
                     self.selecting = false;
                 }
             }
+            WindowEvent::ScaleFactorChanged { .. } => self.reload_font(),
+            WindowEvent::ThemeChanged(_) => self.apply_native_theme(),
+            WindowEvent::DroppedFile(path) => {
+                (self.on_event)(GuiEvent::DroppedFile(path));
+            }
+            WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.mods.control_key()
                     && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
@@ -803,6 +1029,44 @@ impl App {
         let (w, h) = self.size;
         if let (Some(g), Some(w), Some(h)) = (&mut self.gfx, NonZeroU32::new(w as u32), NonZeroU32::new(h as u32)) {
             let _ = g.surface.resize(w, h);
+            g.pixels.resize(self.size.0 * self.size.1, BG);
+        }
+    }
+    fn reload_font(&mut self) {
+        if self.font_loading {
+            self.font_reload_pending = true;
+            return;
+        }
+        self.font_loading = true;
+        let px = self.settings.font.size * self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()) as f32;
+        let proxy = self.proxy.clone();
+        let family = self.settings.font.family.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(UserEvent::FontReady(Font::load_named(px, &family)));
+        });
+    }
+    fn apply_native_theme(&self) {
+        if let Some(g) = &self.gfx {
+            if let Some(native) = &g.native {
+                let dark = if self.settings.theme.follow_os {
+                    g.window.theme() != Some(winit::window::Theme::Light)
+                } else {
+                    self.settings.theme.name != "light"
+                };
+                native.theme(dark, self.policy.remote());
+            }
+        }
+    }
+    fn start_gpu(&mut self) {
+        #[cfg(feature = "gpu")]
+        if !self.gpu_started && !self.policy.remote() {
+            self.gpu_started = true;
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                let result = gpu::Gpu::init();
+                let _ = proxy.send_event(UserEvent::GpuReady(result, start.elapsed().as_secs_f64() * 1000.0));
+            });
         }
     }
 }
