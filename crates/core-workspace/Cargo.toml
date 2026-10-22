@@ -8,3 +8,6 @@ publish = false
 [dependencies]
 kwil-core-text = { path = "../core-text" }
 notify = "8.2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_Security"] }

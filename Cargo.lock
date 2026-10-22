@@ -1228,6 +1228,7 @@ version = "0.1.0"
 dependencies = [
  "kwil-core-text",
  "notify",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1265,7 +1266,9 @@ dependencies = [
 name = "kwil-view-model"
 version = "0.1.0"
 dependencies = [
+ "kwil-core-commands",
  "kwil-core-text",
+ "kwil-core-workspace",
 ]
 
 [[package]]

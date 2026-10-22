@@ -7,6 +7,14 @@
 use kwil_core_text::TextFile;
 use std::path::PathBuf;
 
+mod document;
+mod editor;
+#[cfg(test)]
+mod tests;
+mod text;
+pub use document::{Document, DocumentEncoding, DocumentLineEnding};
+pub use editor::{Clipboard, ClipboardData, CommandArgs, CommandResult, CommandStatus, Cursor, Editor, Motion};
+
 /// A message from a worker thread for the status bar (update notices,
 /// errors). Frontends turn it into a wake-up of their event loop.
 pub type Notify = Box<dyn Fn(String) + Send + 'static>;
@@ -31,6 +39,10 @@ pub struct View {
     rows: usize,
     lines: Vec<Vec<u8>>,
     notice: String,
+    editor: Option<Editor>,
+    pending_goto: Option<(u64, u64, bool)>,
+    first_byte_column: u64,
+    line_byte_limit: usize,
 }
 
 impl View {
@@ -39,7 +51,23 @@ impl View {
             Some((p, f)) => (Some(p), Some(f)),
             None => (None, None),
         };
-        View { file, path, top: 0, rows: 0, lines: Vec::new(), notice: String::new() }
+        let editor = if file.is_none() { Some(Editor::new(Document::new())) } else { None };
+        let mut view = View {
+            file,
+            path,
+            top: 0,
+            rows: 0,
+            lines: Vec::new(),
+            notice: String::new(),
+            editor,
+            pending_goto: None,
+            first_byte_column: 0,
+            line_byte_limit: 16 << 10,
+        };
+        if view.file.as_ref().is_some_and(|file| file.index().is_some()) {
+            view.index_ready();
+        }
+        view
     }
 
     pub fn file(&self) -> Option<&TextFile> {
@@ -56,6 +84,9 @@ impl View {
 
     /// Lines of the file, once the background index is ready.
     pub fn line_count(&self) -> Option<u64> {
+        if let Some(editor) = &self.editor {
+            return Some(editor.document().buffer().line_count());
+        }
         self.file.as_ref()?.index().map(|i| i.line_count())
     }
 
@@ -72,6 +103,9 @@ impl View {
     pub fn set_rows(&mut self, rows: usize) -> Damage {
         self.rows = rows;
         self.top = self.top.min(self.max_top());
+        if let Some(editor) = &mut self.editor {
+            editor.set_viewport(self.top, rows);
+        }
         self.reload();
         Damage { full: true, ..Damage::default() }
     }
@@ -79,6 +113,35 @@ impl View {
     /// Call when the background index finished: line counts and scrolling
     /// become available.
     pub fn index_ready(&mut self) -> Damage {
+        if self.editor.is_none()
+            && let (Some(path), Some(file)) = (&self.path, &self.file)
+            && file.index().is_some()
+        {
+            match Document::from_indexed_file(path.clone(), file.clone()) {
+                Ok(document) => {
+                    let mut editor = Editor::new(document);
+                    editor.set_viewport(self.top, self.rows);
+                    self.editor = Some(editor);
+                }
+                Err(error) => {
+                    self.notice = error.to_string();
+                }
+            }
+        }
+        if let Some((line, column, extend)) = self.pending_goto.take()
+            && let Some(editor) = &mut self.editor
+        {
+            match editor.go_to_line(line, column, extend) {
+                Ok(damage) => {
+                    self.top = editor.top();
+                    self.reload();
+                    return damage;
+                }
+                Err(error) => {
+                    self.notice = error.to_string();
+                }
+            }
+        }
         self.reload();
         Damage { status: true, ..Damage::default() }
     }
@@ -101,6 +164,9 @@ impl View {
             return Damage::default();
         }
         self.top = new_top;
+        if let Some(editor) = &mut self.editor {
+            editor.set_viewport(self.top, self.rows);
+        }
         self.reload();
         let mut damage = Damage { status: true, ..Damage::default() };
         if d.unsigned_abs() as usize >= self.rows {
@@ -122,6 +188,26 @@ impl View {
     }
 
     fn reload(&mut self) {
+        if let Some(editor) = &self.editor {
+            let snapshot = editor.document().snapshot();
+            let result = (0..self.rows)
+                .take_while(|row| self.top + (*row as u64) < snapshot.line_count())
+                .map(|row| {
+                    let range = text::line(&snapshot, self.top + row as u64)?;
+                    let start = (range.start + self.first_byte_column).min(range.end);
+                    text::read(
+                        &snapshot,
+                        start..(start + self.line_byte_limit as u64).min(range.end),
+                        self.line_byte_limit as u64,
+                    )
+                })
+                .collect::<std::io::Result<Vec<_>>>();
+            match result {
+                Ok(lines) => self.lines = lines,
+                Err(error) => self.notice = error.to_string(),
+            }
+            return;
+        }
         let Some(file) = &self.file else {
             self.lines = vec![b"No file open. Usage: kwil <file>".to_vec()];
             return;
@@ -131,16 +217,81 @@ impl View {
             None => file.first_lines(self.rows),
         });
         match lines {
-            Ok(lines) => self.lines = lines.into_iter().map(|l| l.to_vec()).collect(),
+            Ok(lines) => {
+                self.lines = lines
+                    .into_iter()
+                    .map(|l| {
+                        let start = (self.first_byte_column as usize).min(l.len());
+                        l[start..(start + self.line_byte_limit).min(l.len())].to_vec()
+                    })
+                    .collect()
+            }
             Err(e) => self.notice = e.to_string(),
         }
     }
 
+    pub fn editor(&self) -> Option<&Editor> {
+        self.editor.as_ref()
+    }
+    /// After direct operations call refresh_after_edit with their Damage.
+    /// Editing is unavailable until the background sparse index is ready.
+    pub fn editor_mut(&mut self) -> Option<&mut Editor> {
+        self.editor.as_mut()
+    }
+
+    pub fn refresh_after_edit(&mut self, damage: Damage) -> Damage {
+        if let Some(editor) = &self.editor {
+            self.top = editor.top();
+            self.path = editor.document.path.clone();
+            self.file = editor.document.original.clone();
+        }
+        if damage.full || damage.scroll != 0 || !damage.rows.is_empty() {
+            self.reload();
+        }
+        damage
+    }
+
+    /// Bounded byte window for long-line layout. The frontend chooses a
+    /// visible column range; the default never caches an entire giant line.
+    pub fn set_horizontal_window(&mut self, first_byte: u64, max_bytes: usize) -> Damage {
+        self.first_byte_column = first_byte;
+        self.line_byte_limit = max_bytes.clamp(1, 64 << 10);
+        self.reload();
+        Damage { full: true, ..Damage::default() }
+    }
+
+    pub fn execute(&mut self, id: &str, args: &CommandArgs, count: u32) -> std::io::Result<CommandResult> {
+        let Some(editor) = &mut self.editor else {
+            if id == "navigation.goToLine"
+                && let Some(line) = args.line
+            {
+                self.pending_goto = Some((line, args.column.unwrap_or(1), args.extend));
+            }
+            return Ok(CommandResult {
+                damage: Damage { status: true, ..Damage::default() },
+                status: CommandStatus::IndexNotReady,
+            });
+        };
+        let mut result = editor.execute(id, args, count)?;
+        result.damage = self.refresh_after_edit(result.damage);
+        Ok(result)
+    }
+
     pub fn status_text(&self) -> String {
-        let name = self.path.as_ref().map_or_else(|| "kwil".to_string(), |p| p.display().to_string());
+        let mut name = self.path.as_ref().map_or_else(|| "kwil".to_string(), |p| p.display().to_string());
+        if self.editor.as_ref().is_some_and(|editor| editor.document().is_dirty()) {
+            name.push_str(" *");
+        }
         let lines = match (self.file.as_ref(), self.line_count()) {
             (None, _) => String::new(),
-            (Some(_), Some(n)) => format!("  |  {n} lines  |  Ln {}", self.top + 1),
+            (Some(_), Some(n)) => {
+                let (row, column) = self
+                    .editor
+                    .as_ref()
+                    .and_then(|e| e.position_at(e.primary_cursor().head).ok())
+                    .unwrap_or((self.top, 0));
+                format!("  |  {n} lines  |  Ln {}, Col {}", row + 1, column + 1)
+            }
             (Some(f), None) => {
                 let p = f.progress();
                 format!("  |  ~ indexing {}%", p.scanned * 100 / p.total.max(1))
@@ -152,12 +303,14 @@ impl View {
 }
 
 #[cfg(test)]
-mod tests {
+mod viewer_tests {
     use super::*;
 
     fn view_with_lines(name: &str, n: usize) -> View {
         // One file per test: tests run in parallel and must not share it.
-        let dir = std::env::temp_dir().join(format!("kwil-vm-test-{}-{name}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kwil-vm-test-{}-{id}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.txt");
         let text: String = (0..n).map(|i| format!("line {i}\n")).collect();

@@ -46,6 +46,9 @@ commands! {
         "edit.insert" => "Insert Text", "edit.append" => "Append Text",
         "edit.openBelow" => "Open Line Below", "edit.openAbove" => "Open Line Above",
         "edit.insertLineStart" => "Insert at First Nonblank", "edit.appendLineEnd" => "Append at Line End"
+        , "edit.newline" => "Insert Newline", "edit.backspace" => "Delete Previous Character",
+        "edit.delete" => "Delete Next Character", "edit.deleteWordBackward" => "Delete Previous Word",
+        "edit.deleteWordForward" => "Delete Next Word", "edit.selectWord" => "Select Word", "edit.selectLine" => "Select Line"
     },
     "Navigation" => {
         "navigation.goToLine" => "Go to Line", "navigation.matchBracket" => "Go to Matching Bracket",
@@ -59,6 +62,7 @@ commands! {
         "motion.aroundWord" => "Around Word", "motion.innerQuote" => "Inside Quotes",
         "motion.aroundQuote" => "Around Quotes", "motion.innerParentheses" => "Inside Parentheses",
         "motion.aroundParentheses" => "Around Parentheses"
+        , "motion.smartHome" => "First Nonblank or Line Start", "motion.pageUp" => "Page Up", "motion.pageDown" => "Page Down"
     },
     "Vim" => {
         "operator.delete" => "Delete Range", "operator.change" => "Change Range",

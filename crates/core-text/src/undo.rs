@@ -85,6 +85,10 @@ impl History {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
+    pub fn depth(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
+    }
 }
 
 #[cfg(test)]
