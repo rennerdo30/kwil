@@ -2,7 +2,9 @@
 name = "kwil-core-text"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
-
+memchr = "2.8.3"
+memmap2 = "0.9.12"

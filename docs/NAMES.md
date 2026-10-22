@@ -12,7 +12,7 @@
 
 Rejected short ones: Tachy, Lumo, Zeno, Velo, Kwik, Quil, Lino, Lyte (crates taken); Flyt (FLYT trademark covers software); Voxa (several companies); Blyk (too close to Blynk); Inko (a programming language); Nimb (6k-star repo).
 
-**Recommendation:** **Jiffo**. It's short, fun to say and means "instantly", and nothing in software uses it. The command is `jiffo`, or `jf` as a short alias.
+**Superseded:** the owner picked **Kwil** (2026-10-23). Earlier recommendation: **Jiffo**. It's short, fun to say and means "instantly", and nothing in software uses it. The command is `jiffo`, or `jf` as a short alias.
 
 ## Longer names (first round)
 
@@ -33,4 +33,4 @@ Checks for each name: crates.io (crate name free?), GitHub repository search (co
 
 Rejected because the name is taken in software: Riffle, Vivace, Peregrine, Nib, Halcyon, Glint, Spindrift, Kestrel (ASP.NET server), Marlin (printer firmware), Ferrite (Rust markdown editor), Skim (Rust fuzzy finder), Swyft (172-star repo), Zephyr, Presto, Fleet.
 
-**Recommendation:** **Tachyline** (short command `tachy`, or `tl` in the terminal). It says speed and text in one word, nothing else uses it, and it's easy to say. Runner-up: **Blinkline**.
+**Superseded** by Kwil (2026-10-23). Earlier recommendation: **Tachyline** (short command `tachy`, or `tl` in the terminal). It says speed and text in one word, nothing else uses it, and it's easy to say. Runner-up: **Blinkline**.

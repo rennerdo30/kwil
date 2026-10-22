@@ -1,6 +1,6 @@
 # Fast text editor — v1 specification (draft)
 
-Status: draft for owner review, 2026-10-23. Working name **Kwil** (owner preference 2026-10-23; see `NAMES.md` for the name check).
+Status: draft, 2026-10-23; owner decisions in §12. Working name **Kwil** (owner preference 2026-10-23; see `NAMES.md` for the name check).
 Crate versions were checked on crates.io on 2026-10-23.
 
 ## 1. Product
@@ -210,7 +210,12 @@ Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, str
 - v1 bundles ~30 common languages. The rest load as prebuilt grammar libraries on first use, which also keeps clean builds fast.
 
 ### Settings and keymaps
-One TOML settings file that reloads live; no settings UI in v1. One default keymap (common VS Code / Notepad++ shortcuts), rebindable in the same file. Every action is a command with an id, so it can be bound and found in the palette.
+One TOML settings file that reloads live; no settings UI in v1. Every action is a command with an id, so it can be bound and found in the palette.
+
+Keymaps (owner, 2026-10-23, KW-2): the keymap is configurable and ships with three presets, chosen by one setting (`keymap = "vscode" | "notepad++" | "vim"`). Any binding can be overridden in the same file.
+- **VS Code** (default): the common VS Code shortcuts (Ctrl+D selects the next match).
+- **Notepad++:** the Notepad++ shortcuts (Ctrl+D duplicates the line, Ctrl+G goes to a line).
+- **Vim:** modal editing with normal, insert and visual modes. It covers the common motions, operators with counts, text objects, registers, `.` repeat, `/` search and the `:w`, `:q` and `:s` commands. Full Vim compatibility (vimscript, plugins) is not a goal.
 
 ### Platform
 - Windows 10/11 (x64, ARM64): native title-bar integration, high DPI, IME, a portable mode (settings next to the exe), and an "Open with kwil" shell entry.
@@ -282,13 +287,16 @@ debug = "line-tables-only"
 | M5 Compare | Diff views |
 | M6 Polish & ship | Themes, remote-mode measurements on RDP and VNC, installers (MSI/winget, dmg/Homebrew, AppImage/Flatpak) |
 
-## 12. Open questions for the owner
+## 12. Owner decisions and open questions
 
-1. Name: Kwil is the working name; a web3 database ("Kwil DB") uses the same name (see `NAMES.md`).
-2. License: open source (MIT/Apache) or closed? This decides whether GPL grammars or crates are possible.
-3. Do the speed budgets in §3 match your expectations, or do you want stricter ones?
-4. Default keymap: VS Code-like, Notepad++-like or our own?
-5. Plugin direction for v2: WASM components (sandboxed, any language) is the proposal.
+Decided (owner, 2026-10-23, KW-2):
+- **License: MIT.** GPL grammars and crates are therefore out; only permissively licensed dependencies ship.
+- **Speed budgets:** left to the project ("i trust you"). The §3 values stand until the M0 numbers justify stricter ones.
+- **Keymap:** VS Code-like by default, configurable, with VS Code, Notepad++ and Vim presets (§7).
+
+Open:
+1. Name: Kwil is the working name; a web3 database ("Kwil DB") uses the same name (see `NAMES.md`). A trademark search is needed before going public.
+2. Plugin direction for v2: WASM components (sandboxed, any language) is the proposal.
 
 ## Sources
 

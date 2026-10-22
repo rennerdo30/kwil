@@ -2,6 +2,7 @@
 
 Read `E:/Development/AGENTS.md` and `E:/Development/general-agent-rules.md` first; they win over anything here unless this file is stricter.
 
+- **License:** MIT (owner, 2026-10-23); only permissively licensed dependencies.
 - **Product:** plain, very fast text editor in Rust; GUI and TUI in one binary. **P0 is speed.** v1 scope is fixed in `docs/SPEC.md`; no features beyond its v1 list (owner, 2026-10-23).
 - **Remote-friendly drawing:** event-driven, no frame loop, no idle frames, damage-only presents, scroll by copy (owner, 2026-10-23; spec §6).
 - **Pair Desk:** project `kwil` (ids `KW-n`).

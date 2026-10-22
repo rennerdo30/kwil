@@ -8,6 +8,6 @@ exclude = ["spike"]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.99"
-# License: pending owner decision (KW-2).
+license = "MIT"
 
 # Build profiles live in .cargo/config.toml so the spike workspaces share them.
