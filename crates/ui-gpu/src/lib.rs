@@ -224,6 +224,7 @@ mod input_dispatch_tests {
 struct App {
     view: Workspace,
     frontend_document: kwil_view_model::SessionDocumentId,
+    frontend_epoch: u64,
     opts: GuiOptions,
     proxy: EventLoopProxy<UserEvent>,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
@@ -307,10 +308,12 @@ pub fn run_with_external_open(
     });
     let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     let frontend_document = view.active_id();
+    let frontend_epoch = view.input_epoch();
     let horizontal = view.horizontal_origin();
     let mut app = App {
         view,
         frontend_document,
+        frontend_epoch,
         opts,
         proxy,
         on_first_frame: Some(on_first_frame),
@@ -1588,12 +1591,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.checkpoint_session();
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
-                if !text.is_empty()
-                    && self
-                        .ime_destination
-                        .as_ref()
-                        .is_none_or(|destination| matches!(destination, ime::Destination::Cancelled))
-                {
+                if ime::starts_composition(self.composing, &text) {
                     self.ime_destination = Some(ime::capture(&self.view, self.insert_mode()));
                 }
                 // An empty preedit can precede Commit. Keep its captured destination.
@@ -1603,15 +1601,19 @@ impl ApplicationHandler<UserEvent> for App {
                 self.composing = false;
                 let destination =
                     self.ime_destination.take().unwrap_or_else(|| ime::capture(&self.view, self.insert_mode()));
-                let damage = ime::commit(&mut self.view, destination, text, self.started.elapsed());
+                let (damage, follow_active) = ime::commit(&mut self.view, destination, text, self.started.elapsed());
                 self.sync_file_ui();
                 self.apply(damage);
+                if follow_active {
+                    self.keep_caret_visible();
+                }
                 self.view.checkpoint_session();
             }
             WindowEvent::Ime(Ime::Disabled) => {
                 self.composing = false;
                 self.ime_destination = Some(ime::Destination::Cancelled);
             }
+            WindowEvent::Ime(Ime::Enabled) => ime::reset(&mut self.composing, &mut self.ime_destination),
             WindowEvent::Focused(false) => {
                 self.drag = None;
                 self.selecting = false;

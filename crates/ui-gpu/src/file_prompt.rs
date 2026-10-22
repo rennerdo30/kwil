@@ -4,12 +4,14 @@ use super::*;
 pub(super) fn sync_active_document(
     workspace: &Workspace,
     previous: &mut kwil_view_model::SessionDocumentId,
+    previous_epoch: &mut u64,
     horizontal: &mut u64,
     selecting: &mut bool,
     drag: &mut Option<(bool, usize)>,
 ) {
-    if *previous != workspace.active_id() {
+    if *previous != workspace.active_id() || *previous_epoch != workspace.input_epoch() {
         *previous = workspace.active_id();
+        *previous_epoch = workspace.input_epoch();
         *horizontal = workspace.horizontal_origin();
         *selecting = false;
         *drag = None;
@@ -53,6 +55,7 @@ impl App {
         sync_active_document(
             &self.view,
             &mut self.frontend_document,
+            &mut self.frontend_epoch,
             &mut self.horizontal,
             &mut self.selecting,
             &mut self.drag,
@@ -91,18 +94,19 @@ mod tests {
         assert_eq!(workspace.line_offset(0), 0);
         assert_eq!(workspace.line_offset(1), 2);
         let (mut previous, mut horizontal, mut selecting, mut drag) = (first, 2, true, Some((true, 3)));
+        let mut epoch = workspace.input_epoch();
         workspace.document_result(kwil_view_model::document_worker::DocumentResult::Persisted(Ok(())));
-        sync_active_document(&workspace, &mut previous, &mut horizontal, &mut selecting, &mut drag);
+        sync_active_document(&workspace, &mut previous, &mut epoch, &mut horizontal, &mut selecting, &mut drag);
         assert_eq!(horizontal, 2);
         assert!(selecting);
         assert_eq!(drag, Some((true, 3)));
         workspace.file_command("file.new").unwrap();
-        sync_active_document(&workspace, &mut previous, &mut horizontal, &mut selecting, &mut drag);
+        sync_active_document(&workspace, &mut previous, &mut epoch, &mut horizontal, &mut selecting, &mut drag);
         assert_eq!(horizontal, 0);
         assert!(!selecting);
         assert!(drag.is_none());
         workspace.activate(first);
-        sync_active_document(&workspace, &mut previous, &mut horizontal, &mut selecting, &mut drag);
+        sync_active_document(&workspace, &mut previous, &mut epoch, &mut horizontal, &mut selecting, &mut drag);
         assert_eq!(horizontal, 2);
         assert_eq!(workspace.line_offset(0), 0);
         assert_eq!(workspace.line_offset(1), 2);

@@ -337,6 +337,19 @@ impl Workspace {
         if !discard && dirty {
             return Err(io::Error::other("Unsaved changes: save or explicitly discard before closing"));
         }
+        if self.session.closed().len() == kwil_core_workspace::session::MAX_CLOSED
+            && self.files.storage_ready
+            && !self.files.metadata_durable
+        {
+            // An eviction must be proven by prior durable closed metadata before
+            // the worker may retire its journal. Preserve intent until then.
+            self.checkpoint_session();
+            self.persist_snapshot();
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Preserving closed-tab history; repeat close after recovery finishes",
+            ));
+        }
         // Prepare the replacement before mutating the last tab.
         self.sync_active();
         if discard && let Some(tab) = self.session.tab_mut(id) {
@@ -347,6 +360,7 @@ impl Workspace {
                 "Closed-tab history contains unsaved work; recover it before closing another tab",
             ));
         }
+        self.files.metadata_durable = false;
         if let Some(view) = self.views.remove(&id) {
             self.input_epoch = self.input_epoch.wrapping_add(1);
             self.closed_views.insert(id, view);
@@ -380,6 +394,7 @@ impl Workspace {
                 tab.path.clone_from(&view.path);
             }
             tab.first_visible_line = view.top();
+            tab.first_byte_column = view.first_byte_column;
             if let Some(editor) = view.editor() {
                 tab.revision = editor.document().revision();
                 tab.saved_revision = editor.document().saved_revision();
@@ -396,6 +411,7 @@ impl Workspace {
                     metadata.path.clone_from(&view.path);
                 }
                 metadata.first_visible_line = view.top();
+                metadata.first_byte_column = view.first_byte_column;
                 if let Some(editor) = view.editor() {
                     metadata.revision = editor.document().revision();
                     metadata.saved_revision = editor.document().saved_revision();
@@ -696,7 +712,8 @@ impl Workspace {
         }
         let path = path.map(std::path::absolute).transpose()?;
         if let Some(path) = &path
-            && self.session.tabs().iter().any(|tab| tab.id != id && tab.path.as_ref() == Some(path))
+            && (self.session.tabs().iter().any(|tab| tab.id != id && tab.path.as_ref() == Some(path))
+                || self.files.saves.iter().any(|(document, save)| *document != id && save.path.as_ref() == Some(path)))
         {
             self.cancel_close_intent();
             return Err(io::Error::other("Save As target is open in another tab"));
@@ -843,6 +860,8 @@ impl Workspace {
                         let mut view = View::new(None);
                         view.path = tab.path.clone();
                         view.editor = None;
+                        view.top = tab.first_visible_line;
+                        view.set_horizontal_window(tab.first_byte_column, 64 << 10);
                         view.set_notice("Recovering closed tab…".into());
                         self.views.insert(id, view);
                         self.files.queue.push_back(DocumentRequest::Recover { tab });
@@ -1055,6 +1074,13 @@ impl Workspace {
                 {
                     match result {
                         Ok(document) => {
+                            if document.path != tab.path {
+                                view.path.clone_from(&document.path);
+                                self.session.tab_mut(tab.id).unwrap().path.clone_from(&document.path);
+                                view.set_notice(
+                                    "Recovered file changed on disk; original recovery retained. Use Save As".into(),
+                                );
+                            }
                             let mut editor = Editor::new(*document);
                             let len = editor.document().snapshot().len();
                             let _ = editor.set_cursors(
@@ -1067,6 +1093,8 @@ impl Workspace {
                             );
                             editor.set_viewport(tab.first_visible_line, view.rows);
                             view.editor = Some(editor);
+                            view.top = tab.first_visible_line;
+                            view.set_horizontal_window(tab.first_byte_column, 64 << 10);
                             view.refresh_after_edit(Damage { full: true, ..Default::default() });
                         }
                         Err(error) => {
@@ -1199,7 +1227,7 @@ impl Workspace {
             Ok(result) => {
                 self.files.saves.remove(&document);
                 may_close = current && view.editor().is_some_and(|editor| !editor.document().is_dirty());
-                let notice = match result.status {
+                let mut notice = match result.status {
                     CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
                         warning = true;
                         message
@@ -1212,8 +1240,20 @@ impl Workspace {
                     damage = edited;
                     damage.status = true;
                 }
-                if let Some(path) = &view.path {
-                    let _ = self.session.set_path(document, path.clone());
+                if let Some(path) = &view.path
+                    && let Err(error) = self.session.set_path(document, path.clone())
+                {
+                    // Admission reserves destinations, but a stale or inconsistent
+                    // metadata result must still fail visibly and never close.
+                    may_close = false;
+                    warning = true;
+                    view.path = None;
+                    if let Some(editor) = view.editor_mut() {
+                        editor.document.path = None;
+                        editor.document.original = None;
+                        editor.document.saved_revision = editor.document.revision.wrapping_add(1);
+                    }
+                    notice = format!("Save metadata conflict: {error}; recovered contents require Save As");
                 }
                 notice
             }
@@ -1319,11 +1359,18 @@ impl Workspace {
         self.input_epoch = self.input_epoch.wrapping_add(1);
         self.session = prepared.session;
         for (id, document) in prepared.documents {
-            let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap();
+            let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap().clone();
             let mut view = View::new(None);
             view.path = tab.path.clone();
             match document {
                 Ok(document) => {
+                    if document.path != tab.path {
+                        view.path.clone_from(&document.path);
+                        self.session.tab_mut(id).unwrap().path.clone_from(&document.path);
+                        view.set_notice(
+                            "Recovered file changed on disk; original recovery retained. Use Save As".into(),
+                        );
+                    }
                     let mut editor = Editor::new(document);
                     let len = editor.document().snapshot().len();
                     let _ = editor.set_cursors(
@@ -1344,6 +1391,7 @@ impl Workspace {
                     view.set_notice(format!("Recovery failed: {error}; journal retained"));
                 }
             }
+            view.set_horizontal_window(tab.first_byte_column, 64 << 10);
             self.views.insert(id, view);
         }
         let mut mapping = HashMap::new();
@@ -1543,6 +1591,34 @@ mod tests {
     }
 
     #[test]
+    fn recovered_closed_attachment_restores_per_row_windows_and_safe_conflict_path() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        let path = std::env::temp_dir().join("kwil-virtual-recovered-conflict.txt");
+        workspace.session.set_path(first, path.clone()).unwrap();
+        workspace.views.get_mut(&first).unwrap().path = Some(path);
+        workspace.set_horizontal_window(2, 64 << 10);
+        workspace.close(first, true).unwrap();
+        workspace.closed_views.remove(&first);
+        workspace.file_command("file.reopenClosed").unwrap();
+        workspace.set_rows(2);
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, "界a\nxyz".as_bytes()).unwrap();
+        document.saved_revision = 1;
+        workspace.document_result(DocumentResult::Recovered {
+            document: first,
+            revision: 0,
+            result: Ok(Box::new(document)),
+        });
+        assert!(workspace.view(first).unwrap().path.is_none());
+        assert!(workspace.session.tab_mut(first).unwrap().path.is_none());
+        assert_eq!(workspace.horizontal_origin(), 2);
+        assert_eq!(workspace.line_offset(0), 0);
+        assert_eq!(workspace.line_offset(1), 2);
+        assert!(workspace.status_text().contains("Use Save As"));
+    }
+
+    #[test]
     fn stale_index_completion_does_not_replace_edited_or_unrelated_tab() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         let first = workspace.active_id();
@@ -1568,6 +1644,101 @@ mod tests {
             panic!("expected worker save")
         };
         (document, request)
+    }
+
+    #[test]
+    fn pending_save_as_reserves_destination_before_any_worker_completion() {
+        let path = std::env::temp_dir().join(format!("kwil-reserved-save-{}.txt", std::process::id()));
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        edit(&mut workspace, "first");
+        workspace.save_document(first, Some(path.clone())).unwrap();
+        let (_, request) = take_save(&mut workspace);
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        edit(&mut workspace, "second");
+        assert!(
+            workspace.save_document(second, Some(path.clone())).is_err(),
+            "pending SaveFlight.path must reserve its destination"
+        );
+        assert!(!workspace.files.saves.contains_key(&second));
+        assert!(workspace.files.queue.is_empty());
+        assert_eq!(request.path, path);
+    }
+
+    #[test]
+    fn closed_history_eviction_waits_for_its_prior_metadata_to_be_durable() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        for _ in 0..kwil_core_workspace::session::MAX_CLOSED {
+            workspace.close(workspace.active_id(), true).unwrap();
+        }
+        let oldest = workspace.session.closed().back().unwrap().id;
+        workspace.files.storage_ready = true;
+        let current = workspace.active_id();
+        assert!(workspace.close(current, true).is_err());
+        assert_eq!(workspace.session.closed().back().unwrap().id, oldest);
+        assert!(workspace.view(current).is_some());
+        assert!(workspace.files.persist_inflight);
+        workspace.document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
+        assert_eq!(workspace.session.closed().back().unwrap().id, oldest);
+        assert!(workspace.view(current).is_some());
+        assert!(!workspace.files.metadata_durable);
+        workspace.files.metadata_durable = true;
+        workspace.close(current, true).unwrap();
+        assert!(!workspace.session.closed().iter().any(|tab| tab.id == oldest));
+    }
+
+    #[test]
+    fn close_all_invalidates_each_success_so_batch_eviction_waits_at_sixty_four() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        for _ in 1..kwil_core_workspace::session::MAX_TABS {
+            workspace.open(View::new(None)).unwrap();
+        }
+        let original: Vec<_> = workspace.session.tabs().iter().map(|tab| tab.id).collect();
+        workspace.files.storage_ready = true;
+        workspace.files.metadata_durable = true;
+        assert_eq!(workspace.file_command("file.closeAll").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(workspace.session.closed().len(), kwil_core_workspace::session::MAX_CLOSED);
+        assert_eq!(
+            workspace.session.tabs().len(),
+            kwil_core_workspace::session::MAX_TABS - kwil_core_workspace::session::MAX_CLOSED
+        );
+        assert_eq!(workspace.files.close.front(), Some(&original[64]));
+        workspace.document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
+        assert_eq!(workspace.files.close.front(), Some(&original[64]));
+        assert!(original[..64].iter().all(|id| workspace.session.closed().iter().any(|tab| tab.id == *id)));
+        assert!(original[64..].iter().all(|id| workspace.view(*id).is_some()));
+    }
+
+    #[test]
+    fn unexpected_save_metadata_collision_is_visible_and_cannot_close() {
+        let path = std::env::temp_dir().join(format!(
+            "kwil-save-metadata-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        edit(&mut workspace, "first");
+        workspace.save_document(first, Some(path.clone())).unwrap();
+        let (_, request) = take_save(&mut workspace);
+        let revision = request.revision;
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        workspace.session.set_path(second, path.clone()).unwrap();
+        workspace.files.close.push_back(first);
+        workspace.document_result(DocumentResult::Saved {
+            document: first,
+            revision,
+            result: kwil_core_workspace::save_snapshot(request),
+        });
+        let notice = workspace.status_text();
+        assert!(!workspace.close_pending(), "metadata failure cannot complete a close");
+        assert!(notice.contains("metadata") && notice.contains("Save As"), "collision must be visible: {notice}");
+        assert!(workspace.view(first).unwrap().editor().unwrap().document().is_dirty());
+        assert!(workspace.view(first).unwrap().path.is_none());
+        drop(workspace);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

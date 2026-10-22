@@ -21,6 +21,15 @@ pub(super) enum Destination {
     },
 }
 
+pub(super) fn starts_composition(composing: bool, text: &str) -> bool {
+    !composing && !text.is_empty()
+}
+
+pub(super) fn reset(composing: &mut bool, destination: &mut Option<Destination>) {
+    *composing = false;
+    *destination = None;
+}
+
 pub(super) fn capture(workspace: &Workspace, insert_mode: bool) -> Destination {
     let epoch = workspace.input_epoch();
     if let Some(prompt) = workspace.file_prompt() {
@@ -43,7 +52,24 @@ pub(super) fn capture(workspace: &Workspace, insert_mode: bool) -> Destination {
     }
 }
 
-pub(super) fn commit(workspace: &mut Workspace, destination: Destination, text: String, at: Duration) -> Damage {
+pub(super) fn commit(
+    workspace: &mut Workspace,
+    destination: Destination,
+    text: String,
+    at: Duration,
+) -> (Damage, bool) {
+    let mut follow_active = false;
+    let damage = commit_inner(workspace, destination, text, at, &mut follow_active);
+    (damage, follow_active)
+}
+
+fn commit_inner(
+    workspace: &mut Workspace,
+    destination: Destination,
+    text: String,
+    at: Duration,
+    follow_active: &mut bool,
+) -> Damage {
     if text.is_empty() {
         return Damage::default();
     }
@@ -91,7 +117,10 @@ pub(super) fn commit(workspace: &mut Workspace, destination: Destination, text: 
                 1,
             );
             match result {
-                Ok(result) if active => result.damage,
+                Ok(result) if active => {
+                    *follow_active = true;
+                    result.damage
+                }
                 Ok(_) => {
                     workspace.view_mut(document).unwrap().set_notice("IME input committed".into());
                     workspace.set_notice(format!("IME input committed to tab {}", document.0))
@@ -129,7 +158,8 @@ mod tests {
         let capture = capture(&workspace, true);
         workspace.file_command("file.new").unwrap();
         let other = workspace.active_id();
-        let damage = commit(&mut workspace, capture, "日本語".into(), Default::default());
+        let (damage, follow_active) = commit(&mut workspace, capture, "日本語".into(), Default::default());
+        assert!(!follow_active, "an inactive completion must not scroll the active tab");
         assert_eq!(bytes(&workspace, original), 9);
         assert_eq!(bytes(&workspace, other), 0);
         assert!(!damage.full);
@@ -195,5 +225,43 @@ mod tests {
         commit(&mut workspace, destination, "wrong".into(), Default::default());
         assert_eq!(bytes(&workspace, restored), 0);
         assert!(workspace.status_text().contains("cancelled"));
+    }
+
+    #[test]
+    fn empty_preedit_keeps_immediate_commit_but_fresh_composition_recaptures() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        let mut composing = false;
+        assert!(starts_composition(composing, "first"));
+        let destination = capture(&workspace, true);
+        composing = true;
+        assert!(!starts_composition(composing, ""));
+        composing = false;
+        let (_, follow) = commit(&mut workspace, destination, "A".into(), Default::default());
+        assert!(follow, "successful active editor commit follows the caret");
+        let old_destination = capture(&workspace, true);
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        let fresh_destination =
+            if starts_composition(composing, "new") { capture(&workspace, true) } else { old_destination };
+        let (_, follow) = commit(&mut workspace, fresh_destination, "B".into(), Default::default());
+        assert!(follow);
+        assert_eq!(bytes(&workspace, first), 1);
+        assert_eq!(bytes(&workspace, second), 1);
+        let (_, follow) = commit(&mut workspace, Destination::Cancelled, "bad".into(), Default::default());
+        assert!(!follow);
+    }
+
+    #[test]
+    fn enabling_ime_clears_a_cancelled_destination_before_direct_commit() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let mut composing = false;
+        let mut destination = Some(Destination::Cancelled);
+        reset(&mut composing, &mut destination);
+        assert!(!starts_composition(composing, ""));
+        let destination = destination.unwrap_or_else(|| capture(&workspace, true));
+        let (_, follow) = commit(&mut workspace, destination, "direct".into(), Default::default());
+        assert!(follow);
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 6);
     }
 }
