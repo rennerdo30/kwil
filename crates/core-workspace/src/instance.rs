@@ -290,8 +290,7 @@ mod platform {
         call: impl FnOnce(*mut OVERLAPPED) -> i32,
     ) -> io::Result<u32> {
         let event = Handle::new(unsafe { CreateEventW(null(), 1, 0, null()) })?;
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event.0;
+        let mut overlapped = OVERLAPPED { hEvent: event.0, ..Default::default() };
         let ok = call(&mut overlapped);
         if ok == 0 {
             let error = unsafe { GetLastError() };
