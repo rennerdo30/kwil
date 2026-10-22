@@ -46,8 +46,8 @@ def main():
         output.write_bytes(data)
         if os.waitstatus_to_exitcode(status) != 0:
             raise RuntimeError(f"TUI failed: {data.decode(errors='replace')}")
-        marks = re.findall(rb"t_(launch|first_frame|index_done)=([0-9.]+) ms", data)
-        if len(marks) != 3:
+        marks = dict(re.findall(rb"t_(launch|first_frame|index_done)=([0-9.]+) ms", data))
+        if set(marks) != {b"launch", b"first_frame", b"index_done"}:
             raise RuntimeError(f"TUI trace incomplete: {marks}")
         print(marks)
     finally:

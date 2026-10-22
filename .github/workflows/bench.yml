@@ -41,7 +41,8 @@ jobs:
       - name: Build measurement binaries
         run: cargo build --release --locked -j 4 -p kwil-bench --features harness -p kwil --features frame-harness
       - name: Cache generated fixtures
-        uses: actions/cache@v6
+        id: fixtures
+        uses: actions/cache/restore@v6
         with:
           path: fixtures
           key: bench-fixtures-v1-${{ matrix.os }}-${{ hashFiles('crates/bench/src/fixtures.rs') }}
@@ -93,3 +94,9 @@ jobs:
           name: bench-${{ matrix.os }}
           path: results
           if-no-files-found: error
+      - name: Preserve completed fixtures even when a performance gate fails
+        if: always() && steps.fixtures.outputs.cache-hit != 'true' && hashFiles('fixtures/complete-v1') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: fixtures
+          key: ${{ steps.fixtures.outputs.cache-primary-key }}

@@ -36,7 +36,7 @@ pub fn log(path: &Path, target: u64) -> io::Result<()> {
 
 pub fn generate(dir: &Path, all: bool) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    if !dir.join(LOG).exists() {
+    if !std::fs::metadata(dir.join(LOG)).is_ok_and(|m| m.len() >= 1 << 30) {
         log(&dir.join(LOG), 1 << 30)?;
     }
     if !all {
