@@ -11,9 +11,11 @@ mod clipboard;
 mod file_prompt;
 mod font;
 mod hit;
+mod ime;
 mod input;
 mod scrollbar;
 mod tabs;
+mod zoom;
 
 use font::Font;
 use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View, Workspace};
@@ -240,11 +242,13 @@ struct App {
     drag: Option<(bool, usize)>,
     started: std::time::Instant,
     composing: bool,
+    ime_destination: Option<ime::Destination>,
     selecting: bool,
     close_pending: bool,
     save_path: Option<String>,
     keys: Option<kwil_core_commands::keymap::KeymapEngine>,
     settings: Settings,
+    zoom: zoom::Zoom,
     policy: RenderPolicy,
     on_event: Box<dyn FnMut(GuiEvent)>,
     #[cfg(feature = "gpu")]
@@ -325,11 +329,13 @@ pub fn run_with_external_open(
         drag: None,
         started: std::time::Instant::now(),
         composing: false,
+        ime_destination: None,
         selecting: false,
         close_pending: false,
         save_path: None,
         keys: None,
         settings: Settings::default(),
+        zoom: zoom::Zoom::default(),
         policy: RenderPolicy::new(Default::default(), remote::detect()),
         on_event,
         #[cfg(feature = "gpu")]
@@ -443,6 +449,10 @@ impl App {
         if ev.state != ElementState::Pressed {
             return;
         }
+        if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            self.ime_destination = Some(ime::Destination::Cancelled);
+            self.composing = false;
+        }
         if self.composing && !matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             return;
         }
@@ -511,6 +521,9 @@ impl App {
                 match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
+                        if self.dispatch_zoom(call.id) {
+                            return;
+                        }
                         if self.dispatch_file(call.id) {
                             if self.view.wants_exit() {
                                 el.exit();
@@ -598,7 +611,7 @@ impl App {
             input::Action::Command(id) => (id, None),
             input::Action::Text(text) => ("edit.insert", Some(text)),
         };
-        if self.dispatch_file(id) {
+        if self.dispatch_zoom(id) || self.dispatch_file(id) {
             return;
         }
         let args =
@@ -1415,10 +1428,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.policy = RenderPolicy::new(self.settings.render.clone(), self.policy.detected());
                 self.apply_native_theme();
                 (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
-                let scale = self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()) as f32;
-                if font_changed
-                    || self.font.as_ref().is_some_and(|f| (f.px - self.settings.font.size * scale).abs() > 0.01)
-                {
+                if font_changed || self.font.as_ref().is_some_and(|f| (f.px - self.font_physical_px()).abs() > 0.01) {
                     self.reload_font();
                 } else {
                     self.activate_unicode(tabs_changed);
@@ -1439,8 +1449,11 @@ impl ApplicationHandler<UserEvent> for App {
                     let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
                 });
                 self.font = Some(*font);
+                self.chrome_dirty = true;
                 let rows = self.text_rows();
-                self.view.set_rows(rows)
+                let damage = self.view.set_rows(rows);
+                self.keep_caret_visible();
+                damage
             }
             UserEvent::FontReady(None) => {
                 self.font_loading = false;
@@ -1574,22 +1587,36 @@ impl ApplicationHandler<UserEvent> for App {
                 self.key(el, &event);
                 self.view.checkpoint_session();
             }
-            WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                if !text.is_empty()
+                    && self
+                        .ime_destination
+                        .as_ref()
+                        .is_none_or(|destination| matches!(destination, ime::Destination::Cancelled))
+                {
+                    self.ime_destination = Some(ime::capture(&self.view, self.insert_mode()));
+                }
+                // An empty preedit can precede Commit. Keep its captured destination.
+                self.composing = !text.is_empty();
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.composing = false;
-                let insert_mode = self.keys.as_ref().is_none_or(|keys| keys.mode() == kwil_core_commands::Mode::Insert);
-                if let Some(action) = input::commit(text, &mut self.save_path, insert_mode) {
-                    self.edit(action);
-                } else if self.save_path.is_some() {
-                    self.update_file_prompt();
-                }
+                let destination =
+                    self.ime_destination.take().unwrap_or_else(|| ime::capture(&self.view, self.insert_mode()));
+                let damage = ime::commit(&mut self.view, destination, text, self.started.elapsed());
+                self.sync_file_ui();
+                self.apply(damage);
                 self.view.checkpoint_session();
             }
-            WindowEvent::Ime(Ime::Disabled) => self.composing = false,
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.composing = false;
+                self.ime_destination = Some(ime::Destination::Cancelled);
+            }
             WindowEvent::Focused(false) => {
                 self.drag = None;
                 self.selecting = false;
                 self.composing = false;
+                self.ime_destination = Some(ime::Destination::Cancelled);
                 if let Some(keys) = &mut self.keys {
                     keys.cancel_pending();
                 }
@@ -1669,7 +1696,7 @@ impl App {
             return;
         }
         self.font_loading = true;
-        let px = self.settings.font.size * self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()) as f32;
+        let px = self.font_physical_px();
         let proxy = self.proxy.clone();
         let family = self.settings.font.family.clone();
         std::thread::spawn(move || {

@@ -90,6 +90,8 @@ pub enum FilePromptKind {
 }
 
 pub struct FilePrompt {
+    /// Distinguishes a new prompt from a cancelled prompt for the same revision.
+    pub generation: u64,
     pub kind: FilePromptKind,
     pub document: DocumentId,
     pub revision: u64,
@@ -111,6 +113,7 @@ struct FileFlow {
     quit: bool,
     exit: bool,
     prompt: Option<FilePrompt>,
+    next_prompt: u64,
     preparing: bool,
     storage_ready: bool,
     persist_inflight: bool,
@@ -130,6 +133,7 @@ struct FileFlow {
 }
 
 pub struct Workspace {
+    input_epoch: u64,
     session: Session,
     views: HashMap<DocumentId, View>,
     closed_views: HashMap<DocumentId, View>,
@@ -139,6 +143,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(view: View) -> io::Result<Self> {
         let mut workspace = Self {
+            input_epoch: 0,
             session: Session::default(),
             views: HashMap::new(),
             closed_views: HashMap::new(),
@@ -153,6 +158,11 @@ impl Workspace {
     }
     pub fn recovery_ready(&self) -> bool {
         self.files.storage_ready
+    }
+    /// Captured input must be cancelled when startup recovery replaces identities
+    /// or a tab is closed and its identity can subsequently be reopened.
+    pub fn input_epoch(&self) -> u64 {
+        self.input_epoch
     }
     pub fn horizontal_origin(&self) -> u64 {
         self.deref().first_byte_column
@@ -338,6 +348,7 @@ impl Workspace {
             ));
         }
         if let Some(view) = self.views.remove(&id) {
+            self.input_epoch = self.input_epoch.wrapping_add(1);
             self.closed_views.insert(id, view);
         }
         self.files.queue.retain(|request| !matches!(request, DocumentRequest::Open { document, .. } | DocumentRequest::Index { document, .. } if *document == id));
@@ -696,7 +707,9 @@ impl Workspace {
             .and_then(View::editor_mut)
             .ok_or_else(|| io::Error::other("Indexing: editing will be available when ready"))?;
         if path.is_none() && editor.document().path().is_none() {
+            self.files.next_prompt = self.files.next_prompt.wrapping_add(1);
             self.files.prompt = Some(FilePrompt {
+                generation: self.files.next_prompt,
                 kind: FilePromptKind::SaveAs,
                 document: id,
                 revision: editor.document().revision(),
@@ -737,7 +750,14 @@ impl Workspace {
                     "file.recent" => FilePromptKind::Recent,
                     _ => FilePromptKind::SaveAs,
                 };
-                self.files.prompt = Some(FilePrompt { kind, document: id, revision, text: String::new() });
+                self.files.next_prompt = self.files.next_prompt.wrapping_add(1);
+                self.files.prompt = Some(FilePrompt {
+                    generation: self.files.next_prompt,
+                    kind,
+                    document: id,
+                    revision,
+                    text: String::new(),
+                });
                 if kind == FilePromptKind::Recent {
                     let recent = self
                         .session
@@ -1296,6 +1316,7 @@ impl Workspace {
         let old_tabs = self.session.tabs().to_vec();
         let old_active = self.active_id();
         let mut old_views = std::mem::take(&mut self.views);
+        self.input_epoch = self.input_epoch.wrapping_add(1);
         self.session = prepared.session;
         for (id, document) in prepared.documents {
             let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap();

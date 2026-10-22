@@ -380,6 +380,10 @@ fn key(
         match keys.feed_with_selection(chord) {
             VimResult::Pending => return KeyResult::Changed(false),
             VimResult::Command(call) => {
+                if matches!(call.id, "view.zoomIn" | "view.zoomOut" | "view.zoomReset") {
+                    view.set_notice("Terminal font size is controlled by your terminal; use its zoom shortcuts".into());
+                    return KeyResult::Changed(true);
+                }
                 if call.id == "file.save" {
                     return KeyResult::Save(None);
                 }
@@ -631,6 +635,20 @@ mod tests {
 
     fn binding(keys: &str, command: &str) -> kwil_core_commands::Binding {
         kwil_core_commands::Binding { keys: keys.into(), command: command.into(), context: None, mode: None }
+    }
+
+    #[test]
+    fn zoom_in_every_keymap_explains_terminal_font_ownership_without_editing() {
+        for preset in [Preset::VsCode, Preset::Vim, Preset::NotepadPlusPlus] {
+            let mut view = View::new(None);
+            let mut keys = KeymapEngine::new(preset, &[]).unwrap();
+            let event = KeyEvent::new(KeyCode::Char('='), KeyModifiers::CONTROL);
+            assert!(matches!(key(&mut view, event, Default::default(), &mut keys, preset), KeyResult::Changed(true)));
+            assert!(view.status_text().contains("controlled by your terminal"));
+            assert!(view.editor().unwrap().document().snapshot().is_empty());
+            let mut keys = KeymapEngine::new(preset, &[binding("ctrl+=", "")]).unwrap();
+            assert!(matches!(key(&mut view, event, Default::default(), &mut keys, preset), KeyResult::Changed(false)));
+        }
     }
 
     #[test]

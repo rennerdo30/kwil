@@ -5,6 +5,9 @@ pub(crate) struct Zoom {
 }
 
 impl Zoom {
+    pub(crate) fn recognizes(id: &str) -> bool {
+        matches!(id, "view.zoomIn" | "view.zoomOut" | "view.zoomReset")
+    }
     /// Returns whether this command changed zoom. Unknown commands are ignored.
     pub(crate) fn command(&mut self, id: &str) -> bool {
         let next = match id {
@@ -26,9 +29,53 @@ impl Zoom {
     }
 }
 
+impl super::App {
+    pub(super) fn font_physical_px(&self) -> f32 {
+        self.zoom.physical_px(self.settings.font.size, self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()))
+    }
+
+    pub(super) fn dispatch_zoom(&mut self, id: &str) -> bool {
+        if !Zoom::recognizes(id) {
+            return false;
+        }
+        if self.zoom.command(id) {
+            self.reload_font();
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_plus_minus_bindings_preserve_tombstones_and_vim_normal_mode() {
+        use kwil_core_commands::{Binding, Preset, keymap::KeymapEngine, vim::VimResult};
+        for preset in [Preset::VsCode, Preset::Vim, Preset::NotepadPlusPlus] {
+            let mut keys = KeymapEngine::new(preset, &[]).unwrap();
+            for (key, command) in [
+                ("ctrl+Plus", "view.zoomIn"),
+                ("ctrl+shift+=", "view.zoomIn"),
+                ("ctrl+-", "view.zoomOut"),
+                ("ctrl+0", "view.zoomReset"),
+            ] {
+                assert!(
+                    matches!(keys.feed_with_selection(key.parse().unwrap()), VimResult::Command(call) if call.id == command)
+                );
+            }
+            let mut keys = KeymapEngine::new(
+                preset,
+                &[Binding { keys: "ctrl+Plus".into(), command: String::new(), context: None, mode: None }],
+            )
+            .unwrap();
+            assert_eq!(keys.feed_with_selection("ctrl+Plus".parse().unwrap()), VimResult::Unbound);
+            assert!(keys.suppresses_fallback());
+        }
+        let mut zoom = Zoom::default();
+        assert!(!zoom.command("view.zoomReset"));
+        assert!(Zoom::recognizes("view.zoomReset"), "a no-op reset must still be consumed");
+    }
 
     #[test]
     fn zoom_preserves_dpi_and_reset_uses_configured_size() {
