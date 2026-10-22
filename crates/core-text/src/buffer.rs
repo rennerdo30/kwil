@@ -20,6 +20,7 @@ const TYPING_GAP: Duration = Duration::from_millis(500);
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub(crate) root: Tree,
+    originals: Arc<Vec<crate::file::OriginalRef>>,
 }
 
 impl Snapshot {
@@ -82,7 +83,10 @@ impl Snapshot {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.root.as_ref().map_or(0, |node| node.metrics.retained)
+        self.root
+            .as_ref()
+            .map_or(0, |node| node.metrics.retained)
+            .saturating_add(self.originals.iter().map(|source| source.retained_bytes()).sum::<usize>())
     }
 
     fn check_range(&self, range: &Range<u64>) -> io::Result<()> {
@@ -185,7 +189,8 @@ impl Buffer {
     /// Inherits TextFile's external-file-mutation safety contract.
     /// Refuses changed files even when an index is already cached.
     pub fn from_file(file: TextFile) -> Result<Self, ReadError> {
-        Ok(Self { snapshot: Snapshot { root: piece_tree::original(file)? }, ..Self::empty() })
+        let root = piece_tree::original(file.clone())?;
+        Ok(Self { snapshot: Snapshot { root, originals: Arc::new(vec![file.history_backing_ref()]) }, ..Self::empty() })
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -242,9 +247,19 @@ impl Buffer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
         let (_, tail) = piece_tree::split(source.root.clone(), range.start).map_err(io::Error::other)?;
         let (inserted, _) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
+        let inserted = piece_tree::import_added(inserted, &self.added)?;
         let before = self.snapshot();
         let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(piece_tree::join(left, inserted), right);
+        if !Arc::ptr_eq(&self.snapshot.originals, &source.originals) && !source.originals.is_empty() {
+            let mut originals = self.snapshot.originals.as_ref().clone();
+            for candidate in source.originals.iter() {
+                if candidate.retained_bytes() > 0 && !originals.iter().any(|known| known.same_object(candidate)) {
+                    originals.push(candidate.clone());
+                }
+            }
+            self.snapshot.originals = Arc::new(originals);
+        }
         self.typing = None;
         self.record(before, false);
         Ok(())
@@ -344,6 +359,18 @@ impl Buffer {
         Ok(())
     }
 
+    /// Install a worker-prepared changed version as one undo step (for example
+    /// streamed trim-on-save). No scan/copy occurs on the completion thread.
+    pub fn install_worker_edit(&mut self, snapshot: Snapshot) -> io::Result<()> {
+        if self.transaction.is_some() {
+            return Err(io::Error::other("cannot install worker edit during a transaction"));
+        }
+        let before = std::mem::replace(&mut self.snapshot, snapshot);
+        self.typing = None;
+        self.record(before, false);
+        Ok(())
+    }
+
     /// Coalesce contiguous insertions separated by at most 500 ms. The caller
     /// supplies monotonic elapsed time: no timer, polling or idle work is used.
     /// Cursor movement/commands should call `end_typing_burst`.
@@ -437,6 +464,50 @@ mod editing_contract_tests {
         b.begin();
         assert!(b.checkpoint_current(Snapshot::default()).is_err());
         b.cancel();
+    }
+
+    #[test]
+    fn foreign_snapshot_paste_obeys_destination_resident_budget() {
+        let mut source = Buffer::empty();
+        source.insert(0, &[b'x'; 1024]).unwrap();
+        let mut target = Buffer::with_add_memory_limit(16);
+        target.insert_snapshot_range(0, &source.snapshot(), 0..1024).unwrap();
+        assert!(
+            !piece_tree::spill_paths(&target.snapshot.root).is_empty(),
+            "foreign resident blocks must be imported under the destination cap"
+        );
+        drop(source);
+        assert!(target.add_memory_bytes() <= 16);
+        let mut out = Vec::new();
+        target.write_to(&mut out).unwrap();
+        assert_eq!(out, [b'x'; 1024]);
+    }
+
+    #[test]
+    fn history_charges_sparse_backings_once_per_snapshot_not_per_piece() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kwil-backing-budget-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"z\n".repeat(262144)).unwrap();
+        let file = TextFile::open_saved_version(&path).unwrap();
+        let mut b = Buffer::from_file(file.clone()).unwrap();
+        let index = file.index().unwrap().memory_bytes();
+        b.insert(1, b"x").unwrap();
+        assert!(b.undo_memory_bytes() >= 2 * index, "each retained version must charge its sparse index");
+        assert!(b.undo());
+        b.set_undo_memory_limit(128 << 10);
+        b.begin();
+        for row in (0..100).rev() {
+            b.insert(row * 2, b"x").unwrap();
+        }
+        b.commit();
+        assert!(b.undo(), "100 pieces of one original must not charge 100 full indexes");
+        assert_eq!(b.len(), 524288);
+        drop((b, file));
+        std::fs::remove_file(path).unwrap();
     }
 }
 

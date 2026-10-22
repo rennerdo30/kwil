@@ -115,6 +115,13 @@ fn box_selection_replaces_short_lines_and_restores_selections() {
     assert_eq!(e.cursors(), cursors);
     e.redo().unwrap();
     assert_eq!(bytes(&e), b"aZd\nxZ\n1Z45");
+    let mut e = editor(b"abcd\nx\n12345");
+    e.column_selection(0, 3, 2, 4).unwrap();
+    type_text(&mut e, "Z", 0);
+    assert_eq!(bytes(&e), b"abcZ\nx  Z\n123Z5");
+    e.undo().unwrap();
+    type_text(&mut e, "!", 1000);
+    assert_eq!(bytes(&e), b"abc!\nx  !\n123!5");
 }
 
 #[test]
@@ -241,6 +248,9 @@ fn clipboard_cut_copy_paste_and_word_line_all_selection() {
     e.select_word().unwrap();
     assert_eq!(e.primary_cursor().selection(), 0..3);
     e.copy(&mut clipboard).unwrap();
+    let mut copied = Vec::new();
+    clipboard.0.as_ref().unwrap().write_to(&mut copied).unwrap();
+    assert_eq!(copied, b"one");
     e.cut(&mut clipboard).unwrap();
     assert_eq!(bytes(&e), b" two\nthree");
     e.paste(&mut clipboard).unwrap();
@@ -430,6 +440,105 @@ fn saved_revision_and_concurrent_edits_keep_undo_and_dirty_state() {
 }
 
 #[test]
+fn save_rebases_current_root_and_keeps_pre_save_worker_alive() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "kwil-editor-rebase-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("f.txt");
+    std::fs::write(&path, b"old").unwrap();
+    let file = kwil_core_workspace::open_for_editing(&path).unwrap();
+    let mut e = Editor::new(Document::from_file(path.clone(), file).unwrap());
+    type_text(&mut e, "new ", 0);
+    let worker = e.document().snapshot();
+    let request = e.save_request(None).unwrap();
+    e.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+    e.set_undo_memory_limit(0);
+    let mut output = Vec::new();
+    worker.write_to(&mut output).unwrap();
+    assert_eq!(output, b"new old");
+    drop(worker);
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        1,
+        "rebased current root must release the old backing once history/worker references end"
+    );
+    assert_eq!(bytes(&e), b"new old");
+    drop(e);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn trim_save_request_does_no_reads_and_worker_completion_is_undoable() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "kwil-worker-trim-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("f.txt");
+    std::fs::write(&path, b"a  \r\nb\t\nlast  ").unwrap();
+    let file = kwil_core_workspace::open_for_editing(&path).unwrap();
+    let mut e = Editor::new(Document::from_file(path.clone(), file).unwrap());
+    e.set_viewport(0, 4);
+    e.settings.editor.trim_trailing_whitespace_on_save = true;
+    let len = e.document().buffer().len();
+    at(&mut e, len);
+    let moved = dir.join("held.txt");
+    std::fs::rename(&path, &moved).unwrap();
+    let request = e.save_request(None).expect("request creation must not read/scan/mutate the document");
+    assert_eq!(request.snapshot.len(), len);
+    assert_eq!(e.document().revision(), 0);
+    std::fs::rename(&moved, &path).unwrap();
+    let saved = std::thread::spawn(|| kwil_core_workspace::save_snapshot(request)).join().unwrap();
+    let result = e.finish_save(saved).unwrap();
+    assert_eq!(bytes(&e), b"a\r\nb\nlast");
+    assert!(!e.document().is_dirty());
+    assert_eq!(result.damage.rows, vec![0, 1, 2]);
+    assert!(!result.damage.full);
+    assert_eq!(e.primary_cursor().head, b"a\r\nb\nlast".len() as u64);
+    e.undo().unwrap();
+    assert_eq!(bytes(&e), b"a  \r\nb\t\nlast  ");
+    assert!(e.document().is_dirty());
+    e.redo().unwrap();
+    assert_eq!(bytes(&e), b"a\r\nb\nlast");
+    assert!(!e.document().is_dirty());
+    drop(e);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_trim_save_never_marks_untrimmed_undo_version_clean() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "kwil-concurrent-trim-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("f.txt");
+    std::fs::write(&path, b"a  \n").unwrap();
+    let file = kwil_core_workspace::open_for_editing(&path).unwrap();
+    let mut e = Editor::new(Document::from_file(path.clone(), file).unwrap());
+    e.settings.editor.trim_trailing_whitespace_on_save = true;
+    let request = e.save_request(None).unwrap();
+    type_text(&mut e, "!", 100);
+    e.finish_save(std::thread::spawn(|| kwil_core_workspace::save_snapshot(request)).join().unwrap()).unwrap();
+    assert_eq!(bytes(&e), b"!a  \n");
+    assert_eq!(std::fs::read(&path).unwrap(), b"a\n");
+    assert!(e.document().is_dirty());
+    e.undo().unwrap();
+    assert_eq!(bytes(&e), b"a  \n");
+    assert!(e.document().is_dirty());
+    drop(e);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn repeated_typing_at_touching_ranges_keeps_distinct_cursors() {
     let mut e = editor(b"abcdef");
     e.set_cursors(vec![Cursor { anchor: 1, head: 5, desired_column: None }, Cursor::caret(5)], 1).unwrap();
@@ -484,6 +593,50 @@ fn frontend_positions_and_selection_ranges_use_unicode_and_tab_stops() {
     e.select_all().unwrap();
     assert_eq!(e.selection_ranges(0).unwrap(), std::iter::once(0..3).collect::<Vec<_>>());
     assert_eq!(e.selection_ranges(1).unwrap(), std::iter::once(4..8).collect::<Vec<_>>());
+}
+
+#[test]
+fn linewise_put_at_unterminated_eof_and_precise_undo_damage() {
+    let mut e = editor(b"last");
+    let mut parser = Vim::default();
+    vim(&mut e, &mut parser, "yyp");
+    assert_eq!(bytes(&e), b"last\nlast\n");
+    let mut e = editor(b"a\nb\nc");
+    type_text(&mut e, "X", 0);
+    assert_eq!(e.undo().unwrap().rows, vec![0]);
+    assert_eq!(e.redo().unwrap().rows, vec![0]);
+    at(&mut e, 2);
+    assert_eq!(e.indent(false).unwrap().rows, vec![0]);
+}
+
+#[test]
+fn view_defers_goto_and_caches_bounded_long_line_windows() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "kwil-view-window-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut content = vec![b'a'; 128 << 10];
+    content.extend_from_slice(b"\nlast");
+    std::fs::write(&path, content).unwrap();
+    let file = kwil_core_text::TextFile::open(&path).unwrap();
+    let mut v = View::new(Some((path.clone(), file.clone())));
+    v.set_rows(2);
+    assert_eq!(v.line(0).unwrap().len(), 16 << 10);
+    assert_eq!(
+        v.execute("navigation.goToLine", &CommandArgs { line: Some(2), column: Some(3), ..Default::default() }, 1)
+            .unwrap()
+            .status,
+        CommandStatus::IndexNotReady
+    );
+    file.build_index(1).unwrap();
+    v.index_ready();
+    assert_eq!(v.editor().unwrap().position_at(v.editor().unwrap().primary_cursor().head).unwrap(), (1, 2));
+    v.set_horizontal_window(10, 32);
+    assert_eq!(v.line(0).unwrap().len(), 32);
+    drop((v, file));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
