@@ -12,7 +12,10 @@ fn zoom_shortcuts_resolve_in_every_bundled_preset() {
             ("ctrl+0", "view.zoomReset"),
         ] {
             let mut keys = KeymapEngine::new(preset, &[]).unwrap();
-            assert!(matches!(keys.feed(key.parse().unwrap()), VimResult::Command(call) if call.id == expected), "{preset:?}: {key}");
+            assert!(
+                matches!(keys.feed(key.parse().unwrap()), VimResult::Command(call) if call.id == expected),
+                "{preset:?}: {key}"
+            );
         }
     }
 }

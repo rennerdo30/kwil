@@ -19,11 +19,8 @@ impl Zoom {
     }
 
     pub(crate) fn physical_px(self, configured_logical_px: f32, monitor_scale: f64) -> f32 {
-        let base = if configured_logical_px.is_finite() && configured_logical_px > 0.0 {
-            configured_logical_px
-        } else {
-            14.0
-        };
+        let base =
+            if configured_logical_px.is_finite() && configured_logical_px > 0.0 { configured_logical_px } else { 14.0 };
         let scale = if monitor_scale.is_finite() && monitor_scale > 0.0 { monitor_scale } else { 1.0 };
         ((base as f64 * scale * 1.1_f64.powi(self.steps as i32)).clamp(4.0, 256.0)) as f32
     }
@@ -50,11 +47,15 @@ mod tests {
     #[test]
     fn sizes_and_repeated_commands_are_bounded() {
         let mut zoom = Zoom::default();
-        for _ in 0..100 { zoom.command("view.zoomIn"); }
+        for _ in 0..100 {
+            zoom.command("view.zoomIn");
+        }
         assert!(!zoom.command("view.zoomIn"));
         assert_eq!(zoom.physical_px(f32::MAX, f64::MAX), 256.0);
         assert!(zoom.physical_px(f32::NAN, f64::NAN).is_finite());
-        for _ in 0..100 { zoom.command("view.zoomOut"); }
+        for _ in 0..100 {
+            zoom.command("view.zoomOut");
+        }
         assert!(!zoom.command("view.zoomOut"));
         assert_eq!(zoom.physical_px(0.001, 0.001), 4.0);
     }
