@@ -70,6 +70,7 @@ crates/
   core-search    in-buffer search, find-in-files, replace transactions
   core-diff      line and word diff, alignment model
   core-markdown  markdown parse into a render model (no drawing)
+  core-format    bounded worker formatters, selection tidy and external formatter hooks
   core-workspace files, sessions, hot exit, file watching, single-instance IPC
   core-commands  command registry, keymaps, settings (shared by both frontends)
   view-model     viewport, layout model, decorations; frontend-independent

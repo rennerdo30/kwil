@@ -1,0 +1,11 @@
+[package]
+name = "kwil-core-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+toml_edit = "0.25.17"
+tempfile = "3.27.0"
