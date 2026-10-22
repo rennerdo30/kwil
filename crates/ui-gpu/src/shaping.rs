@@ -6,7 +6,7 @@ use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith, image::Content},
     shape::{Direction, ShapeContext},
     text::{
-        Codepoint, Script,
+        Codepoint, JoiningType, Script,
         cluster::{CharCluster, Parser, Token},
     },
 };
@@ -61,6 +61,34 @@ struct ShapeRun {
     script: Script,
     direction: Direction,
     columns: usize,
+}
+struct ShapedCluster {
+    start: usize,
+    end: usize,
+    advance: f32,
+    glyphs: Vec<swash::shape::cluster::Glyph>,
+}
+fn place_cursive(
+    clusters: &[ShapedCluster],
+    direction: Direction,
+    left: f32,
+    width: f32,
+) -> (Vec<(swash::GlyphId, f32, f32)>, f32) {
+    let total = clusters.iter().map(|c| c.advance).sum::<f32>();
+    let scale = if total > 0.0 { width / total } else { 1.0 };
+    let mut before = 0.0;
+    let mut glyphs = Vec::new();
+    for c in clusters {
+        let advance = c.advance;
+        let origin = if direction == Direction::RightToLeft { total - before - advance } else { before };
+        let mut within = 0.0;
+        for g in &c.glyphs {
+            glyphs.push((g.id, left + (origin + within + g.x) * scale, g.y));
+            within += g.advance;
+        }
+        before += advance;
+    }
+    (glyphs, scale)
 }
 
 /// Includes negative results; a missing glyph must not rescan the font database
@@ -229,22 +257,44 @@ impl Rasterizer {
                 cluster.map(|ch| font.charmap().map(ch));
                 shaper.add_cluster(&cluster);
             }
-            let mut glyphs = Vec::new();
-            let positions = ColumnMap::new(&text);
+            let mut clusters = Vec::new();
             shaper.shape_with(|cluster| {
-                let x = (left_column
-                    + positions.origin(cluster.source.start as usize, cluster.source.end as usize, direction))
-                    * self.cw;
-                let mut advance = 0.0;
-                for g in cluster.glyphs {
-                    glyphs.push((g.id, x as f32 + advance + g.x, g.y));
-                    advance += g.advance;
-                }
+                clusters.push(ShapedCluster {
+                    start: cluster.source.start as usize,
+                    end: cluster.source.end as usize,
+                    advance: cluster.advance(),
+                    glyphs: cluster.glyphs.to_vec(),
+                });
             });
+            let cursive = text.chars().any(|c| {
+                matches!(
+                    c.joining_type(),
+                    JoiningType::L | JoiningType::R | JoiningType::D | JoiningType::Alaph | JoiningType::DalathRish
+                )
+            });
+            let (glyphs, scale_x) = if cursive {
+                // Keep joining advances intact across the whole font/script item.
+                // Independently snapping each cluster to a cell breaks Arabic
+                // connections when fallback supplies a proportional font.
+                place_cursive(&clusters, direction, (left_column * self.cw) as f32, (columns * self.cw) as f32)
+            } else {
+                let positions = ColumnMap::new(&text);
+                let mut glyphs = Vec::new();
+                for cluster in &clusters {
+                    let x = ((left_column + positions.origin(cluster.start, cluster.end, direction)) * self.cw) as f32;
+                    let mut advance = 0.0;
+                    for g in &cluster.glyphs {
+                        glyphs.push((g.id, x + advance + g.x, g.y));
+                        advance += g.advance;
+                    }
+                }
+                (glyphs, 1.0)
+            };
             let mut scaler = self.scale.builder(font).size(self.px).hint(true).build();
             for (id, x, y) in glyphs {
                 let Some(image) =
                     Render::new(&[Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline])
+                        .transform((scale_x != 1.0).then(|| swash::zeno::Transform::scale(scale_x, 1.0)))
                         .render(&mut scaler, id)
                 else {
                     continue;
@@ -280,6 +330,27 @@ impl Rasterizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cursive_positions_preserve_joins_and_mark_offsets() {
+        let glyph = |id, advance, x, y| swash::shape::cluster::Glyph { id, advance, x, y, ..Default::default() };
+        let clusters = vec![
+            ShapedCluster {
+                start: 0,
+                end: 2,
+                advance: 5.0,
+                glyphs: vec![glyph(1, 5.0, 0.0, 0.0), glyph(2, 0.0, -2.0, 3.0)],
+            },
+            ShapedCluster { start: 2, end: 4, advance: 9.0, glyphs: vec![glyph(3, 9.0, 0.0, 0.0)] },
+            ShapedCluster { start: 4, end: 6, advance: 6.0, glyphs: vec![glyph(4, 6.0, 0.0, 0.0)] },
+        ];
+        let (placed, scale) = place_cursive(&clusters, Direction::RightToLeft, 0.0, 80.0);
+        assert_eq!(scale, 4.0);
+        assert_eq!(placed, vec![(1, 60.0, 0.0), (2, 72.0, 3.0), (3, 24.0, 0.0), (4, 0.0, 0.0)]);
+        // Unequal natural advances still abut exactly after fitting the run.
+        assert_eq!(placed[3].1 + clusters[2].advance * scale, placed[2].1);
+        assert_eq!(placed[2].1 + clusters[1].advance * scale, placed[0].1);
+        assert_eq!(placed[0].1 + clusters[0].advance * scale, 80.0);
+    }
     fn visual_clusters(text: &str) -> String {
         let mut result = String::new();
         for run in directional_runs(text) {

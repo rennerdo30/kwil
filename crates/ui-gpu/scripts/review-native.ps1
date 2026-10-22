@@ -1,4 +1,4 @@
-param([switch]$BrokenFontRecovery)
+param([switch]$BrokenFontRecovery,[string]$PreparedExecutable)
 $ErrorActionPreference='Stop'
 Set-Location (Resolve-Path "$PSScriptRoot/../../..")
 $env:CARGO_TARGET_DIR='E:/Development/_cache/cargo-target/kwil-kw-11-renderer'
@@ -17,21 +17,26 @@ $bytes=[Collections.Generic.List[byte]]::new()
 for($i=0;$i -lt 16;$i++){$bytes.AddRange($line);$bytes.AddRange([byte[]]@(255,192,128,10))}
 [IO.File]::WriteAllBytes("$dir/mixed.bin",$bytes.ToArray())
 try {
+    if($BrokenFontRecovery -and $PreparedExecutable){throw 'A mutant requires its own build'}
     if($BrokenFontRecovery) {
         $anchor='                self.activate_unicode(true);'
         if(-not $source.Contains($anchor)){throw 'Font-recovery mutation anchor missing'}
         [IO.File]::WriteAllText($sourcePath,$source.Replace($anchor,'                let _ = &self.settings;'))
     }
-    $build=& cargo build -p kwil --release --features kwil-ui-gpu/frame-harness --locked -j 4 --timings 2>&1 | Out-String
-    [IO.File]::WriteAllText("$dir/build.txt","commit $commit ($case)`n$build")
-    if($LASTEXITCODE -ne 0){throw $build}
+    if(-not $PreparedExecutable){
+        $build=& cargo build -p kwil --release --features kwil-ui-gpu/frame-harness --locked -j 4 --timings 2>&1 | Out-String
+        [IO.File]::WriteAllText("$dir/build.txt","commit $commit ($case)`n$build")
+        if($LASTEXITCODE -ne 0){throw $build}
+        $PreparedExecutable="$env:CARGO_TARGET_DIR/release/kwil.exe"
+    }
+    Copy-Item -LiteralPath $PreparedExecutable -Destination "$dir/kwil.exe"
     $env:KWIL_NO_UPDATE='1'
     $env:KWIL_FRAME_SCRIPT='1'
     $env:KWIL_REQUIRE_UNICODE='1'
     $env:KWIL_CAPTURE_DIR=$dir
     $env:APPDATA="$dir/settings"
     Remove-Item Env:KWIL_TRACE_STARTUP -ErrorAction SilentlyContinue
-    $process=Start-Process -FilePath "$env:CARGO_TARGET_DIR/release/kwil.exe" -ArgumentList '--hidden',"$dir/mixed.bin" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$dir/stdout.txt" -RedirectStandardError "$dir/stderr.txt"
+    $process=Start-Process -FilePath "$dir/kwil.exe" -ArgumentList '--hidden',"$dir/mixed.bin" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$dir/stdout.txt" -RedirectStandardError "$dir/stderr.txt"
     Write-Output "Native PID $($process.Id) ($case)"
     try {
         if(-not $process.WaitForExit(15000)){Stop-Process -Id $process.Id;throw 'Hidden renderer timeout'}
