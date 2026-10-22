@@ -1,5 +1,6 @@
 param([string]$Case = '', [int]$TimeoutSeconds = 180, [switch]$VerifyRecipes)
 $ErrorActionPreference = 'Stop'
+Write-Output "Own mutation controller PID $PID; each Cargo process timeout ${TimeoutSeconds}s, finite 20-case block"
 # Run only under the coordinator's shared Cargo lane. Mutations are sequential,
 # assertion-checked and restored byte-for-byte, including on failure. No Git
 # reset/stash, lockfile update, cache clean, native run or network fetch occurs.
