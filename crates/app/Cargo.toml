@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 kwil-core-text = { path = "../core-text" }
+kwil-core-workspace = { path = "../core-workspace" }
 kwil-view-model = { path = "../view-model" }
 kwil-ui-gpu = { path = "../ui-gpu" }
 kwil-ui-tui = { path = "../ui-tui" }

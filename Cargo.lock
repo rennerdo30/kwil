@@ -1863,6 +1863,7 @@ name = "kwil"
 version = "0.1.0"
 dependencies = [
  "kwil-core-text",
+ "kwil-core-workspace",
  "kwil-ui-gpu",
  "kwil-ui-tui",
  "kwil-update",
