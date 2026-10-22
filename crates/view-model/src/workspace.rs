@@ -615,7 +615,7 @@ impl Workspace {
                 {
                     match result {
                         Ok(document) => {
-                            let mut editor = Editor::new(document);
+                            let mut editor = Editor::new(*document);
                             let len = editor.document().snapshot().len();
                             let _ = editor.set_cursors(
                                 vec![crate::Cursor {
@@ -656,7 +656,7 @@ impl Workspace {
                 if let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none() && revision == 0) {
                     match result {
                         Ok(document) => {
-                            let mut editor = Editor::new(document);
+                            let mut editor = Editor::new(*document);
                             editor.set_viewport(view.top, view.rows);
                             view.editor = Some(editor);
                             view.index_ready();
@@ -758,10 +758,17 @@ impl Workspace {
                 let dirty = view.editor().is_some_and(|e| e.document().is_dirty());
                 let blank =
                     view.path.is_none() && view.editor().is_some_and(|e| e.document().snapshot().is_empty()) && !dirty;
-                !blank && (dirty || !prepared.session.tabs().iter().any(|t| t.path.is_some() && t.path == view.path))
+                (!blank
+                    || self.files.saves.contains_key(&tab.id)
+                    || self.files.prompt.as_ref().is_some_and(|p| p.document == tab.id))
+                    && (dirty
+                        || view.path.is_none()
+                        || !prepared.session.tabs().iter().any(|t| t.path.is_some() && t.path == view.path))
             })
             .count();
-        if prepared.session.tabs().len() + additional > kwil_core_workspace::session::MAX_TABS {
+        if prepared.session.tabs().len() + additional > kwil_core_workspace::session::MAX_TABS
+            || !self.closed_views.is_empty()
+        {
             self.files.deferred_recovery = Some(Box::new(prepared));
             self.set_notice("Recovery retained: close tabs before Restore Session; active work is unchanged".into());
             return;
@@ -970,7 +977,7 @@ mod tests {
         workspace.document_result(DocumentResult::Indexed {
             document: first,
             revision: 0,
-            result: Ok(crate::Document::new()),
+            result: Ok(Box::new(crate::Document::new())),
         });
         assert_eq!(workspace.active_id(), second);
         assert_eq!(workspace.view(first).unwrap().editor().unwrap().document().snapshot().len(), 4);

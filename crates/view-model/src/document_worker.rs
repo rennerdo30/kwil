@@ -30,9 +30,9 @@ pub enum DocumentRequest {
 pub enum DocumentResult {
     Prepared(io::Result<PreparedWorkspace>),
     Persisted(io::Result<()>),
-    Recovered { document: DocumentId, revision: u64, result: io::Result<Document> },
+    Recovered { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
     Opened { document: DocumentId, revision: u64, result: io::Result<(PathBuf, TextFile)> },
-    Indexed { document: DocumentId, revision: u64, result: io::Result<Document> },
+    Indexed { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
     Saved { document: DocumentId, revision: u64, result: io::Result<SavedSnapshot> },
 }
 
@@ -90,7 +90,11 @@ impl DocumentWorker {
                                 Err(io::Error::other("Closed document has no complete recovery journal"))
                             }
                         })();
-                        complete(DocumentResult::Recovered { document: tab.id, revision: tab.revision, result });
+                        complete(DocumentResult::Recovered {
+                            document: tab.id,
+                            revision: tab.revision,
+                            result: result.map(Box::new),
+                        });
                     }
                     DocumentRequest::Open { document, revision, path } => {
                         match kwil_core_workspace::open_for_editing(&path) {
@@ -101,13 +105,17 @@ impl DocumentWorker {
                                     result: Ok((path.clone(), file.clone())),
                                 });
                                 let result = index(path, file);
-                                complete(DocumentResult::Indexed { document, revision, result });
+                                complete(DocumentResult::Indexed { document, revision, result: result.map(Box::new) });
                             }
                             Err(error) => complete(DocumentResult::Opened { document, revision, result: Err(error) }),
                         }
                     }
                     DocumentRequest::Index { document, revision, path, file } => {
-                        complete(DocumentResult::Indexed { document, revision, result: index(path, file) });
+                        complete(DocumentResult::Indexed {
+                            document,
+                            revision,
+                            result: index(path, file).map(Box::new),
+                        });
                     }
                     DocumentRequest::Save { document, request } => {
                         let revision = request.revision;
