@@ -35,20 +35,50 @@ struct DiskBlock {
 
 impl DiskBlock {
     fn new(bytes: &[u8]) -> io::Result<Self> {
+        Self::new_with_write(bytes, |file, _, bytes| file.write_all(bytes))
+    }
+
+    fn new_with_write(
+        bytes: &[u8],
+        write: impl FnOnce(&mut File, &std::path::Path, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // create_new prevents collisions between processes, tests and stale files.
-        let (path, file) = loop {
+        let mut block = loop {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::fs::DirBuilderExt;
+                let dir = std::env::temp_dir().join(format!("kwil-add-{}-{id}", std::process::id()));
+                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                    Ok(()) => dir.join("block"),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            };
+            // Windows temp_dir is per-user; retain its inherited ACLs.
+            #[cfg(not(unix))]
             let path = std::env::temp_dir().join(format!("kwil-add-{}-{id}.tmp", std::process::id()));
-            match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
-                Ok(file) => break (path, file),
+            // Own the private directory before any fallible file operation.
+            let mut block = Self { map: None, file: None, path };
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&block.path) {
+                Ok(file) => {
+                    block.file = Some(file);
+                    break block;
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }
         };
         // Own cleanup even when writing or mapping fails.
-        let mut block = Self { map: None, file: Some(file), path };
-        block.file.as_mut().unwrap().write_all(bytes)?;
+        write(block.file.as_mut().unwrap(), &block.path, bytes)?;
         // SAFETY: this private immutable block is never changed or truncated;
         // its handle and mapping live until the last referencing piece drops.
         block.map = Some(unsafe { memmap2::Mmap::map(block.file.as_ref().unwrap())? });
@@ -59,8 +89,15 @@ impl DiskBlock {
 impl Drop for DiskBlock {
     fn drop(&mut self) {
         self.map.take();
-        self.file.take();
-        let _ = std::fs::remove_file(&self.path);
+        let owns_file = self.file.take().is_some();
+        // A failed create_new must never delete somebody else's file.
+        // Only a successfully opened file belongs to this block.
+        // file.take() above closes the handle before removal on Windows.
+        if owns_file {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        #[cfg(unix)]
+        let _ = std::fs::remove_dir(self.path.parent().unwrap());
     }
 }
 
@@ -395,5 +432,42 @@ pub(crate) fn assert_valid(tree: &Tree) {
                 assert_valid(&Some(right.clone()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+
+    #[test]
+    fn spill_write_failure_removes_partial_file() {
+        let mut path = None;
+        let result = DiskBlock::new_with_write(b"private added text", |file, location, bytes| {
+            path = Some(location.to_path_buf());
+            file.write_all(&bytes[..7])?;
+            assert!(location.exists());
+            Err(io::Error::other("simulated spill write failure"))
+        });
+        assert_eq!(result.err().unwrap().to_string(), "simulated spill write failure");
+        let path = path.unwrap();
+        assert!(!path.exists(), "partial spill remains at {}", path.display());
+        #[cfg(unix)]
+        assert!(!path.parent().unwrap().exists(), "private spill directory remains");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_spill_file_and_directory_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let block = DiskBlock::new(b"private added text").unwrap();
+        let mode = std::fs::metadata(&block.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let directory = block.path.parent().unwrap();
+        let mode = std::fs::metadata(directory).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let path = block.path.clone();
+        drop(block);
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
     }
 }

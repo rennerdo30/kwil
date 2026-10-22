@@ -313,7 +313,8 @@ impl Buffer {
 
     /// Conservative retained-root accounting; shared nodes/blocks may count
     /// more than once. Excludes baseline original storage and OS page cache.
-    /// Drops oldest entries, including an oversize newest entry if necessary.
+    /// Drops oldest undo entries, then farthest-future redo entries, keeping
+    /// a contiguous history anchored at the current state.
     /// Active transactions and externally held snapshots are not undo history.
     pub fn set_undo_memory_limit(&mut self, bytes: usize) {
         self.history.set_limit(bytes);
@@ -544,6 +545,23 @@ mod tests {
         assert_eq!(bytes(&buffer.snapshot()), b"one two oneabc!");
         buffer.undo();
         assert_eq!(bytes(&buffer.snapshot()), b"one two oneabc");
+    }
+
+    #[test]
+    fn cap_shrink_after_undo_all_preserves_redo_roundtrip() {
+        let mut buffer = Buffer::empty();
+        buffer.insert(0, b"a").unwrap();
+        let first_cost = buffer.undo_memory_bytes();
+        buffer.insert(1, b"b").unwrap();
+        buffer.insert(2, b"c").unwrap();
+        let cap = buffer.undo_memory_bytes() - first_cost;
+        for _ in 0..3 {
+            assert!(buffer.undo());
+        }
+        buffer.set_undo_memory_limit(cap);
+        assert!(buffer.redo());
+        assert!(buffer.undo());
+        assert_eq!(bytes(&buffer.snapshot()), b"");
     }
 
     #[test]
