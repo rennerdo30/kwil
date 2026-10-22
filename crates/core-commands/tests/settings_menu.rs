@@ -135,6 +135,10 @@ fn comments_inside_arrays_and_before_mapping_keys_are_preserved_or_refused() {
     doc.map_extension("foo", Some("python")).unwrap();
     assert!(doc.source().contains("# custom language"));
     assert!(doc.source().contains("# why this glob"));
+    let mut doc = SettingsDocument::parse("[editor]\n# indent note\n\"tab_size\"=7 # tail\n").unwrap();
+    doc.edit("editor.tab_size", SettingValue::Integer(2)).unwrap();
+    assert!(doc.source().contains("# indent note"));
+    assert!(doc.source().contains("\"tab_size\"=2 # tail"));
 }
 
 #[test]

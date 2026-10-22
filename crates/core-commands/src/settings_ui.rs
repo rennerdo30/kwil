@@ -728,7 +728,7 @@ impl SettingsDocument {
                     if let Some(old) = table.get("command").and_then(Item::as_value) {
                         *command.decor_mut() = old.decor().clone();
                     }
-                    table.insert("command", Item::Value(command));
+                    *table.get_mut("command").expect("validated command field") = Item::Value(command);
                     continue;
                 }
                 let mut table = Table::new();
@@ -794,7 +794,14 @@ fn set_leaf(item: &mut Item, path: &[&str], new: Option<Value>) -> Result<(), Se
                     return Err(error("refusing to replace a table with a scalar"));
                 }
             }
-            table.insert(key, Item::Value(new));
+            // TableLike::insert reformats an occupied key and clears its
+            // decoration. Replace only the value to retain preceding comments
+            // and the owner's quoted/dotted key spelling.
+            if let Some(slot) = table.get_mut(key) {
+                *slot = Item::Value(new);
+            } else {
+                table.insert(key, Item::Value(new));
+            }
         } else if table.get(key).is_some() {
             // Removing an explicitly chosen map entry is intentional; preserve
             // comment text by refusing entries with attached comments.
