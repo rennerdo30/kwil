@@ -49,6 +49,8 @@ pub enum JournalCommand {
     Commit,
     /// Receipt means sync_all completed, covering all preceding committed edits.
     Flush(SyncSender<io::Result<u64>>),
+    Finish,
+    Cancel,
 }
 pub struct JournalWorker {
     tx: Option<SyncSender<JournalCommand>>,
@@ -167,24 +169,10 @@ impl JournalWorker {
         let stop = cancel.clone();
         thread::Builder::new().name("kwil-journal".into()).spawn(move || {
             let result = (|| {
-                let _ownership = journal_lock(&path)?;
-                let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-                let mut reader = JournalReader { limit: file.metadata()?.len(), file: file.try_clone()? };
-                let mut document = None;
-                let summary = reader.recover(&stop, |e| {
-                    if let RecoveryEvent::Base(b) = e {
-                        document = Some(b.document);
-                    }
-                    Ok(())
-                })?;
-                if document != Some(expected_document) {
-                    return Err(invalid("journal document identity mismatch"));
-                }
-                if summary.tail == RecoveryTail::Interrupted {
-                    file.set_len(summary.committed_end)?;
-                    file.sync_all()?;
-                }
-                file.seek(SeekFrom::Start(summary.committed_end))?;
+                let recovered = RecoveredJournal::open(path, expected_document, &stop, |_| Ok(()))?;
+                let mut file = recovered.file;
+                let _ownership = recovered.ownership;
+                let summary = recovered.summary;
                 let _ = ready_tx.try_send(Ok(summary.revision));
                 run(&mut file, State::new(summary.revision, summary.byte_len), rx, interval, &stop)
             })();
@@ -412,10 +400,637 @@ fn run(
                 dirty = false;
                 continue;
             }
+            JournalCommand::Finish => {
+                f.sync_all()?;
+                return Ok(state.revision);
+            }
+            JournalCommand::Cancel => return Err(io::Error::new(io::ErrorKind::Interrupted, "journal cancelled")),
         }
         if !dirty {
             due = Instant::now() + interval;
             dirty = true;
+        }
+    }
+}
+
+/// Production seed admission. The reader owns an immutable, cheap snapshot and
+/// starts at byte zero. One service handles every document; do not spawn one
+/// JournalWorker per tab. Records waiting for a seed spill to its `.pending` file.
+pub struct JournalSeed {
+    pub path: PathBuf,
+    pub base: JournalBase,
+    pub source: Box<dyn Read + Send>,
+}
+impl std::fmt::Debug for JournalSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JournalSeed").field("path", &self.path).field("base", &self.base).finish_non_exhaustive()
+    }
+}
+
+/// Prepared on a recovery worker before admission to the shared writer. Holding
+/// this value pins writer ownership; no second GB scan occurs on the service.
+pub struct RecoveredJournal {
+    path: PathBuf,
+    file: File,
+    ownership: File,
+    base: JournalBase,
+    summary: RecoverySummary,
+}
+impl std::fmt::Debug for RecoveredJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredJournal")
+            .field("path", &self.path)
+            .field("summary", &self.summary)
+            .finish_non_exhaustive()
+    }
+}
+impl RecoveredJournal {
+    pub fn open(
+        path: PathBuf,
+        expected: DocumentId,
+        cancel: &AtomicBool,
+        mut emit: impl FnMut(RecoveryEvent<'_>) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let ownership = journal_lock(&path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let pending = merge_pending_for_recovery(&path, &mut file, expected, cancel)?;
+        let mut reader = JournalReader { limit: file.metadata()?.len(), file: file.try_clone()? };
+        let mut base = None;
+        let summary = reader.recover(cancel, |event| {
+            if let RecoveryEvent::Base(b) = &event {
+                if b.document != expected {
+                    return Err(invalid("journal document identity mismatch"));
+                }
+                base = Some((*b).clone());
+            }
+            emit(event)
+        })?;
+        cancelled(cancel)?;
+        if summary.tail == RecoveryTail::Interrupted {
+            file.set_len(summary.committed_end)?;
+            file.sync_all()?;
+        }
+        if pending {
+            std::fs::remove_file(pending_path(&path))?;
+            if let Some(parent) = path.parent() {
+                sync_parent(parent)?;
+            }
+        }
+        let mut file = file;
+        file.seek(SeekFrom::Start(summary.committed_end))?;
+        Ok(Self { path, file, ownership, base: base.ok_or_else(|| invalid("missing recovery base"))?, summary })
+    }
+    pub fn summary(&self) -> RecoverySummary {
+        self.summary
+    }
+}
+
+enum ServiceRequest {
+    Create {
+        seed: JournalSeed,
+        token: u64,
+        ready: SyncSender<io::Result<u64>>,
+        done: SyncSender<io::Result<u64>>,
+    },
+    Resume {
+        recovered: RecoveredJournal,
+        token: u64,
+        ready: SyncSender<io::Result<u64>>,
+        done: SyncSender<io::Result<u64>>,
+    },
+    Command(u64, JournalCommand),
+    Wake,
+}
+pub struct JournalSession {
+    tx: Option<SyncSender<ServiceRequest>>,
+    token: u64,
+    closing: Arc<AtomicBool>,
+    pub ready: Receiver<io::Result<u64>>,
+    pub finished: Receiver<io::Result<u64>>,
+}
+impl JournalSession {
+    pub fn try_submit(&self, command: JournalCommand) -> Result<(), TrySendError<JournalCommand>> {
+        if self.closing.load(Ordering::Acquire)
+            || matches!(&command,JournalCommand::Bytes(b) if b.is_empty() || b.len()>JOURNAL_CHUNK)
+        {
+            return Err(TrySendError::Disconnected(command));
+        }
+        let Some(tx) = &self.tx else {
+            return Err(TrySendError::Disconnected(command));
+        };
+        tx.try_send(ServiceRequest::Command(self.token, command)).map_err(|e| match e {
+            TrySendError::Full(ServiceRequest::Command(_, c)) => TrySendError::Full(c),
+            TrySendError::Disconnected(ServiceRequest::Command(_, c)) => TrySendError::Disconnected(c),
+            _ => unreachable!(),
+        })
+    }
+    pub fn try_flush(&self) -> Result<Receiver<io::Result<u64>>, TrySendError<JournalCommand>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.try_submit(JournalCommand::Flush(tx))?;
+        Ok(rx)
+    }
+    /// Retain/retry on Full. Completion waits for a pending seed and drains its
+    /// spooled edits; no dirty inactive document is silently dropped.
+    pub fn try_finish(&mut self) -> Result<(), TrySendError<JournalCommand>> {
+        self.try_submit(JournalCommand::Finish)?;
+        self.tx.take();
+        Ok(())
+    }
+    pub fn try_cancel(&mut self) -> Result<(), TrySendError<JournalCommand>> {
+        self.try_submit(JournalCommand::Cancel)?;
+        self.tx.take();
+        Ok(())
+    }
+}
+
+/// One fixed I/O worker, one global queue (16 x <=64KiB payloads), at most
+/// MAX_TABS live journals. Seeds and pending-record merges advance round-robin.
+/// Drop cancels; call finish and poll finished for a graceful hot exit.
+pub struct JournalService {
+    tx: Option<SyncSender<ServiceRequest>>,
+    closing: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    next: std::sync::atomic::AtomicU64,
+    pub finished: Receiver<io::Result<()>>,
+}
+impl JournalService {
+    pub fn spawn(interval: Duration) -> io::Result<Self> {
+        if interval.is_zero() {
+            return Err(invalid("zero journal interval"));
+        }
+        let (tx, rx) = mpsc::sync_channel(JOURNAL_QUEUE);
+        let (done, finished) = mpsc::sync_channel(1);
+        let closing = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_closing = closing.clone();
+        let worker_stop = stop.clone();
+        thread::Builder::new().name("kwil-journals".into()).spawn(move || {
+            let result = service_loop(rx, interval, &worker_closing, &worker_stop);
+            let _ = done.try_send(result);
+        })?;
+        Ok(Self { tx: Some(tx), closing, cancel: stop, next: std::sync::atomic::AtomicU64::new(1), finished })
+    }
+    pub fn try_create(&self, seed: JournalSeed) -> Result<JournalSession, TrySendError<JournalSeed>> {
+        if self.closing.load(Ordering::Acquire)
+            || seed.base.codec.len() > 128
+            || seed.base.document.0 == 0
+            || seed.base.original_path.as_deref().is_some_and(|p| crate::session::validate_path(p).is_err())
+        {
+            return Err(TrySendError::Disconnected(seed));
+        }
+        let token = self.next.fetch_add(1, Ordering::Relaxed);
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let (done, finished) = mpsc::sync_channel(1);
+        let request = ServiceRequest::Create { seed, token, ready: ready_tx, done };
+        self.tx.as_ref().unwrap().try_send(request).map_err(|e| match e {
+            TrySendError::Full(ServiceRequest::Create { seed, .. }) => TrySendError::Full(seed),
+            TrySendError::Disconnected(ServiceRequest::Create { seed, .. }) => TrySendError::Disconnected(seed),
+            _ => unreachable!(),
+        })?;
+        Ok(JournalSession { tx: self.tx.clone(), token, closing: self.closing.clone(), ready, finished })
+    }
+    pub fn try_resume(&self, recovered: RecoveredJournal) -> Result<JournalSession, TrySendError<RecoveredJournal>> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(TrySendError::Disconnected(recovered));
+        }
+        let token = self.next.fetch_add(1, Ordering::Relaxed);
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let (done, finished) = mpsc::sync_channel(1);
+        self.tx
+            .as_ref()
+            .unwrap()
+            .try_send(ServiceRequest::Resume { recovered, token, ready: ready_tx, done })
+            .map_err(|e| match e {
+                TrySendError::Full(ServiceRequest::Resume { recovered, .. }) => TrySendError::Full(recovered),
+                TrySendError::Disconnected(ServiceRequest::Resume { recovered, .. }) => {
+                    TrySendError::Disconnected(recovered)
+                }
+                _ => unreachable!(),
+            })?;
+        Ok(JournalSession { tx: self.tx.clone(), token, closing: self.closing.clone(), ready, finished })
+    }
+    pub fn finish(&mut self) {
+        self.closing.store(true, Ordering::Release);
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.try_send(ServiceRequest::Wake);
+        }
+    }
+    pub fn cancel(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        self.finish();
+    }
+}
+impl Drop for JournalService {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+enum SeedPhase {
+    Seed { reader: Box<dyn Read + Send>, left: u64 },
+    Merge { offset: u64 },
+    Ready,
+}
+struct ServiceEntry {
+    path: PathBuf,
+    file: File,
+    _ownership: File,
+    spool: Option<File>,
+    base: JournalBase,
+    state: State,
+    phase: SeedPhase,
+    ready: Option<SyncSender<io::Result<u64>>>,
+    done: SyncSender<io::Result<u64>>,
+    finishing: bool,
+    dirty: bool,
+    due: Instant,
+}
+fn pending_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".pending");
+    PathBuf::from(name)
+}
+impl ServiceEntry {
+    fn seed(
+        seed: JournalSeed,
+        ready: SyncSender<io::Result<u64>>,
+        done: SyncSender<io::Result<u64>>,
+        interval: Duration,
+    ) -> io::Result<Self> {
+        let ownership = journal_lock(&seed.path)?;
+        let mut file = private_new(&seed.path)?;
+        write_frame(&mut file, &base_bytes(&seed.base)?)?;
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let spool = options.open(pending_path(&seed.path))?;
+        Ok(Self {
+            path: seed.path,
+            file,
+            _ownership: ownership,
+            spool: Some(spool),
+            state: State::new(seed.base.revision, seed.base.byte_len),
+            phase: SeedPhase::Seed { reader: seed.source, left: seed.base.byte_len },
+            base: seed.base,
+            ready: Some(ready),
+            done,
+            finishing: false,
+            dirty: true,
+            due: Instant::now() + interval,
+        })
+    }
+    fn resume(
+        r: RecoveredJournal,
+        ready: SyncSender<io::Result<u64>>,
+        done: SyncSender<io::Result<u64>>,
+        interval: Duration,
+    ) -> Self {
+        let _ = ready.try_send(Ok(r.summary.revision));
+        Self {
+            path: r.path,
+            file: r.file,
+            _ownership: r.ownership,
+            spool: None,
+            base: r.base,
+            state: State::new(r.summary.revision, r.summary.byte_len),
+            phase: SeedPhase::Ready,
+            ready: None,
+            done,
+            finishing: false,
+            dirty: false,
+            due: Instant::now() + interval,
+        }
+    }
+    fn command(&mut self, command: JournalCommand, interval: Duration) -> io::Result<()> {
+        if self.finishing {
+            return Err(invalid("command after journal finish"));
+        }
+        let file = if matches!(self.phase, SeedPhase::Ready) { &mut self.file } else { self.spool.as_mut().unwrap() };
+        match command {
+            JournalCommand::Begin(e) => {
+                self.state.begin(e)?;
+                write_frame(file, &edit_bytes(e))?;
+            }
+            JournalCommand::Bytes(bytes) => {
+                if bytes.is_empty() || bytes.len() > JOURNAL_CHUNK {
+                    return Err(invalid("edit chunk limit"));
+                }
+                self.state.bytes(bytes.len())?;
+                let mut b = Vec::with_capacity(bytes.len() + 1);
+                b.push(5);
+                b.extend(bytes);
+                write_frame(file, &b)?;
+            }
+            JournalCommand::Commit => {
+                self.state.commit()?;
+                write_frame(file, &[6])?;
+            }
+            JournalCommand::Flush(reply) => {
+                if !matches!(self.phase, SeedPhase::Ready) {
+                    let _ = reply.try_send(Err(io::Error::new(io::ErrorKind::WouldBlock, "base still seeding")));
+                    return Ok(());
+                }
+                let result = self.file.sync_all();
+                let _ = reply.try_send(result.as_ref().map(|_| self.state.revision).map_err(copy_error));
+                result?;
+                self.dirty = false;
+                return Ok(());
+            }
+            JournalCommand::Finish => {
+                self.finishing = true;
+                return Ok(());
+            }
+            JournalCommand::Cancel => return Err(io::Error::new(io::ErrorKind::Interrupted, "journal cancelled")),
+        }
+        if !self.dirty {
+            self.due = Instant::now() + interval;
+            self.dirty = true;
+        }
+        Ok(())
+    }
+    fn advance(&mut self) -> io::Result<()> {
+        match &mut self.phase {
+            SeedPhase::Seed { reader, left } => {
+                if *left != 0 {
+                    let n = (*left).min(JOURNAL_CHUNK as u64) as usize;
+                    let mut b = vec![0; n + 1];
+                    b[0] = 2;
+                    reader.read_exact(&mut b[1..])?;
+                    write_frame(&mut self.file, &b)?;
+                    *left -= n as u64;
+                    return Ok(());
+                }
+                write_frame(&mut self.file, &[3])?;
+                self.file.sync_all()?;
+                if let Some(p) = self.path.parent() {
+                    sync_parent(p)?;
+                }
+                self.phase = SeedPhase::Merge { offset: 0 };
+            }
+            SeedPhase::Merge { offset } => {
+                let spool = self.spool.as_ref().unwrap();
+                let len = spool.metadata()?.len();
+                if *offset < len {
+                    let n = (len - *offset).min(JOURNAL_CHUNK as u64) as usize;
+                    let mut bytes = vec![0; n];
+                    read_positioned(spool, *offset, &mut bytes)?;
+                    self.file.write_all(&bytes)?;
+                    *offset += n as u64;
+                    return Ok(());
+                }
+                self.file.sync_all()?;
+                self.spool.take();
+                std::fs::remove_file(pending_path(&self.path))?;
+                if let Some(parent) = self.path.parent() {
+                    sync_parent(parent)?;
+                }
+                self.phase = SeedPhase::Ready;
+                self.dirty = false;
+                if let Some(ready) = self.ready.take() {
+                    let _ = ready.try_send(Ok(self.state.revision));
+                }
+            }
+            SeedPhase::Ready => (),
+        }
+        Ok(())
+    }
+    fn complete(mut self, result: io::Result<u64>) {
+        // Never remove pending data on failure/cancel. It is evidence of an
+        // incomplete seed, and readiness must remain an error.
+        if let Some(ready) = self.ready.take() {
+            let error = result.as_ref().err().map(copy_error).unwrap_or_else(|| invalid("incomplete journal base"));
+            let _ = ready.try_send(Err(error));
+        }
+        let done = self.done.clone();
+        drop(self);
+        let _ = done.try_send(result);
+    }
+}
+fn copy_error(e: &io::Error) -> io::Error {
+    io::Error::new(e.kind(), e.to_string())
+}
+fn read_positioned(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(bytes, offset)?
+        };
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(bytes, offset)?
+        };
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pending journal truncated"));
+        }
+        offset += n as u64;
+        bytes = &mut bytes[n..];
+    }
+    Ok(())
+}
+// A crash may leave a complete base and only part of the pending stream copied.
+// Check the common prefix, append the missing suffix, and preserve any newer
+// records beyond an old pending file resurrected by directory crash recovery.
+fn merge_pending_for_recovery(
+    path: &Path,
+    file: &mut File,
+    expected: DocumentId,
+    cancel: &AtomicBool,
+) -> io::Result<bool> {
+    let pending = match File::open(pending_path(path)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let limit = file.metadata()?.len();
+    file.seek(SeekFrom::Start(0))?;
+    let base = decode_base(&read_frame(file, limit)?.ok_or_else(|| invalid("incomplete journal base"))?)?;
+    if base.document != expected {
+        return Err(invalid("journal document identity mismatch"));
+    }
+    let mut len = 0u64;
+    loop {
+        cancelled(cancel)?;
+        let b = read_frame(file, limit)?.ok_or_else(|| invalid("incomplete journal base"))?;
+        match b[0] {
+            2 if b.len() > 1 => {
+                len = len.checked_add((b.len() - 1) as u64).ok_or_else(|| invalid("base overflow"))?;
+                if len > base.byte_len {
+                    return Err(invalid("base length"));
+                }
+            }
+            3 if b.len() == 1 && len == base.byte_len => break,
+            _ => return Err(invalid("base record order")),
+        }
+    }
+    let base_end = file.stream_position()?;
+    let pending_len = pending.metadata()?.len();
+    let copied = limit - base_end;
+    let common = copied.min(pending_len);
+    let mut offset = 0;
+    let mut a = vec![0; JOURNAL_CHUNK];
+    let mut b = vec![0; JOURNAL_CHUNK];
+    while offset < common {
+        cancelled(cancel)?;
+        let n = (common - offset).min(JOURNAL_CHUNK as u64) as usize;
+        read_positioned(file, base_end + offset, &mut a[..n])?;
+        read_positioned(&pending, offset, &mut b[..n])?;
+        if a[..n] != b[..n] {
+            return Err(invalid("pending journal prefix mismatch"));
+        }
+        offset += n as u64;
+    }
+    file.seek(SeekFrom::End(0))?;
+    offset = copied;
+    while offset < pending_len {
+        cancelled(cancel)?;
+        let n = (pending_len - offset).min(JOURNAL_CHUNK as u64) as usize;
+        read_positioned(&pending, offset, &mut a[..n])?;
+        file.write_all(&a[..n])?;
+        offset += n as u64;
+    }
+    file.sync_all()?;
+    Ok(true)
+}
+fn service_loop(
+    rx: Receiver<ServiceRequest>,
+    interval: Duration,
+    closing: &AtomicBool,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
+    use std::collections::{HashMap, VecDeque};
+    let mut entries = HashMap::<u64, ServiceEntry>::new();
+    let mut order = VecDeque::new();
+    let mut draining = false;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            for (_, e) in entries.drain() {
+                let result = if matches!(e.phase, SeedPhase::Ready) {
+                    e.file.sync_all().map(|_| e.state.revision)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "journal seed cancelled"))
+                };
+                e.complete(result);
+            }
+            return Ok(());
+        }
+        let busy = entries.values().any(|e| !matches!(e.phase, SeedPhase::Ready));
+        let request = if busy || closing.load(Ordering::Acquire) {
+            match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(mpsc::TryRecvError::Empty) => {
+                    if closing.load(Ordering::Acquire) {
+                        draining = true;
+                    }
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    draining = true;
+                    None
+                }
+            }
+        } else if let Some(due) = entries.values().filter(|e| e.dirty).map(|e| e.due).min() {
+            match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                Ok(r) => Some(r),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    draining = true;
+                    None
+                }
+            }
+        } else {
+            match rx.recv() {
+                Ok(r) => Some(r),
+                Err(_) => {
+                    draining = true;
+                    None
+                }
+            }
+        };
+        if let Some(request) = request {
+            match request {
+                ServiceRequest::Create { seed, token, ready, done } => {
+                    if entries.len() >= crate::session::MAX_TABS
+                        || entries.values().any(|e| e.base.document == seed.base.document)
+                    {
+                        let _ = ready.try_send(Err(invalid("journal document limit/duplicate")));
+                        let _ = done.try_send(Err(invalid("journal document limit/duplicate")));
+                    } else {
+                        match ServiceEntry::seed(seed, ready.clone(), done.clone(), interval) {
+                            Ok(entry) => {
+                                entries.insert(token, entry);
+                                order.push_back(token);
+                            }
+                            Err(e) => {
+                                let _ = ready.try_send(Err(copy_error(&e)));
+                                let _ = done.try_send(Err(e));
+                            }
+                        }
+                    }
+                }
+                ServiceRequest::Resume { recovered, token, ready, done } => {
+                    if entries.len() >= crate::session::MAX_TABS
+                        || entries.values().any(|e| e.base.document == recovered.base.document)
+                    {
+                        let _ = ready.try_send(Err(invalid("journal document limit/duplicate")));
+                        let _ = done.try_send(Err(invalid("journal document limit/duplicate")));
+                    } else {
+                        entries.insert(token, ServiceEntry::resume(recovered, ready, done, interval));
+                        order.push_back(token);
+                    }
+                }
+                ServiceRequest::Command(token, command) => {
+                    if let Some(entry) = entries.get_mut(&token) {
+                        if let Err(e) = entry.command(command, interval) {
+                            entries.remove(&token).unwrap().complete(Err(e));
+                        }
+                    } else if let JournalCommand::Flush(reply) = command {
+                        let _ = reply.try_send(Err(invalid("closed journal")));
+                    }
+                }
+                ServiceRequest::Wake => (),
+            }
+        }
+        if draining {
+            for entry in entries.values_mut() {
+                entry.finishing = true;
+            }
+        }
+        if let Some(token) = order.pop_front() {
+            if let Some(entry) = entries.get_mut(&token) {
+                match entry.advance() {
+                    Ok(()) => order.push_back(token),
+                    Err(e) => entries.remove(&token).unwrap().complete(Err(e)),
+                }
+            }
+        }
+        let mut remove = Vec::new();
+        for (&token, entry) in &mut entries {
+            if entry.finishing && matches!(entry.phase, SeedPhase::Ready) {
+                let result = entry.file.sync_all().map(|_| entry.state.revision);
+                remove.push((token, result));
+            } else if entry.dirty && Instant::now() >= entry.due {
+                match entry.file.sync_all().and_then(|_| entry.spool.as_ref().map_or(Ok(()), File::sync_all)) {
+                    Ok(()) => {
+                        entry.dirty = false;
+                        entry.due = Instant::now() + interval;
+                    }
+                    Err(e) => remove.push((token, Err(e))),
+                }
+            }
+        }
+        for (token, result) in remove {
+            if let Some(e) = entries.remove(&token) {
+                e.complete(result);
+            }
+        }
+        if draining && entries.is_empty() {
+            return Ok(());
         }
     }
 }

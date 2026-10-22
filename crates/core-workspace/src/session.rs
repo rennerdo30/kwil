@@ -172,10 +172,10 @@ impl Session {
             }
         }
         for tab in &self.tabs {
-            if let Some(path) = &tab.path {
-                if !paths.insert(path) {
-                    return Err(invalid("duplicate tab path"));
-                }
+            if let Some(path) = &tab.path
+                && !paths.insert(path)
+            {
+                return Err(invalid("duplicate tab path"));
             }
         }
         for path in &self.recent {
@@ -366,7 +366,7 @@ pub(crate) fn validate_path(p: &Path) -> io::Result<()> {
     #[cfg(unix)]
     let nul = bytes.contains(&0);
     #[cfg(windows)]
-    let nul = bytes.chunks_exact(2).any(|b| b == [0, 0]);
+    let nul = bytes.as_chunks::<2>().0.contains(&[0, 0]);
     if bytes.is_empty() || bytes.len() > MAX_PATH_BYTES || nul {
         return Err(invalid("path size or NUL"));
     }
@@ -440,7 +440,7 @@ impl<'a> Decoder<'a> {
             if n % 2 != 0 {
                 return Err(invalid("UTF-16 path size"));
             }
-            let wide: Vec<u16> = b.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+            let wide: Vec<u16> = b.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
             if wide.contains(&0) {
                 return Err(invalid("NUL path"));
             }
