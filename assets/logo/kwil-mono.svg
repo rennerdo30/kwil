@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="80 60 360 380" width="360" height="380">
+  <title>Kwil mark, one colour (uses currentColor; for tray icons, favicons and print)</title>
+  <defs>
+    <mask id="cut">
+      <rect x="-400" y="-400" width="800" height="800" fill="#fff"/>
+      <line x1="0" y1="138" x2="0" y2="22" stroke="#000" stroke-width="14" stroke-linecap="round"/>
+      <circle cx="0" cy="6" r="21" fill="#000"/>
+    </mask>
+  </defs>
+  <g fill="currentColor">
+    <rect x="112" y="390" width="240" height="16" rx="8"/>
+    <g transform="translate(232 284) rotate(45)">
+      <rect x="-56" y="-236" width="22" height="146" rx="11"/>
+      <rect x="-11" y="-276" width="22" height="154" rx="11"/>
+      <rect x="34" y="-222" width="22" height="132" rx="11"/>
+      <path mask="url(#cut)" d="M0 150 L-68 -6 C-76 -64 -48 -112 0 -140 C48 -112 76 -64 68 -6 Z"/>
+    </g>
+  </g>
+</svg>
