@@ -13,7 +13,9 @@
 //! let mut index = PaletteWorker::new(IndexLimits::default(), Arc::new(|| {
 //!     // Post a coalesced event to the parent's event loop; do not draw here.
 //! })).unwrap();
-//! palette.prime_results(index.cached(PaletteMode::Commands));
+//! for mode in [PaletteMode::Commands, PaletteMode::Tabs, PaletteMode::Files] {
+//!     palette.prime_results(index.cached(mode)); // warm mode caches while closed
+//! }
 //! let request = palette.open("src").unwrap().unwrap();
 //! index.request(request).unwrap(); // cached rows remain immediately available
 //! // On a worker-result event:
@@ -199,7 +201,7 @@ impl Palette {
     pub fn selected(&self) -> Option<usize> {
         self.selected
     }
-    /// False means cached file rows are visible but cannot yet be accepted.
+    /// False means cached candidate rows are visible but cannot yet be accepted.
     pub fn results_are_fresh(&self) -> bool {
         self.fresh
     }
@@ -260,6 +262,8 @@ impl Palette {
             .find(|at| *at >= self.cursor)
             .unwrap_or(self.query.len());
     }
+    /// Replaces parent-owned IDs/titles. Submit the returned replacement request
+    /// when tabs mode is active; cached selections from old IDs are invalidated.
     pub fn set_tabs(&mut self, tabs: Vec<Tab>) -> Result<Option<PaletteQuery>, QueryError> {
         self.tabs = TabSnapshot::new(tabs)?;
         // New titles/IDs invalidate both visible and previously primed tab rows.
