@@ -11,6 +11,7 @@ mod document;
 mod editor;
 pub mod grid;
 pub mod hex;
+pub mod palette_session;
 mod workspace;
 pub use workspace::{FilePrompt, FilePromptKind, TabAction, TabArea, TabGeometry, TabMetrics, TabSlot, Workspace};
 pub mod document_worker;
