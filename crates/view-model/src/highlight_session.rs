@@ -13,6 +13,7 @@ const WINDOW: usize = MAX_WINDOW_BYTES - 8192;
 struct Identity {
     document: DocumentId,
     revision: u64,
+    path: std::path::PathBuf,
     windows: Vec<Range<usize>>,
 }
 
@@ -58,7 +59,12 @@ impl HighlightSession {
                 .filter_map(|row| view.line_source(row))
                 .filter_map(|range| Some(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)),
         );
-        let next = Identity { document: view.active_id(), revision: editor.document().revision(), windows };
+        let next = Identity {
+            document: view.active_id(),
+            revision: editor.document().revision(),
+            path: editor.document().path().unwrap_or(std::path::Path::new("")).to_path_buf(),
+            windows,
+        };
         if self.identity.as_ref() == Some(&next) {
             return false;
         }
@@ -87,7 +93,7 @@ impl HighlightSession {
         // Retire superseded handles off the input thread, including rejected
         // requests the syntax worker never accepted.
         self.source = Some(Arc::new(SnapshotTextSource::new(editor.document().snapshot())));
-        self.path = Arc::new(editor.document().path().unwrap_or(std::path::Path::new("")).to_path_buf());
+        self.path = Arc::new(next.path.clone());
         self.identity = Some(next);
         self.in_flight = false;
         if let Some(worker) = &self.worker {
@@ -241,6 +247,24 @@ mod tests {
         sync::mpsc,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn save_as_path_changes_invalidate_detection_without_an_edit() {
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        view.set_rows(1);
+        view.execute("edit.insert", &CommandArgs { text: Some("fn main() {}".into()), ..Default::default() }, 1)
+            .unwrap();
+        let mut host = HighlightSession::new(|| {}).unwrap();
+        assert!(host.update(&view));
+        let revision = view.editor().unwrap().document().revision();
+        let first_key = host.key;
+        view.editor_mut().unwrap().document.path = Some("renamed.rs".into());
+        assert!(host.update(&view));
+        assert_ne!(host.key, first_key);
+        assert_eq!(view.editor().unwrap().document().revision(), revision);
+        assert_eq!(host.path.as_os_str(), std::ffi::OsStr::new("renamed.rs"));
+        host.worker.take().unwrap().shutdown().unwrap();
+    }
 
     #[test]
     fn giant_line_gaps_and_long_windows_remain_bounded() {

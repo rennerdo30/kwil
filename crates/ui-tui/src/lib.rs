@@ -345,7 +345,7 @@ pub fn run_with_external_open(
                     editor.settings = settings.clone();
                 }
                 if let Some(host) = &mut highlighting {
-                    host.update(&view);
+                    prepare_highlighting_for_draw(host, &view);
                 }
                 let spans: Vec<_> = highlighting.as_ref().into_iter().flat_map(|host| host.spans(&view)).collect();
                 terminal.draw(|f| {
@@ -388,6 +388,12 @@ enum KeyResult {
     Changed(bool),
     File(&'static str),
     Palette(&'static str),
+}
+
+fn prepare_highlighting_for_draw(host: &mut kwil_view_model::highlight_session::HighlightSession, view: &Workspace) {
+    if host.update(view) {
+        host.invalidate_painted(view, &kwil_view_model::Damage { full: true, ..Default::default() });
+    }
 }
 
 /// Close only for the successful completion of the requested revision.
@@ -777,6 +783,39 @@ fn keep_visible(view: &mut View, horizontal: &mut u64, columns: usize, tab: usiz
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn trailing_space_edit_restores_unchanged_number_highlights() {
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        view.set_rows(1);
+        view.execute("edit.insert", &CommandArgs { text: Some("123".into()), ..Default::default() }, 1).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut host = kwil_view_model::highlight_session::HighlightSession::new(move || {
+            let _ = sender.send(());
+        })
+        .unwrap();
+        let wait = |host: &mut kwil_view_model::highlight_session::HighlightSession, view: &Workspace| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                let changed = host.worker_ready(view);
+                if host.spans(view).next().is_some() {
+                    break changed;
+                }
+            }
+        };
+        prepare_highlighting_for_draw(&mut host, &view);
+        assert_eq!(wait(&mut host, &view), vec![0]);
+        view.execute("edit.insert", &CommandArgs { text: Some(" ".into()), ..Default::default() }, 1).unwrap();
+        prepare_highlighting_for_draw(&mut host, &view);
+        assert_eq!(host.spans(&view).count(), 0);
+        assert_eq!(wait(&mut host, &view), vec![0], "same Number span must repaint after the plain pending frame");
+        let spans: Vec<_> = host.spans(&view).collect();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 2)).unwrap();
+        terminal.draw(|frame| draw_area_highlighted(frame, &view, frame.area(), false, &spans)).unwrap();
+        assert_ne!(terminal.backend().buffer()[(8, 0)].fg, Color::Reset);
+        host.stop();
+    }
 
     #[test]
     fn syntax_foreground_preserves_selection_background_and_horizontal_bytes() {
