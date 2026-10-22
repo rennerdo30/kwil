@@ -632,8 +632,14 @@ fn main() {
         let p = proxy.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
-            let instance = wgpu::Instance::default();
-            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+            // KWIL_WARP=1 forces the software adapter that RDP sessions without
+            // GPU policy get (DX12 WARP).
+            let warp = std::env::var_os("KWIL_WARP").is_some();
+            let backends = if std::env::var_os("KWIL_DX12").is_some() { wgpu::Backends::DX12 } else { wgpu::Backends::all() };
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+            let opts = wgpu::RequestAdapterOptions { force_fallback_adapter: warp, ..Default::default() };
+            let adapter = pollster::block_on(instance.request_adapter(&opts)).unwrap();
+            eprintln!("adapter: {:?}", adapter.get_info().name);
             let _device = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
             let _ = p.send_event(UserEvent::GpuReady(t.elapsed().as_secs_f64() * 1000.0));
         });
