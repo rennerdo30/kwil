@@ -199,10 +199,7 @@ mod tests {
         for every in [1, 3, DEFAULT_EVERY] {
             let mut index = LineIndex::build_chunked(&bytes[..500_000], every, 100_003, 2, &AtomicU64::new(0));
             index.extend(&bytes, 500_000);
-            for (line, at) in std::iter::once(0)
-                .chain(memchr_iter(b'\n', &bytes).map(|p| p as u64 + 1))
-                .enumerate()
-            {
+            for (line, at) in std::iter::once(0).chain(memchr_iter(b'\n', &bytes).map(|p| p as u64 + 1)).enumerate() {
                 let mut scanned = 0;
                 assert_eq!(index.line_start_observed(&bytes, line as u64, |n| scanned = n), Some(at));
                 assert!(scanned <= RANK_BYTES, "line {line} scanned {scanned} bytes");
