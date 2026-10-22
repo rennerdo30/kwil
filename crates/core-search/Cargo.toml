@@ -9,6 +9,7 @@ publish = false
 kwil-core-text = { path = "../core-text" }
 memchr = "2.8.3"
 regex = "1.13.1"
+regex-syntax = "0.8.11"
 ignore = "0.4.33"
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"

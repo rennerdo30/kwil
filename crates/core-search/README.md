@@ -1,7 +1,7 @@
 # core-search
 
 Worker-side engines for KW-22, KW-23 and the KW-41 line filter. No UI, runtime,
-file mutation, implicit background thread, or file-sized working buffer.
+file mutation, persistent background thread, or file-sized working buffer.
 
 ## Integration contract
 
@@ -15,6 +15,16 @@ file mutation, implicit background thread, or file-sized working buffer.
   and should coalesce progress into its event loop's status updates. Collectors
   must cap or spool hits; signal-strip consumers can aggregate them by viewport
   bin instead of retaining millions of individual markers.
+- **Shipped editor default:** `search_default` uses half the logical CPUs capped
+  at four, leaving headroom for the UI. `search_with_threads` permits a lower
+  admitted count; `search` remains the serial worker primitive. Regex HIR proves
+  whether a pattern can consume LF. Only LF-free patterns with nearby newline
+  shard boundaries run in parallel, preserving non-overlap/anchor semantics;
+  multiline patterns, giant unbroken lines and small ranges stay serial.
+  Count progress merges as workers advance. Hits retain order through bounded
+  256-hit batches; later shards backpressure instead of storing out-of-order hits.
+  The returned summary reports the actual worker count. One light coordinator
+  drains channels in addition to the reported search workers.
 - Literal case-sensitive search uses `memmem`; case-insensitive text literals
   use Unicode regex folding, with ASCII folding for non-UTF-8 byte patterns.
   Whole word uses Unicode `\w`, treating invalid bytes as non-word. Offsets are
@@ -25,6 +35,8 @@ file mutation, implicit background thread, or file-sized working buffer.
   arbitrary-length multiline regex is outside this contract. Detected overlong
   matches return an error. The selection restricts hits, preserving document
   context for anchors and whole words. Memory is O(1 MiB + declared match bound).
+  Main chunk bodies are borrowed; only overlap tails and prefixes are copied.
+  Parallel workers each keep the same bounded working set.
 - `plan_replace` accepts ordered matches from the same source/pattern and emits
   ordered edits. `$1`, `${name}`, `$0`, `$$`, missing and optional captures follow
   `regex` interpolation. Literal replacements preserve dollar signs, including
@@ -57,8 +69,8 @@ file mutation, implicit background thread, or file-sized working buffer.
 `verify.ps1` launches cargo with a recorded PID, timeout, private target directory
 and four compile jobs. `fail-first.ps1` mutates this package only, checks each
 acceptance test fails, and restores byte-identical originals in `finally`.
-The fixture measurement example runs each query exactly once, without a warm-up
-or benchmark loop:
+The fixture measurement example runs each query/configuration exactly once,
+at one worker and at the editor default, without a warm-up or benchmark loop:
 
 ```powershell
 ./crates/core-search/verify.ps1 -CargoArgs test,-p,kwil-core-search,-j,4,--locked
@@ -67,7 +79,7 @@ or benchmark loop:
 ./crates/core-search/verify.ps1 -CargoArgs @('run','--release','-p','kwil-core-search','--example','count_fixture','-j','4','--locked','--','fixtures/log-1g.log') -TimeoutSeconds 240
 ```
 
-Unit tests lower the work-window size to 64 bytes to exercise actual overlap
+Unit tests lower the work-window size to 128 bytes to exercise actual overlap
 ownership, in addition to haystack chunks as small as one byte. Each filesystem
 test owns a unique temporary directory. The real measurement uses 1 MiB windows.
 
@@ -79,6 +91,7 @@ Checked against the crates.io API on 2026-10-23; current stable versions:
 |---|---|---|---|---|
 | memchr | 2.8.3 | 2026-07-08 | SIMD literal/line scans (already in workspace) | MIT or Unlicense |
 | regex | 1.13.1 | 2026-07-15 | Byte regex, captures, Unicode | MIT or Apache-2.0 |
+| regex-syntax | 0.8.11 | 2026-06-09 | Prove LF-free shard safety (already transitive) | MIT or Apache-2.0 |
 | ignore | 0.4.33 | 2026-08-04 | Ignore-aware capped parallel walking | MIT or Unlicense |
 | grep-searcher | 0.1.17 | 2026-07-15 | Streaming file reader and line search | MIT or Unlicense |
 | grep-regex | 0.1.14 | 2025-10-16 | Ripgrep regex matcher | MIT or Unlicense |

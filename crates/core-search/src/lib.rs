@@ -6,10 +6,12 @@
 
 mod files;
 mod filter;
+mod parallel;
 mod search;
 
 pub use files::{FileEvent, FileHit, FileSearch, FileSearchSummary, find_in_files, worker_count};
 pub use filter::{FilterExpr, FilterResume, FilterSummary, LineFilter, LineRun, LineRuns};
+pub use parallel::{search_default, search_with_threads};
 pub use search::{Edit, Haystack, Match, Options, Pattern, Progress, SearchMode, SearchSummary, plan_replace, search};
 
 use std::sync::Arc;

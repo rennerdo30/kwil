@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 #[cfg(not(test))]
 pub(crate) const BLOCK: usize = 1 << 20;
 #[cfg(test)]
-pub(crate) const BLOCK: usize = 64;
+pub(crate) const BLOCK: usize = 128;
 const MAX_PATTERN: usize = 1 << 20;
 
 /// Borrowed, contiguous-in-offset chunks covering exactly the requested range.
@@ -68,6 +68,7 @@ pub struct Pattern {
     options: Options,
     max_len: usize,
     captures: bool,
+    pub(crate) newline_safe: bool,
 }
 
 impl Pattern {
@@ -86,9 +87,16 @@ impl Pattern {
                 options,
                 max_len: needle.len().saturating_mul(4).min(MAX_PATTERN),
                 captures: false,
+                newline_safe: !needle.contains(&b'\n'),
             })
         } else {
-            Ok(Self { engine: Engine::Literal(needle.to_vec()), options, max_len: needle.len(), captures: false })
+            Ok(Self {
+                engine: Engine::Literal(needle.to_vec()),
+                options,
+                max_len: needle.len(),
+                captures: false,
+                newline_safe: !needle.contains(&b'\n'),
+            })
         }
     }
 
@@ -111,7 +119,19 @@ impl Pattern {
             .dfa_size_limit(2 << 20)
             .build()
             .map_err(invalid)?;
-        Ok(Self { engine: Engine::Regex(re), options, max_len: max_match_bytes, captures: true })
+        let hir = regex_syntax::ParserBuilder::new()
+            .utf8(false)
+            .case_insensitive(options.case_insensitive)
+            .build()
+            .parse(expression)
+            .map_err(invalid)?;
+        Ok(Self {
+            engine: Engine::Regex(re),
+            options,
+            max_len: max_match_bytes,
+            captures: true,
+            newline_safe: !consumes_newline(&hir),
+        })
     }
 
     pub(crate) fn visit(
@@ -219,6 +239,19 @@ impl Pattern {
     }
 }
 
+fn consumes_newline(hir: &regex_syntax::hir::Hir) -> bool {
+    use regex_syntax::hir::{Class, HirKind};
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => false,
+        HirKind::Literal(lit) => lit.0.contains(&b'\n'),
+        HirKind::Class(Class::Unicode(c)) => c.iter().any(|r| r.start() <= '\n' && r.end() >= '\n'),
+        HirKind::Class(Class::Bytes(c)) => c.iter().any(|r| r.start() <= b'\n' && r.end() >= b'\n'),
+        HirKind::Repetition(r) => consumes_newline(&r.sub),
+        HirKind::Capture(c) => consumes_newline(&c.sub),
+        HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().any(consumes_newline),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Match {
     pub offset: u64,
@@ -236,6 +269,7 @@ pub struct SearchSummary {
     pub count: u64,
     pub scanned: u64,
     pub cancelled: bool,
+    pub workers: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -257,7 +291,7 @@ pub fn search<H: Haystack + ?Sized>(
     mut on_hit: impl FnMut(Match),
     mut progress: impl FnMut(Progress),
 ) -> io::Result<SearchSummary> {
-    let mut result = SearchSummary::default();
+    let mut result = SearchSummary { workers: 1, ..SearchSummary::default() };
     let mut next = range.start;
     let mut last_end = None;
     let total = range.end.saturating_sub(range.start);
@@ -413,6 +447,8 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
     let mut base = lo;
     let mut expected = lo;
     let mut buf = Vec::with_capacity(BLOCK + max_len + 8);
+    let pad = max_len + 4;
+    let mut finished_direct = false;
     for (at, mut chunk) in source.chunks(lo..hi) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -424,6 +460,30 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
         while !chunk.is_empty() {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
+            }
+            let part_len = chunk.len().min(BLOCK);
+            // Borrow the main body of a large chunk. Only the unresolved tail
+            // and the next chunk's prefix are copied for boundary matching.
+            if part_len >= 2 * pad + 8 {
+                let at = expected - chunk.len() as u64;
+                let part = &chunk[..part_len];
+                if !buf.is_empty() {
+                    buf.extend_from_slice(&part[..pad + 4]);
+                    visit(&buf, base, (at + 4).min(range.end), false)?;
+                    buf.clear();
+                }
+                let final_part = at + part_len as u64 == hi;
+                let safe = if final_part { range.end } else { (at + (part_len - pad) as u64).min(range.end) };
+                visit(part, at, safe, final_part)?;
+                if final_part {
+                    finished_direct = true;
+                } else {
+                    let tail = part_len - pad - 4;
+                    buf.extend_from_slice(&part[tail..]);
+                    base = at + tail as u64;
+                }
+                chunk = &chunk[part_len..];
+                continue;
             }
             let n = chunk.len().min(BLOCK + max_len + 8 - buf.len());
             buf.extend_from_slice(&chunk[..n]);
@@ -444,7 +504,7 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
     if expected != hi {
         return Err(invalid("incomplete haystack chunks"));
     }
-    if !cancel.load(Ordering::Relaxed) {
+    if !finished_direct && !cancel.load(Ordering::Relaxed) {
         visit(&buf, base, range.end, true)?;
     }
     Ok(())

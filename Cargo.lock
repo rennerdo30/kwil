@@ -1267,6 +1267,7 @@ dependencies = [
  "kwil-core-text",
  "memchr",
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]

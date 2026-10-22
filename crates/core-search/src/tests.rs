@@ -45,7 +45,7 @@ fn tiny_chunks_and_work_windows_match_reference() {
     for _ in 0..25 {
         bytes.extend_from_slice(b"aba ababa ab\ncd .. ");
     }
-    for size in [1, 2, 3, 7, 61] {
+    for size in [1, 2, 3, 7, 61, 127, 256] {
         let h = Chunks { bytes: &bytes, size };
         for (p, re) in [
             (literal(b"aba"), "aba"),
@@ -363,4 +363,47 @@ fn invalid_ranges_chunks_and_match_bounds_are_errors() {
     assert!(search(&Broken, &p, 0..10, SearchMode::Count, &token(), |_| {}, |_| {}).is_err());
     let result: io::Result<_> = LineFilter::new(vec![p], FilterExpr::Pattern(9));
     assert!(result.is_err());
+}
+
+#[test]
+fn parallel_default_matches_serial_and_preserves_order() {
+    let bytes = b"aa aaaa INFO ERROR line=123\n".repeat(100);
+    let h = Chunks { bytes: &bytes, size: 13 };
+    for p in [literal(b"aa"), regex("a{1,3}"), regex(r"\b"), regex(r"(?m)^|$"), regex("INFO|ERROR"), regex("aa|$")] {
+        let expected = collect(&h, &p, 0..h.len());
+        let mut actual = Vec::new();
+        let s = search_default(&h, &p, 0..h.len(), SearchMode::Hits, &token(), |m| actual.push(m), |_| {}).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(s.count as usize, expected.len());
+        assert_eq!(s.workers, worker_count());
+        let c = search_with_threads(&h, &p, 0..h.len(), SearchMode::Count, 4, &token(), |_| panic!(), |_| {}).unwrap();
+        assert_eq!(c.count, s.count);
+        assert_eq!(c.scanned, h.len());
+    }
+    let one_line = b"a".repeat(2000);
+    // Multiline patterns and a giant line retain exact serial semantics.
+    for (bytes, p) in [(bytes.as_slice(), literal(b"123\naa")), (one_line.as_slice(), literal(b"aa"))] {
+        let s = search_default(bytes, &p, 0..bytes.len() as u64, SearchMode::Count, &token(), |_| {}, |_| {}).unwrap();
+        assert_eq!(s.workers, 1);
+        assert_eq!(s.count as usize, collect(bytes, &p, 0..bytes.len() as u64).len());
+    }
+    let cancel = token();
+    let mut hits = 0;
+    let stopped = search_default(
+        &h,
+        &literal(b"aa"),
+        0..h.len(),
+        SearchMode::Hits,
+        &cancel,
+        |_| {
+            hits += 1;
+            if hits == 3 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert!(stopped.cancelled);
+    assert_eq!(hits, 3);
 }

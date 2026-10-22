@@ -12,7 +12,8 @@ $cases = @(
     @{ Test='files_gitignore_globs_previews_ranges_and_mapped_adapter'; File='files.rs'; From='walk.require_git(false).threads(workers).follow_links(false);'; To='walk.require_git(false).threads(workers).follow_links(false).git_ignore(false);' },
     @{ Test='files_cancellation_backpressure_and_disconnect'; File='files.rs'; From='self.hits.fetch_add(1, Ordering::Relaxed);'; To='self.hits.fetch_add(500, Ordering::Relaxed);' },
     @{ Test='files_oversize_lines_report_error_and_range_caps'; File='files.rs'; From='ranges_truncated = true;'; To='ranges_truncated = false;' },
-    @{ Test='invalid_ranges_chunks_and_match_bounds_are_errors'; File='search.rs'; From='if m.len() > pattern.max_len {'; To='if false && m.len() > pattern.max_len {' }
+    @{ Test='invalid_ranges_chunks_and_match_bounds_are_errors'; File='search.rs'; From='if m.len() > pattern.max_len {'; To='if false && m.len() > pattern.max_len {' },
+    @{ Test='parallel_default_matches_serial_and_preserves_order'; File='parallel.rs'; From='s.count -= duplicates.get();'; To='s.count += 1;' }
 )
 foreach ($case in $cases) {
     $path = Join-Path $root "src/$($case.File)"
