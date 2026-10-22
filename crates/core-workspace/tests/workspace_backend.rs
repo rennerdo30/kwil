@@ -122,6 +122,25 @@ fn kw20_closed_history_never_silently_evicts_dirty_document() {
 }
 
 #[test]
+fn kw20_orphan_journal_tab_retains_identity_and_advances_allocator() {
+    let mut s = Session::default();
+    let tab = Tab {
+        id: DocumentId(900),
+        path: None,
+        revision: 17,
+        saved_revision: 1,
+        cursor: 9,
+        anchor: 9,
+        first_visible_line: 0,
+    };
+    s.restore_tab(tab.clone()).unwrap();
+    assert_eq!(s.active(), Some(tab.id));
+    assert_eq!(s.tabs()[0], tab);
+    assert!(s.restore_tab(tab).is_err());
+    assert_eq!(s.open(None).unwrap(), DocumentId(901));
+}
+
+#[test]
 fn kw20_journal_interrupted_tail_keeps_only_committed_raw_bytes() {
     let temp = Temp::new();
     let raw = b"\xff\xfea\0\x80\xff\r\n";

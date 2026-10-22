@@ -87,6 +87,7 @@ impl Session {
                 return Err(invalid("session paths must be absolute"));
             }
             if let Some(id) = self.tabs.iter().find(|t| t.path.as_ref() == Some(path)).map(|t| t.id) {
+                self.touch_recent(path.clone());
                 self.active = Some(id);
                 return Ok(id);
             }
@@ -102,6 +103,30 @@ impl Session {
         self.tabs.push(Tab { id, path, revision: 0, saved_revision: 0, cursor: 0, anchor: 0, first_visible_line: 0 });
         self.active = Some(id);
         Ok(id)
+    }
+    /// Restores a journal whose metadata write was interrupted. Keeps its ID and
+    /// advances the allocator; never silently substitutes a new document ID.
+    pub fn restore_tab(&mut self, tab: Tab) -> io::Result<()> {
+        if self.tabs.len() >= MAX_TABS
+            || tab.id.0 == 0
+            || self.tabs.iter().chain(self.closed.iter()).any(|t| t.id == tab.id)
+        {
+            return Err(invalid("restored tab limit/identity"));
+        }
+        if let Some(path) = &tab.path {
+            validate_path(path)?;
+            if !path.is_absolute() || self.tabs.iter().any(|t| t.path.as_ref() == Some(path)) {
+                return Err(invalid("restored tab path"));
+            }
+        }
+        let next = tab.id.0.checked_add(1).ok_or_else(|| invalid("document ID exhausted"))?;
+        self.next_id = self.next_id.max(next);
+        self.active = Some(tab.id);
+        if let Some(path) = &tab.path {
+            self.touch_recent(path.clone());
+        }
+        self.tabs.push(tab);
+        Ok(())
     }
     pub fn close(&mut self, id: DocumentId) -> bool {
         // A bounded history must not silently evict unrecoverable unsaved work.
@@ -142,6 +167,9 @@ impl Session {
             return Err(invalid("path is already open"));
         }
         let id = tab.id;
+        if let Some(path) = &tab.path {
+            self.touch_recent(path.clone());
+        }
         self.tabs.push(tab);
         self.active = Some(id);
         Ok(Some(id))
