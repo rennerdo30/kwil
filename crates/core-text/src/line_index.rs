@@ -156,16 +156,30 @@ impl LineIndex {
 
     /// Byte offset where `line` starts, or `None` past the end.
     pub fn line_start(&self, bytes: &[u8], line: u64) -> Option<u64> {
+        self.line_start_observed(bytes, line, |_| {})
+    }
+
+    fn line_start_observed(&self, bytes: &[u8], line: u64, scanned: impl FnOnce(usize)) -> Option<u64> {
         if line >= self.line_count {
             return None;
         }
         let i = self.checkpoints.partition_point(|&(l, _)| l <= line) - 1;
-        let (cl, off) = self.checkpoints[i];
-        let skip = line - cl;
-        if skip == 0 {
+        let (mut cl, mut off) = self.checkpoints[i];
+        if cl == line {
+            scanned(0);
             return Some(off);
         }
-        let tail = &bytes[off as usize..self.len as usize];
+        // A rank with count == line can already lie inside the requested
+        // line. Use the last STRICTLY smaller rank, so its following block
+        // contains the newline that starts this line, even after a giant line.
+        let j = self.rank_checkpoints.partition_point(|&(count, _)| count < line) - 1;
+        if self.rank_checkpoints[j].1 > off {
+            (cl, off) = self.rank_checkpoints[j];
+        }
+        let end = self.rank_checkpoints.get(j + 1).map_or(self.len, |&(_, at)| at);
+        let skip = line - cl;
+        let tail = &bytes[off as usize..end as usize];
+        scanned(tail.len());
         memchr_iter(b'\n', tail).nth((skip - 1) as usize).map(|p| off + p as u64 + 1)
     }
 }
@@ -173,6 +187,29 @@ impl LineIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inverse_line_lookup_scans_one_byte_rank_block() {
+        let mut bytes = vec![b'x'; 700_003];
+        for at in [65_535, 65_536, 300_001, 699_999, 700_002] {
+            bytes[at] = b'\n';
+        }
+        // Exercise rank boundaries, duplicate counts, sparse checkpoints,
+        // non-grid chunk borders and append-created checkpoints.
+        for every in [1, 3, DEFAULT_EVERY] {
+            let mut index = LineIndex::build_chunked(&bytes[..500_000], every, 100_003, 2, &AtomicU64::new(0));
+            index.extend(&bytes, 500_000);
+            for (line, at) in std::iter::once(0)
+                .chain(memchr_iter(b'\n', &bytes).map(|p| p as u64 + 1))
+                .enumerate()
+            {
+                let mut scanned = 0;
+                assert_eq!(index.line_start_observed(&bytes, line as u64, |n| scanned = n), Some(at));
+                assert!(scanned <= RANK_BYTES, "line {line} scanned {scanned} bytes");
+            }
+            assert_eq!(index.line_start(&bytes, index.line_count()), None);
+        }
+    }
 
     #[test]
     fn rank_scan_is_byte_bounded_inside_giant_line() {
