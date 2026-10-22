@@ -4,6 +4,53 @@ Base: `e51e41bd687276e99eef2dbfee60ac9a88586119`, branch `kw/11-renderer`.
 PR: https://github.com/rennerdo30/kwil/pull/14. No merge or release.
 Only `crates/ui-gpu/**` and dependency resolution in `Cargo.lock` changed.
 
+## Review correction, source b09c102
+
+The independent review of `1b9016c` requested three fixes. `ae7e029` corrects the
+queued-scroll/glyph-result interleaving, Unicode recovery after an unavailable font,
+and directional visual ordering. `b09c102` also preserves cursive advances after the
+first corrected capture exposed gaps with proportional Arabic fallback.
+
+- **15/15 focused ui-gpu tests pass.** All 15 have assertion-level mutant fail-first
+  evidence: the original 14 at `review-r1-unit-mutants/`, the added cursive invariant
+  at `review-r1-cursive-mutant/`, under the evidence root below. This includes all
+  prior width/escape/tab/remote/cache tests as well as new queue/status/RTL cases.
+- The queue regression executes scroll(2), glyph arrival for old row 5, then another
+  queued scroll before paint; the dirty row follows the copied pixels. Fixed status
+  glyph damage is checked separately.
+- Default and all-feature workspace clippy passed with warnings denied; fmt passed.
+  No full suite or startup benchmark was rerun. The source remains based on the
+  original pinned branch; the coordinator owns PR13 integration overlaps.
+- A native deliberate mutation removed the failed-font recovery activation. The
+  hidden app reported `unicode_enabled=false` and failed the `Unicode recovery
+  unavailable` assertion (PID 43544, expected nonzero exit). Restoring the code
+  recovered CJK/emoji/combining/invalid-byte and RTL display despite the unavailable
+  configured family, preserving a visible font-unavailable notice.
+- Final copied-binary capture (`b09c102`, PID 72952, exit 0) was visually inspected:
+  Hebrew/Arabic order, mixed Latin/digits and connected Arabic are visible. No Cargo
+  invocation ran during that capture; the compile lane had been released.
+- Final probe: pending glyphs 0, Unicode enabled, idle 0 presents; scroll 1 partial
+  present with **97,280 damage / 924,160 copied pixels**; status 1 partial present
+  with **24,320 damage pixels**. Different counts reflect the surviving fallback
+  font's 19-pixel cell height. Forced repaint is 1,024,000 pixels. Scroll capture
+  byte-equals repaint; primed GPU backing readback equals CPU after scroll.
+- Native controls, both icons, cloak and WTS/OLE/drop registration remain true.
+  Session policy still switches remote/blink-off to local/blink-on. The native
+  pre-cursive corrected run (PID 75640) also exited 0.
+- Current stable `unicode-bidi 0.3.18` (MIT/Apache, 2024-12-16) adds one lockfile
+  package. First focused dependency compile unit: 0.65 s. Final cached native
+  release build took 18.64 s, including app thin-LTO linking.
+
+Evidence root: `E:/Development/_cache/kwil-kw11-evidence/`.
+Failing native run: `review-broken-font-33268-1/`.
+Final visually checked capture: `review-restored-font-rtl-25624-1/first.png`.
+The copied executable's SHA256 is
+`4a494b65a3310e5aedf1510d52bdb7692bbbeb413460239c91a43348c8a5d7fb`.
+
+GPU onscreen takeover, macOS partial presentation/copy, real RDP/VNC and the 40 ms
+startup target retain their prior open status. The earlier measurements below are
+retained as evidence for their named commits, not relabelled as current startup proof.
+
 ## Source/offline checks
 
 - Nine focused renderer unit tests pass with all features on `21932a7`.
