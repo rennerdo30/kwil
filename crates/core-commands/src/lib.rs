@@ -10,6 +10,10 @@ pub mod registry;
 pub mod settings;
 pub mod settings_ui;
 pub mod vim;
+pub mod theme;
+pub mod theme_cache;
+mod theme_parse;
+pub mod theme_worker;
 
 pub use key::{Key, KeyChord, KeySequence, Modifiers, NamedKey};
 pub use keymap::{Binding, Context, Keymap, Mode, Preset, Resolution};
