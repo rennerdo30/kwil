@@ -53,6 +53,39 @@ boundaries, immutable snapshots, initial/chunk read errors, changed-file errors,
 UTF-16 LE/BE, supplementary scalars, malformed surrogates, original byte ranges,
 CRLF, preview truncation, bounded-line errors and UTF-16 cancellation.
 
+Implementation commit: `4513c5e0bb84f1441ffd6eac603e4e97e027f107`.
+Requested workspace Clippy (`--all-targets --locked -j 4 -- -D warnings`),
+format check and `git diff --check` passed. Clippy initially rejected three
+single-range test assertions; these were rewritten and Clippy then passed.
+No full workspace test suite was run locally.
+
+The Haystack API change touches the literal path, so the authorized **one**
+default-worker remeasurement ran on this exact committed implementation:
+
+```powershell
+./crates/core-search/verify.ps1 -CargoArgs @('run','--release','-p','kwil-core-search','--example','count_fixture','-j','4','--locked','--','E:/Development/kwil/fixtures/log-1g.log','--default-only') -TimeoutSeconds 240
+```
+
+Existing fixture: **1,073,741,835 bytes**. Four search workers; one pass per query,
+in the order shown; no warm-up, cache flush, repeated sample or fixture generation.
+The release build incrementally recompiled core-text and core-search, reusing
+the existing shared target cache (8.07 s).
+
+| Query | Count | Four workers |
+|---|---:|---:|
+| Literal rare `line=20353525` | 1 | **1,549.012 ms** |
+| Literal common `INFO` | 5,090,586 | **38.539 ms** |
+| Regex `ERROR line=[0-9]{1,8}` | 5,086,074 | **169.578 ms** |
+
+**The rare literal misses both the 300 ms target and 1 s hard limit in this
+run.** The common literal meets both. Counts agree with the original evidence.
+The rare query was first on the new mapping and includes its first access;
+page-cache state was uncontrolled. This does not isolate a cause or prove an
+in-memory regression. The earlier 22/37 ms result below remains historical,
+not a passing measurement for this commit. No second timing was taken under
+the one-run budget. Parent owns any decision about further measurement and
+performance acceptance, plus final-head hosted CI and independent review.
+
 ## Regex match-bound limitation
 
 The in-buffer regex engine requires every possible match to fit the declared
