@@ -1,0 +1,98 @@
+[[bindings]]
+keys = "ctrl+s"
+command = "file.save"
+[[bindings]]
+keys = "ctrl+shift+s"
+command = "file.saveAs"
+[[bindings]]
+keys = "ctrl+n"
+command = "file.new"
+[[bindings]]
+keys = "ctrl+o"
+command = "file.open"
+[[bindings]]
+keys = "ctrl+w"
+command = "file.close"
+[[bindings]]
+keys = "ctrl+shift+t"
+command = "file.reopenClosed"
+[[bindings]]
+keys = "ctrl+z"
+command = "edit.undo"
+context = "editor"
+[[bindings]]
+keys = "ctrl+y"
+command = "edit.redo"
+context = "editor"
+[[bindings]]
+keys = "ctrl+c"
+command = "edit.copy"
+[[bindings]]
+keys = "ctrl+x"
+command = "edit.cut"
+context = "editor"
+[[bindings]]
+keys = "ctrl+v"
+command = "edit.paste"
+context = "editor"
+[[bindings]]
+keys = "ctrl+a"
+command = "edit.selectAll"
+context = "editor"
+[[bindings]]
+keys = "ctrl+d"
+command = "edit.duplicateLine"
+context = "editor"
+[[bindings]]
+keys = "ctrl+l"
+command = "edit.deleteLine"
+context = "editor"
+[[bindings]]
+keys = "ctrl+g"
+command = "navigation.goToLine"
+[[bindings]]
+keys = "ctrl+q"
+command = "edit.toggleComment"
+context = "editor"
+[[bindings]]
+keys = "ctrl+f"
+command = "search.find"
+[[bindings]]
+keys = "ctrl+h"
+command = "search.replace"
+[[bindings]]
+keys = "ctrl+shift+f"
+command = "search.findInFiles"
+[[bindings]]
+keys = "f3"
+command = "search.findNext"
+[[bindings]]
+keys = "shift+f3"
+command = "search.findPrevious"
+[[bindings]]
+keys = "ctrl+shift+p"
+command = "view.commandPalette"
+[[bindings]]
+keys = "f7"
+command = "compare.nextChange"
+context = "diff"
+[[bindings]]
+keys = "shift+f7"
+command = "compare.previousChange"
+context = "diff"
+[[bindings]]
+keys = "enter"
+command = "palette.accept"
+context = "palette"
+[[bindings]]
+keys = "escape"
+command = "palette.cancel"
+context = "palette"
+[[bindings]]
+keys = "down"
+command = "palette.next"
+context = "palette"
+[[bindings]]
+keys = "up"
+command = "palette.previous"
+context = "palette"
