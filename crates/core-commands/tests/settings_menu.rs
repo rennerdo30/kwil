@@ -199,6 +199,45 @@ fn vim_grammar_probe_respects_tombstones_explicit_precedence_modes_and_contexts(
 }
 
 #[test]
+fn vim_same_command_rebind_requires_equivalent_invocation_semantics() {
+    for (keys, command) in [
+        ("d w", "operator.delete"),
+        ("d d", "operator.delete"),
+        ("2 j", "motion.down"),
+        ("1 G", "motion.lastLine"),
+        ("\" a j", "motion.down"),
+        ("/ a enter", "search.find"),
+    ] {
+        let mut doc = SettingsDocument::parse("keymap='vim'\n# owner annotation\n").unwrap();
+        let source = doc.source().to_owned();
+        let mut binding = vim_binding(keys, Some(Mode::Normal));
+        binding.command = command.into();
+        let warnings = doc.vim_grammar_warnings(&binding).unwrap();
+        assert_eq!(warnings.len(), 1, "{keys} must warn despite matching command ID");
+        assert_eq!(warnings[0].takeover, VimTakeover::Command(command));
+        assert_eq!(warnings[0].kind, ConflictKind::Exact);
+        assert!(doc.conflicts(&binding).unwrap().iter().any(|c| c.command == command));
+        assert!(doc.rebind(binding.clone(), false).is_err(), "{keys} needs explicit replacement choice");
+        assert_eq!(doc.source(), source);
+        doc.rebind(binding, true).unwrap();
+        assert!(doc.source().contains("# owner annotation"));
+    }
+    // A motion without a count and a Visual selection operator really do
+    // produce the same invocation and resulting mode through explicit dispatch.
+    let doc = SettingsDocument::parse("keymap='vim'\n").unwrap();
+    for (keys, command, mode) in [
+        ("j", "motion.down", Mode::Normal),
+        ("g g", "motion.firstLine", Mode::Normal),
+        ("d", "operator.delete", Mode::Visual),
+        ("c", "operator.change", Mode::VisualLine),
+    ] {
+        let mut binding = vim_binding(keys, Some(mode));
+        binding.command = command.into();
+        assert!(doc.vim_grammar_warnings(&binding).unwrap().is_empty(), "equivalent {keys} should not warn");
+    }
+}
+
+#[test]
 fn scoped_rebind_and_command_reset_restore_preset_without_destroying_custom_data() {
     let mut doc =
         SettingsDocument::parse("[[bindings]]\nkeys='ctrl+shift+f12'\ncommand='file.open'\nfuture='keep' # owner\n")

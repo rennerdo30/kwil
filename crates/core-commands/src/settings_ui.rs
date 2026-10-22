@@ -638,7 +638,8 @@ impl SettingsDocument {
     /// not every possible state after arbitrary earlier Vim input.
     /// Explicit bindings and applicable tombstones are resolved before grammar,
     /// following KeymapEngine's continuation/restart rules. Rebinding a key to
-    /// its same complete native command does not warn.
+    /// an equivalent complete native invocation (including count, motion,
+    /// register, arguments and resulting mode) does not warn.
     pub fn vim_grammar_warnings(&self, candidate: &Binding) -> Result<Vec<VimGrammarWarning>, SettingsError> {
         if !candidate.command.is_empty() && crate::command(&candidate.command).is_none() {
             return Err(error("unknown command"));
@@ -971,6 +972,7 @@ fn probe_vim_grammar(
         }
         _ => {}
     }
+    let mut explicit = vim.clone();
     let warning = |consumed: usize, takeover: VimTakeover| VimGrammarWarning {
         mode,
         keys: sequence.0[..consumed].iter().map(chord_name).collect::<Vec<_>>().join(" "),
@@ -1008,11 +1010,14 @@ fn probe_vim_grammar(
         match vim.feed(key) {
             VimResult::Command(call) => {
                 let consumed = index + 1;
-                return if call.id == candidate.command && consumed == sequence.0.len() {
-                    None
-                } else {
-                    Some(warning(consumed, VimTakeover::Command(call.id)))
-                };
+                // Explicit dispatch starts from the fresh mode, not the
+                // grammar state accumulated by these chords. Matching IDs
+                // alone would hide dw's motion or 2j's count, for example.
+                let equivalent = call.id == candidate.command
+                    && consumed == sequence.0.len()
+                    && explicit.invoke(call.id) == VimResult::Command(call.clone())
+                    && explicit.mode() == vim.mode();
+                return if equivalent { None } else { Some(warning(consumed, VimTakeover::Command(call.id))) };
             }
             VimResult::Pending => {
                 grammar_prefix = Some(index + 1);
