@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "runner": "windows-2025",
+  "fixture": "v1",
+  "commit": "c2530a2699c6afa5744bf33f9b36f98e6eb8bf13",
+  "runs": 5,
+  "samples": [
+    {
+      "index_gb_s": 5.091854843451837,
+      "index_ms": 210.87439999999998,
+      "jump_ms": 0.12300000000000001,
+      "lines": 20353527,
+      "open_first_ms": 0.1972,
+      "private_mb": 4.1640625,
+      "startup_file_ms": 88.85,
+      "startup_empty_ms": 41.019,
+      "startup_index_ms": 232.727
+    },
+    {
+      "index_gb_s": 4.445839573428024,
+      "index_ms": 241.51610000000002,
+      "jump_ms": 0.0892,
+      "lines": 20353527,
+      "open_first_ms": 0.19369999999999998,
+      "private_mb": 4.1015625,
+      "startup_file_ms": 90.961,
+      "startup_empty_ms": 36.037,
+      "startup_index_ms": 236.726
+    },
+    {
+      "index_gb_s": 5.301957529701063,
+      "index_ms": 202.518,
+      "jump_ms": 0.1182,
+      "lines": 20353527,
+      "open_first_ms": 0.1955,
+      "private_mb": 4.12109375,
+      "startup_file_ms": 103.053,
+      "startup_empty_ms": 35.013,
+      "startup_index_ms": 244.484
+    },
+    {
+      "index_gb_s": 5.0302182440317385,
+      "index_ms": 213.45829999999998,
+      "jump_ms": 0.1164,
+      "lines": 20353527,
+      "open_first_ms": 0.251,
+      "private_mb": 4.77734375,
+      "startup_file_ms": 89.52,
+      "startup_empty_ms": 36.829,
+      "startup_index_ms": 235.853
+    },
+    {
+      "index_gb_s": 5.356231832945154,
+      "index_ms": 200.4659,
+      "jump_ms": 0.11220000000000001,
+      "lines": 20353527,
+      "open_first_ms": 0.194,
+      "private_mb": 4.11328125,
+      "startup_file_ms": 92.087,
+      "startup_empty_ms": 35.669,
+      "startup_index_ms": 242.388
+    }
+  ],
+  "medians": {
+    "index_gb_s": 5.091854843451837,
+    "index_ms": 210.87439999999998,
+    "jump_ms": 0.1164,
+    "lines": 20353527,
+    "open_first_ms": 0.1955,
+    "private_mb": 4.12109375,
+    "startup_file_ms": 90.961,
+    "startup_empty_ms": 36.037,
+    "startup_index_ms": 236.726
+  }
+}

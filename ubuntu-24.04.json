@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "runner": "ubuntu-24.04",
+  "fixture": "v1",
+  "commit": "c2530a2699c6afa5744bf33f9b36f98e6eb8bf13",
+  "runs": 5,
+  "samples": [
+    {
+      "index_gb_s": 18.232509745148924,
+      "index_ms": 58.891608999999995,
+      "jump_ms": 0.019599,
+      "lines": 20353527,
+      "open_first_ms": 0.042563,
+      "private_mb": 1.453125,
+      "startup_file_ms": 235.604,
+      "startup_empty_ms": 36.344,
+      "startup_index_ms": 282.372
+    },
+    {
+      "index_gb_s": 17.086410793697066,
+      "index_ms": 62.84186,
+      "jump_ms": 0.018417,
+      "lines": 20353527,
+      "open_first_ms": 0.048112,
+      "private_mb": 1.4921875,
+      "startup_file_ms": 31.521,
+      "startup_empty_ms": 35.918,
+      "startup_index_ms": 82.662
+    },
+    {
+      "index_gb_s": 17.348003994166955,
+      "index_ms": 61.894258,
+      "jump_ms": 0.018307,
+      "lines": 20353527,
+      "open_first_ms": 0.065027,
+      "private_mb": 1.49609375,
+      "startup_file_ms": 41.121,
+      "startup_empty_ms": 31.08,
+      "startup_index_ms": 78.347
+    },
+    {
+      "index_gb_s": 17.4038186351247,
+      "index_ms": 61.695761000000005,
+      "jump_ms": 0.015894000000000002,
+      "lines": 20353527,
+      "open_first_ms": 0.051066,
+      "private_mb": 1.453125,
+      "startup_file_ms": 40.026,
+      "startup_empty_ms": 36.596,
+      "startup_index_ms": 72.811
+    },
+    {
+      "index_gb_s": 17.04838566318542,
+      "index_ms": 62.982023999999996,
+      "jump_ms": 0.018688,
+      "lines": 20353527,
+      "open_first_ms": 0.049935,
+      "private_mb": 1.49609375,
+      "startup_file_ms": 38.813,
+      "startup_empty_ms": 34.696,
+      "startup_index_ms": 101.278
+    }
+  ],
+  "medians": {
+    "index_gb_s": 17.348003994166955,
+    "index_ms": 61.894258,
+    "jump_ms": 0.018417,
+    "lines": 20353527,
+    "open_first_ms": 0.049935,
+    "private_mb": 1.4921875,
+    "startup_file_ms": 40.026,
+    "startup_empty_ms": 35.918,
+    "startup_index_ms": 82.662
+  }
+}
