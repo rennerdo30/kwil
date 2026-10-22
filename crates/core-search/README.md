@@ -1,0 +1,90 @@
+# core-search
+
+Worker-side engines for KW-22, KW-23 and the KW-41 line filter. No UI, runtime,
+file mutation, implicit background thread, or file-sized working buffer.
+
+## Integration contract
+
+- `Haystack` borrows an immutable byte snapshot, returning chunks with absolute
+  `u64` offsets covering the requested range. `TextFile` and byte slices have
+  implementations here. A piece-tree snapshot can implement this trait without
+  making its pieces contiguous. `TextFile` retains responsibility for mapping
+  lifetime and external-change safety; this crate does not add a watcher.
+- `search` emits ordered, non-overlapping `(offset, len)` hits (16 bytes each).
+  Count mode retains no hits. The caller owns the worker and cancellation token,
+  and should coalesce progress into its event loop's status updates. Collectors
+  must cap or spool hits; signal-strip consumers can aggregate them by viewport
+  bin instead of retaining millions of individual markers.
+- Literal case-sensitive search uses `memmem`; case-insensitive text literals
+  use Unicode regex folding, with ASCII folding for non-UTF-8 byte patterns.
+  Whole word uses Unicode `\w`, treating invalid bytes as non-word. Offsets are
+  original bytes; legacy-encoding decode and offset mapping are separate adapters.
+- Regex search requires a declared maximum possible match length, at most 1 MiB
+  (64 KiB is a suggested UI default). Its overlap retains this bound plus Unicode
+  boundary context. Expressions like `.*` require an input-specific guarantee;
+  arbitrary-length multiline regex is outside this contract. Detected overlong
+  matches return an error. The selection restricts hits, preserving document
+  context for anchors and whole words. Memory is O(1 MiB + declared match bound).
+- `plan_replace` accepts ordered matches from the same source/pattern and emits
+  ordered edits. `$1`, `${name}`, `$0`, `$$`, missing and optional captures follow
+  `regex` interpolation. Literal replacements preserve dollar signs, including
+  case-insensitive literals. The editor groups this stream into one undo step;
+  it may spool edits or admit a capped Vec. Templates are capped at 1 MiB and
+  each expanded edit at 8 MiB, checked before allocation growth.
+- `LineFilter` applies an AND/OR/NOT expression to indexed patterns on each line.
+  Lines are virtual haystacks: even giant lines are scanned in bounded windows.
+  Runs use one-based, half-open line numbers. `LineRuns` optionally collects runs
+  under an explicit capacity, returning an error rather than growing unchecked.
+  With `include_unterminated=false`, the resume cursor stays at the incomplete
+  final line, so append processing revisits only that line and new bytes.
+  A static view may include that final line provisionally; the watcher replaces
+  its provisional result on append and resets the cursor on rotation/truncation.
+- `find_in_files` uses ripgrep's engine with `.gitignore` and root-relative
+  include/exclude globs (exclude wins; include does not bypass ignore). Workers
+  default to half the logical CPUs, capped at four, and caller overrides cannot
+  exceed this. Each worker has a default 2 MiB grep buffer (configurable 64 KiB
+  to 8 MiB); longer lines emit an explicit error. Results have capped previews
+  and match ranges; ranges beyond the preview remain full-line-relative.
+  Different files interleave, while each file's results remain ordered.
+  Supply a **bounded `sync_channel`**, consume on the UI side, and set the token
+  or drop the receiver when superseding a query. Worker-only backpressure waits
+  check cancellation every 5 ms; no UI timer or polling is required. Reads also
+  check cancellation, including files with no matches (OS blocking I/O itself
+  cannot be interrupted by the token).
+
+## Verification
+
+`verify.ps1` launches cargo with a recorded PID, timeout, private target directory
+and four compile jobs. `fail-first.ps1` mutates this package only, checks each
+acceptance test fails, and restores byte-identical originals in `finally`.
+The fixture measurement example runs each query exactly once, without a warm-up
+or benchmark loop:
+
+```powershell
+./crates/core-search/verify.ps1 -CargoArgs test,-p,kwil-core-search,-j,4,--locked
+./crates/core-search/fail-first.ps1
+./crates/core-search/verify.ps1 -CargoArgs @('run','--release','-j','4','--manifest-path','spike/textbench/Cargo.toml','--','gen','fixtures/log-1g.log','1024') -TimeoutSeconds 240
+./crates/core-search/verify.ps1 -CargoArgs @('run','--release','-p','kwil-core-search','--example','count_fixture','-j','4','--locked','--','fixtures/log-1g.log') -TimeoutSeconds 240
+```
+
+Unit tests lower the work-window size to 64 bytes to exercise actual overlap
+ownership, in addition to haystack chunks as small as one byte. Each filesystem
+test owns a unique temporary directory. The real measurement uses 1 MiB windows.
+
+## Dependencies
+
+Checked against the crates.io API on 2026-10-23; current stable versions:
+
+| Dependency | Version | Release date | Purpose | License |
+|---|---|---|---|---|
+| memchr | 2.8.3 | 2026-07-08 | SIMD literal/line scans (already in workspace) | MIT or Unlicense |
+| regex | 1.13.1 | 2026-07-15 | Byte regex, captures, Unicode | MIT or Apache-2.0 |
+| ignore | 0.4.33 | 2026-08-04 | Ignore-aware capped parallel walking | MIT or Unlicense |
+| grep-searcher | 0.1.17 | 2026-07-15 | Streaming file reader and line search | MIT or Unlicense |
+| grep-regex | 0.1.14 | 2025-10-16 | Ripgrep regex matcher | MIT or Unlicense |
+| grep-matcher | 0.1.9 | 2026-07-15 | Access per-line match ranges | MIT or Unlicense |
+| globset | 0.4.20 | 2026-08-04 | Include/exclude without overriding ignore | MIT or Unlicense |
+
+No new async runtime or derive/proc-macro dependencies. The lockfile adds 16
+packages to the existing graph. First cold dependency check took about 5 s;
+first focused test compile took 15.06 s at `-j 4` (owner PC, warm registry).
