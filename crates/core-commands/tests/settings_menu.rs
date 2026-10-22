@@ -20,6 +20,30 @@ fn schema_search_navigation_current_default_and_reset() {
 }
 
 #[test]
+fn tabs_layout_is_typed_validated_searchable_and_resets_without_losing_unknown_fields() {
+    assert_eq!(Settings::default().tabs.layout, TabLayout::Horizontal);
+    assert_eq!(Settings::parse("[tabs]\nlayout='vertical'\n").unwrap().settings.tabs.layout, TabLayout::Vertical);
+    assert!(Settings::parse("[tabs]\nlayout='sideways'\n").is_err());
+    assert!(Settings::parse("[tabs]\nlayout=true\n").is_err());
+    let source = "[tabs]\nlayout='vertical' # owner position\nfuture='keep'\n";
+    let mut menu = SettingsMenu::new(SettingsDocument::parse(source).unwrap());
+    menu.search("tabs layout");
+    let row = menu.selected().unwrap();
+    assert_eq!(row.spec.id, "tabs.layout");
+    assert_eq!(row.current, SettingValue::Text("vertical".into()));
+    assert_eq!(row.default, SettingValue::Text("horizontal".into()));
+    assert_eq!(menu.document().report().unknown_keys, vec!["tabs.future"]);
+    assert!(menu.edit_selected(SettingValue::Text("sideways".into())).is_err());
+    assert_eq!(menu.document().source(), source);
+    menu.reset_selected().unwrap();
+    assert_eq!(menu.document().settings().tabs.layout, TabLayout::Horizontal);
+    assert!(menu.document().source().contains("# owner position"));
+    assert!(menu.document().source().contains("future='keep'"));
+    menu.edit_selected(SettingValue::Text("vertical".into())).unwrap();
+    assert_eq!(menu.document().settings().tabs.layout, TabLayout::Vertical);
+}
+
+#[test]
 fn invalid_edit_does_not_change_document_or_unknown_fields() {
     let source = "# owner\nfuture = { enabled = true }\n[editor]\ntab_size = 7 # width\nfuture = 'leave'\n";
     let mut doc = SettingsDocument::parse(source).unwrap();

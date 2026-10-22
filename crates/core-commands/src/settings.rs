@@ -37,7 +37,16 @@ pub enum UpdateChannel {
     Prerelease,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabLayout {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
 group!(RenderSettings { remote: Remote = Remote::Auto, smooth_scrolling: bool = false, cursor_blink: bool = true });
+group!(TabsSettings { layout: TabLayout = TabLayout::Horizontal });
 group!(UpdateSettings { check: bool = true, channel: UpdateChannel = UpdateChannel::Stable });
 group!(FontSettings {
     family: String = "monospace".into(),
@@ -70,6 +79,7 @@ group!(LogSettings { follow: bool = false, detect_levels: bool = true,
 group!(Formatter { executable: String = String::new(), args: Vec<String> = Vec::new(), timeout_ms: u32 = 5000 });
 group!(Settings {
     keymap: Preset = Preset::VsCode, bindings: Vec<Binding> = Vec::new(),
+    tabs: TabsSettings = TabsSettings::default(),
     render: RenderSettings = RenderSettings::default(), update: UpdateSettings = UpdateSettings::default(),
     font: FontSettings = FontSettings::default(), theme: ThemeSettings = ThemeSettings::default(),
     editor: EditorSettings = EditorSettings::default(), files: FilesSettings = FilesSettings::default(),
@@ -339,8 +349,10 @@ fn known(path: &str) -> &'static [&'static str] {
             "log",
             "formatters",
             "file_types",
+            "tabs",
         ],
         "render" => &["remote", "smooth_scrolling", "cursor_blink"],
+        "tabs" => &["layout"],
         "update" => &["check", "channel"],
         "font" => &["family", "size", "line_height", "ligatures"],
         "theme" => &["name", "follow_os", "colors"],

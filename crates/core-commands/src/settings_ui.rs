@@ -100,6 +100,20 @@ macro_rules! spec {
 }
 pub const SCHEMA: &[SettingSpec] = &[
     spec!(
+        "tabs.layout",
+        "Tabs layout",
+        Appearance,
+        "Arrange visible file tabs horizontally at the top or vertically on the left.",
+        SettingKind::Choice(&["horizontal", "vertical"]),
+        |s| SettingValue::Text(
+            match s.tabs.layout {
+                crate::settings::TabLayout::Horizontal => "horizontal",
+                crate::settings::TabLayout::Vertical => "vertical",
+            }
+            .into()
+        )
+    ),
+    spec!(
         "bindings",
         "Custom bindings",
         Keymap,
