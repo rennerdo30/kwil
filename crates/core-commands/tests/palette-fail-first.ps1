@@ -25,6 +25,9 @@ function Reject-Defect([string]$name, [string[]]$cargoArgs, [string[]]$expected)
     if (!$process.WaitForExit(120000)) { Stop-Process -Id $process.Id; throw "$name timeout" }
     $outText = [IO.File]::ReadAllText($stdout)
     $errText = [IO.File]::ReadAllText($stderr)
+    $header = "Commit under test: $commit plus owned KW24 source mutations`n"
+    [IO.File]::WriteAllText($stdout, $header + $outText)
+    [IO.File]::WriteAllText($stderr, $header + $errText)
     if ($process.ExitCode -eq 0 -or $errText.Contains('could not compile')) {
         throw "$name must compile and fail assertions`n$outText`n$errText"
     }
