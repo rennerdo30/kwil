@@ -18,6 +18,7 @@ pub use kwil_core_workspace::session::DocumentId as SessionDocumentId;
 mod tests;
 mod text;
 pub use document::{Document, DocumentEncoding, DocumentLineEnding};
+pub use editor::receipts::{ByteReplacement, EditKind, EditObserver, EditReceipt, SnapshotInsert};
 pub use editor::{Clipboard, ClipboardData, CommandArgs, CommandResult, CommandStatus, Cursor, Editor, Motion};
 
 /// A message from a worker thread for the status bar (update notices,

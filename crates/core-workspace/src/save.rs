@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+mod trim_spool;
+pub use trim_spool::{TrimRanges, TrimSpool};
 
 pub struct SaveRequest {
     pub snapshot: Snapshot,
@@ -28,6 +30,7 @@ pub struct SavedSnapshot {
     /// returned to the frontend as warnings, never hidden.
     pub warnings: Vec<String>,
     pub trimmed_rows: Option<Range<u64>>,
+    pub trim_deletions: Option<TrimSpool>,
 }
 
 /// Opening worker entry point, also conservatively cleans recognized orphan
@@ -71,7 +74,12 @@ impl Drop for Temporary {
 
 pub fn save_snapshot(request: SaveRequest) -> io::Result<SavedSnapshot> {
     if request.trim_trailing_whitespace {
-        save_with_operations(request, write_trimmed, replace)
+        let mut spool = TrimSpool::new()?;
+        let mut saved = save_with_operations(request, |s, f| write_trimmed(s, f, &mut spool), replace)?;
+        if !spool.is_empty() {
+            saved.trim_deletions = Some(spool);
+        }
+        Ok(saved)
     } else {
         save_with(request, |snapshot, file| snapshot.write_to(file))
     }
@@ -151,7 +159,15 @@ fn save_with_operations(
     // scan or read from the original pathname can occur during completion.
     let file = TextFile::open_saved_version(&path).map_err(io::Error::from)?;
     let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
-    Ok(SavedSnapshot { path, file, snapshot: buffer.snapshot(), revision: request.revision, warnings, trimmed_rows })
+    Ok(SavedSnapshot {
+        path,
+        file,
+        snapshot: buffer.snapshot(),
+        revision: request.revision,
+        warnings,
+        trimmed_rows,
+        trim_deletions: None,
+    })
 }
 
 fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io::Write) -> io::Result<()> {
@@ -163,7 +179,7 @@ fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io
 
 /// Scan and emit immutable source ranges. Trailing runs are offsets, even a
 /// gigabyte of spaces/tabs costs two integers, not a buffer or per-line edits.
-fn write_trimmed(snapshot: &Snapshot, writer: &mut File) -> io::Result<Option<Range<u64>>> {
+fn write_trimmed(snapshot: &Snapshot, writer: &mut File, spool: &mut TrimSpool) -> io::Result<Option<Range<u64>>> {
     let mut trail = None;
     let mut cr = false;
     let mut offset = 0_u64;
@@ -172,6 +188,7 @@ fn write_trimmed(snapshot: &Snapshot, writer: &mut File) -> io::Result<Option<Ra
     let mut changed: Option<Range<u64>> = None;
     let mut emit_trim = |start: u64, end: u64, line_end: u64, row: u64, from: &mut u64| -> io::Result<()> {
         if start < end {
+            spool.push(start..end)?;
             write_range(snapshot, *from..start, writer)?;
             write_range(snapshot, end..line_end, writer)?;
             *from = line_end;
@@ -216,6 +233,7 @@ fn write_trimmed(snapshot: &Snapshot, writer: &mut File) -> io::Result<Option<Ra
         emit_trim(start, if cr { offset - 1 } else { offset }, offset, row, &mut from)?;
     }
     write_range(snapshot, from..snapshot.len(), writer)?;
+    spool.seal()?;
     Ok(changed)
 }
 
@@ -394,6 +412,11 @@ mod tests {
         b.insert(1, b" edited").unwrap();
         let worker = b.snapshot();
         let saved = save_snapshot(f.request(original.clone(), &b)).unwrap();
+        assert_eq!(
+            original.check().unwrap(),
+            kwil_core_text::FileState::Replaced,
+            "watchers must still check the live pathname, while snapshots read the pinned object"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"a edited\r\nb\r\n");
         let mut out = Vec::new();
         worker.write_to(&mut out).unwrap();

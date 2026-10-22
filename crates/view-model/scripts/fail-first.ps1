@@ -22,13 +22,20 @@ function Mutate([string]$name,[string]$file,[string]$before,[string]$after,[stri
     if ($Only -and $name -notin $Only) { return }
     $path = Join-Path $copy $file
     $original = [IO.File]::ReadAllText($path)
-    if (-not $original.Contains($before)) { throw "Missing mutation anchor: $name" }
+    $mutated = if ($original.Contains($before)) { $original.Replace($before,$after) } else {
+        $pattern = (($before -split '\s+' | ForEach-Object { [regex]::Escape($_) }) -join '\s+')
+        if (-not [regex]::IsMatch($original,$pattern)) { throw "Missing mutation anchor: $name" }
+        [regex]::Replace($original,$pattern,[Text.RegularExpressions.MatchEvaluator]{ param($match) $after })
+    }
     try {
-        [IO.File]::WriteAllText($path,$original.Replace($before,$after))
+        [IO.File]::WriteAllText($path,$mutated)
         $outPath = Join-Path $scratch "$name.out"
         $errPath = Join-Path $scratch "$name.err"
         "commit=$commit mutant=$name file=$file" | Set-Content -LiteralPath (Join-Path $scratch "$name.log")
-        $args = @('test','--locked','--manifest-path',(Join-Path $copy 'Cargo.toml'),'-p',$package,'-j','4','--','--nocapture') + $tests
+        $args = @('test','--locked','--manifest-path',(Join-Path $copy 'Cargo.toml'),'-j','4')
+        foreach ($pkg in $package.Split(',')) { $args += @('-p',$pkg) }
+        if ($package.Contains(',')) { $args += '--no-fail-fast' }
+        $args += @('--','--nocapture') + $tests
         if ($Ignored) { $args += '--ignored' }
         $startOptions = @{}
         if ($IsWindows) { $startOptions.WindowStyle = 'Hidden' }
@@ -79,11 +86,21 @@ Mutate 'wrong-saved-revision' 'crates/view-model/src/editor/save.rs' 'self.docum
 Mutate 'tab-columns' 'crates/view-model/src/grid.rs' 'tab_size.max(1) - column % tab_size.max(1)' '1' 'kwil-view-model' @('tests::frontend_positions_and_selection_ranges_use_unicode_and_tab_stops')
 Mutate 'drop-pending-goto' 'crates/view-model/src/lib.rs' 'self.pending_goto = Some((line, args.column.unwrap_or(1), args.extend));' 'self.pending_goto = None;' 'kwil-view-model' @('tests::view_defers_goto_and_caches_bounded_long_line_windows')
 Mutate 'full-undo-damage' 'crates/view-model/src/editor.rs' 'edited = entry.edited.clone();' 'edited = self.top..self.top + self.rows as u64;' 'kwil-view-model' @('tests::linewise_put_at_unterminated_eof_and_precise_undo_damage')
+Mutate 'inverse-prefix-scan' 'crates/core-text/src/line_index.rs' 'if self.rank_checkpoints[j].1 > off {
+            (cl, off) = self.rank_checkpoints[j];
+        }
+        let end = self.rank_checkpoints.get(j + 1).map_or(self.len, |&(_, at)| at);' 'let end = self.len;' 'kwil-core-text' @('line_index::tests::inverse_line_lookup_scans_one_byte_rank_block')
 Mutate 'disable-coalescing' 'crates/core-text/src/buffer.rs' 'self.history.record(before, self.snapshot(), coalesce);' 'self.history.record(before, self.snapshot(), false);' 'kwil-core-text' @('buffer::editing_contract_tests::batch_cancel_coalescing_shared_ranges_and_checkpoint_keep_history')
-Mutate 'foreign-budget-bypass' 'crates/core-text/src/buffer.rs' 'let inserted = piece_tree::import_added(inserted, &self.added, &self.snapshot.originals)?;' 'let inserted = inserted;' 'kwil-core-text' @('buffer::editing_contract_tests::foreign_snapshot_paste_obeys_destination_resident_budget')
-Mutate 'retain-foreign-original' 'crates/core-text/src/piece_tree.rs' 'Storage::Original(file) => !originals.contains_key(&file.history_backing_ref().id()),' 'Storage::Original(file) => false,' 'kwil-core-text' @('buffer::editing_contract_tests::tiny_foreign_original_pastes_release_resident_sources_under_zero_caps')
+Mutate 'foreign-budget-bypass' 'crates/core-text/src/piece_tree.rs' 'Storage::Memory { budget: source, .. } => !Arc::ptr_eq(source, budget),' 'Storage::Memory { budget: source, .. } => false,' 'kwil-core-text' @('buffer::editing_contract_tests::foreign_snapshot_paste_obeys_destination_resident_budget')
+Mutate 'retain-foreign-original' 'crates/core-text/src/piece_tree.rs' '!piece.owner.as_ref().is_some_and(|source| Arc::ptr_eq(source, owner))' 'false' 'kwil-core-text' @('buffer::editing_contract_tests::tiny_foreign_original_pastes_release_resident_sources_under_zero_caps')
 Mutate 'keep-deleted-originals' 'crates/core-text/src/buffer.rs' 'if !removed.is_empty() {' 'if false && !removed.is_empty() {' 'kwil-core-text' @('buffer::editing_contract_tests::deleting_last_original_byte_prunes_all_source_bookkeeping')
-Mutate 'copy-own-original' 'crates/core-text/src/piece_tree.rs' 'Storage::Original(file) => !originals.contains_key(&file.history_backing_ref().id()),' 'Storage::Original(file) => true,' 'kwil-core-text' @('buffer::editing_contract_tests::immutable_slice_concat_keep_own_original_shared_and_counted_once')
+Mutate 'copy-own-original' 'crates/core-text/src/piece_tree.rs' '!piece.owner.as_ref().is_some_and(|source| Arc::ptr_eq(source, owner))' 'true' 'kwil-core-text,kwil-view-model' @('buffer::editing_contract_tests::immutable_slice_concat_keep_own_original_shared_and_counted_once','tests::whole_document_line_move_and_clipboard_reuse_keep_original_pieces_owned')
+Mutate 'receipt-payload-range' 'crates/view-model/src/editor/receipts.rs' 'range: source }' 'range: 0..0 }' 'kwil-view-model' @('tests::receipts_multicursor_coalesced_undo_redo_are_exact','tests::receipts_bulk_lines_and_vim_operations_replay_atomically','tests::receipts_backpressure_retains_save_completion_and_stale_save_settles')
+Mutate 'receipt-ignore-backpressure' 'crates/view-model/src/editor/receipts.rs' 'if self.has_pending_edit_receipt() {' 'if false && self.has_pending_edit_receipt() {' 'kwil-view-model' @('tests::receipts_backpressure_retains_save_completion_and_stale_save_settles')
+Mutate 'spool-leak' 'crates/core-workspace/src/save.rs' 'let _ = fs::remove_file(&self.path);' 'let _ = &self.path;' 'kwil-core-workspace' @('save::trim_spool::tests::trim_spool_offsets_are_lazy_reversible_and_removed_on_last_drop')
+Mutate 'model-metadata-cap-bypass' 'crates/core-text/src/buffer.rs' 'self.history.charge_latest_model(bytes);' 'let _ = bytes;' 'kwil-core-text' @('buffer::editing_contract_tests::model_metadata_charge_is_idempotent_and_obeys_history_cap')
+Mutate 'line-selection-boundary' 'crates/view-model/src/editor.rs' 'let owner = old.selection().start;' 'let owner = old.head;' 'kwil-view-model' @('tests::line_move_selection_end_boundary_owns_selected_line_and_restores_orientation')
+Mutate 'unsafe-saved-baseline' 'crates/core-text/src/piece_tree.rs' 'pub(crate) fn saved_original(tree: &Tree) -> bool {' 'pub(crate) fn saved_original(tree: &Tree) -> bool { if tree.is_some() { return true; }' 'kwil-core-text' @('buffer::editing_contract_tests::saved_baseline_shortcuts_reject_foreign_resident_slices')
 Mutate 'keep-invalid-cache' 'crates/core-text/src/file/read_batch.rs' 'admission.invalid |= admission.generation != file.shared.read_generation.load(Ordering::Relaxed);' 'admission.invalid |= false;' 'kwil-core-text' @('file::read_batch::tests::live_check_invalidates_outer_nested_and_fresh_commands','file::read_batch::tests::pin_generation_and_unwind_never_revive_nested_admission')
 Mutate 'ignore-write-failure' 'crates/core-workspace/src/save.rs' 'let trimmed_rows = write(&request.snapshot, temp.file.as_mut().unwrap()).map_err(|e| save_error(&path, e))?;' 'let trimmed_rows = write(&request.snapshot, temp.file.as_mut().unwrap()).unwrap_or(None);' 'kwil-core-workspace' @('save::tests::failed_write_leaves_original_and_no_temp')
 Mutate 'ignore-readonly' 'crates/core-workspace/src/save.rs' 'if m.permissions().readonly() {' 'if false && m.permissions().readonly() {' 'kwil-core-workspace' @('save::tests::read_only_error_is_clear')

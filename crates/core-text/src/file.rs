@@ -280,20 +280,31 @@ impl TextFile {
     /// A missing path counts as replaced. Other I/O errors propagate, and
     /// callers must not read the old mapping on error.
     pub fn check(&self) -> io::Result<FileState> {
-        let result = self.check_live();
+        self.observe_check(self.check_path_live())
+    }
+
+    fn check_source(&self) -> io::Result<FileState> {
+        self.observe_check(self.check_source_live())
+    }
+
+    fn observe_check(&self, result: io::Result<FileState>) -> io::Result<FileState> {
         if !matches!(&result, Ok(FileState::Unchanged)) {
             self.shared.read_generation.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
 
-    fn check_live(&self) -> io::Result<FileState> {
+    fn check_source_live(&self) -> io::Result<FileState> {
         let pinned = self.shared.save_backing.lock().map_err(|_| io::Error::other("save pin lock poisoned"))?;
         if pinned.is_some() {
             // A save pins this exact object. Path replacement can no longer
             // redirect old pieces or worker snapshots to the new file.
             return Ok(self.shared.stamp.state(&Stamp::read(&self.shared._file)?));
         }
+        self.check_path_live()
+    }
+
+    fn check_path_live(&self) -> io::Result<FileState> {
         match File::open(&self.shared.path) {
             Ok(file) => Ok(self.shared.stamp.state(&Stamp::read(&file)?)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(FileState::Replaced),
@@ -356,7 +367,7 @@ impl TextFile {
             result?;
             return Ok(self.shared.bytes.as_slice());
         }
-        match self.check().map_err(ReadError::Io)? {
+        match self.check_source().map_err(ReadError::Io)? {
             FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
             state => Err(ReadError::Changed(state)),
         }

@@ -63,7 +63,7 @@ pub(super) fn admitted(file: &TextFile) -> Option<Result<(), ReadError>> {
         });
     }
     let generation = file.shared.read_generation.load(Ordering::Relaxed);
-    let result = match file.check() {
+    let result = match file.check_source() {
         Ok(FileState::Unchanged) => Ok(()),
         Ok(state) => Err(ReadError::Changed(state)),
         Err(e) => Err(ReadError::Io(e)),
