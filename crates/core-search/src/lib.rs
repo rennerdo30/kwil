@@ -2,7 +2,15 @@
 //! wake their event loop from callbacks/channels; nothing here runs on a UI timer.
 //!
 //! Offsets refer to the immutable source snapshot's original bytes. Encoding
-//! adapters can implement [`Haystack`] separately. Search does not decode files.
+//! adapters can implement [`Haystack`] separately. In-buffer search does not
+//! decode files; find-in-files decodes BOM-marked UTF-16 LE/BE in bounded lines
+//! and translates hits back to original-file byte offsets.
+//!
+//! Regex windowing requires every match to fit the caller's max-match bound.
+//! A longer match may be missed silently across window borders; only detected
+//! overlong matches return errors. Callers must not assume every bound violation
+//! errors. Prefer the line-oriented [`find_in_files`] mode when completeness
+//! matters: it searches complete lines and reports lines exceeding its heap cap.
 
 mod files;
 mod filter;

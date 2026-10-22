@@ -6,9 +6,10 @@ file mutation, persistent background thread, or file-sized working buffer.
 ## Integration contract
 
 - `Haystack` borrows an immutable byte snapshot, returning chunks with absolute
-  `u64` offsets covering the requested range. `TextFile` and byte slices have
-  implementations here. A piece-tree snapshot can implement this trait without
-  making its pieces contiguous. `TextFile` retains responsibility for mapping
+  `u64` offsets covering the requested range. `TextFile`, byte slices and the
+  piece-tree `Snapshot` have implementations here without flattening pieces.
+  Both opening the chunk iterator and reading individual chunks may fail; all
+  consumers propagate these errors. `TextFile` retains responsibility for mapping
   lifetime and external-change safety; this crate does not add a watcher.
 - `search` emits ordered, non-overlapping `(offset, len)` hits (16 bytes each).
   Count mode retains no hits. The caller owns the worker and cancellation token,
@@ -27,13 +28,18 @@ file mutation, persistent background thread, or file-sized working buffer.
   drains channels in addition to the reported search workers.
 - Literal case-sensitive search uses `memmem`; case-insensitive text literals
   use Unicode regex folding, with ASCII folding for non-UTF-8 byte patterns.
-  Whole word uses Unicode `\w`, treating invalid bytes as non-word. Offsets are
-  original bytes; legacy-encoding decode and offset mapping are separate adapters.
+  Whole word uses Unicode `\b` at both ends, treating invalid bytes as non-word.
+  Regexes compile these constraints into the expression, preserving alternatives
+  and capture numbering. Offsets are original bytes; in-buffer encoding decode
+  and offset mapping are separate adapters.
 - Regex search requires a declared maximum possible match length, at most 1 MiB
   (64 KiB is a suggested UI default). Its overlap retains this bound plus Unicode
   boundary context. Expressions like `.*` require an input-specific guarantee;
   arbitrary-length multiline regex is outside this contract. Detected overlong
-  matches return an error. The selection restricts hits, preserving document
+  matches return an error, but overlong matches may be missed silently across
+  window borders. Callers cannot assume every bound violation errors. Prefer
+  line-oriented `find_in_files` where completeness matters within a line.
+  The selection restricts hits, preserving document
   context for anchors and whole words. Memory is O(1 MiB + declared match bound).
   Main chunk bodies are borrowed; only overlap tails and prefixes are copied.
   Parallel workers each keep the same bounded working set.
@@ -57,6 +63,12 @@ file mutation, persistent background thread, or file-sized working buffer.
   exceed this. Each worker has a default 2 MiB grep buffer (configurable 64 KiB
   to 8 MiB); longer lines emit an explicit error. Results have capped previews
   and match ranges; ranges beyond the preview remain full-line-relative.
+  UTF-16 LE/BE BOMs select a bounded line decoder before binary detection;
+  other files retain grep's NUL detection. UTF-16 previews are UTF-8, while
+  line offsets and match ranges refer to original file bytes, including the BOM.
+  Ranges include a matching CR in CRLF; previews omit CRLF only. LF separates
+  records and cannot be matched. UTF-16 lines use at most heap_limit/8 code
+  units, allowing both raw units and decoded text within the worker budget.
   Different files interleave, while each file's results remain ordered.
   Supply a **bounded `sync_channel`**, consume on the UI side, and set the token
   or drop the receiver when superseding a query. Worker-only backpressure waits
@@ -75,6 +87,7 @@ at one worker and at the editor default, without a warm-up or benchmark loop:
 ```powershell
 ./crates/core-search/verify.ps1 -CargoArgs test,-p,kwil-core-search,-j,4,--locked
 ./crates/core-search/fail-first.ps1
+./crates/core-search/review-fail-first.ps1
 ./crates/core-search/verify.ps1 -CargoArgs @('run','--release','-j','4','--manifest-path','spike/textbench/Cargo.toml','--','gen','fixtures/log-1g.log','1024') -TimeoutSeconds 240
 ./crates/core-search/verify.ps1 -CargoArgs @('run','--release','-p','kwil-core-search','--example','count_fixture','-j','4','--locked','--','fixtures/log-1g.log') -TimeoutSeconds 240
 ```
@@ -82,6 +95,8 @@ at one worker and at the editor default, without a warm-up or benchmark loop:
 Unit tests lower the work-window size to 128 bytes to exercise actual overlap
 ownership, in addition to haystack chunks as small as one byte. Each filesystem
 test owns a unique temporary directory. The real measurement uses 1 MiB windows.
+Pass `--default-only` after the fixture path for one pass at the default worker
+count only, as used for fix round 1.
 
 ## Dependencies
 

@@ -8,4 +8,8 @@ A blazing fast plain text editor for GUI and terminal, written in Rust.
 
 Status: early development (M0 done; see [docs/SPEC.md](docs/SPEC.md) and [docs/decisions](docs/decisions)).
 
+## Known limitations
+
+- **ISO-2022-JP** (and other stateful encodings) are not supported yet. Such files open with a clear "unsupported encoding" message instead of garbled text. All other common encodings work, including UTF-8, UTF-16, Shift_JIS, EUC-JP, GBK, Big5 and Windows-1252. See [docs/SPEC.md](docs/SPEC.md) §5.
+
 License: [MIT](LICENSE).

@@ -210,7 +210,8 @@ fn partitions<H: Haystack + ?Sized>(
         let end = nominal.saturating_add(256 << 10).min(range.end);
         let mut expected = nominal;
         let mut boundary = None;
-        for (at, bytes) in source.chunks(nominal..end) {
+        for chunk in source.chunks(nominal..end)? {
+            let (at, bytes) = chunk?;
             if at != expected || bytes.len() as u64 > end - expected {
                 return Err(invalid("invalid haystack chunks"));
             }

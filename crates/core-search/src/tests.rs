@@ -24,11 +24,11 @@ impl Haystack for Chunks<'_> {
     fn len(&self) -> u64 {
         self.bytes.len() as u64
     }
-    fn chunks(&self, r: Range<u64>) -> impl Iterator<Item = (u64, &[u8])> {
-        self.bytes[r.start as usize..r.end as usize]
+    fn chunks(&self, r: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+        Ok(self.bytes[r.start as usize..r.end as usize]
             .chunks(self.size)
             .enumerate()
-            .map(move |(i, b)| (r.start + (i * self.size) as u64, b))
+            .map(move |(i, b)| Ok((r.start + (i * self.size) as u64, b))))
     }
 }
 fn collect<H: Haystack + ?Sized>(h: &H, p: &Pattern, r: Range<u64>) -> Vec<Match> {
@@ -356,8 +356,8 @@ fn invalid_ranges_chunks_and_match_bounds_are_errors() {
         fn len(&self) -> u64 {
             10
         }
-        fn chunks(&self, _: Range<u64>) -> impl Iterator<Item = (u64, &[u8])> {
-            std::iter::once((1, b"x".as_slice()))
+        fn chunks(&self, _: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+            Ok(std::iter::once(Ok((1, b"x".as_slice()))))
         }
     }
     assert!(search(&Broken, &p, 0..10, SearchMode::Count, &token(), |_| {}, |_| {}).is_err());
@@ -406,4 +406,190 @@ fn parallel_default_matches_serial_and_preserves_order() {
     .unwrap();
     assert!(stopped.cancelled);
     assert_eq!(hits, 3);
+}
+
+#[test]
+fn whole_word_alternatives_captures_and_literal_boundaries() {
+    let options = Options { whole_word: true, ..Options::default() };
+    let bytes = "ab a abc 猫ab ab猫 !ab!".as_bytes();
+    let p = Pattern::regex(r"(a|ab)", options, 8).unwrap();
+    let h = Chunks { bytes, size: 1 };
+    let hits = collect(&h, &p, 0..h.len());
+    assert_eq!(hits, [Match { offset: 0, len: 2 }, Match { offset: 3, len: 1 }, Match { offset: 22, len: 2 }]);
+    let mut edits = Vec::new();
+    plan_replace(&h, &p, hits, b"$1:$0", &token(), |e| {
+        edits.push(e);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(edits[0].new_bytes, b"ab:ab");
+    assert_eq!(edits[1].new_bytes, b"a:a");
+    for needle in ["ab", "!", "!ab", "ab!", "猫", "\u{301}"] {
+        let bytes = "ab !ab! 猫 \u{301}".as_bytes();
+        let expected: Vec<_> = regex::bytes::Regex::new(&format!(r"\b(?:{})\b", regex::escape(needle)))
+            .unwrap()
+            .find_iter(bytes)
+            .map(|m| Match { offset: m.start() as u64, len: m.len() as u64 })
+            .collect();
+        for case_insensitive in [false, true] {
+            let p = Pattern::literal(needle.as_bytes(), Options { case_insensitive, ..options }).unwrap();
+            assert_eq!(collect(bytes, &p, 0..bytes.len() as u64), expected, "{needle}");
+        }
+    }
+}
+
+#[test]
+fn piece_snapshot_chunks_search_and_replace_stay_immutable() {
+    let mut buffer = kwil_core_text::Buffer::empty();
+    buffer.insert(0, b"abef tail").unwrap();
+    buffer.insert(2, b"cd").unwrap();
+    let snapshot = buffer.snapshot();
+    assert!(snapshot.chunks(0..snapshot.len()).unwrap().count() > 1);
+    buffer.delete(0..6).unwrap();
+    let p = regex("(bc)(de)");
+    let hits = collect(&snapshot, &p, 0..snapshot.len());
+    assert_eq!(hits, [Match { offset: 1, len: 4 }]);
+    let mut edits = Vec::new();
+    plan_replace(&snapshot, &p, hits, b"$2$1", &token(), |e| {
+        edits.push(e);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(edits, [Edit { offset: 1, len: 4, new_bytes: b"debc".to_vec() }]);
+}
+
+#[test]
+fn haystack_read_errors_reach_search_filter_and_replace() {
+    struct Failed {
+        initial: bool,
+    }
+    impl Haystack for Failed {
+        fn len(&self) -> u64 {
+            2048
+        }
+        fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+            if self.initial {
+                return Err(io::Error::other("initial read failed"));
+            }
+            Ok(std::iter::once(Err(io::Error::other(format!("chunk read failed at {}", range.start)))))
+        }
+    }
+    for initial in [false, true] {
+        let source = Failed { initial };
+        let p = literal(b"x");
+        assert!(search(&source, &p, 0..source.len(), SearchMode::Count, &token(), |_| {}, |_| {}).is_err());
+        assert!(search_default(&source, &p, 0..source.len(), SearchMode::Count, &token(), |_| {}, |_| {}).is_err());
+        assert!(plan_replace(&source, &p, [Match { offset: 0, len: 1 }], b"y", &token(), |_| Ok(())).is_err());
+        let f = LineFilter::new(vec![p], FilterExpr::Pattern(0)).unwrap();
+        assert!(f.scan(&source, FilterResume::default(), true, &token(), |_| Ok(())).is_err());
+    }
+}
+
+#[test]
+fn changed_file_adapter_reports_errors_for_file_and_snapshot() {
+    let tree = TempTree::new();
+    let path = tree.0.join("mapped.txt");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(16).unwrap();
+    let mapped = kwil_core_text::TextFile::open(&path).unwrap();
+    let second = kwil_core_text::TextFile::open(&path).unwrap();
+    let snapshot = kwil_core_text::Buffer::from_file(second).unwrap().snapshot();
+    file.set_len(17).unwrap();
+    let p = literal(b"x");
+    let err = search(&mapped, &p, 0..10, SearchMode::Count, &token(), |_| {}, |_| {}).unwrap_err();
+    assert!(err.to_string().contains("file changed on disk"));
+    let err = search(&snapshot, &p, 0..10, SearchMode::Count, &token(), |_| {}, |_| {}).unwrap_err();
+    assert!(err.to_string().contains("file changed on disk"));
+}
+
+#[test]
+fn files_utf16_boms_keep_original_offsets_and_skip_binary() {
+    let tree = TempTree::new();
+    let text = "猫😀\r\nxx猫😀hit\r\nhit";
+    for (name, little) in [("le.txt", true), ("be.txt", false)] {
+        let mut bytes = if little { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&if little { unit.to_le_bytes() } else { unit.to_be_bytes() });
+        }
+        tree.write(name, &bytes);
+    }
+    tree.write("binary.bin", b"\0hit\0");
+    let (summary, events) = files(FileSearch::new(tree.0.clone(), "😀hit|hit".into()));
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.matching_lines, 4);
+    for event in events {
+        let FileEvent::Hit(hit) = event else { panic!("unexpected error") };
+        assert_ne!(hit.path.file_name().unwrap(), "binary.bin");
+        if hit.line_number == 2 {
+            assert_eq!(hit.line_offset, 12);
+            assert_eq!(hit.line, "xx猫😀hit".as_bytes());
+            assert_eq!(hit.match_ranges.len(), 1);
+            assert_eq!(hit.match_ranges[0], 6..16);
+        } else {
+            assert_eq!(hit.line_number, 3);
+            assert_eq!(hit.line_offset, 32);
+            assert_eq!(hit.match_ranges.len(), 1);
+            assert_eq!(hit.match_ranges[0], 0..6);
+        }
+    }
+    let mut options = FileSearch::new(tree.0.clone(), r"\r".into());
+    options.max_line_bytes = 2;
+    let (summary, events) = files(options);
+    assert_eq!(summary.matching_lines, 4);
+    for event in events {
+        let FileEvent::Hit(hit) = event else { panic!("unexpected error") };
+        assert!(hit.line_truncated);
+        assert_eq!(hit.line.len(), 2);
+        assert_eq!(hit.match_ranges, [if hit.line_number == 1 { 6..8 } else { 16..18 }]);
+    }
+    // A malformed surrogate consumes one original code unit, just like U+FFFD.
+    tree.write("surrogate.txt", &[0xff, 0xfe, 0, 0xd8, b'h', 0, b'i', 0, b't', 0]);
+    let mut options = FileSearch::new(tree.0.clone(), "�|hit".into());
+    options.include = vec!["surrogate.txt".into()];
+    let (summary, events) = files(options);
+    assert_eq!(summary.matching_lines, 1);
+    let FileEvent::Hit(hit) = &events[0] else { panic!("unexpected error") };
+    assert_eq!(hit.line_offset, 2);
+    assert_eq!(hit.match_ranges, [0..2, 2..8]);
+
+    // The BOM decoder must keep the original grep memory and cancellation caps.
+    let mut oversized = vec![0xff, 0xfe];
+    oversized.extend([b'x', 0].repeat(9000));
+    tree.write("oversized.txt", &oversized);
+    let mut options = FileSearch::new(tree.0.clone(), "x".into());
+    options.include = vec!["oversized.txt".into()];
+    options.heap_limit = 1 << 16;
+    let (summary, _) = files(options);
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.matching_lines, 0);
+
+    let mut repeated = vec![0xfe, 0xff];
+    for unit in "hit\n".repeat(500).encode_utf16() {
+        repeated.extend_from_slice(&unit.to_be_bytes());
+    }
+    tree.write("cancel.txt", &repeated);
+    let mut options = FileSearch::new(tree.0.clone(), "hit".into());
+    options.include = vec!["cancel.txt".into()];
+    let cancel = token();
+    let (tx, rx) = sync_channel(1);
+    std::thread::scope(|scope| {
+        let task = scope.spawn(|| find_in_files(&options, &cancel, tx).unwrap());
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), FileEvent::Hit(_)));
+        cancel.store(true, Ordering::Relaxed);
+        let result = task.join().unwrap();
+        assert!(result.cancelled);
+        assert!(result.matching_lines < 500);
+    });
+}
+
+#[test]
+fn files_crlf_ranges_include_matching_terminator() {
+    let tree = TempTree::new();
+    tree.write("crlf.txt", b"abc\r\n");
+    let (summary, events) = files(FileSearch::new(tree.0.clone(), r"\r".into()));
+    assert_eq!(summary.matching_lines, 1);
+    let FileEvent::Hit(hit) = &events[0] else { panic!("unexpected error") };
+    assert_eq!(hit.line, b"abc");
+    assert_eq!(hit.match_ranges.len(), 1);
+    assert_eq!(hit.match_ranges[0], 3..4);
 }

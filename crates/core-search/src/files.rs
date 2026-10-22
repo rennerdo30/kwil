@@ -5,7 +5,7 @@ use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,10 +56,14 @@ pub struct FileHit {
     pub path: PathBuf,
     pub line_number: u64,
     pub line_offset: u64,
-    /// Raw bytes, without a line terminator, truncated to the configured cap.
+    /// Preview without LF or a CR belonging to CRLF, truncated to the byte cap.
+    /// UTF-16 BOM files are decoded to UTF-8 here; other files retain raw bytes.
     pub line: Vec<u8>,
     pub line_truncated: bool,
-    /// Ranges are relative to the full line, including hits beyond the preview.
+    /// Original-file byte ranges relative to line_offset, including CR in CRLF
+    /// and hits beyond the preview. LF separates records and cannot be matched.
+    /// For UTF-16, a byte-mode regex splitting a decoded scalar covers that
+    /// scalar's original code units; preview indices and these ranges differ.
     pub match_ranges: Vec<Range<usize>>,
     pub ranges_truncated: bool,
 }
@@ -153,7 +157,19 @@ pub fn find_in_files(
             let mut sink =
                 FileSink { matcher: &matcher, path: entry.path(), options, output, cancel, disconnected, hits };
             let result = std::fs::File::open(entry.path()).and_then(|file| {
-                searcher.search_reader(&matcher, CancelReader { file, cancel, disconnected }, &mut sink)
+                let mut reader = BufReader::new(CancelReader { file, cancel, disconnected });
+                let prefix = reader.fill_buf()?;
+                let little = match prefix.get(..2) {
+                    Some([0xff, 0xfe]) => Some(true),
+                    Some([0xfe, 0xff]) => Some(false),
+                    _ => None,
+                };
+                if let Some(little) = little {
+                    reader.consume(2);
+                    search_utf16(reader, little, &mut sink)
+                } else {
+                    searcher.search_reader(&matcher, reader, &mut sink)
+                }
             });
             if let Err(e) = result {
                 if cancel.load(Ordering::Relaxed) || disconnected.load(Ordering::Relaxed) {
@@ -234,32 +250,36 @@ struct FileSink<'a> {
     disconnected: &'a AtomicBool,
     hits: &'a AtomicU64,
 }
-impl Sink for FileSink<'_> {
-    type Error = io::Error;
-    fn matched(&mut self, _: &Searcher, matched: &SinkMatch<'_>) -> io::Result<bool> {
-        if self.cancel.load(Ordering::Relaxed) || self.disconnected.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        let bytes = matched.bytes().strip_suffix(b"\n").unwrap_or(matched.bytes());
-        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+impl FileSink<'_> {
+    fn line(&mut self, bytes: &[u8], line_number: u64, line_offset: u64, utf16: bool) -> io::Result<bool> {
+        // Match against the original record, preserving its CR. Only the preview
+        // loses CRLF. A standalone CR in an unterminated record stays visible.
+        let preview = bytes.strip_suffix(b"\n").map_or(bytes, |line| line.strip_suffix(b"\r").unwrap_or(line));
         let mut ranges = Vec::new();
         let mut ranges_truncated = false;
+        let text = if utf16 { std::str::from_utf8(bytes).map_err(invalid)? } else { "" };
+        let mut offsets = Utf16Offsets { text, decoded: 0, original: 0 };
         self.matcher
             .find_iter(bytes, |m| {
                 if ranges.len() == self.options.max_match_ranges {
                     ranges_truncated = true;
                     return false;
                 }
-                ranges.push(m.start()..m.end());
+                let range =
+                    if utf16 { offsets.at(m.start(), false)..offsets.at(m.end(), true) } else { m.start()..m.end() };
+                ranges.push(range);
                 true
             })
             .map_err(invalid)?;
+        if ranges.is_empty() {
+            return Ok(true);
+        }
         let hit = FileHit {
             path: self.path.to_owned(),
-            line_number: matched.line_number().unwrap_or(1),
-            line_offset: matched.absolute_byte_offset(),
-            line: bytes[..bytes.len().min(self.options.max_line_bytes)].to_vec(),
-            line_truncated: bytes.len() > self.options.max_line_bytes,
+            line_number,
+            line_offset,
+            line: preview[..preview.len().min(self.options.max_line_bytes)].to_vec(),
+            line_truncated: preview.len() > self.options.max_line_bytes,
             match_ranges: ranges,
             ranges_truncated,
         };
@@ -269,6 +289,84 @@ impl Sink for FileSink<'_> {
         } else {
             Ok(false)
         }
+    }
+}
+
+// Walk each decoded line once while translating ordered match boundaries back
+// to original UTF-16 code units. No file-sized offset map is retained.
+struct Utf16Offsets<'a> {
+    text: &'a str,
+    decoded: usize,
+    original: usize,
+}
+impl Utf16Offsets<'_> {
+    fn at(&mut self, offset: usize, round_up: bool) -> usize {
+        while self.decoded < offset {
+            // UTF-16 decoding below always produces valid UTF-8, including a
+            // replacement scalar for each unpaired surrogate.
+            let c = self.text[self.decoded..].chars().next().unwrap();
+            let next = self.decoded + c.len_utf8();
+            if next > offset {
+                return self.original + if round_up { c.len_utf16() * 2 } else { 0 };
+            }
+            self.decoded = next;
+            self.original += c.len_utf16() * 2;
+        }
+        self.original
+    }
+}
+
+fn search_utf16(mut reader: impl Read, little: bool, sink: &mut FileSink<'_>) -> io::Result<()> {
+    // Keep raw units and decoded bytes under the same per-worker heap budget.
+    // Worst case is 2 bytes/unit plus 3 UTF-8 bytes/unit. Fixed-capacity buffers
+    // avoid geometric Vec growth beyond that budget. A long line is an error.
+    let cap = sink.options.heap_limit / 8;
+    let mut units = Vec::with_capacity(cap);
+    let mut decoded = String::with_capacity(cap * 3);
+    let mut offset = 2;
+    let mut line_number = 1;
+    loop {
+        if sink.cancel.load(Ordering::Relaxed) || sink.disconnected.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut raw = [0; 2];
+        let n = reader.read(&mut raw[..1])?;
+        if n == 0 && units.is_empty() {
+            return Ok(());
+        }
+        let eof = n == 0;
+        if !eof {
+            reader.read_exact(&mut raw[1..])?;
+            if units.len() == cap {
+                return Err(io::Error::other("UTF-16 line exceeds file-search heap limit"));
+            }
+            units.push(if little { u16::from_le_bytes(raw) } else { u16::from_be_bytes(raw) });
+        }
+        if eof || units.last() == Some(&10) {
+            decoded.clear();
+            for scalar in char::decode_utf16(units.iter().copied()) {
+                decoded.push(scalar.unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            if !sink.line(decoded.as_bytes(), line_number, offset, true)? {
+                return Ok(());
+            }
+            offset += units.len() as u64 * 2;
+            line_number += 1;
+            units.clear();
+            if eof {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl Sink for FileSink<'_> {
+    type Error = io::Error;
+    fn matched(&mut self, _: &Searcher, matched: &SinkMatch<'_>) -> io::Result<bool> {
+        if self.cancel.load(Ordering::Relaxed) || self.disconnected.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        self.line(matched.bytes(), matched.line_number().unwrap_or(1), matched.absolute_byte_offset(), false)
     }
     fn context(&mut self, _: &Searcher, _: &grep_searcher::SinkContext<'_>) -> io::Result<bool> {
         Ok(!self.cancel.load(Ordering::Relaxed) && !self.disconnected.load(Ordering::Relaxed))

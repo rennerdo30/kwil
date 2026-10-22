@@ -8,6 +8,7 @@ use std::time::Instant;
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args_os().nth(1).expect("usage: count_fixture <fixture path>");
+    let default_only = std::env::args_os().nth(2).is_some_and(|arg| arg == "--default-only");
     let file = TextFile::open(std::path::Path::new(&path))?;
     println!("bytes={} editor_default_workers={} one pass per query/configuration", file.len(), worker_count());
     let queries = [
@@ -15,8 +16,9 @@ fn main() -> std::io::Result<()> {
         ("literal common: INFO", Pattern::literal(b"INFO", Options::default())?),
         ("regex: ERROR line=[0-9]{1,8}", Pattern::regex(r"ERROR line=[0-9]{1,8}", Options::default(), 64)?),
     ];
+    let configurations = if default_only { vec![worker_count()] } else { vec![1, worker_count()] };
     for (name, pattern) in queries {
-        for requested in [1, worker_count()] {
+        for &requested in &configurations {
             let cancel = Arc::new(AtomicBool::new(false));
             let start = Instant::now();
             let result = search_with_threads(

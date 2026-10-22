@@ -173,7 +173,8 @@ impl LineFilter {
             Ok(true)
         };
         let mut expected = start.offset;
-        'chunks: for (at, bytes) in source.chunks(start.offset..source.len()) {
+        'chunks: for chunk in source.chunks(start.offset..source.len())? {
+            let (at, bytes) = chunk?;
             if at != expected || bytes.len() as u64 > source.len() - expected {
                 return Err(invalid("invalid haystack chunks"));
             }
@@ -210,9 +211,10 @@ impl<H: Haystack + ?Sized> Haystack for LineSource<'_, H> {
     fn len(&self) -> u64 {
         self.range.end - self.range.start
     }
-    fn chunks(&self, range: Range<u64>) -> impl Iterator<Item = (u64, &[u8])> {
-        self.source
-            .chunks(self.range.start + range.start..self.range.start + range.end)
-            .map(|(at, b)| (at - self.range.start, b))
+    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+        Ok(self
+            .source
+            .chunks(self.range.start + range.start..self.range.start + range.end)?
+            .map(|chunk| chunk.map(|(at, b)| (at - self.range.start, b))))
     }
 }

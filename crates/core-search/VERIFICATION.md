@@ -4,6 +4,67 @@ Starting base: `b1b5c55658953a8572ea10662adf4f2aa4e7f730` (`main`).
 Final implementation measured: `e7d8ff36e3e9dfed5938c30749238b14bd497845`.
 Branch: `kw/22-search`.
 
+## Fix round 1
+
+Started at PR head `0c0cfc872ace55ed779db7870a8acb3d62fc366c` on local
+`fix-22`; merged `main` at `419823207a8fb31f9e09c21ccdc69debc02e62e3`.
+The only merge conflict was `Cargo.lock`; Cargo regenerated it offline from
+main's lockfile and the combined manifests. No new dependency was added.
+
+- `Haystack::chunks` now reports iterator-construction and individual read
+  errors. Search windows, parallel partitioning, line filters and replacement
+  planning propagate them. The `TextFile` adapter preserves change checks;
+  the new `Snapshot` adapter searches non-contiguous pieces without flattening.
+- Whole-word regexes include Unicode word-boundary assertions in the compiled
+  expression, so `a|ab` can try `ab` when `a` fails its trailing assertion.
+  Non-capturing wrapping preserves `$1` and named capture numbering. Literals
+  retain their fast path and compare Unicode word status on both sides of each
+  endpoint, matching the same `\b` semantics even for punctuation.
+- Find-in-files recognizes UTF-16 LE/BE BOMs before binary detection. It decodes
+  one bounded line at a time and streams hits with original-file byte offsets
+  (including the BOM in absolute offsets). The preview is UTF-8; match ranges
+  are original bytes relative to the original line start. A malformed surrogate
+  becomes one replacement scalar covering one original code unit. Binary files
+  without a text BOM still follow grep's NUL detection.
+- Ranges are recomputed on original records, including CR in CRLF; only the
+  preview loses the terminator. LF is the record separator and cannot be matched.
+  A standalone trailing CR stays visible. UTF-16 byte-mode partial-scalar regex
+  hits cover that scalar's original code units. Line-buffer overflow emits an
+  error; decoding, range output and previews retain fixed caps and cancellation.
+
+**Fail first:** before the regex/encoding/CRLF fixes, the new tests failed with
+`a|ab` returning only the standalone `a`, UTF-16 returning zero of four matching
+lines, and `\r` returning an empty range list. After implementation,
+`review-fail-first.ps1` verified all six new tests against deliberately broken
+copies, restoring original bytes in `finally`. Every mutant ran one test and
+reported `test result: FAILED` (the PowerShell wrapper returned exit 1).
+
+| New test | Deliberate defect detected |
+|---|---|
+| whole_word_alternatives_captures_and_literal_boundaries | Remove compiled boundary constraints |
+| piece_snapshot_chunks_search_and_replace_stay_immutable | Stop advancing piece offsets |
+| haystack_read_errors_reach_search_filter_and_replace | Swallow a replacement read error |
+| changed_file_adapter_reports_errors_for_file_and_snapshot | Bypass TextFile's read/change gate |
+| files_utf16_boms_keep_original_offsets_and_skip_binary | Return decoded UTF-8 match offsets |
+| files_crlf_ranges_include_matching_terminator | Match only the trimmed preview |
+
+Restored focused tests: **17 passed**, including all original tests, tiny piece
+boundaries, immutable snapshots, initial/chunk read errors, changed-file errors,
+UTF-16 LE/BE, supplementary scalars, malformed surrogates, original byte ranges,
+CRLF, preview truncation, bounded-line errors and UTF-16 cancellation.
+
+## Regex match-bound limitation
+
+The in-buffer regex engine requires every possible match to fit the declared
+`max_match_bytes`. A match longer than this bound may be **missed silently across
+window borders**: for example, `x{200}` with a bound of 2 can return no match
+without an error. Only overlong matches that the windows actually expose can
+produce a bound error. Callers must not assume every violation errors, even
+when a small-input probe does error. This limitation also applies to line filters
+using the bounded window engine. Prefer the line-oriented `find_in_files` mode
+where completeness matters: it searches complete lines and reports an error if
+a line exceeds its configured heap cap. It does not support multiline matches.
+
 ## Focused checks
 
 - `cargo test -p kwil-core-search -j 4 --locked`: **11 passed**, 0 failed,

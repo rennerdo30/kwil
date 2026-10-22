@@ -15,24 +15,41 @@ const MAX_PATTERN: usize = 1 << 20;
 /// Borrowed, contiguous-in-offset chunks covering exactly the requested range.
 /// Chunks may have any size, including one byte; empty chunks are permitted.
 /// Implementations must retain an immutable snapshot for the entire operation.
+/// Range validation and read failures may occur when opening the iterator or
+/// reading any chunk; consumers propagate both kinds of errors to the caller.
 pub trait Haystack {
     fn len(&self) -> u64;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    fn chunks(&self, range: Range<u64>) -> impl Iterator<Item = (u64, &[u8])>;
+    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>>;
 }
 
 impl Haystack for kwil_core_text::TextFile {
     fn len(&self) -> u64 {
         self.len()
     }
-    fn chunks(&self, range: Range<u64>) -> impl Iterator<Item = (u64, &[u8])> {
+    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
         // TextFile owns the mapping and its external-change safety contract.
-        self.bytes()[range.start as usize..range.end as usize]
-            .chunks(BLOCK)
-            .enumerate()
-            .map(move |(i, b)| (range.start + (i * BLOCK) as u64, b))
+        let bytes = self.bytes().map_err(io::Error::other)?;
+        let bytes =
+            bytes.get(range.start as usize..range.end as usize).ok_or_else(|| invalid("invalid haystack range"))?;
+        Ok(bytes.chunks(BLOCK).enumerate().map(move |(i, b)| Ok((range.start + (i * BLOCK) as u64, b))))
+    }
+}
+
+impl Haystack for kwil_core_text::Snapshot {
+    fn len(&self) -> u64 {
+        self.len()
+    }
+    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+        let mut at = range.start;
+        Ok(self.chunks(range)?.map(move |chunk| {
+            let bytes = chunk.map_err(io::Error::other)?;
+            let start = at;
+            at += bytes.len() as u64;
+            Ok((start, bytes))
+        }))
     }
 }
 
@@ -40,11 +57,10 @@ impl Haystack for [u8] {
     fn len(&self) -> u64 {
         self.len() as u64
     }
-    fn chunks(&self, range: Range<u64>) -> impl Iterator<Item = (u64, &[u8])> {
-        self[range.start as usize..range.end as usize]
-            .chunks(BLOCK)
-            .enumerate()
-            .map(move |(i, b)| (range.start + (i * BLOCK) as u64, b))
+    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+        let bytes =
+            self.get(range.start as usize..range.end as usize).ok_or_else(|| invalid("invalid haystack range"))?;
+        Ok(bytes.chunks(BLOCK).enumerate().map(move |(i, b)| Ok((range.start + (i * BLOCK) as u64, b))))
     }
 }
 
@@ -105,15 +121,19 @@ impl Pattern {
     /// Contract: every possible match must fit `max_match_bytes` (1..=1 MiB).
     /// 64 KiB is a useful UI default. Unbounded expressions such as `.*` are
     /// supported only when the caller can guarantee this bound for its input.
-    /// Longer matches are outside this API's contract; detected overlong matches
-    /// return an error. This is not an arbitrary-length multiline regex engine.
+    /// Longer matches are outside this API's contract. Detected overlong matches
+    /// return an error, but matches longer than the bound may be missed silently
+    /// across window borders. Callers must not assume every violation errors.
+    /// Use line-oriented find-in-files when complete bounded lines are needed.
     /// Anchors, captures, Unicode and zero-width matches retain regex semantics
     /// within this contract. The range restricts matches, not anchor context.
     pub fn regex(expression: &str, options: Options, max_match_bytes: usize) -> io::Result<Self> {
         if !(1..=MAX_PATTERN).contains(&max_match_bytes) {
             return Err(invalid("regex match bound must be 1..=1 MiB"));
         }
-        let re = RegexBuilder::new(expression)
+        let constrained =
+            if options.whole_word { format!(r"(?u:\b)(?:{expression})(?u:\b)") } else { expression.to_owned() };
+        let re = RegexBuilder::new(&constrained)
             .case_insensitive(options.case_insensitive)
             .size_limit(8 << 20)
             .dfa_size_limit(2 << 20)
@@ -317,7 +337,7 @@ pub fn search<H: Haystack + ?Sized>(
                     next = start + 1;
                     return Ok(true);
                 }
-                if pattern.options.whole_word && !whole_word(bytes, m.clone()) {
+                if pattern.options.whole_word && !pattern.captures && !whole_word(bytes, m.clone()) {
                     return Ok(true);
                 }
                 result.count += 1;
@@ -400,7 +420,8 @@ pub(crate) fn invalid(e: impl std::fmt::Display) -> io::Error {
 
 pub(crate) fn copy_range<H: Haystack + ?Sized>(source: &H, range: Range<u64>, out: &mut Vec<u8>) -> io::Result<()> {
     let mut expected = range.start;
-    for (at, b) in source.chunks(range.clone()) {
+    for chunk in source.chunks(range.clone())? {
+        let (at, b) = chunk?;
         if at != expected || b.len() as u64 > range.end - expected {
             return Err(invalid("invalid haystack chunks"));
         }
@@ -430,13 +451,16 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
     // Most log lines are one borrowed chunk. Avoid an allocation and copy for
     // every pattern on every line, while retaining the same source contract.
     if hi - lo <= (BLOCK + max_len + 8) as u64 {
-        let mut chunks = source.chunks(lo..hi);
-        if let Some((at, bytes)) = chunks.next()
+        let mut chunks = source.chunks(lo..hi)?;
+        if let Some((at, bytes)) = chunks.next().transpose()?
             && at == lo
             && bytes.len() as u64 == hi - lo
         {
-            if chunks.any(|(at, b)| at != hi || !b.is_empty()) {
-                return Err(invalid("invalid haystack chunks"));
+            for chunk in chunks {
+                let (at, b) = chunk?;
+                if at != hi || !b.is_empty() {
+                    return Err(invalid("invalid haystack chunks"));
+                }
             }
             if !cancel.load(Ordering::Relaxed) {
                 visit(bytes, lo, range.end, true)?;
@@ -449,7 +473,8 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
     let mut buf = Vec::with_capacity(BLOCK + max_len + 8);
     let pad = max_len + 4;
     let mut finished_direct = false;
-    for (at, mut chunk) in source.chunks(lo..hi) {
+    for chunk in source.chunks(lo..hi)? {
+        let (at, mut chunk) = chunk?;
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -511,7 +536,8 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
 }
 
 fn whole_word(bytes: &[u8], m: Range<usize>) -> bool {
-    !word_before(&bytes[..m.start]) && !word_after(&bytes[m.end..])
+    (word_before(&bytes[..m.start]) != word_after(&bytes[m.start..]))
+        && (word_before(&bytes[..m.end]) != word_after(&bytes[m.end..]))
 }
 fn word_before(bytes: &[u8]) -> bool {
     (1..=4.min(bytes.len()))
