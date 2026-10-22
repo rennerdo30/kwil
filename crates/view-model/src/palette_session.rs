@@ -93,8 +93,8 @@ impl PaletteSession {
         }
         let request = self.model.set_tabs(tabs.clone())?;
         self.tabs = tabs;
-        if self.model.is_open() {
-            self.submit(request)?;
+        if let Some(request) = request {
+            self.worker.request(request)?;
         }
         Ok(())
     }
@@ -224,6 +224,51 @@ impl Drop for PaletteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tab_metadata_refresh_preserves_a_pending_non_tab_query() {
+        use std::sync::{Condvar, Mutex, mpsc};
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let (sender, receiver) = mpsc::channel();
+        let worker_gate = gate.clone();
+        let mut session = PaletteSession::new(
+            std::env::temp_dir().join("kwil-no-pending-query-catalogue"),
+            Arc::new(move || {
+                if std::thread::current().name() != Some("kwil-palette") {
+                    return;
+                }
+                let _ = sender.send(());
+                let (mutex, ready) = &*worker_gate;
+                let guard = mutex.lock().unwrap();
+                let _guard = ready.wait_while(guard, |released| !*released).unwrap();
+            }),
+        )
+        .unwrap();
+        receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        session.open(">save").unwrap();
+        session.set_tabs(vec![Tab { id: 99, title: "new external tab".into() }]).unwrap();
+        // Release the worker only after the metadata change: the query was
+        // deliberately pending throughout that update, without timing races.
+        drop(release);
+        session.worker_ready();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !session.model().results_are_fresh() {
+            assert!(
+                receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_ok(),
+                "pending command query was cancelled by tab metadata"
+            );
+            session.worker_ready();
+        }
+        assert!(session.model().rows().iter().any(|row| row.action == PaletteAction::Command("file.save")));
+        finish(session);
+    }
 
     #[test]
     fn tab_snapshot_replacement_invalidates_acceptance_and_publishes_new_tabs() {

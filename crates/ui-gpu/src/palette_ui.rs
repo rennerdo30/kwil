@@ -8,6 +8,12 @@ pub(super) fn palette_blocks_copy(open: bool, displayed: bool) -> bool {
     open || displayed
 }
 
+fn model_vim_command(id: &str) -> bool {
+    !id.starts_with("file.")
+        && !id.starts_with("view.")
+        && !matches!(id, "edit.copy" | "edit.cut" | "edit.paste" | "navigation.goToLine")
+}
+
 pub(super) fn area(size: (usize, usize), cw: usize, ch: usize) -> Option<Rect> {
     let (cw, ch) = (cw.max(1), ch.max(1));
     let columns = (size.0 / cw).min(80);
@@ -151,9 +157,7 @@ impl App {
                 let result = self.keys.as_mut().map(|keys| keys.invoke_named(command));
                 match result {
                     Some(VimResult::Command(call))
-                        if self.settings.keymap == kwil_core_commands::Preset::Vim
-                            && !call.id.starts_with("file.")
-                            && !call.id.starts_with("view.") =>
+                        if self.settings.keymap == kwil_core_commands::Preset::Vim && model_vim_command(call.id) =>
                     {
                         if let Some(editor) = self.view.editor_mut() {
                             match editor.execute_vim(&call) {
@@ -344,6 +348,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepted_frontend_actions_keep_clipboard_and_navigation_adapters() {
+        for id in ["edit.copy", "edit.cut", "edit.paste", "navigation.goToLine", "file.save", "view.zoomIn"] {
+            assert!(!model_vim_command(id), "{id} must retain its frontend adapter");
+        }
+        assert!(model_vim_command("mode.insert"));
+        assert!(model_vim_command("motion.wordForward"));
+    }
     #[test]
     fn dismissed_overlay_blocks_scroll_copy_until_restored() {
         assert!(palette_blocks_copy(false, true), "assertion: accepted actions still have displayed popup pixels");
