@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $cases = @(
     @{ Test='tiny_chunks_and_work_windows_match_reference'; File='search.rs'; From='buf.copy_within(discard.., 0);'; To='buf.fill(0);' },
-    @{ Test='case_word_selection_and_invalid_bytes'; File='search.rs'; From='.case_insensitive(true)'; To='.case_insensitive(false)' },
+    @{ Test='case_word_selection_and_invalid_bytes'; File='search.rs'; From='.case_insensitive(options.case_insensitive)'; To='.case_insensitive(false)' },
     @{ Test='count_progress_and_cancellation_stop_early'; File='search.rs'; From='result.count += 1;'; To='result.count += 0;' },
     @{ Test='capture_replace_plans_and_literal_dollars'; File='search.rs'; From='append(&mut out, capture.as_bytes())?;'; To='append(&mut out, b"BROKEN")?;' },
     @{ Test='filter_boolean_runs_and_incremental_partial_line'; File='filter.rs'; From='if self.expression.eval(&values) {'; To='if !self.expression.eval(&values) {' },

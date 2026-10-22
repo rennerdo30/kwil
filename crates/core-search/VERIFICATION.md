@@ -73,6 +73,41 @@ first-access concern. Those remain historical evidence, not measurements of this
 implementation. Hosted CI, independent re-review and frontend integration remain
 with the parent; no acceptance gate is waived.
 
+### Verification follow-up: case-folding mutant anchor
+
+The next review found that `fail-first.ps1` still looked for the old
+`.case_insensitive(true)` constructor call. Verification-only commit
+`ce405412f30574010c5c4a39881bc54cbd0c219f` repairs the anchor to
+`.case_insensitive(options.case_insensitive)`, replacing it with `false` to
+disable folding at the three current builder sites. Production source is unchanged.
+
+On 2026-10-23 at 05:17 JST, the parent authorized exactly two serial runs after
+the frontend's lane release. The actual named mutant was read from the harness's
+constant PowerShell `HashtableAst` via `SafeGetValue`, applied in this isolated
+worktree, and restored byte-for-byte in `finally`:
+
+- Mutant: `case_word_selection_and_invalid_bytes` compiled, then failed its
+  intended assertion: actual offsets `[0, 35]`, expected `[0, 4, 35]` (the
+  uppercase match was missing). Exactly one test ran; PID 25456 exited **101**.
+- Restored: the same exact test passed **1/1**; PID 38560 exited **0**. The
+  restored source hash matches the validated implementation above, and Git
+  confirms no production source diff.
+- Each Cargo process had a 60-second timeout. Both used `--offline --locked -j 4`
+  and the configured shared target, without invoking the legacy verification
+  wrapper's private target override. Dependencies were reused; only core-search
+  recompiled (1.23 s for the mutant, 0.86 s restored).
+- Logs: `%TEMP%/kwil-search-casefold-86146cf7/{mutant,restored}.log`; each first
+  line names the commit, phase, harness/source hashes, timestamp and matched-site
+  count. Both processes exited before direct lane handoff to the named backend job.
+
+```text
+cargo test -p kwil-core-search --lib --offline --locked -j 4 -- --exact tests::case_word_selection_and_invalid_bytes --test-threads=1
+```
+
+No broader test or mutation selection, benchmark, Clippy, native or frontend
+run was repeated for this anchor-only follow-up. The previous 20-test and lint
+evidence remains unchanged; parent review and hosted CI remain separate gates.
+
 ## Fix round 2: extended-mode regex comments
 
 Base: `f3242e7c7e04241e9b26555975108703a720edcd`.
