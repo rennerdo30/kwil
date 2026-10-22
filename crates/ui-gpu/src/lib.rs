@@ -576,6 +576,15 @@ impl App {
         let cells = text::cells(bytes, columns, self.settings.editor.tab_size as usize);
         let byte = hit::byte_at(&cells, column);
         let first = self.view.line_offset(screen_row);
+        // Anchor the window to the bytes actually displayed on the clicked
+        // row. A requested offset inside a scalar was aligned down by View;
+        // retaining that request would hide the first inserted ASCII byte.
+        let aligned_window = if first != self.horizontal {
+            self.horizontal = first;
+            Some(self.view.set_horizontal_window(first, 64 << 10))
+        } else {
+            None
+        };
         let Some(editor) = self.view.editor_mut() else {
             return;
         };
@@ -588,6 +597,9 @@ impl App {
             Ok(damage) => {
                 let damage = self.view.refresh_after_edit(damage);
                 self.apply(damage);
+                if let Some(damage) = aligned_window {
+                    self.apply(damage);
+                }
             }
             Err(error) => {
                 let damage = self.view.set_notice(error.to_string());
