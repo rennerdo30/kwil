@@ -1,7 +1,8 @@
 //! One settings file. Watching is deliberately an event callback hook, ready for
 //! core-workspace's FileWatcher: register the settings FILE path (it watches
 //! parent directories internally), then call SettingsWatch::reload on events.
-//! This crate starts no watcher, thread, polling loop or startup-path I/O.
+//! The original hook starts no thread. Opt-in `SettingsWorker` owns native
+//! watching and atomic writes after the first frame; it has no polling loop.
 use crate::{Binding, Keymap, Preset};
 use serde::Deserialize;
 use std::{
@@ -671,6 +672,14 @@ mod settings_atomic_tests {
     fn invalid_stale_and_failed_replacement_preserve_owner_file() {
         let path = std::env::temp_dir().join(format!("kwil-settings-atomic-{}", std::process::id()));
         fs::create_dir(&path).unwrap();
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.0.join("settings.toml"));
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+        let _fixture = Fixture(path.clone());
         let file = path.join("settings.toml");
         let source = "# keep\n[editor]\ntab_size=8\n";
         fs::write(&file, source).unwrap();

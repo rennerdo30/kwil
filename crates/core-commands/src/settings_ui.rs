@@ -501,6 +501,7 @@ impl SettingsDocument {
     /// Compound maps are edited entrywise; refusing a destructive reset is explicit.
     pub fn reset(&mut self, id: &str) -> Result<(), SettingsError> {
         if id == "bindings" || id == "formatters" {
+            let comments = self.source.contains('#');
             let unknown = self
                 .report
                 .unknown_keys
@@ -511,7 +512,7 @@ impl SettingsDocument {
                     // Lossless removal cannot infer what owner annotations mean.
                     // Refuse comments and unknown nested fields explicitly.
                     let source = item.to_string();
-                    if source.contains('#') || unknown {
+                    if source.contains('#') || comments || unknown {
                         return Err(error(
                             "compound reset would discard comments or unknown fields; edit the settings file",
                         ));
@@ -759,6 +760,9 @@ fn set_leaf(item: &mut Item, path: &[&str], new: Option<Value>) -> Result<(), Se
         if let Some(mut new) = new {
             if let Some(old) = table.get(key) {
                 if let Some(old) = old.as_value() {
+                    if old.is_array() && old.to_string().contains('#') {
+                        return Err(error("replacing this array could discard comments; edit the settings file"));
+                    }
                     *new.decor_mut() = old.decor().clone();
                 } else {
                     return Err(error("refusing to replace a table with a scalar"));
@@ -768,10 +772,12 @@ fn set_leaf(item: &mut Item, path: &[&str], new: Option<Value>) -> Result<(), Se
         } else if table.get(key).is_some() {
             // Removing an explicitly chosen map entry is intentional; preserve
             // comment text by refusing entries with attached comments.
-            if table.get(key).and_then(Item::as_value).is_some_and(|v| {
-                v.decor().prefix().and_then(|r| r.as_str()).is_some_and(|s| s.contains('#'))
-                    || v.decor().suffix().and_then(|r| r.as_str()).is_some_and(|s| s.contains('#'))
-            }) {
+            if table.key(key).is_some_and(|k| decor_has_comment(k.leaf_decor()) || decor_has_comment(k.dotted_decor()))
+                || table.get(key).and_then(Item::as_value).is_some_and(|v| {
+                    v.decor().prefix().and_then(|r| r.as_str()).is_some_and(|s| s.contains('#'))
+                        || v.decor().suffix().and_then(|r| r.as_str()).is_some_and(|s| s.contains('#'))
+                })
+            {
                 return Err(error("cannot remove a commented entry losslessly; edit the settings file"));
             }
             table.remove(key);
@@ -786,6 +792,9 @@ fn set_leaf(item: &mut Item, path: &[&str], new: Option<Value>) -> Result<(), Se
         set_leaf(table.get_mut(key).expect("inserted parent"), &path[1..], new)?;
     }
     Ok(())
+}
+fn decor_has_comment(decor: &toml_edit::Decor) -> bool {
+    [decor.prefix(), decor.suffix()].into_iter().flatten().any(|raw| raw.as_str().is_some_and(|s| s.contains('#')))
 }
 pub fn normalize_extension(extension: &str) -> Result<String, SettingsError> {
     let ext = extension.strip_prefix("*.").or_else(|| extension.strip_prefix('.')).unwrap_or(extension);

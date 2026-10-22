@@ -122,6 +122,19 @@ fn schema_covers_compound_preferences_and_refuses_destructive_reset() {
 }
 
 #[test]
+fn comments_inside_arrays_and_before_mapping_keys_are_preserved_or_refused() {
+    let source =
+        "[search]\ninclude = [\n # why this glob\n '*.rs',\n]\n[file_types]\n# custom language\n'*.foo' = 'rust'\n";
+    let mut doc = SettingsDocument::parse(source).unwrap();
+    assert!(doc.edit("search.include", SettingValue::Strings(vec!["*.txt".into()])).is_err());
+    assert!(doc.map_extension("foo", None).is_err());
+    assert_eq!(doc.source(), source);
+    doc.map_extension("foo", Some("python")).unwrap();
+    assert!(doc.source().contains("# custom language"));
+    assert!(doc.source().contains("# why this glob"));
+}
+
+#[test]
 fn worker_loads_saves_and_reloads_external_edits_away_from_caller() {
     use kwil_core_commands::settings::{SettingsWorker, SettingsWorkerEvent};
     use std::{

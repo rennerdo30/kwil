@@ -50,6 +50,8 @@ pub trait AssociationAdapter {
     fn owner(&self) -> String;
     fn read(&mut self, location: &Location) -> Result<Option<StoredValue>, AssociationError>;
     fn write(&mut self, location: &Location, value: Option<&StoredValue>) -> Result<(), AssociationError>;
+    /// Notify the platform after owned mutations; never runs during planning.
+    fn notify_changes(&mut self) {}
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DefaultChoice {
@@ -271,6 +273,9 @@ pub fn apply(
         };
         return Err(ApplyFailure { error, receipt });
     }
+    if !receipt.remaining.is_empty() {
+        adapter.notify_changes();
+    }
     Ok(receipt)
 }
 /// Idempotent rollback. Foreign edits are conflicts, never overwritten. Keep
@@ -299,6 +304,7 @@ pub fn rollback(adapter: &mut impl AssociationAdapter, receipt: &mut Association
     }
     pending.reverse();
     receipt.remaining = pending;
+    adapter.notify_changes();
     failures
 }
 
@@ -308,7 +314,7 @@ fn identifier(s: &str, mime: bool) -> bool {
         && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_') || mime && c == b'+')
 }
 fn desktop_escape(s: &str) -> String {
-    s.replace('\\', "\\\\\\\\").replace('`', "\\`").replace('$', "\\$")
+    s.replace('\\', "\\\\\\\\").replace('`', "\\\\`").replace('$', "\\\\$")
 }
 // Preserve all unrelated lines/comments. Refuse duplicate groups or keys rather
 // than guess which the desktop will use. Change only the selected list value.
@@ -479,6 +485,12 @@ impl AssociationAdapter for WindowsAssociations {
     }
     fn write(&mut self, location: &Location, value: Option<&StoredValue>) -> Result<(), AssociationError> {
         windows_registry(location, value, true).map(|_| ())
+    }
+    fn notify_changes(&mut self) {
+        use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+        unsafe {
+            SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST, std::ptr::null(), std::ptr::null());
+        }
     }
 }
 #[cfg(windows)]
