@@ -10,4 +10,9 @@ fuzzy-matcher = "=0.3.7"
 unicode-segmentation = "=1.13.3"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
+kwil-core-workspace = { path = "../core-workspace" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_Shell"] }
 
