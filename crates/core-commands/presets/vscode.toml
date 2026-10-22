@@ -282,3 +282,11 @@ command = "view.zoomOut"
 [[bindings]]
 keys = "ctrl+0"
 command = "view.zoomReset"
+[[bindings]]
+keys = "ctrl+v"
+command = "edit.paste"
+context = "palette"
+[[bindings]]
+keys = "cmd+v"
+command = "edit.paste"
+context = "palette"

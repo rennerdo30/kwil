@@ -4,6 +4,10 @@ use super::*;
 use kwil_core_commands::palette::Palette;
 use kwil_view_model::palette_session::{display_text, query_window};
 
+pub(super) fn palette_blocks_copy(open: bool, displayed: bool) -> bool {
+    open || displayed
+}
+
 pub(super) fn area(size: (usize, usize), cw: usize, ch: usize) -> Option<Rect> {
     let (cw, ch) = (cw.max(1), ch.max(1));
     let columns = (size.0 / cw).min(80);
@@ -140,6 +144,9 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
+                if self.dispatch_palette(command) {
+                    return;
+                }
                 use kwil_core_commands::vim::VimResult;
                 let result = self.keys.as_mut().map(|keys| keys.invoke_named(command));
                 match result {
@@ -337,6 +344,47 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dismissed_overlay_blocks_scroll_copy_until_restored() {
+        assert!(palette_blocks_copy(false, true), "accepted actions still have displayed popup pixels");
+        assert!(palette_blocks_copy(true, false));
+        assert!(!palette_blocks_copy(false, false));
+    }
+
+    #[test]
+    fn palette_paste_binding_respects_unbind_and_pending_chords() {
+        use kwil_core_commands::{Binding, Context, Preset, keymap::KeymapEngine, vim::VimResult};
+        for preset in [Preset::VsCode, Preset::NotepadPlusPlus, Preset::Vim] {
+            let mut keys = KeymapEngine::new(preset, &[]).unwrap();
+            keys.set_context(Context::Palette);
+            for chord in ["ctrl+v", "cmd+v"] {
+                assert!(
+                    matches!(keys.feed(chord.parse().unwrap()), VimResult::Command(call) if call.id == "edit.paste")
+                );
+            }
+            let mut keys = KeymapEngine::new(
+                preset,
+                &[
+                    Binding {
+                        keys: "ctrl+v".into(),
+                        command: String::new(),
+                        context: Some(Context::Palette),
+                        mode: None,
+                    },
+                    Binding {
+                        keys: "ctrl+v ctrl+s".into(),
+                        command: "file.save".into(),
+                        context: Some(Context::Palette),
+                        mode: None,
+                    },
+                ],
+            )
+            .unwrap();
+            keys.set_context(Context::Palette);
+            assert!(matches!(keys.feed("ctrl+v".parse().unwrap()), VimResult::Pending));
+            assert!(matches!(keys.feed("ctrl+s".parse().unwrap()), VimResult::Command(call) if call.id == "file.save"));
+        }
+    }
     #[test]
     fn panel_is_inside_tiny_and_scaled_windows() {
         assert!(area((10, 10), 8, 16).is_none());

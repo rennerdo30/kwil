@@ -54,6 +54,14 @@ impl App {
     }
 
     pub(super) fn sync_file_ui(&mut self) {
+        if let Some(palette) = self.palette.as_mut().filter(|palette| palette.model().is_open()) {
+            match palette.refresh_tabs(&self.view) {
+                Ok(changed) => self.palette_dirty |= changed,
+                Err(error) => {
+                    self.view.set_notice(format!("Palette: {error:?}"));
+                }
+            }
+        }
         self.save_path = self.view.file_prompt().map(|p| p.text.clone());
         self.close_pending = self.view.close_pending();
         sync_active_document(

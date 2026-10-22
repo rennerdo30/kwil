@@ -168,7 +168,13 @@ pub(super) fn key(
     input(view, host, keys, value, elapsed, preset)
 }
 
-pub(super) fn mouse(host: &mut PaletteSession, event: &event::MouseEvent, bounds: Rect) -> bool {
+pub(super) fn mouse(
+    view: &mut Workspace,
+    host: &mut PaletteSession,
+    keys: &mut KeymapEngine,
+    event: &event::MouseEvent,
+    bounds: Rect,
+) -> bool {
     let value = match event.kind {
         MouseEventKind::ScrollDown => PaletteInput::Next,
         MouseEventKind::ScrollUp => PaletteInput::Previous,
@@ -179,7 +185,7 @@ pub(super) fn mouse(host: &mut PaletteSession, event: &event::MouseEvent, bounds
         }
         _ => return false,
     };
-    let _ = host.input(value);
+    let _ = input(view, host, keys, value, Duration::ZERO, Preset::VsCode);
     true
 }
 
@@ -276,6 +282,18 @@ mod tests {
         assert_eq!(view.editor().unwrap().document().snapshot().len(), 0);
         input(&mut view, &mut host, &mut keys, PaletteInput::Cancel, Duration::ZERO, Preset::Vim);
         assert!(!host.model().is_open());
+        host.open(":").unwrap();
+        keys.set_context(kwil_core_commands::Context::Palette);
+        let outside = event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(mouse(&mut view, &mut host, &mut keys, &outside, Rect::new(0, 0, 100, 30)));
+        assert!(!host.model().is_open());
+        assert!(matches!(keys.feed("i".parse().unwrap()), VimResult::Command(call) if call.id == "edit.insert"));
+        assert_eq!(keys.mode(), kwil_core_commands::Mode::Insert);
         for handle in host.stop() {
             handle.join().unwrap();
         }

@@ -282,7 +282,13 @@ pub fn run_with_external_open(
                 }
                 Msg::Input(Event::Mouse(m)) if palette.as_ref().is_some_and(|host| host.model().is_open()) => {
                     let size = terminal.size()?;
-                    palette_ui::mouse(palette.as_mut().unwrap(), &m, Rect::new(0, 0, size.width, size.height))
+                    palette_ui::mouse(
+                        &mut view,
+                        palette.as_mut().unwrap(),
+                        &mut keys,
+                        &m,
+                        Rect::new(0, 0, size.width, size.height),
+                    )
                 }
                 Msg::Input(Event::Mouse(m))
                     if {
@@ -300,6 +306,11 @@ pub fn run_with_external_open(
                 Msg::Input(_) => false,
             };
             palette_ui::sync_input_identity(&view, &mut keys, &mut input_identity);
+            if let Some(host) = palette.as_mut().filter(|host| host.model().is_open())
+                && let Err(error) = host.refresh_tabs(&view)
+            {
+                view.set_notice(format!("Palette: {error:?}"));
+            }
             if changed {
                 if user_input {
                     view.checkpoint_session();

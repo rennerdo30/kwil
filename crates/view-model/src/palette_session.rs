@@ -30,6 +30,7 @@ pub enum PaletteInput<'a> {
 }
 
 pub struct PaletteSession {
+    tabs: Vec<Tab>,
     input_epoch: u64,
     model: Palette,
     worker: PaletteWorker,
@@ -67,6 +68,7 @@ impl PaletteSession {
             }
         };
         Ok(Self {
+            tabs: Vec::new(),
             input_epoch: 0,
             model: Palette::new(limits.result_limit),
             worker,
@@ -86,11 +88,31 @@ impl PaletteSession {
 
     /// `tabs` is rebuilt only on tab metadata changes, never per query key.
     pub fn set_tabs(&mut self, tabs: Vec<Tab>) -> Result<(), QueryError> {
-        let request = self.model.set_tabs(tabs)?;
+        if self.tabs == tabs {
+            return Ok(());
+        }
+        let request = self.model.set_tabs(tabs.clone())?;
+        self.tabs = tabs;
         if self.model.is_open() {
             self.submit(request)?;
         }
         Ok(())
+    }
+
+    /// Call after addressed document/file events. Unchanged metadata does not
+    /// restart matching or invalidate fresh rows.
+    pub fn refresh_tabs(&mut self, workspace: &crate::Workspace) -> Result<bool, QueryError> {
+        let tabs: Vec<_> = workspace
+            .session()
+            .tabs()
+            .iter()
+            .map(|tab| Tab { id: tab.id.0, title: workspace.tab_title(tab.id) })
+            .collect();
+        if self.tabs == tabs {
+            return Ok(false);
+        }
+        self.set_tabs(tabs)?;
+        Ok(true)
     }
 
     pub fn open(&mut self, query: &str) -> Result<(), QueryError> {
@@ -202,6 +224,35 @@ impl Drop for PaletteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_snapshot_replacement_invalidates_acceptance_and_publishes_new_tabs() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut session = PaletteSession::new(
+            std::env::temp_dir().join("kwil-no-catalogue-required"),
+            Arc::new(move || {
+                let _ = sender.send(());
+            }),
+        )
+        .unwrap();
+        session.set_tabs(vec![Tab { id: 1, title: "alpha".into() }]).unwrap();
+        session.open("#").unwrap();
+        let wait = |session: &mut PaletteSession| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !session.model().results_are_fresh() {
+                receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                session.worker_ready();
+            }
+        };
+        wait(&mut session);
+        assert_eq!(session.model().rows().len(), 1);
+        session.set_tabs(vec![Tab { id: 1, title: "alpha".into() }, Tab { id: 2, title: "beta".into() }]).unwrap();
+        assert!(!session.model().results_are_fresh());
+        assert_eq!(session.input(PaletteInput::Accept).unwrap(), None);
+        wait(&mut session);
+        assert!(session.model().rows().iter().any(|row| row.action == PaletteAction::ActivateTab(2)));
+        finish(session);
+    }
 
     fn session() -> PaletteSession {
         let root = std::env::temp_dir().join(format!("kwil-palette-host-absent-{}", std::process::id()));

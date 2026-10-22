@@ -792,7 +792,7 @@ impl App {
         let body_pixels = &mut self.body_pixels;
         let mut p = std::mem::take(&mut self.pending);
         let palette_dirty = std::mem::take(&mut self.palette_dirty);
-        if palette_open && p.scroll != 0 {
+        if palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some()) && p.scroll != 0 {
             // A pending document scroll predates opening the overlay. Avoid
             // copying overlay pixels through the native scroll seam.
             p.full = true;
