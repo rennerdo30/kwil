@@ -7,6 +7,7 @@
 //! SSH.
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -20,6 +21,7 @@ enum Msg {
     Notice(String),
     InputClosed,
     Saved(std::io::Result<kwil_core_workspace::SavedSnapshot>),
+    Settings(Box<Settings>),
 }
 
 pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
@@ -68,11 +70,33 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
         on_first_frame(Box::new(move |msg| {
             let _ = t.send(Msg::Notice(msg));
         }));
+        let settings_sender = tx.clone();
+        std::thread::spawn(move || {
+            let settings = std::env::current_exe()
+                .ok()
+                .and_then(|exe| Settings::path(&exe).ok())
+                .and_then(|path| Settings::load(&path).ok())
+                .map(|report| report.settings)
+                .unwrap_or_default();
+            let _ = settings_sender.send(Msg::Settings(Box::new(settings)));
+        });
         let started = std::time::Instant::now();
         let mut closing = false;
+        let mut settings = Settings::default();
+        let mut keys = KeymapEngine::new(settings.keymap, &settings.bindings).expect("bundled keymap");
         while let Ok(msg) = rx.recv() {
             let changed = match msg {
                 Msg::InputClosed => break,
+                Msg::Settings(next) => {
+                    if let Ok(next_keys) = KeymapEngine::new(next.keymap, &next.bindings) {
+                        keys = next_keys;
+                        settings = *next;
+                        if let Some(editor) = view.editor_mut() {
+                            editor.settings = settings.clone();
+                        }
+                    }
+                    true
+                }
                 Msg::Saved(saved) => {
                     if let Some(editor) = view.editor_mut() {
                         match editor.finish_save(saved) {
@@ -92,6 +116,9 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                 }
                 Msg::IndexDone => {
                     view.index_ready();
+                    if let Some(editor) = view.editor_mut() {
+                        editor.settings = settings.clone();
+                    }
                     true
                 }
                 Msg::Notice(n) => {
@@ -103,7 +130,7 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     true
                 }
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    match key(&mut view, k, started.elapsed()) {
+                    match key(&mut view, k, started.elapsed(), &mut keys, settings.keymap) {
                         KeyResult::Quit => {
                             if view.editor().is_some_and(|editor| editor.document().is_dirty())
                                 && !(closing && k.modifiers.contains(KeyModifiers::SHIFT))
@@ -179,8 +206,72 @@ enum KeyResult {
     Changed(bool),
 }
 
-fn key(view: &mut View, k: KeyEvent, elapsed: std::time::Duration) -> KeyResult {
+fn key(
+    view: &mut View,
+    k: KeyEvent,
+    elapsed: std::time::Duration,
+    keys: &mut KeymapEngine,
+    preset: Preset,
+) -> KeyResult {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    if let Some(mut chord) = chord(k) {
+        if matches!(
+            k.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        ) {
+            chord.modifiers.shift = false;
+        }
+        match keys.feed(chord) {
+            VimResult::Pending => return KeyResult::Changed(false),
+            VimResult::Command(call) => {
+                if call.id == "file.save" {
+                    return KeyResult::Save;
+                }
+                if call.id == "file.quit" {
+                    return KeyResult::Quit;
+                }
+                if preset == Preset::Vim {
+                    if let Some(editor) = view.editor_mut() {
+                        match editor.execute_vim(&call) {
+                            Ok(result) => {
+                                view.refresh_after_edit(result.damage);
+                            }
+                            Err(error) => {
+                                view.set_notice(error.to_string());
+                            }
+                        }
+                    }
+                    return KeyResult::Changed(true);
+                }
+                return KeyResult::Changed(execute(
+                    view,
+                    call.id,
+                    None,
+                    k.modifiers.contains(KeyModifiers::SHIFT),
+                    elapsed,
+                ));
+            }
+            VimResult::Error(error) => {
+                view.set_notice(error);
+                return KeyResult::Changed(true);
+            }
+            VimResult::Unbound => {
+                if keys.mode() != kwil_core_commands::Mode::Insert {
+                    return KeyResult::Changed(false);
+                }
+                if ctrl && !matches!(k.code, KeyCode::Char('q' | 'Q')) {
+                    return KeyResult::Changed(false);
+                }
+            }
+        }
+    }
     let command = match k.code {
         KeyCode::Char('q' | 'Q') if ctrl => return KeyResult::Quit,
         KeyCode::Char('s' | 'S') if ctrl => return KeyResult::Save,
@@ -214,6 +305,38 @@ fn key(view: &mut View, k: KeyEvent, elapsed: std::time::Duration) -> KeyResult 
         _ => return KeyResult::Changed(false),
     };
     KeyResult::Changed(execute(view, command, None, k.modifiers.contains(KeyModifiers::SHIFT), elapsed))
+}
+
+fn chord(event: KeyEvent) -> Option<kwil_core_commands::KeyChord> {
+    use kwil_core_commands::{Key, KeyChord, Modifiers, NamedKey as N};
+    let key = match event.code {
+        KeyCode::Char(c) => Key::Character(c),
+        KeyCode::F(n) => Key::Function(n),
+        KeyCode::Enter => Key::Named(N::Enter),
+        KeyCode::Esc => Key::Named(N::Escape),
+        KeyCode::Tab | KeyCode::BackTab => Key::Named(N::Tab),
+        KeyCode::Backspace => Key::Named(N::Backspace),
+        KeyCode::Delete => Key::Named(N::Delete),
+        KeyCode::Insert => Key::Named(N::Insert),
+        KeyCode::Home => Key::Named(N::Home),
+        KeyCode::End => Key::Named(N::End),
+        KeyCode::PageUp => Key::Named(N::PageUp),
+        KeyCode::PageDown => Key::Named(N::PageDown),
+        KeyCode::Left => Key::Named(N::Left),
+        KeyCode::Right => Key::Named(N::Right),
+        KeyCode::Up => Key::Named(N::Up),
+        KeyCode::Down => Key::Named(N::Down),
+        _ => return None,
+    };
+    Some(KeyChord::new(
+        key,
+        Modifiers {
+            ctrl: event.modifiers.contains(KeyModifiers::CONTROL),
+            alt: event.modifiers.contains(KeyModifiers::ALT),
+            shift: event.modifiers.contains(KeyModifiers::SHIFT) || event.code == KeyCode::BackTab,
+            super_key: event.modifiers.contains(KeyModifiers::SUPER),
+        },
+    ))
 }
 
 fn execute(view: &mut View, id: &str, text: Option<String>, extend: bool, at: std::time::Duration) -> bool {
@@ -252,12 +375,13 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
         status,
         Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
     );
-    if let Some(editor) = view.editor() {
-        if let Ok((row, column)) = editor.position_at(editor.primary_cursor().head) {
-            if row >= view.top() && row - view.top() < view.rows() as u64 && column + 8 < area.width as u64 {
-                f.set_cursor_position((area.x + 8 + column as u16, area.y + (row - view.top()) as u16));
-            }
-        }
+    if let Some(editor) = view.editor()
+        && let Ok((row, column)) = editor.position_at(editor.primary_cursor().head)
+        && row >= view.top()
+        && row - view.top() < view.rows() as u64
+        && column + 8 < area.width as u64
+    {
+        f.set_cursor_position((area.x + 8 + column as u16, area.y + (row - view.top()) as u16));
     }
 }
 
@@ -267,7 +391,8 @@ mod tests {
     use std::time::Duration;
 
     fn press(view: &mut View, code: KeyCode, modifiers: KeyModifiers, seconds: u64) {
-        key(view, KeyEvent::new(code, modifiers), Duration::from_secs(seconds));
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
+        key(view, KeyEvent::new(code, modifiers), Duration::from_secs(seconds), &mut keys, Preset::VsCode);
     }
 
     #[test]

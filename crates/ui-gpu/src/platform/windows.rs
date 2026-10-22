@@ -236,7 +236,8 @@ unsafe extern "system" fn drop_files(
             use std::os::windows::ffi::OsStringExt;
             let path = PathBuf::from(std::ffi::OsString::from_wide(&path[..len as usize]));
             unsafe {
-                ((&(*t).state).send)(UserEvent::DroppedFile(path));
+                let state = &(*t).state;
+                (state.send)(UserEvent::DroppedFile(path));
             }
         }
         unsafe {

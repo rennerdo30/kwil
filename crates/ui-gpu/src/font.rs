@@ -107,10 +107,10 @@ impl Font {
                 if !rows.contains(&y) {
                     rows.push(y);
                 }
-            } else if let Some(tx) = &self.sender {
-                if tx.try_send(key.clone()).is_ok() {
-                    self.waiting.insert(key.clone(), vec![y]);
-                }
+            } else if let Some(tx) = &self.sender
+                && tx.try_send(key.clone()).is_ok()
+            {
+                self.waiting.insert(key.clone(), vec![y]);
             }
         }
         self.unicode.get(&key).map(Vec::as_slice)

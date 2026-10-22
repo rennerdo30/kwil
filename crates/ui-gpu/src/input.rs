@@ -11,7 +11,7 @@ pub fn translate(key: &Key, text: Option<&str>, mods: ModifiersState, composing:
     if composing {
         return None;
     }
-    let ctrl = mods.control_key() || (cfg!(target_os = "macos") && mods.super_key());
+    let ctrl = mods.control_key();
     let command = match key {
         Key::Character(c) if ctrl => match c.to_ascii_lowercase().as_str() {
             "z" if mods.shift_key() => "edit.redo",
@@ -85,6 +85,47 @@ pub fn translate(key: &Key, text: Option<&str>, mods: ModifiersState, composing:
         _ => return None,
     };
     Some(Action::Command(command))
+}
+
+pub fn chord(key: &Key, mods: ModifiersState) -> Option<kwil_core_commands::KeyChord> {
+    use kwil_core_commands::{Key as K, KeyChord, Modifiers, NamedKey as N};
+    let key = match key {
+        Key::Character(text) => {
+            let mut chars = text.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            K::Character(c)
+        }
+        Key::Named(key) => K::Named(match key {
+            NamedKey::Enter => N::Enter,
+            NamedKey::Escape => N::Escape,
+            NamedKey::Tab => N::Tab,
+            NamedKey::Backspace => N::Backspace,
+            NamedKey::Delete => N::Delete,
+            NamedKey::Insert => N::Insert,
+            NamedKey::Home => N::Home,
+            NamedKey::End => N::End,
+            NamedKey::PageUp => N::PageUp,
+            NamedKey::PageDown => N::PageDown,
+            NamedKey::ArrowLeft => N::Left,
+            NamedKey::ArrowRight => N::Right,
+            NamedKey::ArrowUp => N::Up,
+            NamedKey::ArrowDown => N::Down,
+            _ => return None,
+        }),
+        _ => return None,
+    };
+    Some(KeyChord::new(
+        key,
+        Modifiers {
+            ctrl: mods.control_key(),
+            alt: mods.alt_key(),
+            shift: mods.shift_key(),
+            super_key: mods.super_key(),
+        },
+    ))
 }
 
 #[cfg(test)]

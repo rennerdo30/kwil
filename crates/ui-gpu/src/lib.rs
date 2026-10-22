@@ -120,6 +120,7 @@ struct App {
     selecting: bool,
     close_pending: bool,
     save_path: Option<String>,
+    keys: Option<kwil_core_commands::keymap::KeymapEngine>,
     settings: Settings,
     policy: RenderPolicy,
     on_event: Box<dyn FnMut(GuiEvent)>,
@@ -183,6 +184,7 @@ pub fn run_with_events(
         selecting: false,
         close_pending: false,
         save_path: None,
+        keys: None,
         settings: Settings::default(),
         policy: RenderPolicy::new(Default::default(), remote::detect()),
         on_event,
@@ -296,8 +298,15 @@ impl App {
         }
     }
 
-    fn key(&mut self, ev: &KeyEvent) {
+    fn key(&mut self, el: &ActiveEventLoop, ev: &KeyEvent) {
         if ev.state != ElementState::Pressed {
+            return;
+        }
+        // A scoped native-window probe can exercise the actual asynchronous
+        // save callback without injecting global Ctrl state or taking focus.
+        #[cfg(feature = "frame-harness")]
+        if self.opts.hidden && matches!(ev.logical_key, Key::Named(NamedKey::F12)) {
+            self.save();
             return;
         }
         if self.save_path.is_some() {
@@ -329,11 +338,87 @@ impl App {
             self.apply(damage);
             return;
         }
-        if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+        if self.close_pending && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             self.close_pending = false;
             let damage = self.view.set_notice(String::new());
             self.apply(damage);
             return;
+        }
+        if !self.composing
+            && let Some(mut chord) = input::chord(&ev.logical_key, self.mods)
+        {
+            // Shift extends a motion while the preset chooses that motion.
+            if matches!(
+                ev.logical_key,
+                Key::Named(
+                    NamedKey::ArrowLeft
+                        | NamedKey::ArrowRight
+                        | NamedKey::ArrowUp
+                        | NamedKey::ArrowDown
+                        | NamedKey::Home
+                        | NamedKey::End
+                        | NamedKey::PageUp
+                        | NamedKey::PageDown
+                )
+            ) {
+                chord.modifiers.shift = false;
+            }
+            if self.keys.is_none() {
+                self.keys =
+                    kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
+            }
+            if let Some(keys) = &mut self.keys {
+                use kwil_core_commands::vim::VimResult;
+                match keys.feed(chord) {
+                    VimResult::Pending => return,
+                    VimResult::Command(call) => {
+                        if self.settings.keymap == kwil_core_commands::Preset::Vim {
+                            if call.id == "file.save" {
+                                self.save();
+                                return;
+                            }
+                            if call.id == "file.quit" {
+                                self.request_close(el, false);
+                                return;
+                            }
+                            if call.id == "file.saveAndQuit" {
+                                self.close_pending = true;
+                                self.save();
+                                return;
+                            }
+                            if let Some(editor) = self.view.editor_mut() {
+                                match editor.execute_vim(&call) {
+                                    Ok(result) => {
+                                        let damage = self.view.refresh_after_edit(result.damage);
+                                        self.apply(damage);
+                                        self.keep_caret_visible();
+                                    }
+                                    Err(error) => {
+                                        let damage = self.view.set_notice(error.to_string());
+                                        self.apply(damage);
+                                    }
+                                }
+                            }
+                        } else {
+                            self.edit(input::Action::Command(call.id));
+                        }
+                        return;
+                    }
+                    VimResult::Error(error) => {
+                        let damage = self.view.set_notice(error);
+                        self.apply(damage);
+                        return;
+                    }
+                    VimResult::Unbound => {
+                        if keys.mode() != kwil_core_commands::Mode::Insert {
+                            return;
+                        }
+                        if self.mods.control_key() || self.mods.super_key() || self.mods.alt_key() {
+                            return;
+                        }
+                    }
+                }
+            }
         }
         if let Some(action) = input::translate(&ev.logical_key, ev.text.as_deref(), self.mods, self.composing) {
             self.edit(action);
@@ -496,17 +581,17 @@ impl App {
         if w == 0 || h < font.ch {
             return;
         }
-        let mut buf = &mut gfx.pixels;
+        let buf = &mut gfx.pixels;
         let mut p = std::mem::take(&mut self.pending);
         let ch = font.ch;
         let rows = h.saturating_sub(ch + BAR) / ch;
         let mut damage: Vec<Rect> = Vec::new();
 
         if p.full {
-            fill(&mut buf, w, Rect { x: 0, y: 0, w, h }, BG);
+            fill(buf, w, Rect { x: 0, y: 0, w, h }, BG);
             for r in 0..rows {
-                draw_row(&mut buf, w, font, &self.view, r, self.horizontal);
-                draw_editor_marks(&mut buf, w, font, &self.view, r, self.horizontal);
+                draw_row(buf, w, font, &self.view, r, self.horizontal);
+                draw_editor_marks(buf, w, font, &self.view, r, self.horizontal);
             }
             p.status = true;
             damage.push(Rect { x: 0, y: 0, w, h });
@@ -529,17 +614,17 @@ impl App {
             p.rows.sort_unstable();
             p.rows.dedup();
             for &r in p.rows.iter().filter(|&&r| r < rows) {
-                draw_row(&mut buf, w, font, &self.view, r, self.horizontal);
-                draw_editor_marks(&mut buf, w, font, &self.view, r, self.horizontal);
+                draw_row(buf, w, font, &self.view, r, self.horizontal);
+                draw_editor_marks(buf, w, font, &self.view, r, self.horizontal);
                 damage.push(Rect { x: 0, y: r * ch, w, h: ch });
             }
         }
         if p.status {
             let sr = Rect { x: 0, y: h - ch, w, h: ch };
-            fill(&mut buf, w, sr, STATUS_BG);
+            fill(buf, w, sr, STATUS_BG);
             let cols = w / font.cw;
             draw_text(
-                &mut buf,
+                buf,
                 w,
                 font,
                 font.cw,
@@ -557,11 +642,11 @@ impl App {
         let (v, horizontal) = bars;
         let vr = Rect { x: w.saturating_sub(BAR), y: 0, w: BAR.min(w), h: v.length };
         let hr = Rect { x: 0, y: v.length, w, h: BAR.min(h.saturating_sub(v.length)) };
-        fill(&mut buf, w, vr, GUTTER_BG);
-        fill(&mut buf, w, hr, GUTTER_BG);
+        fill(buf, w, vr, GUTTER_BG);
+        fill(buf, w, hr, GUTTER_BG);
         if v.maximum > 0 {
             fill(
-                &mut buf,
+                buf,
                 w,
                 Rect { x: vr.x + 2.min(vr.w), y: v.thumb_start, w: vr.w.saturating_sub(4), h: v.thumb_length },
                 GUTTER_FG,
@@ -569,7 +654,7 @@ impl App {
         }
         if horizontal.maximum > 0 {
             fill(
-                &mut buf,
+                buf,
                 w,
                 Rect {
                     x: horizontal.thumb_start,
@@ -585,18 +670,18 @@ impl App {
         }
         let rects: Vec<_> = damage.iter().filter_map(|r| r.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
-        if !self.policy.remote() {
-            if let Some(gpu) = &mut self.gpu {
-                gpu.update(buf, (w, h), &damage, p.scroll, ch, rows);
-            }
+        if !self.policy.remote()
+            && let Some(gpu) = &mut self.gpu
+        {
+            gpu.update(buf, (w, h), &damage, p.scroll, ch, rows);
         }
-        if !rects.is_empty() {
-            if let Ok(mut target) = gfx.surface.buffer_mut() {
-                // Retain a canonical framebuffer: Wayland/macOS may rotate or
-                // replace buffers. Age never forces re-layout or glyph repaint.
-                target.copy_from_slice(buf);
-                let _ = target.present_with_damage(&rects);
-            }
+        if !rects.is_empty()
+            && let Ok(mut target) = gfx.surface.buffer_mut()
+        {
+            // Retain a canonical framebuffer: Wayland/macOS may rotate or
+            // replace buffers. Age never forces re-layout or glyph repaint.
+            target.copy_from_slice(buf);
+            let _ = target.present_with_damage(&rects);
         }
     }
 }
@@ -644,17 +729,18 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
         }
     }
     for cursor in editor.cursors() {
-        if let Ok((cursor_row, byte)) = editor.byte_position(cursor.head) {
-            if cursor_row == absolute_row && byte >= horizontal {
-                let line = view.line(row).unwrap_or_default();
-                let cells = text::cells(line, columns, font.tab_size());
-                let local = byte - horizontal;
-                let column = hit::column_at(&cells, local.min(usize::MAX as u64) as usize);
-                if column >= columns {
-                    continue;
-                }
-                fill(buf, w, Rect { x: gutter + column * font.cw, y: row * font.ch, w: 2, h: font.ch }, STATUS_FG);
+        if let Ok((cursor_row, byte)) = editor.byte_position(cursor.head)
+            && cursor_row == absolute_row
+            && byte >= horizontal
+        {
+            let line = view.line(row).unwrap_or_default();
+            let cells = text::cells(line, columns, font.tab_size());
+            let local = byte - horizontal;
+            let column = hit::column_at(&cells, local.min(usize::MAX as u64) as usize);
+            if column >= columns {
+                continue;
             }
+            fill(buf, w, Rect { x: gutter + column * font.cw, y: row * font.ch, w: 2, h: font.ch }, STATUS_FG);
         }
     }
 }
@@ -802,18 +888,19 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // Drag and drop starts OLE, which costs ~10 ms of window creation;
         // it is registered after the first frame (KW-11).
+        let icon = winit::window::Icon::from_rgba(include_bytes!("icon.rgba").to_vec(), 32, 32).ok();
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title("Kwil")
             .with_inner_size(PhysicalSize::new(1280, 800))
             .with_decorations(true)
             .with_transparent(false)
-            .with_window_icon(winit::window::Icon::from_rgba(include_bytes!("icon.rgba").to_vec(), 32, 32).ok())
+            .with_window_icon(icon.clone())
             .with_visible(!self.opts.hidden);
         #[cfg(windows)]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
-            attrs = attrs.with_drag_and_drop(false);
+            attrs = attrs.with_drag_and_drop(false).with_taskbar_icon(icon);
             if self.opts.hidden {
                 attrs = attrs.with_active(false).with_skip_taskbar(true);
             }
@@ -909,7 +996,13 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
-            UserEvent::IndexDone => self.view.index_ready(),
+            UserEvent::IndexDone => {
+                let damage = self.view.index_ready();
+                if let Some(editor) = self.view.editor_mut() {
+                    editor.settings = self.settings.clone();
+                }
+                damage
+            }
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::Saved(saved) => {
                 let Some(editor) = self.view.editor_mut() else {
@@ -947,6 +1040,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SettingsReady(settings) => {
                 self.settings = settings;
+                self.keys =
+                    kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
+                if let Some(editor) = self.view.editor_mut() {
+                    editor.settings = self.settings.clone();
+                }
                 self.policy = RenderPolicy::new(self.settings.render.clone(), self.policy.detected());
                 self.apply_native_theme();
                 (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
@@ -1039,12 +1137,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.mods.control_key()
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && self.mods.control_key()
                     && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
                 {
                     self.request_close(el, self.close_pending && self.mods.shift_key());
                 } else {
-                    self.key(&event);
+                    self.key(el, &event);
                 }
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
@@ -1057,6 +1157,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.drag = None;
                 self.selecting = false;
                 self.composing = false;
+                if let Some(keys) = &mut self.keys {
+                    keys.cancel_pending();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (horizontal, vertical) = match delta {
@@ -1101,15 +1204,15 @@ impl App {
         });
     }
     fn apply_native_theme(&self) {
-        if let Some(g) = &self.gfx {
-            if let Some(native) = &g.native {
-                let dark = if self.settings.theme.follow_os {
-                    g.window.theme() != Some(winit::window::Theme::Light)
-                } else {
-                    self.settings.theme.name != "light"
-                };
-                native.theme(dark, self.policy.remote());
-            }
+        if let Some(g) = &self.gfx
+            && let Some(native) = &g.native
+        {
+            let dark = if self.settings.theme.follow_os {
+                g.window.theme() != Some(winit::window::Theme::Light)
+            } else {
+                self.settings.theme.name != "light"
+            };
+            native.theme(dark, self.policy.remote());
         }
     }
     fn start_gpu(&mut self) {

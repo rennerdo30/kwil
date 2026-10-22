@@ -1431,6 +1431,7 @@ name = "kwil-ui-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "kwil-core-commands",
  "kwil-core-workspace",
  "kwil-view-model",
  "ratatui",
