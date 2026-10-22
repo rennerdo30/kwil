@@ -45,7 +45,8 @@ jobs:
       # re-runs of a failed release.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          add-rust-environment-hash-key: false
+          key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           cache-on-failure: true
       - run: cargo build --release --locked -p kwil --target ${{ matrix.target }}
       - name: Stage the binary

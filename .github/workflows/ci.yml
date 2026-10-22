@@ -42,12 +42,16 @@ jobs:
       - uses: actions/checkout@v7
       # rust-toolchain.toml pins the version; rustup installs it on first use.
       - run: rustup show active-toolchain
-      # Caches ~/.cargo (registry, git) and target/ dependencies, keyed by
-      # OS, toolchain and Cargo.lock. Only main writes the cache, so pull
-      # requests reuse it without churning it; failed runs still save, so a
-      # red build does not cost the next run a cold compile.
+      # Caches ~/.cargo (registry, git) and target/ dependencies. The key is
+      # OS + job + our own inputs (lockfile, pinned toolchain, cargo config);
+      # rust-cache's automatic environment hash also covers every toolchain
+      # preinstalled on the runner image, so each image update missed the
+      # cache. Only main writes the cache, so pull requests reuse it without
+      # churning it; failed runs still save.
       - uses: Swatinem/rust-cache@v2
         with:
+          add-rust-environment-hash-key: false
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
