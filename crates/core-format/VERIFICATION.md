@@ -133,7 +133,7 @@ in that directory identify the tested base plus edits on their first line.
 No native macOS/Linux, full workspace tests, GUI/TUI/undo integration or owner
 acceptance ran locally. The parent owns the new CI result, review and merge.
 
-## Review round 4 source candidate (2026-10-23)
+## Review round 4 (2026-10-23)
 
 Base: `9ade72ae2c5465c528a268a56d681c2592482466`, same isolated `fix-7b`.
 The fourth review found two further boundary assumptions. The implementation
@@ -151,9 +151,32 @@ approach is now conservative admission, rather than guessing missing grammar:
   All 49 previous contracts are retained. The four new tests cover three failure
   selections plus a Unicode SQL literal/comment control.
 
-**Validation pending:** no Cargo/test/Clippy invocation has run for this candidate.
-The parent owns the current shared lane queue and must explicitly grant it before
-this job runs `verify-round4-fail-first.ps1`, the restored focused formatter suite,
-workspace Clippy and fmt. Source formatting used only standalone rustfmt (PID
-20856, exit 0); `git diff --check` passes. No full suite or native run started.
-This source candidate is not ready for merge or a passing claim.
+Source candidate: `e8072e01c1112889b2fc0b7a1bb152247b0384a7`. After the parent’s
+serial lane handoff, validation ran once per required check on exact source:
+
+- `verify-round4-fail-first.ps1`: broken `9ade72a` source copy produced **3 failed,
+  1 passed**, owned cargo PID **18220**, expected exit 101. SQL split `éfrom` into
+  a name prefix plus `FROM`, the shell fixture lost literal trailing spaces, and
+  opt-in reindent changed those literal bytes. The Unicode literal/comment control
+  passed as required.
+- Both source files restored byte-identical to the candidate, verified against
+  the pre-run SHA256/mtime receipt before testing the restored implementation.
+  The test build log records a fresh compile after restoration.
+- `cargo test -p kwil-core-format --locked -j 4`: **53/53 passed**, including all
+  **49 prior contracts** and all four round-4 tests, PID **67740**, exit 0.
+- `cargo clippy --workspace --all-targets --locked -j 4 -- -D warnings`: passed,
+  PID **23424**, exit 0. `cargo fmt --all --check`: passed, PID **51424**, exit 0.
+  `git diff --check` passed; source worktree was clean before this evidence edit.
+
+All owned Cargo processes exited. Existing lock/reap tests prove the formatter
+descendants stopped; no native/app launch was performed. The lane was released
+directly to `codex-t3-a7ed711a` immediately after the finite block, and the parent
+received the exact result/PID copy. No further Cargo was run for this docs update.
+
+Cache: the brief-specified `E:/Development/_cache/cargo-target/kwil-kw-7-format`
+was retained; only changed inputs compiled. No target/cache bypass, clean,
+benchmark or full workspace test suite ran locally. Exact input provenance is in
+`round4-source-provenance.json`; `round4-red.log`, `round4-green.log` and
+`round4-clippy.log` identify their source commit on the first line, all beneath
+that target directory. Native macOS/Linux and full workspace evidence belongs to
+CI; the parent still owns independent review and merge.
