@@ -1,8 +1,10 @@
 # Review regressions must fail assertions on deliberately broken implementations.
 # Only this worktree's owned source is mutated, then restored byte-for-byte.
+param([string]$TestName)
 $ErrorActionPreference = 'Stop'
 $cases = @(
     @{ Test='whole_word_alternatives_captures_and_literal_boundaries'; File='search.rs'; From='RegexBuilder::new(&constrained)'; To='RegexBuilder::new(expression)' },
+    @{ Test='whole_word_extended_comments_preserve_flags_and_captures'; File='search.rs'; From='format!(r"(?u:\b)(?:{ast})(?u:\b)")'; To='format!(r"(?u:\b)(?:{expression})(?u:\b)")' },
     @{ Test='piece_snapshot_chunks_search_and_replace_stay_immutable'; File='search.rs'; From='at += bytes.len() as u64;'; To='at += 0;' },
     @{ Test='haystack_read_errors_reach_search_filter_and_replace'; File='search.rs'; From='copy_range(source, lo..hi, &mut bytes)?;'; To='if copy_range(source, lo..hi, &mut bytes).is_err() { return Ok(()); }' },
     @{ Test='changed_file_adapter_reports_errors_for_file_and_snapshot'; File='search.rs'; From='let bytes = self.bytes().map_err(io::Error::other)?;'; To='let bytes: &[u8] = b"xxxxxxxxxxxxxxxxx";' },
@@ -10,6 +12,7 @@ $cases = @(
     @{ Test='files_crlf_ranges_include_matching_terminator'; File='files.rs'; From='.find_iter(bytes, |m| {'; To='.find_iter(preview, |m| {' }
 )
 foreach ($case in $cases) {
+    if ($TestName -and $case.Test -ne $TestName) { continue }
     $path = Join-Path $PSScriptRoot "src/$($case.File)"
     $original = [IO.File]::ReadAllBytes($path)
     $source = [Text.Encoding]::UTF8.GetString($original)

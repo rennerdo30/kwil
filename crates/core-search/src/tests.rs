@@ -439,6 +439,49 @@ fn whole_word_alternatives_captures_and_literal_boundaries() {
 }
 
 #[test]
+fn whole_word_extended_comments_preserve_flags_and_captures() {
+    let options = Options { whole_word: true, ..Options::default() };
+    for expression in [r"(?x)ab #comment", r"(?x)(?P<first>a|ab) # closing ) is a comment"] {
+        let p = Pattern::regex(expression, options, 8).unwrap();
+        let bytes = b"ab a abc";
+        let hits = collect(bytes.as_slice(), &p, 0..bytes.len() as u64);
+        assert_eq!(hits[0], Match { offset: 0, len: 2 });
+        if expression.contains("first") {
+            assert_eq!(hits, [Match { offset: 0, len: 2 }, Match { offset: 3, len: 1 }]);
+            let mut edits = Vec::new();
+            plan_replace(bytes.as_slice(), &p, hits, b"$1:${first}:$0", &token(), |edit| {
+                edits.push(edit);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(edits[0].new_bytes, b"ab:ab:ab");
+            assert_eq!(edits[1].new_bytes, b"a:a:a");
+        } else {
+            assert_eq!(hits.len(), 1);
+        }
+    }
+    for (expression, options) in [
+        (r"(?ix)(?P<first>a)(?-i:B) # scoped case", options),
+        (r"(?x)(?P<first>a)(?-i:B) # caller case", Options { case_insensitive: true, ..options }),
+    ] {
+        let p = Pattern::regex(expression, options, 8).unwrap();
+        assert_eq!(
+            collect(b"AB Ab aB ab".as_slice(), &p, 0..11),
+            [Match { offset: 0, len: 2 }, Match { offset: 6, len: 2 }]
+        );
+    }
+    let p = Pattern::regex(r"(?x)(?P<gone>a){0}(?P<kept>b) # preserve $2", options, 8).unwrap();
+    let hits = collect(b"b".as_slice(), &p, 0..1);
+    let mut replacement = Vec::new();
+    plan_replace(b"b".as_slice(), &p, hits, b"$1:$2:${gone}:${kept}", &token(), |edit| {
+        replacement = edit.new_bytes;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(replacement, b":b::b");
+}
+
+#[test]
 fn piece_snapshot_chunks_search_and_replace_stay_immutable() {
     let mut buffer = kwil_core_text::Buffer::empty();
     buffer.insert(0, b"abef tail").unwrap();

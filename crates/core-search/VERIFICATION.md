@@ -4,6 +4,31 @@ Starting base: `b1b5c55658953a8572ea10662adf4f2aa4e7f730` (`main`).
 Final implementation measured: `e7d8ff36e3e9dfed5938c30749238b14bd497845`.
 Branch: `kw/22-search`.
 
+## Fix round 2: extended-mode regex comments
+
+Base: `f3242e7c7e04241e9b26555975108703a720edcd`.
+Round 2 review found that whole-word raw string wrapping rejects the otherwise
+valid `(?x)ab #comment`: the trailing comment consumes the wrapper's closing
+syntax. Whole-word boundaries now wrap serialized parsed AST, whose printer
+removes comments while retaining capture syntax and inline flags. HIR remains
+the source of LF-consumption analysis. HIR serialization was tested but would
+renumber captures after simplifying a zero-count repetition: `(a){0}(b)` would
+make `b` capture 1 instead of capture 2. The regression also caught that defect
+before switching to AST serialization. An explicit `(?-i:...)` still overrides
+the caller's case-insensitive option.
+
+`whole_word_extended_comments_preserve_flags_and_captures` failed before the fix
+with `error: unclosed group`. The same test failed against a deliberately broken
+copy restoring raw wrapping (`review-fail-first.ps1 -TestName
+whole_word_extended_comments_preserve_flags_and_captures`); the script restored
+the implementation byte-for-byte. The restored crate suite passed **18/18**,
+covering alternatives, numbered/named replacements, inline/caller case flags,
+and every earlier read-error, snapshot, UTF-16, CRLF and streaming regression.
+Workspace Clippy (`--all-targets --locked -j 4 -- -D warnings`), fmt and diff
+checks passed with incremental cache reuse. No literal search hot-path change,
+new performance run, full local suite or native/UI launch occurred in this round.
+Re-review and new-head hosted CI remain with the parent.
+
 ## Fix round 1
 
 Started at PR head `0c0cfc872ace55ed779db7870a8acb3d62fc366c` on local

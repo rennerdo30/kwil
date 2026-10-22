@@ -131,27 +131,29 @@ impl Pattern {
         if !(1..=MAX_PATTERN).contains(&max_match_bytes) {
             return Err(invalid("regex match bound must be 1..=1 MiB"));
         }
-        let constrained =
-            if options.whole_word { format!(r"(?u:\b)(?:{expression})(?u:\b)") } else { expression.to_owned() };
-        let re = RegexBuilder::new(&constrained)
-            .case_insensitive(options.case_insensitive)
-            .size_limit(8 << 20)
-            .dfa_size_limit(2 << 20)
-            .build()
-            .map_err(invalid)?;
         let hir = regex_syntax::ParserBuilder::new()
             .utf8(false)
             .case_insensitive(options.case_insensitive)
             .build()
             .parse(expression)
             .map_err(invalid)?;
-        Ok(Self {
-            engine: Engine::Regex(re),
-            options,
-            max_len: max_match_bytes,
-            captures: true,
-            newline_safe: !consumes_newline(&hir),
-        })
+        let newline_safe = !consumes_newline(&hir);
+        let constrained = if options.whole_word {
+            // AST serialization removes comments while retaining capture syntax
+            // and inline flags. HIR serialization would drop groups under {0}
+            // and renumber later captures when compiled back from its string.
+            let ast = regex_syntax::ast::parse::Parser::new().parse(expression).map_err(invalid)?;
+            format!(r"(?u:\b)(?:{ast})(?u:\b)")
+        } else {
+            expression.to_owned()
+        };
+        let re = RegexBuilder::new(&constrained)
+            .case_insensitive(options.case_insensitive)
+            .size_limit(8 << 20)
+            .dfa_size_limit(2 << 20)
+            .build()
+            .map_err(invalid)?;
+        Ok(Self { engine: Engine::Regex(re), options, max_len: max_match_bytes, captures: true, newline_safe })
     }
 
     pub(crate) fn visit(
