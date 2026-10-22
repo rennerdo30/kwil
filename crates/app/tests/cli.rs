@@ -53,7 +53,7 @@ fn version(binary: &str) {
 fn help(binary: &str) {
     let out = output(binary, "--help");
     assert!(out.status.success(), "{:?}", out);
-    assert!(String::from_utf8(out.stdout).unwrap().contains("Usage: kwil [options] [file]"));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("Usage: kwil [options] [file[:line[:column]] ...]"));
 }
 #[test]
 fn gui_version() {
