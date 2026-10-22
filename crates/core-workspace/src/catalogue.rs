@@ -229,11 +229,16 @@ mod tests {
             use std::os::windows::ffi::OsStringExt;
             std::ffi::OsString::from_wide(&[0x0061, 0xD800, 0x0062])
         };
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         let name = {
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b'])
         };
+        // APFS rejects invalid UTF-8 filenames with EILSEQ before the walk can
+        // observe them. Exercise exact native Unicode identity there; Linux
+        // retains the arbitrary-byte contract above, Windows the surrogate one.
+        #[cfg(target_os = "macos")]
+        let name = std::ffi::OsString::from("日本語-log.rs");
         let path = f.0.join(name);
         fs::write(&path, "").unwrap();
         let mut emitted = Vec::new();
