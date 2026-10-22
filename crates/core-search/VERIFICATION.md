@@ -27,8 +27,47 @@ Both literal case modes keep replacement dollars literal. The shared AST
 composition retains trailing extended-mode comments, scoped flags and capture
 numbering; no public function or trait signature changes.
 
-Focused validation is recorded below when run. No benchmark rerun is authorized
-for this round. The prior independent round-2 review measured warm medians of
+**Validated implementation:** `8f68d2298f7816fd7cdd5fdb2d2375c1f39de2d8`,
+2026-10-23, 05:03 JST. The parent-controlled Cargo lane was granted by the
+upstream launcher job, then released directly to the named next job after these
+finite checks; every process exited before handoff, with a 180-second timeout.
+
+- **Fail first:** the saved pre-fix `search.rs` was verified against Git blob
+  `8aaf8b6184a7060c9a29ce01994111469f99b9d1` from `769f09d`, substituted only in
+  this isolated worktree, then restored byte-for-byte in `finally`. The new
+  `whole_word_literal_rejected_overlap_search` and
+  `whole_word_literal_rejected_overlap_replace_all` tests both failed assertions
+  (Cargo PID 15564, exit 101). Each reported `left: [[], []]`, proving that both
+  case modes missed the required hit or edit, rather than failing compilation.
+- **Fixed:** all **20/20** focused crate tests passed (PID 16848, exit 0, 0.10 s).
+  The new checks cover periodic literals, accepted-hit non-overlap, Unicode case
+  folding, non-word-ended patterns, invalid bytes, selection context, count mode,
+  tiny chunks, work-window borders, parallel equivalence and literal dollars.
+  All 18 prior tests passed, including every earlier review regression.
+- Package all-targets Clippy with warnings denied passed (PID 77936, exit 0).
+  Package formatting passed (PID 13352, exit 0); `git diff --check` also passed.
+- Checks used `--offline --locked -j 4` and the configured shared target
+  `E:/Development/_cache/cargo-target/kwil`, without any target override or clean.
+  The first test build compiled missing search dependency artifacts (13.05 s);
+  the fixed test build reused them and rebuilt only core-search (1.04 s).
+- Logs are `%TEMP%/kwil-search-r4-86146cf7/{fail-first,focused-tests,clippy,fmt}.log`.
+  Each first line records the commit, phase, start time, source timestamps and
+  SHA-256 hashes. Fixed `search.rs` SHA-256:
+  `419EEFD4369D87E563F0CB9ACD077A237B1F0EF8E0D6715A04CBAC8A79BB0B59`;
+  test source SHA-256:
+  `774093A2BA9BA879E873962882289A473727C10F3159DF57CF0F3670ECCE9E6F`.
+
+Fixed-source commands (tests used two test threads):
+
+```text
+cargo test -p kwil-core-search --lib --offline --locked -j 4 -- --test-threads=2
+cargo clippy -p kwil-core-search --all-targets --offline --locked -j 4 -- -D warnings
+cargo fmt -p kwil-core-search -- --check
+```
+
+No benchmark rerun is authorized or performed for this round. No workspace
+tests/Clippy, native, GUI/TUI or frontend integration check ran locally.
+The prior independent round-2 review measured warm medians of
 **18.896 ms** at `0c0cfc8` and **18.649 ms** at `f3242e7`, resolving the earlier
 first-access concern. Those remain historical evidence, not measurements of this
 implementation. Hosted CI, independent re-review and frontend integration remain

@@ -32,8 +32,8 @@ file mutation, persistent background thread, or file-sized working buffer.
   Both literals and regexes compile these constraints into the expression, so
   rejecting a boundary does not skip an overlapping candidate. Accepted hits stay
   non-overlapping. There is no per-rejection restart that repeatedly scans a long
-  periodic needle. Parsed AST composition preserves extended-mode comments,
-  alternatives and capture numbering. Literal replacements keep dollar signs
+  periodic needle. Parsed AST composition handles extended-mode comments and
+  preserves alternatives and capture numbering. Literal replacements keep dollar signs
   literal in both case modes. Offsets are original bytes; in-buffer encoding decode
   and offset mapping are separate adapters.
 - Regex search requires a declared maximum possible match length, at most 1 MiB
