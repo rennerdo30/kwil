@@ -70,6 +70,11 @@ impl Native {
         if target.is_null() {
             (state.send)(UserEvent::Notice("File drop registration unavailable".into()));
         }
+        #[cfg(feature = "frame-harness")]
+        println!(
+            "kwil-native subclass={subclass} session_notifications={session} ole={ole} drop_target={}",
+            !target.is_null()
+        );
         Self { hwnd, state, ole, target, session, subclass }
     }
     pub fn theme(&self, dark: bool, remote: bool) {
@@ -107,8 +112,8 @@ impl Drop for Native {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _id: usize, data: usize) -> LRESULT {
     if msg == WM_WTSSESSION_CHANGE {
         let remote = match w as u32 {
-            WTS_REMOTE_CONNECT => true,
-            WTS_REMOTE_DISCONNECT | WTS_CONSOLE_CONNECT => false,
+            WTS_REMOTE_CONNECT | WTS_REMOTE_DISCONNECT => true,
+            WTS_CONSOLE_CONNECT => false,
             _ => super::super::remote::detect(),
         };
         // SAFETY: Native owns this stable Box and removes the subclass before drop.
@@ -236,8 +241,8 @@ unsafe extern "system" fn drop_files(
             use std::os::windows::ffi::OsStringExt;
             let path = PathBuf::from(std::ffi::OsString::from_wide(&path[..len as usize]));
             unsafe {
-                let state = &(*t).state;
-                (state.send)(UserEvent::DroppedFile(path));
+                let target = &*t;
+                (target.state.send)(UserEvent::DroppedFile(path));
             }
         }
         unsafe {

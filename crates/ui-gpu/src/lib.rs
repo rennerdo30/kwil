@@ -17,6 +17,8 @@ use font::Font;
 use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View};
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(feature = "frame-harness")]
+mod harness;
 mod platform;
 pub mod remote;
 mod shaping;
@@ -74,12 +76,14 @@ enum UserEvent {
     Notice(String),
     Saved(std::io::Result<kwil_core_workspace::SavedSnapshot>),
     GlyphReady(shaping::Tile, u64),
-    SettingsReady(Settings),
-    FontReady(Option<Font>),
+    SettingsReady(Box<Settings>),
+    FontReady(Option<Box<Font>>),
     SessionChanged(bool),
     DroppedFile(std::path::PathBuf),
     #[cfg(feature = "gpu")]
-    GpuReady(Result<gpu::Gpu, String>, f64),
+    GpuReady(Result<Box<gpu::Gpu>, String>, f64),
+    #[cfg(feature = "frame-harness")]
+    Harness(harness::Step),
 }
 
 /// Events for the app integration package. A dropped file is a request, never
@@ -130,6 +134,10 @@ struct App {
     gpu_started: bool,
     font_loading: bool,
     font_reload_pending: bool,
+    redraw_requested: bool,
+    settings_loaded: bool,
+    #[cfg(feature = "frame-harness")]
+    metrics: harness::Metrics,
 }
 
 /// Runs the GUI until the window closes. `on_first_frame` runs once the
@@ -147,7 +155,7 @@ pub fn run_with_events(
 ) -> Result<(), GuiError> {
     trace::mark("gui entry");
     // Font loading runs while the event loop and window are created.
-    let font_thread = Some(std::thread::spawn(|| Font::load(15.0)));
+    let font_thread = Some(std::thread::spawn(|| Font::load(14.0)));
     let event_loop =
         EventLoop::<UserEvent>::with_user_event().build().map_err(|e| GuiError::Unavailable(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -194,6 +202,10 @@ pub fn run_with_events(
         gpu_started: false,
         font_loading: false,
         font_reload_pending: false,
+        redraw_requested: false,
+        settings_loaded: false,
+        #[cfg(feature = "frame-harness")]
+        metrics: Default::default(),
     };
     event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
@@ -294,6 +306,7 @@ impl App {
             }
         }
         if let Some(g) = &self.gfx {
+            self.redraw_requested = true;
             g.window.request_redraw();
         }
     }
@@ -574,9 +587,9 @@ impl App {
         }
     }
 
-    fn render(&mut self) {
+    fn render(&mut self) -> bool {
         if self.pending == Damage::default() {
-            return;
+            return true;
         }
         let (w, h) = self.size;
         for r in 0..self.view.rows() {
@@ -589,17 +602,20 @@ impl App {
             self.widest = self.widest.max(length);
         }
         let bars = self.bars();
-        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return };
+        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
         if w == 0 || h < font.ch {
-            return;
+            return true;
         }
         let buf = &mut gfx.pixels;
         let mut p = std::mem::take(&mut self.pending);
         let ch = font.ch;
         let rows = h.saturating_sub(ch + BAR) / ch;
         let mut damage: Vec<Rect> = Vec::new();
+        #[cfg(feature = "frame-harness")]
+        let mut copied = 0u64;
 
         if p.full {
+            font.invalidate_rows();
             fill(buf, w, Rect { x: 0, y: 0, w, h }, BG);
             for r in 0..rows {
                 draw_row(buf, w, font, &self.view, r, self.horizontal);
@@ -609,6 +625,7 @@ impl App {
             damage.push(Rect { x: 0, y: 0, w, h });
         } else {
             if p.scroll != 0 {
+                font.scroll_rows(p.scroll, rows);
                 let d = p.scroll.unsigned_abs() as usize;
                 let keep = (rows - d) * ch;
                 if p.scroll > 0 {
@@ -616,10 +633,18 @@ impl App {
                     if !screen_copy(&gfx.window, gfx.hwnd, w.saturating_sub(BAR), keep, d * ch, 0) {
                         damage.push(Rect { x: 0, y: 0, w, h: keep });
                     }
+                    #[cfg(feature = "frame-harness")]
+                    {
+                        copied = (w * keep) as u64;
+                    }
                 } else {
                     buf.copy_within(0..keep * w, d * ch * w);
                     if !screen_copy(&gfx.window, gfx.hwnd, w.saturating_sub(BAR), keep, 0, d * ch) {
                         damage.push(Rect { x: 0, y: d * ch, w, h: keep });
+                    }
+                    #[cfg(feature = "frame-harness")]
+                    {
+                        copied = (w * keep) as u64;
                     }
                 }
             }
@@ -632,7 +657,8 @@ impl App {
             }
         }
         if p.status {
-            let sr = Rect { x: 0, y: h - ch, w, h: ch };
+            let status_height = ch.min(h);
+            let sr = Rect { x: 0, y: h - status_height, w, h: status_height };
             fill(buf, w, sr, STATUS_BG);
             let cols = w / font.cw;
             draw_text(
@@ -687,14 +713,33 @@ impl App {
         {
             gpu.update(buf, (w, h), &damage, p.scroll, ch, rows);
         }
-        if !rects.is_empty()
-            && let Ok(mut target) = gfx.surface.buffer_mut()
-        {
+        if !rects.is_empty() {
+            let mut target = match gfx.surface.buffer_mut() {
+                Ok(target) => target,
+                Err(error) => {
+                    self.error = Some(GuiError::Unavailable(error.to_string()));
+                    return false;
+                }
+            };
             // Retain a canonical framebuffer: Wayland/macOS may rotate or
             // replace buffers. Age never forces re-layout or glyph repaint.
+            if target.len() != buf.len() {
+                self.error = Some(GuiError::Unavailable("CPU surface resize failed".into()));
+                return false;
+            }
             target.copy_from_slice(buf);
-            let _ = target.present_with_damage(&rects);
+            match target.present_with_damage(&rects) {
+                Ok(()) => {
+                    #[cfg(feature = "frame-harness")]
+                    self.metrics.present(p.full, damage.iter().map(|r| (r.w * r.h) as u64).sum(), copied);
+                }
+                Err(error) => {
+                    self.error = Some(GuiError::Unavailable(error.to_string()));
+                    return false;
+                }
+            }
         }
+        true
     }
 }
 
@@ -958,22 +1003,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.resize_surface();
         let d = self.view.set_rows(self.text_rows());
         self.apply(d);
-        self.render();
-        trace::mark("first frame presented");
-        let proxy = self.proxy.clone();
-        if let Some(font) = self.font.as_mut() {
-            font.enable_unicode("monospace".into(), move |tile, generation| {
-                let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
-            });
+        if !self.render() {
+            el.exit();
+            return;
         }
-        // First-frame Unicode placeholders retain grid widths; only now may a
-        // redraw queue lazy fallback work. No fallback lookup precedes the mark.
-        self.apply(Damage {
-            rows: (0..self.view.rows())
-                .filter(|r| self.view.line(*r).is_some_and(|s| s.iter().take(64 * 1024).any(|b| !b.is_ascii())))
-                .collect(),
-            ..Default::default()
-        });
+        trace::mark("first frame presented");
         let proxy = self.proxy.clone();
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.native = Some(platform::Native::register(gfx.hwnd, move |e| {
@@ -990,14 +1024,18 @@ impl ApplicationHandler<UserEvent> for App {
                 .and_then(|path| Settings::load(&path).map_err(|e| e.to_string()));
             match result {
                 Ok(report) => {
-                    let _ = proxy.send_event(UserEvent::SettingsReady(report.settings));
+                    let _ = proxy.send_event(UserEvent::SettingsReady(Box::new(report.settings)));
                 }
                 Err(message) => {
                     let _ = proxy.send_event(UserEvent::Notice(format!("Settings: {message}")));
-                    let _ = proxy.send_event(UserEvent::SettingsReady(Settings::default()));
+                    let _ = proxy.send_event(UserEvent::SettingsReady(Box::default()));
                 }
             }
         });
+        #[cfg(feature = "frame-harness")]
+        if self.opts.hidden && std::env::var_os("KWIL_FRAME_SCRIPT").is_some() {
+            harness::start(self.proxy.clone());
+        }
         if let Some(cb) = self.on_first_frame.take() {
             let p = self.proxy.clone();
             cb(Box::new(move |msg| {
@@ -1048,14 +1086,32 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::SessionChanged(detected) => {
+                #[cfg(feature = "gpu")]
+                let previous = self.policy.remote();
                 self.policy.session_changed(detected);
+                #[cfg(feature = "gpu")]
+                if previous != self.policy.remote()
+                    && let Some(gpu) = self.gpu.as_mut()
+                {
+                    gpu.invalidate();
+                }
                 self.apply_native_theme();
                 (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
                 self.start_gpu();
+                #[cfg(feature = "frame-harness")]
+                println!(
+                    "kwil-frame session_detected={detected} remote={} blink={}",
+                    self.policy.remote(),
+                    self.policy.cursor_blink_allowed()
+                );
                 return;
             }
             UserEvent::SettingsReady(settings) => {
-                self.settings = settings;
+                self.settings_loaded = true;
+                let font_changed =
+                    settings.font.family != self.settings.font.family || settings.font.size != self.settings.font.size;
+                let tabs_changed = settings.editor.tab_size != self.settings.editor.tab_size;
+                self.settings = *settings;
                 self.keys =
                     kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
                 if let Some(editor) = self.view.editor_mut() {
@@ -1064,7 +1120,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.policy = RenderPolicy::new(self.settings.render.clone(), self.policy.detected());
                 self.apply_native_theme();
                 (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
-                self.reload_font();
+                let scale = self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()) as f32;
+                if font_changed
+                    || self.font.as_ref().is_some_and(|f| (f.px - self.settings.font.size * scale).abs() > 0.01)
+                {
+                    self.reload_font();
+                } else {
+                    self.activate_unicode(tabs_changed);
+                }
                 self.start_gpu();
                 return;
             }
@@ -1080,7 +1143,7 @@ impl ApplicationHandler<UserEvent> for App {
                 font.enable_unicode(self.settings.font.family.clone(), move |tile, generation| {
                     let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
                 });
-                self.font = Some(font);
+                self.font = Some(*font);
                 self.view.set_rows(self.text_rows())
             }
             UserEvent::FontReady(None) => {
@@ -1097,9 +1160,14 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("kwil-gpu device_init_ms={ms:.3} onscreen_takeover=false reason=no-damage-present-api");
                 }
                 match result {
-                    Ok(gpu) => self.gpu = Some(gpu),
+                    Ok(gpu) => self.gpu = Some(*gpu),
                     Err(error) => eprintln!("kwil-gpu unavailable: {error}"),
                 }
+                return;
+            }
+            #[cfg(feature = "frame-harness")]
+            UserEvent::Harness(step) => {
+                harness::step(self, _el, step);
                 return;
             }
         };
@@ -1119,7 +1187,16 @@ impl ApplicationHandler<UserEvent> for App {
                 let d = self.view.set_rows(self.text_rows());
                 self.apply(d);
             }
-            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::RedrawRequested => {
+                // Distinguish our already-serviced startup request from an OS
+                // expose event (X11 needs the retained pixels restored).
+                if !std::mem::take(&mut self.redraw_requested) && self.pending == Damage::default() {
+                    self.pending.full = true;
+                }
+                if !self.render() {
+                    el.exit();
+                }
+            }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
@@ -1149,8 +1226,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ScaleFactorChanged { .. } => self.reload_font(),
             WindowEvent::ThemeChanged(_) => self.apply_native_theme(),
             WindowEvent::DroppedFile(path) => {
-                (self.on_event)(GuiEvent::DroppedFile(path));
+                self.user_event(el, UserEvent::DroppedFile(path));
             }
+            WindowEvent::Focused(true) => self.user_event(el, UserEvent::SessionChanged(remote::detect())),
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
             WindowEvent::KeyboardInput { event, .. } => self.key(el, &event),
             WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
@@ -1208,7 +1286,27 @@ impl App {
         let proxy = self.proxy.clone();
         let family = self.settings.font.family.clone();
         std::thread::spawn(move || {
-            let _ = proxy.send_event(UserEvent::FontReady(Font::load_named(px, &family)));
+            let _ = proxy.send_event(UserEvent::FontReady(Font::load_named(px, &family).map(Box::new)));
+        });
+    }
+    fn activate_unicode(&mut self, tabs_changed: bool) {
+        let proxy = self.proxy.clone();
+        if let Some(font) = self.font.as_mut() {
+            font.tab_size = self.settings.editor.tab_size as usize;
+            font.enable_unicode(self.settings.font.family.clone(), move |tile, generation| {
+                let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
+            });
+        }
+        self.apply(Damage {
+            rows: (0..self.view.rows())
+                .filter(|r| {
+                    self.view.line(*r).is_some_and(|s| {
+                        s.iter().take(64 * 1024).any(|b| !b.is_ascii() || (tabs_changed && *b == b'\t'))
+                    })
+                })
+                .collect(),
+            status: !self.view.status_text().is_ascii(),
+            ..Default::default()
         });
     }
     fn apply_native_theme(&self) {
@@ -1220,18 +1318,19 @@ impl App {
             } else {
                 self.settings.theme.name != "light"
             };
-            native.theme(dark, self.policy.remote());
+            native.theme(dark, self.policy.remote() || !self.settings_loaded);
         }
     }
     fn start_gpu(&mut self) {
         #[cfg(feature = "gpu")]
-        if !self.gpu_started && !self.policy.remote() {
+        if self.settings_loaded && !self.gpu_started && !self.policy.remote() {
             self.gpu_started = true;
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
                 let start = std::time::Instant::now();
                 let result = gpu::Gpu::init();
-                let _ = proxy.send_event(UserEvent::GpuReady(result, start.elapsed().as_secs_f64() * 1000.0));
+                let _ =
+                    proxy.send_event(UserEvent::GpuReady(result.map(Box::new), start.elapsed().as_secs_f64() * 1000.0));
             });
         }
     }

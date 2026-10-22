@@ -14,6 +14,7 @@ pub struct Cell {
 /// Only visits the visible prefix. Both output and grapheme inspection are capped,
 /// including adversarial lines made entirely from combining marks.
 pub fn cells(bytes: &[u8], columns: usize, tab_size: usize) -> Vec<Cell> {
+    let columns = columns.min(4096);
     let limit = bytes.len().min(columns.saturating_mul(256).min(64 * 1024));
     let bytes = &bytes[..limit];
     let mut result = Vec::new();
