@@ -6,6 +6,9 @@
 //! macOS requires an installed bundle with declared document types; changing a
 //! Launch Services role is reversible only if a previous handler exists.
 //! Linux edits the XDG desktop/mimeapps files used by xdg-mime, without a shell.
+//! Conflict checks are optimistic: platform APIs do not offer a cross-process
+//! compare-and-swap spanning inspection and replacement. Hosts must serialize
+//! their own actions; an external edit racing the final check may still win.
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, path::PathBuf};
 
@@ -299,7 +302,7 @@ pub fn apply(
     }
     Ok(receipt)
 }
-/// Idempotent rollback. Foreign edits are conflicts, never overwritten. Keep
+/// Idempotent rollback. Detected foreign edits are conflicts, never overwritten. Keep
 /// the returned pending receipt when any restoration fails; it can be retried.
 pub fn rollback(adapter: &mut impl AssociationAdapter, receipt: &mut AssociationReceipt) -> Vec<AssociationError> {
     if adapter.owner() != receipt.owner {
