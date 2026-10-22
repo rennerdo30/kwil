@@ -7,11 +7,66 @@ impl LineSource for Source<'_> {
     fn line_count(&self) -> usize {
         self.0.len()
     }
-    fn line(&self, i: usize) -> &[u8] {
-        self.0[i]
+    fn line<'a>(&'a self, i: usize, _: &mut Vec<u8>) -> Result<Line<'a>, DiffError> {
+        Ok(Line::Borrowed(self.0[i]))
     }
 }
 struct Source<'a>(&'a [&'a [u8]]);
+#[test]
+fn whitespace_preserves_content_terminator_boundary() {
+    for whitespace in [Whitespace::All, Whitespace::Trailing] {
+        let options = Options { whitespace, ..Options::default() };
+        assert_eq!(model(&[b"a\r \n"], &[b"a\r\n"], options.clone()).hunks.len(), 1);
+        // Ignoring CRLF still leaves the literal content CR significant.
+        assert_eq!(model(&[b"a\r \n"], &[b"a\r\n"], Options { ignore_line_endings: true, ..options }).hunks.len(), 1);
+    }
+}
+
+struct Fragmented<'a>(Vec<Vec<&'a [u8]>>);
+impl LineSource for Fragmented<'_> {
+    fn line_count(&self) -> usize {
+        self.0.len()
+    }
+    fn line<'a>(&'a self, i: usize, scratch: &mut Vec<u8>) -> Result<Line<'a>, DiffError> {
+        scratch.clear();
+        for chunk in &self.0[i] {
+            if chunk.len() > MAX_LINE_BYTES - scratch.len() {
+                return Err(DiffError::TooLarge);
+            }
+            scratch.extend_from_slice(chunk);
+        }
+        Ok(Line::Scratch)
+    }
+}
+#[test]
+fn fragmented_sources_match_contiguous_and_propagate_errors() {
+    let a = Fragmented(vec![vec![b"same", b"\r", b"\n"], vec![b"hello ", b"old", b" world"]]);
+    let b = Fragmented(vec![vec![b"sa", b"me\r\n"], vec![b"hello", b" new ", b"world"]]);
+    let contiguous = model(&[b"same\r\n", b"hello old world"], &[b"same\r\n", b"hello new world"], Options::default());
+    let token = CancellationToken::default();
+    let actual = compare(&a, &b, &Options::default(), &token).unwrap();
+    assert_eq!(actual.hunks, contiguous.hunks);
+    assert_eq!(actual.row_count(), contiguous.row_count());
+    for i in 0..actual.row_count() {
+        assert_eq!(actual.row(i), contiguous.row(i));
+    }
+    let words = actual.refine(1, &a, &b, &token).unwrap().unwrap();
+    assert_eq!(words.left, vec![6..9]);
+    assert_eq!(words.right, vec![6..9]);
+    struct Broken;
+    impl LineSource for Broken {
+        fn line_count(&self) -> usize {
+            2
+        }
+        fn line<'a>(&'a self, _: usize, _: &mut Vec<u8>) -> Result<Line<'a>, DiffError> {
+            Err(DiffError::Read(std::io::ErrorKind::UnexpectedEof))
+        }
+    }
+    let error = DiffError::Read(std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(compare(&Broken, &b, &Options::default(), &token).unwrap_err(), error);
+    assert_eq!(compare(&a, &Broken, &Options::default(), &token).unwrap_err(), error);
+    assert_eq!(actual.refine(1, &a, &Broken, &token).unwrap_err(), error);
+}
 #[test]
 fn insert_delete_modify_alignment() {
     for algorithm in [Algorithm::Histogram, Algorithm::Myers] {
@@ -117,7 +172,7 @@ fn size_guards_precede_reads_and_bound_bytes() {
         fn line_count(&self) -> usize {
             usize::MAX
         }
-        fn line(&self, _: usize) -> &[u8] {
+        fn line<'a>(&'a self, _: usize, _: &mut Vec<u8>) -> Result<Line<'a>, DiffError> {
             panic!("guard must precede reads")
         }
     }
@@ -162,9 +217,9 @@ fn cancellation_before_and_during_source_reads() {
         fn line_count(&self) -> usize {
             10
         }
-        fn line(&self, _: usize) -> &[u8] {
+        fn line<'a>(&'a self, _: usize, _: &mut Vec<u8>) -> Result<Line<'a>, DiffError> {
             self.0.cancel();
-            b"x"
+            Ok(Line::Borrowed(b"x"))
         }
     }
     let token = CancellationToken::default();

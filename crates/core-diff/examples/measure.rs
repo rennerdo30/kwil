@@ -1,4 +1,4 @@
-use kwil_core_diff::{CancellationToken, LineSource, Options, compare};
+use kwil_core_diff::{CancellationToken, DiffError, Line, LineSource, Options, compare};
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Write},
@@ -9,8 +9,8 @@ impl LineSource for Lines {
     fn line_count(&self) -> usize {
         self.0.len()
     }
-    fn line(&self, i: usize) -> &[u8] {
-        &self.0[i]
+    fn line<'a>(&'a self, i: usize, _: &mut Vec<u8>) -> Result<Line<'a>, DiffError> {
+        Ok(Line::Borrowed(&self.0[i]))
     }
 }
 fn main() -> std::io::Result<()> {

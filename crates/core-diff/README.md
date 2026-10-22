@@ -5,6 +5,14 @@
 and pass those same snapshots to `refine`. All line indexes, alignment rows and
 byte ranges are zero-based. Ranges are half-open.
 
+`LineSource::line` returns `Result<Line, DiffError>`. Contiguous sources return
+`Line::Borrowed`; fragmented piece-tree snapshots and positioned-read adapters
+assemble a line in the caller-provided scratch vector and return `Line::Scratch`.
+Adapters must stop before growing scratch beyond `MAX_LINE_BYTES` and return
+`TooLarge`. I/O failures return `DiffError::Read(error.kind())`, propagated by
+both `compare` and `refine`. Snapshots must remain immutable across both calls.
+Assembled lines are retained by the capped interner; contiguous bytes stay borrowed.
+
 Histogram is the default; Myers (with imara's runtime heuristics) is optional.
 Changed hunks pair lines by ordinal position as `Modify`; any excess is `Delete`
 or `Insert`. This is deterministic alignment, not a similarity-based line matcher.
@@ -22,10 +30,12 @@ make absent whitespace equal to present whitespace). Line terminators remain
 significant independently of whitespace options. `ignore_line_endings` equates
 CRLF with LF, retaining the distinction between a final newline and none. Input
 sources may omit all line terminators, but then cannot report EOL differences.
-Bytes, including invalid UTF-8, are preserved; normalization borrows slices and
-streams normalized bytes into hashing/equality instead of copying line contents.
+Bytes, including invalid UTF-8, are preserved. Normalization compares and hashes
+content and terminators as separate fields, preserving literal content CR bytes.
+It borrows contiguous slices, owns assembled lines, and streams normalized bytes
+into hashing/equality.
 
-## Bounded worker work
+## Capped global diffing
 
 Admission ceilings are fixed, regardless of input file size:
 
@@ -33,11 +43,13 @@ Admission ceilings are fixed, regardless of input file size:
 - 1 MiB per line and 64 MiB total bytes visited across both sources.
 - Inputs above any ceiling return `DiffError::TooLarge`; line-count overflow and
   count limits are checked before reading lines or allocating token storage.
-- imara's global diff requires per-line integer tokens and borrowed interner
+- imara's global diff requires per-line integer tokens and borrowed/owned interner
   entries. These metadata allocations grow only within the fixed line ceiling;
-  neither input is loaded/copied into a file-sized byte buffer. The result has at
+  contiguous inputs are never copied; assembled bytes have the visited-byte cap.
+  The result has at
   most a bounded number of runs/hunks. This is a capped global diff, not a streaming
   diff for arbitrarily many lines. Callers must surface `TooLarge` to the user.
+  Streaming large-file comparison remains open follow-up work under **KW-40**.
 - Word refinement is **on demand for visible modified rows**, never eagerly for
   all changes. Skip lines over 4,096 bytes and hunks with over 64 lines on either
   side. `similar` receives byte slices and a 10 ms algorithm timeout; returned
@@ -58,13 +70,15 @@ adds `bstr 1.13.1` (MIT/Apache-2.0). No UI or async dependencies. The first
 focused debug build compiled the new diff stack in 9.7 seconds including tests;
 the isolated release example build took 8.73 seconds with four compile jobs.
 
-Seven acceptance tests passed. `tests/fail-first.ps1` temporarily breaks one
-behavior at a time, requires the corresponding acceptance test to fail with an
-assertion, and restores the original source in `finally`. All seven mutations
-were detected on the initial implementation; no compile error is counted as a
-failing acceptance test. The script is a developer check, not part of normal CI.
+Ten tests passed (nine integration, one Hash/Eq invariant). `tests/fail-first.ps1`
+creates a unique standalone temporary crate, then breaks one behavior at a time
+only in that copy. All eleven mutations produced assertion failures, including
+the content/terminator boundary, Hash/Eq, fragmented lines and read errors.
+Compile failures do not count. Copies and logs are retained for inspection.
+This keeps fail-first reproduction without writes or restoration to product
+source, so interruption cannot overwrite concurrent edits. It is not normal CI.
 
-One release measurement on the owner's Windows PC: **94.067 ms**, histogram,
+Fix-round-1 single release measurement on the owner's Windows PC: **92.314 ms**, histogram,
 100,000 lines per file, 1,000 modified lines (1%), 1,000 hunks and 100,000 alignment
 rows. This meets the 100 ms target and 500 ms hard limit. Generation and loading
 of the measurement-only fixtures are outside the timer; tokenization, line diff
@@ -81,5 +95,5 @@ cargo build -p kwil-core-diff --example measure --release -j 4 --locked
 
 The example generates separate files under ignored `fixtures/diff-100k-<PID>`.
 Its full-memory fixture loader is measurement code only; production comparisons
-borrow their caller's snapshots. No GUI, frontend integration or native drawing
+borrow contiguous snapshots or retain bounded assembled lines. No GUI, frontend integration or native drawing
 acceptance is claimed here.
