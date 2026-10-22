@@ -798,6 +798,7 @@ mod tests {
     #[test]
     fn savequit_stale_completion_does_not_close_after_undo_to_clean_revision() {
         let file = SaveFile::new();
+        let earlier_file = SaveFile::new();
         let mut view = View::new(None);
         view.set_rows(3);
         let mut save = SaveFlow::default();
@@ -807,7 +808,9 @@ mod tests {
         // Produce a real earlier-revision worker result without relying on
         // the storage result's fields beyond its public revision contract.
         let stale = kwil_core_workspace::save_snapshot(
-            kwil_view_model::Editor::new(kwil_view_model::Document::new()).save_request(Some(file.0.clone())).unwrap(),
+            kwil_view_model::Editor::new(kwil_view_model::Document::new())
+                .save_request(Some(earlier_file.0.clone()))
+                .unwrap(),
         )
         .unwrap();
         execute(&mut view, "edit.insert", Some("new revision".into()), false, Duration::ZERO);
@@ -831,7 +834,9 @@ mod tests {
         assert!(save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
         assert!(!view.editor().unwrap().document().is_dirty());
         assert_eq!(std::fs::read(&file.0).unwrap(), b"trim me");
-        assert_eq!(view.line(0), Some(b"trim me".as_slice()));
+        let mut bytes = Vec::new();
+        view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"trim me");
     }
 
     #[test]
