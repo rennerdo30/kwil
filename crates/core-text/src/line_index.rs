@@ -86,6 +86,18 @@ impl LineIndex {
         self.checkpoints.len()
     }
 
+    /// Zero-based line containing a byte offset, including EOF. Scans only
+    /// from the preceding sparse checkpoint (normally at most ~2k lines).
+    /// Returns `None` for an offset past the indexed bytes.
+    pub fn line_of_offset(&self, bytes: &[u8], offset: u64) -> Option<u64> {
+        if offset > self.len {
+            return None;
+        }
+        let i = self.checkpoints.partition_point(|&(_, at)| at <= offset) - 1;
+        let (line, at) = self.checkpoints[i];
+        Some(line + memchr_iter(b'\n', &bytes[at as usize..offset as usize]).count() as u64)
+    }
+
     /// Byte offset where `line` starts, or `None` past the end.
     pub fn line_start(&self, bytes: &[u8], line: u64) -> Option<u64> {
         if line >= self.line_count {

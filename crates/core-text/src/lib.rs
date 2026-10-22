@@ -1,11 +1,14 @@
 //! Buffer (piece tree over mmap/pread), line index, cursors, undo, encoding.
 //!
-//! M0 scope: open any file without a full pass, show the first screen from
-//! raw bytes, build a sparse line index in the background, and read any
-//! line range once the index is ready. Editing (the piece tree) is M2.
+//! Mapped originals, sparse indexing and persistent byte-exact editing.
 
+mod buffer;
 mod file;
 mod line_index;
+mod piece_tree;
+mod undo;
 
+pub use buffer::{Buffer, Lines, Snapshot};
 pub use file::{IndexProgress, TextFile};
 pub use line_index::LineIndex;
+pub use piece_tree::Chunks;
