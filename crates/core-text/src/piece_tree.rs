@@ -1,7 +1,7 @@
 //! Persistent AVL rope. Leaves reference immutable original/add storage;
 //! branches cache extensible subtree metrics. No document bytes are copied.
 
-use crate::TextFile;
+use crate::{ReadError, TextFile};
 use memchr::memchr_iter;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -116,30 +116,30 @@ impl Drop for Storage {
 }
 
 impl Storage {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Original(file) => file.bytes(),
+    fn bytes(&self) -> Result<&[u8], ReadError> {
+        Ok(match self {
+            Self::Original(file) => file.bytes()?,
             Self::Memory { bytes, .. } => bytes,
             Self::Disk(block) => block.map.as_ref().expect("mapped add block"),
-        }
+        })
     }
 
-    fn rank(&self, offset: u64) -> u64 {
-        match self {
+    fn rank(&self, offset: u64) -> Result<u64, ReadError> {
+        Ok(match self {
             Self::Original(file) => {
-                file.index().expect("indexed original").line_of_offset(file.bytes(), offset).unwrap()
+                file.index().expect("indexed original").line_of_offset(file.bytes()?, offset).unwrap()
             }
             // Added pieces never scan more than ADD_BLOCK bytes.
-            _ => memchr_iter(b'\n', &self.bytes()[..offset as usize]).count() as u64,
-        }
+            _ => memchr_iter(b'\n', &self.bytes()?[..offset as usize]).count() as u64,
+        })
     }
 
-    fn line_start(&self, line: u64) -> u64 {
-        match self {
-            Self::Original(file) => file.index().unwrap().line_start(file.bytes(), line).unwrap(),
+    fn line_start(&self, line: u64) -> Result<u64, ReadError> {
+        Ok(match self {
+            Self::Original(file) => file.index().unwrap().line_start(file.bytes()?, line).unwrap(),
             _ if line == 0 => 0,
-            _ => memchr_iter(b'\n', self.bytes()).nth((line - 1) as usize).unwrap() as u64 + 1,
-        }
+            _ => memchr_iter(b'\n', self.bytes()?).nth((line - 1) as usize).unwrap() as u64 + 1,
+        })
     }
 
     fn retained_bytes(&self) -> usize {
@@ -162,13 +162,13 @@ pub(crate) struct Piece {
 }
 
 impl Piece {
-    fn split(&self, at: u64) -> (Self, Self) {
+    fn split(&self, at: u64) -> Result<(Self, Self), ReadError> {
         let middle = self.start + at;
-        let line = self.storage.rank(middle);
-        (
+        let line = self.storage.rank(middle)?;
+        Ok((
             Self { end: middle, breaks: line - self.first_line, ..self.clone() },
             Self { start: middle, first_line: line, breaks: self.first_line + self.breaks - line, ..self.clone() },
-        )
+        ))
     }
 }
 
@@ -266,37 +266,37 @@ pub(crate) fn join(left: Tree, right: Tree) -> Tree {
     })
 }
 
-pub(crate) fn split(tree: Tree, at: u64) -> (Tree, Tree) {
-    let Some(node) = tree else { return (None, None) };
+pub(crate) fn split(tree: Tree, at: u64) -> Result<(Tree, Tree), ReadError> {
+    let Some(node) = tree else { return Ok((None, None)) };
     if at == 0 {
-        return (None, Some(node));
+        return Ok((None, Some(node)));
     }
     if at == node.metrics.bytes {
-        return (Some(node), None);
+        return Ok((Some(node), None));
     }
-    match &node.kind {
+    Ok(match &node.kind {
         Kind::Leaf(piece) => {
-            let (left, right) = piece.split(at);
+            let (left, right) = piece.split(at)?;
             (Some(leaf(left)), Some(leaf(right)))
         }
         Kind::Branch(left, right) if at < left.metrics.bytes => {
-            let (a, b) = split(Some(left.clone()), at);
+            let (a, b) = split(Some(left.clone()), at)?;
             (a, join(b, Some(right.clone())))
         }
         Kind::Branch(left, right) => {
-            let (a, b) = split(Some(right.clone()), at - left.metrics.bytes);
+            let (a, b) = split(Some(right.clone()), at - left.metrics.bytes)?;
             (join(Some(left.clone()), a), b)
         }
-    }
+    })
 }
 
-pub(crate) fn original(file: TextFile) -> Tree {
+pub(crate) fn original(file: TextFile) -> Result<Tree, ReadError> {
+    let breaks = file.build_index(4)?.line_count() - 1;
     if file.is_empty() {
-        return None;
+        return Ok(None);
     }
     let len = file.len();
-    let breaks = file.build_index(4).line_count() - 1;
-    Some(leaf(Piece { storage: Arc::new(Storage::Original(file)), start: 0, end: len, first_line: 0, breaks }))
+    Ok(Some(leaf(Piece { storage: Arc::new(Storage::Original(file)), start: 0, end: len, first_line: 0, breaks })))
 }
 
 pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
@@ -323,11 +323,11 @@ pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
 }
 
 /// Offset immediately after the `nth` newline (one-based).
-pub(crate) fn after_break(mut node: &Node, mut nth: u64) -> u64 {
+pub(crate) fn after_break(mut node: &Node, mut nth: u64) -> Result<u64, ReadError> {
     let mut offset = 0;
     loop {
         match &node.kind {
-            Kind::Leaf(piece) => return offset + piece.storage.line_start(piece.first_line + nth) - piece.start,
+            Kind::Leaf(piece) => return Ok(offset + piece.storage.line_start(piece.first_line + nth)? - piece.start),
             Kind::Branch(left, right) if nth <= left.metrics.breaks => node = left,
             Kind::Branch(left, right) => {
                 nth -= left.metrics.breaks;
@@ -338,11 +338,11 @@ pub(crate) fn after_break(mut node: &Node, mut nth: u64) -> u64 {
     }
 }
 
-pub(crate) fn rank(mut node: &Node, mut at: u64) -> u64 {
+pub(crate) fn rank(mut node: &Node, mut at: u64) -> Result<u64, ReadError> {
     let mut breaks = 0;
     loop {
         match &node.kind {
-            Kind::Leaf(piece) => return breaks + piece.storage.rank(piece.start + at) - piece.first_line,
+            Kind::Leaf(piece) => return Ok(breaks + piece.storage.rank(piece.start + at)? - piece.first_line),
             Kind::Branch(left, _) if at < left.metrics.bytes => node = left,
             Kind::Branch(left, right) => {
                 at -= left.metrics.bytes;
@@ -355,6 +355,7 @@ pub(crate) fn rank(mut node: &Node, mut at: u64) -> u64 {
 
 /// Borrowed byte slices, clipped to the requested range. Scratch space is
 /// O(tree height), independent of the document's length or number of lines.
+/// Each item is fallible; the first original-file read error ends iteration.
 pub struct Chunks<'a> {
     stack: Vec<(&'a Node, u64)>,
     range: Range<u64>,
@@ -372,7 +373,7 @@ impl<'a> Chunks<'a> {
 }
 
 impl<'a> Iterator for Chunks<'a> {
-    type Item = &'a [u8];
+    type Item = Result<&'a [u8], ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((node, offset)) = self.stack.pop() {
@@ -387,7 +388,13 @@ impl<'a> Iterator for Chunks<'a> {
                 Kind::Leaf(piece) => {
                     let start = self.range.start.saturating_sub(offset);
                     let end = (self.range.end - offset).min(node.metrics.bytes);
-                    return Some(&piece.storage.bytes()[(piece.start + start) as usize..(piece.start + end) as usize]);
+                    let bytes = piece.storage.bytes();
+                    if bytes.is_err() {
+                        self.stack.clear();
+                    }
+                    return Some(
+                        bytes.map(|bytes| &bytes[(piece.start + start) as usize..(piece.start + end) as usize]),
+                    );
                 }
             }
         }
@@ -421,7 +428,10 @@ pub(crate) fn assert_valid(tree: &Tree) {
             Kind::Leaf(piece) => {
                 assert_eq!(node.height, 1);
                 assert_eq!(node.metrics.bytes, piece.end - piece.start);
-                assert_eq!(node.metrics.breaks, piece.storage.rank(piece.end) - piece.storage.rank(piece.start));
+                assert_eq!(
+                    node.metrics.breaks,
+                    piece.storage.rank(piece.end).unwrap() - piece.storage.rank(piece.start).unwrap()
+                );
             }
             Kind::Branch(left, right) => {
                 assert!(left.height.abs_diff(right.height) <= 1);

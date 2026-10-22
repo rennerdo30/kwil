@@ -26,8 +26,12 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
     if let Some(file) = view.file() {
         let t = tx.clone();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-        file.index_in_background(threads, move || {
-            let _ = t.send(Msg::IndexDone);
+        file.index_in_background(threads, move |result| {
+            let event = match result {
+                Ok(()) => Msg::IndexDone,
+                Err(e) => Msg::Notice(e.to_string()),
+            };
+            let _ = t.send(event);
         });
     }
     let mut terminal = ratatui::init();

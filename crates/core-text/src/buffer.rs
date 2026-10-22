@@ -1,9 +1,9 @@
 //! Byte-exact editing over immutable, shared pieces. Offsets, columns and
 //! line numbers are zero-based; columns count bytes, not Unicode scalars.
 
-use crate::TextFile;
 use crate::piece_tree::{self, AddBudget, Chunks, Tree};
 use crate::undo::History;
+use crate::{ReadError, TextFile};
 use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ const TYPING_GAP: Duration = Duration::from_millis(500);
 
 /// O(1) immutable version, safe to send to search/highlight/save workers.
 /// Holding a snapshot pins its referenced storage until the worker drops it.
+/// Original-file reads follow TextFile's change checks and may return ReadError.
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub(crate) root: Tree,
@@ -35,27 +36,31 @@ impl Snapshot {
         self.root.as_ref().map_or(1, |node| node.metrics.breaks + 1)
     }
 
-    pub fn line_start(&self, line: u64) -> Option<u64> {
+    pub fn line_start(&self, line: u64) -> Result<Option<u64>, ReadError> {
         if line >= self.line_count() {
-            None
+            Ok(None)
         } else if line == 0 {
-            Some(0)
+            Ok(Some(0))
         } else {
-            Some(piece_tree::after_break(self.root.as_ref().unwrap(), line))
+            Ok(Some(piece_tree::after_break(self.root.as_ref().unwrap(), line)?))
         }
     }
 
     /// EOF is a valid position. A CR in CRLF occupies one byte column.
-    pub fn offset_to_line_col(&self, offset: u64) -> Option<(u64, u64)> {
+    pub fn offset_to_line_col(&self, offset: u64) -> Result<Option<(u64, u64)>, ReadError> {
         if offset > self.len() {
-            return None;
+            return Ok(None);
         }
-        let line = self.root.as_ref().map_or(0, |node| piece_tree::rank(node, offset));
-        Some((line, offset - self.line_start(line).unwrap()))
+        let line = match &self.root {
+            Some(node) => piece_tree::rank(node, offset)?,
+            None => 0,
+        };
+        Ok(Some((line, offset - self.line_start(line)?.unwrap())))
     }
 
     /// Borrowed slices clipped to `range`; invalid/reversed ranges are errors.
     /// Empty ranges yield no chunks. No file-sized output allocation occurs.
+    /// Each iterator item reports original-file read errors and then stops.
     pub fn chunks(&self, range: Range<u64>) -> io::Result<Chunks<'_>> {
         self.check_range(&range)?;
         Ok(Chunks::new(&self.root, range))
@@ -63,6 +68,7 @@ impl Snapshot {
 
     /// Borrow each viewport line as chunks, without LF or a trailing CR.
     /// Even a single giant line is never joined into an owned buffer.
+    /// Both line and chunk iterator items can report ReadError.
     pub fn lines(&self, start_line: u64, count: usize) -> Lines<'_> {
         Lines { snapshot: self, next: start_line, remaining: count }
     }
@@ -70,7 +76,7 @@ impl Snapshot {
     /// Stream this version to a writer. Atomic replacement is the save layer's job.
     pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
         for chunk in Chunks::new(&self.root, 0..self.len()) {
-            writer.write_all(chunk)?;
+            writer.write_all(chunk.map_err(io::Error::other)?)?;
         }
         Ok(())
     }
@@ -87,8 +93,8 @@ impl Snapshot {
         }
     }
 
-    fn byte_at(&self, offset: u64) -> u8 {
-        Chunks::new(&self.root, offset..offset + 1).next().unwrap()[0]
+    fn byte_at(&self, offset: u64) -> Result<u8, ReadError> {
+        Ok(Chunks::new(&self.root, offset..offset + 1).next().unwrap()?[0])
     }
 }
 
@@ -99,21 +105,37 @@ pub struct Lines<'a> {
     remaining: usize,
 }
 
+impl<'a> Lines<'a> {
+    fn next_line(&mut self) -> Result<Option<Chunks<'a>>, ReadError> {
+        let Some(start) = self.snapshot.line_start(self.next)? else { return Ok(None) };
+        self.next += 1;
+        self.remaining -= 1;
+        let mut end = self.snapshot.line_start(self.next)?.map_or(self.snapshot.len(), |at| at - 1);
+        if end > start && self.snapshot.byte_at(end - 1)? == b'\r' {
+            end -= 1;
+        }
+        Ok(Some(Chunks::new(&self.snapshot.root, start..end)))
+    }
+}
+
 impl<'a> Iterator for Lines<'a> {
-    type Item = Chunks<'a>;
+    type Item = Result<Chunks<'a>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
-        let start = self.snapshot.line_start(self.next)?;
-        self.next += 1;
-        self.remaining -= 1;
-        let mut end = self.snapshot.line_start(self.next).map_or(self.snapshot.len(), |at| at - 1);
-        if end > start && self.snapshot.byte_at(end - 1) == b'\r' {
-            end -= 1;
+        match self.next_line() {
+            Ok(Some(line)) => Some(Ok(line)),
+            Ok(None) => {
+                self.remaining = 0;
+                None
+            }
+            Err(error) => {
+                self.remaining = 0;
+                Some(Err(error))
+            }
         }
-        Some(Chunks::new(&self.snapshot.root, start..end))
     }
 }
 
@@ -161,8 +183,9 @@ impl Buffer {
     /// Otherwise builds that index on the calling thread with four workers;
     /// call on a worker, or await TextFile's background index before attaching.
     /// Inherits TextFile's external-file-mutation safety contract.
-    pub fn from_file(file: TextFile) -> Self {
-        Self { snapshot: Snapshot { root: piece_tree::original(file) }, ..Self::empty() }
+    /// Refuses changed files even when an index is already cached.
+    pub fn from_file(file: TextFile) -> Result<Self, ReadError> {
+        Ok(Self { snapshot: Snapshot { root: piece_tree::original(file)? }, ..Self::empty() })
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -181,11 +204,11 @@ impl Buffer {
         self.snapshot.line_count()
     }
 
-    pub fn line_start(&self, line: u64) -> Option<u64> {
+    pub fn line_start(&self, line: u64) -> Result<Option<u64>, ReadError> {
         self.snapshot.line_start(line)
     }
 
-    pub fn offset_to_line_col(&self, offset: u64) -> Option<(u64, u64)> {
+    pub fn offset_to_line_col(&self, offset: u64) -> Result<Option<(u64, u64)>, ReadError> {
         self.snapshot.offset_to_line_col(offset)
     }
 
@@ -217,7 +240,7 @@ impl Buffer {
         // Allocate all new storage before mutating the root: I/O errors are atomic.
         let added = piece_tree::added(bytes, &self.added)?;
         let before = self.snapshot();
-        let (left, right) = piece_tree::split(before.root.clone(), offset);
+        let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(piece_tree::join(left, added), right);
         self.record(before, coalesce);
         Ok(())
@@ -230,8 +253,8 @@ impl Buffer {
             return Ok(());
         }
         let before = self.snapshot();
-        let (left, tail) = piece_tree::split(before.root.clone(), range.start);
-        let (_, right) = piece_tree::split(tail, range.end - range.start);
+        let (left, tail) = piece_tree::split(before.root.clone(), range.start).map_err(io::Error::other)?;
+        let (_, right) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(left, right);
         self.record(before, false);
         Ok(())
@@ -375,12 +398,15 @@ mod tests {
         let starts: Vec<_> = std::iter::once(0).chain(memchr_iter(b'\n', model).map(|at| at as u64 + 1)).collect();
         assert_eq!(buffer.line_count(), starts.len() as u64, "line count at step {step}");
         for (line, &start) in starts.iter().enumerate() {
-            assert_eq!(buffer.line_start(line as u64), Some(start), "line {line}, step {step}");
+            assert_eq!(buffer.line_start(line as u64).unwrap(), Some(start), "line {line}, step {step}");
         }
-        assert_eq!(buffer.line_start(starts.len() as u64), None);
+        assert_eq!(buffer.line_start(starts.len() as u64).unwrap(), None);
         for offset in [0, model.len() / 2, model.len()] {
             let line = starts.partition_point(|&at| at <= offset as u64) - 1;
-            assert_eq!(buffer.offset_to_line_col(offset as u64), Some((line as u64, offset as u64 - starts[line])));
+            assert_eq!(
+                buffer.offset_to_line_col(offset as u64).unwrap(),
+                Some((line as u64, offset as u64 - starts[line]))
+            );
         }
         piece_tree::assert_valid(&buffer.snapshot.root);
     }
@@ -396,7 +422,7 @@ mod tests {
     fn randomized_model_6000_operations() {
         let initial = b"original\r\n\xff\n".repeat(3100);
         let fixture = Fixture::new(&initial);
-        let mut buffer = Buffer::from_file(fixture.open());
+        let mut buffer = Buffer::from_file(fixture.open()).unwrap();
         buffer.set_undo_memory_limit(usize::MAX);
         let mut model = initial.clone();
         let mut history: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -471,7 +497,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Snapshot>();
         let fixture = Fixture::new(b"original\r\nlast");
-        let mut buffer = Buffer::from_file(fixture.open());
+        let mut buffer = Buffer::from_file(fixture.open()).unwrap();
         let original = buffer.snapshot();
         buffer.delete(0..buffer.len()).unwrap();
         buffer.insert(0, b"changed").unwrap();
@@ -486,7 +512,7 @@ mod tests {
         buffer.insert(0, &large).unwrap();
         assert_eq!(buffer.add_memory_bytes(), 3); // pinned snapshot owns the quota
         assert_eq!(bytes(&buffer.snapshot()), large);
-        assert_eq!(buffer.line_start(25_000), Some(99_999));
+        assert_eq!(buffer.line_start(25_000).unwrap(), Some(99_999));
         let paths = spill_paths(&buffer.snapshot.root);
         assert!(!paths.is_empty());
         assert!(paths.iter().all(|path| path.exists()));
@@ -594,9 +620,10 @@ mod tests {
         buffer.insert(0, b"one\rtwo\r").unwrap();
         buffer.insert(buffer.len(), b"\n\nlast\r\n").unwrap();
         buffer.insert(2, b"\xff").unwrap();
-        let lines: Vec<Vec<u8>> = buffer.lines(0, 10).map(|line| line.flatten().copied().collect()).collect();
+        let lines: Vec<Vec<u8>> =
+            buffer.lines(0, 10).map(|line| line.unwrap().flat_map(Result::unwrap).copied().collect()).collect();
         assert_eq!(lines, [b"on\xffe\rtwo".to_vec(), vec![], b"last".to_vec(), vec![]]);
-        let middle: Vec<_> = buffer.chunks(3..12).unwrap().flatten().copied().collect();
+        let middle: Vec<_> = buffer.chunks(3..12).unwrap().flat_map(Result::unwrap).copied().collect();
         assert_eq!(middle, b"e\rtwo\r\n\nl");
         assert_eq!(buffer.chunks(2..2).unwrap().count(), 0);
         assert_eq!(buffer.chunks(1..1).unwrap().count(), 0);
@@ -608,7 +635,7 @@ mod tests {
         let reversed = Range { start: 5, end: 1 };
         assert!(buffer.delete(reversed.clone()).is_err());
         assert!(buffer.chunks(reversed).is_err());
-        assert_eq!(buffer.offset_to_line_col(buffer.len() + 1), None);
+        assert_eq!(buffer.offset_to_line_col(buffer.len() + 1).unwrap(), None);
         assert_eq!(bytes(&buffer.snapshot()), before);
         struct FailingWriter;
         impl Write for FailingWriter {
@@ -623,10 +650,56 @@ mod tests {
     }
 
     #[test]
+    fn changed_original_returns_errors_without_mutating_history() {
+        use crate::FileState;
+        // Rename a mapped file rather than truncate a live mapping (which
+        // Windows disallows). No stale mapped pages need to be touched.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("buffer-changed-{}.bin", std::process::id()));
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        file.set_len(crate::file::MAP_THRESHOLD).unwrap();
+        file.write_all(b"a\nbody").unwrap();
+        drop(file);
+        let original = TextFile::open(&path).unwrap();
+        let mut buffer = Buffer::from_file(original.clone()).unwrap();
+        let snapshot = buffer.snapshot();
+        let mut chunks = snapshot.chunks(0..2).unwrap();
+        let mut lines = snapshot.lines(0, 1);
+        let rotated = path.with_extension("old");
+        fs::rename(&path, &rotated).unwrap();
+        // Surface absence/replacement before dereferencing the old mapping.
+        assert!(matches!(Buffer::from_file(original), Err(ReadError::Changed(FileState::Replaced))));
+        assert!(matches!(chunks.next(), Some(Err(ReadError::Changed(FileState::Replaced)))));
+        assert!(chunks.next().is_none());
+        assert!(matches!(lines.next(), Some(Err(ReadError::Changed(FileState::Replaced)))));
+        assert!(lines.next().is_none());
+        assert!(matches!(snapshot.offset_to_line_col(1), Err(ReadError::Changed(FileState::Replaced))));
+        assert!(matches!(snapshot.line_start(1), Err(ReadError::Changed(FileState::Replaced))));
+        let mut output = Vec::new();
+        let error = snapshot.write_to(&mut output).unwrap_err();
+        assert!(matches!(
+            error.get_ref().and_then(|e| e.downcast_ref::<ReadError>()),
+            Some(ReadError::Changed(FileState::Replaced))
+        ));
+        assert!(output.is_empty());
+        assert!(buffer.insert(1, b"edit").is_err());
+        assert!(buffer.delete(1..2).is_err());
+        assert!(Arc::ptr_eq(buffer.snapshot.root.as_ref().unwrap(), snapshot.root.as_ref().unwrap()));
+        assert_eq!(buffer.undo_memory_bytes(), 0);
+        assert_eq!(buffer.add_memory_bytes(), 0);
+        assert!(!buffer.undo());
+        drop(chunks);
+        drop(snapshot);
+        drop(buffer);
+        fs::remove_file(rotated).unwrap();
+    }
+
+    #[test]
     fn sparse_original_splits_at_checkpoint_and_crlf_boundaries() {
         let initial = b"x\r\n".repeat(5000);
         let fixture = Fixture::new(&initial);
-        let mut buffer = Buffer::from_file(fixture.open());
+        let mut buffer = Buffer::from_file(fixture.open()).unwrap();
         let mut model = initial;
         // Reverse order retains many pieces of the original on both sides.
         for (step, at) in [14999, 12288, 6145, 6144, 6143, 3072, 3071, 2, 1, 0].into_iter().enumerate() {
@@ -637,7 +710,7 @@ mod tests {
         for at in 0..=model.len() {
             let line = memchr_iter(b'\n', &model[..at]).count() as u64;
             let col = model[..at].iter().rposition(|&byte| byte == b'\n').map_or(at, |p| at - p - 1);
-            assert_eq!(buffer.offset_to_line_col(at as u64), Some((line, col as u64)));
+            assert_eq!(buffer.offset_to_line_col(at as u64).unwrap(), Some((line, col as u64)));
         }
     }
 
@@ -654,27 +727,27 @@ mod tests {
         let open_ms = start.elapsed().as_secs_f64() * 1000.0;
         assert!(file.len() >= 1 << 30);
         let start = Instant::now();
-        let lines = file.build_index(4).line_count();
+        let lines = file.build_index(4).unwrap().line_count();
         let index_ms = start.elapsed().as_secs_f64() * 1000.0;
         let len = file.len();
         let middle = len / 2;
-        let original_jump = file.index().unwrap().line_start(file.bytes(), 15_000_000).unwrap();
+        let original_jump = file.index().unwrap().line_start(file.bytes().unwrap(), 15_000_000).unwrap();
         let start = Instant::now();
-        let mut buffer = Buffer::from_file(file);
+        let mut buffer = Buffer::from_file(file).unwrap();
         let attach_ms = start.elapsed().as_secs_f64() * 1000.0;
         let before = buffer.snapshot();
         let start = Instant::now();
         buffer.insert(middle, b"inserted\r\n").unwrap();
         let insert_ms = start.elapsed().as_secs_f64() * 1000.0;
         let start = Instant::now();
-        let jump = buffer.line_start(15_000_000).unwrap();
+        let jump = buffer.line_start(15_000_000).unwrap().unwrap();
         let jump_ms = start.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(buffer.len(), len + 10);
         assert_eq!(buffer.line_count(), lines + 1);
         // The edit inserts a newline before 15M; that line is now original
         // 14,999,999 plus inserted bytes. Check against the pinned version.
         assert!(middle < original_jump);
-        assert_eq!(jump, before.line_start(14_999_999).unwrap() + 10);
+        assert_eq!(jump, before.line_start(14_999_999).unwrap().unwrap() + 10);
         assert_eq!(before.len(), len);
         assert_eq!(before.line_count(), lines);
         assert_eq!(buffer.add_memory_bytes(), 10);
