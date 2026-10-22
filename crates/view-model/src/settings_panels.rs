@@ -174,7 +174,10 @@ impl PanelWindow {
         if let Some(conflict) = self.confirmation.get(self.confirmation_index) {
             fields.extend([
                 format!("Conflict {}/{}", self.confirmation_index + 1, self.confirmation.len()),
-                format!("Keys: {}", conflict.keys),
+                // Parsing treats whitespace as chord separators. Display the
+                // same sequence compactly so raw TOML spacing cannot consume
+                // the grid's bounded inspection window and hide a chord.
+                format!("Keys: {}", conflict.keys.split_whitespace().collect::<Vec<_>>().join(" ")),
                 format!("Command: {}", conflict.command),
                 format!("Kind: {:?}", conflict.kind),
             ]);
@@ -894,8 +897,8 @@ mod tests {
 
     #[test]
     fn settings_confirmation_pages_preserve_long_fields_in_compact_cards() {
-        let doc = SettingsDocument::parse("[[bindings]]\nkeys='ctrl+shift+f11 ctrl+shift+f10'\ncommand='file.open'\n")
-            .unwrap();
+        let raw_keys = format!("ctrl+shift+f11{}ctrl+shift+f10", " ".repeat(5000));
+        let doc = SettingsDocument::parse(&format!("[[bindings]]\nkeys='{raw_keys}'\ncommand='file.open'\n")).unwrap();
         let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
         panel.search(&doc, "file.save").unwrap();
         press(&mut panel, &doc, PanelInput::Accept);
