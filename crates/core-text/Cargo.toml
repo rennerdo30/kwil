@@ -1,0 +1,8 @@
+[package]
+name = "kwil-core-text"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+

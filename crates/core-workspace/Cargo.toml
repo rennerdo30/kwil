@@ -1,0 +1,8 @@
+[package]
+name = "kwil-core-workspace"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+kwil-core-text = { path = "../core-text" }

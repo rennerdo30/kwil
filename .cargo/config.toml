@@ -1,0 +1,23 @@
+# Build output stays outside the repo (spec §9). No environment or PATH changes.
+[build]
+target-dir = "E:/Development/_cache/cargo-target/kwil"
+
+# rust-lld is not the Windows default; it links much faster than link.exe.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+[profile.dev]
+debug = "line-tables-only"   # small debug info; full debug only when needed
+
+[profile.dev.package."*"]
+opt-level = 2                # dependencies are fast at run time and compile once
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

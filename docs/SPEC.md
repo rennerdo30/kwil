@@ -1,0 +1,307 @@
+# Fast text editor — v1 specification (draft)
+
+Status: draft for owner review, 2026-10-23. Working name **Kwil** (owner preference 2026-10-23; see `NAMES.md` for the name check).
+Crate versions were checked on crates.io on 2026-10-23.
+
+## 1. Product
+
+`kwil` is a plain, very fast text editor for the agent era. It is what Notepad++ is today, built with modern tools, running on every platform, in a GUI window and in a terminal.
+
+**P0 is speed.** Every other goal gives way to it. A feature that cannot meet the speed budgets (§3) does not ship in v1.
+
+### v1 scope
+
+- Open, edit and save any text file of any size. This includes files with millions of lines and files of several GB.
+- Syntax highlighting for nearly every common language.
+- Markdown: a rendered preview next to the text.
+- Search and replace in the file and across folders (regex, case, whole word).
+- Compare two files, or a file against its saved version, side by side.
+- Tabs, a command palette, a fuzzy file finder and keyboard shortcuts.
+- The basics every editor has, nothing more: undo/redo, multiple cursors, column selection, go to line, encodings, line endings, auto-indent, comment toggle, word wrap, zoom, recent files, and restoring unsaved work after a crash or close.
+- Windows, macOS and Linux. GUI and TUI in one binary, chosen automatically (§6).
+
+### Not in v1 (on purpose)
+
+Kwil is a text editor, not an IDE and not an AI editor. Not planned: AI features, chat, agents, LSP/IDE features, git panels, debuggers, terminals inside the editor, remote/SSH editing and collaboration.
+
+Maybe later, only if speed stays intact: plugins (v2, as WASM components), split views, folding, bookmarks, macros, inline markdown rendering and a settings UI.
+
+## 2. Principles
+
+1. **Show the file first, do the rest after.** Paint the first screen from the raw file bytes. Line counts, highlighting, encoding checks and indexes then fill in behind it.
+2. **Work in proportion to the viewport, not to the file.** Layout, shaping, highlighting and rendering only touch visible lines plus a small margin.
+3. **Nothing blocks the UI thread.** Disk, search, parsing, diffing and saving run on worker threads and report progress. The UI thread only handles input, layout and frame submission.
+4. **Measured, not assumed.** Every budget in §3 has a benchmark in CI. A regression fails the build.
+5. **Small dependency graph.** Each dependency costs compile time and startup time and has to earn its place (§9).
+6. **Event-driven, damage-only drawing.** No frame loop. Draw only what changed, and present only that region. This has to hold over RDP and VNC (§6).
+
+## 3. Speed budgets (proposed; the owner sets the final numbers)
+
+Reference machines: the owner's Windows PC (Ryzen 9 9950X3D2, NVMe) and a mid-range laptop.
+
+| Measure | Target | Hard limit |
+|---|---|---|
+| Launch to first frame with file content (any file size, warm disk cache) | ≤ 40 ms | 100 ms |
+| Launch to first frame, empty window | ≤ 25 ms | 60 ms |
+| Open a 1 GB / 20M-line file: first screen | ≤ 40 ms | 100 ms |
+| Line index for that file, in the background | ≥ 2 GB/s | 1 GB/s |
+| Jump to line 15,000,000 once the index is ready | ≤ 1 frame | 16 ms |
+| Keystroke to pixels | ≤ 1 frame at 120 Hz (8.3 ms) | 16 ms |
+| Scrolling, any file size | display refresh rate, 0 dropped frames | — |
+| Literal search, 1 GB file in memory | ≤ 300 ms | 1 s |
+| Memory for a clean 1 GB file | ≤ 64 MB plus the OS page cache | 256 MB |
+| Command palette / file finder, 100k files | results on the first frame after a key | 16 ms |
+| Diff of two 100k-line files | ≤ 100 ms | 500 ms |
+| Second launch while running (single instance) | file shown ≤ 20 ms | 50 ms |
+| Idle (nothing changing) | 0 frames, 0 % CPU | — |
+| Typing one character | redraws one line + status field, no full-window present | — |
+| Scrolling over RDP/VNC (remote mode) | one copy + newly exposed lines per step; no lag after the wheel stops | — |
+
+## 4. Architecture
+
+A Cargo workspace. The core crates have no UI dependencies, so changing the editor logic never recompiles the GPU stack, and the reverse.
+
+```
+crates/
+  core-text      buffer (piece tree over mmap/pread), line index, cursors, undo, encoding
+  core-syntax    tree-sitter integration, highlight queries, fallback lexer
+  core-search    in-buffer search, find-in-files, replace transactions
+  core-diff      line and word diff, alignment model
+  core-markdown  markdown parse into a render model (no drawing)
+  core-workspace files, sessions, hot exit, file watching, single-instance IPC
+  core-commands  command registry, keymaps, settings (shared by both frontends)
+  view-model     viewport, layout model, decorations; frontend-independent
+  ui-gpu         GPU frontend (winit + renderer, see §6)
+  ui-tui         terminal frontend (ratatui + crossterm)
+  app            binary: argument parsing, picks a frontend, wires threads
+```
+
+Threading: the UI thread, plus a small fixed pool of worker threads (`std::thread` + channels; no async runtime in v1). Workers own disk I/O, indexing, parsing, search and save. The UI thread reads immutable snapshots: the buffer is persistent (copy-on-write nodes), so a worker can search or highlight a snapshot while the user keeps typing.
+
+## 5. Text engine (the core of the speed promise)
+
+### Opening
+
+1. `open()` maps the file (`memmap2`) or, if mapping is refused (network drives, some special files), uses positioned reads.
+2. It reads the first and last few hundred KB at once: encoding sniff (BOM, UTF-16 detection, `chardetng` for legacy encodings), line-ending style, binary check.
+3. It paints the first screen from those bytes before any full pass over the file.
+4. A background pass builds the line index. It scans the bytes with `memchr` in parallel chunks, recording line starts sparsely (one checkpoint per N lines) so the index for a 20M-line file stays a few MB. The scrollbar and line count show "≈" until the pass ends.
+5. UTF-8 is checked lazily per chunk (`simdutf8`). Invalid bytes are shown as escape glyphs and kept byte-exact on save.
+
+Legacy encodings (Shift-JIS, Windows-1252, UTF-16, …) are decoded to UTF-8 with `encoding_rs`, chunk by chunk in the background, and encoded back on save.
+
+**mmap safety:** if another program truncates a mapped file, reading it can crash the process (SIGBUS on Unix). Rule: files under 64 MB (configurable) are read fully into memory, which takes a few ms. Larger files are mapped, watched with `notify`, and re-checked by size and mtime before each region read. If they changed, the editor shows "file changed on disk" instead of reading stale pages.
+
+### Editing
+
+A **piece tree**, the same idea as VS Code's: the document is a balanced tree of pieces that point into the original read-only file or into an append-only "added text" buffer. Each node stores byte length, line-break count and UTF-16/char counts for its subtree, so offset ↔ line ↔ column lookups are O(log n). Opening a file never copies it, and an edit costs O(log n).
+
+The tree's nodes are immutable and shared between versions. Snapshots are free, which gives undo and background readers without locks.
+
+Library options: `ropey 1.6.1` and `crop 0.4.3` are good ropes, but both need the whole text in memory as validated UTF-8, which breaks the "1 GB opens instantly" goal. `qem` (a file-backed engine for huge files with a sparse on-disk line index; the author's own figures are 3 GB opening in ~5 ms) is the closest existing match and should be benchmarked in week 1. Default plan: our own piece tree, with `qem` as the benchmark baseline.
+
+### Long lines
+
+Minified files can have one 100 MB line. Layout is chunked per line: only the visible column range is shaped. Word wrap is computed lazily for visible lines and cached. Horizontal scrolling is virtual, like vertical scrolling.
+
+### Undo
+
+Transactions group edits (a typing burst, one replace-all, one multi-cursor action). Undo history is linear in v1, can optionally be saved to disk with the session, and has a memory cap that drops the oldest history first.
+
+### Saving
+
+Write to a temp file in the same folder, `fsync`, then an atomic rename. File permissions, owner (Unix), ACLs and attributes (Windows) and the line-ending and encoding style are kept. Very large files are written streaming from the piece tree. Optional backup copy. Read-only and elevated-only paths show a clear prompt instead of failing silently.
+
+## 6. Rendering and UI
+
+### Decision: run a week-1 spike between two paths
+
+| | A. `gpui` (Zed's UI framework) | B. Own thin renderer |
+|---|---|---|
+| Stack | `gpui` 0.2.2 on crates.io, or a distribution such as `gpui-box` | `winit 0.30` + `wgpu 30` + `swash` glyph rasterizing + own glyph atlas; `taffy` for panel layout |
+| Pros | Proven for a top-speed code editor; a polished UI comes quickly | Full control of startup, frame timing and look; a small graph; the same model drives the TUI |
+| Cons | Pre-1.0 with breaking changes; heavy dependency graph (compile time); macOS was its strongest platform; several unofficial distributions; built around redrawing the whole window each frame, which is the wrong model for RDP/VNC (check in the spike) | More work: text input/IME, accessibility and widgets are ours to build |
+
+The spike builds the same three screens with both: a 1 GB file, scrolling, and the command palette. It measures cold start, frame time and clean/incremental compile time. The numbers decide, and the result is recorded in `docs/decisions/`. Expected: B, because startup in milliseconds is P0 and because remote mode needs damage-only presents and a CPU renderer, which only our own renderer controls fully. The spike also measures both paths over a real RDP and VNC session.
+
+### First frame in milliseconds
+
+Creating a GPU device takes 50–200 ms on some systems. Path B therefore paints the first frame on the CPU (`softbuffer`, a small blit of already rasterized glyphs). Locally, the GPU renderer starts in parallel and takes over on the next frame, and the user never sees the switch. The CPU renderer is a complete backend: in remote mode it stays in use.
+
+Glyphs: monospace fast path. ASCII runs skip full shaping and come straight from the atlas. Only non-ASCII runs, emoji and ligatures go through shaping (`swash` / `parley 0.12`; `cosmic-text 0.19` is the fallback). Fonts load lazily, starting with the configured font. Font fallback is found on demand and cached.
+
+### Event-driven rendering (no frame loop)
+
+Kwil draws only when something changed. There is no fixed FPS loop and no idle frames. This matters most over RDP and VNC, but it also saves battery and CPU everywhere.
+
+- **Redraw triggers:** input, a worker result (highlights, search hits, index progress), a window event (resize, expose, DPI) or a timer the UI asked for. Nothing else. At idle, the frame and CPU counters are zero.
+- **Damage tracking:** the view model records which rectangles changed (per line, gutter cell, cursor, status field). The renderer redraws only those and presents only those:
+  - Windows: DXGI `Present1` with dirty rectangles and a scroll rectangle (flip-sequential swap chain). Microsoft documents that this metadata is passed on to terminal servers to cut traffic.
+  - Linux: Wayland `damage_buffer` and EGL/Vulkan present-with-damage where the driver honours it (some only claim to; measure).
+  - CPU renderer: `softbuffer` present with damage.
+- **Scrolling is a copy, not a repaint:** the existing pixels move (scroll rect / blit) and only the newly exposed lines are drawn. RDP and VNC can send a copy command (VNC *CopyRect*) instead of pixels.
+- **Batched progress:** background progress (line counting, search counts) updates the screen at most a few times per second and only damages the small status area.
+- **Cursor:** blinking is a small damage rectangle, stops after 10 s idle, and is off in remote mode.
+
+### Remote desktop mode (RDP, VNC)
+
+A remote session often has no real GPU. RDP renders Direct3D in software (WARP) unless GPU use for RDP is enabled by policy. A GPU-style renderer then burns CPU, and every full-window present costs bandwidth.
+
+- **Detection:** Windows `GetSystemMetrics(SM_REMOTESESSION)`, plus live switching on session-change events (`WM_WTSSESSION_CHANGE`), for example when the same session is moved from local to RDP. Linux: xrdp/VNC session markers where present. macOS: no reliable signal, so it's a setting. Override: `render.remote = "auto" | "on" | "off"`.
+- **In remote mode:**
+  - The CPU renderer with damage is used (it is a full backend, not just the first-frame helper).
+  - Smooth scrolling and all animations are off.
+  - Cursor blink is off.
+  - No translucency or blur.
+  - Solid backgrounds, so codecs compress well.
+- **Budgets in remote mode:**
+  - Idle: 0 presents.
+  - Typing one character: damage of one line plus the status field.
+  - Scrolling one line: one copy plus one line of new pixels.
+  - Measured with a scripted RDP session and a TigerVNC session that count damaged pixels and bytes on the wire per action.
+
+### Choosing GUI or TUI
+
+One binary. `kwil` starts the GUI when a desktop is available and the TUI when it is not:
+- Linux: no `WAYLAND_DISPLAY`/`DISPLAY`, or no connection to the display.
+- Any platform: an SSH session without forwarding, or a non-interactive service session.
+- If window or renderer creation fails, Kwil also falls back to the TUI when it is attached to a terminal.
+
+Flags: `--tui` forces the terminal UI and `--gui` forces a window. The check costs well under 1 ms and runs before anything else.
+
+### Terminal UI
+
+`ratatui 0.30` + `crossterm 0.29`. It uses the same view model, commands, keymaps, search and diff. True colour, mouse and bracketed paste. Only changed cells are written to the terminal, never a full clear, so it also stays fast over SSH. Markdown preview is text only.
+
+### Look and feel (state of the art, built for speed)
+
+- **Calm, content-first chrome.** No toolbar by default: a thin title strip with tabs and a status line that only shows something when there is something to say. Everything else is reached through the command palette.
+- **Command palette** (`Ctrl/Cmd+Shift+P`) with one input: `>` commands, `:` go to line, `#` open tabs, no prefix for files. Fuzzy matching (`nucleo`, from Helix). Results appear on the first frame after each key; there is no spinner below 16 ms.
+- **Signal strip** instead of a classic minimap: a slim column beside the scrollbar showing search hits, changes since save and diff hunks across the whole file, even for 20M lines (drawn from the sparse index).
+- **Motion that never waits:** optional smooth scrolling, driven only while the scroll is moving (no idle frames). It is off in remote mode. No other animations.
+- **Markdown preview:** side by side, one key away.
+- **Diff view:** aligned side by side, word-level highlights, collapsed unchanged regions and change navigation (`F7` / `Shift+F7`).
+- **Themes:** one dark and one light theme designed for long sessions, plus colour overrides in the settings file.
+- **Typography:** good default font size, line height and ligature support; crisp text at fractional DPI scales on Windows.
+
+## 7. Feature specification
+
+### Files
+New, open, save, save as, save all, close, reopen closed tab, recent files, drag and drop, open from the command line (`kwil file:line:col`), single instance (a second launch passes files to the running one and exits), restore of unsaved buffers (journaled to disk every few seconds), file-changed-on-disk prompt (reload / compare / keep), and encoding and line-ending switch per file.
+
+### Editing
+Undo/redo, multiple cursors (click, Ctrl+D next match), column selection, line move/duplicate/delete, indent/outdent, comment toggle, go to line, bracket match, word wrap, whitespace display, zoom and trim trailing whitespace on save (optional).
+
+### Search
+- **In file:** incremental, as you type. Regex (`regex 1.13`), case, whole word, in-selection. Hits are highlighted across the whole file in the signal strip, with live counts ("12 of 3,481"; "≈" while counting in the background).
+- **Replace:** with regex capture groups; replace-all is one undo step.
+- **Find in files:** ripgrep's engine (`grep-searcher 0.1.17`, `grep-regex`, `ignore 0.4.33` for .gitignore-aware walking). Results stream in. Include/exclude globs.
+
+### Compare
+Two files, or a buffer vs. its saved version. Line diff with `imara-diff 0.2` (histogram/Myers; used by gitoxide and Helix), word-level refinement with `similar 3.2`, and an option to ignore whitespace. Large files are diffed in the background.
+
+### Markdown
+Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, strikethrough). Rendered natively by our renderer, without a webview (a webview would cost startup time and memory). Code blocks are highlighted with the same syntax engine. Images are decoded lazily on a worker.
+
+### Syntax highlighting
+- `tree-sitter 0.27` with `tree-sitter-highlight`. Grammars come from `arborium` (a tree-sitter distribution with ~70–96 permissively licensed grammars, with a feature flag per language).
+- Incremental parse on a worker after each edit. The UI keeps the last highlights until new ones arrive, so typing never waits on the parser.
+- Only visible ranges are queried. For files over a size limit (e.g. 20 MB), full-file parsing is skipped and a fast lexical highlighter is used for the visible window (keywords, strings, comments, numbers per language).
+- v1 bundles ~30 common languages. The rest load as prebuilt grammar libraries on first use, which also keeps clean builds fast.
+
+### Settings and keymaps
+One TOML settings file that reloads live; no settings UI in v1. One default keymap (common VS Code / Notepad++ shortcuts), rebindable in the same file. Every action is a command with an id, so it can be bound and found in the palette.
+
+### Platform
+- Windows 10/11 (x64, ARM64): native title-bar integration, high DPI, IME, a portable mode (settings next to the exe), and an "Open with kwil" shell entry.
+- macOS 13+ (Apple silicon, Intel): native menu bar, trackpad scrolling, IME.
+- Linux (Wayland and X11).
+- Accessibility: screen-reader support through `accesskit` (GUI) for v1 basics (text, cursor, selection announcements).
+
+## 8. Reliability
+
+- No data loss: hot-exit journal, atomic saves, a crash handler that flushes the journal and keeps a recovery copy of unsaved buffers.
+- Fuzz tests for the piece tree, encodings and the line index (`cargo-fuzz`). Property tests check that edits and undo round-trip byte for byte.
+- A save must reproduce the original bytes exactly for untouched regions (encoding, BOM, mixed line endings, invalid UTF-8).
+
+## 9. Build speed and disk use
+
+Goal: a fast inner loop, and Rust build output that doesn't fill the disk.
+
+**Proposed budgets** on the owner PC: clean debug build ≤ 60 s; incremental rebuild after a `core-text` edit ≤ 3 s; after a `ui-gpu` edit ≤ 5 s. Tracked with `cargo build --timings` in CI.
+
+**Workspace layout:** many small crates. The frontends depend on core crates, never the other way round. Heavy dependencies (GPU, tree-sitter grammars) are isolated in leaf crates.
+
+**Dependency rules:** no async runtime, few proc macros (`serde` derive only in the settings crate), no `syn`-heavy helper crates in core. Each new dependency notes its compile cost in the PR.
+
+**Profiles** (`Cargo.toml`):
+
+```toml
+[profile.dev]
+debug = "line-tables-only"   # small debug info; full debug only when needed
+[profile.dev.package."*"]
+opt-level = 2                # dependencies are fast at run time and compile once
+debug = false
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+```
+
+**Linker:** Linux uses `rust-lld` by default since Rust 1.90 (the Rust blog reports up to 7× faster linking on incremental rebuilds). Windows: enable `rust-lld` per project in `.cargo/config.toml` (`[target.x86_64-pc-windows-msvc] linker = "rust-lld.exe"`), because it is not the Windows default. macOS: the default `ld-prime` is already fast. `wild` is Linux-only as of 0.9 and optional there.
+
+**Cranelift backend:** nightly-only preview. It is offered as an opt-in for fast debug builds (`cargo +nightly` with `-Zcodegen-backend`), never required.
+
+**Caches and disk use:**
+- One build folder outside the repo, set in the project's `.cargo/config.toml` (`[build] target-dir = "E:/Development/_cache/cargo-target/kwil"`). No environment variable or PATH changes.
+- Cargo's automatic global-cache cleanup (stable since Rust 1.88) keeps `~/.cargo/registry` in check. For the build folder, a `just clean-old` task runs `cargo sweep --time 14` (removes build files unused for 14 days), and CI uses `sccache` for clean builds.
+- `debug = "line-tables-only"` and `opt-level`-ed dependencies without debug info keep the build folder small (often less than half the size of default debug info).
+- Watch the "build-dir layout v2" Cargo work (in testing since March 2026). It separates build cache from final artifacts, which makes cleanup simpler.
+
+**Toolchain:** pinned in `rust-toolchain.toml` to the current stable at project start (check on the Rust blog; reported 1.97 shipped on 2026-07-09).
+
+## 10. Testing and benchmarks
+
+- Benchmarks (`divan`, or `criterion`) for every budget in §3, with fixture files: 1 GB of logs, a 20M-line CSV, a 100 MB one-line JSON, a mixed-encoding sample and a 100k-file tree.
+- Startup tracing: the binary logs `t_launch → t_first_frame → t_index_done` with `--trace-startup`. CI fails on a regression over 10 %.
+- A frame-time harness scripts scrolling and typing and checks the 99th percentile.
+- Self-hosted CI runners only (no paid GitHub minutes). Windows, macOS and Linux runners. Full suites run on CI, not on the owner PC.
+
+## 11. Milestones
+
+| Milestone | Content |
+|---|---|
+| M0 Spike (1–2 weeks) | Renderer A vs. B, text engine vs. `qem` baseline, startup measured on all three platforms; decision record |
+| M1 Viewer | Instant open of any file, damage-only rendering and scroll copy, remote-mode detection, GUI/TUI auto-select, go to line, encodings |
+| M2 Editor | Piece tree editing, cursors, undo, save, tabs, session restore |
+| M3 Find & palette | Search/replace, find in files, command palette, file finder, keymaps |
+| M4 Language | Tree-sitter highlighting, markdown preview |
+| M5 Compare | Diff views |
+| M6 Polish & ship | Themes, remote-mode measurements on RDP and VNC, installers (MSI/winget, dmg/Homebrew, AppImage/Flatpak) |
+
+## 12. Open questions for the owner
+
+1. Name: Kwil is the working name; a web3 database ("Kwil DB") uses the same name (see `NAMES.md`).
+2. License: open source (MIT/Apache) or closed? This decides whether GPL grammars or crates are possible.
+3. Do the speed budgets in §3 match your expectations, or do you want stricter ones?
+4. Default keymap: VS Code-like, Notepad++-like or our own?
+5. Plugin direction for v2: WASM components (sandboxed, any language) is the proposal.
+
+## Sources
+
+- Crate versions: crates.io API, 2026-10-23.
+- [Rust: LLD default on Linux in 1.90](https://blog.rust-lang.org/2025/09/01/rust-lld-on-1.90.0-stable)
+- [Rust blog (build-dir layout v2 call for testing)](https://blog.rust-lang.org/)
+- [Rust 1.97 release report](https://www.linuxcompatible.org/story/rust-1970-drops-legacy-symbol-mangling-and-stabilizes-cargo-warning-controls/) (secondary source)
+- [Cranelift backend readme](https://rust.googlesource.com/rust/+show/HEAD/compiler/rustc_codegen_cranelift/Readme.md)
+- [Wild linker 0.9](https://phoronix.com/news/Wild-Linker-0.9), [Wild in the Rust Innovation Lab](https://rustfoundation.org/?p=105369)
+- [Qem: a Rust text engine for huge files](https://users.rust-lang.org/t/qem-a-backend-first-rust-text-engine-for-huge-files/139281)
+- [gpui-box](https://docs.rs/crate/gpui-box/0.1.1), [gpui-pre](https://docs.rs/crate/gpui-pre/0.3.3)
+- [Introducing arborium](https://fasterthanli.me/articles/introducing-arborium)
+- [DXGI flip model, dirty rectangles, scrolled areas](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-1-2-presentation-improvements), [IDXGISwapChain1::Present1](https://learn.microsoft.com/en-us/windows/desktop/api/DXGI1_2/nf-dxgi1_2-idxgiswapchain1-present1)
+- [Firefox: partial invalidation on Windows](https://bugzilla.mozilla.org/show_bug.cgi?id=1575159), [Mesa: swrast ignores swap-with-damage](https://gitlab.freedesktop.org/mesa/mesa/-/issues/10537)
+- [Why RDP feels slow: input, rendering, network](https://comcomponent.com/en/blog/windows-rdp-slow-fast-network/), [Smooth scrolling slow over RDP](https://www.syncfusion.com/forums/95597/slow-scrolling-with-a-rdp-connection)
+- [Rust GUI comparison 2026](https://www.pistack.xyz/posts/2026-08-25-rust-gui-frameworks-egui-iced-slint-comparison/), [Are we GUI yet?](https://areweguiyet.com/)

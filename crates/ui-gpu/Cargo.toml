@@ -1,0 +1,8 @@
+[package]
+name = "kwil-ui-gpu"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+kwil-view-model = { path = "../view-model" }

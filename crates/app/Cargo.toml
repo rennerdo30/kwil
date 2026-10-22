@@ -1,0 +1,13 @@
+[package]
+name = "kwil"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "kwil"
+path = "src/main.rs"
+
+[dependencies]
+kwil-ui-gpu = { path = "../ui-gpu" }
+kwil-ui-tui = { path = "../ui-tui" }
