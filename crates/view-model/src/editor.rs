@@ -69,16 +69,15 @@ impl ClipboardData {
         Ok(())
     }
     fn joined(&self, ending: &[u8]) -> io::Result<Snapshot> {
-        let mut buffer = Buffer::empty();
-        buffer.begin();
+        let mut joined = Snapshot::default();
+        let separator = literal_snapshot(ending)?;
         for (i, range) in self.ranges.iter().enumerate() {
             if i > 0 && !self.linewise {
-                buffer.insert(buffer.len(), ending)?;
+                joined = joined.concat(&separator)?;
             }
-            buffer.insert_snapshot_range(buffer.len(), &self.snapshot, range.clone())?;
+            joined = joined.concat(&self.snapshot.slice(range.clone())?)?;
         }
-        buffer.commit();
-        Ok(buffer.snapshot())
+        Ok(joined)
     }
 }
 
@@ -977,12 +976,7 @@ impl Editor {
             let start = text::line_full(&s, r.start)?.start;
             let end = s.line_start(r.end).map_err(io::Error::other)?.unwrap_or(s.len());
             if end == s.len() && text::byte(&s, end.saturating_sub(1))? != Some(b'\n') {
-                let mut buffer = Buffer::empty();
-                buffer.begin();
-                buffer.insert(0, self.document.line_ending.bytes())?;
-                buffer.insert_snapshot_range(buffer.len(), &s, start..end)?;
-                buffer.commit();
-                let joined = buffer.snapshot();
+                let joined = literal_snapshot(self.document.line_ending.bytes())?.concat(&s.slice(start..end)?)?;
                 let len = joined.len();
                 edits.push(Edit { range: end..end, insert: Insert::Pieces(joined, 0..len) });
             } else {
@@ -1011,14 +1005,11 @@ impl Editor {
             let left_last = text::line(&s, middle - 1)?;
             let right_last = text::line(&s, b - 1)?;
             let separator = left_last.end..mid;
-            let mut joined = Buffer::empty();
-            joined.begin();
-            joined.insert_snapshot_range(0, &s, mid..right_last.end)?;
-            joined.insert_snapshot_range(joined.len(), &s, separator.clone())?;
-            joined.insert_snapshot_range(joined.len(), &s, start..left_last.end)?;
-            joined.insert_snapshot_range(joined.len(), &s, right_last.end..end)?;
-            joined.commit();
-            let source = joined.snapshot();
+            let source = s
+                .slice(mid..right_last.end)?
+                .concat(&s.slice(separator.clone())?)?
+                .concat(&s.slice(start..left_last.end)?)?
+                .concat(&s.slice(right_last.end..end)?)?;
             let len = source.len();
             edits.push(Edit { range: start..end, insert: Insert::Pieces(source, 0..len) });
             let selected = if down { start..mid } else { mid..end };
@@ -1202,16 +1193,14 @@ impl Editor {
     fn paste_data(&mut self, data: &ClipboardData, after: Option<bool>, count: u32) -> io::Result<Damage> {
         let s = self.document.snapshot();
         let joined = data.joined(self.document.line_ending.bytes())?;
-        let mut repeated = Buffer::empty();
-        repeated.begin();
+        let mut source = Snapshot::default();
+        let ending = literal_snapshot(self.document.line_ending.bytes())?;
         for _ in 0..count.max(1) {
-            repeated.insert_snapshot_range(repeated.len(), &joined, 0..joined.len())?;
+            source = source.concat(&joined)?;
             if data.linewise && text::byte(&joined, joined.len().saturating_sub(1))? != Some(b'\n') {
-                repeated.insert(repeated.len(), self.document.line_ending.bytes())?;
+                source = source.concat(&ending)?;
             }
         }
-        repeated.commit();
-        let source = repeated.snapshot();
         let edits = self
             .cursors
             .iter()
@@ -1240,12 +1229,7 @@ impl Editor {
                     && !s.is_empty()
                     && text::byte(&s, s.len() - 1)? != Some(b'\n')
                 {
-                    let mut prefixed = Buffer::empty();
-                    prefixed.begin();
-                    prefixed.insert(0, self.document.line_ending.bytes())?;
-                    prefixed.insert_snapshot_range(prefixed.len(), &source, 0..source.len())?;
-                    prefixed.commit();
-                    let snapshot = prefixed.snapshot();
+                    let snapshot = ending.concat(&source)?;
                     let len = snapshot.len();
                     Insert::Pieces(snapshot, 0..len)
                 } else if count == 1 && data.ranges.len() == self.cursors.len() && !data.linewise {
@@ -1323,6 +1307,12 @@ enum LineEdit {
     Toggle,
     Comment,
     Uncomment,
+}
+
+fn literal_snapshot(bytes: &[u8]) -> io::Result<Snapshot> {
+    let mut buffer = Buffer::empty();
+    buffer.insert(0, bytes)?;
+    Ok(buffer.snapshot())
 }
 
 fn transform(at: u64, edits: &[Edit], end_bias: bool) -> u64 {

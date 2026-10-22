@@ -206,14 +206,11 @@ impl Editor {
                     if register.is_ascii_uppercase() {
                         let key = register.to_ascii_lowercase();
                         if let Some(previous) = self.registers.get(&key) {
-                            let mut joined = Buffer::empty();
-                            joined.begin();
+                            let mut s = Snapshot::default();
                             for item in [previous, &data] {
                                 let snapshot = item.joined(self.document.line_ending.bytes())?;
-                                joined.insert_snapshot_range(joined.len(), &snapshot, 0..snapshot.len())?;
+                                s = s.concat(&snapshot)?;
                             }
-                            joined.commit();
-                            let s = joined.snapshot();
                             let len = s.len();
                             self.registers.insert(
                                 key,

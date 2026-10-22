@@ -1,7 +1,7 @@
 //! Byte-exact editing over immutable, shared pieces. Offsets, columns and
 //! line numbers are zero-based; columns count bytes, not Unicode scalars.
 
-use crate::piece_tree::{self, AddBudget, Chunks, Tree};
+use crate::piece_tree::{self, AddBudget, Chunks, OriginalUses, Tree};
 use crate::undo::History;
 use crate::{ReadError, TextFile};
 use std::io::{self, Write};
@@ -20,7 +20,7 @@ const TYPING_GAP: Duration = Duration::from_millis(500);
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub(crate) root: Tree,
-    originals: Arc<Vec<crate::file::OriginalRef>>,
+    originals: Arc<OriginalUses>,
 }
 
 impl Snapshot {
@@ -83,10 +83,32 @@ impl Snapshot {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.root
-            .as_ref()
-            .map_or(0, |node| node.metrics.retained)
-            .saturating_add(self.originals.iter().map(|source| source.retained_bytes()).sum::<usize>())
+        self.root.as_ref().map_or(0, |node| node.metrics.retained).saturating_add(
+            self.originals
+                .values()
+                .fold(0_usize, |cost, (source, _)| cost.saturating_add(source.retained_bytes()).saturating_add(512)),
+        )
+    }
+
+    /// Compose immutable ranges without importing storage. The final mutable
+    /// destination enforces its own resident/spill cap when inserting them.
+    pub fn slice(&self, range: Range<u64>) -> io::Result<Self> {
+        self.check_range(&range)?;
+        let (_, tail) = piece_tree::split(self.root.clone(), range.start).map_err(io::Error::other)?;
+        let (root, _) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
+        let originals = Arc::new(piece_tree::original_uses(&root, 0..range.end - range.start));
+        Ok(Self { root, originals })
+    }
+
+    pub fn concat(&self, other: &Self) -> io::Result<Self> {
+        self.len()
+            .checked_add(other.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
+        let mut originals = self.originals.as_ref().clone();
+        for (&id, (source, bytes)) in other.originals.iter() {
+            originals.entry(id).or_insert((source.clone(), 0)).1 += bytes;
+        }
+        Ok(Self { root: piece_tree::join(self.root.clone(), other.root.clone()), originals: Arc::new(originals) })
     }
 
     fn check_range(&self, range: &Range<u64>) -> io::Result<()> {
@@ -190,7 +212,8 @@ impl Buffer {
     /// Refuses changed files even when an index is already cached.
     pub fn from_file(file: TextFile) -> Result<Self, ReadError> {
         let root = piece_tree::original(file.clone())?;
-        Ok(Self { snapshot: Snapshot { root, originals: Arc::new(vec![file.history_backing_ref()]) }, ..Self::empty() })
+        let originals = Arc::new(piece_tree::original_uses(&root, 0..file.len()));
+        Ok(Self { snapshot: Snapshot { root, originals }, ..Self::empty() })
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -247,16 +270,15 @@ impl Buffer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
         let (_, tail) = piece_tree::split(source.root.clone(), range.start).map_err(io::Error::other)?;
         let (inserted, _) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
-        let inserted = piece_tree::import_added(inserted, &self.added)?;
+        let inserted = piece_tree::import_added(inserted, &self.added, &self.snapshot.originals)?;
+        let uses = piece_tree::original_uses(&inserted, 0..range.end - range.start);
         let before = self.snapshot();
         let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(piece_tree::join(left, inserted), right);
-        if !Arc::ptr_eq(&self.snapshot.originals, &source.originals) && !source.originals.is_empty() {
+        if !uses.is_empty() {
             let mut originals = self.snapshot.originals.as_ref().clone();
-            for candidate in source.originals.iter() {
-                if candidate.retained_bytes() > 0 && !originals.iter().any(|known| known.same_object(candidate)) {
-                    originals.push(candidate.clone());
-                }
+            for (id, (source, bytes)) in uses {
+                originals.entry(id).or_insert((source, 0)).1 += bytes;
             }
             self.snapshot.originals = Arc::new(originals);
         }
@@ -289,9 +311,26 @@ impl Buffer {
             return Ok(());
         }
         let before = self.snapshot();
+        let removed = if range.start == 0 && range.end == before.len() {
+            before.originals.as_ref().clone()
+        } else {
+            piece_tree::original_uses(&before.root, range.clone())
+        };
         let (left, tail) = piece_tree::split(before.root.clone(), range.start).map_err(io::Error::other)?;
         let (_, right) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(left, right);
+        if !removed.is_empty() {
+            let mut originals = before.originals.as_ref().clone();
+            for (id, (_, bytes)) in removed {
+                if let Some((_, remaining)) = originals.get_mut(&id) {
+                    *remaining -= bytes;
+                    if *remaining == 0 {
+                        originals.remove(&id);
+                    }
+                }
+            }
+            self.snapshot.originals = Arc::new(originals);
+        }
         self.record(before, false);
         Ok(())
     }
@@ -435,6 +474,93 @@ impl Buffer {
 #[cfg(test)]
 mod editing_contract_tests {
     use super::*;
+    struct OriginalsFixture(std::path::PathBuf);
+    impl OriginalsFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "kwil-foreign-originals-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+        fn file(&self, n: usize) -> TextFile {
+            let path = self.0.join(format!("{n}.txt"));
+            std::fs::write(&path, [b'x'; 65536]).unwrap();
+            TextFile::open(&path).unwrap()
+        }
+    }
+    impl Drop for OriginalsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn tiny_foreign_original_pastes_release_resident_sources_under_zero_caps() {
+        let fixture = OriginalsFixture::new();
+        let mut target = Buffer::with_add_memory_limit(0);
+        target.set_undo_memory_limit(0);
+        for n in 0..4 {
+            let file = fixture.file(n);
+            assert_eq!(file.resident_original_bytes(), 65536);
+            let source = Buffer::from_file(file.clone()).unwrap();
+            let probe = file.history_backing_ref();
+            target.insert_snapshot_range(target.len(), &source.snapshot(), 0..1).unwrap();
+            drop((source, file));
+            assert_eq!(
+                probe.retained_bytes(),
+                0,
+                "a one-byte paste must not retain a 64 KiB foreign resident original"
+            );
+            assert!(target.snapshot.originals.is_empty());
+        }
+        assert_eq!(target.len(), 4);
+        assert_eq!(target.add_memory_bytes(), 0);
+        assert_eq!(target.undo_memory_bytes(), 0);
+        let mut bytes = Vec::new();
+        target.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"xxxx");
+    }
+
+    #[test]
+    fn deleting_last_original_byte_prunes_all_source_bookkeeping() {
+        let fixture = OriginalsFixture::new();
+        let source = Buffer::from_file(fixture.file(0)).unwrap().snapshot();
+        let mut target = Buffer::empty();
+        target.set_undo_memory_limit(0);
+        for _ in 0..8 {
+            target.install_worker_edit(source.clone()).unwrap();
+            assert_eq!(target.snapshot.originals.len(), 1);
+            assert!(target.snapshot.retained_bytes() > target.snapshot.root.as_ref().unwrap().metrics.retained);
+            target.delete(0..target.len()).unwrap();
+            assert!(target.snapshot.originals.is_empty(), "empty buffers must not accumulate weak source entries");
+            assert_eq!(target.snapshot.retained_bytes(), 0);
+            assert_eq!(target.undo_memory_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn immutable_slice_concat_keep_own_original_shared_and_counted_once() {
+        let fixture = OriginalsFixture::new();
+        let mut target = Buffer::from_file(fixture.file(0)).unwrap();
+        let source = target.snapshot();
+        let part = source.slice(16..65520).unwrap();
+        let joined = part.concat(&part).unwrap();
+        target.insert_snapshot_range(target.len(), &joined, 0..joined.len()).unwrap();
+        assert_eq!(
+            target.add_memory_bytes(),
+            0,
+            "own original composition must share pieces rather than materialize bytes"
+        );
+        assert_eq!(target.snapshot.originals.len(), 1);
+        assert_eq!(target.len(), 65536 + 2 * (65520 - 16));
+        assert_eq!(target.snapshot.originals.values().next().unwrap().1, target.len());
+        assert!(target.undo());
+        assert_eq!(target.len(), 65536);
+    }
     #[test]
     fn batch_cancel_coalescing_shared_ranges_and_checkpoint_keep_history() {
         let mut b = Buffer::empty();
