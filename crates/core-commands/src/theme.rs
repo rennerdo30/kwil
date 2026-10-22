@@ -212,6 +212,9 @@ impl Theme {
     /// prevent "string" matching "stringish". Context selectors are rejected.
     pub fn style(&self, scope: &str) -> SyntaxStyle {
         let mut result = SyntaxStyle::default();
+        if scope.len() > MAX_SCOPE_BYTES {
+            return result;
+        }
         for (end, _) in scope.match_indices('.').chain(std::iter::once((scope.len(), ""))) {
             if let Some(rule) = self.syntax.get(&scope[..end]) {
                 result.overlay(rule);

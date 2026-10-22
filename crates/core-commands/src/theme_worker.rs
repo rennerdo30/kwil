@@ -101,12 +101,25 @@ impl ThemeWorker {
         scheme: Scheme,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, ThemeError> {
-        Self::start_with(config, selection, scheme, wake, |_| {})
+        Self::start_with(config, selection, scheme, None, wake, |_| {})
+    }
+    /// Seed the post-first-frame worker from the already validated startup
+    /// cache. Invalid/deleted source themes then retain those displayed pixels
+    /// rather than briefly falling back to a different built-in palette.
+    pub fn start_cached(
+        config: ThemeWorkerConfig,
+        cached: CachedTheme,
+        scheme: Scheme,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self, ThemeError> {
+        cached.theme.validate()?;
+        Self::start_with(config, cached.selection, scheme, Some(cached.theme), wake, |_| {})
     }
     fn start_with(
         config: ThemeWorkerConfig,
         selection: ThemeSelection,
         scheme: Scheme,
+        initial_theme: Option<Theme>,
         wake: impl Fn() + Send + 'static,
         before_publish: impl Fn(PublishStage) + Send + 'static,
     ) -> Result<Self, ThemeError> {
@@ -121,11 +134,13 @@ impl ThemeWorker {
         }
         let session = ThemeSession::new(selection, scheme);
         let catalogue = builtins();
-        let initial = catalogue
-            .iter()
-            .find(|t| &t.id == session.active_id())
-            .map(|t| t.theme.clone())
-            .unwrap_or_else(|| Arc::new(Theme::builtin(scheme)));
+        let initial = initial_theme.map(Arc::new).unwrap_or_else(|| {
+            catalogue
+                .iter()
+                .find(|t| &t.id == session.active_id())
+                .map(|t| t.theme.clone())
+                .unwrap_or_else(|| Arc::new(Theme::builtin(scheme)))
+        });
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 desired: Desired { revision: 1, reload: 1, session: session.clone(), import: None },

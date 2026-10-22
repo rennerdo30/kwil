@@ -62,6 +62,8 @@ selected theme retains the previous active snapshot/cache with an error.
    `ThemeWorkerConfig` paths, a `ThemeSelection`, OS `Scheme` and an event-loop
    wake callback. The cache must be outside the watched directory. This code
    does not discover owner settings paths, read the registry or alter environment.
+   If a valid cache supplied the displayed theme, use `start_cached` to seed the
+   worker with it; invalid or deleted source files retain that active theme.
 3. `request()` accepts typed Preview, Cancel, Apply, Select, OsChanged, Reload and
    Import actions. Preview changes only display state. Cancel restores the
    committed selection. Apply commits the preview and stops OS follow. Select

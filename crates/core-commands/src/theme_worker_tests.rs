@@ -213,6 +213,7 @@ fn obsolete_completion_at(stage: PublishStage) {
         f.config(),
         ThemeSelection::Named(ThemeId::Dark),
         Scheme::Dark,
+        None,
         move || {
             let _ = wake_tx.send(());
         },
@@ -258,4 +259,24 @@ fn theme_worker_obsolete_cache_write_is_skipped_contract() {
 #[test]
 fn theme_worker_obsolete_completion_is_not_published_contract() {
     obsolete_completion_at(PublishStage::Snapshot);
+}
+
+#[test]
+fn theme_worker_keeps_startup_cache_when_source_is_invalid_contract() {
+    let f = Fixture::new();
+    fs::create_dir(f.config().user_directory).unwrap();
+    fs::write(f.config().user_directory.join("fixture.toml"), b"not TOML").unwrap();
+    let mut theme = Theme::builtin(Scheme::Light);
+    theme.name = "Cached fixture".into();
+    let cached = CachedTheme { selection: ThemeSelection::Named(ThemeId::user("fixture").unwrap()), theme };
+    theme_cache::atomic_write(&f.config().active_cache, &theme_cache::encode(&cached).unwrap()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let worker = ThemeWorker::start_cached(f.config(), cached.clone(), Scheme::Dark, move || {
+        let _ = tx.send(());
+    })
+    .unwrap();
+    let snapshot = wait(&worker, &rx, 1);
+    assert_eq!(*snapshot.active, cached.theme);
+    assert!(!snapshot.diagnostics.is_empty());
+    assert_eq!(theme_cache::read_active_cache(&f.config().active_cache).unwrap(), Some(cached));
 }
