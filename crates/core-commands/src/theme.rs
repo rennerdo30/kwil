@@ -229,7 +229,9 @@ impl Theme {
         let backing = self.ui.get(UiRole::Background).over(Self::builtin(self.scheme).ui.get(UiRole::Background));
         for role in UiRole::ALL {
             if role.is_background() {
-                theme.ui.set(*role, self.ui.get(*role).over(backing));
+                theme
+                    .ui
+                    .set(*role, if *role == UiRole::Background { backing } else { self.ui.get(*role).over(backing) });
             }
         }
         for style in theme.syntax.values_mut() {
