@@ -525,8 +525,16 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
         if session.tabs().iter().chain(session.closed()).any(|t| t.id == *id) {
             continue;
         }
-        let metadata =
-            Tab { id: *id, path: None, revision: 0, saved_revision: 0, cursor: 0, anchor: 0, first_visible_line: 0 };
+        let metadata = Tab {
+            id: *id,
+            path: None,
+            revision: 0,
+            saved_revision: 0,
+            cursor: 0,
+            anchor: 0,
+            first_visible_line: 0,
+            first_byte_column: 0,
+        };
         let (mut document, recovered, base) = recover_document(path.clone(), &metadata)?;
         let summary = recovered.summary();
         let path = base.original_path.filter(|path| !session.tabs().iter().any(|t| t.path.as_ref() == Some(path)));
@@ -539,6 +547,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             cursor: 0,
             anchor: 0,
             first_visible_line: 0,
+            first_byte_column: 0,
         })?;
         orphans.insert(*id, (document, recovered));
     }

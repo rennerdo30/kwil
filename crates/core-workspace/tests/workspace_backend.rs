@@ -132,6 +132,7 @@ fn kw20_orphan_journal_tab_retains_identity_and_advances_allocator() {
         cursor: 9,
         anchor: 9,
         first_visible_line: 0,
+        first_byte_column: 0,
     };
     s.restore_tab(tab.clone()).unwrap();
     assert_eq!(s.active(), Some(tab.id));
