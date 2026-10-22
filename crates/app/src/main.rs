@@ -16,6 +16,7 @@ Usage: kwil [options] [file]
 Options:
   --gui        Force the window UI
   --tui        Force the terminal UI
+  --trace-startup  Trace process-age startup marks to stderr, then exit after indexing
   --update     Check for an update now and install it
   --version    Print the version
   -h, --help   Print this help
@@ -29,6 +30,9 @@ struct Args {
     gui: bool,
     tui: bool,
     hidden: bool,
+    trace_startup: bool,
+    #[cfg(feature = "frame-harness")]
+    frame_script: bool,
     update: bool,
     file: Option<PathBuf>,
 }
@@ -41,6 +45,9 @@ fn parse_args() -> Result<Args, String> {
             Some("--tui") => a.tui = true,
             // Agent and test runs: window composed but never shown (Windows).
             Some("--hidden") => a.hidden = true,
+            Some("--trace-startup") => a.trace_startup = true,
+            #[cfg(feature = "frame-harness")]
+            Some("--frame-script") => a.frame_script = true,
             Some("--update") => a.update = true,
             Some("--version" | "-V") => {
                 println!("kwil {VERSION}");
@@ -105,6 +112,8 @@ fn main() -> ExitCode {
         };
     }
 
+    let trace = args.trace_startup.then(|| std::sync::Arc::new(kwil_bench::startup::Trace::launch()));
+
     let open = |path: &PathBuf| match TextFile::open(path) {
         Ok(f) => Ok(View::new(Some((path.clone(), f)))),
         Err(e) => Err(format!("cannot open {}: {e}", path.display())),
@@ -113,8 +122,14 @@ fn main() -> ExitCode {
         Some(p) => open(p),
         None => Ok(View::new(None)),
     };
-    let on_first_frame =
-        || -> Box<dyn FnOnce(Notify)> { Box::new(|notify: Notify| kwil_update::spawn_background(VERSION, notify)) };
+    let on_first_frame = || -> Box<dyn FnOnce(Notify)> {
+        let measuring = args.trace_startup;
+        Box::new(move |notify: Notify| {
+            if !measuring {
+                kwil_update::spawn_background(VERSION, notify);
+            }
+        })
+    };
     let in_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
     let use_gui = args.gui || (!args.tui && desktop_available());
@@ -126,8 +141,15 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        detach_console_if_own();
-        let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden };
+        if !args.trace_startup {
+            detach_console_if_own();
+        }
+        let opts = kwil_ui_gpu::GuiOptions {
+            hidden: args.hidden,
+            trace: trace.clone(),
+            #[cfg(feature = "frame-harness")]
+            frame_script: args.frame_script,
+        };
         match kwil_ui_gpu::run(view, opts, on_first_frame()) {
             Ok(()) => return ExitCode::SUCCESS,
             // Spec §6: fall back to the TUI when the window fails and a
@@ -150,7 +172,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match kwil_ui_tui::run(view, on_first_frame()) {
+    match kwil_ui_tui::run_traced(view, on_first_frame(), trace) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kwil: {e}");

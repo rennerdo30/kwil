@@ -21,14 +21,28 @@ enum Msg {
     InputClosed,
 }
 
-pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
+pub fn run(view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
+    run_traced(view, on_first_frame, None)
+}
+
+pub fn run_traced(
+    mut view: View,
+    on_first_frame: Box<dyn FnOnce(Notify)>,
+    trace: Option<std::sync::Arc<kwil_bench::startup::Trace>>,
+) -> std::io::Result<()> {
     let (tx, rx) = mpsc::channel::<Msg>();
     if let Some(file) = view.file() {
         let t = tx.clone();
+        let trace = trace.clone();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
         file.index_in_background(threads, move |result| {
             let event = match result {
-                Ok(()) => Msg::IndexDone,
+                Ok(()) => {
+                    if let Some(trace) = trace {
+                        trace.index_done();
+                    }
+                    Msg::IndexDone
+                }
                 Err(e) => Msg::Notice(e.to_string()),
             };
             let _ = t.send(event);
@@ -59,6 +73,14 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
         let size = terminal.size()?;
         view.set_rows(size.height.saturating_sub(1) as usize);
         terminal.draw(|f| draw(f, &view))?;
+        if let Some(trace) = &trace {
+            trace.first_frame();
+            if view.file().is_none() || view.file().is_some_and(|f| f.index().is_some()) {
+                trace.index_done();
+                trace.finish();
+                return Ok(());
+            }
+        }
         let t = tx.clone();
         on_first_frame(Box::new(move |msg| {
             let _ = t.send(Msg::Notice(msg));
@@ -68,10 +90,17 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
             let changed = match msg {
                 Msg::InputClosed => break,
                 Msg::IndexDone => {
+                    if let Some(trace) = &trace {
+                        trace.finish();
+                        break;
+                    }
                     view.index_ready();
                     true
                 }
                 Msg::Notice(n) => {
+                    if trace.is_some() {
+                        return Err(std::io::Error::other(n));
+                    }
                     view.set_notice(n);
                     true
                 }
