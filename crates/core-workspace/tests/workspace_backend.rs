@@ -544,6 +544,243 @@ fn kw20_recovery_finishes_interrupted_pending_merge_without_duplicate_edits() {
     assert_eq!(recovered.summary().revision, 3);
 }
 
+fn batch_commands(commit: bool) -> Vec<JournalCommand> {
+    let mut commands = vec![
+        JournalCommand::BeginBatch(JournalBatch { from_revision: 1, to_revision: 9, replacements: 2 }),
+        JournalCommand::BeginReplacement(JournalReplacement { offset: 1, removed: 1, inserted: 2 }),
+        JournalCommand::Bytes(vec![0xff, 0]),
+        JournalCommand::EndReplacement,
+        // Offset four is legal only in the intermediate five-byte document.
+        JournalCommand::BeginReplacement(JournalReplacement { offset: 4, removed: 1, inserted: 1 }),
+        JournalCommand::Bytes(vec![b'Z']),
+        JournalCommand::EndReplacement,
+    ];
+    if commit {
+        commands.push(JournalCommand::CommitBatch);
+    }
+    commands
+}
+
+#[test]
+fn kw20_batch_recovery_is_atomic_at_each_frame_boundary_and_frozen_snapshot() {
+    let temp = Temp::new();
+    let mut worker = create(&temp, b"abcd");
+    let path = temp.path("journal");
+    let base_end =
+        JournalReader::open(&path).unwrap().recover(&AtomicBool::new(false), |_| Ok(())).unwrap().committed_end;
+    for command in batch_commands(false) {
+        submit(&worker, command);
+    }
+    assert_eq!(flush(&worker), 1);
+    let mut frozen = JournalReader::open(&path).unwrap();
+    submit(&worker, JournalCommand::CommitBatch);
+    assert_eq!(flush(&worker), 9);
+    worker.finish();
+    worker.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    let mut events = 0;
+    let old = frozen
+        .recover(&AtomicBool::new(false), |e| {
+            if matches!(
+                e,
+                RecoveryEvent::BeginBatch(_)
+                    | RecoveryEvent::BeginReplacement(_)
+                    | RecoveryEvent::EditBytes(_)
+                    | RecoveryEvent::EndReplacement
+                    | RecoveryEvent::CommitBatch
+            ) {
+                events += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(events, 0);
+    assert_eq!(old.revision, 1);
+    assert_eq!(old.byte_len, 4);
+    assert_eq!(old.tail, RecoveryTail::Interrupted);
+    let bytes = fs::read(&path).unwrap();
+    let mut cursor = base_end as usize;
+    let mut cuts = vec![cursor];
+    while cursor < bytes.len() {
+        let n = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        cursor += 12 + n;
+        if cursor < bytes.len() {
+            cuts.push(cursor);
+        }
+    }
+    for (i, cut) in cuts.into_iter().enumerate() {
+        let prefix = temp.path(&format!("prefix-{i}"));
+        fs::write(&prefix, &bytes[..cut]).unwrap();
+        let mut emitted = 0;
+        let summary = JournalReader::open(&prefix)
+            .unwrap()
+            .recover(&AtomicBool::new(false), |e| {
+                if matches!(
+                    e,
+                    RecoveryEvent::BeginBatch(_)
+                        | RecoveryEvent::BeginReplacement(_)
+                        | RecoveryEvent::EditBytes(_)
+                        | RecoveryEvent::EndReplacement
+                        | RecoveryEvent::CommitBatch
+                ) {
+                    emitted += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(emitted, 0, "partial batch exposed at boundary {i}");
+        assert_eq!(summary.revision, 1);
+        assert_eq!(summary.byte_len, 4);
+        assert_eq!(summary.committed_end, base_end);
+    }
+    let mut model = Vec::new();
+    let mut current = None;
+    let mut replacement_bytes = Vec::new();
+    let mut batch_commits = 0;
+    let summary = JournalReader::open(&path)
+        .unwrap()
+        .recover(&AtomicBool::new(false), |e| {
+            match e {
+                RecoveryEvent::BaseBytes(b) => model.extend_from_slice(b),
+                RecoveryEvent::BeginBatch(b) => {
+                    assert_eq!(b, JournalBatch { from_revision: 1, to_revision: 9, replacements: 2 })
+                }
+                RecoveryEvent::BeginReplacement(r) => {
+                    current = Some(r);
+                    replacement_bytes.clear();
+                }
+                RecoveryEvent::EditBytes(b) => replacement_bytes.extend_from_slice(b),
+                RecoveryEvent::EndReplacement => {
+                    let r = current.take().unwrap();
+                    model.splice(r.offset as usize..(r.offset + r.removed) as usize, replacement_bytes.iter().copied());
+                }
+                RecoveryEvent::CommitBatch => batch_commits += 1,
+                _ => (),
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(model, [b'a', 0xff, 0, b'c', b'Z']);
+    assert_eq!(batch_commits, 1);
+    assert_eq!(summary.revision, 9);
+    assert_eq!(summary.byte_len, 5);
+}
+
+#[test]
+fn kw20_batch_service_spill_interruption_and_resume_keep_one_model_revision() {
+    use std::sync::mpsc;
+    struct Gated {
+        gate: mpsc::Receiver<()>,
+        entered: mpsc::SyncSender<()>,
+        data: std::io::Cursor<Vec<u8>>,
+    }
+    impl Read for Gated {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            self.gate.recv_timeout(TIMEOUT).map_err(std::io::Error::other)?;
+            self.data.read(b)
+        }
+    }
+    let temp = Temp::new();
+    let path = temp.path("batch");
+    let (release, gate) = mpsc::sync_channel(1);
+    let (entered_tx, entered) = mpsc::sync_channel(1);
+    let mut service = JournalService::spawn(Duration::from_secs(60)).unwrap();
+    let doc = service
+        .try_create(JournalSeed {
+            path: path.clone(),
+            base: base(4),
+            source: Box::new(Gated { gate, entered: entered_tx, data: std::io::Cursor::new(b"abcd".to_vec()) }),
+        })
+        .unwrap();
+    entered.recv_timeout(TIMEOUT).unwrap();
+    for command in batch_commands(false) {
+        doc.try_submit(command).unwrap();
+    }
+    release.send(()).unwrap();
+    assert_eq!(doc.ready.recv_timeout(TIMEOUT).unwrap().unwrap(), 1);
+    assert_eq!(doc.try_flush().unwrap().recv_timeout(TIMEOUT).unwrap().unwrap(), 1);
+    service.finish();
+    service.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(doc.finished.recv_timeout(TIMEOUT).unwrap().unwrap(), 1);
+    let mut exposed = 0;
+    let recovered = RecoveredJournal::open(path.clone(), DocumentId(17), &AtomicBool::new(false), |e| {
+        if matches!(
+            e,
+            RecoveryEvent::BeginBatch(_)
+                | RecoveryEvent::BeginReplacement(_)
+                | RecoveryEvent::EditBytes(_)
+                | RecoveryEvent::EndReplacement
+                | RecoveryEvent::CommitBatch
+        ) {
+            exposed += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(exposed, 0);
+    assert_eq!(recovered.summary().revision, 1);
+    assert_eq!(recovered.summary().byte_len, 4);
+    let mut resumed = JournalService::spawn(Duration::from_secs(60)).unwrap();
+    let doc = resumed.try_resume(recovered).unwrap();
+    doc.ready.recv_timeout(TIMEOUT).unwrap().unwrap();
+    for command in batch_commands(true) {
+        doc.try_submit(command).unwrap();
+    }
+    assert_eq!(doc.try_flush().unwrap().recv_timeout(TIMEOUT).unwrap().unwrap(), 9);
+    resumed.finish();
+    resumed.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    let summary = JournalReader::open(&path).unwrap().recover(&AtomicBool::new(false), |_| Ok(())).unwrap();
+    assert_eq!(summary.revision, 9);
+    assert_eq!(summary.byte_len, 5);
+    assert_eq!(summary.tail, RecoveryTail::Complete);
+}
+
+#[test]
+fn kw20_batch_refuses_bad_count_order_and_nested_single_edit_without_partial_commit() {
+    for kind in 0..3 {
+        let temp = Temp::new();
+        let mut worker = create(&temp, b"abcd");
+        submit(&worker, JournalCommand::BeginBatch(JournalBatch { from_revision: 1, to_revision: 9, replacements: 2 }));
+        match kind {
+            0 => submit(&worker, JournalCommand::CommitBatch),
+            1 => submit(&worker, JournalCommand::Bytes(vec![1])),
+            _ => submit(
+                &worker,
+                JournalCommand::Begin(JournalEdit {
+                    from_revision: 1,
+                    to_revision: 2,
+                    offset: 0,
+                    removed: 0,
+                    inserted: 0,
+                }),
+            ),
+        }
+        assert!(worker.finished.recv_timeout(TIMEOUT).unwrap().is_err());
+        worker.finish();
+        let mut exposed = 0;
+        let summary = JournalReader::open(&temp.path("journal"))
+            .unwrap()
+            .recover(&AtomicBool::new(false), |e| {
+                if matches!(
+                    e,
+                    RecoveryEvent::BeginBatch(_)
+                        | RecoveryEvent::BeginReplacement(_)
+                        | RecoveryEvent::EditBytes(_)
+                        | RecoveryEvent::EndReplacement
+                        | RecoveryEvent::CommitBatch
+                ) {
+                    exposed += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(exposed, 0);
+        assert_eq!(summary.revision, 1);
+        assert_eq!(summary.byte_len, 4);
+        assert_eq!(summary.tail, RecoveryTail::Interrupted);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn kw20_unix_stale_recovery_and_replaced_endpoint_is_not_removed() {
