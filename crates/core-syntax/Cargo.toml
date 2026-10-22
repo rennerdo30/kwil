@@ -6,4 +6,80 @@ license.workspace = true
 publish = false
 
 [dependencies]
-kwil-core-text = { path = "../core-text" }
+tree-sitter = "=0.27.1"
+arborium-c = { version = "=2.18.2", optional = true, default-features = false }
+arborium-cpp = { version = "=2.18.2", optional = true, default-features = false }
+arborium-c-sharp = { version = "=2.18.2", optional = true, default-features = false }
+arborium-css = { version = "=2.18.2", optional = true, default-features = false }
+arborium-go = { version = "=2.18.2", optional = true, default-features = false }
+arborium-html = { version = "=2.18.2", optional = true, default-features = false }
+arborium-java = { version = "=2.18.2", optional = true, default-features = false }
+arborium-javascript = { version = "=2.18.2", optional = true, default-features = false }
+arborium-json = { version = "=2.18.2", optional = true, default-features = false }
+arborium-kotlin = { version = "=2.18.2", optional = true, default-features = false }
+arborium-lua = { version = "=2.18.2", optional = true, default-features = false }
+arborium-markdown = { version = "=2.18.2", optional = true, default-features = false }
+arborium-php = { version = "=2.18.2", optional = true, default-features = false }
+arborium-python = { version = "=2.18.2", optional = true, default-features = false }
+arborium-ruby = { version = "=2.18.2", optional = true, default-features = false }
+tree-sitter-rust = { version = "=0.24.2", optional = true }
+arborium-bash = { version = "=2.18.2", optional = true, default-features = false }
+arborium-sql = { version = "=2.18.2", optional = true, default-features = false }
+arborium-swift = { version = "=2.18.2", optional = true, default-features = false }
+arborium-toml = { version = "=2.18.2", optional = true, default-features = false }
+arborium-typescript = { version = "=2.18.2", optional = true, default-features = false }
+arborium-tsx = { version = "=2.18.2", optional = true, default-features = false }
+arborium-xml = { version = "=2.18.2", optional = true, default-features = false }
+arborium-yaml = { version = "=2.18.2", optional = true, default-features = false }
+arborium-dockerfile = { version = "=2.18.2", optional = true, default-features = false }
+arborium-make = { version = "=2.18.2", optional = true, default-features = false }
+arborium-ini = { version = "=2.18.2", optional = true, default-features = false }
+arborium-diff = { version = "=2.18.2", optional = true, default-features = false }
+arborium-batch = { version = "=2.18.2", optional = true, default-features = false }
+arborium-powershell = { version = "=2.18.2", optional = true, default-features = false }
+arborium-haskell = { version = "=2.18.2", optional = true, default-features = false }
+arborium-scala = { version = "=2.18.2", optional = true, default-features = false }
+
+[features]
+measure = []
+default = ["starter"]
+starter = ["lang-c", "lang-cpp", "lang-c-sharp", "lang-css", "lang-go", "lang-html", "lang-java", "lang-javascript", "lang-json", "lang-kotlin", "lang-lua", "lang-markdown", "lang-php", "lang-python", "lang-ruby", "lang-rust", "lang-bash", "lang-sql", "lang-swift", "lang-toml", "lang-typescript", "lang-tsx", "lang-xml", "lang-yaml", "lang-dockerfile", "lang-make", "lang-ini", "lang-diff", "lang-batch", "lang-powershell", "lang-haskell", "lang-scala"]
+lang-c = ["dep:arborium-c"]
+lang-cpp = ["dep:arborium-cpp"]
+lang-c-sharp = ["dep:arborium-c-sharp"]
+lang-css = ["dep:arborium-css"]
+lang-go = ["dep:arborium-go"]
+lang-html = ["dep:arborium-html"]
+lang-java = ["dep:arborium-java"]
+lang-javascript = ["dep:arborium-javascript"]
+lang-json = ["dep:arborium-json"]
+lang-kotlin = ["dep:arborium-kotlin"]
+lang-lua = ["dep:arborium-lua"]
+lang-markdown = ["dep:arborium-markdown"]
+lang-php = ["dep:arborium-php"]
+lang-python = ["dep:arborium-python"]
+lang-ruby = ["dep:arborium-ruby"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-bash = ["dep:arborium-bash"]
+lang-sql = ["dep:arborium-sql"]
+lang-swift = ["dep:arborium-swift"]
+lang-toml = ["dep:arborium-toml"]
+lang-typescript = ["dep:arborium-typescript"]
+lang-tsx = ["dep:arborium-tsx"]
+lang-xml = ["dep:arborium-xml"]
+lang-yaml = ["dep:arborium-yaml"]
+lang-dockerfile = ["dep:arborium-dockerfile"]
+lang-make = ["dep:arborium-make"]
+lang-ini = ["dep:arborium-ini"]
+lang-diff = ["dep:arborium-diff"]
+lang-batch = ["dep:arborium-batch"]
+lang-powershell = ["dep:arborium-powershell"]
+lang-haskell = ["dep:arborium-haskell"]
+lang-scala = ["dep:arborium-scala"]
+
+[dev-dependencies]
+memmap2 = "=0.9.12"
+
+[[example]]
+name = "measure"
+required-features = ["measure", "lang-rust"]
