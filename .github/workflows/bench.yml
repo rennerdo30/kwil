@@ -1,0 +1,85 @@
+name: Bench budgets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TARGET_DIR: target
+  CARGO_INCREMENTAL: 0
+  KWIL_NO_UPDATE: 1
+
+jobs:
+  budgets:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          key: bench-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build measurement binaries
+        run: cargo build --release --locked -j 4 -p kwil-bench --features harness -p kwil --features frame-harness
+      - name: Cache generated fixtures
+        uses: actions/cache@v5
+        with:
+          path: fixtures
+          key: bench-fixtures-v1-${{ matrix.os }}-${{ hashFiles('crates/bench/src/fixtures.rs') }}
+      - name: Generate fixtures on demand
+        shell: bash
+        run: target/release/kwil-bench generate fixtures --all
+      - name: Read reviewed OS baseline
+        shell: bash
+        run: |
+          mkdir -p baseline
+          if git fetch origin bench-baseline; then
+            git show FETCH_HEAD:${{ matrix.os }}.json > baseline/current.json
+          fi
+      - name: Python environment
+        shell: bash
+        run: python -m venv .bench-venv
+      - name: Divan API benchmarks (five samples, one operation per sample)
+        shell: bash
+        env:
+          KWIL_FIXTURES: ${{ github.workspace }}/fixtures
+        run: cargo bench --locked -j 4 -p kwil-bench --features harness --bench text -- --sample-count 5 --sample-size 1
+      - name: Gate contract tests
+        shell: bash
+        run: |
+          py=.bench-venv/bin/python
+          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
+          "$py" crates/bench/test_gate.py
+      - name: Median-of-five hard and regression gates
+        shell: bash
+        run: |
+          py=.bench-venv/bin/python
+          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
+          if [ '${{ runner.os }}' = Linux ]; then
+            xvfb-run -a "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/${{ matrix.os }}.json --baseline baseline/current.json
+          else
+            "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/${{ matrix.os }}.json --baseline baseline/current.json
+          fi
+      - name: Retain raw samples, medians and commit even on gate failure
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: bench-${{ matrix.os }}
+          path: results
+          if-no-files-found: error

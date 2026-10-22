@@ -29,11 +29,14 @@ const STATUS_BG: u32 = 0x080d18;
 const STATUS_FG: u32 = 0x8fe3ff;
 const GUTTER_COLS: usize = 9;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct GuiOptions {
     /// Agent and test runs: the window is DWM-cloaked (composed but never
     /// shown), unfocused and has no taskbar entry (Windows only).
     pub hidden: bool,
+    pub trace: Option<std::sync::Arc<kwil_bench::startup::Trace>>,
+    #[cfg(feature = "frame-harness")]
+    pub frame_script: bool,
 }
 
 #[derive(Debug)]
@@ -56,6 +59,8 @@ impl std::fmt::Display for GuiError {
 enum UserEvent {
     IndexDone,
     Notice(String),
+    #[cfg(feature = "frame-harness")]
+    Script(kwil_bench::frames::Step),
 }
 
 struct Gfx {
@@ -77,6 +82,11 @@ struct App {
     mods: ModifiersState,
     pending: Damage,
     error: Option<GuiError>,
+    first_presented: bool,
+    #[cfg(feature = "frame-harness")]
+    frame_stats: kwil_bench::frames::Stats,
+    #[cfg(feature = "frame-harness")]
+    script_started: bool,
 }
 
 /// Runs the GUI until the window closes. `on_first_frame` runs once the
@@ -91,8 +101,12 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
     let proxy = event_loop.create_proxy();
     if let Some(file) = view.file() {
         let p = proxy.clone();
+        let trace = opts.trace.clone();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
         file.index_in_background(threads, move || {
+            if let Some(trace) = trace {
+                trace.index_done();
+            }
             let _ = p.send_event(UserEvent::IndexDone);
         });
     }
@@ -108,6 +122,11 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
         mods: ModifiersState::empty(),
         pending: Damage::default(),
         error: None,
+        first_presented: false,
+        #[cfg(feature = "frame-harness")]
+        frame_stats: Default::default(),
+        #[cfg(feature = "frame-harness")]
+        script_started: false,
     };
     event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
@@ -171,6 +190,8 @@ impl App {
     }
 
     fn render(&mut self) {
+        #[cfg(feature = "frame-harness")]
+        let started = std::time::Instant::now();
         let (w, h) = self.size;
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return };
         if w == 0 || h == 0 {
@@ -187,6 +208,8 @@ impl App {
         let ch = font.ch;
         let rows = h.saturating_sub(ch) / ch;
         let mut damage: Vec<Rect> = Vec::new();
+        #[cfg(feature = "frame-harness")]
+        let mut copy_px = 0u64;
 
         if p.full {
             fill(&mut buf, w, Rect { x: 0, y: 0, w, h }, BG);
@@ -201,12 +224,22 @@ impl App {
                 let keep = (rows - d) * ch;
                 if p.scroll > 0 {
                     buf.copy_within(d * ch * w..(d * ch + keep) * w, 0);
-                    if !screen_copy(gfx.hwnd, w, keep, d * ch, 0) {
+                    let copied = screen_copy(gfx.hwnd, w, keep, d * ch, 0);
+                    #[cfg(feature = "frame-harness")]
+                    if copied {
+                        copy_px = (w * keep) as u64;
+                    }
+                    if !copied {
                         damage.push(Rect { x: 0, y: 0, w, h: keep });
                     }
                 } else {
                     buf.copy_within(0..keep * w, d * ch * w);
-                    if !screen_copy(gfx.hwnd, w, keep, 0, d * ch) {
+                    let copied = screen_copy(gfx.hwnd, w, keep, 0, d * ch);
+                    #[cfg(feature = "frame-harness")]
+                    if copied {
+                        copy_px = (w * keep) as u64;
+                    }
+                    if !copied {
                         damage.push(Rect { x: 0, y: d * ch, w, h: keep });
                     }
                 }
@@ -238,7 +271,24 @@ impl App {
             }
         }
         let rects: Vec<_> = damage.iter().filter_map(|r| r.to_softbuffer()).collect();
-        let _ = buf.present_with_damage(&rects);
+        if buf.present_with_damage(&rects).is_err() {
+            return;
+        }
+        self.first_presented = true;
+        if let Some(trace) = &self.opts.trace {
+            trace.first_frame();
+        }
+        #[cfg(feature = "frame-harness")]
+        if self.opts.frame_script {
+            let expected = (w * ch * (p.rows.len() + usize::from(p.status))) as u64;
+            self.frame_stats.present(
+                damage.iter().map(|r| (r.w * r.h) as u64).sum(),
+                copy_px,
+                p.full,
+                expected,
+                started,
+            );
+        }
     }
 }
 
@@ -404,6 +454,7 @@ impl ApplicationHandler<UserEvent> for App {
         let d = self.view.set_rows(self.text_rows());
         self.apply(d);
         self.render();
+        self.measurement_ready(el);
         if let Some(cb) = self.on_first_frame.take() {
             let p = self.proxy.clone();
             cb(Box::new(move |msg| {
@@ -412,12 +463,32 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
             UserEvent::IndexDone => self.view.index_ready(),
             UserEvent::Notice(msg) => self.view.set_notice(msg),
+            #[cfg(feature = "frame-harness")]
+            UserEvent::Script(step) => {
+                use kwil_bench::frames::Step;
+                self.frame_stats.enter(step);
+                match step {
+                    Step::Scroll => {
+                        let d = self.view.scroll(1);
+                        self.apply(d);
+                    }
+                    Step::Exit => {
+                        if let Err(e) = self.frame_stats.report() {
+                            self.error = Some(GuiError::Unavailable(e));
+                        }
+                        el.exit();
+                    }
+                    _ => {}
+                }
+                return;
+            }
         };
         self.apply(d);
+        self.measurement_ready(el);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
@@ -458,6 +529,24 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    fn measurement_ready(&mut self, el: &ActiveEventLoop) {
+        let ready = self.first_presented && self.view.file().is_none_or(|f| f.index().is_some());
+        if !ready {
+            return;
+        }
+        if let Some(trace) = &self.opts.trace {
+            trace.index_done();
+            trace.finish();
+            el.exit();
+        }
+        #[cfg(feature = "frame-harness")]
+        if self.opts.frame_script && !self.script_started {
+            self.script_started = true;
+            let proxy = self.proxy.clone();
+            kwil_bench::frames::spawn_script(move |step| proxy.send_event(UserEvent::Script(step)).is_ok());
+        }
+    }
+
     fn resize_surface(&mut self) {
         let (w, h) = self.size;
         if let (Some(g), Some(w), Some(h)) = (&mut self.gfx, NonZeroU32::new(w as u32), NonZeroU32::new(h as u32)) {

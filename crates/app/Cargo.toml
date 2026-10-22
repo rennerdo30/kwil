@@ -6,11 +6,15 @@ license.workspace = true
 description = "A blazing fast plain text editor for GUI and terminal."
 publish = false
 
+[features]
+frame-harness = ["kwil-ui-gpu/frame-harness"]
+
 [[bin]]
 name = "kwil"
 path = "src/main.rs"
 
 [dependencies]
+kwil-bench = { path = "../bench" }
 kwil-core-text = { path = "../core-text" }
 kwil-view-model = { path = "../view-model" }
 kwil-ui-gpu = { path = "../ui-gpu" }
