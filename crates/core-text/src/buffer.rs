@@ -66,6 +66,12 @@ impl Snapshot {
         Ok(Chunks::new(&self.root, range))
     }
 
+    /// Encoding-save traversal retaining original byte ranges. Does not decode or copy.
+    pub fn source_chunks(&self, range: Range<u64>) -> io::Result<crate::piece_tree::SourceChunks<'_>> {
+        self.check_range(&range)?;
+        Ok(crate::piece_tree::SourceChunks::new(&self.root, range))
+    }
+
     /// Borrow each viewport line as chunks, without LF or a trailing CR.
     /// Even a single giant line is never joined into an owned buffer.
     /// Both line and chunk iterator items can report ReadError.
