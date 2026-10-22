@@ -185,7 +185,7 @@ impl DocumentWorker {
         let capacity = self.journal_capacity.clone();
         Box::new(move |receipt| {
             if capacity
-                .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |left| {
+                .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |left| {
                     left.checked_sub(1)
                 })
                 .is_err()
@@ -1149,12 +1149,11 @@ mod tests {
     fn wait_stopped(receiver: &mpsc::Receiver<DocumentResult>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap() {
-                DocumentResult::Stopped(result) => {
-                    result.unwrap();
-                    break;
-                }
-                _ => {}
+            if let DocumentResult::Stopped(result) =
+                receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap()
+            {
+                result.unwrap();
+                break;
             }
         }
     }

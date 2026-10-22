@@ -229,8 +229,8 @@ impl Workspace {
         };
         result.capacity = available.min(kwil_core_workspace::session::MAX_TABS);
         let active = self.session.tabs().iter().position(|t| t.id == self.active_id()).unwrap_or(0);
-        if result.capacity > 0 {
-            result.first = active / result.capacity * result.capacity;
+        if let Some(page) = active.checked_div(result.capacity) {
+            result.first = page * result.capacity;
             for (index, tab) in self.session.tabs().iter().enumerate().skip(result.first).take(result.capacity) {
                 let local = index - result.first;
                 let area = TabArea {
@@ -1151,11 +1151,14 @@ impl Workspace {
         damage.status |= retried.status;
         damage.scroll += retried.scroll;
         damage.rows.extend(retried.rows);
-        if self.close_pending() && !self.files.hot_exit && self.files.prompt.is_none() && !self.files.manual_guard {
-            if let Err(error) = self.advance_close(false) {
-                self.set_notice(error.to_string());
-                self.cancel_close_intent();
-            }
+        if self.close_pending()
+            && !self.files.hot_exit
+            && self.files.prompt.is_none()
+            && !self.files.manual_guard
+            && let Err(error) = self.advance_close(false)
+        {
+            self.set_notice(error.to_string());
+            self.cancel_close_intent();
         }
         self.check_hot_exit();
         self.pump_files();
