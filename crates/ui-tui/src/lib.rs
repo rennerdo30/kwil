@@ -105,6 +105,7 @@ pub fn run_with_external_open(
                     if let Ok(next_keys) = KeymapEngine::new(next.keymap, &next.bindings) {
                         keys = next_keys;
                         settings = *next;
+                        view.set_session_restore(settings.files.restore_session);
                         if let Some(editor) = view.editor_mut() {
                             editor.settings = settings.clone();
                         }

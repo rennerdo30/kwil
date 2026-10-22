@@ -1394,6 +1394,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let tabs_changed = settings.editor.tab_size != self.settings.editor.tab_size;
                 let layout_changed = settings.tabs.layout != self.settings.tabs.layout;
                 self.settings = *settings;
+                self.view.set_session_restore(self.settings.files.restore_session);
                 if layout_changed {
                     self.chrome_dirty = true;
                     let rows = self.text_rows();
