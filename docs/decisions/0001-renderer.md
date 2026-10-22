@@ -1,6 +1,6 @@
 # 0001: GUI renderer: own thin renderer (B), not gpui (A)
 
-Status: decided 2026-10-23 (M0 spike, Pair Desk KW-1). Owner review pending.
+Status: accepted by the owner 2026-10-23 (M0 spike, Pair Desk KW-1).
 
 ## Decision
 
