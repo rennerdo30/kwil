@@ -54,7 +54,14 @@ jobs:
           add-rust-environment-hash-key: false
           key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           cache-on-failure: true
-      - run: cargo build --release --locked -p kwil --target ${{ matrix.target }}
+      - name: Build platform entry points
+        shell: bash
+        run: |
+          features=()
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            features=(--features windows-console)
+          fi
+          cargo build --release --locked -p kwil --target ${{ matrix.target }} "${features[@]}"
       - name: Compiler cache statistics
         if: always() && steps.sccache.outcome == 'success'
         run: sccache --show-stats
@@ -63,6 +70,9 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/kwil${{ matrix.ext }}" "dist/kwil-${{ matrix.target }}${{ matrix.ext }}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/kwil-console.exe" "dist/kwil-${{ matrix.target }}.com"
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: kwil-${{ matrix.target }}
