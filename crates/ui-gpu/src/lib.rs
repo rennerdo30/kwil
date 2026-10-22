@@ -115,6 +115,10 @@ fn cancel_save_prompt(path: &mut Option<String>, close_pending: &mut bool) {
     *close_pending = false;
 }
 
+fn submitted_save_path(prompt: &mut Option<String>) -> Option<std::path::PathBuf> {
+    if prompt.as_ref().is_some_and(|path| !path.trim().is_empty()) { prompt.take().map(Into::into) } else { None }
+}
+
 fn command_notice(status: CommandStatus) -> Option<String> {
     match status {
         CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => Some(message),
@@ -135,6 +139,22 @@ mod input_dispatch_tests {
         cancel_save_prompt(&mut path, &mut close_pending);
         assert!(path.is_none());
         assert!(!close_pending, "a later ordinary save must not close the window");
+    }
+
+    #[test]
+    fn blank_save_submission_keeps_the_input_destination_and_cancel_intent() {
+        for value in ["", "   ", "\t"] {
+            let mut prompt = Some(value.to_owned());
+            let mut close_pending = true;
+            assert!(submitted_save_path(&mut prompt).is_none());
+            assert_eq!(prompt.as_deref(), Some(value));
+            prompt.as_mut().unwrap().push_str("日本語.txt");
+            assert!(submitted_save_path(&mut prompt).is_some());
+            assert!(prompt.is_none());
+            prompt = Some(String::new());
+            cancel_save_prompt(&mut prompt, &mut close_pending);
+            assert!(!close_pending);
+        }
     }
 
     #[test]
@@ -404,9 +424,8 @@ impl App {
                     cancel_save_prompt(&mut self.save_path, &mut self.close_pending);
                 }
                 Key::Named(NamedKey::Enter) => {
-                    let path = self.save_path.take().unwrap();
-                    if !path.trim().is_empty() {
-                        self.start_save(Some(path.into()));
+                    if let Some(path) = submitted_save_path(&mut self.save_path) {
+                        self.start_save(Some(path));
                     }
                     return;
                 }
