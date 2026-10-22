@@ -2,6 +2,8 @@
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::{ops::Range, sync::Arc};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub const MAX_PREVIEW_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_MODEL_ITEMS: usize = 1_000_000;
@@ -299,6 +301,7 @@ impl Builder<'_> {
                 let i = self.active.pop().unwrap();
                 if self.blocks[i].kind == BlockKind::Paragraph
                     && self.blocks[i].spans.len() == 1
+                    && self.blocks[i].spans[0].style == Style::default()
                     && let InlineKind::Image { alt, url } = &self.blocks[i].spans[0].kind
                 {
                     self.blocks[i].kind = BlockKind::Image { alt: alt.clone(), url: url.clone() };
@@ -456,9 +459,8 @@ fn inline_text(spans: &[Span]) -> String {
     out
 }
 
-/// Plain text fallback. Width counts Unicode scalar values, not terminal cells
-/// (frontends should use the styled spans for terminal-specific cell layout).
-/// Width zero is treated as one. Long words and code lines are split safely.
+/// Plain text fallback, wrapped by grapheme clusters and terminal display cells.
+/// Width zero is treated as one. Overwide clusters occupy a line on their own.
 pub fn render_text(model: &Model, width: usize) -> String {
     let width = width.max(1);
     let mut out = String::new();
@@ -513,7 +515,7 @@ pub fn render_text(model: &Model, width: usize) -> String {
             }
         };
         let continuation = if matches!(block.kind, BlockKind::Heading(_) | BlockKind::ListItem { .. }) {
-            format!("{quote}{}", " ".repeat(prefix.chars().count() - quote.chars().count()))
+            format!("{quote}{}", " ".repeat(prefix.width() - quote.width()))
         } else {
             prefix.clone()
         };
@@ -528,30 +530,35 @@ fn wrap(out: &mut String, text: &str, first: &str, continuation: &str, width: us
         let mut pending = String::new();
         let mut used = 0;
         let units: Vec<&str> = if raw { vec![line] } else { line.split_whitespace().collect() };
-        let mut capacity = width.saturating_sub(prefix.chars().count().min(width - 1));
+        let mut capacity = width.saturating_sub(prefix.width().min(width - 1));
         for word in units {
-            let length = word.chars().count();
-            if used > 0 && used + 1 + length > capacity {
+            let length = word.width();
+            if !pending.is_empty() && used + 1 + length > capacity {
                 write_line(out, prefix, &pending, width);
                 prefix = continuation;
                 pending.clear();
                 used = 0;
-                capacity = width.saturating_sub(prefix.chars().count().min(width - 1));
             }
-            if used > 0 {
+            if !pending.is_empty() {
                 pending.push(' ');
                 used += 1;
             }
-            for c in word.chars() {
-                if used == capacity {
+            for cluster in word.graphemes(true) {
+                let cells = cluster.width();
+                if !pending.is_empty() && used + cells > capacity {
                     write_line(out, prefix, &pending, width);
                     prefix = continuation;
                     pending.clear();
                     used = 0;
-                    capacity = width.saturating_sub(prefix.chars().count().min(width - 1));
                 }
-                pending.push(c);
-                used += 1;
+                if pending.is_empty() {
+                    // Shorten the prefix to leave room for this whole cluster.
+                    // If it exceeds the entire width, omit the prefix entirely.
+                    let budget = width.saturating_sub(cells.max(1));
+                    capacity = width - prefix_cells(prefix, budget).width();
+                }
+                pending.push_str(cluster);
+                used += cells;
             }
         }
         write_line(out, prefix, &pending, width);
@@ -560,9 +567,23 @@ fn wrap(out: &mut String, text: &str, first: &str, continuation: &str, width: us
 }
 
 fn write_line(out: &mut String, prefix: &str, text: &str, width: usize) {
-    out.extend(prefix.chars().take(width - 1));
+    out.push_str(prefix_cells(prefix, width.saturating_sub(text.width().max(1))));
     out.push_str(text);
     out.push('\n');
+}
+
+fn prefix_cells(prefix: &str, budget: usize) -> &str {
+    let mut used = 0;
+    let mut end = 0;
+    for (offset, cluster) in prefix.grapheme_indices(true) {
+        let cells = cluster.width();
+        if used + cells > budget {
+            break;
+        }
+        used += cells;
+        end = offset + cluster.len();
+    }
+    &prefix[..end]
 }
 
 #[cfg(test)]

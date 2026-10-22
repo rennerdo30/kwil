@@ -1122,6 +1122,8 @@ name = "kwil-core-markdown"
 version = "0.1.0"
 dependencies = [
  "pulldown-cmark",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

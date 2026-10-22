@@ -7,4 +7,6 @@ publish = false
 
 [dependencies]
 pulldown-cmark = { version = "0.13.5", default-features = false }
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 
