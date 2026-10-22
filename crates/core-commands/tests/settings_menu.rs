@@ -69,6 +69,73 @@ fn rebind_detects_exact_prefix_and_context_conflicts_and_keeps_tombstones() {
     assert!(doc.conflicts(&prefix).unwrap().iter().any(|c| c.kind == ConflictKind::Prefix));
 }
 
+fn vim_binding(keys: &str, mode: Option<Mode>) -> Binding {
+    Binding { keys: keys.into(), command: "file.save".into(), context: Some(Context::Editor), mode }
+}
+
+#[test]
+fn vim_grammar_probe_reports_motion_operator_and_multikey_takeovers() {
+    let mut doc = SettingsDocument::parse("keymap='vim'\n").unwrap();
+    let source = doc.source().to_owned();
+    let motion = doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap();
+    assert_eq!(motion.len(), 1);
+    assert_eq!(motion[0].takeover, VimTakeover::Command("motion.down"));
+    assert_eq!(motion[0].kind, ConflictKind::Exact);
+    assert_eq!(motion[0].consumed_chords, 1);
+    assert!(doc.conflicts(&vim_binding("j", Some(Mode::Normal))).unwrap().iter().any(|c| c.command == "motion.down"));
+    assert!(doc.rebind(vim_binding("j", Some(Mode::Normal)), false).is_err());
+    assert_eq!(doc.source(), source);
+    let operator = doc.vim_grammar_warnings(&vim_binding("d", Some(Mode::Normal))).unwrap();
+    assert_eq!(operator[0].takeover, VimTakeover::Pending);
+    assert_eq!(operator[0].kind, ConflictKind::Prefix);
+    let gg = doc.vim_grammar_warnings(&vim_binding("g g", Some(Mode::Normal))).unwrap();
+    assert_eq!(gg[0].takeover, VimTakeover::Command("motion.firstLine"));
+    assert_eq!(gg[0].kind, ConflictKind::Exact);
+    assert_eq!(gg[0].consumed_chords, 2);
+    let prefix = doc.vim_grammar_warnings(&vim_binding("j x", Some(Mode::Normal))).unwrap();
+    assert_eq!(prefix[0].takeover, VimTakeover::Command("motion.down"));
+    assert_eq!(prefix[0].kind, ConflictKind::Prefix);
+    let failed_sequence = doc.vim_grammar_warnings(&vim_binding("g z", Some(Mode::Normal))).unwrap();
+    assert_eq!(failed_sequence[0].takeover, VimTakeover::Pending);
+    assert_eq!(failed_sequence[0].keys, "g");
+    let visual = doc.vim_grammar_warnings(&vim_binding("d", Some(Mode::Visual))).unwrap();
+    assert_eq!(visual[0].mode, Mode::Visual);
+    assert_eq!(visual[0].takeover, VimTakeover::Command("operator.delete"));
+    assert!(doc.vim_grammar_warnings(&vim_binding("g g g g g g g g g", Some(Mode::Normal))).is_err());
+}
+
+#[test]
+fn vim_grammar_probe_respects_tombstones_explicit_precedence_modes_and_contexts() {
+    let doc =
+        SettingsDocument::parse("keymap='vim'\n[[bindings]]\nkeys='j'\ncommand=''\ncontext='editor'\nmode='normal'\n")
+            .unwrap();
+    assert!(doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap().is_empty());
+    assert!(
+        doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Visual))).unwrap().iter().any(|w| w.mode == Mode::Visual)
+    );
+    let explicit = SettingsDocument::parse(
+        "keymap='vim'\n[[bindings]]\nkeys='j'\ncommand='file.open'\ncontext='editor'\nmode='normal'\n",
+    )
+    .unwrap();
+    assert!(explicit.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap().is_empty());
+    assert!(
+        explicit.conflicts(&vim_binding("j", Some(Mode::Normal))).unwrap().iter().any(|c| c.command == "file.open")
+    );
+    assert!(doc.vim_grammar_warnings(&vim_binding("j", Some(Mode::Insert))).unwrap().is_empty());
+    let mut palette = vim_binding("j", Some(Mode::Normal));
+    palette.context = Some(Context::Palette);
+    assert!(doc.vim_grammar_warnings(&palette).unwrap().is_empty());
+    let nonvim = SettingsDocument::parse("").unwrap();
+    assert!(nonvim.vim_grammar_warnings(&vim_binding("j", Some(Mode::Normal))).unwrap().is_empty());
+    let native = SettingsDocument::parse("keymap='vim'").unwrap();
+    let mut same = vim_binding("j", Some(Mode::Normal));
+    same.command = "motion.down".into();
+    assert!(native.vim_grammar_warnings(&same).unwrap().is_empty());
+    let mut unbind = vim_binding("j", Some(Mode::Normal));
+    unbind.command.clear();
+    assert!(native.vim_grammar_warnings(&unbind).unwrap().is_empty());
+}
+
 #[test]
 fn scoped_rebind_and_command_reset_restore_preset_without_destroying_custom_data() {
     let mut doc =
