@@ -706,10 +706,20 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
             }
             // Escapes and URLs are atomic data, never structural punctuation.
             quoted = true;
-        } else if b[i].is_ascii_alphabetic() || b[i] == b'_' {
-            i += 1;
-            while b.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$')) {
-                i += 1;
+        } else if sql && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'$') || b[i] >= 128) {
+            // Consume one complete identifier/number atom before considering
+            // keywords. Never expose an ASCII keyword suffix of a Unicode name.
+            while b.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$') || *c >= 128) {
+                i += text[i..].chars().next().unwrap().len_utf8();
+            }
+            if !text[start..i].is_ascii() {
+                // Unicode identifier boundaries/case rules vary by dialect.
+                // Quoted literals/comments are handled above and remain supported.
+                return Err(FormatError::new(
+                    "SQL",
+                    "Unicode identifier requires an explicit dialect; configure an external formatter",
+                    line_at(b, start),
+                ));
             }
         } else {
             i += text[i..].chars().next().map_or(1, char::len_utf8);

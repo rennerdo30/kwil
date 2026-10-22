@@ -132,3 +132,28 @@ Logs `round3-red.log`, `round3-green.log`, `round3-final.log`, `round3-clippy.lo
 in that directory identify the tested base plus edits on their first line.
 No native macOS/Linux, full workspace tests, GUI/TUI/undo integration or owner
 acceptance ran locally. The parent owns the new CI result, review and merge.
+
+## Review round 4 source candidate (2026-10-23)
+
+Base: `9ade72ae2c5465c528a268a56d681c2592482466`, same isolated `fix-7b`.
+The fourth review found two further boundary assumptions. The implementation
+approach is now conservative admission, rather than guessing missing grammar:
+
+- SQL consumes complete identifier/number atoms before keyword classification,
+  and refuses unquoted non-ASCII atoms with an explicit dialect explanation.
+  Recognized Unicode quoted identifiers, literals and comments still format.
+- Heredoc body searching is admitted only after validating the entire simple
+  header (heredoc operators/delimiters and spaces/tabs). Any other header token
+  protects the suffix through EOF. A physical LF inside a quoted argument or
+  continuation is never presumed to be the shell's lexical NEWLINE.
+- `FAILURE-MATRIX.md` maps every earlier R1-R3 failure, both R4 failures and the
+  unchanged admission/process contracts to their preservation rules and tests.
+  All 49 previous contracts are retained. The four new tests cover three failure
+  selections plus a Unicode SQL literal/comment control.
+
+**Validation pending:** no Cargo/test/Clippy invocation has run for this candidate.
+The parent owns the current shared lane queue and must explicitly grant it before
+this job runs `verify-round4-fail-first.ps1`, the restored focused formatter suite,
+workspace Clippy and fmt. Source formatting used only standalone rustfmt (PID
+20856, exit 0); `git diff --check` passes. No full suite or native run started.
+This source candidate is not ready for merge or a passing claim.

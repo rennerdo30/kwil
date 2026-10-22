@@ -63,6 +63,10 @@ input ceiling; a lower output limit is checked after its serialization.
   A `#` outside a literal/comment is refused with a dialect explanation: MySQL
   treats it as a comment, while other dialects use it in operators/identifiers.
   A configured external formatter can handle the selected dialect explicitly.
+  SQL keyword classification operates on complete identifier/number atoms. An
+  unquoted non-ASCII atom is refused before keyword classification because this
+  formatter has no selected dialect's Unicode identifier rules. Unicode quoted
+  identifiers, literals and comments remain supported and byte-exact.
   These are lexical formatters, not dialect rewrites or syntax repair tools.
 - Generic tidy runs **only** for tokenized types: Python, JavaScript/TypeScript,
   Rust, Go, C/C++, C#, Java, Shell (sh/bash/zsh/ksh), Ruby, PHP, Lua, Kotlin and
@@ -83,6 +87,10 @@ input ceiling; a lower output limit is checked after its serialization.
   delimiter. Code before that suffix can still be tidied. PHP inline HTML and
   attributes and Ruby trailing data are protected. PHP heredoc spans stop at the
   closing label, so following expression literals are tokenized normally.
+  Heredoc body scanning requires a proven simple header made only of heredoc
+  operators, simple delimiter words (optionally quoted) and spaces/tabs. Any
+  other header token protects the suffix through EOF: a physical LF inside a
+  quoted argument, continuation or substitution must never start a body scan.
   JS/TS comments terminate at U+2028/U+2029 as well as CR/LF. Shell uses only LF
   as a structural ending: bare CR and the CR in CRLF retain their argument bytes.
   Comments are preserved too (trimming them is allowed by policy, but not needed).
@@ -167,6 +175,9 @@ before its mutation assertion fails.
 `verify-round3-fail-first.ps1` runs the six round-3 boundary regressions against
 the unchanged `f9dff6f` tokenizer and SQL implementation. All six must fail; both
 sources are restored in `finally`. Obtain the shared Cargo lane before running it.
+`verify-round4-fail-first.ps1` runs against unchanged `9ade72a`: Unicode SQL
+identifier and uncertain-header tests must fail (three failures); the Unicode
+SQL literal/comment control must pass. It restores sources in `finally` too.
 
 One-shot measurement (run only when authorized):
 

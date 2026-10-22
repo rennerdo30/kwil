@@ -251,9 +251,18 @@ impl Scanner<'_> {
         let mut i = start;
         let mut delimiters = Vec::new(); // Fixed ceiling of 16 pending heredocs.
         while i < header_end {
-            if !self.text[i..].starts_with("<<") {
-                i += self.text[i..].chars().next().unwrap().len_utf8();
+            if matches!(b[i], b' ' | b'\t') {
+                i += 1;
                 continue;
+            }
+            if !self.text[i..].starts_with("<<") {
+                // Physical LF starts the body only when the complete header is
+                // proven to consist of simple heredoc operators/delimiters and
+                // whitespace. Quotes, continuations, substitutions, comments or
+                // any other unparsed token may defer the shell's lexical NEWLINE.
+                // Preserve the entire uncertain suffix; never search its quoted
+                // argument text for what merely looks like a body terminator.
+                return self.uncertain();
             }
             if delimiters.len() == 16 {
                 return self.uncertain();
