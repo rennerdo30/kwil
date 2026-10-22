@@ -573,7 +573,7 @@ impl SettingsWorker {
             let watcher = path
                 .parent()
                 .ok_or_else(|| std::io::Error::other("settings path needs parent"))
-                .and_then(|p| fs::create_dir_all(p))
+                .and_then(fs::create_dir_all)
                 .and_then(|_| {
                     kwil_core_workspace::FileWatcher::new(
                         std::slice::from_ref(&path),
