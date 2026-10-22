@@ -104,6 +104,30 @@ impl Session {
         self.active = Some(id);
         Ok(id)
     }
+    /// Restores a journal whose metadata write was interrupted. Keeps its ID and
+    /// advances the allocator; never silently substitutes a new document ID.
+    pub fn restore_tab(&mut self, tab: Tab) -> io::Result<()> {
+        if self.tabs.len() >= MAX_TABS
+            || tab.id.0 == 0
+            || self.tabs.iter().chain(self.closed.iter()).any(|t| t.id == tab.id)
+        {
+            return Err(invalid("restored tab limit/identity"));
+        }
+        if let Some(path) = &tab.path {
+            validate_path(path)?;
+            if !path.is_absolute() || self.tabs.iter().any(|t| t.path.as_ref() == Some(path)) {
+                return Err(invalid("restored tab path"));
+            }
+        }
+        let next = tab.id.0.checked_add(1).ok_or_else(|| invalid("document ID exhausted"))?;
+        self.next_id = self.next_id.max(next);
+        self.active = Some(tab.id);
+        if let Some(path) = &tab.path {
+            self.touch_recent(path.clone());
+        }
+        self.tabs.push(tab);
+        Ok(())
+    }
     pub fn close(&mut self, id: DocumentId) -> bool {
         // A bounded history must not silently evict unrecoverable unsaved work.
         // The frontend can reopen/save or explicitly discard that entry first.
