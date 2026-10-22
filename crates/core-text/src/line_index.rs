@@ -42,8 +42,6 @@ impl LineIndex {
     /// Builds the index with up to `threads` worker threads. `progress`
     /// receives the number of bytes scanned so far.
     pub fn build(bytes: &[u8], every: u64, threads: usize, progress: &AtomicU64) -> Self {
-        // Temporary KW-33 acceptance proof: remove after the hosted gate fails.
-        std::thread::sleep(std::time::Duration::from_secs(1));
         Self::build_chunked(bytes, every, CHUNK, threads, progress)
     }
 
