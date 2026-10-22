@@ -61,7 +61,7 @@ impl PaletteSession {
             Err(error) => {
                 // No input/event loop exists yet. Signal the worker; do not join
                 // it on the caller's input path, including construction failure.
-                worker.stop();
+                let _ = worker.stop();
                 return Err(error);
             }
         };
@@ -181,7 +181,7 @@ impl PaletteSession {
 
 impl Drop for PaletteSession {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -237,5 +237,81 @@ mod tests {
         session.input(PaletteInput::Delete).unwrap();
         assert_eq!(session.model().query(), "");
         finish(session);
+    }
+}
+
+/// Escape control characters in path labels and pasted query text. Native paths
+/// remain in typed actions; this representation is display-only.
+pub fn display_text(text: &str) -> String {
+    let mut display = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            display.extend(character.escape_default());
+        } else {
+            display.push(character);
+        }
+    }
+    display
+}
+
+pub struct QueryWindow {
+    pub text: String,
+    /// Display cells from the start of `text`; always inside a nonempty viewport.
+    pub cursor: usize,
+}
+
+/// Bound layout by the palette's 4 KiB query cap, with grapheme-safe horizontal
+/// scrolling. Both frontends use this to keep the input caret visible.
+pub fn query_window(palette: &Palette, columns: usize) -> QueryWindow {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if columns == 0 {
+        return QueryWindow { text: String::new(), cursor: 0 };
+    }
+    let mut cells = Vec::new();
+    let mut caret = 0;
+    for (byte, cluster) in palette.query().grapheme_indices(true) {
+        if byte < palette.cursor() {
+            caret += 1;
+        }
+        let display = display_text(cluster);
+        let width = display.width().max(1);
+        cells.push((display, width));
+    }
+    let mut first = 0;
+    let mut cursor: usize = cells[..caret].iter().map(|(_, width)| width).sum();
+    while cursor >= columns && first < caret {
+        cursor -= cells[first].1;
+        first += 1;
+    }
+    let mut text = String::new();
+    let mut used: usize = 0;
+    for (display, width) in &cells[first..] {
+        if *width > columns.saturating_sub(used) {
+            break;
+        }
+        text.push_str(display);
+        used += width;
+    }
+    QueryWindow { text, cursor }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn query_window_keeps_unicode_caret_visible_and_escapes_controls() {
+        let mut palette = Palette::new(10);
+        palette.open("a界e\u{301}\nZ").unwrap();
+        let window = query_window(&palette, 5);
+        assert_eq!(window.text, "e\u{301}\\nZ");
+        assert_eq!(window.cursor, 4);
+        palette.move_left();
+        let window = query_window(&palette, 3);
+        assert_eq!(window.text, "\\nZ");
+        assert_eq!(window.cursor, 2);
+        assert_eq!(display_text("a\t\r\nb"), "a\\t\\r\\nb");
+        assert!(query_window(&palette, 0).text.is_empty());
     }
 }
