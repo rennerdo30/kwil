@@ -1454,6 +1454,8 @@ dependencies = [
  "kwil-core-commands",
  "kwil-core-text",
  "kwil-core-workspace",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

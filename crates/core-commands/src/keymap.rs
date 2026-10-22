@@ -12,6 +12,21 @@ pub enum Context {
     Diff,
 }
 
+#[cfg(test)]
+mod selection_dispatch_tests {
+    use super::*;
+    #[test]
+    fn exact_shift_shortcuts_win_before_selection_fallback() {
+        let mut keys = KeymapEngine::new(Preset::NotepadPlusPlus, &[]).unwrap();
+        let call = keys.feed_with_selection("ctrl+shift+up".parse().unwrap());
+        assert!(matches!(call,crate::vim::VimResult::Command(call) if call.id=="edit.moveLineUp"));
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
+        assert!(
+            matches!(keys.feed_with_selection("shift+left".parse().unwrap()),crate::vim::VimResult::Command(call) if call.id=="motion.left")
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
@@ -252,6 +267,35 @@ impl KeymapEngine {
                 }
                 VimResult::Unbound
             }
+        }
+    }
+
+    /// Resolve an exact shifted shortcut before falling back to extending a
+    /// navigation command. Explicit unbinds continue to suppress the fallback.
+    pub fn feed_with_selection(&mut self, key: KeyChord) -> crate::vim::VimResult {
+        let result = self.feed(key);
+        if matches!(result, crate::vim::VimResult::Unbound)
+            && key.modifiers.shift
+            && matches!(
+                key.key,
+                crate::Key::Named(
+                    crate::NamedKey::Left
+                        | crate::NamedKey::Right
+                        | crate::NamedKey::Up
+                        | crate::NamedKey::Down
+                        | crate::NamedKey::Home
+                        | crate::NamedKey::End
+                        | crate::NamedKey::PageUp
+                        | crate::NamedKey::PageDown
+                )
+            )
+            && !self.keymap.explicitly_unbound(&[key], self.context, self.mode())
+        {
+            let mut plain = key;
+            plain.modifiers.shift = false;
+            self.feed(plain)
+        } else {
+            result
         }
     }
 }

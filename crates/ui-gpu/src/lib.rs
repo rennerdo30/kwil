@@ -241,11 +241,31 @@ impl App {
             scrollbar::Bar::new(
                 0,
                 self.size.0.saturating_sub(BAR),
-                self.columns(),
-                self.widest.max(self.columns()),
+                self.page_bytes(),
+                self.widest.max(self.page_bytes()),
                 self.horizontal,
             ),
         )
+    }
+
+    fn page_bytes(&self) -> u64 {
+        let columns = self.columns() as usize;
+        let mut longest = (0, columns as u64);
+        for row in 0..self.view.rows() {
+            let Some(line) = self.view.line(row) else {
+                continue;
+            };
+            let length = self
+                .view
+                .editor()
+                .and_then(|editor| editor.line_range(self.view.top() + row as u64).ok())
+                .map_or(line.len() as u64, |range| range.end - range.start);
+            if length >= longest.0 {
+                let cells = text::cells(line, columns, self.settings.editor.tab_size as usize);
+                longest = (length, cells.last().map_or(1, |cell| cell.bytes.end as u64).max(1));
+            }
+        }
+        longest.1.max(1)
     }
 
     fn scroll_bar(&mut self, vertical: bool, offset: u64) {
@@ -271,7 +291,7 @@ impl App {
         let (bar, pixel, offset, page) = if vertical {
             (v, y, self.view.top(), self.view.rows() as u64)
         } else {
-            (h, x, self.horizontal, self.columns())
+            (h, x, self.horizontal, self.page_bytes())
         };
         if bar.contains_thumb(pixel) {
             self.drag = Some((vertical, pixel - bar.thumb_start));
@@ -313,6 +333,9 @@ impl App {
 
     fn key(&mut self, el: &ActiveEventLoop, ev: &KeyEvent) {
         if ev.state != ElementState::Pressed {
+            return;
+        }
+        if self.composing && !matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             return;
         }
         // A scoped native-window probe can exercise the actual asynchronous
@@ -358,31 +381,15 @@ impl App {
             return;
         }
         if !self.composing
-            && let Some(mut chord) = input::chord(&ev.logical_key, self.mods)
+            && let Some(chord) = input::chord(&ev.logical_key, self.mods)
         {
-            // Shift extends a motion while the preset chooses that motion.
-            if matches!(
-                ev.logical_key,
-                Key::Named(
-                    NamedKey::ArrowLeft
-                        | NamedKey::ArrowRight
-                        | NamedKey::ArrowUp
-                        | NamedKey::ArrowDown
-                        | NamedKey::Home
-                        | NamedKey::End
-                        | NamedKey::PageUp
-                        | NamedKey::PageDown
-                )
-            ) {
-                chord.modifiers.shift = false;
-            }
             if self.keys.is_none() {
                 self.keys =
                     kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
             }
             if let Some(keys) = &mut self.keys {
                 use kwil_core_commands::vim::VimResult;
-                match keys.feed(chord) {
+                match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
                         if call.id == "file.quit" {
@@ -507,9 +514,10 @@ impl App {
         let cells = text::cells(line, self.columns() as usize, self.settings.editor.tab_size as usize);
         let last_byte = cells.last().map_or(0, |cell| cell.bytes.end as u64);
         let last_column = cells.last().map_or(0, |cell| cell.column + cell.width);
-        if byte < self.horizontal
-            || byte > self.horizontal + last_byte
-            || (byte == self.horizontal + last_byte && last_column >= self.columns() as usize)
+        let start = self.view.line_offset((row - self.view.top()) as usize);
+        if byte < start
+            || byte > start + last_byte
+            || (byte == start + last_byte && last_column >= self.columns() as usize)
         {
             self.scroll_bar(false, byte);
         }
@@ -567,11 +575,12 @@ impl App {
         let bytes = self.view.line(screen_row).unwrap_or_default();
         let cells = text::cells(bytes, columns, self.settings.editor.tab_size as usize);
         let byte = hit::byte_at(&cells, column);
+        let first = self.view.line_offset(screen_row);
         let Some(editor) = self.view.editor_mut() else {
             return;
         };
         let result = editor.line_range(row).and_then(|range| {
-            let offset = (range.start + self.horizontal + byte as u64).min(range.end);
+            let offset = (range.start + first + byte as u64).min(range.end);
             let anchor = if extend { editor.primary_cursor().anchor } else { offset };
             editor.set_cursors(vec![kwil_view_model::Cursor { anchor, head: offset, desired_column: None }], 0)
         });
@@ -619,7 +628,7 @@ impl App {
             fill(buf, w, Rect { x: 0, y: 0, w, h }, BG);
             for r in 0..rows {
                 draw_row(buf, w, font, &self.view, r, self.horizontal);
-                draw_editor_marks(buf, w, font, &self.view, r, self.horizontal);
+                draw_editor_marks(buf, w, font, &self.view, r, self.view.line_offset(r));
             }
             p.status = true;
             damage.push(Rect { x: 0, y: 0, w, h });
@@ -652,7 +661,7 @@ impl App {
             p.rows.dedup();
             for &r in p.rows.iter().filter(|&&r| r < rows) {
                 draw_row(buf, w, font, &self.view, r, self.horizontal);
-                draw_editor_marks(buf, w, font, &self.view, r, self.horizontal);
+                draw_editor_marks(buf, w, font, &self.view, r, self.view.line_offset(r));
                 damage.push(Rect { x: 0, y: r * ch, w, h: ch });
             }
         }
@@ -1167,7 +1176,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             #[cfg(feature = "frame-harness")]
             UserEvent::Harness(step) => {
-                harness::step(self, _el, step);
+                harness::step(self, el, step);
                 return;
             }
         };
@@ -1234,8 +1243,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.composing = false;
-                if self.keys.as_ref().is_none_or(|keys| keys.mode() == kwil_core_commands::Mode::Insert) {
-                    self.edit(input::Action::Text(text));
+                let insert_mode = self.keys.as_ref().is_none_or(|keys| keys.mode() == kwil_core_commands::Mode::Insert);
+                if let Some(action) = input::commit(text, &mut self.save_path, insert_mode) {
+                    self.edit(action);
+                } else if let Some(path) = &self.save_path {
+                    let notice = format!("Save as: {path}  (Enter to save, Esc to cancel)");
+                    let damage = self.view.set_notice(notice);
+                    self.apply(damage);
                 }
             }
             WindowEvent::Ime(Ime::Disabled) => self.composing = false,

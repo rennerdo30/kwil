@@ -7,6 +7,17 @@ pub enum Action {
     Text(String),
 }
 
+pub fn commit(text: String, path: &mut Option<String>, insert_mode: bool) -> Option<Action> {
+    if let Some(path) = path {
+        path.push_str(&text);
+        None
+    } else if insert_mode {
+        Some(Action::Text(text))
+    } else {
+        None
+    }
+}
+
 pub fn translate(key: &Key, text: Option<&str>, mods: ModifiersState, composing: bool) -> Option<Action> {
     if composing {
         return None;
@@ -131,6 +142,14 @@ pub fn chord(key: &Key, mods: ModifiersState) -> Option<kwil_core_commands::KeyC
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ime_commit_targets_the_save_prompt_and_respects_normal_mode() {
+        let mut path = Some("notes-".to_string());
+        assert_eq!(commit("日本語.txt".into(), &mut path, true), None);
+        assert_eq!(path.as_deref(), Some("notes-日本語.txt"));
+        assert_eq!(commit("界".into(), &mut None, false), None);
+        assert_eq!(commit("界".into(), &mut None, true), Some(Action::Text("界".into())));
+    }
     #[test]
     fn printable_and_composed_text_are_never_shortcuts() {
         let key = Key::Character("é".into());

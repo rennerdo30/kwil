@@ -527,3 +527,23 @@ fn measure_model_typing_1gb_one_and_100_cursors() {
     assert_eq!(hundred.document().buffer().add_memory_bytes(), 100);
     assert!(one_ms < 8.3 && hundred_ms < 8.3, "model operation missed 120 Hz frame budget");
 }
+#[test]
+fn horizontal_windows_have_per_row_utf8_boundaries() {
+    let mut view = crate::View::new(None);
+    view.set_rows(3);
+    view.execute("edit.insert", &crate::CommandArgs { text: Some("a界z\nab界z".into()), ..Default::default() }, 1)
+        .unwrap();
+    view.set_horizontal_window(2, 100);
+    assert_eq!(view.line_offset(0), 1);
+    assert_eq!(view.line_offset(1), 2);
+    assert!(std::str::from_utf8(view.line(0).unwrap()).unwrap().starts_with('界'));
+    assert!(std::str::from_utf8(view.line(1).unwrap()).unwrap().starts_with('界'));
+    let offset = view.line_offset(0);
+    let editor = view.editor_mut().unwrap();
+    let damage = editor.set_cursors(vec![crate::Cursor::caret(offset)], 0).unwrap();
+    view.refresh_after_edit(damage);
+    view.execute("edit.insert", &crate::CommandArgs { text: Some("X".into()), ..Default::default() }, 1).unwrap();
+    let mut bytes = Vec::new();
+    view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "aX界z\nab界z");
+}

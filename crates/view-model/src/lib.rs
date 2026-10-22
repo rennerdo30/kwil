@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 mod document;
 mod editor;
+pub mod grid;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -38,6 +39,7 @@ pub struct View {
     top: u64,
     rows: usize,
     lines: Vec<Vec<u8>>,
+    line_offsets: Vec<u64>,
     notice: String,
     editor: Option<Editor>,
     pending_goto: Option<(u64, u64, bool)>,
@@ -58,6 +60,7 @@ impl View {
             top: 0,
             rows: 0,
             lines: Vec::new(),
+            line_offsets: Vec::new(),
             notice: String::new(),
             editor,
             pending_goto: None,
@@ -93,6 +96,11 @@ impl View {
     /// Text of visible row `row` (without line ending), if there is a line.
     pub fn line(&self, row: usize) -> Option<&[u8]> {
         self.lines.get(row).map(|l| l.as_slice())
+    }
+
+    /// Source-byte column of this row's UTF-8-aligned visible window.
+    pub fn line_offset(&self, row: usize) -> u64 {
+        self.line_offsets.get(row).copied().unwrap_or(0)
     }
 
     /// 1-based line number shown in the gutter for `row`.
@@ -194,16 +202,21 @@ impl View {
                 .take_while(|row| self.top + (*row as u64) < snapshot.line_count())
                 .map(|row| {
                     let range = text::line(&snapshot, self.top + row as u64)?;
-                    let start = (range.start + self.first_byte_column).min(range.end);
-                    text::read(
-                        &snapshot,
-                        start..(start + self.line_byte_limit as u64).min(range.end),
-                        self.line_byte_limit as u64,
-                    )
+                    let wanted = range.start.saturating_add(self.first_byte_column).min(range.end);
+                    let context = wanted.saturating_sub(3).max(range.start);
+                    let end = wanted.saturating_add(self.line_byte_limit as u64 + 4).min(range.end);
+                    let bytes = text::read(&snapshot, context..end, self.line_byte_limit as u64 + 7)?;
+                    let start = grid::boundary(&bytes, (wanted - context) as usize);
+                    let end = grid::boundary(&bytes, (start + self.line_byte_limit).min(bytes.len()));
+                    Ok((context - range.start + start as u64, bytes[start..end].to_vec()))
                 })
                 .collect::<std::io::Result<Vec<_>>>();
             match result {
-                Ok(lines) => self.lines = lines,
+                Ok(lines) => {
+                    let (offsets, lines) = lines.into_iter().unzip();
+                    self.line_offsets = offsets;
+                    self.lines = lines;
+                }
                 Err(error) => self.notice = error.to_string(),
             }
             return;
@@ -218,13 +231,16 @@ impl View {
         });
         match lines {
             Ok(lines) => {
-                self.lines = lines
+                let (offsets, lines) = lines
                     .into_iter()
                     .map(|l| {
-                        let start = (self.first_byte_column as usize).min(l.len());
-                        l[start..(start + self.line_byte_limit).min(l.len())].to_vec()
+                        let start = grid::boundary(l, self.first_byte_column.min(l.len() as u64) as usize);
+                        let end = grid::boundary(l, start.saturating_add(self.line_byte_limit).min(l.len()));
+                        (start as u64, l[start..end].to_vec())
                     })
-                    .collect()
+                    .unzip();
+                self.line_offsets = offsets;
+                self.lines = lines;
             }
             Err(e) => self.notice = e.to_string(),
         }

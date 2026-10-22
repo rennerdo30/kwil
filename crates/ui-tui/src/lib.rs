@@ -82,6 +82,8 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
         });
         let started = std::time::Instant::now();
         let mut closing = false;
+        let mut save_path: Option<String> = None;
+        let mut horizontal = 0u64;
         let mut settings = Settings::default();
         let mut keys = KeymapEngine::new(settings.keymap, &settings.bindings).expect("bundled keymap");
         while let Ok(msg) = rx.recv() {
@@ -134,7 +136,12 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     true
                 }
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    match key(&mut view, k, started.elapsed(), &mut keys, settings.keymap) {
+                    let intent = if save_path.is_some() {
+                        path_key(&mut view, &mut save_path, k)
+                    } else {
+                        key(&mut view, k, started.elapsed(), &mut keys, settings.keymap)
+                    };
+                    match intent {
                         KeyResult::Quit => {
                             if view.editor().is_some_and(|editor| editor.document().is_dirty())
                                 && !(closing && k.modifiers.contains(KeyModifiers::SHIFT))
@@ -148,19 +155,25 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                                 break;
                             }
                         }
-                        KeyResult::Save => {
-                            if let Some(editor) = view.editor_mut() {
-                                match editor.save_request(None) {
-                                    Ok(request) => {
-                                        let sender = tx.clone();
-                                        std::thread::spawn(move || {
-                                            let _ =
-                                                sender.send(Msg::Saved(kwil_core_workspace::save_snapshot(request)));
-                                        });
-                                        view.set_notice("Saving…".into());
-                                    }
-                                    Err(error) => {
-                                        view.set_notice(error.to_string());
+                        KeyResult::Save(path) => {
+                            if path.is_none() && view.editor().is_some_and(|editor| editor.document().path().is_none())
+                            {
+                                save_path = Some(String::new());
+                                view.set_notice("Save as:  (Enter a path, Enter to save, Esc to cancel)".into());
+                            } else {
+                                if let Some(editor) = view.editor_mut() {
+                                    match editor.save_request(path) {
+                                        Ok(request) => {
+                                            let sender = tx.clone();
+                                            std::thread::spawn(move || {
+                                                let _ = sender
+                                                    .send(Msg::Saved(kwil_core_workspace::save_snapshot(request)));
+                                            });
+                                            view.set_notice("Saving…".into());
+                                        }
+                                        Err(error) => {
+                                            view.set_notice(error.to_string());
+                                        }
                                     }
                                 }
                             }
@@ -175,7 +188,13 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     }
                 }
                 Msg::Input(Event::Paste(text)) => {
-                    if keys.mode() == kwil_core_commands::Mode::Insert {
+                    if let Some(path) = &mut save_path {
+                        if !text.chars().any(char::is_control) {
+                            path.push_str(&text);
+                        }
+                        view.set_notice(format!("Save as: {path}  (Enter to save, Esc to cancel)"));
+                        true
+                    } else if keys.mode() == kwil_core_commands::Mode::Insert {
                         execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
                         true
                     } else {
@@ -190,6 +209,12 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                 Msg::Input(_) => false,
             };
             if changed {
+                keep_visible(
+                    &mut view,
+                    &mut horizontal,
+                    terminal.size()?.width.saturating_sub(8) as usize,
+                    settings.editor.tab_size as usize,
+                );
                 // ratatui diffs against the previous frame and writes only
                 // the changed cells.
                 terminal.draw(|f| draw(f, &view))?;
@@ -209,9 +234,36 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
 
 enum KeyResult {
     Quit,
-    Save,
+    Save(Option<std::path::PathBuf>),
     Cancel,
     Changed(bool),
+}
+
+fn path_key(view: &mut View, prompt: &mut Option<String>, key: KeyEvent) -> KeyResult {
+    let Some(path) = prompt.as_mut() else {
+        return KeyResult::Changed(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            *prompt = None;
+            view.set_notice(String::new());
+            return KeyResult::Changed(true);
+        }
+        KeyCode::Enter if !path.trim().is_empty() => {
+            return KeyResult::Save(prompt.take().map(Into::into));
+        }
+        KeyCode::Backspace => {
+            path.pop();
+        }
+        KeyCode::Char(c)
+            if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            path.push(c);
+        }
+        _ => {}
+    }
+    view.set_notice(format!("Save as: {path}  (Enter to save, Esc to cancel)"));
+    KeyResult::Changed(true)
 }
 
 fn key(
@@ -222,25 +274,12 @@ fn key(
     preset: Preset,
 ) -> KeyResult {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    if let Some(mut chord) = chord(k) {
-        if matches!(
-            k.code,
-            KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Home
-                | KeyCode::End
-                | KeyCode::PageUp
-                | KeyCode::PageDown
-        ) {
-            chord.modifiers.shift = false;
-        }
-        match keys.feed(chord) {
+    if let Some(chord) = chord(k) {
+        match keys.feed_with_selection(chord) {
             VimResult::Pending => return KeyResult::Changed(false),
             VimResult::Command(call) => {
                 if call.id == "file.save" {
-                    return KeyResult::Save;
+                    return KeyResult::Save(None);
                 }
                 if call.id == "file.quit" {
                     return KeyResult::Quit;
@@ -282,7 +321,7 @@ fn key(
     }
     let command = match k.code {
         KeyCode::Char('q' | 'Q') if ctrl => return KeyResult::Quit,
-        KeyCode::Char('s' | 'S') if ctrl => return KeyResult::Save,
+        KeyCode::Char('s' | 'S') if ctrl => return KeyResult::Save(None),
         KeyCode::Esc => return KeyResult::Cancel,
         KeyCode::Char('z' | 'Z') if ctrl && k.modifiers.contains(KeyModifiers::SHIFT) => "edit.redo",
         KeyCode::Char('z') if ctrl => "edit.undo",
@@ -371,10 +410,24 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
     for row in 0..view.rows().min(area.height.saturating_sub(1) as usize) {
         let y = area.y + row as u16;
         let Some(text) = view.line(row) else { continue };
-        let line = Line::from(vec![
-            Span::styled(format!("{:>7} ", view.line_number(row)), gutter_style),
-            Span::raw(String::from_utf8_lossy(text).replace('\t', "    ")),
-        ]);
+        let tab = view.editor().map_or(4, |editor| editor.settings.editor.tab_size as usize);
+        let cells = kwil_view_model::grid::cells(text, area.width.saturating_sub(8) as usize, tab);
+        let source = view
+            .editor()
+            .and_then(|editor| editor.line_range(view.top() + row as u64).ok())
+            .map_or(0, |range| range.start)
+            + view.line_offset(row);
+        let selections =
+            view.editor().and_then(|editor| editor.selection_ranges(view.top() + row as u64).ok()).unwrap_or_default();
+        let mut spans = vec![Span::styled(format!("{:>7} ", view.line_number(row)), gutter_style)];
+        for cell in cells {
+            let selected = selections.iter().any(|range| {
+                range.start < source + cell.bytes.end as u64 && source + (cell.bytes.start as u64) < range.end
+            });
+            let style = if selected { Style::default().bg(Color::Rgb(0x30, 0x58, 0x80)) } else { Style::default() };
+            spans.push(Span::styled(if cell.text == "\t" { " ".repeat(cell.width) } else { cell.text }, style));
+        }
+        let line = Line::from(spans);
         f.render_widget(Paragraph::new(line), Rect { x: area.x, y, width: area.width, height: 1 });
     }
     let status = Paragraph::new(view.status_text())
@@ -384,12 +437,47 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
         Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
     );
     if let Some(editor) = view.editor()
-        && let Ok((row, column)) = editor.position_at(editor.primary_cursor().head)
+        && let Ok((row, byte)) = editor.byte_position(editor.primary_cursor().head)
         && row >= view.top()
         && row - view.top() < view.rows() as u64
-        && column + 8 < area.width as u64
     {
-        f.set_cursor_position((area.x + 8 + column as u16, area.y + (row - view.top()) as u16));
+        let screen_row = (row - view.top()) as usize;
+        let first = view.line_offset(screen_row);
+        let cells = kwil_view_model::grid::cells(
+            view.line(screen_row).unwrap_or_default(),
+            area.width.saturating_sub(8) as usize,
+            editor.settings.editor.tab_size as usize,
+        );
+        if byte >= first {
+            let column = cells
+                .iter()
+                .find(|cell| byte - first < cell.bytes.end as u64)
+                .map_or_else(|| cells.last().map_or(0, |cell| cell.column + cell.width), |cell| cell.column);
+            if column + 8 < (area.width as usize) {
+                f.set_cursor_position((area.x + 8 + column as u16, area.y + screen_row as u16));
+            }
+        }
+    }
+}
+
+fn keep_visible(view: &mut View, horizontal: &mut u64, columns: usize, tab: usize) {
+    let Some(editor) = view.editor() else {
+        return;
+    };
+    let Ok((row, byte)) = editor.byte_position(editor.primary_cursor().head) else {
+        return;
+    };
+    if row < view.top() || row - view.top() >= view.rows() as u64 {
+        return;
+    }
+    let screen_row = (row - view.top()) as usize;
+    let first = view.line_offset(screen_row);
+    let cells = kwil_view_model::grid::cells(view.line(screen_row).unwrap_or_default(), columns, tab);
+    let end = cells.last().map_or(0, |cell| cell.bytes.end as u64);
+    let end_column = cells.last().map_or(0, |cell| cell.column + cell.width);
+    if byte < first || byte > first + end || (byte == first + end && end_column >= columns) {
+        *horizontal = byte;
+        view.set_horizontal_window(byte, 64 << 10);
     }
 }
 
@@ -397,6 +485,47 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn untitled_save_prompt_keeps_text_out_of_document_and_provides_a_path() {
+        let mut view = View::new(None);
+        view.set_rows(3);
+        let mut prompt = Some(String::new());
+        for c in "日本語.txt".chars() {
+            path_key(&mut view, &mut prompt, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            matches!(path_key(&mut view,&mut prompt,KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),KeyResult::Save(Some(path)) if path.as_path()==std::path::Path::new("日本語.txt"))
+        );
+        assert!(view.editor().unwrap().document().snapshot().is_empty());
+        assert!(prompt.is_none());
+    }
+
+    #[test]
+    fn rendered_tabs_wide_characters_selection_and_horizontal_caret_agree() {
+        let mut view = View::new(None);
+        view.set_rows(3);
+        execute(&mut view, "edit.insert", Some("a\t界Z".into()), false, Duration::ZERO);
+        let backend = ratatui::backend::TestBackend::new(30, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &view)).unwrap();
+        assert_eq!(terminal.get_cursor_position().unwrap().x, 15);
+        let damage = view
+            .editor_mut()
+            .unwrap()
+            .set_cursors(vec![kwil_view_model::Cursor { anchor: 0, head: 1, desired_column: None }], 0)
+            .unwrap();
+        view.refresh_after_edit(damage);
+        terminal.draw(|frame| draw(frame, &view)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(8, 0)].bg, Color::Rgb(0x30, 0x58, 0x80));
+        execute(&mut view, "edit.selectAll", None, false, Duration::from_secs(1));
+        execute(&mut view, "edit.insert", Some("x".repeat(100)), false, Duration::from_secs(2));
+        let mut horizontal = 0;
+        keep_visible(&mut view, &mut horizontal, 22, 4);
+        assert!(horizontal > 0);
+        terminal.draw(|frame| draw(frame, &view)).unwrap();
+        assert!(terminal.get_cursor_position().unwrap().x < 30);
+    }
 
     fn press(view: &mut View, code: KeyCode, modifiers: KeyModifiers, seconds: u64) {
         let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
