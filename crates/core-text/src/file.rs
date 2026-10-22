@@ -211,6 +211,19 @@ pub struct IndexProgress {
 }
 
 impl TextFile {
+    /// Worker-only retirement seam. Close the shared mapping/handle only if no
+    /// snapshot, buffer or reader retains it. Failure returns this owner intact
+    /// so its private backing must remain available until a later worker event.
+    pub fn try_close(self) -> Result<(), Self> {
+        match Arc::try_unwrap(self.shared) {
+            Ok(shared) => {
+                drop(shared);
+                Ok(())
+            }
+            Err(shared) => Err(Self { shared }),
+        }
+    }
+
     /// Opens `path` without scanning it. kind() samples lazily and caches.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
         Self::open_with_mapper(path, |f| {

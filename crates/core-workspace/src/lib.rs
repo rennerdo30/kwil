@@ -1,6 +1,7 @@
 //! Files, sessions, hot exit, file watching, single-instance IPC.
 
 pub mod catalogue;
+pub mod compressed;
 
 mod save;
 pub mod save_destination;

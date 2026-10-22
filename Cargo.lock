@@ -1976,6 +1976,7 @@ dependencies = [
 name = "kwil-core-workspace"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "ignore",
  "kwil-core-text",
  "notify",
