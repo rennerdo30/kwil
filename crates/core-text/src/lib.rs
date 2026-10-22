@@ -3,6 +3,7 @@
 //! Mapped originals, sparse indexing and persistent byte-exact editing.
 
 mod buffer;
+pub mod encoding;
 mod file;
 mod line_index;
 mod piece_tree;
@@ -12,3 +13,4 @@ pub use buffer::{Buffer, Lines, Snapshot};
 pub use file::{FileKind, FileState, IndexProgress, OpenError, ReadError, TextFile};
 pub use line_index::LineIndex;
 pub use piece_tree::Chunks;
+pub use piece_tree::{SourceChunk, SourceChunks};

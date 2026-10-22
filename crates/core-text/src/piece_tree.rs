@@ -361,6 +361,60 @@ pub struct Chunks<'a> {
     range: Range<u64>,
 }
 
+/// A borrowed piece with its original-file provenance retained for encoding saves.
+pub enum SourceChunk<'a> {
+    Original {
+        file: &'a TextFile,
+        range: Range<u64>,
+        bytes: &'a [u8],
+    },
+    /// Added bytes are UTF-8 for an encoding-aware editor.
+    Added(&'a [u8]),
+}
+
+/// Read-only traversal with the same O(tree height) scratch bound as `Chunks`.
+pub struct SourceChunks<'a>(Chunks<'a>);
+
+impl<'a> SourceChunks<'a> {
+    pub(crate) fn new(tree: &'a Tree, range: Range<u64>) -> Self {
+        Self(Chunks::new(tree, range))
+    }
+}
+
+impl<'a> Iterator for SourceChunks<'a> {
+    type Item = Result<SourceChunk<'a>, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((node, offset)) = self.0.stack.pop() {
+            if offset >= self.0.range.end || offset + node.metrics.bytes <= self.0.range.start {
+                continue;
+            }
+            match &node.kind {
+                Kind::Branch(left, right) => {
+                    self.0.stack.push((right, offset + left.metrics.bytes));
+                    self.0.stack.push((left, offset));
+                }
+                Kind::Leaf(piece) => {
+                    let start = piece.start + self.0.range.start.saturating_sub(offset);
+                    let end = piece.start + (self.0.range.end - offset).min(node.metrics.bytes);
+                    let result = piece.storage.bytes().map(|bytes| {
+                        let bytes = &bytes[start as usize..end as usize];
+                        match piece.storage.as_ref() {
+                            Storage::Original(file) => SourceChunk::Original { file, range: start..end, bytes },
+                            _ => SourceChunk::Added(bytes),
+                        }
+                    });
+                    if result.is_err() {
+                        self.0.stack.clear();
+                    }
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+}
+
 impl<'a> Chunks<'a> {
     pub(crate) fn new(tree: &'a Tree, range: Range<u64>) -> Self {
         let stack = if range.is_empty() {
