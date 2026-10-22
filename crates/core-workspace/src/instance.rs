@@ -560,10 +560,11 @@ mod platform {
     }
     impl Drop for OwnedSocket {
         fn drop(&mut self) {
-            if let Ok(m) = fs::symlink_metadata(&self.path) {
-                if m.dev() == self.dev && m.ino() == self.ino {
-                    let _ = fs::remove_file(&self.path);
-                }
+            if let Ok(m) = fs::symlink_metadata(&self.path)
+                && m.dev() == self.dev
+                && m.ino() == self.ino
+            {
+                let _ = fs::remove_file(&self.path);
             }
         }
     }
@@ -577,10 +578,10 @@ mod platform {
             let directory = dir(&e);
             private_dir(&directory)?;
             let lockpath = directory.join("owner.lock");
-            if let Ok(m) = fs::symlink_metadata(&lockpath) {
-                if !m.is_file() || m.uid() != uid() || m.mode() & 0o077 != 0 {
-                    return Err(invalid("unsafe IPC lock"));
-                }
+            if let Ok(m) = fs::symlink_metadata(&lockpath)
+                && (!m.is_file() || m.uid() != uid() || m.mode() & 0o077 != 0)
+            {
+                return Err(invalid("unsafe IPC lock"));
             }
             let lock =
                 OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600).open(lockpath)?;
@@ -636,7 +637,7 @@ mod platform {
                 let mut h = [0u8; 4];
                 read_deadline(&mut stream, &mut h, deadline)?;
                 let n = u32::from_le_bytes(h) as usize;
-                if n > MAX_IPC_BYTES || n < 8 {
+                if !(8..=MAX_IPC_BYTES).contains(&n) {
                     return Err(invalid("IPC frame size"));
                 }
                 let mut b = vec![0; n];
