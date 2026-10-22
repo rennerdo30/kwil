@@ -143,10 +143,30 @@ pub fn chord(key: &Key, mods: ModifiersState) -> Option<kwil_core_commands::KeyC
 }
 
 const FUNCTION_KEYS: [NamedKey; 24] = [
-    NamedKey::F1, NamedKey::F2, NamedKey::F3, NamedKey::F4, NamedKey::F5, NamedKey::F6,
-    NamedKey::F7, NamedKey::F8, NamedKey::F9, NamedKey::F10, NamedKey::F11, NamedKey::F12,
-    NamedKey::F13, NamedKey::F14, NamedKey::F15, NamedKey::F16, NamedKey::F17, NamedKey::F18,
-    NamedKey::F19, NamedKey::F20, NamedKey::F21, NamedKey::F22, NamedKey::F23, NamedKey::F24,
+    NamedKey::F1,
+    NamedKey::F2,
+    NamedKey::F3,
+    NamedKey::F4,
+    NamedKey::F5,
+    NamedKey::F6,
+    NamedKey::F7,
+    NamedKey::F8,
+    NamedKey::F9,
+    NamedKey::F10,
+    NamedKey::F11,
+    NamedKey::F12,
+    NamedKey::F13,
+    NamedKey::F14,
+    NamedKey::F15,
+    NamedKey::F16,
+    NamedKey::F17,
+    NamedKey::F18,
+    NamedKey::F19,
+    NamedKey::F20,
+    NamedKey::F21,
+    NamedKey::F22,
+    NamedKey::F23,
+    NamedKey::F24,
 ];
 
 #[cfg(test)]
