@@ -86,6 +86,11 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 native_probe(gfx.hwnd);
             }
             println!("kwil-frame glyphs_pending={}", app.font.as_ref().map_or(0, |f| f.pending_glyphs()));
+            let unicode_enabled = app.font.as_ref().is_some_and(|f| f.unicode_enabled());
+            println!("kwil-frame unicode_enabled={unicode_enabled}");
+            if std::env::var_os("KWIL_REQUIRE_UNICODE").is_some() {
+                assert!(unicode_enabled, "Unicode recovery unavailable");
+            }
             app.metrics.phase = 1;
             capture(app, dir.as_deref(), "first.bmp");
         }

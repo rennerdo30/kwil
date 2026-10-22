@@ -78,8 +78,10 @@ impl Font {
         })
     }
 
-    pub fn enable_unicode(&mut self, family: String, ready: impl Fn(Tile, u64) + Send + 'static) {
-        let family = if family == "monospace" { self.family.clone() } else { family };
+    pub fn enable_unicode(&mut self, _family: String, ready: impl Fn(Tile, u64) + Send + 'static) {
+        // The retained font can differ from a failed configured-family request.
+        // Always shape combining clusters with the actual surviving primary face.
+        let family = self.family.clone();
         if self.sender.is_some() {
             return;
         }
@@ -119,6 +121,10 @@ impl Font {
     #[cfg(feature = "frame-harness")]
     pub fn pending_glyphs(&self) -> usize {
         self.waiting.len() + self.retry_rows.len()
+    }
+    #[cfg(feature = "frame-harness")]
+    pub fn unicode_enabled(&self) -> bool {
+        self.sender.is_some()
     }
     pub fn accept(&mut self, tile: Tile) -> Vec<usize> {
         let mut rows = self.waiting.remove(&tile.key).unwrap_or_default();
@@ -186,6 +192,10 @@ impl Drop for Font {
 fn move_rows(rows: &mut Vec<usize>, delta: i64, ch: usize, visible: usize) {
     let shift = delta * ch as i64;
     rows.retain_mut(|y| {
+        // The status field is fixed while text pixels scroll.
+        if *y >= visible * ch {
+            return true;
+        }
         let next = *y as i64 - shift;
         if (0..(visible * ch) as i64).contains(&next) {
             *y = next as usize;
@@ -205,5 +215,58 @@ mod tests {
         assert_eq!(rows, vec![0, 60, 140]);
         move_rows(&mut rows, -3, 20, 10);
         assert_eq!(rows, vec![60, 120]);
+    }
+    fn waiting_font(ys: Vec<usize>) -> (Font, TileKey) {
+        let key = TileKey { text: "界".into(), columns: 2, fg: 1, bg: 0 };
+        let font = Font {
+            cw: 1,
+            ch: 10,
+            family: "monospace".into(),
+            glyphs: vec![],
+            baseline: 8,
+            tiles: HashMap::new(),
+            px: 8.0,
+            generation: 1,
+            unicode: HashMap::new(),
+            waiting: HashMap::from([(key.clone(), ys)]),
+            sender: None,
+            unicode_bytes: 0,
+            tab_size: 4,
+            retry_rows: Default::default(),
+            canceled: Default::default(),
+        };
+        (font, key)
+    }
+    #[test]
+    fn glyph_arrival_between_queued_scroll_and_paint_damages_moved_row() {
+        let (mut font, key) = waiting_font(vec![50]);
+        let mut pending = crate::Damage::default();
+        crate::queue_damage(
+            &mut pending,
+            crate::Damage { scroll: 2, rows: vec![8, 9], ..Default::default() },
+            10,
+            Some(&mut font),
+        );
+        let arrived = crate::glyph_damage(&mut font, Tile { key, pixels: vec![0; 20] }, 10);
+        assert_eq!(arrived.rows, vec![3]);
+        crate::queue_damage(&mut pending, arrived, 10, Some(&mut font));
+        crate::queue_damage(
+            &mut pending,
+            crate::Damage { scroll: 1, rows: vec![9], ..Default::default() },
+            10,
+            Some(&mut font),
+        );
+        assert!(pending.rows.contains(&2));
+        assert!(!pending.rows.contains(&5));
+        assert_eq!(pending.scroll, 3);
+    }
+    #[test]
+    fn queued_scroll_preserves_fixed_status_glyph_damage() {
+        let (mut font, key) = waiting_font(vec![100]);
+        let mut pending = crate::Damage::default();
+        crate::queue_damage(&mut pending, crate::Damage { scroll: 2, ..Default::default() }, 10, Some(&mut font));
+        let arrived = crate::glyph_damage(&mut font, Tile { key, pixels: vec![0; 20] }, 10);
+        assert!(arrived.status);
+        assert!(arrived.rows.is_empty());
     }
 }
