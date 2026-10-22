@@ -123,3 +123,23 @@ keys = "pageDown"
 command = "motion.pageDown"
 context = "editor"
 mode = "insert"
+
+# Editor zoom: Plus is the literal '+' key, independent of keyboard layout.
+[[bindings]]
+keys = "ctrl+Plus"
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+shift+Plus"
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+="
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+shift+="
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+-"
+command = "view.zoomOut"
+[[bindings]]
+keys = "ctrl+0"
+command = "view.zoomReset"
