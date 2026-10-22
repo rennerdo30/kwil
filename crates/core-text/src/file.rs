@@ -4,8 +4,13 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
+
+mod original_save;
+pub use original_save::{OriginalSavePin, cleanup_stale_save_backups};
+mod read_batch;
+pub use read_batch::with_checked_read_batch;
 
 /// Files below this size are read into memory; larger ones are mapped
 /// (spec §5, "mmap safety").
@@ -163,6 +168,9 @@ struct Shared {
     kind: OnceLock<FileKind>,
     index: OnceLock<LineIndex>,
     scanned: AtomicU64,
+    // Drops after the file handle and mapping, so Windows can delete backups.
+    save_backing: Mutex<Option<original_save::SaveBacking>>,
+    read_generation: AtomicU64,
 }
 
 /// An open file. The first screen is readable at once; the line index
@@ -198,7 +206,15 @@ impl TextFile {
 
     fn open_with_mapper(path: &Path, map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>) -> Result<Self, OpenError> {
         let path = std::path::absolute(path)?;
-        let mut f = File::open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+        let mut f = options.open(&path)?;
         let stamp = Stamp::read(&f)?;
         let len = stamp.len;
         let bytes = if len < MAP_THRESHOLD {
@@ -221,6 +237,8 @@ impl TextFile {
                 kind: OnceLock::new(),
                 index: OnceLock::new(),
                 scanned: AtomicU64::new(0),
+                save_backing: Mutex::new(None),
+                read_generation: AtomicU64::new(0),
             }),
         })
     }
@@ -229,11 +247,29 @@ impl TextFile {
     /// A missing path counts as replaced. Other I/O errors propagate, and
     /// callers must not read the old mapping on error.
     pub fn check(&self) -> io::Result<FileState> {
+        let result = self.check_live();
+        if !matches!(&result, Ok(FileState::Unchanged)) {
+            self.shared.read_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn check_live(&self) -> io::Result<FileState> {
+        let pinned = self.shared.save_backing.lock().map_err(|_| io::Error::other("save pin lock poisoned"))?;
+        if pinned.is_some() {
+            // A save pins this exact object. Path replacement can no longer
+            // redirect old pieces or worker snapshots to the new file.
+            return Ok(self.shared.stamp.state(&Stamp::read(&self.shared._file)?));
+        }
         match File::open(&self.shared.path) {
             Ok(file) => Ok(self.shared.stamp.state(&Stamp::read(&file)?)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(FileState::Replaced),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.shared.path
     }
 
     /// Reopens append-only growth. Existing checkpoints are cloned and only
@@ -266,6 +302,10 @@ impl TextFile {
     /// this slice across a wake-up; the check cannot prevent a concurrent
     /// external truncation while the slice is being read.
     pub fn bytes(&self) -> Result<&[u8], ReadError> {
+        if let Some(result) = read_batch::admitted(self) {
+            result?;
+            return Ok(self.shared.bytes.as_slice());
+        }
         match self.check().map_err(ReadError::Io)? {
             FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
             state => Err(ReadError::Changed(state)),
@@ -299,6 +339,8 @@ impl TextFile {
         let this = self.clone();
         std::thread::spawn(move || {
             before();
+            // Opening housekeeping stays off the UI/first-screen path.
+            let _ = cleanup_stale_save_backups(&this.shared.path);
             done(this.build_index(threads).map(|_| ()));
         })
     }

@@ -229,6 +229,27 @@ impl Buffer {
         self.insert_inner(offset, bytes, false)
     }
 
+    /// Insert an immutable range by sharing pieces, without copying its bytes.
+    /// Useful for huge-line moves, duplication, clipboard and Vim registers.
+    pub fn insert_snapshot_range(&mut self, offset: u64, source: &Snapshot, range: Range<u64>) -> io::Result<()> {
+        self.snapshot.check_range(&(offset..offset))?;
+        source.check_range(&range)?;
+        if range.is_empty() {
+            return Ok(());
+        }
+        self.len()
+            .checked_add(range.end - range.start)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
+        let (_, tail) = piece_tree::split(source.root.clone(), range.start).map_err(io::Error::other)?;
+        let (inserted, _) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
+        let before = self.snapshot();
+        let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
+        self.snapshot.root = piece_tree::join(piece_tree::join(left, inserted), right);
+        self.typing = None;
+        self.record(before, false);
+        Ok(())
+    }
+
     fn insert_inner(&mut self, offset: u64, bytes: &[u8], coalesce: bool) -> io::Result<()> {
         self.snapshot.check_range(&(offset..offset))?;
         if bytes.is_empty() {
@@ -279,6 +300,12 @@ impl Buffer {
 
     /// Commit an open batch. Empty batches create no history entry.
     pub fn commit(&mut self) -> bool {
+        self.commit_coalesced(false)
+    }
+
+    /// Finish a batch, optionally merging it with the preceding undo step.
+    /// The editing model owns burst timing and cursor-continuity checks.
+    pub fn commit_coalesced(&mut self, coalesce: bool) -> bool {
         self.typing = None;
         let Some(before) = self.transaction.take() else { return false };
         let unchanged = match (&before.root, &self.snapshot.root) {
@@ -287,9 +314,34 @@ impl Buffer {
             _ => false,
         };
         if !unchanged {
-            self.history.record(before, self.snapshot(), false);
+            self.history.record(before, self.snapshot(), coalesce);
         }
         true
+    }
+
+    /// Roll back an uncommitted batch after a fallible multi-edit operation.
+    pub fn cancel(&mut self) -> bool {
+        self.typing = None;
+        let Some(before) = self.transaction.take() else { return false };
+        self.snapshot = before;
+        true
+    }
+
+    /// Counts let model metadata follow oldest-first history eviction exactly.
+    pub fn history_depth(&self) -> (usize, usize) {
+        self.history.depth()
+    }
+
+    /// Rebase the current version onto an equivalent, reopened saved original.
+    /// Caller must establish byte equivalence and finish any pending batch.
+    /// History and already issued snapshots retain their old backing objects.
+    pub fn checkpoint_current(&mut self, saved: Snapshot) -> io::Result<()> {
+        if self.transaction.is_some() || saved.len() != self.len() || saved.line_count() != self.line_count() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid saved checkpoint"));
+        }
+        self.typing = None;
+        self.snapshot = saved;
+        Ok(())
     }
 
     /// Coalesce contiguous insertions separated by at most 500 ms. The caller
@@ -350,6 +402,41 @@ impl Buffer {
     /// Resident added bytes across this buffer, history and worker snapshots.
     pub fn add_memory_bytes(&self) -> usize {
         self.added.used.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod editing_contract_tests {
+    use super::*;
+    #[test]
+    fn batch_cancel_coalescing_shared_ranges_and_checkpoint_keep_history() {
+        let mut b = Buffer::empty();
+        b.insert(0, b"abc").unwrap();
+        let source = b.snapshot();
+        b.begin();
+        b.delete(0..2).unwrap();
+        b.cancel();
+        let mut out = Vec::new();
+        b.write_to(&mut out).unwrap();
+        assert_eq!(out, b"abc");
+        b.begin();
+        b.insert_snapshot_range(3, &source, 0..2).unwrap();
+        b.commit_coalesced(true);
+        assert_eq!(b.history_depth(), (1, 0));
+        assert!(b.undo());
+        assert!(b.is_empty());
+        assert!(b.redo());
+        let checkpoint = b.snapshot();
+        b.checkpoint_current(checkpoint).unwrap();
+        assert!(b.undo());
+        assert!(b.is_empty());
+        assert!(b.redo());
+        let mut out = Vec::new();
+        b.write_to(&mut out).unwrap();
+        assert_eq!(out, b"abcab");
+        b.begin();
+        assert!(b.checkpoint_current(Snapshot::default()).is_err());
+        b.cancel();
     }
 }
 
