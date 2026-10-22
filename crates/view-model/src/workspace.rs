@@ -1071,6 +1071,13 @@ impl Workspace {
                 {
                     match result {
                         Ok(document) => {
+                            if document.path != tab.path {
+                                view.path.clone_from(&document.path);
+                                self.session.tab_mut(tab.id).unwrap().path.clone_from(&document.path);
+                                view.set_notice(
+                                    "Recovered file changed on disk; original recovery retained. Use Save As".into(),
+                                );
+                            }
                             let mut editor = Editor::new(*document);
                             let len = editor.document().snapshot().len();
                             let _ = editor.set_cursors(
@@ -1083,6 +1090,8 @@ impl Workspace {
                             );
                             editor.set_viewport(tab.first_visible_line, view.rows);
                             view.editor = Some(editor);
+                            view.top = tab.first_visible_line;
+                            view.set_horizontal_window(tab.first_byte_column, 64 << 10);
                             view.refresh_after_edit(Damage { full: true, ..Default::default() });
                         }
                         Err(error) => {
@@ -1576,6 +1585,33 @@ mod tests {
         assert!(!workspace.close_pending());
         workspace.file_command("file.saveAs").unwrap();
         assert_eq!(workspace.file_prompt().unwrap().kind, FilePromptKind::SaveAs);
+    }
+
+    #[test]
+    fn recovered_closed_attachment_restores_per_row_windows_and_safe_conflict_path() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        let path = std::env::temp_dir().join("kwil-virtual-recovered-conflict.txt");
+        workspace.session.set_path(first, path.clone()).unwrap();
+        workspace.views.get_mut(&first).unwrap().path = Some(path);
+        workspace.set_horizontal_window(2, 64 << 10);
+        workspace.close(first, true).unwrap();
+        workspace.closed_views.remove(&first);
+        workspace.file_command("file.reopenClosed").unwrap();
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, "界a\nxyz".as_bytes()).unwrap();
+        document.saved_revision = 1;
+        workspace.document_result(DocumentResult::Recovered {
+            document: first,
+            revision: 0,
+            result: Ok(Box::new(document)),
+        });
+        assert!(workspace.view(first).unwrap().path.is_none());
+        assert!(workspace.session.tab_mut(first).unwrap().path.is_none());
+        assert_eq!(workspace.horizontal_origin(), 2);
+        assert_eq!(workspace.line_offset(0), 0);
+        assert_eq!(workspace.line_offset(1), 2);
+        assert!(workspace.status_text().contains("Use Save As"));
     }
 
     #[test]
