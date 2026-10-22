@@ -28,6 +28,7 @@
 //! shutdown.shutdown().map_err(std::io::Error::other)?;
 //! # Ok(()) }
 //! ```
+use crate::settings_panels::{PanelInput, PanelWindow, SettingsPanelController};
 use kwil_core_commands::{
     Settings,
     settings::{SettingsError, SettingsWorker, SettingsWorkerEvent},
@@ -315,7 +316,7 @@ pub struct SettingsSession {
     category: Option<Category>,
     searching: bool,
     editing: Option<Editing>,
-    panel: Option<SettingsPanel>,
+    panel: Option<SettingsPanelController>,
     error: Option<String>,
     save_error: Option<String>,
     status: String,
@@ -419,13 +420,14 @@ impl SettingsSession {
         self.menu.as_ref()?.selected()
     }
     pub fn select(&mut self, index: usize) {
-        if self.editing.is_some() {
+        if self.editing.is_some() || self.panel_has_draft() {
             return;
         }
         let current = self.selected();
         if let Some(menu) = &mut self.menu {
             menu.move_selection(index.min(isize::MAX as usize) as isize - current as isize);
         }
+        self.panel = None;
     }
     pub fn category(&self) -> Option<Category> {
         self.category
@@ -457,7 +459,82 @@ impl SettingsSession {
         self.editing.is_some()
     }
     pub fn panel(&self) -> Option<SettingsPanel> {
+        self.panel.as_ref().map(SettingsPanelController::panel)
+    }
+    /// Memory-only, bounded viewport of the active compound settings page.
+    pub fn panel_window(&self, offset: usize, max: usize) -> Result<Option<PanelWindow>, String> {
         self.panel
+            .as_ref()
+            .map(|panel| {
+                panel.window(self.document().ok_or("settings have not loaded")?, offset, max).map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+    pub fn panel_is_capturing(&self) -> bool {
+        self.panel.as_ref().is_some_and(SettingsPanelController::is_capturing)
+    }
+    /// Includes capture and conflict confirmation as well as mapping text edits.
+    pub fn panel_is_editing(&self) -> bool {
+        self.panel.as_ref().is_some_and(SettingsPanelController::is_editing)
+    }
+    pub fn panel_query_cursor(&self) -> usize {
+        self.panel.as_ref().map_or(0, SettingsPanelController::query_cursor)
+    }
+    fn panel_has_draft(&self) -> bool {
+        self.panel.as_ref().is_some_and(|panel| panel.is_editing() || !panel.query().is_empty())
+    }
+    /// Select within the filtered panel; never retarget a capture or row draft.
+    /// Controller row limits bound the number of navigation operations.
+    pub fn panel_select(&mut self, index: usize) -> Result<(), String> {
+        let result = (|| {
+            if !self.open {
+                return Ok(());
+            }
+            let doc = self.menu.as_ref().ok_or("settings have not loaded")?.document();
+            let panel = self.panel.as_mut().ok_or("no active settings panel")?;
+            if panel.is_editing() {
+                return Err("finish or cancel the panel edit before selecting another row".into());
+            }
+            let window = panel.window(doc, 0, 0).map_err(|e| e.to_string())?;
+            let target = index.min(window.total.saturating_sub(1));
+            for _ in 0..window.selection.abs_diff(target) {
+                let input = if target > window.selection { PanelInput::Next } else { PanelInput::Previous };
+                panel.input(doc, input).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        self.finish_action(result)
+    }
+    /// Escape cancels one stage, then clears the query, then returns to the
+    /// generic menu. It never closes the parent settings screen. Hidden input
+    /// is ignored, and close/open retains controller drafts and selection.
+    pub fn panel_input(&mut self, input: PanelInput<'_>) -> Result<(), String> {
+        if !self.open {
+            return Ok(());
+        }
+        let result = (|| {
+            let doc = self.menu.as_ref().ok_or("settings have not loaded")?.document();
+            let panel = self.panel.as_mut().ok_or("no active settings panel")?;
+            let cancel = matches!(input, PanelInput::Cancel)
+                || matches!(input, PanelInput::Capture(chord)
+                    if chord.key == kwil_core_commands::Key::Named(kwil_core_commands::NamedKey::Escape)
+                        && chord.modifiers == Default::default());
+            if cancel && !panel.is_editing() {
+                if !panel.query().is_empty() {
+                    // The pure controller's Cancel only resets its stage; the
+                    // session owns query dismissal and whole-panel navigation.
+                    panel.search(doc, "").map_err(|e| e.to_string())?;
+                } else {
+                    self.panel = None;
+                }
+                return Ok(());
+            }
+            if let Some(edit) = panel.input(doc, input).map_err(|e| e.to_string())? {
+                self.edit_document(|doc| edit.apply(doc))?;
+            }
+            Ok(())
+        })();
+        self.finish_action(result)
     }
     pub fn status(&self) -> &str {
         &self.status
@@ -488,7 +565,7 @@ impl SettingsSession {
         self.update_status();
     }
     pub fn set_category(&mut self, category: Option<Category>) {
-        if self.editing.is_some() {
+        if self.editing.is_some() || self.panel_has_draft() {
             return;
         }
         self.category = category;
@@ -534,9 +611,34 @@ impl SettingsSession {
         result
     }
     fn handle_input(&mut self, input: SettingsInput<'_>) -> Result<(), String> {
+        if self.panel.is_some() && matches!(input, SettingsInput::Cancel) {
+            return self.panel_input(PanelInput::Cancel);
+        }
+        if self.panel.is_some() {
+            let panel_input = match input {
+                SettingsInput::Text(s) => Some(PanelInput::Text(s)),
+                SettingsInput::Backspace => Some(PanelInput::Backspace),
+                SettingsInput::Delete => Some(PanelInput::Delete),
+                SettingsInput::Left => Some(PanelInput::Left),
+                SettingsInput::Right => Some(PanelInput::Right),
+                SettingsInput::Home => Some(PanelInput::Home),
+                SettingsInput::End => Some(PanelInput::End),
+                SettingsInput::Next => Some(PanelInput::Next),
+                SettingsInput::Previous => Some(PanelInput::Previous),
+                SettingsInput::Accept => Some(PanelInput::Accept),
+                // Generic search/reset must not discard specialized state.
+                SettingsInput::Search | SettingsInput::Reset if self.panel_has_draft() => return Ok(()),
+                SettingsInput::Search | SettingsInput::Reset => None,
+                SettingsInput::Save => return self.save(),
+                SettingsInput::Cancel => unreachable!(),
+            };
+            if let Some(input) = panel_input {
+                return self.panel_input(input);
+            }
+        }
         match input {
             SettingsInput::Cancel => {
-                if self.editing.take().is_some() || self.panel.take().is_some() {
+                if self.editing.take().is_some() {
                     return Ok(());
                 }
                 if self.searching {
@@ -562,6 +664,7 @@ impl SettingsSession {
             }
             SettingsInput::Reset => {
                 self.editing = None;
+                self.panel = None;
                 self.menu.as_mut().ok_or("settings have not loaded")?.reset_selected().map_err(|e| e.to_string())?;
                 self.save()?;
             }
@@ -603,19 +706,19 @@ impl SettingsSession {
                 Some(SettingValue::Text(choices[(index + 1) % choices.len()].to_string()))
             }
             (SettingKind::Bindings, _) => {
-                self.panel = Some(SettingsPanel::Keymap);
+                self.activate_panel(SettingsPanel::Keymap)?;
                 None
             }
             (SettingKind::Formatters, _) => {
-                self.panel = Some(SettingsPanel::Formatters);
+                self.activate_panel(SettingsPanel::Formatters)?;
                 None
             }
             (SettingKind::StringMap, _) => {
-                self.panel = Some(if row.spec.id == "file_types" {
+                self.activate_panel(if row.spec.id == "file_types" {
                     SettingsPanel::FileTypes
                 } else {
                     SettingsPanel::StringMap { id: row.spec.id }
-                });
+                })?;
                 None
             }
             _ => {
@@ -636,6 +739,12 @@ impl SettingsSession {
             self.menu.as_mut().unwrap().edit_selected(value).map_err(|e| e.to_string())?;
             self.save()?;
         }
+        Ok(())
+    }
+    fn activate_panel(&mut self, panel: SettingsPanel) -> Result<(), String> {
+        let controller = SettingsPanelController::new(panel, self.document().ok_or("settings have not loaded")?)
+            .map_err(|e| e.to_string())?;
+        self.panel = Some(controller);
         Ok(())
     }
     fn accept_edit(&mut self) -> Result<(), String> {
@@ -712,7 +821,7 @@ impl SettingsSession {
                     self.external = None;
                     return;
                 }
-                if self.is_dirty() || self.editing.is_some() || self.pending.is_some() {
+                if self.is_dirty() || self.editing.is_some() || self.panel_is_editing() || self.pending.is_some() {
                     self.external = Some(External { source, document: *document });
                 } else {
                     self.adopt(source, *document, SettingsAppliedReason::Loaded);
@@ -809,7 +918,7 @@ impl SettingsSession {
         } else if self.is_dirty() {
             "Unsaved settings".into()
         } else if self.panel.is_some() {
-            "Edit this panel through the typed settings document".into()
+            "Enter to edit or confirm; Escape cancels a stage, query, then panel".into()
         } else if self.editing.is_some() {
             "Enter to save; Escape to cancel (lists: one string per line)".into()
         } else {
@@ -901,7 +1010,237 @@ mod tests {
             assert_eq!(rows.len(), 1, "query must identify one row");
             0
         });
-        session.menu.as_mut().unwrap().move_selection(index as isize);
+        session.select(index);
+    }
+
+    fn activate_panel(session: &mut SettingsSession, id: &str) {
+        select(session, id);
+        session.input(SettingsInput::Accept).unwrap();
+        assert!(session.panel_window(0, 8).unwrap().is_some());
+    }
+
+    #[test]
+    fn settings_panel_session_capture_confirms_and_publishes_only_saved_receipt() {
+        let original = "# keep\nkeymap = 'vscode'\n";
+        let (mut session, requests) = fixture(Some(original));
+        activate_panel(&mut session, "bindings");
+        session.panel_input(PanelInput::Text("file.save")).unwrap();
+        session.panel_input(PanelInput::Accept).unwrap();
+        assert!(session.panel_is_capturing());
+        session.panel_input(PanelInput::Capture("ctrl+c".parse().unwrap())).unwrap();
+        session.panel_input(PanelInput::Accept).unwrap();
+        let window = session.panel_window(0, 8).unwrap().unwrap();
+        assert!(!window.confirmation.is_empty());
+        assert!(session.panel_is_editing());
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(session.take_applied().is_none());
+        session.panel_input(PanelInput::Accept).unwrap();
+        let request = requests.lock().unwrap()[0].clone();
+        assert_eq!(request.1.as_deref(), Some(original));
+        assert!(request.2.contains("# keep"));
+        assert!(session.take_applied().is_none());
+        assert!(
+            session
+                .document()
+                .unwrap()
+                .settings()
+                .bindings
+                .iter()
+                .any(|b| b.command == "file.save" && b.keys == "ctrl+c")
+        );
+        // An acknowledgement for an earlier accepted edit cannot end a new capture.
+        session.panel_input(PanelInput::Accept).unwrap();
+        assert!(session.panel_is_capturing());
+        saved(&mut session, &request);
+        let applied = session.take_applied().unwrap();
+        assert!(matches!(applied.reason, SettingsAppliedReason::Saved { request: id } if id == request.0));
+        assert!(applied.settings.bindings.iter().any(|b| b.command == "file.save" && b.keys == "ctrl+c"));
+        assert_eq!(
+            SettingsDocument::parse(applied.source.as_deref().unwrap()).unwrap().settings().bindings,
+            applied.settings.bindings
+        );
+        loaded(&mut session, Some(&request.2));
+        assert!(!session.has_conflict());
+        assert!(session.panel_is_capturing());
+    }
+
+    #[test]
+    fn settings_panel_session_mapping_save_reopens_and_keeps_navigation_on_draft() {
+        let (mut session, requests) = fixture(Some(""));
+        activate_panel(&mut session, "file_types");
+        session.panel_input(PanelInput::Accept).unwrap();
+        session.panel_input(PanelInput::Text("rs")).unwrap();
+        assert!(session.panel_select(usize::MAX).unwrap_err().contains("finish or cancel"));
+        session.close();
+        session.panel_input(PanelInput::Text("ignored")).unwrap();
+        session.open();
+        let selected = session.selected_row().unwrap().spec.id;
+        session.select(usize::MAX);
+        session.set_category(Some(Category::Appearance));
+        session.cycle_category(false);
+        session.input(SettingsInput::Search).unwrap();
+        assert_eq!(session.selected_row().unwrap().spec.id, selected);
+        assert_eq!(session.category(), None);
+        assert_eq!(session.panel_window(0, 1).unwrap().unwrap().edit_text.unwrap().key, "rs");
+        session.panel_input(PanelInput::Accept).unwrap();
+        session.panel_input(PanelInput::Text("rust")).unwrap();
+        session.panel_input(PanelInput::Accept).unwrap();
+        assert_eq!(session.document().unwrap().language_for_extension("rs"), Some("rust"));
+        assert!(session.take_applied().is_none());
+        assert_eq!(requests.lock().unwrap().len(), 1, "a completed panel edit must enqueue an optimistic save");
+        let request = requests.lock().unwrap()[0].clone();
+        saved(&mut session, &request);
+        assert_eq!(session.take_applied().unwrap().file_types.get("rs").map(String::as_str), Some("rust"));
+        session.panel_input(PanelInput::Cancel).unwrap();
+        assert_eq!(session.panel(), None);
+        assert!(session.is_open());
+        assert!(session.panel_window(usize::MAX, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn settings_panel_session_cancel_unwinds_capture_confirmation_edit_query_then_panel() {
+        for confirm in [false, true] {
+            let (mut session, requests) = fixture(Some(""));
+            activate_panel(&mut session, "bindings");
+            session.panel_input(PanelInput::Text("file.save")).unwrap();
+            session.panel_input(PanelInput::Accept).unwrap();
+            if confirm {
+                session.panel_input(PanelInput::Capture("ctrl+c".parse().unwrap())).unwrap();
+                session.panel_input(PanelInput::Accept).unwrap();
+                assert!(!session.panel_window(0, 1).unwrap().unwrap().confirmation.is_empty());
+            }
+            session.input(SettingsInput::Cancel).unwrap();
+            assert_eq!(session.panel(), Some(SettingsPanel::Keymap));
+            assert!(!session.panel_is_editing());
+            assert_eq!(session.panel_window(0, 1).unwrap().unwrap().query, "file.save");
+            session.panel_input(PanelInput::Cancel).unwrap();
+            assert_eq!(session.panel_window(0, 1).unwrap().unwrap().query, "");
+            session.panel_input(PanelInput::Cancel).unwrap();
+            assert_eq!(session.panel(), None);
+            assert!(session.is_open());
+            assert!(requests.lock().unwrap().is_empty());
+        }
+        let (mut session, _) = fixture(Some(""));
+        activate_panel(&mut session, "file_types");
+        session.panel_input(PanelInput::Accept).unwrap();
+        session.panel_input(PanelInput::Text("unfinished")).unwrap();
+        session.panel_input(PanelInput::Cancel).unwrap();
+        assert!(!session.panel_is_editing());
+        assert_eq!(session.panel(), Some(SettingsPanel::FileTypes));
+        session.panel_input(PanelInput::Cancel).unwrap();
+        assert!(session.is_open());
+    }
+
+    #[test]
+    fn settings_panel_session_reload_preserves_capture_and_mapping_draft_until_explicit_adoption() {
+        for id in ["bindings", "file_types"] {
+            let (mut session, requests) = fixture(Some(""));
+            activate_panel(&mut session, id);
+            session.panel_input(PanelInput::Accept).unwrap();
+            if id == "file_types" {
+                session.panel_input(PanelInput::Text("rs")).unwrap();
+            } else {
+                session.panel_input(PanelInput::Capture("ctrl+k".parse().unwrap())).unwrap();
+            }
+            loaded(&mut session, Some("[editor]\ntab_size=9\n"));
+            assert!(session.has_conflict(), "unaccepted panel state must block silent adoption");
+            assert!(session.panel_is_editing());
+            assert_eq!(session.document().unwrap().settings().editor.tab_size, 4);
+            assert!(session.take_applied().is_none());
+            assert!(session.input(SettingsInput::Save).is_err());
+            assert!(requests.lock().unwrap().is_empty());
+            let window = session.panel_window(0, 1).unwrap().unwrap();
+            if id == "file_types" {
+                assert_eq!(window.edit_text.unwrap().key, "rs");
+                session.panel_input(PanelInput::Accept).unwrap();
+                session.panel_input(PanelInput::Text("rust")).unwrap();
+                assert!(session.panel_input(PanelInput::Accept).unwrap_err().contains("reload conflict"));
+                assert_eq!(session.document().unwrap().language_for_extension("rs"), Some("rust"));
+                assert!(session.is_dirty(), "completed edits survive a rejected save");
+                assert!(requests.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(window.capture.as_deref(), Some("ctrl+k"));
+            }
+            session.adopt_external().unwrap();
+            assert_eq!(session.panel(), None);
+            assert_eq!(session.take_applied().unwrap().settings.editor.tab_size, 9);
+        }
+    }
+
+    #[test]
+    fn settings_panel_session_confirmation_rechecks_current_document_and_retains_new_conflicts() {
+        let (mut session, requests) = fixture(Some(""));
+        activate_panel(&mut session, "bindings");
+        session.panel_input(PanelInput::Text("file.save")).unwrap();
+        session.panel_input(PanelInput::Accept).unwrap();
+        session.panel_input(PanelInput::Capture("ctrl+c".parse().unwrap())).unwrap();
+        session.panel_input(PanelInput::Accept).unwrap();
+        session
+            .edit_document(|doc| {
+                doc.rebind(
+                    kwil_core_commands::Binding {
+                        command: "file.open".into(),
+                        keys: "ctrl+c".into(),
+                        context: None,
+                        mode: None,
+                    },
+                    true,
+                )
+            })
+            .unwrap();
+        let before = session.document().unwrap().source().to_owned();
+        assert!(session.panel_input(PanelInput::Accept).unwrap_err().contains("conflicts changed"));
+        assert_eq!(session.document().unwrap().source(), before);
+        assert!(session.panel_window(0, 1).unwrap().unwrap().confirmation.iter().any(|c| c.command == "file.open"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        session.panel_input(PanelInput::Accept).unwrap();
+        assert!(
+            session
+                .document()
+                .unwrap()
+                .settings()
+                .bindings
+                .iter()
+                .any(|b| b.command == "file.save" && b.keys == "ctrl+c")
+        );
+    }
+
+    #[test]
+    fn settings_panel_session_typed_maps_formatters_generic_paste_and_bounded_selection() {
+        for (id, key, value) in [
+            ("file_types", "rs", "rust"),
+            ("theme.colors", "editor.background", "#112233"),
+            ("formatters", "rust.executable", "rustfmt"),
+        ] {
+            let (mut session, requests) = fixture(Some(""));
+            activate_panel(&mut session, id);
+            session.input(SettingsInput::Accept).unwrap();
+            session.input(SettingsInput::Text(key)).unwrap();
+            session.input(SettingsInput::Accept).unwrap();
+            session.input(SettingsInput::Text(value)).unwrap();
+            let window = session.panel_window(0, 1).unwrap().unwrap();
+            assert_eq!(window.edit_text.unwrap().value, value);
+            session.input(SettingsInput::Save).unwrap();
+            assert!(requests.lock().unwrap().is_empty(), "Save must not accept panel text");
+            session.input(SettingsInput::Accept).unwrap();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert!(session.search_text().is_empty() || session.search_text() == id);
+            assert!(session.panel_window(0, crate::settings_panels::PANEL_ROW_LIMIT + 1).is_err());
+            session.panel_select(usize::MAX).unwrap();
+            let window = session.panel_window(usize::MAX, 1).unwrap().unwrap();
+            assert!(window.rows.is_empty());
+            assert_eq!(window.selection, window.total - 1);
+            session.panel_select(0).unwrap();
+            session.panel_input(PanelInput::Text("é")).unwrap();
+            assert_eq!(session.panel_query_cursor(), "é".len());
+            session.panel_input(PanelInput::Capture("escape".parse().unwrap())).unwrap();
+            assert_eq!(session.panel_query_cursor(), 0);
+            assert!(session.panel().is_some());
+            session.panel_input(PanelInput::Cancel).unwrap();
+            assert!(session.panel().is_none());
+            session.input(SettingsInput::Cancel).unwrap(); // generic search was not active
+            assert!(!session.is_open());
+        }
     }
 
     #[test]

@@ -253,6 +253,7 @@ pub fn run_with_external_open(
                     let intent = if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
                         if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
                             && matches!(k.code, KeyCode::Char('o' | 'O'))
+                            && !panel.panel_is_capturing()
                         {
                             KeyResult::SettingsFile
                         } else {

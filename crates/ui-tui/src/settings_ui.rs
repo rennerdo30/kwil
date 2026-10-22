@@ -2,6 +2,7 @@
 use super::*;
 use kwil_core_commands::settings_ui::SettingValue;
 use kwil_view_model::palette_session::{display_text, text_window};
+use kwil_view_model::settings_panels::{EditColumn, PanelInput};
 use kwil_view_model::settings_session::{SettingsInput, SettingsSession};
 
 fn value_text(value: &SettingValue) -> String {
@@ -18,6 +19,36 @@ fn value_text(value: &SettingValue) -> String {
 }
 
 pub(super) fn key(host: &mut SettingsSession, event: KeyEvent) -> bool {
+    if host.panel().is_some() {
+        if host.panel_is_capturing() {
+            if let Some(chord) = super::chord(event) {
+                let _ = host.panel_input(PanelInput::Capture(chord));
+            }
+            return true;
+        }
+        let text;
+        let input = match event.code {
+            KeyCode::Esc => Some(PanelInput::Cancel),
+            KeyCode::Enter => Some(PanelInput::Accept),
+            KeyCode::Down | KeyCode::Tab => Some(PanelInput::Next),
+            KeyCode::Up | KeyCode::BackTab => Some(PanelInput::Previous),
+            KeyCode::Backspace => Some(PanelInput::Backspace),
+            KeyCode::Delete => Some(PanelInput::Delete),
+            KeyCode::Left => Some(PanelInput::Left),
+            KeyCode::Right => Some(PanelInput::Right),
+            KeyCode::Home => Some(PanelInput::Home),
+            KeyCode::End => Some(PanelInput::End),
+            KeyCode::Char(c) if !event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                text = c.to_string();
+                Some(PanelInput::Text(&text))
+            }
+            _ => None,
+        };
+        if let Some(input) = input {
+            let _ = host.panel_input(input);
+        }
+        return true;
+    }
     let editing = host.is_editing() || host.is_searching();
     let command = event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
     if event.code == KeyCode::Tab && !host.is_editing() {
@@ -69,6 +100,10 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
     }
     let area =
         Rect { x: screen.x + (screen.width - width) / 2, y: screen.y + (screen.height - height) / 2, width, height };
+    if host.panel().is_some() {
+        draw_panel(frame, host, area);
+        return;
+    }
     let style = Style::default().fg(Color::Rgb(214, 228, 240)).bg(Color::Rgb(8, 13, 24));
     let columns = width as usize - 2;
     let mut caret = None;
@@ -120,10 +155,107 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
     }
 }
 
+fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect) {
+    let columns = area.width.saturating_sub(2) as usize;
+    let visible = area.height.saturating_sub(6) as usize;
+    let Ok(Some(summary)) = host.panel_window(0, 0) else { return };
+    let first = summary.selection.saturating_sub(visible / 2).min(summary.total.saturating_sub(visible));
+    let Ok(Some(window)) = host.panel_window(first, visible) else { return };
+    let style = Style::default().fg(Color::Rgb(214, 228, 240)).bg(Color::Rgb(8, 13, 24));
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let mut line = |row, text: String, selected| {
+        frame.render_widget(
+            Paragraph::new(display_text(&text)).style(if selected { style.bg(Color::Rgb(25, 42, 67)) } else { style }),
+            Rect { x: area.x + 1, y: area.y + row, width: area.width - 2, height: 1 },
+        );
+    };
+    line(0, format!("Settings > {}", window.title), false);
+    let query = text_window(&window.query, host.panel_query_cursor(), columns.saturating_sub(2));
+    let query_cursor = query.cursor;
+    line(1, format!("/ {}", query.text), false);
+    for (index, row) in window.rows.iter().enumerate() {
+        line(index as u16 + 2, format!("{}: {}  {}", row.title, row.value, row.source), row.selected);
+    }
+    let mut caret = Some((area.x + 3 + query_cursor as u16, area.y + 1));
+    if let Some(edit) = &window.edit_text {
+        let (label, text) = match edit.column {
+            EditColumn::Key => ("Key: ", &edit.key),
+            EditColumn::Value => ("Value: ", &edit.value),
+        };
+        let input = text_window(text, edit.cursor, columns.saturating_sub(label.len()));
+        line(area.height - 4, format!("{label}{}", input.text), true);
+        line(area.height - 3, format!("{} -> {}", edit.key, edit.value), false);
+        caret = Some((area.x + 1 + (label.len() + input.cursor).min(columns - 1) as u16, area.y + area.height - 4));
+    } else if let Some(capture) = &window.capture {
+        line(area.height - 4, format!("Keys: {}", if capture.is_empty() { "Press keys..." } else { capture }), true);
+        line(area.height - 3, "Enter accepts a captured chord; Esc cancels".into(), false);
+    } else if !window.confirmation.is_empty() {
+        line(
+            area.height - 4,
+            format!("Conflicts: {}  Enter move binding  Esc cancel", window.confirmation.len()),
+            true,
+        );
+    } else if let Some(row) = window.rows.iter().find(|row| row.selected) {
+        line(area.height - 4, row.description.clone(), false);
+        line(area.height - 3, format!("Default: {}", row.default), false);
+    }
+    line(area.height - 2, host.status().into(), false);
+    line(area.height - 1, "Enter edit/apply  Delete reset/remove  Esc back".into(), false);
+    if let Some(caret) = caret {
+        frame.set_cursor_position(caret);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn terminal_compound_capture_keeps_modified_escape_and_cancels_in_stages() {
+        let directory = std::env::temp_dir().join(format!(
+            "kwil-panel-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("settings.toml");
+        std::fs::write(&path, "").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut host = SettingsSession::start(
+            path,
+            Arc::new(move || {
+                let _ = tx.send(());
+            }),
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        host.worker_ready();
+        host.take_applied();
+        host.open();
+        host.input(SettingsInput::Search).unwrap();
+        host.input(SettingsInput::Text("bindings")).unwrap();
+        host.input(SettingsInput::Accept).unwrap();
+        host.input(SettingsInput::Accept).unwrap();
+        assert!(host.panel().is_some());
+        key(&mut host, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(host.panel_is_capturing());
+        key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::SHIFT));
+        assert!(host.panel_is_capturing(), "modified Escape is data during capture");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 25)).unwrap();
+        terminal.draw(|frame| draw(frame, &host)).unwrap();
+        let screen: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("shift+escape"), "captured chord must be visible");
+        key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!host.panel_is_capturing());
+        assert!(host.panel().is_some(), "first Escape cancels the capture only");
+        key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(host.panel().is_none());
+        assert!(host.is_open(), "second Escape returns to settings, not the document");
+        host.stop().shutdown().unwrap();
+        drop(host);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn terminal_settings_keyboard_edits_persist_and_render_without_replacing_search() {
