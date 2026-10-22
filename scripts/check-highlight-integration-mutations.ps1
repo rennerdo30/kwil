@@ -8,7 +8,9 @@ $cases = @(
     @{Name='bounded-windows';File='crates/view-model/src/highlight_session.rs';Old='end.saturating_sub(last.start) <= WINDOW';New='(true || end.saturating_sub(last.start) <= WINDOW)';Package='kwil-view-model';Test='highlight_session::tests::giant_line_gaps_and_long_windows_remain_bounded'},
     @{Name='highlight-row-damage';File='crates/view-model/src/highlight_session.rs';Old='if *previous != styles {';New='if true || *previous != styles {';Package='kwil-view-model';Test='highlight_session::tests::worker_results_style_visible_rows_and_only_repaint_changed_styles'},
     @{Name='source-retirement';File='crates/view-model/src/highlighting.rs';Old='*slot = Some(source);';New='drop(source);';Package='kwil-view-model';Test='highlighting::tests::idle_source_retirement_runs_on_the_existing_worker_and_wakes_host'},
-    @{Name='terminal-color';File='crates/ui-tui/src/lib.rs';Old='style = style.fg(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));';New='let _ = rgb;';Package='kwil-ui-tui';Test='tests::syntax_foreground_preserves_selection_background_and_horizontal_bytes'}
+    @{Name='terminal-color';File='crates/ui-tui/src/lib.rs';Old='style = style.fg(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));';New='let _ = rgb;';Package='kwil-ui-tui';Test='tests::syntax_foreground_preserves_selection_background_and_horizontal_bytes'},
+    @{Name='terminal-restyle';File='crates/ui-tui/src/lib.rs';Old='host.invalidate_painted(view, &kwil_view_model::Damage { full: true, ..Default::default() });';New='let _ = view;';Package='kwil-ui-tui';Test='tests::trailing_space_edit_restores_unchanged_number_highlights'},
+    @{Name='saveas-language';File='crates/view-model/src/highlight_session.rs';Old='path: editor.document().path().unwrap_or(std::path::Path::new("")).to_path_buf(),';New='path: Default::default(),';Package='kwil-view-model';Test='highlight_session::tests::save_as_path_changes_invalidate_detection_without_an_edit'}
 )
 $executed = 0
 foreach($case in $cases) {

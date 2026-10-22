@@ -112,3 +112,15 @@ Limits remain explicit: initial wiring uses automatic detection and built-in dar
 ### Reopen reservations R4
 
 `f46df0e` stages named cached reopens through a bounded native-admission worker request before consuming history/cache. Provisional reservations survive ordinary registry refresh until the addressed UI receipt. Evidence: `E:/AgentData/scratch/kwil/kw20-reopen-r4/` (workspace27, worker14, fail-first cases, one compiling provisional-reservation mutant, exact restoration, strict VM Clippy and fmt). Independent R4 review is running. No native, latency or full-v1 acceptance is claimed.
+
+### Native syntax and accepted palette actions at 9021239
+
+A copied debug `frame-harness` binary built offline/locked/-j4 in 5.13 s (Cargo41780). Executable SHA256 `875D6C9AB689D990629316175344E756F1806FF899B31E4AFC34468E7022A182`; source `90212390348bf1cbcc33581a7005e50bc0194d7f`. Hidden isolated runner57728 and GUI64560 exited0. The probe verified native caption/resize/min/max/system-menu, both icons and DWM cloak. APPDATA/XDG/KWIL_WORKSPACE_ROOT were isolated beneath `E:/Development/_cache/kwil-highlight-native-20261023/capture/`; no global input, clipboard or display changes.
+
+Visually inspected `highlighting.png`, `goto-prompt.png`, `goto-accepted.png`, `new-file-accepted.png` in that capture directory. Rust keywords/strings/numbers/comments are coloured. Accepting Go to Line opens `:` mode, then accepting `55` places the caret on line55 with no remaining popup pixels. Accepting New File creates the second empty tab. Fixture SHA256 stayed `90397D146B53A1B15BAF3BF4BBCA1706E6DAC04AB0C63010046D9C841912EBA5`; app stderr was empty. This establishes these actions on this Windows candidate; no latency, native clipboard, all-platform, final incremental-parse or full-v1 acceptance is claimed.
+
+### Recovery dirty-state and highlighting R1 follow-ups
+
+R4 review found a reserved-saved-state collision after reopening recovery. The extended regression assertion-failed before the correction (PID78036). `05ff3aa` allocates an unreachable saved marker, skips it for later edits, and restores the allocator beyond persisted saved markers. Positive cached reopen/SaveAll/undo/redo/close and saved-marker100 recovery tests pass (restored28124/8884). Independent compiling reservation/restore faults were rejected in `E:/Development/_cache/kwil-recovery-marker-proof-3d7f32c898b24182a4ecd31a60565192`, PIDs52836/13140. Independent R5 review remains required.
+
+`9021239` additionally fixes terminal highlighting erased by a trailing-space edit and Save As language detection without a revision change. Both corresponding compiling faults are rejected in `E:/Development/_cache/kwil-highlight-integration-proof-df63b01eed93410991c9f043ec076843`, PIDs58864/10712; restored tests PID17680/54960 pass. The remaining R1 full-reparse finding is being corrected through bounded transaction metadata and worker-side incremental edits. It is not waived by the native capture.
