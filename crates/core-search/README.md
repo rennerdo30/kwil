@@ -26,11 +26,15 @@ file mutation, persistent background thread, or file-sized working buffer.
   256-hit batches; later shards backpressure instead of storing out-of-order hits.
   The returned summary reports the actual worker count. One light coordinator
   drains channels in addition to the reported search workers.
-- Literal case-sensitive search uses `memmem`; case-insensitive text literals
-  use Unicode regex folding, with ASCII folding for non-UTF-8 byte patterns.
+- Literal case-sensitive search without whole word uses `memmem`; case-insensitive
+  text literals use Unicode regex folding, with ASCII folding for non-UTF-8 byte patterns.
   Whole word uses Unicode `\b` at both ends, treating invalid bytes as non-word.
-  Regexes compile these constraints into the expression, preserving alternatives
-  and capture numbering. Offsets are original bytes; in-buffer encoding decode
+  Both literals and regexes compile these constraints into the expression, so
+  rejecting a boundary does not skip an overlapping candidate. Accepted hits stay
+  non-overlapping. There is no per-rejection restart that repeatedly scans a long
+  periodic needle. Parsed AST composition preserves extended-mode comments,
+  alternatives and capture numbering. Literal replacements keep dollar signs
+  literal in both case modes. Offsets are original bytes; in-buffer encoding decode
   and offset mapping are separate adapters.
 - Regex search requires a declared maximum possible match length, at most 1 MiB
   (64 KiB is a suggested UI default). Its overlap retains this bound plus Unicode

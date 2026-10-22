@@ -3,7 +3,6 @@ use memchr::memmem;
 use regex::bytes::{Regex, RegexBuilder};
 use std::io;
 use std::ops::Range;
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 #[cfg(not(test))]
@@ -81,7 +80,6 @@ enum Engine {
 #[derive(Clone, Debug)]
 pub struct Pattern {
     engine: Engine,
-    options: Options,
     max_len: usize,
     captures: bool,
     pub(crate) newline_safe: bool,
@@ -92,23 +90,35 @@ impl Pattern {
         if needle.is_empty() || needle.len() > MAX_PATTERN {
             return Err(invalid("literal length must be 1..=1 MiB"));
         }
-        if options.case_insensitive {
+        if options.case_insensitive || options.whole_word {
             let (escaped, unicode) = match std::str::from_utf8(needle) {
                 Ok(s) => (regex::escape(s), true),
                 Err(_) => (needle.iter().map(|b| format!("\\x{b:02x}")).collect(), false),
             };
-            let re = RegexBuilder::new(&escaped).unicode(unicode).case_insensitive(true).build().map_err(invalid)?;
+            // Boundary rejection belongs inside the matcher: a rejected start
+            // must not consume an overlapping candidate. Repeated find calls
+            // from start + 1 would rescan long periodic needles. The compiled
+            // assertions let regex retry in one scan, emitting non-overlapping
+            // accepted hits. Ordinary exact literals keep the memmem fast path.
+            let expression = if options.whole_word { whole_word_expression(&escaped)? } else { escaped };
+            let re = RegexBuilder::new(&expression)
+                .unicode(unicode)
+                .case_insensitive(options.case_insensitive)
+                .build()
+                .map_err(invalid)?;
             Ok(Self {
                 engine: Engine::Regex(re),
-                options,
-                max_len: needle.len().saturating_mul(4).min(MAX_PATTERN),
+                max_len: if options.case_insensitive {
+                    needle.len().saturating_mul(4).min(MAX_PATTERN)
+                } else {
+                    needle.len()
+                },
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
             })
         } else {
             Ok(Self {
                 engine: Engine::Literal(needle.to_vec()),
-                options,
                 max_len: needle.len(),
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
@@ -138,22 +148,14 @@ impl Pattern {
             .parse(expression)
             .map_err(invalid)?;
         let newline_safe = !consumes_newline(&hir);
-        let constrained = if options.whole_word {
-            // AST serialization removes comments while retaining capture syntax
-            // and inline flags. HIR serialization would drop groups under {0}
-            // and renumber later captures when compiled back from its string.
-            let ast = regex_syntax::ast::parse::Parser::new().parse(expression).map_err(invalid)?;
-            format!(r"(?u:\b)(?:{ast})(?u:\b)")
-        } else {
-            expression.to_owned()
-        };
+        let constrained = if options.whole_word { whole_word_expression(expression)? } else { expression.to_owned() };
         let re = RegexBuilder::new(&constrained)
             .case_insensitive(options.case_insensitive)
             .size_limit(8 << 20)
             .dfa_size_limit(2 << 20)
             .build()
             .map_err(invalid)?;
-        Ok(Self { engine: Engine::Regex(re), options, max_len: max_match_bytes, captures: true, newline_safe })
+        Ok(Self { engine: Engine::Regex(re), max_len: max_match_bytes, captures: true, newline_safe })
     }
 
     pub(crate) fn visit(
@@ -261,6 +263,15 @@ impl Pattern {
     }
 }
 
+fn whole_word_expression(expression: &str) -> io::Result<String> {
+    // AST serialization removes comments while retaining capture syntax and
+    // inline flags. HIR serialization would drop groups under {0} and renumber
+    // later captures. Scoped Unicode assertions also preserve word boundaries
+    // around byte literals compiled with Unicode disabled.
+    let ast = regex_syntax::ast::parse::Parser::new().parse(expression).map_err(invalid)?;
+    Ok(format!(r"(?u:\b)(?:{ast})(?u:\b)"))
+}
+
 fn consumes_newline(hir: &regex_syntax::hir::Hir) -> bool {
     use regex_syntax::hir::{Class, HirKind};
     match hir.kind() {
@@ -337,9 +348,6 @@ pub fn search<H: Haystack + ?Sized>(
                 }
                 if m.is_empty() && last_end == Some(start) {
                     next = start + 1;
-                    return Ok(true);
-                }
-                if pattern.options.whole_word && !pattern.captures && !whole_word(bytes, m.clone()) {
                     return Ok(true);
                 }
                 result.count += 1;
@@ -535,26 +543,4 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
         visit(&buf, base, range.end, true)?;
     }
     Ok(())
-}
-
-fn whole_word(bytes: &[u8], m: Range<usize>) -> bool {
-    (word_before(&bytes[..m.start]) != word_after(&bytes[m.start..]))
-        && (word_before(&bytes[..m.end]) != word_after(&bytes[m.end..]))
-}
-fn word_before(bytes: &[u8]) -> bool {
-    (1..=4.min(bytes.len()))
-        .find_map(|n| std::str::from_utf8(&bytes[bytes.len() - n..]).ok().and_then(|s| s.chars().next()))
-        .is_some_and(word_char)
-}
-fn word_after(bytes: &[u8]) -> bool {
-    (1..=4.min(bytes.len()))
-        .find_map(|n| std::str::from_utf8(&bytes[..n]).ok().and_then(|s| s.chars().next()))
-        .is_some_and(word_char)
-}
-fn word_char(c: char) -> bool {
-    if c.is_ascii() {
-        return c.is_ascii_alphanumeric() || c == '_';
-    }
-    static WORD: OnceLock<regex::Regex> = OnceLock::new();
-    WORD.get_or_init(|| regex::Regex::new(r"^\w$").unwrap()).is_match(c.encode_utf8(&mut [0; 4]))
 }

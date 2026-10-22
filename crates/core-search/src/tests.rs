@@ -409,6 +409,118 @@ fn parallel_default_matches_serial_and_preserves_order() {
 }
 
 #[test]
+fn whole_word_literal_rejected_overlap_search() {
+    let bytes = b"xa a a";
+    let results: Vec<_> = [false, true]
+        .into_iter()
+        .map(|case_insensitive| {
+            let p = Pattern::literal(b"a a", Options { whole_word: true, case_insensitive }).unwrap();
+            collect(bytes.as_slice(), &p, 0..bytes.len() as u64)
+        })
+        .collect();
+    // The byte-1 candidate fails its leading boundary; byte 3 must still be tried.
+    assert_eq!(results, [vec![Match { offset: 3, len: 3 }], vec![Match { offset: 3, len: 3 }]]);
+
+    for case_insensitive in [false, true] {
+        let options = Options { whole_word: true, case_insensitive };
+        // Periodic candidates cross copied windows, borrowed chunks and shard cuts.
+        for (needle, text) in [
+            ("a a", "xa a a a a a\n"),
+            ("é é", "xé é é é é é\n"),
+            ("k k", "xK k K k K k\n"),
+            ("!a!", "a!a!a!a!a!a\n"),
+            ("a a!", "xa a! a a!\n"),
+        ] {
+            let bytes = text.repeat(30).into_bytes();
+            let p = Pattern::literal(needle.as_bytes(), options).unwrap();
+            let reference = regex::bytes::RegexBuilder::new(&format!(r"\b(?:{})\b", regex::escape(needle)))
+                .case_insensitive(case_insensitive)
+                .build()
+                .unwrap();
+            let expected: Vec<_> =
+                reference.find_iter(&bytes).map(|m| Match { offset: m.start() as u64, len: m.len() as u64 }).collect();
+            assert!(expected.windows(2).all(|pair| pair[0].offset + pair[0].len <= pair[1].offset));
+            for size in [1, 7, 127, 256] {
+                let h = Chunks { bytes: &bytes, size };
+                assert_eq!(collect(&h, &p, 0..h.len()), expected, "{needle}, ci={case_insensitive}, chunk={size}");
+            }
+            let mut parallel_hits = Vec::new();
+            let summary = search_with_threads(
+                bytes.as_slice(),
+                &p,
+                0..bytes.len() as u64,
+                SearchMode::Hits,
+                4,
+                &token(),
+                |m| parallel_hits.push(m),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(parallel_hits, expected);
+            assert_eq!(summary.count as usize, expected.len());
+            let count = search(
+                bytes.as_slice(),
+                &p,
+                0..bytes.len() as u64,
+                SearchMode::Count,
+                &token(),
+                |_| panic!("count emitted hit"),
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(count.count as usize, expected.len());
+        }
+        let p = Pattern::literal(b"a a", options).unwrap();
+        assert_eq!(
+            collect(b"a a a a a".as_slice(), &p, 0..9),
+            [Match { offset: 0, len: 3 }, Match { offset: 4, len: 3 }]
+        );
+        // Range edges still use document context and cannot turn byte 1 into a hit.
+        assert!(collect(bytes.as_slice(), &p, 1..4).is_empty());
+        assert_eq!(collect(bytes.as_slice(), &p, 2..6), [Match { offset: 3, len: 3 }]);
+        for (needle, raw, expected) in [
+            (b"\xffa".as_slice(), b"x\xffa \xffa".as_slice(), vec![Match { offset: 1, len: 2 }]),
+            (b"a\xff".as_slice(), b" a\xffx a\xff ".as_slice(), vec![Match { offset: 1, len: 2 }]),
+            (
+                b"cat".as_slice(),
+                b"\xffcat cat\xfe".as_slice(),
+                vec![Match { offset: 1, len: 3 }, Match { offset: 5, len: 3 }],
+            ),
+        ] {
+            let p = Pattern::literal(needle, options).unwrap();
+            assert_eq!(collect(raw, &p, 0..raw.len() as u64), expected);
+        }
+    }
+}
+
+#[test]
+fn whole_word_literal_rejected_overlap_replace_all() {
+    let bytes = b"xa a a";
+    let results: Vec<_> = [false, true]
+        .into_iter()
+        .map(|case_insensitive| {
+            let p = Pattern::literal(b"a a", Options { whole_word: true, case_insensitive }).unwrap();
+            let hits = collect(bytes.as_slice(), &p, 0..bytes.len() as u64);
+            let mut edits = Vec::new();
+            plan_replace(bytes.as_slice(), &p, hits, b"$0", &token(), |edit| {
+                edits.push(edit);
+                Ok(())
+            })
+            .unwrap();
+            edits
+        })
+        .collect();
+    // Literal replacement must preserve dollar signs even when regex does the scan.
+    assert_eq!(
+        results,
+        [
+            vec![Edit { offset: 3, len: 3, new_bytes: b"$0".to_vec() }],
+            vec![Edit { offset: 3, len: 3, new_bytes: b"$0".to_vec() }]
+        ]
+    );
+}
+
+#[test]
 fn whole_word_alternatives_captures_and_literal_boundaries() {
     let options = Options { whole_word: true, ..Options::default() };
     let bytes = "ab a abc 猫ab ab猫 !ab!".as_bytes();

@@ -4,6 +4,36 @@ Starting base: `b1b5c55658953a8572ea10662adf4f2aa4e7f730` (`main`).
 Final implementation measured: `e7d8ff36e3e9dfed5938c30749238b14bd497845`.
 Branch: `kw/22-search`.
 
+## Fix round 3: rejected overlapping literal candidates
+
+Integration base: `44adc5528423fd5a4c158ce5f40e888b457716d7`.
+Merged exact PR #5 head `769f09d2fb18844b7b7adb807260abd96a864f29`
+as `8ca20075cb4b8d53ac5fb81282f1dc20a47f4bfa` on
+`t3/search-overlap-correctness` before editing. The only merge conflict was
+`Cargo.lock`: the resolution retains the parent's packages and adds the search
+dependencies, without changing versions or other manifests.
+
+The round-3 review found that literal `a a` with whole word enabled misses the
+valid `(offset=3, len=3)` hit in `xa a a` in both case modes. Non-overlapping
+candidate iteration consumes the byte-1 candidate before its boundary fails,
+skipping byte 3. That also removes its edit from replace-all.
+
+Whole-word literals now use the existing byte-regex engine with compiled Unicode
+boundary assertions. Boundary failures can retry overlapping starts inside the
+matcher; accepted matches still advance to their end. This avoids repeatedly
+restarting a literal search after each rejected start on periodic input.
+Case-sensitive literals without whole word retain the unchanged `memmem` scan.
+Both literal case modes keep replacement dollars literal. The shared AST
+composition retains trailing extended-mode comments, scoped flags and capture
+numbering; no public function or trait signature changes.
+
+Focused validation is recorded below when run. No benchmark rerun is authorized
+for this round. The prior independent round-2 review measured warm medians of
+**18.896 ms** at `0c0cfc8` and **18.649 ms** at `f3242e7`, resolving the earlier
+first-access concern. Those remain historical evidence, not measurements of this
+implementation. Hosted CI, independent re-review and frontend integration remain
+with the parent; no acceptance gate is waived.
+
 ## Fix round 2: extended-mode regex comments
 
 Base: `f3242e7c7e04241e9b26555975108703a720edcd`.
