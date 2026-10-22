@@ -16,8 +16,8 @@ use std::{
 };
 
 mod commands;
-mod hex;
 mod compound;
+mod hex;
 use compound::CompoundEdit;
 pub(crate) mod receipts;
 mod save;
