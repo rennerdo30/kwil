@@ -8,6 +8,7 @@
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
 mod font;
+mod scrollbar;
 
 use font::Font;
 use kwil_view_model::{Damage, Notify, View};
@@ -16,7 +17,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -28,6 +29,7 @@ const GUTTER_FG: u32 = 0x5b6b85;
 const STATUS_BG: u32 = 0x080d18;
 const STATUS_FG: u32 = 0x8fe3ff;
 const GUTTER_COLS: usize = 9;
+const BAR: usize = 14;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GuiOptions {
@@ -77,6 +79,10 @@ struct App {
     mods: ModifiersState,
     pending: Damage,
     error: Option<GuiError>,
+    horizontal: u64,
+    widest: u64,
+    pointer: (usize, usize),
+    drag: Option<(bool, usize)>,
 }
 
 /// Runs the GUI until the window closes. `on_first_frame` runs once the
@@ -112,6 +118,10 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
         mods: ModifiersState::empty(),
         pending: Damage::default(),
         error: None,
+        horizontal: 0,
+        widest: 0,
+        pointer: (0, 0),
+        drag: None,
     };
     event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
@@ -126,7 +136,63 @@ impl App {
     }
 
     fn text_rows(&self) -> usize {
-        self.size.1.saturating_sub(self.ch()) / self.ch()
+        self.size.1.saturating_sub(self.ch() + BAR) / self.ch()
+    }
+
+    fn columns(&self) -> u64 {
+        let cw = self.font.as_ref().map_or(8, |f| f.cw);
+        (self.size.0.saturating_sub(BAR + GUTTER_COLS * cw) / cw) as u64
+    }
+
+    fn bars(&self) -> (scrollbar::Bar, scrollbar::Bar) {
+        let height = self.size.1.saturating_sub(self.ch() + BAR);
+        (
+            scrollbar::Bar::new(
+                0,
+                height,
+                self.view.rows() as u64,
+                self.view.line_count().unwrap_or(self.view.rows() as u64),
+                self.view.top(),
+            ),
+            scrollbar::Bar::new(
+                0,
+                self.size.0.saturating_sub(BAR),
+                self.columns(),
+                self.widest.max(self.columns()),
+                self.horizontal,
+            ),
+        )
+    }
+
+    fn scroll_bar(&mut self, vertical: bool, offset: u64) {
+        if vertical {
+            let delta = (offset as i128 - self.view.top() as i128).clamp(i64::MIN as i128, i64::MAX as i128);
+            let damage = self.view.scroll(delta as i64);
+            self.apply(damage);
+        } else if self.horizontal != offset {
+            self.horizontal = offset;
+            self.apply(Damage { full: true, ..Damage::default() });
+        }
+    }
+
+    fn pointer_down(&mut self) {
+        let (x, y) = self.pointer;
+        let (v, h) = self.bars();
+        let vertical = x >= self.size.0.saturating_sub(BAR) && y < v.length;
+        let horizontal = y >= v.length && y < v.length + BAR && x < h.length;
+        if !vertical && !horizontal {
+            return;
+        }
+        let (bar, pixel, offset, page) = if vertical {
+            (v, y, self.view.top(), self.view.rows() as u64)
+        } else {
+            (h, x, self.horizontal, self.columns())
+        };
+        if bar.contains_thumb(pixel) {
+            self.drag = Some((vertical, pixel - bar.thumb_start));
+        } else {
+            self.scroll_bar(vertical, bar.page(pixel, offset, page));
+        }
     }
 
     fn apply(&mut self, d: Damage) {
@@ -176,8 +242,14 @@ impl App {
 
     fn render(&mut self) {
         let (w, h) = self.size;
+        for r in 0..self.view.rows() {
+            if let Some(line) = self.view.line(r) {
+                self.widest = self.widest.max(line.len() as u64);
+            }
+        }
+        let bars = self.bars();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return };
-        if w == 0 || h == 0 {
+        if w == 0 || h < font.ch {
             return;
         }
         let mut buf = match gfx.surface.buffer_mut() {
@@ -189,13 +261,13 @@ impl App {
             p.full = true;
         }
         let ch = font.ch;
-        let rows = h.saturating_sub(ch) / ch;
+        let rows = h.saturating_sub(ch + BAR) / ch;
         let mut damage: Vec<Rect> = Vec::new();
 
         if p.full {
             fill(&mut buf, w, Rect { x: 0, y: 0, w, h }, BG);
             for r in 0..rows {
-                draw_row(&mut buf, w, font, &self.view, r);
+                draw_row(&mut buf, w, font, &self.view, r, self.horizontal);
             }
             p.status = true;
             damage.push(Rect { x: 0, y: 0, w, h });
@@ -205,12 +277,12 @@ impl App {
                 let keep = (rows - d) * ch;
                 if p.scroll > 0 {
                     buf.copy_within(d * ch * w..(d * ch + keep) * w, 0);
-                    if !screen_copy(gfx.hwnd, w, keep, d * ch, 0) {
+                    if !screen_copy(gfx.hwnd, w.saturating_sub(BAR), keep, d * ch, 0) {
                         damage.push(Rect { x: 0, y: 0, w, h: keep });
                     }
                 } else {
                     buf.copy_within(0..keep * w, d * ch * w);
-                    if !screen_copy(gfx.hwnd, w, keep, 0, d * ch) {
+                    if !screen_copy(gfx.hwnd, w.saturating_sub(BAR), keep, 0, d * ch) {
                         damage.push(Rect { x: 0, y: d * ch, w, h: keep });
                     }
                 }
@@ -218,7 +290,7 @@ impl App {
             p.rows.sort_unstable();
             p.rows.dedup();
             for &r in p.rows.iter().filter(|&&r| r < rows) {
-                draw_row(&mut buf, w, font, &self.view, r);
+                draw_row(&mut buf, w, font, &self.view, r, self.horizontal);
                 damage.push(Rect { x: 0, y: r * ch, w, h: ch });
             }
         }
@@ -241,12 +313,42 @@ impl App {
                 damage.push(sr);
             }
         }
+        // Scrollbars do not move with the text. Repaint them after every copy.
+        let (v, horizontal) = bars;
+        let vr = Rect { x: w.saturating_sub(BAR), y: 0, w: BAR.min(w), h: v.length };
+        let hr = Rect { x: 0, y: v.length, w, h: BAR.min(h.saturating_sub(v.length)) };
+        fill(&mut buf, w, vr, GUTTER_BG);
+        fill(&mut buf, w, hr, GUTTER_BG);
+        if v.maximum > 0 {
+            fill(
+                &mut buf,
+                w,
+                Rect { x: vr.x + 2.min(vr.w), y: v.thumb_start, w: vr.w.saturating_sub(4), h: v.thumb_length },
+                GUTTER_FG,
+            );
+        }
+        if horizontal.maximum > 0 {
+            fill(
+                &mut buf,
+                w,
+                Rect {
+                    x: horizontal.thumb_start,
+                    y: hr.y + 2.min(hr.h),
+                    w: horizontal.thumb_length,
+                    h: hr.h.saturating_sub(4),
+                },
+                GUTTER_FG,
+            );
+        }
+        if !p.full {
+            damage.extend([vr, hr]);
+        }
         let rects: Vec<_> = damage.iter().filter_map(|r| r.to_softbuffer()).collect();
         let _ = buf.present_with_damage(&rects);
     }
 }
 
-fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize) {
+fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, horizontal: u64) {
     let (cw, ch) = (font.cw, font.ch);
     let y = r * ch;
     let gutter = GUTTER_COLS * cw;
@@ -255,7 +357,8 @@ fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize) {
     if let Some(text) = view.line(r) {
         let num = format!("{:>7} ", view.line_number(r));
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, GUTTER_FG, GUTTER_BG);
-        draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter) / cw, FG, BG);
+        let text = text.get((horizontal as usize).min(text.len())..).unwrap_or_default();
+        draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, FG, BG);
     }
 }
 
@@ -439,6 +542,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
+                if let Some((vertical, grab)) = self.drag {
+                    let (v, h) = self.bars();
+                    let (bar, pixel) = if vertical { (v, self.pointer.1) } else { (h, self.pointer.0) };
+                    self.scroll_bar(vertical, bar.drag(pixel, grab));
+                }
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                if state == ElementState::Pressed {
+                    self.pointer_down();
+                } else {
+                    self.drag = None;
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.mods.control_key()
                     && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
@@ -449,12 +567,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -(y * 3.0) as i64,
-                    MouseScrollDelta::PixelDelta(p) => -(p.y / self.ch() as f64) as i64,
+                let (horizontal, vertical) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-(x * 3.0) as i64, -(y * 3.0) as i64),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        (-(p.x / self.ch() as f64) as i64, -(p.y / self.ch() as f64) as i64)
+                    }
                 };
-                let d = self.view.scroll(lines);
-                self.apply(d);
+                if horizontal != 0 || self.mods.shift_key() {
+                    let delta = if horizontal != 0 { horizontal } else { vertical };
+                    let maximum = self.bars().1.maximum;
+                    self.scroll_bar(false, self.horizontal.saturating_add_signed(delta).min(maximum));
+                } else {
+                    let d = self.view.scroll(vertical);
+                    self.apply(d);
+                }
             }
             _ => {}
         }
