@@ -455,6 +455,7 @@ impl App {
                 Key::Named(NamedKey::F11) => Some("file.new"),
                 Key::Named(NamedKey::F10) => Some("file.nextTab"),
                 Key::Named(NamedKey::F9) => Some("file.previousTab"),
+                Key::Named(NamedKey::F8) => Some("file.close"),
                 _ => None,
             };
             if let Some(command) = command {
