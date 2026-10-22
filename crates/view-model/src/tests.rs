@@ -771,6 +771,95 @@ fn receipts_multicursor_coalesced_undo_redo_are_exact() {
 }
 
 #[test]
+fn vim_compound_repeat_is_one_receipt_when_observer_is_full() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    let mut e = editor(b"one two three");
+    let mut parser = Vim::default();
+    vim(&mut e, &mut parser, "ciw");
+    type_text(&mut e, "X", 0);
+    escape(&mut e, &mut parser);
+    at(&mut e, 2);
+    let initial = bytes(&e);
+    let before = e.document().revision();
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sink, ready, observed) = (accepted.clone(), gate.clone(), calls.clone());
+    e.set_edit_observer(Some(Box::new(move |receipt| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        if ready.load(Ordering::Relaxed) {
+            sink.lock().unwrap().push(receipt);
+            Ok(())
+        } else {
+            Err(receipt)
+        }
+    })))
+    .unwrap();
+    let result = vim(&mut e, &mut parser, ".");
+    assert_eq!(result.last().unwrap().status, CommandStatus::Applied);
+    assert_eq!(bytes(&e), b"X X three");
+    assert_eq!(e.mode, Mode::Normal);
+    assert_eq!(e.document().revision(), before + 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "one command publishes exactly one receipt");
+    assert!(e.has_pending_edit_receipt());
+    assert_eq!(e.undo().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(bytes(&e), b"X X three");
+    gate.store(true, Ordering::Relaxed);
+    e.flush_edit_receipt().unwrap();
+    e.undo().unwrap();
+    assert_eq!(bytes(&e), initial);
+    e.redo().unwrap();
+    assert_eq!(bytes(&e), b"X X three");
+    let receipts = std::mem::take(&mut *accepted.lock().unwrap());
+    assert_eq!(receipts.len(), 3);
+    assert_eq!(replay_receipts(&initial, receipts), bytes(&e));
+}
+
+#[test]
+fn vim_counted_open_repeat_preserves_structural_damage_and_one_undo() {
+    let mut e = editor(b"a\nb\nc\nd\ne\nf");
+    e.set_viewport(0, 6);
+    let mut parser = Vim::default();
+    vim(&mut e, &mut parser, "o");
+    type_text(&mut e, "X", 0);
+    escape(&mut e, &mut parser);
+    let initial = bytes(&e);
+    let cursors = e.cursors().to_vec();
+    let receipts = observe(&mut e);
+    let before = e.document().revision();
+    let results = vim(&mut e, &mut parser, "2.");
+    let result = results.last().unwrap();
+    assert_eq!(bytes(&e), b"a\nX\nX\nX\nb\nc\nd\ne\nf");
+    assert!(!result.damage.full);
+    assert_eq!(result.damage.rows, vec![1, 2, 3, 4, 5], "structural rows cannot be replaced by final typing damage");
+    assert_eq!(e.mode, Mode::Normal);
+    assert_eq!(e.document().revision(), before + 1);
+    assert_eq!(receipts.lock().unwrap().len(), 1);
+    e.undo().unwrap();
+    assert_eq!(bytes(&e), initial);
+    assert_eq!(e.cursors(), cursors);
+    e.redo().unwrap();
+    let receipts = std::mem::take(&mut *receipts.lock().unwrap());
+    assert_eq!(replay_receipts(&initial, receipts), bytes(&e));
+
+    let mut scrolling = editor(b"a\nb\nc\nd\ne\nf");
+    scrolling.set_viewport(0, 3);
+    let mut parser = Vim::default();
+    vim(&mut scrolling, &mut parser, "o");
+    type_text(&mut scrolling, "X", 0);
+    escape(&mut scrolling, &mut parser);
+    let results = vim(&mut scrolling, &mut parser, "3.");
+    let damage = &results.last().unwrap().damage;
+    assert!(!damage.full);
+    assert_eq!(scrolling.top(), 2);
+    assert_eq!(damage.scroll, 2);
+    assert_eq!(damage.rows, vec![0, 1, 2], "dirty rows follow later scrolling");
+}
+
+#[test]
 fn receipts_bulk_lines_and_vim_operations_replay_atomically() {
     let initial = b"one  \n  two\t\nthree\n";
     let mut e = editor(initial);

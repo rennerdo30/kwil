@@ -252,25 +252,36 @@ impl Editor {
                 Ok(applied(damage))
             }
             "edit.repeat" => {
+                if count > 4096 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "repeat count exceeds 4096"));
+                }
                 let Some(repeat) = self.repeat.clone() else {
                     return Ok(message("no completed change to repeat"));
                 };
-                let mut result = applied(Damage::default());
-                for _ in 0..count.min(4096) {
-                    match &repeat {
-                        Repeat::Insert(bytes) => result = applied(self.insert_bytes(bytes, None)?),
-                        Repeat::Vim(command, bytes) => {
-                            result = self.execute_vim(command)?;
-                            if !bytes.is_empty() {
-                                result.damage = self.insert_bytes(bytes, Some(Duration::ZERO))?;
+                self.compound_edit(|editor| {
+                    let mut result = applied(Damage::default());
+                    for _ in 0..count {
+                        match &repeat {
+                            Repeat::Insert(bytes) => {
+                                let damage = editor.insert_bytes(bytes, None)?;
+                                editor.merge_damage(&mut result.damage, damage);
                             }
-                            self.mode = Mode::Normal;
-                            self.finish_insert();
+                            Repeat::Vim(command, bytes) => {
+                                let next = editor.execute_vim(command)?;
+                                editor.merge_damage(&mut result.damage, next.damage);
+                                result.status = next.status;
+                                if !bytes.is_empty() {
+                                    let damage = editor.insert_bytes(bytes, Some(Duration::ZERO))?;
+                                    editor.merge_damage(&mut result.damage, damage);
+                                }
+                                editor.mode = Mode::Normal;
+                                editor.finish_insert();
+                            }
                         }
                     }
-                }
-                self.repeat = Some(repeat);
-                Ok(result)
+                    editor.repeat = Some(repeat);
+                    Ok(result)
+                })
             }
             "mode.normal" => {
                 self.finish_insert();
@@ -299,10 +310,14 @@ impl Editor {
             }
             "edit.openBelow" | "edit.openAbove" => {
                 let above = call.id == "edit.openAbove";
-                self.move_cursors(if above { Motion::LineStart } else { Motion::LineEnd }, 1, false)?;
-                let damage = self.newline()?;
+                self.admit_edit()?;
+                let mut damage =
+                    self.move_cursors(if above { Motion::LineStart } else { Motion::LineEnd }, 1, false)?;
+                let newline = self.newline()?;
+                self.merge_damage(&mut damage, newline);
                 if above {
-                    self.move_cursors(Motion::Up, 1, false)?;
+                    let moved = self.move_cursors(Motion::Up, 1, false)?;
+                    self.merge_damage(&mut damage, moved);
                 }
                 self.start_insert(Some(call.clone()));
                 self.join_insert = true;

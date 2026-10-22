@@ -17,6 +17,8 @@ use std::{
 
 mod commands;
 mod hex;
+mod compound;
+use compound::CompoundEdit;
 pub(crate) mod receipts;
 mod save;
 use receipts::{EditKind, ReceiptState, Recipe, Transition};
@@ -217,6 +219,7 @@ pub struct Editor {
     saving: bool,
     box_column: Option<u64>,
     receipts: ReceiptState,
+    compound: Option<CompoundEdit>,
 }
 
 impl Editor {
@@ -242,6 +245,7 @@ impl Editor {
             saving: false,
             box_column: None,
             receipts: ReceiptState::default(),
+            compound: None,
         }
     }
     pub fn document(&self) -> &Document {
@@ -485,6 +489,10 @@ impl Editor {
         let first_row = text::row(&snapshot, plan[0].range.start)?;
         let last_row = text::row(&snapshot, plan.last().unwrap().range.end)?;
         let recipe = Recipe::explicit(&plan);
+        let compound = self.compound.is_some();
+        if let Some(compound) = &mut self.compound {
+            compound.add(&plan)?;
+        }
         let merged_recipe = self.undo.back().and_then(|entry| entry.transition.recipe.coalesced(&recipe));
         let coalesce = typing.is_some_and(|at| {
             self.join_insert
@@ -492,18 +500,24 @@ impl Editor {
                     *cursors == self.cursors && at.checked_sub(*previous).is_some_and(|gap| gap <= BURST_GAP)
                 })
         }) && merged_recipe.is_some();
-        self.document.buffer.begin();
+        if !compound {
+            self.document.buffer.begin();
+        }
         for edit in plan.iter().rev() {
             let result = (|| {
                 self.document.buffer.delete(edit.range.clone())?;
                 edit.insert.apply(&mut self.document.buffer, edit.range.start)
             })();
             if let Err(error) = result {
-                self.document.buffer.cancel();
+                if !compound {
+                    self.document.buffer.cancel();
+                }
                 return Err(error);
             }
         }
-        self.document.buffer.commit_coalesced(coalesce);
+        if !compound {
+            self.document.buffer.commit_coalesced(coalesce);
+        }
         for c in &mut self.cursors {
             if caret_at_end {
                 let selection = c.selection();
@@ -528,8 +542,15 @@ impl Editor {
             c.desired_column = None;
         }
         self.normalize();
-        self.document.changed();
+        if !compound {
+            self.document.changed();
+        }
         self.box_column = None;
+        if compound {
+            let delta = self.document.buffer.line_count() as i128 - snapshot.line_count() as i128;
+            let end = if delta != 0 { self.top + self.rows as u64 } else { last_row + 1 };
+            return self.finish_damage(old_rows, Some(first_row..end));
+        }
         let after = self.state();
         let transition = Transition { before: snapshot.clone(), after: self.document.snapshot(), recipe };
         let structural = snapshot.line_count() != self.document.buffer.line_count();
@@ -579,6 +600,9 @@ impl Editor {
     where
         I: DoubleEndedIterator<Item = io::Result<Option<Edit>>> + Clone + Send + Sync + 'static,
     {
+        if self.compound.is_some() {
+            return Err(io::Error::other("bulk edits cannot nest inside a compound repeat"));
+        }
         self.admit_edit()?;
         let recipe_seed = edits.clone();
         let mut replacement_count = 0;

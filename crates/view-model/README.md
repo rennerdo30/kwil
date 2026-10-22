@@ -14,6 +14,16 @@ Large line operations retain immutable piece ranges rather than copying their
 contents. Literal occurrence search, bracket matching, cursor count, column
 sampling and repeat payloads have explicit bounds.
 
+Dot repeat admits once and stages its sub-operations in one transaction. One
+completed command publishes one revision/undo entry/receipt; a failure restores
+text, cursors, modes, registers, repeat state and history. Damage merges across
+every sub-operation, transporting dirty rows through later viewport scrolls.
+Replacement composition merges touching/overlapping net spans and retains at
+most 4096 disjoint spans. A command exceeding that explicit metadata limit is
+refused and rolled back in full. Repeat counts through 4096 are supported;
+larger counts are refused explicitly, never silently truncated. There is no
+file-byte cap and no UI-thread spool I/O.
+
 ## Save and undo
 
 Call `save_request`, send the returned immutable snapshot to

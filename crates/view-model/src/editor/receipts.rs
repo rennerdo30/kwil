@@ -178,6 +178,9 @@ pub(super) struct ReceiptState {
 }
 impl Editor {
     pub(super) fn admit_edit(&mut self) -> io::Result<()> {
+        if self.compound.is_some() {
+            return Ok(());
+        }
         self.flush_edit_receipt()?;
         if self.has_pending_save_completion() {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "finish the retained save completion first"))
