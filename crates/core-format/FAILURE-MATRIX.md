@@ -1,6 +1,6 @@
-# Formatter preservation audit after four review rounds
+# Formatter preservation audit after five review rounds
 
-Base audited: `9ade72ae2c5465c528a268a56d681c2592482466` plus the round-4 changes
+Base audited: `4540af270c4e3b08387549f6f66c0d2ebbde9360` plus the round-5 changes
 in this commit. Every prior failure class below retains its existing contracts;
 none was removed or weakened. This is a source audit and test map, not a claim
 that local tests replace macOS/Linux CI or prove every language grammar.
@@ -26,8 +26,11 @@ that local tests replace macOS/Linux CI or prove every language grammar.
 | R4 Unicode SQL name exposes an ASCII keyword suffix | Consume the complete atom first; refuse non-ASCII dialect rules before any keyword classification; never split a name | `round4_regressions::sql_unicode_identifier_atoms_are_not_split_into_keywords` |
 | R4 physical LF in an unparsed heredoc header mistaken for lexical NEWLINE | Changed approach: only a fully validated simple header admits body scanning; any other token protects the entire suffix, independent of fixture text | `round4_regressions::{shell_heredoc_header_requires_a_proven_lexical_newline,uncertain_heredoc_headers_preserve_literals_with_every_tidy_option}` |
 | R4 conservative SQL admission must retain proven Unicode literal/comment support | Refusal applies only outside recognized quote/comment spans | `round4_regressions::sql_unicode_literals_and_comments_still_format` |
+| R5 SQL parameter/variable names expose reserved words | Refuse ambiguous `:`, `@`, `?` introducers outside literal/comment spans before they can bind a keyword-looking name | `round5_regressions::sql_parameter_names_are_not_keyword_tokens` |
+| R5 Oracle alternative quoting mistaken for ordinary quotes | Refuse atoms adjoining quote delimiters (optionally via `&`) without inferring a dialect; no formatted replacement is returned | `round5_regressions::sql_prefixed_literals_are_preserved_or_refused` |
+| R5 C++ spliced block-comment terminator hides a later raw string opener | Backslash/trigraph syntax in a C/C++ block comment protects the entire uncertain suffix through EOF; raw-byte comment termination is no longer guessed | `round5_regressions::cpp_spliced_block_comments_cannot_hide_raw_string_openers` |
 
 The existing malformed-input, UTF-8, input/output cap, nesting, selection offset,
 external timeout/error and one-replacement contracts remain part of the focused
-formatter suite. R4 changes neither the process-tree code nor the public admission
+formatter suite. R5 changes neither the process-tree code nor the public admission
 ceilings. The parent retains independent review, cross-platform CI and merge.

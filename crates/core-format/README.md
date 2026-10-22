@@ -60,9 +60,13 @@ input ceiling; a lower output limit is checked after its serialization.
   full language grammar. SQL also preserves bracket and dollar-quoted content.
   SQL retains original whitespace separators so newline-concatenated literals
   remain concatenated, and supports nested block comments.
-  A `#` outside a literal/comment is refused with a dialect explanation: MySQL
-  treats it as a comment, while other dialects use it in operators/identifiers.
-  A configured external formatter can handle the selected dialect explicitly.
+  Unproven SQL constructs outside literals/comments are refused with a dialect
+  explanation and no returned edit: `#` has dialect-specific comment/operator
+  meanings, and `:`, `@`, `?` can introduce parameters or variables. Complete
+  atoms adjoining quotes (optionally through `&`) are refused too, because their
+  literal delimiters/escapes require an explicit dialect. This includes Oracle
+  alternative quoting; an ordinary quoted-string scanner must not guess its end.
+  A configured external formatter can handle that dialect explicitly.
   SQL keyword classification operates on complete identifier/number atoms. An
   unquoted non-ASCII atom is refused before keyword classification because this
   formatter has no selected dialect's Unicode identifier rules. Unicode quoted
@@ -93,6 +97,9 @@ input ceiling; a lower output limit is checked after its serialization.
   quoted argument, continuation or substitution must never start a body scan.
   JS/TS comments terminate at U+2028/U+2029 as well as CR/LF. Shell uses only LF
   as a structural ending: bare CR and the CR in CRLF retain their argument bytes.
+  C/C++ block comments encountering backslash or trigraph syntax protect the
+  suffix: translation-phase line splicing can change where the comment closes
+  and expose later raw-string openers that a raw-byte scan would otherwise hide.
   Comments are preserved too (trimming them is allowed by policy, but not needed).
   Boundary references: [PHP heredoc expressions](https://www.php.net/manual/en/language.types.string.php#language.types.string.syntax.heredoc),
   [PHP attributes](https://www.php.net/manual/en/language.attributes.syntax.php),
@@ -178,6 +185,8 @@ sources are restored in `finally`. Obtain the shared Cargo lane before running i
 `verify-round4-fail-first.ps1` runs against unchanged `9ade72a`: Unicode SQL
 identifier and uncertain-header tests must fail (three failures); the Unicode
 SQL literal/comment control must pass. It restores sources in `finally` too.
+`verify-round5-fail-first.ps1` requires all three parameter/prefixed-literal/C++
+comment-splice regressions to fail on unchanged `4540af2`, then restores sources.
 
 One-shot measurement (run only when authorized):
 

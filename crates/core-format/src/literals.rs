@@ -166,7 +166,13 @@ impl Scanner<'_> {
         let mut depth = 1;
         let mut i = start + 2;
         while i < self.text.len() {
-            if self.text[i..].starts_with("*/") {
+            if self.kind == Kind::C && (self.text.as_bytes()[i] == b'\\' || self.text[i..].starts_with("??")) {
+                // C/C++ translation phases splice lines before recognizing
+                // comments. A raw-byte lexer cannot prove the closing boundary
+                // after such input; preserve the suffix rather than hide later
+                // string openers inside a falsely extended comment span.
+                return self.uncertain();
+            } else if self.text[i..].starts_with("*/") {
                 depth -= 1;
                 i += 2;
                 if depth == 0 {

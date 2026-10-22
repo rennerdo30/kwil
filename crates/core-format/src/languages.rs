@@ -641,13 +641,14 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
             continue;
         }
         let start = i;
-        if sql && b[i] == b'#' {
+        if sql && matches!(b[i], b'#' | b':' | b'@' | b'?') {
             // MySQL starts a line comment here; other dialects use # in
-            // operators or temporary identifiers. Without a selected dialect,
-            // refusing the edit is safer than exposing comment text as code.
+            // operators or temporary identifiers. Parameter/variable prefixes
+            // likewise bind names that must never be classified as keywords.
+            // Abort the entire edit when their dialect grammar is unproven.
             return Err(FormatError::new(
                 "SQL",
-                "ambiguous '#' token; configure an external formatter for this dialect",
+                format!("ambiguous '{}' token; configure an external formatter for this dialect", b[i] as char),
                 line_at(b, i),
             ));
         }
@@ -718,6 +719,17 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
                 return Err(FormatError::new(
                     "SQL",
                     "Unicode identifier requires an explicit dialect; configure an external formatter",
+                    line_at(b, start),
+                ));
+            }
+            let next = if b.get(i) == Some(&b'&') { i + 1 } else { i };
+            if b.get(next).is_some_and(|c| matches!(c, b'\'' | b'"' | b'`')) {
+                // An atom adjoining a quote (optionally via &) may introduce a
+                // dialect-specific literal with different delimiters/escapes.
+                // Do not guess its interior or classify any fragment as SQL.
+                return Err(FormatError::new(
+                    "SQL",
+                    "prefixed literal requires an explicit dialect; configure an external formatter",
                     line_at(b, start),
                 ));
             }

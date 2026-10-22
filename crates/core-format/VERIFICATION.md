@@ -180,3 +180,30 @@ benchmark or full workspace test suite ran locally. Exact input provenance is in
 `round4-clippy.log` identify their source commit on the first line, all beneath
 that target directory. Native macOS/Linux and full workspace evidence belongs to
 CI; the parent still owns independent review and merge.
+
+## Review round 5 source candidate (2026-10-23)
+
+Base: `4540af270c4e3b08387549f6f66c0d2ebbde9360`, same isolated `fix-7b`.
+Three new P1 findings extend the conservative admission policy:
+
+- Unquoted SQL `:`, `@`, `?` syntax is refused with the same explicit dialect
+  explanation as `#`. Names bound to parameter/variable introducers can never
+  be mistaken for standalone keywords such as `from`.
+- Complete SQL atoms adjoining quote delimiters, optionally through `&`, are
+  refused before ordinary string scanning. This covers Oracle alternative
+  quoting and other unproven prefixed literal grammars without inferring each
+  dialect's delimiters or escapes. The error returns no edit for the document.
+- C/C++ block comments containing backslash/trigraph syntax protect the entire
+  uncertain suffix through EOF: translation-phase splicing can change where
+  the comment closes and expose raw strings hidden from a physical-byte scan.
+
+All **53 earlier contracts** remain unchanged. Three new tests and
+`verify-round5-fail-first.ps1` are prepared against unchanged `4540af2`.
+`FAILURE-MATRIX.md` now maps all R1-R5 findings to their preservation boundaries
+and tests. The pending finite block is fail-first, restored focused formatter
+tests, workspace Clippy and fmt, with exact hash/mtime provenance.
+
+**Validation pending parent Cargo grant after settings/parent:** no Cargo, test,
+Clippy, full suite or native process has started for this source candidate.
+Standalone rustfmt passed (PID **65760**, exit 0); `git diff --check` passed.
+This source candidate is not a passing claim or permission to merge.
