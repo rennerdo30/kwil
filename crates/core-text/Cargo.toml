@@ -8,3 +8,6 @@ publish = false
 [dependencies]
 memchr = "2.8.3"
 memmap2 = "0.9.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

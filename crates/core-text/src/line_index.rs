@@ -21,6 +21,24 @@ struct ChunkResult {
 }
 
 impl LineIndex {
+    /// Continues an append-only file from its previously indexed length.
+    /// `bytes` is the complete new view; only `bytes[from_len..]` is scanned.
+    /// The caller must ensure the old prefix is unchanged. Truncation or
+    /// replacement requires a fresh build. New checkpoints use DEFAULT_EVERY.
+    pub fn extend(&mut self, bytes: &[u8], from_len: u64) {
+        assert_eq!(from_len, self.len, "extension must start at the indexed length");
+        assert!(from_len <= bytes.len() as u64, "cannot extend a truncated file");
+        for pos in memchr_iter(b'\n', &bytes[from_len as usize..]) {
+            // The old final (possibly partial or empty) line already counts.
+            self.line_count += 1;
+            let line = self.line_count - 1;
+            if line.is_multiple_of(DEFAULT_EVERY) {
+                self.checkpoints.push((line, from_len + pos as u64 + 1));
+            }
+        }
+        self.len = bytes.len() as u64;
+    }
+
     /// Builds the index with up to `threads` worker threads. `progress`
     /// receives the number of bytes scanned so far.
     pub fn build(bytes: &[u8], every: u64, threads: usize, progress: &AtomicU64) -> Self {
@@ -99,5 +117,53 @@ impl LineIndex {
         }
         let tail = &bytes[off as usize..self.len as usize];
         memchr_iter(b'\n', tail).nth((skip - 1) as usize).map(|p| off + p as u64 + 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extend_matches_fresh_after_appends() {
+        for initial in [b"".as_slice(), b"partial", b"one\n", b"one\r\npartial"] {
+            let mut bytes = initial.to_vec();
+            let mut index = LineIndex::build_chunked(&bytes, 3, 7, 2, &AtomicU64::new(0));
+            let original = index.checkpoints.clone();
+            for append in [b" suffix".as_slice(), b"\r", b"\nnext\n", b"", &b"row\n".repeat(4097), b"end"] {
+                let from = bytes.len() as u64;
+                bytes.extend_from_slice(append);
+                index.extend(&bytes, from);
+                let fresh = LineIndex::build(&bytes, DEFAULT_EVERY, 2, &AtomicU64::new(0));
+                assert_eq!(index.line_count(), fresh.line_count());
+                for line in 0..=fresh.line_count() {
+                    assert_eq!(index.line_start(&bytes, line), fresh.line_start(&bytes, line), "line {line}");
+                }
+                assert!(index.checkpoints.starts_with(&original));
+                assert!(index.checkpoint_count() <= original.len() + (index.line_count() / DEFAULT_EVERY) as usize);
+            }
+            // Existing checkpoint lookups do not depend on rescanning the old
+            // prefix during extend: deliberately hide its newlines from extend.
+            let old_len = bytes.len() as u64;
+            bytes.fill(b'x');
+            bytes.push(b'\n');
+            let count = index.line_count();
+            index.extend(&bytes, old_len);
+            assert_eq!(index.line_count(), count + 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "extension must start at the indexed length")]
+    fn extend_rejects_wrong_offset() {
+        let mut index = LineIndex::build(b"a", 1024, 1, &AtomicU64::new(0));
+        index.extend(b"ab", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot extend a truncated file")]
+    fn extend_rejects_truncation() {
+        let mut index = LineIndex::build(b"abc", 1024, 1, &AtomicU64::new(0));
+        index.extend(b"a", 3);
     }
 }
