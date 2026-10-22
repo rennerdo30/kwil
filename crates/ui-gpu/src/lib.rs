@@ -13,6 +13,7 @@ mod font;
 mod hit;
 mod input;
 mod scrollbar;
+mod tabs;
 
 use font::Font;
 use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View, Workspace};
@@ -220,6 +221,7 @@ mod input_dispatch_tests {
 
 struct App {
     view: Workspace,
+    frontend_document: kwil_view_model::SessionDocumentId,
     opts: GuiOptions,
     proxy: EventLoopProxy<UserEvent>,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
@@ -253,6 +255,9 @@ struct App {
     font_reload_pending: bool,
     redraw_requested: bool,
     settings_loaded: bool,
+    body_pixels: Vec<u32>,
+    chrome_frame: Option<tabs::Frame>,
+    chrome_dirty: bool,
     #[cfg(feature = "frame-harness")]
     metrics: harness::Metrics,
 }
@@ -297,8 +302,11 @@ pub fn run_with_external_open(
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GUI closed"))
     });
     let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
+    let frontend_document = view.active_id();
+    let horizontal = view.horizontal_origin();
     let mut app = App {
         view,
+        frontend_document,
         opts,
         proxy,
         on_first_frame: Some(on_first_frame),
@@ -312,7 +320,7 @@ pub fn run_with_external_open(
         mods: ModifiersState::empty(),
         pending: Damage::default(),
         error: None,
-        horizontal: 0,
+        horizontal,
         pointer: (0, 0),
         drag: None,
         started: std::time::Instant::now(),
@@ -332,6 +340,9 @@ pub fn run_with_external_open(
         font_reload_pending: false,
         redraw_requested: false,
         settings_loaded: false,
+        body_pixels: Vec::new(),
+        chrome_frame: None,
+        chrome_dirty: true,
         #[cfg(feature = "frame-harness")]
         metrics: Default::default(),
     };
@@ -348,16 +359,21 @@ impl App {
     }
 
     fn text_rows(&self) -> usize {
-        self.size.1.saturating_sub(self.ch() + BAR) / self.ch()
+        self.body_area().height.saturating_sub(BAR) / self.ch()
+    }
+
+    fn body_area(&self) -> kwil_view_model::TabArea {
+        tabs::body(self.size, self.font.as_ref().map_or(8, |font| font.cw), self.ch(), self.settings.tabs.layout)
     }
 
     fn columns(&self) -> u64 {
         let cw = self.font.as_ref().map_or(8, |f| f.cw);
-        (self.size.0.saturating_sub(BAR + GUTTER_COLS * cw) / cw) as u64
+        (self.body_area().width.saturating_sub(BAR + GUTTER_COLS * cw) / cw) as u64
     }
 
     fn bars(&self) -> (scrollbar::Bar, scrollbar::Bar) {
-        let height = self.size.1.saturating_sub(self.ch() + BAR);
+        let body = self.body_area();
+        let height = body.height.saturating_sub(BAR);
         let (page, total) =
             horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize);
         (
@@ -368,7 +384,7 @@ impl App {
                 self.view.line_count().unwrap_or(self.view.rows() as u64),
                 self.view.top(),
             ),
-            scrollbar::Bar::new(0, self.size.0.saturating_sub(BAR), page, total, self.horizontal),
+            scrollbar::Bar::new(0, body.width.saturating_sub(BAR), page, total, self.horizontal),
         )
     }
 
@@ -389,9 +405,13 @@ impl App {
     }
 
     fn pointer_down(&mut self) {
-        let (x, y) = self.pointer;
+        let body = self.body_area();
+        if !body.contains(self.pointer.0, self.pointer.1) {
+            return;
+        }
+        let (x, y) = (self.pointer.0 - body.x, self.pointer.1 - body.y);
         let (v, h) = self.bars();
-        let vertical = x >= self.size.0.saturating_sub(BAR) && y < v.length;
+        let vertical = x >= body.width.saturating_sub(BAR) && y < v.length;
         let horizontal = y >= v.length && y < v.length + BAR && x < h.length;
         if !vertical && !horizontal {
             return;
@@ -409,7 +429,7 @@ impl App {
     }
 
     fn apply(&mut self, d: Damage) {
-        if d == Damage::default() {
+        if d == Damage::default() && !self.chrome_dirty {
             return;
         }
         queue_damage(&mut self.pending, d, self.view.rows(), self.font.as_mut());
@@ -432,6 +452,20 @@ impl App {
         if self.opts.hidden && matches!(ev.logical_key, Key::Named(NamedKey::F12)) {
             self.save();
             return;
+        }
+        #[cfg(all(feature = "frame-harness", debug_assertions))]
+        if self.opts.hidden {
+            let command = match ev.logical_key {
+                Key::Named(NamedKey::F11) => Some("file.new"),
+                Key::Named(NamedKey::F10) => Some("file.nextTab"),
+                Key::Named(NamedKey::F9) => Some("file.previousTab"),
+                Key::Named(NamedKey::F8) => Some("file.close"),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.dispatch_file(command);
+                return;
+            }
         }
         if self.save_path.is_some() {
             match &ev.logical_key {
@@ -643,12 +677,14 @@ impl App {
     }
 
     fn place_caret(&mut self, extend: bool) {
+        let body = self.body_area();
         let Some(font) = &self.font else {
             return;
         };
-        let row = self.view.top() + (self.pointer.1 / font.ch).min(self.view.rows().saturating_sub(1)) as u64;
+        let row = self.view.top()
+            + (self.pointer.1.saturating_sub(body.y) / font.ch).min(self.view.rows().saturating_sub(1)) as u64;
         let screen_row = row.saturating_sub(self.view.top()) as usize;
-        let column = self.pointer.0.saturating_sub(GUTTER_COLS * font.cw) / font.cw;
+        let column = self.pointer.0.saturating_sub(body.x + GUTTER_COLS * font.cw) / font.cw;
         let columns = self.columns() as usize;
         let bytes = self.view.line(screen_row).unwrap_or_default();
         let cells = text::cells(bytes, columns, self.settings.editor.tab_size as usize);
@@ -687,120 +723,139 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
-        if self.pending == Damage::default() {
+        if self.pending == Damage::default() && !self.chrome_dirty {
             return true;
         }
         let (w, h) = self.size;
-        let bars = self.bars();
-        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
-        if w == 0 || h < font.ch {
+        let (cw, ch) = (self.font.as_ref().map_or(8, |f| f.cw), self.ch());
+        if w == 0 || h < ch {
             return true;
         }
-        let buf = &mut gfx.pixels;
+        let frame = tabs::frame(&self.view, self.size, cw, ch, self.settings.tabs.layout);
+        let geometry = frame.geometry.clone();
+        let chrome_changed = self.chrome_dirty || self.chrome_frame.as_ref() != Some(&frame);
+        self.chrome_frame = Some(frame);
+        self.chrome_dirty = false;
+        let body = geometry.body;
+        let (bw, bh) = (body.width, body.height);
+        self.body_pixels.resize(bw.saturating_mul(bh), BG);
+        let bars = self.bars();
+        let rows = geometry.text.height / ch;
+        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
+        let pixels = &mut gfx.pixels;
+        let body_pixels = &mut self.body_pixels;
         let mut p = std::mem::take(&mut self.pending);
-        let ch = font.ch;
-        let rows = h.saturating_sub(ch + BAR) / ch;
-        let mut damage: Vec<Rect> = Vec::new();
+        let mut damage = Vec::new();
         #[cfg(feature = "frame-harness")]
         let mut copied = 0u64;
-
+        let body_changed = p.full || p.scroll != 0 || !p.rows.is_empty();
         if p.full {
             font.invalidate_rows();
-            fill(buf, w, Rect { x: 0, y: 0, w, h }, BG);
-            for r in 0..rows {
-                draw_row(buf, w, font, &self.view, r, self.horizontal);
-                draw_editor_marks(buf, w, font, &self.view, r, self.view.line_offset(r));
+            pixels.fill(BG);
+            body_pixels.fill(BG);
+            for row in 0..rows {
+                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal);
+                draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
             }
+            tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             p.status = true;
             damage.push(Rect { x: 0, y: 0, w, h });
         } else {
-            if p.scroll != 0 {
-                let d = p.scroll.unsigned_abs() as usize;
-                let keep = (rows - d) * ch;
-                if p.scroll > 0 {
-                    buf.copy_within(d * ch * w..(d * ch + keep) * w, 0);
-                    if !screen_copy(&gfx.window, gfx.hwnd, w.saturating_sub(BAR), keep, d * ch, 0) {
-                        damage.push(Rect { x: 0, y: 0, w, h: keep });
-                    }
-                    #[cfg(feature = "frame-harness")]
-                    {
-                        copied = (w * keep) as u64;
-                    }
-                } else {
-                    buf.copy_within(0..keep * w, d * ch * w);
-                    if !screen_copy(&gfx.window, gfx.hwnd, w.saturating_sub(BAR), keep, 0, d * ch) {
-                        damage.push(Rect { x: 0, y: d * ch, w, h: keep });
-                    }
-                    #[cfg(feature = "frame-harness")]
-                    {
-                        copied = (w * keep) as u64;
-                    }
+            if let Some((source, target)) = geometry.scroll_copy(p.scroll) {
+                let dy = p.scroll.unsigned_abs() as usize * ch;
+                let keep = source.height;
+                let (from, to) = if p.scroll > 0 { (dy, 0) } else { (0, dy) };
+                body_pixels.copy_within(from * bw..(from + keep) * bw, to * bw);
+                let moved = Rect { x: 0, y: to, w: bw, h: keep };
+                tabs::composite(body_pixels, bw, pixels, w, body, moved);
+                if !screen_copy_region(&gfx.window, gfx.hwnd, source, target) {
+                    damage.push(tabs::rect(target));
+                }
+                #[cfg(feature = "frame-harness")]
+                {
+                    copied = (source.width * source.height) as u64;
                 }
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for &r in p.rows.iter().filter(|&&r| r < rows) {
-                draw_row(buf, w, font, &self.view, r, self.horizontal);
-                draw_editor_marks(buf, w, font, &self.view, r, self.view.line_offset(r));
-                damage.push(Rect { x: 0, y: r * ch, w, h: ch });
+            for &row in p.rows.iter().filter(|&&r| r < rows) {
+                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal);
+                draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
+                let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
+                tabs::composite(body_pixels, bw, pixels, w, body, area);
+                damage.push(tabs::translated(area, body));
+            }
+        }
+        if p.full || chrome_changed {
+            tabs::draw(self.chrome_frame.as_ref().unwrap(), pixels, w, font);
+            if !p.full {
+                damage.push(tabs::rect(geometry.chrome));
             }
         }
         if p.status {
-            let status_height = ch.min(h);
-            let sr = Rect { x: 0, y: h - status_height, w, h: status_height };
-            fill(buf, w, sr, STATUS_BG);
-            let cols = w / font.cw;
+            let height = ch.min(h);
+            let area = Rect { x: 0, y: h - height, w, h: height };
+            fill(pixels, w, area, STATUS_BG);
             draw_text(
-                buf,
+                pixels,
                 w,
                 font,
                 font.cw,
-                sr.y,
+                area.y,
                 self.view.status_text().as_bytes(),
-                cols.saturating_sub(2),
+                (w / font.cw).saturating_sub(2),
                 STATUS_FG,
                 STATUS_BG,
             );
             if !p.full {
-                damage.push(sr);
+                damage.push(area);
             }
         }
-        // Scrollbars do not move with the text. Repaint them after every copy.
-        let (v, horizontal) = bars;
-        let vr = Rect { x: w.saturating_sub(BAR), y: 0, w: BAR.min(w), h: v.length };
-        let hr = Rect { x: 0, y: v.length, w, h: BAR.min(h.saturating_sub(v.length)) };
-        fill(buf, w, vr, GUTTER_BG);
-        fill(buf, w, hr, GUTTER_BG);
-        if v.maximum > 0 {
-            fill(
-                buf,
-                w,
-                Rect { x: vr.x + 2.min(vr.w), y: v.thumb_start, w: vr.w.saturating_sub(4), h: v.thumb_length },
-                GUTTER_FG,
-            );
+        if body_changed || p.status {
+            let (vertical, horizontal) = bars;
+            let vr = Rect { x: bw.saturating_sub(BAR), y: 0, w: BAR.min(bw), h: vertical.length };
+            let hr = Rect { x: 0, y: vertical.length, w: bw, h: BAR.min(bh.saturating_sub(vertical.length)) };
+            fill(body_pixels, bw, vr, GUTTER_BG);
+            fill(body_pixels, bw, hr, GUTTER_BG);
+            if vertical.maximum > 0 {
+                fill(
+                    body_pixels,
+                    bw,
+                    Rect {
+                        x: vr.x + 2.min(vr.w),
+                        y: vertical.thumb_start,
+                        w: vr.w.saturating_sub(4),
+                        h: vertical.thumb_length,
+                    },
+                    GUTTER_FG,
+                );
+            }
+            if horizontal.maximum > 0 {
+                fill(
+                    body_pixels,
+                    bw,
+                    Rect {
+                        x: horizontal.thumb_start,
+                        y: hr.y + 2.min(hr.h),
+                        w: horizontal.thumb_length,
+                        h: hr.h.saturating_sub(4),
+                    },
+                    GUTTER_FG,
+                );
+            }
+            for area in [vr, hr] {
+                tabs::composite(body_pixels, bw, pixels, w, body, area);
+                if !p.full {
+                    damage.push(tabs::translated(area, body));
+                }
+            }
         }
-        if horizontal.maximum > 0 {
-            fill(
-                buf,
-                w,
-                Rect {
-                    x: horizontal.thumb_start,
-                    y: hr.y + 2.min(hr.h),
-                    w: horizontal.thumb_length,
-                    h: hr.h.saturating_sub(4),
-                },
-                GUTTER_FG,
-            );
-        }
-        if !p.full {
-            damage.extend([vr, hr]);
-        }
-        let rects: Vec<_> = damage.iter().filter_map(|r| r.to_softbuffer()).collect();
+        let rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
         if !self.policy.remote()
             && let Some(gpu) = &mut self.gpu
         {
-            gpu.update(buf, (w, h), &damage, p.scroll, ch, rows);
+            gpu.update_body(pixels, (w, h), &damage, p.scroll, ch, rows, Some(tabs::rect(geometry.text)));
         }
         if !rects.is_empty() {
             let mut target = match gfx.surface.buffer_mut() {
@@ -810,17 +865,15 @@ impl App {
                     return false;
                 }
             };
-            // Retain a canonical framebuffer: Wayland/macOS may rotate or
-            // replace buffers. Age never forces re-layout or glyph repaint.
-            if target.len() != buf.len() {
+            if target.len() != pixels.len() {
                 self.error = Some(GuiError::Unavailable("CPU surface resize failed".into()));
                 return false;
             }
-            target.copy_from_slice(buf);
+            target.copy_from_slice(pixels);
             match target.present_with_damage(&rects) {
                 Ok(()) => {
                     #[cfg(feature = "frame-harness")]
-                    self.metrics.present(p.full, damage.iter().map(|r| (r.w * r.h) as u64).sum(), copied);
+                    self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
                 }
                 Err(error) => {
                     self.error = Some(GuiError::Unavailable(error.to_string()));
@@ -1101,26 +1154,46 @@ fn copy_tile(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: us
 /// a copy instead of new pixels. Returns false where unsupported; the caller
 /// then presents the moved area as damage.
 #[cfg(windows)]
-fn screen_copy(_window: &Window, hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> bool {
+fn screen_copy_region(
+    _window: &Window,
+    hwnd: isize,
+    source: kwil_view_model::TabArea,
+    target: kwil_view_model::TabArea,
+) -> bool {
     use windows_sys::Win32::Graphics::Gdi::{BitBlt, GetDC, ReleaseDC, SRCCOPY};
     unsafe {
         let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
         let dc = GetDC(hwnd);
-        let ok = BitBlt(dc, 0, to_y as i32, w as i32, h as i32, dc, 0, from_y as i32, SRCCOPY) != 0;
+        let ok = BitBlt(
+            dc,
+            target.x as i32,
+            target.y as i32,
+            source.width as i32,
+            source.height as i32,
+            dc,
+            source.x as i32,
+            source.y as i32,
+            SRCCOPY,
+        ) != 0;
         ReleaseDC(hwnd, dc);
         ok
     }
 }
 
 #[cfg(not(windows))]
-fn screen_copy(window: &Window, _hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> bool {
+fn screen_copy_region(
+    window: &Window,
+    _hwnd: isize,
+    source: kwil_view_model::TabArea,
+    target: kwil_view_model::TabArea,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
-        platform::x11_copy(window, w, h, from_y, to_y)
+        platform::x11_copy(window, source.x, source.width, source.height, source.y, target.y)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (window, w, h, from_y, to_y);
+        let _ = (window, source, target);
         false
     }
 }
@@ -1290,7 +1363,13 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
-                glyph_damage(font, tile, self.view.rows())
+                if matches!(tile.key.bg, tabs::ACTIVE | tabs::INACTIVE) {
+                    font.accept(tile);
+                    self.chrome_dirty = true;
+                    Damage::default()
+                } else {
+                    glyph_damage(font, tile, self.view.rows())
+                }
             }
             UserEvent::SessionChanged(detected) => {
                 #[cfg(feature = "gpu")]
@@ -1318,7 +1397,16 @@ impl ApplicationHandler<UserEvent> for App {
                 let font_changed =
                     settings.font.family != self.settings.font.family || settings.font.size != self.settings.font.size;
                 let tabs_changed = settings.editor.tab_size != self.settings.editor.tab_size;
+                let layout_changed = settings.tabs.layout != self.settings.tabs.layout;
                 self.settings = *settings;
+                self.view.set_session_restore(self.settings.files.restore_session);
+                if layout_changed {
+                    self.chrome_dirty = true;
+                    let rows = self.text_rows();
+                    let damage = self.view.set_rows(rows);
+                    self.apply(damage);
+                    self.keep_caret_visible();
+                }
                 self.keys =
                     kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
                 if let Some(editor) = self.view.editor_mut() {
@@ -1424,22 +1512,52 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
                 if let Some((vertical, grab)) = self.drag {
                     let (v, h) = self.bars();
-                    let (bar, pixel) = if vertical { (v, self.pointer.1) } else { (h, self.pointer.0) };
+                    let body = self.body_area();
+                    let (bar, pixel) = if vertical {
+                        (v, self.pointer.1.saturating_sub(body.y))
+                    } else {
+                        (h, self.pointer.0.saturating_sub(body.x))
+                    };
                     self.scroll_bar(vertical, bar.drag(pixel, grab));
                 } else if self.selecting {
                     self.place_caret(true);
                 }
+                if self.drag.is_some() || self.selecting {
+                    self.view.checkpoint_session();
+                }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if state == ElementState::Pressed {
+                    let cw = self.font.as_ref().map_or(8, |f| f.cw);
+                    let geometry = self.view.tab_geometry(
+                        kwil_view_model::TabMetrics {
+                            width: self.size.0,
+                            height: self.size.1,
+                            cell_width: cw,
+                            cell_height: self.ch(),
+                            scrollbar: BAR,
+                        },
+                        self.settings.tabs.layout,
+                    );
+                    if let Some(action) = geometry.hit(self.pointer.0, self.pointer.1) {
+                        if let Err(error) = self.view.tab_action(action, &geometry) {
+                            self.view.set_notice(error.to_string());
+                        }
+                        self.sync_file_ui();
+                        self.apply(Damage { full: true, status: true, ..Default::default() });
+                        return;
+                    }
                     self.pointer_down();
+                    let body = self.body_area();
                     if self.drag.is_none()
-                        && self.pointer.0 < self.size.0.saturating_sub(BAR)
-                        && self.pointer.1 < self.bars().0.length
+                        && body.contains(self.pointer.0, self.pointer.1)
+                        && self.pointer.0 - body.x < body.width.saturating_sub(BAR)
+                        && self.pointer.1 - body.y < self.bars().0.length
                     {
                         self.selecting = true;
                         self.place_caret(self.mods.shift_key());
                     }
+                    self.view.checkpoint_session();
                 } else {
                     self.drag = None;
                     self.selecting = false;
@@ -1491,6 +1609,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let d = self.view.scroll(vertical);
                     self.apply(d);
                 }
+                self.view.checkpoint_session();
             }
             _ => {}
         }
@@ -1558,6 +1677,7 @@ impl App {
         });
     }
     fn activate_unicode(&mut self, tabs_changed: bool) {
+        self.chrome_dirty = true;
         let proxy = self.proxy.clone();
         if let Some(font) = self.font.as_mut() {
             font.tab_size = self.settings.editor.tab_size as usize;

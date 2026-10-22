@@ -27,17 +27,6 @@ pub(super) fn key(view: &mut Workspace, key: KeyEvent) -> KeyResult {
     KeyResult::Changed(true)
 }
 
-pub(super) fn draw(frame: &mut ratatui::Frame, workspace: &Workspace) {
-    super::draw(frame, workspace);
-    let area = frame.area();
-    let status = Paragraph::new(workspace.status_text())
-        .style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18)));
-    frame.render_widget(
-        status,
-        Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

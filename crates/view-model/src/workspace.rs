@@ -4,11 +4,83 @@ use crate::document_worker::{DocumentRequest, DocumentResult, DocumentWorker};
 use crate::{CommandStatus, Damage, Editor, View};
 use kwil_core_workspace::session::{DocumentId, Session};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     ops::{Deref, DerefMut},
     path::PathBuf,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TabArea {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+impl TabArea {
+    pub fn contains(self, x: usize, y: usize) -> bool {
+        x >= self.x && y >= self.y && x < self.x.saturating_add(self.width) && y < self.y.saturating_add(self.height)
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct TabMetrics {
+    pub width: usize,
+    pub height: usize,
+    pub cell_width: usize,
+    pub cell_height: usize,
+    pub scrollbar: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabAction {
+    Activate(DocumentId),
+    Close(DocumentId),
+    PreviousPage,
+    NextPage,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabSlot {
+    pub document: DocumentId,
+    pub area: TabArea,
+    pub close: TabArea,
+    pub active: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabGeometry {
+    pub body: TabArea,
+    pub chrome: TabArea,
+    pub text: TabArea,
+    pub previous: TabArea,
+    pub next: TabArea,
+    pub slots: Vec<TabSlot>,
+    pub first: usize,
+    pub capacity: usize,
+    pub total: usize,
+    pub cell_height: usize,
+}
+impl TabGeometry {
+    pub fn hit(&self, x: usize, y: usize) -> Option<TabAction> {
+        if self.first > 0 && self.previous.contains(x, y) {
+            return Some(TabAction::PreviousPage);
+        }
+        if self.capacity > 0 && self.first + self.capacity < self.total && self.next.contains(x, y) {
+            return Some(TabAction::NextPage);
+        }
+        self.slots.iter().find(|slot| slot.area.contains(x, y)).map(|slot| {
+            if slot.close.contains(x, y) { TabAction::Close(slot.document) } else { TabAction::Activate(slot.document) }
+        })
+    }
+    /// Physical source/destination rectangles; only editor pixels participate.
+    pub fn scroll_copy(&self, delta: i64) -> Option<(TabArea, TabArea)> {
+        let dy = (delta.unsigned_abs() as usize).saturating_mul(self.cell_height);
+        if delta == 0 || dy >= self.text.height || self.text.width == 0 {
+            return None;
+        }
+        let source =
+            TabArea { y: self.text.y + if delta > 0 { dy } else { 0 }, height: self.text.height - dy, ..self.text };
+        let target = TabArea { y: self.text.y + if delta < 0 { dy } else { 0 }, ..source };
+        Some((source, target))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilePromptKind {
@@ -26,6 +98,7 @@ pub struct FilePrompt {
 
 struct SaveFlight {
     revision: u64,
+    path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -42,7 +115,18 @@ struct FileFlow {
     storage_ready: bool,
     persist_inflight: bool,
     persist_pending: bool,
+    persist_timer: bool,
     deferred_recovery: Option<Box<crate::document_worker::PreparedWorkspace>>,
+    observed: HashMap<DocumentId, (u64, u64)>,
+    next_observer: u64,
+    seeded: HashSet<DocumentId>,
+    durable: HashMap<DocumentId, (u64, u64)>,
+    journal_failed: HashMap<DocumentId, String>,
+    metadata_durable: bool,
+    restore_session: Option<bool>,
+    hot_exit: bool,
+    manual_guard: bool,
+    exit_without_metadata: bool,
 }
 
 pub struct Workspace {
@@ -67,6 +151,12 @@ impl Workspace {
     pub fn session(&self) -> &Session {
         &self.session
     }
+    pub fn recovery_ready(&self) -> bool {
+        self.files.storage_ready
+    }
+    pub fn horizontal_origin(&self) -> u64 {
+        self.deref().first_byte_column
+    }
     pub fn active_id(&self) -> DocumentId {
         self.session.active().expect("workspace always has a tab")
     }
@@ -75,6 +165,120 @@ impl Workspace {
     }
     pub fn view_mut(&mut self, id: DocumentId) -> Option<&mut View> {
         self.views.get_mut(&id)
+    }
+
+    pub fn tab_title(&self, id: DocumentId) -> String {
+        let Some(tab) = self.session.tabs().iter().find(|t| t.id == id) else { return String::new() };
+        let name = tab
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map_or_else(|| format!("Untitled {}", id.0), |name| name.to_string_lossy().into_owned());
+        let dirty = self
+            .views
+            .get(&id)
+            .and_then(View::editor)
+            .map_or(tab.revision != tab.saved_revision, |editor| editor.document().is_dirty());
+        if dirty { format!("* {name}") } else { name }
+    }
+
+    pub fn tab_geometry(&self, metrics: TabMetrics, layout: kwil_core_commands::settings::TabLayout) -> TabGeometry {
+        use kwil_core_commands::settings::TabLayout;
+        let TabMetrics { width, height, cell_width, cell_height, scrollbar } = metrics;
+        let (cw, ch) = (cell_width.max(1), cell_height.max(1));
+        let content_height = height.saturating_sub(ch);
+        let mut result = TabGeometry {
+            body: TabArea { width, height: content_height, ..Default::default() },
+            chrome: TabArea::default(),
+            text: TabArea::default(),
+            previous: TabArea::default(),
+            next: TabArea::default(),
+            slots: Vec::new(),
+            first: 0,
+            capacity: 0,
+            total: self.session.tabs().len(),
+            cell_height: ch,
+        };
+        let (available, slot_width, slot_height, start_x, start_y) = match layout {
+            TabLayout::Horizontal => {
+                let header = ch.min(content_height);
+                result.chrome = TabArea { width, height: header, ..Default::default() };
+                result.body.y = header;
+                result.body.height = content_height - header;
+                let nav = cw.saturating_mul(2).min(width / 2);
+                result.previous = TabArea { width: nav, height: header, ..Default::default() };
+                result.next = TabArea { x: width - nav, width: nav, height: header, ..Default::default() };
+                let available = width.saturating_sub(2 * nav);
+                let count = (available / cw.saturating_mul(20)).max(1);
+                (if available == 0 || header == 0 { 0 } else { count }, available / count, header, nav, 0)
+            }
+            TabLayout::Vertical => {
+                let side = cw.saturating_mul(26).min(width / 3);
+                result.chrome = TabArea { width: side, height: content_height, ..Default::default() };
+                result.body.x = side;
+                result.body.width = width - side;
+                result.previous = TabArea { width: side / 2, height: ch.min(content_height), ..Default::default() };
+                result.next = TabArea {
+                    x: side / 2,
+                    width: side - side / 2,
+                    height: ch.min(content_height),
+                    ..Default::default()
+                };
+                (if side == 0 { 0 } else { content_height.saturating_sub(ch) / ch }, side, ch, 0, ch)
+            }
+        };
+        result.capacity = available.min(kwil_core_workspace::session::MAX_TABS);
+        let active = self.session.tabs().iter().position(|t| t.id == self.active_id()).unwrap_or(0);
+        if result.capacity > 0 {
+            result.first = active / result.capacity * result.capacity;
+            for (index, tab) in self.session.tabs().iter().enumerate().skip(result.first).take(result.capacity) {
+                let local = index - result.first;
+                let area = TabArea {
+                    x: start_x + if layout == TabLayout::Horizontal { local * slot_width } else { 0 },
+                    y: start_y + if layout == TabLayout::Vertical { local * slot_height } else { 0 },
+                    width: slot_width,
+                    height: slot_height,
+                };
+                let close_width = cw.saturating_mul(3).min(area.width);
+                let close = TabArea { x: area.x + area.width - close_width, width: close_width, ..area };
+                result.slots.push(TabSlot { document: tab.id, area, close, active: tab.id == self.active_id() });
+            }
+        }
+        result.text = TabArea {
+            x: result.body.x,
+            y: result.body.y,
+            width: result.body.width.saturating_sub(scrollbar),
+            height: result.body.height.saturating_sub(scrollbar) / ch * ch,
+        };
+        result
+    }
+
+    pub fn tab_action(&mut self, action: TabAction, geometry: &TabGeometry) -> io::Result<()> {
+        match action {
+            TabAction::Activate(id) => {
+                self.cancel_file_prompt();
+                self.activate(id);
+            }
+            TabAction::Close(id) => {
+                self.cancel_file_prompt();
+                self.files.close = [id].into();
+                self.advance_close(false)?;
+            }
+            TabAction::PreviousPage | TabAction::NextPage => {
+                let index = if action == TabAction::PreviousPage {
+                    geometry.first.saturating_sub(geometry.capacity)
+                } else {
+                    (geometry.first + geometry.capacity).min(geometry.total.saturating_sub(1))
+                };
+                if let Some(tab) = self.session.tabs().get(index) {
+                    let id = tab.id;
+                    self.cancel_file_prompt();
+                    self.activate(id);
+                }
+            }
+        }
+        self.checkpoint_session();
+        Ok(())
     }
 
     pub fn open(&mut self, mut view: View) -> io::Result<DocumentId> {
@@ -138,6 +342,15 @@ impl Workspace {
         }
         self.files.queue.retain(|request| !matches!(request, DocumentRequest::Open { document, .. } | DocumentRequest::Index { document, .. } if *document == id));
         self.closed_views.retain(|id, _| self.session.closed().iter().any(|tab| tab.id == *id));
+        let generation = self.files.observed.remove(&id).map_or(0, |(_, generation)| generation);
+        self.files.observed.retain(|id, _| self.views.contains_key(id) || self.closed_views.contains_key(id));
+        self.files.seeded.retain(|id| self.views.contains_key(id) || self.closed_views.contains_key(id));
+        self.files.durable.retain(|id, _| self.views.contains_key(id) || self.closed_views.contains_key(id));
+        self.files.journal_failed.retain(|id, _| self.views.contains_key(id) || self.closed_views.contains_key(id));
+        self.files
+            .queue
+            .retain(|request| !matches!(request,DocumentRequest::FinishJournal {document,..} if *document==id));
+        self.files.queue.push_back(DocumentRequest::FinishJournal { document: id, generation });
         if self.views.is_empty() {
             self.open(View::new(None))?;
         }
@@ -152,7 +365,9 @@ impl Workspace {
         let id = self.active_id();
         let Some(view) = self.views.get(&id) else { return };
         if let Some(tab) = self.session.tab_mut(id) {
-            tab.path = view.path.clone();
+            if tab.path != view.path {
+                tab.path.clone_from(&view.path);
+            }
             tab.first_visible_line = view.top();
             if let Some(editor) = view.editor() {
                 tab.revision = editor.document().revision();
@@ -166,7 +381,9 @@ impl Workspace {
     pub fn sync_all(&mut self) {
         for tab in self.session.tabs().iter().map(|t| t.id).collect::<Vec<_>>() {
             if let (Some(view), Some(metadata)) = (self.views.get(&tab), self.session.tab_mut(tab)) {
-                metadata.path = view.path.clone();
+                if metadata.path != view.path {
+                    metadata.path.clone_from(&view.path);
+                }
                 metadata.first_visible_line = view.top();
                 if let Some(editor) = view.editor() {
                     metadata.revision = editor.document().revision();
@@ -241,11 +458,11 @@ impl Workspace {
             match self.files.worker.as_ref().unwrap().try_submit(request) {
                 Ok(()) => {}
                 Err(std::sync::mpsc::TrySendError::Full(request)) => {
-                    self.files.queue.push_front(request);
+                    self.files.queue.push_front(*request);
                     break;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(request)) => {
-                    if let DocumentRequest::Save { document, .. } = request {
+                    if let DocumentRequest::Save { document, .. } = *request {
                         self.files.saves.remove(&document);
                         if let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut) {
                             let _ = editor.finish_save(Err(io::Error::other("document worker disconnected")));
@@ -260,13 +477,69 @@ impl Workspace {
 
     /// Cheap metadata snapshot. Coalesce writes while one worker write is active.
     pub fn checkpoint_session(&mut self) {
+        self.install_journal_observers();
         self.sync_all();
         self.files.persist_pending = true;
+        self.files.metadata_durable = false;
         if self.files.storage_ready && !self.files.persist_inflight {
-            self.files.persist_pending = false;
-            self.files.persist_inflight = true;
-            self.files.queue.push_back(DocumentRequest::Persist(self.session.clone()));
-            self.pump_files();
+            if self.files.hot_exit || (self.files.quit && self.files.exit) {
+                self.persist_snapshot();
+            } else if !self.files.persist_timer {
+                self.files.persist_timer = true;
+                self.files.queue.push_back(DocumentRequest::SessionTimer);
+                self.pump_files();
+            }
+        }
+    }
+
+    fn persist_snapshot(&mut self) {
+        if !self.files.storage_ready || self.files.persist_inflight {
+            return;
+        }
+        self.files.persist_pending = false;
+        self.files.persist_inflight = true;
+        self.files.queue.push_back(DocumentRequest::Persist(self.session.clone()));
+        self.pump_files();
+    }
+
+    pub fn set_session_restore(&mut self, enabled: bool) {
+        self.files.restore_session = Some(enabled);
+    }
+
+    fn install_journal_observers(&mut self) {
+        if !self.files.storage_ready {
+            return;
+        }
+        let Some(worker) = &self.files.worker else { return };
+        for (&document, view) in &mut self.views {
+            if self.files.observed.contains_key(&document) {
+                continue;
+            }
+            let Some(editor) = view.editor_mut() else { continue };
+            let next = editor.next_edit_sequence();
+            self.files.next_observer = self.files.next_observer.checked_add(1).expect("observer generation exhausted");
+            let generation = self.files.next_observer;
+            let path = editor.document().path().map(PathBuf::from);
+            let observer = worker.observer(document, path.clone(), next, generation);
+            if let Err(error) = editor.set_edit_observer(Some(observer)) {
+                view.set_notice(format!("Recovery observer unavailable: {error}"));
+                continue;
+            }
+            self.files.observed.insert(document, (next, generation));
+            if editor.document().is_dirty() {
+                self.files.seeded.insert(document);
+                self.files.queue.retain(
+                    |request| !matches!(request,DocumentRequest::SeedJournal {document:old,..} if *old==document),
+                );
+                self.files.queue.push_back(DocumentRequest::SeedJournal {
+                    document,
+                    revision: editor.document().revision(),
+                    snapshot: editor.document().snapshot(),
+                    path,
+                    next_sequence: next,
+                    generation,
+                });
+            }
         }
     }
 
@@ -278,6 +551,7 @@ impl Workspace {
     }
     pub fn wants_exit(&self) -> bool {
         self.files.exit
+            && (self.files.exit_without_metadata || !self.files.storage_ready || self.files.metadata_durable)
     }
     pub fn close_pending(&self) -> bool {
         self.files.quit || !self.files.close.is_empty()
@@ -286,6 +560,9 @@ impl Workspace {
         self.files.close.clear();
         self.files.quit = false;
         self.files.exit = false;
+        self.files.hot_exit = false;
+        self.files.manual_guard = false;
+        self.files.exit_without_metadata = false;
     }
     pub fn cancel_file_prompt(&mut self) {
         self.files.prompt = None;
@@ -355,6 +632,11 @@ impl Workspace {
             return Err(io::Error::other("File worker queue is full; retry after current work finishes"));
         }
         let path = std::path::absolute(path)?;
+        if let Some(id) = self.files.saves.iter().find(|(_, save)| save.path.as_ref() == Some(&path)).map(|(id, _)| *id)
+        {
+            self.activate(id);
+            return Ok(id);
+        }
         if let Some(id) = self.session.tabs().iter().find(|t| t.path.as_ref() == Some(&path)).map(|t| t.id) {
             self.activate(id);
             return Ok(id);
@@ -431,7 +713,7 @@ impl Workspace {
                 return Err(error);
             }
         };
-        self.files.saves.insert(id, SaveFlight { revision: request.revision });
+        self.files.saves.insert(id, SaveFlight { revision: request.revision, path: Some(request.path.clone()) });
         self.files.queue.push_back(DocumentRequest::Save { document: id, request });
         if let Some(view) = self.views.get_mut(&id) {
             view.set_notice("Saving…".into());
@@ -516,6 +798,26 @@ impl Workspace {
                 if let Some(id) = self.session.reopen_closed()? {
                     if let Some(view) = self.closed_views.remove(&id) {
                         self.views.insert(id, view);
+                        if self.views[&id].editor().is_none() {
+                            let tab = self.session.tabs().iter().find(|tab| tab.id == id).unwrap().clone();
+                            self.files.queue.retain(|request|!matches!(request,DocumentRequest::Open {document,..}|DocumentRequest::Index {document,..} if *document==id));
+                            let request = if tab.revision != 0 {
+                                DocumentRequest::Recover { tab }
+                            } else if let (Some(path), Some(file)) = (&self.views[&id].path, self.views[&id].file()) {
+                                DocumentRequest::Index {
+                                    document: id,
+                                    revision: 0,
+                                    path: path.clone(),
+                                    file: file.clone(),
+                                }
+                            } else if let Some(path) = &self.views[&id].path {
+                                DocumentRequest::Open { document: id, revision: 0, path: path.clone() }
+                            } else {
+                                return Err(io::Error::other("Closed document requires recovery"));
+                            };
+                            self.files.queue.push_back(request);
+                            self.pump_files();
+                        }
                     } else {
                         let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap().clone();
                         let mut view = View::new(None);
@@ -542,11 +844,32 @@ impl Workspace {
     }
 
     pub fn request_window_close(&mut self, discard: bool) -> io::Result<()> {
-        if !self.close_pending() {
+        if discard && self.files.manual_guard {
+            self.files.exit_without_metadata = true;
+        }
+        if !discard
+            && self.files.restore_session == Some(true)
+            && self.files.storage_ready
+            && !self.files.journal_failed.keys().any(|id| self.views.contains_key(id))
+        {
+            self.begin_hot_exit();
+            return Ok(());
+        }
+        if self.files.hot_exit || self.files.manual_guard {
+            self.files.hot_exit = false;
+            let active = self.active_id();
+            self.files.close = std::iter::once(active)
+                .chain(self.session.tabs().iter().map(|tab| tab.id).filter(|id| *id != active))
+                .collect();
+        }
+        if !self.files.quit && !(discard && !self.files.close.is_empty()) {
             self.files.quit = true;
             self.files.close = self.session.tabs().iter().map(|t| t.id).collect();
         }
         self.advance_close(discard)?;
+        if self.files.manual_guard && !discard {
+            self.files.exit = false;
+        }
         self.checkpoint_session();
         Ok(())
     }
@@ -561,6 +884,16 @@ impl Workspace {
                 self.set_notice("Save in progress; close will wait for its revision".into());
                 return Ok(());
             }
+            if !discard
+                && self
+                    .views
+                    .get(&id)
+                    .and_then(View::editor)
+                    .is_some_and(|editor| editor.has_pending_edit_receipt() || editor.has_pending_save_completion())
+            {
+                self.set_notice("Recovery queue is busy; close will wait. Esc cancels".into());
+                return Ok(());
+            }
             let dirty = self.views.get(&id).and_then(View::editor).map_or_else(
                 || self.session.tabs().iter().find(|t| t.id == id).is_some_and(|t| t.revision != t.saved_revision),
                 |editor| editor.document().is_dirty(),
@@ -573,7 +906,7 @@ impl Workspace {
                 return Ok(());
             }
             // Window close checks every tab but does not throw away the session.
-            if !self.files.quit || discard {
+            if !self.files.quit || discard || self.files.restore_session == Some(false) {
                 self.close(id, discard)?;
             }
             self.files.close.pop_front();
@@ -583,6 +916,62 @@ impl Workspace {
         Ok(())
     }
 
+    fn begin_hot_exit(&mut self) {
+        self.files.quit = true;
+        self.files.hot_exit = true;
+        self.files.manual_guard = false;
+        self.files.exit = false;
+        self.files.close.clear();
+        self.set_notice("Preserving tabs and unsaved work… Esc cancels; Ctrl+Shift+Q discards this tab".into());
+        self.checkpoint_session();
+        if !self.files.queue.iter().any(|request| matches!(request, DocumentRequest::FlushJournals)) {
+            self.files.queue.push_back(DocumentRequest::FlushJournals);
+        }
+        self.pump_files();
+    }
+
+    fn fail_hot_exit(&mut self, message: String) {
+        if !self.files.quit {
+            return;
+        }
+        self.files.hot_exit = false;
+        self.files.manual_guard = true;
+        self.files.exit = false;
+        self.files.close = self.session.tabs().iter().map(|tab| tab.id).collect();
+        let _ = self.advance_close(false);
+        self.files.exit = false;
+        self.set_notice(format!("{message}; save or explicitly discard each unsaved tab, Esc cancels"));
+    }
+
+    fn check_hot_exit(&mut self) {
+        if !self.files.hot_exit
+            || !self.files.metadata_durable
+            || self.files.persist_inflight
+            || self.files.persist_pending
+            || !self.files.saves.is_empty()
+            || self.files.prompt.is_some()
+        {
+            return;
+        }
+        let durable = self.session.tabs().iter().all(|tab| {
+            let Some(editor) = self.views.get(&tab.id).and_then(View::editor) else {
+                return tab.revision == tab.saved_revision;
+            };
+            if editor.has_pending_edit_receipt() || editor.has_pending_save_completion() {
+                return false;
+            }
+            let next = editor.next_edit_sequence();
+            let needs_journal = editor.document().is_dirty()
+                || self.files.seeded.contains(&tab.id)
+                || self.files.observed.get(&tab.id).is_some_and(|(first, _)| next > *first);
+            !needs_journal
+                || self.files.durable.get(&tab.id) == Some(&(editor.document().revision(), next.saturating_sub(1)))
+        });
+        if durable {
+            self.files.exit = true;
+        }
+    }
+
     pub fn document_result(&mut self, result: DocumentResult) -> Damage {
         let checkpoint = matches!(
             &result,
@@ -590,6 +979,22 @@ impl Workspace {
         );
         let mut damage = Damage { status: true, ..Default::default() };
         match result {
+            DocumentResult::SessionCheckpointDue => {
+                damage = Damage::default();
+                self.files.persist_timer = false;
+                if self.files.persist_pending {
+                    self.persist_snapshot();
+                }
+            }
+            DocumentResult::CapacityAvailable => {
+                damage = Damage::default();
+            }
+            DocumentResult::Stopped(result) => {
+                damage = Damage::default();
+                if let Err(error) = result {
+                    damage = self.set_notice(error.to_string());
+                }
+            }
             DocumentResult::Prepared(result) => {
                 self.files.preparing = false;
                 match result {
@@ -612,10 +1017,14 @@ impl Workspace {
                         damage = Damage::default();
                         if self.files.persist_pending {
                             self.checkpoint_session();
+                        } else {
+                            self.files.metadata_durable = true;
                         }
                     }
                     Err(error) => {
-                        self.set_notice(format!("Session metadata not durable: {error}"));
+                        let message = format!("Session metadata not durable: {error}");
+                        self.set_notice(message.clone());
+                        self.fail_hot_exit(message);
                     }
                 }
             }
@@ -685,76 +1094,171 @@ impl Workspace {
                     self.set_notice("Ignored save completion with mismatched source revision".into());
                     return damage;
                 }
-                if self.files.saves.get(&document).is_some_and(|save| save.revision == revision) {
-                    self.files.saves.remove(&document);
-                    let mut may_close = false;
-                    let mut warning = false;
-                    let mut background_notice = None;
-                    if let Some(view) = self.views.get_mut(&document)
-                        && let Some(editor) = view.editor_mut()
-                    {
-                        let current = editor.document().revision() == revision;
-                        match editor.finish_save(result) {
-                            Ok(result) => {
-                                may_close = current && !editor.document().is_dirty();
-                                let notice = match result.status {
-                                    CommandStatus::Message(message) => {
-                                        warning = true;
-                                        message
-                                    }
-                                    _ if !may_close => "Saved earlier revision; current changes remain unsaved".into(),
-                                    _ => "Saved".into(),
-                                };
-                                if self.session.active() != Some(document) {
-                                    background_notice = Some(format!("Tab {}: {notice}", document.0));
-                                }
-                                let edited = view.refresh_after_edit(result.damage);
-                                view.set_notice(notice);
-                                if self.session.active() == Some(document) {
-                                    damage = edited;
-                                    damage.status = true;
-                                }
-                                if let Some(path) = &view.path {
-                                    let _ = self.session.set_path(document, path.clone());
-                                }
-                            }
-                            Err(error) => {
-                                let notice = format!("Save failed: {error}");
-                                if self.session.active() != Some(document) {
-                                    background_notice = Some(format!("Tab {}: {notice}", document.0));
-                                }
-                                view.set_notice(notice);
-                            }
-                        }
+                if self.files.saves.get(&document).is_some_and(|save| save.revision == revision)
+                    && let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut)
+                {
+                    let current = editor.document().revision() == revision;
+                    let result = editor.finish_save(result);
+                    damage = self.complete_save(document, current, result);
+                }
+            }
+            DocumentResult::JournalQueued { document, revision, sequence: _, result } => match result {
+                Ok(()) => {
+                    self.files.seeded.insert(document);
+                    damage = Damage::default();
+                    self.checkpoint_session();
+                }
+                Err(error) => {
+                    let message = format!("Tab {} revision {revision} is not journaled: {error}", document.0);
+                    self.files.journal_failed.insert(document, message.clone());
+                    self.files.durable.remove(&document);
+                    self.set_notice(message.clone());
+                    self.fail_hot_exit(message);
+                }
+            },
+            DocumentResult::JournalDurable { document, revision, sequence, result } => {
+                let pending_before = self.recovery_pending(self.active_id());
+                match result {
+                    Ok(()) => {
+                        self.files.durable.insert(document, (revision, sequence));
+                        damage = Damage {
+                            status: pending_before != self.recovery_pending(self.active_id()),
+                            ..Default::default()
+                        };
                     }
-                    if let Some(notice) = background_notice {
-                        self.set_notice(notice);
+                    Err(error) => {
+                        let message = format!("Tab {} recovery is not durable: {error}", document.0);
+                        self.files.journal_failed.insert(document, message.clone());
+                        self.files.durable.remove(&document);
+                        self.set_notice(message.clone());
+                        self.fail_hot_exit(message);
                     }
-                    if may_close && !warning {
-                        if self.files.close.contains(&document) {
-                            if self.files.quit {
-                                self.files.close.retain(|id| *id != document);
-                            }
-                            if let Err(error) = self.advance_close(false) {
-                                self.set_notice(error.to_string());
-                                self.cancel_close_intent();
-                            }
-                            damage.full = true;
-                        }
-                        if let Err(error) = self.next_save_all() {
-                            self.set_notice(error.to_string());
-                        }
-                    } else {
-                        self.cancel_close_intent();
-                        self.files.save_all.clear();
-                    }
+                }
+            }
+            DocumentResult::JournalClosed { document, result } => {
+                damage = Damage::default();
+                if let Err(error) = result {
+                    damage = self
+                        .set_notice(format!("Tab {} journal close incomplete: {error}; recovery retained", document.0));
                 }
             }
         }
         if checkpoint {
             self.checkpoint_session();
         }
+        let retried = self.flush_receipts();
+        damage.full |= retried.full;
+        damage.status |= retried.status;
+        damage.scroll += retried.scroll;
+        damage.rows.extend(retried.rows);
+        if self.close_pending() && !self.files.hot_exit && self.files.prompt.is_none() && !self.files.manual_guard {
+            if let Err(error) = self.advance_close(false) {
+                self.set_notice(error.to_string());
+                self.cancel_close_intent();
+            }
+        }
+        self.check_hot_exit();
         self.pump_files();
+        damage
+    }
+
+    fn complete_save(
+        &mut self,
+        document: DocumentId,
+        current: bool,
+        result: io::Result<crate::CommandResult>,
+    ) -> Damage {
+        let mut damage = Damage { status: true, ..Default::default() };
+        let mut may_close = false;
+        let mut warning = false;
+        let Some(view) = self.views.get_mut(&document) else { return damage };
+        let notice = match result {
+            Ok(result) => {
+                self.files.saves.remove(&document);
+                may_close = current && view.editor().is_some_and(|editor| !editor.document().is_dirty());
+                let notice = match result.status {
+                    CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
+                        warning = true;
+                        message
+                    }
+                    _ if !may_close => "Saved earlier revision; current changes remain unsaved".into(),
+                    _ => "Saved".into(),
+                };
+                let edited = view.refresh_after_edit(result.damage);
+                if self.session.active() == Some(document) {
+                    damage = edited;
+                    damage.status = true;
+                }
+                if let Some(path) = &view.path {
+                    let _ = self.session.set_path(document, path.clone());
+                }
+                notice
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && view.editor().is_some_and(|editor| editor.has_pending_save_completion()) =>
+            {
+                view.set_notice("Save completion is waiting for recovery queue admission".into());
+                return damage;
+            }
+            Err(error) => {
+                self.files.saves.remove(&document);
+                format!("Save failed: {error}")
+            }
+        };
+        view.set_notice(notice.clone());
+        if self.session.active() != Some(document) {
+            self.set_notice(format!("Tab {}: {notice}", document.0));
+        }
+        if may_close && !warning {
+            if self.files.close.contains(&document) {
+                if self.files.quit && self.files.restore_session == Some(true) && self.files.storage_ready {
+                    self.begin_hot_exit();
+                } else if let Err(error) = self.advance_close(false) {
+                    self.set_notice(error.to_string());
+                    self.cancel_close_intent();
+                }
+                damage.full = true;
+            }
+            if let Err(error) = self.next_save_all() {
+                self.set_notice(error.to_string());
+            }
+        } else {
+            self.cancel_close_intent();
+            self.files.save_all.clear();
+        }
+        damage
+    }
+
+    fn flush_receipts(&mut self) -> Damage {
+        let mut finished = Vec::new();
+        for (&document, view) in &mut self.views {
+            let Some(editor) = view.editor_mut() else { continue };
+            if editor.flush_edit_receipt().is_err() {
+                continue;
+            }
+            if editor.has_pending_save_completion()
+                && let Some(save) = self.files.saves.get(&document)
+            {
+                let current = editor.document().revision() == save.revision;
+                match editor.finish_pending_save() {
+                    Ok(Some(result)) => finished.push((document, current, Ok(result))),
+                    Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
+                        finished.push((document, current, Err(error)))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut damage = Damage::default();
+        for (document, current, result) in finished {
+            let changed = self.complete_save(document, current, result);
+            damage.full |= changed.full;
+            damage.status |= changed.status;
+            damage.scroll += changed.scroll;
+            damage.rows.extend(changed.rows);
+            self.checkpoint_session();
+        }
         damage
     }
 
@@ -910,7 +1414,27 @@ impl Workspace {
     pub fn status_text(&self) -> String {
         let tabs = self.session.tabs();
         let position = tabs.iter().position(|t| t.id == self.active_id()).unwrap_or(0) + 1;
-        format!("[{position}/{}] {}", tabs.len(), self.deref().status_text())
+        let recovery = if self.files.journal_failed.contains_key(&self.active_id())
+            || (self.files.worker.is_some() && !self.files.preparing && !self.files.storage_ready)
+        {
+            "  |  Recovery unavailable"
+        } else if self.recovery_pending(self.active_id()) {
+            "  |  Recovery pending"
+        } else {
+            ""
+        };
+        format!("[{position}/{}] {}{recovery}", tabs.len(), self.deref().status_text())
+    }
+
+    fn recovery_pending(&self, id: DocumentId) -> bool {
+        let Some(editor) = self.views.get(&id).and_then(View::editor) else { return false };
+        let next = editor.next_edit_sequence();
+        let needed = editor.document().is_dirty()
+            || self.files.seeded.contains(&id)
+            || self.files.observed.get(&id).is_some_and(|(first, _)| next > *first);
+        self.files.observed.contains_key(&id)
+            && needed
+            && self.files.durable.get(&id) != Some(&(editor.document().revision(), next.saturating_sub(1)))
     }
 }
 
@@ -1103,7 +1627,7 @@ mod tests {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         edit(&mut workspace, "unsaved");
         let document = workspace.active_id();
-        workspace.files.saves.insert(document, SaveFlight { revision: 1 });
+        workspace.files.saves.insert(document, SaveFlight { revision: 1, path: None });
         workspace.files.quit = true;
         workspace.files.close.push_back(document);
         workspace.document_result(DocumentResult::Saved {
@@ -1122,6 +1646,63 @@ mod tests {
         assert!(!workspace.close_pending());
         assert!(workspace.editor().unwrap().document().is_dirty());
         assert!(workspace.status_text().contains("denied"));
+    }
+
+    #[test]
+    fn window_close_promotes_a_tab_close_prompt_to_cover_all_tabs() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "one");
+        let first = workspace.active_id();
+        workspace.file_command("file.new").unwrap();
+        edit(&mut workspace, "two");
+        let second = workspace.active_id();
+        workspace.file_command("file.close").unwrap();
+        assert_eq!(workspace.files.close.iter().copied().collect::<Vec<_>>(), vec![second]);
+        workspace.request_window_close(false).unwrap();
+        assert_eq!(workspace.active_id(), first);
+        workspace.discard_close_target().unwrap();
+        assert_eq!(workspace.active_id(), second);
+        assert!(!workspace.wants_exit());
+        workspace.cancel_file_prompt();
+    }
+
+    #[test]
+    fn named_save_as_routes_to_new_path_without_overwriting_the_original() {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-named-saveas-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let original = root.join("original.txt");
+        let target = root.join("copy.txt");
+        std::fs::write(&original, b"original").unwrap();
+        let file = kwil_core_workspace::open_for_editing(&original).unwrap();
+        file.build_index(1).unwrap();
+        let mut workspace = Workspace::new(View::new(Some((original.clone(), file)))).unwrap();
+        let document = workspace.active_id();
+        workspace.execute("edit.selectAll", &CommandArgs::default(), 1).unwrap();
+        edit(&mut workspace, "changed");
+        workspace.file_command("file.saveAs").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().kind, FilePromptKind::SaveAs);
+        workspace.file_prompt_mut().unwrap().text = target.to_string_lossy().into();
+        workspace.submit_file_prompt().unwrap();
+        let (owner, request) = take_save(&mut workspace);
+        assert_eq!(owner, document);
+        assert_eq!(request.path, target);
+        let revision = request.revision;
+        workspace.document_result(DocumentResult::Saved {
+            document,
+            revision,
+            result: kwil_core_workspace::save_snapshot(request),
+        });
+        assert_eq!(workspace.editor().unwrap().document().path(), Some(target.as_path()));
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        assert_eq!(std::fs::read(&target).unwrap(), b"changed");
+        drop(workspace);
+        std::fs::remove_file(original).unwrap();
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -1159,5 +1740,96 @@ mod tests {
         workspace.close(second, false).unwrap();
         assert_eq!(workspace.session().tabs().len(), 1);
         assert!(workspace.editor().unwrap().document().snapshot().is_empty());
+    }
+
+    #[test]
+    fn recovery_remaps_early_edits_and_their_save_prompt_without_reusing_identity() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "early");
+        workspace.file_command("file.saveAndQuit").unwrap();
+        let old = workspace.active_id();
+        let mut session = Session::default();
+        let restored = session.open(None).unwrap();
+        assert_eq!(restored, old, "the fixture must exercise a real startup identity collision");
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, b"recovered").unwrap();
+        document.revision = 4;
+        document.saved_revision = 3;
+        document.next_revision = 5;
+        session.tab_mut(restored).unwrap().revision = 4;
+        session.tab_mut(restored).unwrap().saved_revision = 3;
+        workspace.install_prepared(crate::document_worker::PreparedWorkspace {
+            session,
+            documents: vec![(restored, Ok(document))],
+        });
+        let early = workspace.active_id();
+        assert_ne!(early, restored);
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 5);
+        assert_eq!(workspace.view(restored).unwrap().editor().unwrap().document().snapshot().len(), 9);
+        assert_eq!(workspace.file_prompt().unwrap().document, early);
+        assert_eq!(workspace.files.close.front().copied(), Some(early));
+        assert!(workspace.close_pending());
+        assert_eq!(workspace.session().tabs().len(), 2);
+        workspace.cancel_file_prompt();
+    }
+
+    #[test]
+    fn tab_geometry_keeps_editor_hits_and_scroll_copy_inside_both_origins() {
+        use kwil_core_commands::settings::TabLayout;
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.file_command("file.new").unwrap();
+        let active = workspace.active_id();
+        for layout in [TabLayout::Horizontal, TabLayout::Vertical] {
+            let geometry = workspace.tab_geometry(
+                TabMetrics { width: 800, height: 400, cell_width: 8, cell_height: 16, scrollbar: 14 },
+                layout,
+            );
+            let expected = if layout == TabLayout::Horizontal { (0, 16) } else { (208, 0) };
+            assert_eq!((geometry.body.x, geometry.body.y), expected);
+            assert!(geometry.body.contains(geometry.text.x, geometry.text.y));
+            assert!(geometry.hit(geometry.text.x, geometry.text.y).is_none(), "text origin must not activate a tab");
+            let slot = geometry.slots.iter().find(|slot| slot.document == active).unwrap();
+            assert_eq!(geometry.hit(slot.area.x, slot.area.y), Some(TabAction::Activate(active)));
+            assert_eq!(geometry.hit(slot.close.x, slot.close.y), Some(TabAction::Close(active)));
+            for delta in [-1, 1] {
+                let (source, target) = geometry.scroll_copy(delta).unwrap();
+                assert_eq!(source.x, geometry.text.x);
+                assert_eq!(target.x, geometry.text.x);
+                assert_eq!(source.width, geometry.text.width);
+                assert_eq!(source.height + 16, geometry.text.height);
+                assert!(geometry.text.contains(source.x, source.y));
+                assert!(geometry.text.contains(target.x, target.y));
+                assert!(source.y + source.height <= geometry.text.y + geometry.text.height);
+                assert!(target.y + target.height <= geometry.text.y + geometry.text.height);
+            }
+        }
+    }
+
+    #[test]
+    fn tab_overflow_virtualizes_labels_and_tiny_windows_have_no_out_of_bounds_hits() {
+        use kwil_core_commands::settings::TabLayout;
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        for _ in 1..128 {
+            workspace.file_command("file.new").unwrap();
+        }
+        for layout in [TabLayout::Horizontal, TabLayout::Vertical] {
+            let geometry = workspace.tab_geometry(
+                TabMetrics { width: 400, height: 200, cell_width: 8, cell_height: 16, scrollbar: 14 },
+                layout,
+            );
+            assert!(geometry.slots.len() < 128);
+            assert!(geometry.slots.iter().any(|slot| slot.document == workspace.active_id()));
+            assert!(geometry.first > 0);
+            let previous = geometry.previous;
+            workspace.tab_action(geometry.hit(previous.x, previous.y).unwrap(), &geometry).unwrap();
+            assert!(
+                workspace.session.tabs().iter().position(|t| t.id == workspace.active_id()).unwrap() < geometry.first
+            );
+            let tiny = workspace
+                .tab_geometry(TabMetrics { width: 0, height: 0, cell_width: 0, cell_height: 0, scrollbar: 14 }, layout);
+            assert_eq!(tiny.body, TabArea::default());
+            assert!(tiny.hit(0, 0).is_none());
+            assert!(tiny.scroll_copy(1).is_none());
+        }
     }
 }
