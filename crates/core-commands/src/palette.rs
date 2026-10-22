@@ -1,7 +1,7 @@
 //! Shared palette input, typed actions, and an event-driven file matcher.
 //!
-//! `Palette` performs no filesystem operations. File matching runs on exactly one
-//! `FileIndex` worker, with a 64-path feed queue and one replaceable query slot.
+//! `Palette` performs no matching or filesystem operations. Every candidate mode
+//! runs on one `PaletteWorker`, with a 64-path feed queue and one query slot.
 //! `latest()` clones an `Arc` to at most `MAX_RESULTS` entries, never the catalogue.
 //! The parent posts a GUI/TUI event from the `Send + Sync` wake callback, then
 //! applies `latest()` on that event. No frame polling or async runtime is needed.
@@ -10,14 +10,16 @@
 //! use kwil_core_commands::palette::*;
 //! use std::sync::Arc;
 //! let mut palette = Palette::new(32);
-//! let mut index = FileIndex::new(IndexLimits::default(), Arc::new(|| {
+//! let mut index = PaletteWorker::new(IndexLimits::default(), Arc::new(|| {
 //!     // Post a coalesced event to the parent's event loop; do not draw here.
 //! })).unwrap();
-//! palette.prime_files(index.latest()); // do this on index events while closed
+//! for mode in [PaletteMode::Commands, PaletteMode::Tabs, PaletteMode::Files] {
+//!     palette.prime_results(index.cached(mode)); // warm mode caches while closed
+//! }
 //! let request = palette.open("src").unwrap().unwrap();
 //! index.request(request).unwrap(); // cached rows remain immediately available
 //! // On a worker-result event:
-//! palette.apply_files(index.latest());
+//! palette.apply_results(index.latest());
 //! if let Some(action) = palette.accept() { /* parent dispatches action */ }
 //! // On shutdown, join on a shutdown worker, never the UI input path:
 //! index.stop().unwrap().join().unwrap();
@@ -74,6 +76,37 @@ pub struct Tab {
     pub title: String,
 }
 
+/// Validated once when parent-owned tabs change, then shared in O(1) per key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabSnapshot(Arc<[Tab]>);
+impl TabSnapshot {
+    pub fn new(tabs: Vec<Tab>) -> Result<Self, QueryError> {
+        if tabs.len() > MAX_TABS {
+            return Err(QueryError::TooManyTabs);
+        }
+        if tabs.iter().any(|t| t.title.len() > MAX_QUERY_BYTES) {
+            return Err(QueryError::TooLong);
+        }
+        Ok(Self(tabs.into()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaletteCandidates {
+    Commands,
+    Tabs(TabSnapshot),
+    Files,
+}
+impl PaletteCandidates {
+    pub fn mode(&self) -> PaletteMode {
+        match self {
+            Self::Commands => PaletteMode::Commands,
+            Self::Tabs(_) => PaletteMode::Tabs,
+            Self::Files => PaletteMode::Files,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryError {
     TooLong,
@@ -84,9 +117,11 @@ pub enum QueryError {
 /// Queries and results are tagged with the model's generation and query text.
 /// Each editing operation invalidates results, including reopening the same text.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileQuery {
+pub struct PaletteQuery {
     pub generation: u64,
+    /// Matching text only, without the command/tab prefix.
     pub query: Arc<str>,
+    pub candidates: PaletteCandidates,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,10 +137,11 @@ impl FileEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileResults {
+pub struct PaletteResults {
     pub generation: u64,
+    pub mode: PaletteMode,
     pub query: Arc<str>,
-    pub files: Vec<Arc<FileEntry>>,
+    pub rows: Arc<[PaletteRow]>,
     pub total: usize,
 }
 
@@ -115,12 +151,11 @@ pub struct Palette {
     cursor: usize,
     generation: u64,
     limit: usize,
-    rows: Vec<PaletteRow>,
+    rows: Arc<[PaletteRow]>,
     selected: Option<usize>,
-    tabs: Vec<Tab>,
-    files: Option<Arc<FileResults>>,
+    tabs: TabSnapshot,
+    cached: [Option<Arc<PaletteResults>>; 4],
     fresh: bool,
-    matcher: SkimMatcherV2,
 }
 
 impl Palette {
@@ -131,12 +166,11 @@ impl Palette {
             cursor: 0,
             generation: 0,
             limit: result_limit.clamp(1, MAX_RESULTS),
-            rows: Vec::new(),
+            rows: Arc::from([]),
             selected: None,
-            tabs: Vec::new(),
-            files: None,
+            tabs: TabSnapshot(Arc::from([])),
+            cached: std::array::from_fn(|_| None),
             fresh: false,
-            matcher: matcher(),
         }
     }
     pub fn is_open(&self) -> bool {
@@ -162,12 +196,12 @@ impl Palette {
         self.cursor = self.query.len();
     }
     pub fn rows(&self) -> &[PaletteRow] {
-        &self.rows
+        &self.rows[..self.rows.len().min(self.limit)]
     }
     pub fn selected(&self) -> Option<usize> {
         self.selected
     }
-    /// False means cached file rows are visible but cannot yet be accepted.
+    /// False means cached candidate rows are visible but cannot yet be accepted.
     pub fn results_are_fresh(&self) -> bool {
         self.fresh
     }
@@ -179,14 +213,14 @@ impl Palette {
             _ => PaletteMode::Files,
         }
     }
-    pub fn open(&mut self, query: &str) -> Result<Option<FileQuery>, QueryError> {
+    pub fn open(&mut self, query: &str) -> Result<Option<PaletteQuery>, QueryError> {
         let request = self.set_query(query)?;
         self.open = true;
         Ok(request)
     }
     /// Replaces the entire input. The returned request goes to `FileIndex::request`.
-    /// For non-file modes call `FileIndex::cancel_query` to stop obsolete work.
-    pub fn set_query(&mut self, query: &str) -> Result<Option<FileQuery>, QueryError> {
+    /// Only line mode returns no worker request; cancel obsolete work then.
+    pub fn set_query(&mut self, query: &str) -> Result<Option<PaletteQuery>, QueryError> {
         if query.len() > MAX_QUERY_BYTES {
             return Err(QueryError::TooLong);
         }
@@ -195,7 +229,7 @@ impl Palette {
         self.cursor = self.query.len();
         Ok(self.changed())
     }
-    pub fn insert(&mut self, text: &str) -> Result<Option<FileQuery>, QueryError> {
+    pub fn insert(&mut self, text: &str) -> Result<Option<PaletteQuery>, QueryError> {
         if text.len() > MAX_QUERY_BYTES.saturating_sub(self.query.len()) {
             return Err(QueryError::TooLong);
         }
@@ -205,7 +239,7 @@ impl Palette {
         self.snap_cursor_forward();
         Ok(self.changed())
     }
-    pub fn backspace(&mut self) -> Option<FileQuery> {
+    pub fn backspace(&mut self) -> Option<PaletteQuery> {
         if let Some((start, _)) = self.query[..self.cursor].grapheme_indices(true).next_back() {
             self.query.replace_range(start..self.cursor, "");
             self.cursor = start;
@@ -213,7 +247,7 @@ impl Palette {
         self.snap_cursor_forward();
         self.changed()
     }
-    pub fn delete_forward(&mut self) -> Option<FileQuery> {
+    pub fn delete_forward(&mut self) -> Option<PaletteQuery> {
         if let Some(cluster) = self.query[self.cursor..].graphemes(true).next() {
             self.query.replace_range(self.cursor..self.cursor + cluster.len(), "");
         }
@@ -228,27 +262,22 @@ impl Palette {
             .find(|at| *at >= self.cursor)
             .unwrap_or(self.query.len());
     }
-    pub fn set_tabs(&mut self, tabs: Vec<Tab>) -> Result<(), QueryError> {
-        if tabs.len() > MAX_TABS {
-            return Err(QueryError::TooManyTabs);
-        }
-        if tabs.iter().any(|t| t.title.len() > MAX_QUERY_BYTES) {
-            return Err(QueryError::TooLong);
-        }
-        self.tabs = tabs;
-        if self.mode() == PaletteMode::Tabs {
-            self.changed();
-        }
-        Ok(())
+    /// Replaces parent-owned IDs/titles. Submit the returned replacement request
+    /// when tabs mode is active; cached selections from old IDs are invalidated.
+    pub fn set_tabs(&mut self, tabs: Vec<Tab>) -> Result<Option<PaletteQuery>, QueryError> {
+        self.tabs = TabSnapshot::new(tabs)?;
+        // New titles/IDs invalidate both visible and previously primed tab rows.
+        self.cached[PaletteMode::Tabs as usize] = None;
+        if self.mode() == PaletteMode::Tabs { Ok(self.changed()) } else { Ok(None) }
     }
     pub fn next(&mut self) {
         if !self.rows.is_empty() {
-            self.selected = Some((self.selected.unwrap_or(0) + 1) % self.rows.len());
+            self.selected = Some((self.selected.unwrap_or(0) + 1) % self.rows().len());
         }
     }
     pub fn previous(&mut self) {
         if !self.rows.is_empty() {
-            self.selected = Some((self.selected.unwrap_or(0) + self.rows.len() - 1) % self.rows.len());
+            self.selected = Some((self.selected.unwrap_or(0) + self.rows().len() - 1) % self.rows().len());
         }
     }
     pub fn accept(&mut self) -> Option<PaletteAction> {
@@ -264,108 +293,74 @@ impl Palette {
         self.open = false;
         self.generation = self.generation.checked_add(1).expect("palette generation exhausted");
         self.fresh = false;
-        self.rows.clear();
+        self.rows = Arc::from([]);
         self.selected = None;
     }
-    pub fn apply_files(&mut self, result: Arc<FileResults>) -> bool {
+    pub fn apply_results(&mut self, result: Arc<PaletteResults>) -> bool {
         if !self.open
-            || self.mode() != PaletteMode::Files
+            || self.mode() != result.mode
             || result.generation != self.generation
-            || result.query.as_ref() != self.query
+            || result.query.as_ref() != self.needle()
         {
             return false;
         }
-        self.files = Some(result);
-        self.file_rows();
+        self.cached[result.mode as usize] = Some(result.clone());
+        self.rows = result.rows.clone();
+        self.clamp_selection();
         self.fresh = true;
         true
     }
     /// Prime first-open cached rows from the index while the palette is closed.
     /// This does not make any action selectable. Call on index events while closed
     /// and before `open`; subsequent keys retain the last displayed bounded rows.
-    pub fn prime_files(&mut self, result: Arc<FileResults>) -> bool {
+    pub fn prime_results(&mut self, result: Arc<PaletteResults>) -> bool {
         if self.open {
             return false;
         }
-        self.files = Some(result);
+        let mode = result.mode as usize;
+        self.cached[mode] = Some(result);
         true
     }
-    fn file_rows(&mut self) {
-        self.rows = self
-            .files
-            .as_ref()
-            .into_iter()
-            .flat_map(|r| r.files.iter())
-            .take(self.limit)
-            .map(|f| PaletteRow {
-                title: f.label.clone(),
-                category: "File".into(),
-                action: PaletteAction::OpenFile(f.path.clone()),
-            })
-            .collect();
+    fn clamp_selection(&mut self) {
         self.selected =
-            if self.rows.is_empty() { None } else { Some(self.selected.unwrap_or(0).min(self.rows.len() - 1)) };
+            if self.rows().is_empty() { None } else { Some(self.selected.unwrap_or(0).min(self.rows().len() - 1)) };
     }
-    fn changed(&mut self) -> Option<FileQuery> {
+    fn needle(&self) -> &str {
+        match self.mode() {
+            PaletteMode::Files => &self.query,
+            _ => &self.query[1..],
+        }
+    }
+    fn changed(&mut self) -> Option<PaletteQuery> {
         self.generation = self.generation.checked_add(1).expect("palette generation exhausted");
         self.selected = None;
-        self.fresh = true;
-        let mut scored = Vec::new();
-        match self.mode() {
-            PaletteMode::Files => {
-                self.fresh = false;
-                self.file_rows();
-                return Some(FileQuery { generation: self.generation, query: self.query.as_str().into() });
-            }
-            PaletteMode::Line => {
-                self.rows.clear();
-                if let Some((line, column)) = location(&self.query[1..]) {
-                    self.rows.push(PaletteRow {
+        let mode = self.mode();
+        self.fresh = mode == PaletteMode::Line;
+        if mode == PaletteMode::Line {
+            self.rows = location(self.needle()).map_or_else(
+                || Arc::from([]),
+                |(line, column)| {
+                    Arc::from([PaletteRow {
                         title: format!("Go to {line}:{column}").into(),
                         category: "Navigation".into(),
                         action: PaletteAction::GoTo { line, column },
-                    });
-                }
-            }
-            PaletteMode::Commands => {
-                let query = &self.query[1..];
-                for command in COMMANDS {
-                    let label = format!("{} {} {}", command.id, command.title, command.category);
-                    if let Some(score) = self.matcher.fuzzy_match(&label, query) {
-                        keep_best(
-                            &mut scored,
-                            score,
-                            PaletteRow {
-                                title: command.title.into(),
-                                category: command.category.into(),
-                                action: PaletteAction::Command(command.id),
-                            },
-                            self.limit,
-                        );
-                    }
-                }
-                self.rows = scored.into_iter().map(|(_, row)| row).collect();
-            }
-            PaletteMode::Tabs => {
-                for tab in &self.tabs {
-                    if let Some(score) = self.matcher.fuzzy_match(&tab.title, &self.query[1..]) {
-                        keep_best(
-                            &mut scored,
-                            score,
-                            PaletteRow {
-                                title: tab.title.as_str().into(),
-                                category: "Tab".into(),
-                                action: PaletteAction::ActivateTab(tab.id),
-                            },
-                            self.limit,
-                        );
-                    }
-                }
-                self.rows = scored.into_iter().map(|(_, row)| row).collect();
-            }
+                    }])
+                },
+            );
+            self.clamp_selection();
+            return None;
         }
-        self.selected = (!self.rows.is_empty()).then_some(0);
-        None
+        // O(1) immutable cache/tab clones; no registry scan, scoring, sorting or
+        // catalogue-sized copy is reachable from any input-editing method.
+        self.rows = self.cached[mode as usize].as_ref().map_or_else(|| Arc::from([]), |r| r.rows.clone());
+        self.clamp_selection();
+        let candidates = match mode {
+            PaletteMode::Commands => PaletteCandidates::Commands,
+            PaletteMode::Tabs => PaletteCandidates::Tabs(self.tabs.clone()),
+            PaletteMode::Files => PaletteCandidates::Files,
+            PaletteMode::Line => unreachable!(),
+        };
+        Some(PaletteQuery { generation: self.generation, query: self.needle().into(), candidates })
     }
 }
 
@@ -426,13 +421,14 @@ pub enum FeedError {
 
 struct Inbox {
     paths: VecDeque<FileEntry>,
-    query: Option<FileQuery>,
+    query: Option<PaletteQuery>,
     revision: u64,
     files: usize,
     bytes: usize,
     feed_cancelled: bool,
     stopped: bool,
-    latest: Arc<FileResults>,
+    latest: Arc<PaletteResults>,
+    cached: [Arc<PaletteResults>; 4],
 }
 struct Shared {
     inbox: Mutex<Inbox>,
@@ -481,11 +477,14 @@ impl FileFeed {
 
 /// One matcher worker per workspace index, reused for every query. The caller
 /// owns its lifecycle and must reuse it rather than spawning an index per key.
-pub struct FileIndex {
+pub struct PaletteWorker {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
-impl FileIndex {
+/// Previous name retained for callers that only use the file catalogue feed.
+pub type FileIndex = PaletteWorker;
+
+impl PaletteWorker {
     /// Spawns one named worker; `notify` runs there and must only post an event.
     /// Wakes are coalesced until `latest()` acknowledges them. The callback must
     /// not block, call UI methods, panic, or recursively join this worker.
@@ -500,7 +499,12 @@ impl FileIndex {
                 bytes: 0,
                 feed_cancelled: false,
                 stopped: false,
-                latest: Arc::new(FileResults { generation: 0, query: "".into(), files: Vec::new(), total: 0 }),
+                latest: Arc::new(empty_results(PaletteMode::Files)),
+                cached: std::array::from_fn(|i| {
+                    Arc::new(empty_results(
+                        [PaletteMode::Commands, PaletteMode::Line, PaletteMode::Tabs, PaletteMode::Files][i],
+                    ))
+                }),
             }),
             ready: Condvar::new(),
             space: Condvar::new(),
@@ -518,7 +522,7 @@ impl FileIndex {
     }
     /// Replaces any pending query, invalidates matching immediately, and returns
     /// the previous capped cache without doing matching or I/O on the caller.
-    pub fn request(&self, query: FileQuery) -> Result<Arc<FileResults>, QueryError> {
+    pub fn request(&self, query: PaletteQuery) -> Result<Arc<PaletteResults>, QueryError> {
         if query.query.len() > MAX_QUERY_BYTES {
             return Err(QueryError::TooLong);
         }
@@ -533,10 +537,14 @@ impl FileIndex {
         self.shared.ready.notify_one();
         Ok(cached)
     }
-    pub fn latest(&self) -> Arc<FileResults> {
+    pub fn latest(&self) -> Arc<PaletteResults> {
         let inbox = self.shared.inbox.lock().unwrap();
         self.shared.notified.store(false, Ordering::Release);
         inbox.latest.clone()
+    }
+    /// Bounded per-mode cache, including the default command/file snapshots.
+    pub fn cached(&self, mode: PaletteMode) -> Arc<PaletteResults> {
+        self.shared.inbox.lock().unwrap().cached[mode as usize].clone()
     }
     /// Stops the current query while retaining the catalogue and discovery feed.
     pub fn cancel_query(&self) {
@@ -565,7 +573,7 @@ impl FileIndex {
         self.worker.take()
     }
 }
-impl Drop for FileIndex {
+impl Drop for PaletteWorker {
     fn drop(&mut self) {
         self.stop();
     }
@@ -578,6 +586,24 @@ fn bump_revision(shared: &Shared, inbox: &mut Inbox) {
 
 fn run_index(shared: Arc<Shared>, notify: Arc<dyn Fn() + Send + Sync>) {
     let matcher = matcher();
+    // Registry metadata and the matcher itself are constructed on this worker.
+    let commands: Vec<_> = COMMANDS
+        .iter()
+        .map(|c| {
+            (
+                format!("{} {} {}", c.id, c.title, c.category),
+                PaletteRow { title: c.title.into(), category: c.category.into(), action: PaletteAction::Command(c.id) },
+            )
+        })
+        .collect();
+    let initial = PaletteQuery { generation: 0, query: "".into(), candidates: PaletteCandidates::Commands };
+    if let Some(result) = match_candidates(&commands, &initial, shared.limits.result_limit, &matcher, || {
+        shared.revision.load(Ordering::Acquire) != 0
+    }) && publish(&shared, 0, result)
+        && !shared.notified.swap(true, Ordering::AcqRel)
+    {
+        notify();
+    }
     let mut paths: Vec<Arc<FileEntry>> = Vec::new();
     let mut seen_revision = 0;
     loop {
@@ -593,14 +619,26 @@ fn run_index(shared: Arc<Shared>, notify: Arc<dyn Fn() + Send + Sync>) {
             (batch, inbox.query.clone(), inbox.revision)
         };
         shared.space.notify_all();
+        let new_paths = !batch.is_empty();
         paths.extend(batch.into_iter().map(Arc::new));
+        if new_paths {
+            // Preparing a file cache is O(result_limit), even during a command
+            // query. It never changes the generation-tagged active snapshot.
+            let default_query = PaletteQuery { generation: 0, query: "".into(), candidates: PaletteCandidates::Files };
+            let result = match_files(&paths, &default_query, shared.limits.result_limit, &matcher, || false).unwrap();
+            shared.inbox.lock().unwrap().cached[PaletteMode::Files as usize] = Arc::new(result);
+        }
         seen_revision = revision;
         // Maintain a cheap default-file cache even before the first query. A
         // cancelled query also falls back to this cache without scanning names.
-        let query = query.unwrap_or(FileQuery { generation: 0, query: "".into() });
-        let Some(result) = match_files(&paths, &query, shared.limits.result_limit, &matcher, || {
-            shared.revision.load(Ordering::Acquire) != revision
-        }) else {
+        let query =
+            query.unwrap_or(PaletteQuery { generation: 0, query: "".into(), candidates: PaletteCandidates::Files });
+        let cancelled = || shared.revision.load(Ordering::Acquire) != revision;
+        let result = match &query.candidates {
+            PaletteCandidates::Files => match_files(&paths, &query, shared.limits.result_limit, &matcher, cancelled),
+            _ => match_candidates(&commands, &query, shared.limits.result_limit, &matcher, cancelled),
+        };
+        let Some(result) = result else {
             continue;
         };
         if publish(&shared, revision, result) && !shared.notified.swap(true, Ordering::AcqRel) {
@@ -609,24 +647,26 @@ fn run_index(shared: Arc<Shared>, notify: Arc<dyn Fn() + Send + Sync>) {
     }
 }
 
-fn publish(shared: &Shared, revision: u64, result: FileResults) -> bool {
+fn publish(shared: &Shared, revision: u64, result: PaletteResults) -> bool {
     // Re-check while holding the same lock used by request/cancel so an old
     // worker can never overwrite a newer generation's published snapshot.
     let mut inbox = shared.inbox.lock().unwrap();
     if inbox.revision != revision || inbox.stopped {
         return false;
     }
-    inbox.latest = Arc::new(result);
+    let result = Arc::new(result);
+    inbox.cached[result.mode as usize] = result.clone();
+    inbox.latest = result;
     true
 }
 
 fn match_files(
     paths: &[Arc<FileEntry>],
-    query: &FileQuery,
+    query: &PaletteQuery,
     limit: usize,
     matcher: &SkimMatcherV2,
     cancelled: impl Fn() -> bool,
-) -> Option<FileResults> {
+) -> Option<PaletteResults> {
     if cancelled() {
         return None;
     }
@@ -646,10 +686,74 @@ fn match_files(
             }
         }
     }
-    Some(FileResults {
+    Some(PaletteResults {
         generation: query.generation,
+        mode: PaletteMode::Files,
         query: query.query.clone(),
-        files: rows.into_iter().map(|(_, path)| path).collect(),
+        rows: rows
+            .into_iter()
+            .map(|(_, f)| PaletteRow {
+                title: f.label.clone(),
+                category: "File".into(),
+                action: PaletteAction::OpenFile(f.path.clone()),
+            })
+            .collect(),
+        total,
+    })
+}
+
+fn empty_results(mode: PaletteMode) -> PaletteResults {
+    PaletteResults { generation: 0, mode, query: "".into(), rows: Arc::from([]), total: 0 }
+}
+
+fn match_candidates(
+    commands: &[(String, PaletteRow)],
+    query: &PaletteQuery,
+    limit: usize,
+    matcher: &SkimMatcherV2,
+    cancelled: impl Fn() -> bool,
+) -> Option<PaletteResults> {
+    let mut scored = Vec::new();
+    let mut total = 0;
+    match &query.candidates {
+        PaletteCandidates::Commands => {
+            for (label, row) in commands {
+                if cancelled() {
+                    return None;
+                }
+                if let Some(score) = matcher.fuzzy_match(label, &query.query) {
+                    total += 1;
+                    keep_best(&mut scored, score, row.clone(), limit);
+                }
+            }
+        }
+        PaletteCandidates::Tabs(snapshot) => {
+            for tab in snapshot.0.iter() {
+                if cancelled() {
+                    return None;
+                }
+                if let Some(score) = matcher.fuzzy_match(&tab.title, &query.query) {
+                    total += 1;
+                    keep_best(
+                        &mut scored,
+                        score,
+                        PaletteRow {
+                            title: tab.title.as_str().into(),
+                            category: "Tab".into(),
+                            action: PaletteAction::ActivateTab(tab.id),
+                        },
+                        limit,
+                    );
+                }
+            }
+        }
+        PaletteCandidates::Files => unreachable!("files use native-path catalogue"),
+    }
+    Some(PaletteResults {
+        generation: query.generation,
+        mode: query.candidates.mode(),
+        query: query.query.clone(),
+        rows: scored.into_iter().map(|(_, r)| r).collect(),
         total,
     })
 }
@@ -662,37 +766,70 @@ mod tests {
         let paths: Vec<_> =
             ["alpha", "alpine", "beta"].into_iter().map(|s| Arc::new(FileEntry::new(s.into(), s.into()))).collect();
         let checks = std::cell::Cell::new(0);
-        let result = match_files(&paths, &FileQuery { generation: 1, query: "al".into() }, 2, &matcher(), || {
-            checks.set(checks.get() + 1);
-            checks.get() == 3
-        });
-        assert!(result.is_none());
+        let result = match_files(
+            &paths,
+            &PaletteQuery { generation: 1, query: "al".into(), candidates: PaletteCandidates::Files },
+            2,
+            &matcher(),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() == 3
+            },
+        );
+        assert!(result.is_none(), "cancelled scoring must discard partial snapshot");
         assert_eq!(checks.get(), 3, "cancel checked after matching began");
     }
 
     #[test]
     fn superseded_worker_cannot_publish_even_if_cancellation_arrives_after_scoring() {
         let mut index = FileIndex::new(IndexLimits::default(), Arc::new(|| {})).unwrap();
-        index.request(FileQuery { generation: 10, query: "al".into() }).unwrap();
+        index
+            .request(PaletteQuery { generation: 10, query: "al".into(), candidates: PaletteCandidates::Files })
+            .unwrap();
         let old_revision = index.shared.revision.load(Ordering::Acquire);
         let paths = vec![Arc::new(FileEntry::new("alpha".into(), "alpha".into()))];
-        let result =
-            match_files(&paths, &FileQuery { generation: 10, query: "al".into() }, 2, &matcher(), || false).unwrap();
-        index.request(FileQuery { generation: 11, query: "beta".into() }).unwrap();
-        assert!(!publish(&index.shared, old_revision, result));
+        let result = match_files(
+            &paths,
+            &PaletteQuery { generation: 10, query: "al".into(), candidates: PaletteCandidates::Files },
+            2,
+            &matcher(),
+            || false,
+        )
+        .unwrap();
+        index
+            .request(PaletteQuery { generation: 11, query: "beta".into(), candidates: PaletteCandidates::Files })
+            .unwrap();
+        assert!(!publish(&index.shared, old_revision, result), "superseded worker must not publish");
         index.stop().unwrap().join().unwrap();
     }
 
     #[test]
-    fn capped_snapshot_counts_all_matches_without_copying_catalogue() {
+    fn capped_snapshot_counts_all_matches() {
         let paths: Vec<_> = ["one.rs", "two.rs", "three.rs"]
             .into_iter()
             .map(|s| Arc::new(FileEntry::new(s.into(), s.into())))
             .collect();
-        let result =
-            match_files(&paths, &FileQuery { generation: 1, query: "rs".into() }, 2, &matcher(), || false).unwrap();
+        let result = match_files(
+            &paths,
+            &PaletteQuery { generation: 1, query: "rs".into(), candidates: PaletteCandidates::Files },
+            2,
+            &matcher(),
+            || false,
+        )
+        .unwrap();
         assert_eq!(result.total, 3);
-        assert_eq!(result.files.len(), 2);
-        assert!(result.files.iter().all(|f| paths.iter().any(|p| Arc::ptr_eq(p, f))));
+        assert_eq!(result.rows.len(), 2, "worker snapshot exceeded result cap");
+    }
+
+    #[test]
+    fn tab_queries_share_validated_snapshot_without_copying_titles() {
+        let mut p = Palette::new(2);
+        p.set_tabs(vec![Tab { id: 1, title: "alpha".into() }]).unwrap();
+        let first = p.open("#").unwrap().unwrap();
+        let second = p.insert("a").unwrap().unwrap();
+        let (PaletteCandidates::Tabs(a), PaletteCandidates::Tabs(b)) = (first.candidates, second.candidates) else {
+            panic!("tab query lost snapshot");
+        };
+        assert!(Arc::ptr_eq(&a.0, &b.0), "editing copied the tab snapshot");
     }
 }
