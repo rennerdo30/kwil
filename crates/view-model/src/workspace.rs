@@ -859,6 +859,8 @@ impl Workspace {
                         let mut view = View::new(None);
                         view.path = tab.path.clone();
                         view.editor = None;
+                        view.top = tab.first_visible_line;
+                        view.set_horizontal_window(tab.first_byte_column, 64 << 10);
                         view.set_notice("Recovering closed tab…".into());
                         self.views.insert(id, view);
                         self.files.queue.push_back(DocumentRequest::Recover { tab });
@@ -1598,6 +1600,7 @@ mod tests {
         workspace.close(first, true).unwrap();
         workspace.closed_views.remove(&first);
         workspace.file_command("file.reopenClosed").unwrap();
+        workspace.set_rows(2);
         let mut document = crate::Document::new();
         document.buffer.insert(0, "界a\nxyz".as_bytes()).unwrap();
         document.saved_revision = 1;
