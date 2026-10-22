@@ -1,6 +1,7 @@
 //! Shared application used by the GUI and console entry points.
 
 pub mod frontend;
+mod startup;
 #[cfg(windows)]
 mod windows;
 use frontend::{Flags, Frontend, ProcessEnv, after_gui_failure, choose_frontend, current_platform};
@@ -77,15 +78,28 @@ pub fn run_console() -> ExitCode {
 }
 
 fn run_app(console_launcher: bool) -> ExitCode {
-    if let Err(e) = kwil_update::recover_on_startup() {
-        let message = format!("kwil: {e}");
-        eprintln!("{message}");
-        #[cfg(windows)]
-        windows::show_error(&message, std::env::args_os().any(|arg| arg == "--hidden"));
-        return ExitCode::FAILURE;
-    }
+    let platform = current_platform();
+    #[cfg(windows)]
+    let streams = windows::standard_streams();
     #[cfg(not(windows))]
-    let _ = console_launcher;
+    let streams = if std::io::stderr().is_terminal() {
+        startup::StandardStreams::Terminal
+    } else {
+        startup::StandardStreams::Redirected
+    };
+    let presentation =
+        startup::error_presentation(std::env::args_os().skip(1), console_launcher, streams, &ProcessEnv, platform);
+    let dialog = |message: &str| {
+        #[cfg(windows)]
+        windows::show_error(message);
+        #[cfg(not(windows))]
+        let _ = message;
+    };
+    if let Err(code) =
+        startup::recover(presentation, kwil_update::recover_on_startup, |message| eprintln!("{message}"), dialog)
+    {
+        return code;
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -139,7 +153,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
     };
     let in_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
-    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, current_platform());
+    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, platform);
     if let Frontend::Error(e) = frontend {
         eprintln!("kwil: {e}");
         return ExitCode::from(2);
@@ -156,9 +170,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
             Err(e) => {
                 let message = format!("{e}; no interactive terminal is attached");
-                eprintln!("kwil: {message}");
-                #[cfg(windows)]
-                windows::show_error(&message, args.hidden);
+                presentation.report(&format!("kwil: {message}"), |message| eprintln!("{message}"), dialog);
                 return ExitCode::FAILURE;
             }
         }
@@ -185,9 +197,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             Err(e) if after_gui_failure(in_terminal) == Frontend::Tui => eprintln!("kwil: {e}; using the terminal UI"),
             Err(e) => {
                 let message = format!("{e}; no interactive terminal is attached");
-                eprintln!("kwil: {message}");
-                #[cfg(windows)]
-                windows::show_error(&message, args.hidden);
+                presentation.report(&format!("kwil: {message}"), |message| eprintln!("{message}"), dialog);
                 return ExitCode::FAILURE;
             }
         }
