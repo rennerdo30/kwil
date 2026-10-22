@@ -179,8 +179,12 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
+            // Tests run in parallel and the clock can be coarse (microseconds
+            // on macOS), so a per-process counter keeps every folder unique.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-            let path = std::env::temp_dir().join(format!("kwil-watch-{}-{time}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("kwil-watch-{}-{n}-{time}", std::process::id()));
             std::fs::create_dir(&path).unwrap();
             Self(path)
         }
