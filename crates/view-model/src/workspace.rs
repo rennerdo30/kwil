@@ -1,22 +1,65 @@
 //! Open views retain their own cursor, undo history and viewport. Worker
 //! completions address a document ID, never whichever tab happens to be active.
-use crate::{Damage, View};
+use crate::document_worker::{DocumentRequest, DocumentResult, DocumentWorker};
+use crate::{CommandStatus, Damage, Editor, View};
 use kwil_core_workspace::session::{DocumentId, Session};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     ops::{Deref, DerefMut},
     path::PathBuf,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilePromptKind {
+    Open,
+    SaveAs,
+    Recent,
+}
+
+pub struct FilePrompt {
+    pub kind: FilePromptKind,
+    pub document: DocumentId,
+    pub revision: u64,
+    pub text: String,
+}
+
+struct SaveFlight {
+    revision: u64,
+}
+
+#[derive(Default)]
+struct FileFlow {
+    worker: Option<DocumentWorker>,
+    queue: VecDeque<DocumentRequest>,
+    saves: HashMap<DocumentId, SaveFlight>,
+    save_all: VecDeque<DocumentId>,
+    close: VecDeque<DocumentId>,
+    quit: bool,
+    exit: bool,
+    prompt: Option<FilePrompt>,
+    preparing: bool,
+    storage_ready: bool,
+    persist_inflight: bool,
+    persist_pending: bool,
+    deferred_recovery: Option<Box<crate::document_worker::PreparedWorkspace>>,
+}
+
 pub struct Workspace {
     session: Session,
     views: HashMap<DocumentId, View>,
+    closed_views: HashMap<DocumentId, View>,
+    files: FileFlow,
 }
 
 impl Workspace {
     pub fn new(view: View) -> io::Result<Self> {
-        let mut workspace = Self { session: Session::default(), views: HashMap::new() };
+        let mut workspace = Self {
+            session: Session::default(),
+            views: HashMap::new(),
+            closed_views: HashMap::new(),
+            files: FileFlow::default(),
+        };
         workspace.open(view)?;
         Ok(workspace)
     }
@@ -57,24 +100,30 @@ impl Workspace {
     }
 
     pub fn cycle(&mut self, backwards: bool) -> Damage {
+        self.cancel_file_prompt();
         self.sync_active();
         let tabs = self.session.tabs();
         let current = tabs.iter().position(|tab| tab.id == self.active_id()).unwrap_or(0);
         let next = if backwards { (current + tabs.len() - 1) % tabs.len() } else { (current + 1) % tabs.len() };
         self.session.activate(tabs[next].id);
+        self.checkpoint_session();
         Damage { full: true, status: true, ..Default::default() }
     }
 
     /// Refuse dirty close until the caller saves or explicitly chooses discard.
     pub fn close(&mut self, id: DocumentId, discard: bool) -> io::Result<bool> {
+        if self.files.saves.contains_key(&id) {
+            return Err(io::Error::other("Save in progress; wait before closing this tab"));
+        }
         let Some(view) = self.views.get(&id) else { return Ok(false) };
-        if !discard && view.editor().is_some_and(|editor| editor.document().is_dirty()) {
+        let dirty = view.editor().map_or_else(
+            || self.session.tabs().iter().find(|t| t.id == id).is_some_and(|t| t.revision != t.saved_revision),
+            |editor| editor.document().is_dirty(),
+        );
+        if !discard && dirty {
             return Err(io::Error::other("Unsaved changes: save or explicitly discard before closing"));
         }
         // Prepare the replacement before mutating the last tab.
-        if self.views.len() == 1 {
-            self.open(View::new(None))?;
-        }
         self.sync_active();
         if discard && let Some(tab) = self.session.tab_mut(id) {
             tab.saved_revision = tab.revision;
@@ -84,7 +133,14 @@ impl Workspace {
                 "Closed-tab history contains unsaved work; recover it before closing another tab",
             ));
         }
-        self.views.remove(&id);
+        if let Some(view) = self.views.remove(&id) {
+            self.closed_views.insert(id, view);
+        }
+        self.files.queue.retain(|request| !matches!(request, DocumentRequest::Open { document, .. } | DocumentRequest::Index { document, .. } if *document == id));
+        self.closed_views.retain(|id, _| self.session.closed().iter().any(|tab| tab.id == *id));
+        if self.views.is_empty() {
+            self.open(View::new(None))?;
+        }
         Ok(true)
     }
 
@@ -106,6 +162,722 @@ impl Workspace {
             }
         }
     }
+
+    pub fn sync_all(&mut self) {
+        for tab in self.session.tabs().iter().map(|t| t.id).collect::<Vec<_>>() {
+            if let (Some(view), Some(metadata)) = (self.views.get(&tab), self.session.tab_mut(tab)) {
+                metadata.path = view.path.clone();
+                metadata.first_visible_line = view.top();
+                if let Some(editor) = view.editor() {
+                    metadata.revision = editor.document().revision();
+                    metadata.saved_revision = editor.document().saved_revision();
+                    metadata.cursor = editor.primary_cursor().head;
+                    metadata.anchor = editor.primary_cursor().anchor;
+                }
+            }
+        }
+    }
+
+    /// Start only after the first frame. Every callback is already addressed.
+    pub fn start_document_worker(&mut self, complete: impl Fn(DocumentResult) + Send + 'static) -> io::Result<()> {
+        self.start_document_worker_at(None, complete)
+    }
+
+    /// Tests and embedders can select an isolated recovery location explicitly.
+    pub fn start_document_worker_at(
+        &mut self,
+        root: Option<PathBuf>,
+        complete: impl Fn(DocumentResult) + Send + 'static,
+    ) -> io::Result<()> {
+        if self.files.worker.is_some() {
+            return Ok(());
+        }
+        self.files.worker = Some(DocumentWorker::spawn(complete)?);
+        self.files
+            .worker
+            .as_ref()
+            .unwrap()
+            .try_submit(DocumentRequest::Prepare { root })
+            .map_err(|_| io::Error::other("Recovery admission failed"))?;
+        self.files.preparing = true;
+        Ok(())
+    }
+
+    fn queue_initial_indexes(&mut self) {
+        for tab in self.session.tabs() {
+            let view = &self.views[&tab.id];
+            if view.editor().is_none()
+                && let (Some(path), Some(file)) = (&view.path, view.file())
+            {
+                self.files.queue.push_back(DocumentRequest::Index {
+                    document: tab.id,
+                    revision: tab.revision,
+                    path: path.clone(),
+                    file: file.clone(),
+                });
+            }
+        }
+        self.pump_files();
+    }
+
+    fn pump_files(&mut self) {
+        if self.files.preparing {
+            return;
+        }
+        if self.files.worker.is_none() {
+            return;
+        }
+        while let Some(request) = self.files.queue.pop_front() {
+            match self.files.worker.as_ref().unwrap().try_submit(request) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(request)) => {
+                    self.files.queue.push_front(request);
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(request)) => {
+                    if let DocumentRequest::Save { document, .. } = request {
+                        self.files.saves.remove(&document);
+                        if let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut) {
+                            let _ = editor.finish_save(Err(io::Error::other("document worker disconnected")));
+                        }
+                    }
+                    self.cancel_close_intent();
+                    self.set_notice("Document worker disconnected; changes remain unsaved".into());
+                }
+            }
+        }
+    }
+
+    /// Cheap metadata snapshot. Coalesce writes while one worker write is active.
+    pub fn checkpoint_session(&mut self) {
+        self.sync_all();
+        self.files.persist_pending = true;
+        if self.files.storage_ready && !self.files.persist_inflight {
+            self.files.persist_pending = false;
+            self.files.persist_inflight = true;
+            self.files.queue.push_back(DocumentRequest::Persist(self.session.clone()));
+            self.pump_files();
+        }
+    }
+
+    pub fn file_prompt(&self) -> Option<&FilePrompt> {
+        self.files.prompt.as_ref()
+    }
+    pub fn file_prompt_mut(&mut self) -> Option<&mut FilePrompt> {
+        self.files.prompt.as_mut()
+    }
+    pub fn wants_exit(&self) -> bool {
+        self.files.exit
+    }
+    pub fn close_pending(&self) -> bool {
+        self.files.quit || !self.files.close.is_empty()
+    }
+    pub fn cancel_close_intent(&mut self) {
+        self.files.close.clear();
+        self.files.quit = false;
+        self.files.exit = false;
+    }
+    pub fn cancel_file_prompt(&mut self) {
+        self.files.prompt = None;
+        self.files.save_all.clear();
+        self.cancel_close_intent();
+    }
+    pub fn prompt_notice(&mut self) -> Damage {
+        let notice = self
+            .files
+            .prompt
+            .as_ref()
+            .map(|p| {
+                let label = match p.kind {
+                    FilePromptKind::Open => "Open",
+                    FilePromptKind::SaveAs => "Save as",
+                    FilePromptKind::Recent => "Recent (number)",
+                };
+                format!("{label}: {}  (Enter to submit, Esc to cancel)", p.text)
+            })
+            .unwrap_or_default();
+        self.set_notice(notice)
+    }
+    pub fn submit_file_prompt(&mut self) -> io::Result<()> {
+        // Blank submissions retain the prompt, destination and close intent.
+        if self.files.prompt.as_ref().is_none_or(|p| p.text.trim().is_empty()) {
+            return Ok(());
+        }
+        let prompt = self.files.prompt.take().unwrap();
+        match prompt.kind {
+            FilePromptKind::Open => {
+                self.open_path(prompt.text.into())?;
+            }
+            FilePromptKind::Recent => {
+                let number = prompt.text.trim().parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+                let path = number
+                    .and_then(|n| self.session.recent().get(n))
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("Choose a recent file number"));
+                match path {
+                    Ok(path) => {
+                        self.open_path(path)?;
+                    }
+                    Err(error) => {
+                        self.files.prompt = Some(prompt);
+                        return Err(error);
+                    }
+                }
+            }
+            FilePromptKind::SaveAs => {
+                if self
+                    .views
+                    .get(&prompt.document)
+                    .and_then(View::editor)
+                    .is_none_or(|e| e.document().revision() != prompt.revision)
+                {
+                    self.cancel_close_intent();
+                    return Err(io::Error::other("Document changed while naming it; save again"));
+                }
+                self.save_document(prompt.document, Some(prompt.text.into()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn open_path(&mut self, path: PathBuf) -> io::Result<DocumentId> {
+        if self.files.queue.len() >= 256 {
+            return Err(io::Error::other("File worker queue is full; retry after current work finishes"));
+        }
+        let path = std::path::absolute(path)?;
+        if let Some(id) = self.session.tabs().iter().find(|t| t.path.as_ref() == Some(&path)).map(|t| t.id) {
+            self.activate(id);
+            return Ok(id);
+        }
+        self.cancel_file_prompt();
+        self.sync_active();
+        let id = self.session.open(Some(path.clone()))?;
+        let mut view = View::new(None);
+        view.editor = None;
+        view.path = Some(path.clone());
+        view.set_notice("Opening…".into());
+        self.views.insert(id, view);
+        self.files.queue.push_back(DocumentRequest::Open { document: id, revision: 0, path });
+        self.pump_files();
+        self.checkpoint_session();
+        Ok(id)
+    }
+
+    /// App-owned CLI/IPC parsing feeds already validated native paths here.
+    pub fn open_files(&mut self, request: kwil_core_workspace::instance::OpenFiles) -> io::Result<()> {
+        if request.files.len() > kwil_core_workspace::instance::MAX_OPEN_FILES {
+            return Err(io::Error::other("Too many open requests"));
+        }
+        for file in request.files {
+            let id = self.open_path(file.path)?;
+            if let Some(line) = file.line {
+                let view = self.views.get_mut(&id).unwrap();
+                view.execute(
+                    "navigation.goToLine",
+                    &crate::CommandArgs { line: Some(line), column: file.column, ..Default::default() },
+                    1,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_document(&mut self, id: DocumentId, path: Option<PathBuf>) -> io::Result<()> {
+        if self.files.queue.len() >= 256 {
+            self.cancel_close_intent();
+            return Err(io::Error::other("File worker queue is full; retry save"));
+        }
+        if self.files.saves.contains_key(&id) {
+            self.cancel_close_intent();
+            return Err(io::Error::other("save already in progress"));
+        }
+        let path = path.map(std::path::absolute).transpose()?;
+        if let Some(path) = &path
+            && self.session.tabs().iter().any(|tab| tab.id != id && tab.path.as_ref() == Some(path))
+        {
+            self.cancel_close_intent();
+            return Err(io::Error::other("Save As target is open in another tab"));
+        }
+        let editor = self
+            .views
+            .get_mut(&id)
+            .and_then(View::editor_mut)
+            .ok_or_else(|| io::Error::other("Indexing: editing will be available when ready"))?;
+        if path.is_none() && editor.document().path().is_none() {
+            self.files.prompt = Some(FilePrompt {
+                kind: FilePromptKind::SaveAs,
+                document: id,
+                revision: editor.document().revision(),
+                text: String::new(),
+            });
+            self.activate(id);
+            self.prompt_notice();
+            return Ok(());
+        }
+        let request = match editor.save_request(path) {
+            Ok(request) => request,
+            Err(error) => {
+                self.cancel_close_intent();
+                return Err(error);
+            }
+        };
+        self.files.saves.insert(id, SaveFlight { revision: request.revision });
+        self.files.queue.push_back(DocumentRequest::Save { document: id, request });
+        if let Some(view) = self.views.get_mut(&id) {
+            view.set_notice("Saving…".into());
+        }
+        self.pump_files();
+        Ok(())
+    }
+
+    /// Commands are intercepted before Vim/editor dispatch, preserving keymap tombstones.
+    pub fn file_command(&mut self, command: &str) -> io::Result<bool> {
+        match command {
+            "file.new" => {
+                self.cancel_file_prompt();
+                self.open(View::new(None))?;
+            }
+            "file.open" | "file.recent" | "file.saveAs" => {
+                let id = self.active_id();
+                let revision = self.editor().map_or(0, |e| e.document().revision());
+                let kind = match command {
+                    "file.open" => FilePromptKind::Open,
+                    "file.recent" => FilePromptKind::Recent,
+                    _ => FilePromptKind::SaveAs,
+                };
+                self.files.prompt = Some(FilePrompt { kind, document: id, revision, text: String::new() });
+                if kind == FilePromptKind::Recent {
+                    let recent = self
+                        .session
+                        .recent()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| format!("{}: {}", i + 1, p.display()))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    self.set_notice(format!("Recent: {recent}  (type number, Enter; Esc cancels)"));
+                } else {
+                    self.prompt_notice();
+                }
+            }
+            "file.save" => {
+                let id = self.files.close.front().copied().unwrap_or(self.active_id());
+                self.save_document(id, None)?;
+            }
+            "file.saveAll" => {
+                self.sync_all();
+                self.files.save_all =
+                    self.session.tabs().iter().filter(|t| t.revision != t.saved_revision).map(|t| t.id).collect();
+                self.next_save_all()?;
+            }
+            "file.nextTab" => {
+                self.cycle(false);
+            }
+            "file.previousTab" => {
+                self.cycle(true);
+            }
+            "file.close" => {
+                self.files.quit = false;
+                self.files.close = [self.active_id()].into();
+                self.advance_close(false)?;
+            }
+            "file.closeAll" => {
+                self.files.quit = false;
+                self.files.close = self.session.tabs().iter().map(|t| t.id).collect();
+                self.advance_close(false)?;
+            }
+            "file.quit" => {
+                self.request_window_close(false)?;
+            }
+            "file.saveAndQuit" => {
+                self.files.quit = true;
+                self.files.close = self.session.tabs().iter().map(|t| t.id).collect();
+                self.save_document(self.active_id(), None)?;
+            }
+            "file.restoreSession" => {
+                if let Some(prepared) = self.files.deferred_recovery.take() {
+                    self.install_prepared(*prepared);
+                }
+            }
+            "file.reopenClosed" => {
+                self.cancel_file_prompt();
+                self.sync_active();
+                if let Some(id) = self.session.reopen_closed()? {
+                    if let Some(view) = self.closed_views.remove(&id) {
+                        self.views.insert(id, view);
+                    } else {
+                        let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap().clone();
+                        let mut view = View::new(None);
+                        view.path = tab.path.clone();
+                        view.editor = None;
+                        view.set_notice("Recovering closed tab…".into());
+                        self.views.insert(id, view);
+                        self.files.queue.push_back(DocumentRequest::Recover { tab });
+                        self.pump_files();
+                    }
+                }
+            }
+            _ => return Ok(false),
+        }
+        self.checkpoint_session();
+        Ok(true)
+    }
+
+    fn next_save_all(&mut self) -> io::Result<()> {
+        if let Some(id) = self.files.save_all.pop_front() {
+            self.save_document(id, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn request_window_close(&mut self, discard: bool) -> io::Result<()> {
+        if !self.close_pending() {
+            self.files.quit = true;
+            self.files.close = self.session.tabs().iter().map(|t| t.id).collect();
+        }
+        self.advance_close(discard)?;
+        self.checkpoint_session();
+        Ok(())
+    }
+
+    pub fn discard_close_target(&mut self) -> io::Result<()> {
+        self.advance_close(true)
+    }
+
+    fn advance_close(&mut self, mut discard: bool) -> io::Result<()> {
+        while let Some(id) = self.files.close.front().copied() {
+            if self.files.saves.contains_key(&id) {
+                self.set_notice("Save in progress; close will wait for its revision".into());
+                return Ok(());
+            }
+            let dirty = self.views.get(&id).and_then(View::editor).map_or_else(
+                || self.session.tabs().iter().find(|t| t.id == id).is_some_and(|t| t.revision != t.saved_revision),
+                |editor| editor.document().is_dirty(),
+            );
+            if dirty && !discard {
+                self.activate(id);
+                self.set_notice(
+                    "Unsaved changes: Ctrl+S to save; Ctrl+Shift+Q to discard this tab; Esc to cancel".into(),
+                );
+                return Ok(());
+            }
+            // Window close checks every tab but does not throw away the session.
+            if !self.files.quit || discard {
+                self.close(id, discard)?;
+            }
+            self.files.close.pop_front();
+            discard = false;
+        }
+        self.files.exit = self.files.quit;
+        Ok(())
+    }
+
+    pub fn document_result(&mut self, result: DocumentResult) -> Damage {
+        let checkpoint = matches!(
+            &result,
+            DocumentResult::Indexed { .. } | DocumentResult::Saved { .. } | DocumentResult::Recovered { .. }
+        );
+        let mut damage = Damage { status: true, ..Default::default() };
+        match result {
+            DocumentResult::Prepared(result) => {
+                self.files.preparing = false;
+                match result {
+                    Ok(prepared) => {
+                        self.install_prepared(prepared);
+                        self.files.storage_ready = self.files.deferred_recovery.is_none();
+                        damage.full = true;
+                        self.checkpoint_session();
+                    }
+                    Err(error) => {
+                        self.set_notice(format!("Recovery unavailable: {error}; existing recovery files retained"));
+                    }
+                }
+                self.queue_initial_indexes();
+            }
+            DocumentResult::Persisted(result) => {
+                self.files.persist_inflight = false;
+                match result {
+                    Ok(()) => {
+                        damage = Damage::default();
+                        if self.files.persist_pending {
+                            self.checkpoint_session();
+                        }
+                    }
+                    Err(error) => {
+                        self.set_notice(format!("Session metadata not durable: {error}"));
+                    }
+                }
+            }
+            DocumentResult::Recovered { document, revision, result } => {
+                let metadata = self.session.tabs().iter().find(|t| t.id == document && t.revision == revision).cloned();
+                if let Some(tab) = metadata
+                    && let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none())
+                {
+                    match result {
+                        Ok(document) => {
+                            let mut editor = Editor::new(document);
+                            let len = editor.document().snapshot().len();
+                            let _ = editor.set_cursors(
+                                vec![crate::Cursor {
+                                    head: tab.cursor.min(len),
+                                    anchor: tab.anchor.min(len),
+                                    desired_column: None,
+                                }],
+                                0,
+                            );
+                            editor.set_viewport(tab.first_visible_line, view.rows);
+                            view.editor = Some(editor);
+                            view.refresh_after_edit(Damage { full: true, ..Default::default() });
+                        }
+                        Err(error) => {
+                            view.set_notice(format!("Recovery failed: {error}; journal retained"));
+                        }
+                    }
+                    damage.full = self.session.active() == Some(tab.id);
+                }
+            }
+            DocumentResult::Opened { document, revision, result } => {
+                if let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none() && revision == 0) {
+                    match result {
+                        Ok((path, file)) => {
+                            let rows = view.rows();
+                            view.path = Some(path);
+                            view.file = Some(file);
+                            view.set_rows(rows);
+                        }
+                        Err(error) => {
+                            view.set_notice(format!("Open failed: {error}"));
+                        }
+                    }
+                    damage.full = self.active_id() == document;
+                }
+            }
+            DocumentResult::Indexed { document, revision, result } => {
+                if let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none() && revision == 0) {
+                    match result {
+                        Ok(document) => {
+                            let mut editor = Editor::new(document);
+                            editor.set_viewport(view.top, view.rows);
+                            view.editor = Some(editor);
+                            view.index_ready();
+                            view.set_notice(String::new());
+                        }
+                        Err(error) => {
+                            view.set_notice(format!("Index failed: {error}"));
+                        }
+                    }
+                    damage.full = self.active_id() == document;
+                }
+            }
+            DocumentResult::Saved { document, revision, result } => {
+                if result.as_ref().is_ok_and(|saved| saved.revision != revision) {
+                    self.set_notice("Ignored save completion with mismatched source revision".into());
+                    return damage;
+                }
+                if self.files.saves.get(&document).is_some_and(|save| save.revision == revision) {
+                    self.files.saves.remove(&document);
+                    let mut may_close = false;
+                    let mut warning = false;
+                    let mut background_notice = None;
+                    if let Some(view) = self.views.get_mut(&document)
+                        && let Some(editor) = view.editor_mut()
+                    {
+                        let current = editor.document().revision() == revision;
+                        match editor.finish_save(result) {
+                            Ok(result) => {
+                                may_close = current && !editor.document().is_dirty();
+                                let notice = match result.status {
+                                    CommandStatus::Message(message) => {
+                                        warning = true;
+                                        message
+                                    }
+                                    _ if !may_close => "Saved earlier revision; current changes remain unsaved".into(),
+                                    _ => "Saved".into(),
+                                };
+                                if self.session.active() != Some(document) {
+                                    background_notice = Some(format!("Tab {}: {notice}", document.0));
+                                }
+                                let edited = view.refresh_after_edit(result.damage);
+                                view.set_notice(notice);
+                                if self.session.active() == Some(document) {
+                                    damage = edited;
+                                    damage.status = true;
+                                }
+                                if let Some(path) = &view.path {
+                                    let _ = self.session.set_path(document, path.clone());
+                                }
+                            }
+                            Err(error) => {
+                                let notice = format!("Save failed: {error}");
+                                if self.session.active() != Some(document) {
+                                    background_notice = Some(format!("Tab {}: {notice}", document.0));
+                                }
+                                view.set_notice(notice);
+                            }
+                        }
+                    }
+                    if let Some(notice) = background_notice {
+                        self.set_notice(notice);
+                    }
+                    if may_close && !warning {
+                        if self.files.close.contains(&document) {
+                            if self.files.quit {
+                                self.files.close.retain(|id| *id != document);
+                            }
+                            if let Err(error) = self.advance_close(false) {
+                                self.set_notice(error.to_string());
+                                self.cancel_close_intent();
+                            }
+                            damage.full = true;
+                        }
+                        if let Err(error) = self.next_save_all() {
+                            self.set_notice(error.to_string());
+                        }
+                    } else {
+                        self.cancel_close_intent();
+                        self.files.save_all.clear();
+                    }
+                }
+            }
+        }
+        if checkpoint {
+            self.checkpoint_session();
+        }
+        self.pump_files();
+        damage
+    }
+
+    fn install_prepared(&mut self, prepared: crate::document_worker::PreparedWorkspace) {
+        self.sync_all();
+        let additional = self
+            .session
+            .tabs()
+            .iter()
+            .filter(|tab| {
+                let view = &self.views[&tab.id];
+                let dirty = view.editor().is_some_and(|e| e.document().is_dirty());
+                let blank =
+                    view.path.is_none() && view.editor().is_some_and(|e| e.document().snapshot().is_empty()) && !dirty;
+                !blank && (dirty || !prepared.session.tabs().iter().any(|t| t.path.is_some() && t.path == view.path))
+            })
+            .count();
+        if prepared.session.tabs().len() + additional > kwil_core_workspace::session::MAX_TABS {
+            self.files.deferred_recovery = Some(Box::new(prepared));
+            self.set_notice("Recovery retained: close tabs before Restore Session; active work is unchanged".into());
+            return;
+        }
+        let old_tabs = self.session.tabs().to_vec();
+        let old_active = self.active_id();
+        let mut old_views = std::mem::take(&mut self.views);
+        self.session = prepared.session;
+        for (id, document) in prepared.documents {
+            let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap();
+            let mut view = View::new(None);
+            view.path = tab.path.clone();
+            match document {
+                Ok(document) => {
+                    let mut editor = Editor::new(document);
+                    let len = editor.document().snapshot().len();
+                    let _ = editor.set_cursors(
+                        vec![crate::Cursor {
+                            head: tab.cursor.min(len),
+                            anchor: tab.anchor.min(len),
+                            desired_column: None,
+                        }],
+                        0,
+                    );
+                    editor.set_viewport(tab.first_visible_line, 0);
+                    view.editor = Some(editor);
+                    view.top = tab.first_visible_line;
+                    view.file = view.editor().unwrap().document().original.clone();
+                }
+                Err(error) => {
+                    view.editor = None;
+                    view.set_notice(format!("Recovery failed: {error}; journal retained"));
+                }
+            }
+            self.views.insert(id, view);
+        }
+        let mut mapping = HashMap::new();
+        let mut active = None;
+        for tab in old_tabs {
+            let Some(view) = old_views.remove(&tab.id) else { continue };
+            let dirty = view.editor().is_some_and(|e| e.document().is_dirty());
+            let blank =
+                view.path.is_none() && view.editor().is_some_and(|e| e.document().snapshot().is_empty()) && !dirty;
+            if blank
+                && !self.views.is_empty()
+                && !self.files.saves.contains_key(&tab.id)
+                && self.files.prompt.as_ref().is_none_or(|p| p.document != tab.id)
+            {
+                continue;
+            }
+            if let Some(existing) =
+                self.session.tabs().iter().find(|t| t.path.is_some() && t.path == view.path).map(|t| t.id)
+            {
+                if !dirty {
+                    mapping.insert(tab.id, existing);
+                    if tab.id == old_active {
+                        active = Some(existing);
+                    }
+                    continue;
+                }
+                // Preserve both contents without giving two tabs the same save target.
+                if let Some(recovered) = self.views.get_mut(&existing) {
+                    recovered.path = None;
+                    if let Some(editor) = recovered.editor_mut() {
+                        editor.document.path = None;
+                    }
+                }
+                self.session.tab_mut(existing).unwrap().path = None;
+            }
+            let id = self.session.open(view.path.clone()).expect("validated paths and reserved recovery capacity");
+            mapping.insert(tab.id, id);
+            if tab.id == old_active {
+                active = Some(id);
+            }
+            self.views.insert(id, view);
+        }
+        // Requests captured while recovery was preparing retain their source tab.
+        for request in &mut self.files.queue {
+            match request {
+                DocumentRequest::Open { document, .. }
+                | DocumentRequest::Index { document, .. }
+                | DocumentRequest::Save { document, .. } => {
+                    if let Some(id) = mapping.get(document) {
+                        *document = *id;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.files.saves = std::mem::take(&mut self.files.saves)
+            .into_iter()
+            .map(|(id, save)| (*mapping.get(&id).unwrap_or(&id), save))
+            .collect();
+        if let Some(prompt) = &mut self.files.prompt
+            && let Some(id) = mapping.get(&prompt.document)
+        {
+            prompt.document = *id;
+        }
+        for id in self.files.close.iter_mut().chain(self.files.save_all.iter_mut()) {
+            if let Some(mapped) = mapping.get(id) {
+                *id = *mapped;
+            }
+        }
+        if let Some(id) = active {
+            self.session.activate(id);
+        }
+        if self.views.is_empty() {
+            let _ = self.open(View::new(None));
+        }
+    }
+
+    pub fn status_text(&self) -> String {
+        let tabs = self.session.tabs();
+        let position = tabs.iter().position(|t| t.id == self.active_id()).unwrap_or(0) + 1;
+        format!("[{position}/{}] {}", tabs.len(), self.deref().status_text())
+    }
 }
 
 impl Deref for Workspace {
@@ -125,6 +897,198 @@ impl DerefMut for Workspace {
 mod tests {
     use super::*;
     use crate::CommandArgs;
+
+    #[test]
+    fn file_commands_create_cycle_close_reopen_and_preserve_unsaved_tabs() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("日本語".into()), ..Default::default() }, 1)
+            .unwrap();
+        assert!(workspace.file_command("file.new").unwrap());
+        let second = workspace.active_id();
+        assert_ne!(first, second);
+        workspace.file_command("file.previousTab").unwrap();
+        assert_eq!(workspace.active_id(), first);
+        workspace.file_command("file.close").unwrap();
+        assert!(workspace.close_pending());
+        assert_eq!(workspace.session().tabs().len(), 2);
+        workspace.cancel_file_prompt();
+        workspace.activate(second);
+        workspace.file_command("file.close").unwrap();
+        workspace.file_command("file.reopenClosed").unwrap();
+        assert_eq!(workspace.active_id(), second);
+        workspace.activate(first);
+        assert_eq!(workspace.editor().unwrap().primary_cursor().head, "日本語".len() as u64);
+    }
+
+    #[test]
+    fn window_close_visits_inactive_dirty_tabs_and_requires_each_discard() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("first".into()), ..Default::default() }, 1).unwrap();
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("second".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.file_command("file.new").unwrap();
+        workspace.request_window_close(false).unwrap();
+        assert_eq!(workspace.active_id(), first);
+        assert!(!workspace.wants_exit());
+        workspace.discard_close_target().unwrap();
+        assert_eq!(workspace.active_id(), second);
+        assert!(!workspace.wants_exit());
+        workspace.cancel_file_prompt();
+        assert!(!workspace.close_pending());
+        assert!(!workspace.wants_exit());
+        assert!(workspace.view(second).unwrap().editor().unwrap().document().is_dirty());
+    }
+
+    #[test]
+    fn save_as_named_blank_prompt_keeps_destination_and_cancels_close_intent() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        workspace.file_command("file.saveAndQuit").unwrap();
+        workspace.file_prompt_mut().unwrap().text = "   ".into();
+        workspace.submit_file_prompt().unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().document, first);
+        assert!(workspace.close_pending());
+        workspace.cancel_file_prompt();
+        assert!(!workspace.close_pending());
+        workspace.file_command("file.saveAs").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().kind, FilePromptKind::SaveAs);
+    }
+
+    #[test]
+    fn stale_index_completion_does_not_replace_edited_or_unrelated_tab() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1).unwrap();
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        workspace.document_result(DocumentResult::Indexed {
+            document: first,
+            revision: 0,
+            result: Ok(crate::Document::new()),
+        });
+        assert_eq!(workspace.active_id(), second);
+        assert_eq!(workspace.view(first).unwrap().editor().unwrap().document().snapshot().len(), 4);
+        assert!(workspace.editor().unwrap().document().snapshot().is_empty());
+    }
+
+    fn edit(workspace: &mut Workspace, text: &str) {
+        workspace.execute("edit.insert", &CommandArgs { text: Some(text.into()), ..Default::default() }, 1).unwrap();
+    }
+
+    fn take_save(workspace: &mut Workspace) -> (DocumentId, kwil_core_workspace::SaveRequest) {
+        let Some(DocumentRequest::Save { document, request }) = workspace.files.queue.pop_front() else {
+            panic!("expected worker save")
+        };
+        (document, request)
+    }
+
+    #[test]
+    fn inactive_save_completion_keeps_active_text_and_concurrent_source_edits() {
+        let path = std::env::temp_dir().join(format!(
+            "kwil-inactive-save-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        edit(&mut workspace, "before");
+        workspace.save_document(first, Some(path.clone())).unwrap();
+        let (document, request) = take_save(&mut workspace);
+        let revision = request.revision;
+        edit(&mut workspace, " after");
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        edit(&mut workspace, "other");
+        workspace.document_result(DocumentResult::Saved {
+            document,
+            revision,
+            result: kwil_core_workspace::save_snapshot(request),
+        });
+        assert_eq!(workspace.active_id(), second);
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 5);
+        let source = workspace.view(first).unwrap().editor().unwrap();
+        assert!(source.document().is_dirty());
+        assert_eq!(source.document().snapshot().len(), 12);
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        drop(workspace);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn save_all_serializes_untitled_prompts_and_save_warnings_cancel_exit() {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-saveall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "one");
+        let first = workspace.active_id();
+        workspace.file_command("file.new").unwrap();
+        edit(&mut workspace, "two");
+        let second = workspace.active_id();
+        workspace.file_command("file.saveAll").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().document, first);
+        workspace.file_prompt_mut().unwrap().text = root.join("first.txt").to_string_lossy().into();
+        workspace.submit_file_prompt().unwrap();
+        let (document, request) = take_save(&mut workspace);
+        let revision = request.revision;
+        workspace.document_result(DocumentResult::Saved {
+            document,
+            revision,
+            result: kwil_core_workspace::save_snapshot(request),
+        });
+        assert_eq!(workspace.file_prompt().unwrap().document, second);
+        workspace.file_prompt_mut().unwrap().text = root.join("second.txt").to_string_lossy().into();
+        workspace.submit_file_prompt().unwrap();
+        let (document, request) = take_save(&mut workspace);
+        let revision = request.revision;
+        let mut result = kwil_core_workspace::save_snapshot(request).unwrap();
+        result.warnings.push("security metadata warning".into());
+        workspace.files.quit = true;
+        workspace.files.close.push_back(second);
+        workspace.document_result(DocumentResult::Saved { document, revision, result: Ok(result) });
+        assert!(!workspace.wants_exit());
+        assert!(!workspace.close_pending());
+        assert!(workspace.status_text().contains("security metadata warning"));
+        drop(workspace);
+        std::fs::remove_file(root.join("first.txt")).unwrap();
+        std::fs::remove_file(root.join("second.txt")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn failed_and_unsolicited_save_results_never_close_any_tab() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "unsaved");
+        let document = workspace.active_id();
+        workspace.files.saves.insert(document, SaveFlight { revision: 1 });
+        workspace.files.quit = true;
+        workspace.files.close.push_back(document);
+        workspace.document_result(DocumentResult::Saved {
+            document,
+            revision: 999,
+            result: Err(io::Error::other("unrelated")),
+        });
+        assert!(workspace.files.saves.contains_key(&document));
+        assert!(!workspace.wants_exit());
+        workspace.document_result(DocumentResult::Saved {
+            document,
+            revision: 1,
+            result: Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+        });
+        assert!(!workspace.wants_exit());
+        assert!(!workspace.close_pending());
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        assert!(workspace.status_text().contains("denied"));
+    }
 
     #[test]
     fn tabs_keep_their_text_undo_and_cursor_and_refuse_dirty_close() {

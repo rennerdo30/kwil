@@ -8,13 +8,14 @@
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
 mod clipboard;
+mod file_prompt;
 mod font;
 mod hit;
 mod input;
 mod scrollbar;
 
 use font::Font;
-use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View};
+use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View, Workspace};
 #[cfg(feature = "gpu")]
 mod gpu;
 #[cfg(feature = "frame-harness")]
@@ -72,9 +73,9 @@ impl std::fmt::Display for GuiError {
 }
 
 enum UserEvent {
-    IndexDone,
+    Document(kwil_view_model::document_worker::DocumentResult),
+    OpenExternal(kwil_core_workspace::instance::OpenFiles),
     Notice(String),
-    Saved(std::io::Result<kwil_core_workspace::SavedSnapshot>),
     GlyphReady(shaping::Tile, u64),
     SettingsReady(Box<Settings>),
     FontReady(Option<Box<Font>>),
@@ -110,11 +111,13 @@ enum UnboundKey {
     Ignore,
 }
 
+#[cfg(test)]
 fn cancel_save_prompt(path: &mut Option<String>, close_pending: &mut bool) {
     *path = None;
     *close_pending = false;
 }
 
+#[cfg(test)]
 fn submitted_save_path(prompt: &mut Option<String>) -> Option<std::path::PathBuf> {
     if prompt.as_ref().is_some_and(|path| !path.trim().is_empty()) { prompt.take().map(Into::into) } else { None }
 }
@@ -219,10 +222,11 @@ mod input_dispatch_tests {
 }
 
 struct App {
-    view: View,
+    view: Workspace,
     opts: GuiOptions,
     proxy: EventLoopProxy<UserEvent>,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
+    on_external_ready: Option<Box<dyn FnOnce(ExternalOpen)>>,
     font_thread: Option<std::thread::JoinHandle<Option<Font>>>,
     font: Option<Font>,
     gfx: Option<Gfx>,
@@ -267,6 +271,19 @@ pub fn run_with_events(
     on_first_frame: Box<dyn FnOnce(Notify)>,
     on_event: Box<dyn FnMut(GuiEvent)>,
 ) -> Result<(), GuiError> {
+    run_with_external_open(view, opts, on_first_frame, on_event, Box::new(|_| {}))
+}
+
+pub type ExternalOpen = Box<dyn Fn(kwil_core_workspace::instance::OpenFiles) + Send>;
+
+/// The launcher can wire CLI/IPC requests without owning a frontend event loop.
+pub fn run_with_external_open(
+    view: View,
+    opts: GuiOptions,
+    on_first_frame: Box<dyn FnOnce(Notify)>,
+    on_event: Box<dyn FnMut(GuiEvent)>,
+    on_external_ready: Box<dyn FnOnce(ExternalOpen)>,
+) -> Result<(), GuiError> {
     trace::mark("gui entry");
     // Font loading runs while the event loop and window are created.
     let font_thread = Some(std::thread::spawn(|| Font::load(14.0)));
@@ -274,22 +291,13 @@ pub fn run_with_events(
         EventLoop::<UserEvent>::with_user_event().build().map_err(|e| GuiError::Unavailable(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    if let Some(file) = view.file() {
-        let p = proxy.clone();
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-        file.index_in_background(threads, move |result| {
-            let event = match result {
-                Ok(()) => UserEvent::IndexDone,
-                Err(e) => UserEvent::Notice(e.to_string()),
-            };
-            let _ = p.send_event(event);
-        });
-    }
+    let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     let mut app = App {
         view,
         opts,
         proxy,
         on_first_frame: Some(on_first_frame),
+        on_external_ready: Some(on_external_ready),
         font_thread,
         font: None,
         gfx: None,
@@ -421,12 +429,16 @@ impl App {
         if self.save_path.is_some() {
             match &ev.logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    cancel_save_prompt(&mut self.save_path, &mut self.close_pending);
+                    self.view.cancel_file_prompt();
+                    self.sync_file_ui();
                 }
                 Key::Named(NamedKey::Enter) => {
-                    if let Some(path) = submitted_save_path(&mut self.save_path) {
-                        self.start_save(Some(path));
+                    self.update_file_prompt();
+                    if let Err(error) = self.view.submit_file_prompt() {
+                        self.view.set_notice(error.to_string());
                     }
+                    self.sync_file_ui();
+                    self.apply(Damage { full: true, status: true, ..Default::default() });
                     return;
                 }
                 Key::Named(NamedKey::Backspace) => {
@@ -438,16 +450,12 @@ impl App {
                     }
                 }
             }
-            let notice = self
-                .save_path
-                .as_ref()
-                .map_or_else(String::new, |path| format!("Save as: {path}  (Enter to save, Esc to cancel)"));
-            let damage = self.view.set_notice(notice);
-            self.apply(damage);
+            self.update_file_prompt();
             return;
         }
         if self.close_pending && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
-            self.close_pending = false;
+            self.view.cancel_file_prompt();
+            self.sync_file_ui();
             let damage = self.view.set_notice(String::new());
             self.apply(damage);
             return;
@@ -464,8 +472,10 @@ impl App {
                 match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
-                        if call.id == "file.quit" {
-                            self.request_close(el, false);
+                        if self.dispatch_file(call.id) {
+                            if self.view.wants_exit() {
+                                el.exit();
+                            }
                             return;
                         }
                         if self.settings.keymap == kwil_core_commands::Preset::Vim {
@@ -549,6 +559,9 @@ impl App {
             input::Action::Command(id) => (id, None),
             input::Action::Text(text) => ("edit.insert", Some(text)),
         };
+        if self.dispatch_file(id) {
+            return;
+        }
         let args =
             CommandArgs { text, at: self.started.elapsed(), extend: self.mods.shift_key(), ..Default::default() };
         let result = if matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
@@ -610,44 +623,18 @@ impl App {
     }
 
     fn request_close(&mut self, el: &ActiveEventLoop, discard: bool) {
-        if !discard && self.view.editor().is_some_and(|editor| editor.document().is_dirty()) {
-            self.close_pending = true;
-            let damage =
-                self.view.set_notice("Unsaved changes: Ctrl+S to save; Ctrl+Shift+Q to discard; Esc to cancel".into());
-            self.apply(damage);
-        } else {
+        if let Err(error) = self.view.request_window_close(discard) {
+            self.view.set_notice(error.to_string());
+        }
+        self.sync_file_ui();
+        self.apply(Damage { full: true, status: true, ..Default::default() });
+        if self.view.wants_exit() {
             el.exit();
         }
     }
 
     fn save(&mut self) {
-        if self.view.editor().is_some_and(|editor| editor.document().path().is_none()) {
-            self.save_path = Some(String::new());
-            let damage = self.view.set_notice("Save as:  (Enter a path, Enter to save, Esc to cancel)".into());
-            self.apply(damage);
-        } else {
-            self.start_save(None);
-        }
-    }
-
-    fn start_save(&mut self, path: Option<std::path::PathBuf>) {
-        let Some(editor) = self.view.editor_mut() else {
-            return;
-        };
-        match editor.save_request(path) {
-            Ok(request) => {
-                let proxy = self.proxy.clone();
-                std::thread::spawn(move || {
-                    let _ = proxy.send_event(UserEvent::Saved(kwil_core_workspace::save_snapshot(request)));
-                });
-                let damage = self.view.set_notice("Saving…".into());
-                self.apply(damage);
-            }
-            Err(error) => {
-                let damage = self.view.set_notice(error.to_string());
-                self.apply(damage);
-            }
-        }
+        self.dispatch_file("file.save");
     }
 
     fn place_caret(&mut self, extend: bool) {
@@ -1216,6 +1203,13 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         trace::mark("first frame presented");
+        let document_proxy = self.proxy.clone();
+        if let Err(error) = self.view.start_document_worker(move |result| {
+            let _ = document_proxy.send_event(UserEvent::Document(result));
+        }) {
+            let damage = self.view.set_notice(format!("File worker: {error}"));
+            self.apply(damage);
+        }
         let proxy = self.proxy.clone();
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.native = Some(platform::Native::register(gfx.hwnd, move |e| {
@@ -1250,39 +1244,35 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = p.send_event(UserEvent::Notice(msg));
             }));
         }
+        if let Some(callback) = self.on_external_ready.take() {
+            let proxy = self.proxy.clone();
+            callback(Box::new(move |path| {
+                let _ = proxy.send_event(UserEvent::OpenExternal(path));
+            }));
+        }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
-            UserEvent::IndexDone => {
-                let damage = self.view.index_ready();
+            UserEvent::Document(result) => {
+                let damage = self.view.document_result(result);
                 if let Some(editor) = self.view.editor_mut() {
                     editor.settings = self.settings.clone();
                 }
+                self.sync_file_ui();
+                if self.view.wants_exit() {
+                    el.exit();
+                }
                 damage
             }
-            UserEvent::Notice(msg) => self.view.set_notice(msg),
-            UserEvent::Saved(saved) => {
-                let Some(editor) = self.view.editor_mut() else {
-                    return;
-                };
-                match editor.finish_save(saved) {
-                    Ok(result) => {
-                        let notice = match result.status {
-                            CommandStatus::Message(message) => message,
-                            _ => "Saved".into(),
-                        };
-                        let damage = self.view.refresh_after_edit(result.damage);
-                        self.apply(damage);
-                        if self.close_pending && self.view.editor().is_some_and(|editor| !editor.document().is_dirty())
-                        {
-                            el.exit();
-                        }
-                        self.view.set_notice(notice)
-                    }
-                    Err(error) => self.view.set_notice(format!("Save failed: {error}")),
+            UserEvent::OpenExternal(request) => {
+                if let Err(error) = self.view.open_files(request) {
+                    self.view.set_notice(format!("Open failed: {error}"));
                 }
+                self.sync_file_ui();
+                Damage { full: true, status: true, ..Default::default() }
             }
+            UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
                 glyph_damage(font, tile, self.view.rows())
@@ -1362,8 +1352,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.set_notice("Configured font is unavailable".into())
             }
             UserEvent::DroppedFile(path) => {
-                (self.on_event)(GuiEvent::DroppedFile(path));
-                return;
+                (self.on_event)(GuiEvent::DroppedFile(path.clone()));
+                if let Err(error) = self.view.open_path(path) {
+                    self.view.set_notice(format!("Open failed: {error}"));
+                }
+                self.sync_file_ui();
+                Damage { full: true, status: true, ..Default::default() }
             }
             #[cfg(feature = "gpu")]
             UserEvent::GpuReady(result, ms) => {
@@ -1441,18 +1435,20 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(true) => self.user_event(el, UserEvent::SessionChanged(remote::detect())),
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
-            WindowEvent::KeyboardInput { event, .. } => self.key(el, &event),
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.key(el, &event);
+                self.view.checkpoint_session();
+            }
             WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.composing = false;
                 let insert_mode = self.keys.as_ref().is_none_or(|keys| keys.mode() == kwil_core_commands::Mode::Insert);
                 if let Some(action) = input::commit(text, &mut self.save_path, insert_mode) {
                     self.edit(action);
-                } else if let Some(path) = &self.save_path {
-                    let notice = format!("Save as: {path}  (Enter to save, Esc to cancel)");
-                    let damage = self.view.set_notice(notice);
-                    self.apply(damage);
+                } else if self.save_path.is_some() {
+                    self.update_file_prompt();
                 }
+                self.view.checkpoint_session();
             }
             WindowEvent::Ime(Ime::Disabled) => self.composing = false,
             WindowEvent::Focused(false) => {

@@ -8,7 +8,8 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
-use kwil_view_model::{CommandArgs, CommandStatus, Notify, View};
+use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
+mod file_prompt;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -17,26 +18,25 @@ use std::sync::mpsc;
 
 enum Msg {
     Input(Event),
-    IndexDone,
+    Document(kwil_view_model::document_worker::DocumentResult),
+    OpenExternal(kwil_core_workspace::instance::OpenFiles),
     Notice(String),
     InputClosed,
-    Saved(std::io::Result<kwil_core_workspace::SavedSnapshot>),
     Settings(Box<Settings>),
 }
 
-pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
+pub fn run(view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
+    run_with_external_open(view, on_first_frame, Box::new(|_| {}))
+}
+
+pub type ExternalOpen = Box<dyn Fn(kwil_core_workspace::instance::OpenFiles) + Send>;
+pub fn run_with_external_open(
+    view: View,
+    on_first_frame: Box<dyn FnOnce(Notify)>,
+    on_external_ready: Box<dyn FnOnce(ExternalOpen)>,
+) -> std::io::Result<()> {
+    let mut view = Workspace::new(view)?;
     let (tx, rx) = mpsc::channel::<Msg>();
-    if let Some(file) = view.file() {
-        let t = tx.clone();
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-        file.index_in_background(threads, move |result| {
-            let event = match result {
-                Ok(()) => Msg::IndexDone,
-                Err(e) => Msg::Notice(e.to_string()),
-            };
-            let _ = t.send(event);
-        });
-    }
     let mut terminal = ratatui::init();
     crossterm::execute!(
         std::io::stdout(),
@@ -65,10 +65,18 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
     let result = (|| -> std::io::Result<()> {
         let size = terminal.size()?;
         view.set_rows(size.height.saturating_sub(1) as usize);
-        terminal.draw(|f| draw(f, &view))?;
+        terminal.draw(|f| file_prompt::draw(f, &view))?;
+        let document_sender = tx.clone();
+        view.start_document_worker(move |result| {
+            let _ = document_sender.send(Msg::Document(result));
+        })?;
         let t = tx.clone();
         on_first_frame(Box::new(move |msg| {
             let _ = t.send(Msg::Notice(msg));
+        }));
+        let external_sender = tx.clone();
+        on_external_ready(Box::new(move |path| {
+            let _ = external_sender.send(Msg::OpenExternal(path));
         }));
         let settings_sender = tx.clone();
         std::thread::spawn(move || {
@@ -81,11 +89,11 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
             let _ = settings_sender.send(Msg::Settings(Box::new(settings)));
         });
         let started = std::time::Instant::now();
-        let mut save = SaveFlow::default();
         let mut horizontal = 0u64;
         let mut settings = Settings::default();
         let mut keys = KeymapEngine::new(settings.keymap, &settings.bindings).expect("bundled keymap");
         while let Ok(msg) = rx.recv() {
+            let user_input = matches!(&msg, Msg::Input(_));
             let changed = match msg {
                 Msg::InputClosed => break,
                 Msg::Settings(next) => {
@@ -98,16 +106,19 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     }
                     true
                 }
-                Msg::Saved(saved) => {
-                    if save.finish(&mut view, saved) {
+                Msg::Document(result) => {
+                    view.document_result(result);
+                    if let Some(editor) = view.editor_mut() {
+                        editor.settings = settings.clone();
+                    }
+                    if view.wants_exit() {
                         break;
                     }
                     true
                 }
-                Msg::IndexDone => {
-                    view.index_ready();
-                    if let Some(editor) = view.editor_mut() {
-                        editor.settings = settings.clone();
+                Msg::OpenExternal(request) => {
+                    if let Err(error) = view.open_files(request) {
+                        view.set_notice(format!("Open failed: {error}"));
                     }
                     true
                 }
@@ -120,24 +131,23 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     true
                 }
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    let intent = if save.path.is_some() {
-                        path_key(&mut view, &mut save.path, k)
+                    let intent = if view.file_prompt().is_some() {
+                        file_prompt::key(&mut view, k)
+                    } else if view.close_pending() && k.code == KeyCode::Esc {
+                        KeyResult::Cancel
                     } else {
                         key(&mut view, k, started.elapsed(), &mut keys, settings.keymap)
                     };
                     match intent {
                         KeyResult::Quit => {
-                            if view.editor().is_some_and(|editor| editor.document().is_dirty())
-                                && !(save.closing && k.modifiers.contains(KeyModifiers::SHIFT))
-                            {
-                                save.closing = true;
-                                view.set_notice(
-                                    "Unsaved changes: Ctrl+S to save; Ctrl+Shift+Q to discard; Esc to cancel".into(),
-                                );
-                                true
-                            } else {
+                            let discard = view.close_pending() && k.modifiers.contains(KeyModifiers::SHIFT);
+                            if let Err(error) = view.request_window_close(discard) {
+                                view.set_notice(error.to_string());
+                            }
+                            if view.wants_exit() {
                                 break;
                             }
+                            true
                         }
                         KeyResult::Save(_) | KeyResult::SaveAndQuit => {
                             let (path, quit) = match intent {
@@ -145,16 +155,32 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                                 KeyResult::SaveAndQuit => (None, true),
                                 _ => unreachable!(),
                             };
-                            if let Some(request) = save.request(&mut view, path, quit) {
-                                let sender = tx.clone();
-                                std::thread::spawn(move || {
-                                    let _ = sender.send(Msg::Saved(kwil_core_workspace::save_snapshot(request)));
-                                });
+                            let result = if quit {
+                                view.file_command("file.saveAndQuit").map(|_| ())
+                            } else {
+                                let id = view.active_id();
+                                if path.is_none() {
+                                    view.file_command("file.save").map(|_| ())
+                                } else {
+                                    view.save_document(id, path)
+                                }
+                            };
+                            if let Err(error) = result {
+                                view.set_notice(format!("Save failed: {error}"));
+                            }
+                            true
+                        }
+                        KeyResult::File(command) => {
+                            if let Err(error) = view.file_command(command) {
+                                view.set_notice(error.to_string());
+                            }
+                            if view.wants_exit() {
+                                break;
                             }
                             true
                         }
                         KeyResult::Cancel => {
-                            save.closing = false;
+                            view.cancel_file_prompt();
                             view.set_notice(String::new());
                             true
                         }
@@ -162,11 +188,11 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     }
                 }
                 Msg::Input(Event::Paste(text)) => {
-                    if let Some(path) = &mut save.path {
+                    if let Some(prompt) = view.file_prompt_mut() {
                         if !text.chars().any(char::is_control) {
-                            path.push_str(&text);
+                            prompt.text.push_str(&text);
                         }
-                        view.set_notice(format!("Save as: {path}  (Enter to save, Esc to cancel)"));
+                        view.prompt_notice();
                         true
                     } else if keys.mode() == kwil_core_commands::Mode::Insert {
                         execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
@@ -183,6 +209,9 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                 Msg::Input(_) => false,
             };
             if changed {
+                if user_input {
+                    view.checkpoint_session();
+                }
                 keep_visible(
                     &mut view,
                     &mut horizontal,
@@ -191,7 +220,14 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                 );
                 // ratatui diffs against the previous frame and writes only
                 // the changed cells.
-                terminal.draw(|f| draw(f, &view))?;
+                if let Some(editor) = view.editor_mut() {
+                    editor.settings = settings.clone();
+                }
+                let rows = terminal.size()?.height.saturating_sub(1) as usize;
+                if view.rows() != rows {
+                    view.set_rows(rows);
+                }
+                terminal.draw(|f| file_prompt::draw(f, &view))?;
             }
         }
         Ok(())
@@ -212,17 +248,20 @@ enum KeyResult {
     SaveAndQuit,
     Cancel,
     Changed(bool),
+    File(&'static str),
 }
 
 /// Close only for the successful completion of the requested revision.
 /// A prompt, failed request, failed write or concurrent edit never exits.
 #[derive(Default)]
+#[cfg(test)]
 struct SaveFlow {
     closing: bool,
     path: Option<String>,
     revision: Option<u64>,
 }
 
+#[cfg(test)]
 impl SaveFlow {
     fn request(
         &mut self,
@@ -283,6 +322,7 @@ impl SaveFlow {
     }
 }
 
+#[cfg(test)]
 fn path_key(view: &mut View, prompt: &mut Option<String>, key: KeyEvent) -> KeyResult {
     let Some(path) = prompt.as_mut() else {
         return KeyResult::Changed(false);
@@ -330,6 +370,22 @@ fn key(
                 }
                 if call.id == "file.saveAndQuit" {
                     return KeyResult::SaveAndQuit;
+                }
+                if matches!(
+                    call.id,
+                    "file.new"
+                        | "file.open"
+                        | "file.saveAs"
+                        | "file.saveAll"
+                        | "file.close"
+                        | "file.closeAll"
+                        | "file.reopenClosed"
+                        | "file.recent"
+                        | "file.nextTab"
+                        | "file.previousTab"
+                        | "file.restoreSession"
+                ) {
+                    return KeyResult::File(call.id);
                 }
                 if preset == Preset::Vim {
                     if let Some(editor) = view.editor_mut() {
@@ -553,6 +609,35 @@ mod tests {
     }
 
     #[test]
+    fn kw20_file_commands_are_dispatched_before_editor_fallback() {
+        for command in [
+            "file.new",
+            "file.open",
+            "file.saveAs",
+            "file.saveAll",
+            "file.close",
+            "file.closeAll",
+            "file.reopenClosed",
+            "file.recent",
+            "file.nextTab",
+            "file.previousTab",
+            "file.restoreSession",
+        ] {
+            let mut view = View::new(None);
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+g", command)]).unwrap();
+            let result = key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            assert!(!view.status_text().contains("command not implemented"), "file workflow must intercept {command}");
+            assert!(matches!(result, KeyResult::File(id) if id == command));
+        }
+    }
+
+    #[test]
     fn input_shift_left_tombstone_suppresses_selection_fallback() {
         let mut view = View::new(None);
         view.set_rows(3);
@@ -587,13 +672,13 @@ mod tests {
     fn vim_command_status_is_visible_in_test_backend() {
         let mut view = View::new(None);
         view.set_rows(3);
-        let mut keys = KeymapEngine::new(Preset::Vim, &[binding("z", "file.open")]).unwrap();
+        let mut keys = KeymapEngine::new(Preset::Vim, &[binding("z", "file.openFolder")]).unwrap();
         key(&mut view, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
-        assert!(view.status_text().contains("command not implemented: file.open"));
+        assert!(view.status_text().contains("command not implemented: file.openFolder"));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
         terminal.draw(|frame| draw(frame, &view)).unwrap();
         let status: String = (0..80).map(|x| terminal.backend().buffer()[(x, 3)].symbol()).collect();
-        assert!(status.contains("command not implemented: file.open"));
+        assert!(status.contains("command not implemented: file.openFolder"));
         key(&mut view, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
         assert!(view.status_text().contains("register is empty"));
         for c in ":unknown".chars() {
