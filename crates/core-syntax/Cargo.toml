@@ -22,7 +22,7 @@ arborium-markdown = { version = "=2.18.2", optional = true, default-features = f
 arborium-php = { version = "=2.18.2", optional = true, default-features = false }
 arborium-python = { version = "=2.18.2", optional = true, default-features = false }
 arborium-ruby = { version = "=2.18.2", optional = true, default-features = false }
-arborium-rust = { version = "=2.18.2", optional = true, default-features = false }
+tree-sitter-rust = { version = "=0.24.2", optional = true }
 arborium-bash = { version = "=2.18.2", optional = true, default-features = false }
 arborium-sql = { version = "=2.18.2", optional = true, default-features = false }
 arborium-swift = { version = "=2.18.2", optional = true, default-features = false }
@@ -59,7 +59,7 @@ lang-markdown = ["dep:arborium-markdown"]
 lang-php = ["dep:arborium-php"]
 lang-python = ["dep:arborium-python"]
 lang-ruby = ["dep:arborium-ruby"]
-lang-rust = ["dep:arborium-rust"]
+lang-rust = ["dep:tree-sitter-rust"]
 lang-bash = ["dep:arborium-bash"]
 lang-sql = ["dep:arborium-sql"]
 lang-swift = ["dep:arborium-swift"]

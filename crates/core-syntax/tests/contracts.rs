@@ -59,6 +59,16 @@ fn markdown_ranges() {
 }
 
 #[test]
+#[cfg(feature = "lang-sql")]
+fn sql_numeric_literals() {
+    let h = run(Language::Sql, "SELECT 42, 1.5, 'text';");
+    assert_eq!(h.mode, Mode::TreeSitter);
+    at(&h, 7..9, Class::Number);
+    at(&h, 11..14, Class::Number);
+    at(&h, 16..22, Class::String);
+}
+
+#[test]
 fn detection() {
     for (name, line, expected) in [
         ("main.RS", "", Language::Rust),
@@ -220,6 +230,77 @@ impl TextSource for Gated {
 fn request(source: Arc<dyn TextSource>, revision: u64) -> Request {
     let len = source.len();
     Request { source, language: Language::Rust, revision, previous_revision: None, edit: None, visible: 0..len }
+}
+
+struct DropRecorded {
+    dropped: mpsc::Sender<(std::thread::ThreadId, String)>,
+}
+impl TextSource for DropRecorded {
+    fn len(&self) -> usize {
+        1
+    }
+    fn chunk(&self, _: usize, _: usize) -> io::Result<Cow<'_, [u8]>> {
+        Ok(Cow::Borrowed(b"x"))
+    }
+}
+impl Drop for DropRecorded {
+    fn drop(&mut self) {
+        let current = std::thread::current();
+        let _ = self.dropped.send((current.id(), current.name().unwrap_or("").to_owned()));
+    }
+}
+
+fn retirement(action: &str) {
+    let worker = Worker::new(Config::default(), || {}).unwrap();
+    let (entered, wait) = mpsc::sync_channel(1);
+    let (release, gate) = mpsc::sync_channel(1);
+    worker
+        .submit(request(
+            Arc::new(Gated {
+                bytes: b"let active = 1;".to_vec(),
+                entered,
+                release: Mutex::new(gate),
+                entered_once: std::sync::atomic::AtomicBool::new(false),
+            }),
+            1,
+        ))
+        .unwrap();
+    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (dropped, observed) = mpsc::channel();
+    worker.submit(request(Arc::new(DropRecorded { dropped }), 2)).unwrap();
+    match action {
+        "submit" => {
+            worker.submit(request(Arc::new(b"new".to_vec()), 3)).unwrap();
+        }
+        "cancel" => worker.cancel(),
+        "drop" => {
+            drop(worker);
+            release.send(()).unwrap();
+            assert_worker_drop(observed);
+            return;
+        }
+        _ => unreachable!(),
+    }
+    release.send(()).unwrap();
+    worker.shutdown().unwrap();
+    assert_worker_drop(observed);
+}
+fn assert_worker_drop(observed: mpsc::Receiver<(std::thread::ThreadId, String)>) {
+    let (id, name) = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(id, std::thread::current().id(), "snapshot destroyed on submitter");
+    assert_eq!(name, "kwil-syntax", "snapshot destroyed outside the worker");
+}
+#[test]
+fn worker_retires_superseded_snapshot() {
+    retirement("submit");
+}
+#[test]
+fn worker_retires_cancelled_snapshot() {
+    retirement("cancel");
+}
+#[test]
+fn worker_retires_dropped_snapshot() {
+    retirement("drop");
 }
 #[test]
 fn worker_cancels_stale_work_and_keeps_previous() {

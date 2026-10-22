@@ -25,7 +25,7 @@ try {
     Write-Source 'language' $broken
     Expect-Failure @('detection')
     Write-Source 'language' $original.language
-    $broken = $original.language.Replace('highlights: std::borrow::Cow::Borrowed(&$module::HIGHLIGHTS_QUERY)', 'highlights: std::borrow::Cow::Borrowed("(")')
+    $broken = $original.language.Replace('bundled_query(self, &$module::HIGHLIGHTS_QUERY)', 'bundled_query(self, "(")')
     if ($broken -eq $original.language) { throw 'Query mutation did not apply' }
     Write-Source 'language' $broken
     Expect-Failure @('every_bundled_query_compiles')

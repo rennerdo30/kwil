@@ -24,8 +24,21 @@ base edits the retained tree with `Tree::edit`, then passes it as `old_tree` to
 Another viewport can reuse an unchanged revision without parsing. The revision
 must uniquely identify a document snapshot; do not reuse it for different bytes.
 
-The worker keeps one pending request and one result. Submitting replaces pending
-work and cancels the active generation. Parser progress callbacks, source reads,
+The mailbox keeps one pending request, eight retired requests and one result.
+Submitting replaces pending work and cancels the active generation. The worker
+drains retired snapshots outside the mailbox lock, including on cancel and stop.
+It can hold an additional batch of eight snapshots while draining, plus its
+current request: at most 18 accepted snapshot references across worker and mailbox.
+No snapshot or parser-tree destruction runs on the submitter.
+
+If the retire slots fill while the worker is busy, `submit()` returns a boxed
+`SubmitError { request, error: Error::Busy }` without cancelling accepted work.
+The caller retains ownership of that request for retry on a later worker event;
+it must retain the snapshot until it can hand it off, rather than dropping its
+last reference on the UI thread. Closed submissions likewise return ownership.
+This explicit backpressure keeps both submission time and storage bounded; a
+consumer must handle rejection instead of blindly unwrapping submission results.
+Parser progress callbacks, source reads,
 query progress callbacks and lexer steps check cancellation; stale results are
 discarded. Idle workers wait on a condition variable, with no periodic timer.
 `wake` must only schedule an event, never block. `Worker::drop` signals cancellation
@@ -80,8 +93,9 @@ Checked against the crates.io API on **2026-10-23**:
 - Dev-only [memmap2 0.9.12](https://crates.io/crates/memmap2/0.9.12), MIT OR
   Apache-2.0, serves borrowed mapped chunks in the retained measurement example.
 
-`default = ["starter"]` enables these **32** features, each selecting its
-corresponding `arborium-<language>` 2.18.2 C grammar:
+`default = ["starter"]` enables these **32** features, selecting individual
+`arborium-<language>` 2.18.2 C grammars except for official `tree-sitter-rust`
+0.24.2 behind the unchanged `lang-rust` feature:
 
 ```text
 lang-c          lang-cpp         lang-c-sharp    lang-css
@@ -97,7 +111,11 @@ lang-batch      lang-powershell  lang-haskell    lang-scala
 The selected grammar manifests are **MIT**, except
 [`arborium-ini`](https://crates.io/crates/arborium-ini/2.18.2), **Apache-2.0**.
 Transitive `arborium-jsdoc` and WASM-only `arborium-sysroot` are MIT. No GPL grammar
-is selected. Disabling defaults and enabling `lang-rust` builds only the Rust
+is selected. Kotlin's highlight query separately carries Apache-2.0 provenance.
+[LICENSES.md](LICENSES.md) records every grammar source/version/commit, the
+verification method, tarball and licence hashes, Rust source equality, and Ruby's
+blank upstream pin. [LICENSES.txt](LICENSES.txt) retains the licence texts.
+Disabling defaults and enabling `lang-rust` builds only the official Rust
 grammar; detection and lexical tables remain available for every language.
 
 `detect(path, first_line)` checks filenames, extensions, shebang interpreters and
@@ -114,6 +132,9 @@ state. Loading, downloading and publishing grammar libraries are a later step.
 
 On the owner Windows PC, Rust 1.99.1, `-j 4`, 2026-10-23 JST. These are one-shot
 samples, not percentile claims or native UI keystroke-to-pixel acceptance.
+These original measurements used arborium-rust 2.18.2. Round 1 replaces that
+grammar for verifiable provenance; the figures are historical, and were not
+remeasured for the official Rust grammar (the fix brief forbids new benchmarks).
 
 Clean **dev** crate builds, separate fresh target directories, dependencies already
 downloaded (no cache deletion): **29.07 s** default 32-language set; **12.90 s** with
@@ -158,11 +179,29 @@ restoration. A separate cancellation mutation emitted a stale wake and failed th
 gated worker contract. `tools/fail-first.ps1` preserves the mutations and always
 restores source in `finally`.
 
+Round 1 adds destructor-recording tests for submit, cancel, drop and orderly
+shutdown, including unlocked destruction and bounded retirement with returned
+rejected-request ownership. A separate SQL test checks integer and decimal
+numbers plus a string. `tools/round1-fail-first.ps1` restores deliberate broken
+copies in `finally`: all four destruction paths fail on submitter destruction,
+the queue bound fails when raised to 64, and independently breaking each SQL
+predicate fails at the integer or decimal assertion respectively.
+
+The query audit scanned all packaged query files for the 32 selected grammars
+plus JSDoc (including inherited query sources). Only SQL 2.18.2 highlights lines
+38 and 41 contain Lua-pattern predicates: `^[-+]?%d+$` and
+`^[-+]?%d*\.%d*$`. `Language::bundled()` patches these two patterns to ASCII digit
+classes, with a double-escaped literal decimal point in the SCM string, before
+query compilation. Other percent signs are operator tokens or Ruby string
+delimiters, and Kotlin mentions removed `#lua-match?` predicates in a comment.
+Provider queries are unchanged; percent signs are not rewritten globally.
+
 Reproduce checks from the repository root (PowerShell 7):
 
 ```powershell
 & crates/core-syntax/tools/run-cargo.ps1 -CargoArgs @('test','-p','kwil-core-syntax','-j','4','--locked')
 & crates/core-syntax/tools/fail-first.ps1
+& crates/core-syntax/tools/round1-fail-first.ps1
 & crates/core-syntax/tools/run-cargo.ps1 -CargoArgs @('test','-p','kwil-core-syntax','--no-default-features','--features','lang-rust','-j','4','--locked')
 ```
 

@@ -13,9 +13,33 @@ macro_rules! languages {
             pub fn filenames(self) -> &'static str { match self { $(Self::$variant => $names),* } }
             pub fn bundled(self) -> Option<Grammar> { match self { $(
                 #[cfg(feature = $feature)]
-                Self::$variant => Some(Grammar { language: $module::language().into(), highlights: std::borrow::Cow::Borrowed(&$module::HIGHLIGHTS_QUERY) }),
+                Self::$variant => Some(Grammar { language: $module::language().into(), highlights: bundled_query(self, &$module::HIGHLIGHTS_QUERY) }),
             )* #[allow(unreachable_patterns)] _ => None } }
         }
+    }
+}
+
+// Use the official grammar: the Arborium orchard fork's pinned source is unavailable.
+#[cfg(feature = "lang-rust")]
+mod bundled_rust {
+    pub fn language() -> tree_sitter::Language {
+        tree_sitter_rust::LANGUAGE.into()
+    }
+    pub const HIGHLIGHTS_QUERY: &str = tree_sitter_rust::HIGHLIGHTS_QUERY;
+}
+
+fn bundled_query(language: Language, query: &'static str) -> std::borrow::Cow<'static, str> {
+    if language == Language::Sql {
+        // Arborium SQL 2.18.2 has exactly two Lua %d predicates. Query::new uses
+        // Rust regex syntax. Patch only these audited expressions, not arbitrary
+        // query text or provider queries (where '%' may be a literal).
+        std::borrow::Cow::Owned(
+            query
+                .replace(r#""^[-+]?%d+$""#, r#""^[-+]?[0-9]+$""#)
+                .replace(r#""^[-+]?%d*\.%d*$""#, r#""^[-+]?[0-9]*\\.[0-9]*$""#),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(query)
     }
 }
 
@@ -42,7 +66,7 @@ languages! {
     (Php, "php", "lang-php", arborium_php, "php phtml", "", "abstract and array as break callable case catch class clone const continue declare default die do echo else elseif empty enddeclare endfor endforeach endif endswitch endwhile enum eval exit extends final finally fn for foreach function global goto if implements include include_once instanceof insteadof interface isset list match namespace new null or print private protected public readonly require require_once return static switch throw trait try unset use var while xor yield true false", "//", "/*", "*/"),
     (Python, "python", "lang-python", arborium_python, "py pyi pyw", "", "False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case", "#", "\"\"\"", "\"\"\""),
     (Ruby, "ruby", "lang-ruby", arborium_ruby, "rb rake gemspec", "Gemfile Rakefile", "BEGIN END alias and begin break case class def defined do else elsif end ensure false for if in module next nil not or redo rescue retry return self super then true undef unless until when while yield", "#", "=begin", "=end"),
-    (Rust, "rust", "lang-rust", arborium_rust, "rs", "", "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while", "//", "/*", "*/"),
+    (Rust, "rust", "lang-rust", bundled_rust, "rs", "", "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while", "//", "/*", "*/"),
     (Bash, "bash", "lang-bash", arborium_bash, "sh bash zsh", "", "if then else elif fi case esac for select while until do done in function time coproc", "#", "", ""),
     (Sql, "sql", "lang-sql", arborium_sql, "sql", "", "select from where join inner outer left right full cross on as insert into values update set delete create alter drop table view index database primary key foreign references not null default unique check and or in is like between exists union all distinct group by having order asc desc limit offset with recursive begin end case when then else commit rollback transaction grant revoke true false", "--", "/*", "*/"),
     (Swift, "swift", "lang-swift", arborium_swift, "swift", "", "associatedtype class deinit enum extension fileprivate func import init inout internal let open operator private protocol public rethrows static struct subscript typealias var break case continue default defer do else fallthrough for guard if in repeat return switch where while as Any catch false is nil super self Self throw throws true try async await", "//", "/*", "*/"),

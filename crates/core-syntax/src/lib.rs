@@ -12,7 +12,7 @@ pub use engine::Timings;
 pub use engine::{Config, Engine, Grammar, GrammarProvider, Highlights, Mode};
 pub use language::{Language, detect};
 pub use tree_sitter::{InputEdit, Point};
-pub use worker::{Request, Worker};
+pub use worker::{Request, SubmitError, Worker};
 
 use std::{borrow::Cow, io, ops::Range};
 
@@ -124,6 +124,7 @@ pub enum Error {
     InvalidConfig,
     Cancelled,
     Closed,
+    Busy,
     Grammar(String),
     QueryLimit,
 }

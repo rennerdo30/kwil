@@ -353,17 +353,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arborium-rust"
-version = "2.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8471397c67c4164b93d6a23ae80fb5b7af5dcc00fa9b143015efb1ea927ca8da"
-dependencies = [
- "arborium-sysroot",
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
 name = "arborium-scala"
 version = "2.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1630,7 +1619,6 @@ dependencies = [
  "arborium-powershell",
  "arborium-python",
  "arborium-ruby",
- "arborium-rust",
  "arborium-scala",
  "arborium-sql",
  "arborium-swift",
@@ -1641,6 +1629,7 @@ dependencies = [
  "arborium-yaml",
  "memmap2",
  "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]
@@ -3227,6 +3216,16 @@ name = "tree-sitter-language"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "ttf-parser"
