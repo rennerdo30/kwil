@@ -169,9 +169,14 @@ impl JournalState {
 pub struct DocumentWorker {
     tx: SyncSender<DocumentRequest>,
     journal_capacity: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    save_destinations: std::sync::Arc<std::sync::Mutex<Vec<(DocumentId, PathBuf)>>>,
 }
 
 impl DocumentWorker {
+    pub(crate) fn set_save_destinations(&self, destinations: Vec<(DocumentId, PathBuf)>) {
+        debug_assert!(destinations.len() <= session::MAX_TABS * 2);
+        *self.save_destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = destinations;
+    }
     /// The model retains one receipt on Full and centrally gates subsequent
     /// document mutations. This callback only transfers ownership; no I/O or
     /// replacement iteration runs on the UI thread.
@@ -216,6 +221,8 @@ impl DocumentWorker {
         let (tx, rx) = mpsc::sync_channel(16);
         let journal_capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16));
         let capacity = journal_capacity.clone();
+        let save_destinations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let destinations = save_destinations.clone();
         std::thread::Builder::new().name("kwil-documents".into()).spawn(move || {
             let mut storage: Option<Storage> = None;
             let mut deferred = std::collections::VecDeque::new();
@@ -351,11 +358,11 @@ impl DocumentWorker {
                         }
                         DocumentRequest::Save { document, request } => {
                             let revision = request.revision;
-                            complete(DocumentResult::Saved {
-                                document,
-                                revision,
-                                result: kwil_core_workspace::save_snapshot(request),
-                            });
+                            let reserved =
+                                destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            let result = validate_save_destination(document, &request.path, &reserved)
+                                .and_then(|()| kwil_core_workspace::save_snapshot(request));
+                            complete(DocumentResult::Saved { document, revision, result });
                         }
                         DocumentRequest::SeedJournal {
                             document,
@@ -456,7 +463,7 @@ impl DocumentWorker {
             };
             complete(DocumentResult::Stopped(stopped));
         })?;
-        Ok(Self { tx, journal_capacity })
+        Ok(Self { tx, journal_capacity, save_destinations })
     }
 
     /// Full admission returns ownership. Callers must retain/retry or explicitly
@@ -467,6 +474,30 @@ impl DocumentWorker {
             TrySendError::Disconnected(request) => TrySendError::Disconnected(Box::new(request)),
         })
     }
+}
+
+fn validate_save_destination(
+    document: DocumentId,
+    path: &std::path::Path,
+    reserved: &[(DocumentId, PathBuf)],
+) -> io::Result<()> {
+    // All filesystem resolution runs on the one document worker, freshly for
+    // each save. A formerly missing destination may have been created by the
+    // preceding save, or another native spelling may now identify that file.
+    let destination = kwil_core_workspace::resolve_save_destination(path)?;
+    for (owner, path) in reserved {
+        if *owner == document {
+            continue;
+        }
+        let other = kwil_core_workspace::resolve_save_destination(path)?;
+        if destination.equivalent(&other) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Save target is open or reserved by tab {}; use a different Save As path", owner.0),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
@@ -1100,6 +1131,52 @@ mod tests {
     }
 
     #[test]
+    fn save_worker_refreshes_native_file_identity_before_writing_an_alias() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("protected.txt");
+        let alias = scratch.0.join("hard-link.txt");
+        std::fs::write(&path, b"protected").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = sender.send(result);
+        })
+        .unwrap();
+        worker.set_save_destinations(vec![(DocumentId(1), path.clone())]);
+        let mut editor = crate::Editor::new(Document::new());
+        editor
+            .execute("edit.insert", &crate::CommandArgs { text: Some("overwrite".into()), ..Default::default() }, 1)
+            .unwrap();
+        let request = editor.save_request(Some(alias.clone())).unwrap();
+        let revision = request.revision;
+        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request }).unwrap();
+        match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            DocumentResult::Saved { document, revision: source, result } => {
+                assert_eq!(document, DocumentId(2));
+                assert_eq!(source, revision);
+                let error = result.err().expect("native alias must be rejected");
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                assert!(editor.finish_save(Err(error)).is_err());
+            }
+            _ => panic!("expected addressed worker save rejection"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"protected");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"protected");
+        // A later request sees the latest reservation set, not cached identities.
+        worker.set_save_destinations(Vec::new());
+        let request = editor.save_request(Some(scratch.0.join("different.txt"))).unwrap();
+        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request }).unwrap();
+        match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+            DocumentResult::Saved { result, .. } => {
+                result.unwrap();
+            }
+            _ => panic!("expected addressed worker save completion"),
+        }
+        drop(worker);
+        wait_stopped(&receiver);
+    }
+
+    #[test]
     fn clean_named_recovery_conflicts_preserve_old_bytes_without_overwriting_changed_disk() {
         let scratch = Scratch::new();
         let path = scratch.0.join("named.txt");
@@ -1383,7 +1460,7 @@ mod tests {
     fn observer_full_retains_the_successful_edit_and_gates_only_later_mutations() {
         let (tx, rx) = mpsc::sync_channel(16);
         let capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let worker = DocumentWorker { tx, journal_capacity: capacity.clone() };
+        let worker = DocumentWorker { tx, journal_capacity: capacity.clone(), save_destinations: Default::default() };
         let mut editor = crate::Editor::new(Document::new());
         editor.set_edit_observer(Some(worker.observer(DocumentId(1), None, 1, 1))).unwrap();
         let args = |text: &str| crate::CommandArgs { text: Some(text.into()), ..Default::default() };

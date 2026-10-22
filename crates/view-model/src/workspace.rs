@@ -108,6 +108,7 @@ struct FileFlow {
     worker: Option<DocumentWorker>,
     queue: VecDeque<DocumentRequest>,
     saves: HashMap<DocumentId, SaveFlight>,
+    failed_opens: HashSet<DocumentId>,
     save_all: VecDeque<DocumentId>,
     close: VecDeque<DocumentId>,
     quit: bool,
@@ -303,10 +304,40 @@ impl Workspace {
                 editor.document.path = Some(path);
             }
         }
+        if let Some(path) = &view.path
+            && let Some(id) = self
+                .session
+                .tabs()
+                .iter()
+                .find(|tab| {
+                    tab.path.as_ref().is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, path))
+                })
+                .map(|tab| tab.id)
+        {
+            self.session.activate(id);
+            return Ok(id);
+        }
         let id = self.session.open(view.path.clone())?;
         // Reopening an already-open path activates its existing unsaved view.
         self.views.entry(id).or_insert(view);
+        self.refresh_save_destinations();
         Ok(id)
+    }
+
+    fn refresh_save_destinations(&self) {
+        let Some(worker) = &self.files.worker else { return };
+        let mut destinations: Vec<_> = self
+            .session
+            .tabs()
+            .iter()
+            .filter(|tab| {
+                !self.files.failed_opens.contains(&tab.id)
+                    || self.views.get(&tab.id).is_some_and(|view| view.editor().is_some() || view.file().is_some())
+            })
+            .filter_map(|tab| tab.path.clone().map(|path| (tab.id, path)))
+            .collect();
+        destinations.extend(self.files.saves.iter().filter_map(|(id, save)| save.path.clone().map(|path| (*id, path))));
+        worker.set_save_destinations(destinations);
     }
 
     pub fn activate(&mut self, id: DocumentId) -> bool {
@@ -370,6 +401,7 @@ impl Workspace {
             self.input_epoch = self.input_epoch.wrapping_add(1);
             self.closed_views.insert(id, view);
         }
+        self.files.failed_opens.remove(&id);
         self.files.queue.retain(|request| !matches!(request, DocumentRequest::Open { document, .. } | DocumentRequest::Index { document, .. } if *document == id));
         self.closed_views.retain(|id, _| self.session.closed().iter().any(|tab| tab.id == *id));
         let generation = self.files.observed.remove(&id).map_or(0, |(_, generation)| generation);
@@ -384,6 +416,7 @@ impl Workspace {
         if self.views.is_empty() {
             self.open(View::new(None))?;
         }
+        self.refresh_save_destinations();
         Ok(true)
     }
 
@@ -452,6 +485,7 @@ impl Workspace {
             return Ok(());
         }
         self.files.worker = Some(DocumentWorker::spawn(complete)?);
+        self.refresh_save_destinations();
         self.files
             .worker
             .as_ref()
@@ -665,12 +699,25 @@ impl Workspace {
             return Err(io::Error::other("File worker queue is full; retry after current work finishes"));
         }
         let path = std::path::absolute(path)?;
-        if let Some(id) = self.files.saves.iter().find(|(_, save)| save.path.as_ref() == Some(&path)).map(|(id, _)| *id)
+        if let Some(id) = self
+            .files
+            .saves
+            .iter()
+            .find(|(_, save)| {
+                save.path.as_ref().is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, &path))
+            })
+            .map(|(id, _)| *id)
         {
             self.activate(id);
             return Ok(id);
         }
-        if let Some(id) = self.session.tabs().iter().find(|t| t.path.as_ref() == Some(&path)).map(|t| t.id) {
+        if let Some(id) = self
+            .session
+            .tabs()
+            .iter()
+            .find(|t| t.path.as_ref().is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, &path)))
+            .map(|t| t.id)
+        {
             self.activate(id);
             return Ok(id);
         }
@@ -682,6 +729,7 @@ impl Workspace {
         view.path = Some(path.clone());
         view.set_notice("Opening…".into());
         self.views.insert(id, view);
+        self.refresh_save_destinations();
         self.files.queue.push_back(DocumentRequest::Open { document: id, revision: 0, path });
         self.pump_files();
         self.checkpoint_session();
@@ -718,8 +766,13 @@ impl Workspace {
         }
         let path = path.map(std::path::absolute).transpose()?;
         if let Some(path) = &path
-            && (self.session.tabs().iter().any(|tab| tab.id != id && tab.path.as_ref() == Some(path))
-                || self.files.saves.iter().any(|(document, save)| *document != id && save.path.as_ref() == Some(path)))
+            && (self.session.tabs().iter().any(|tab| {
+                tab.id != id
+                    && tab.path.as_ref().is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, path))
+            }) || self.files.saves.iter().any(|(document, save)| {
+                *document != id
+                    && save.path.as_ref().is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, path))
+            }))
         {
             self.cancel_close_intent();
             return Err(io::Error::other("Save As target is open in another tab"));
@@ -750,6 +803,7 @@ impl Workspace {
             }
         };
         self.files.saves.insert(id, SaveFlight { revision: request.revision, path: Some(request.path.clone()) });
+        self.refresh_save_destinations();
         self.files.queue.push_back(DocumentRequest::Save { document: id, request });
         if let Some(view) = self.views.get_mut(&id) {
             view.set_notice("Saving…".into());
@@ -1018,6 +1072,13 @@ impl Workspace {
     }
 
     pub fn document_result(&mut self, result: DocumentResult) -> Damage {
+        let destinations_changed = matches!(
+            &result,
+            DocumentResult::Prepared(_)
+                | DocumentResult::Recovered { .. }
+                | DocumentResult::Opened { .. }
+                | DocumentResult::Saved { .. }
+        );
         let checkpoint = matches!(
             &result,
             DocumentResult::Indexed { .. } | DocumentResult::Saved { .. } | DocumentResult::Recovered { .. }
@@ -1114,6 +1175,7 @@ impl Workspace {
                 if let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none() && revision == 0) {
                     match result {
                         Ok((path, file)) => {
+                            self.files.failed_opens.remove(&document);
                             let rows = view.rows();
                             view.path = Some(path);
                             view.file = Some(file);
@@ -1121,6 +1183,7 @@ impl Workspace {
                         }
                         Err(error) => {
                             view.set_notice(format!("Open failed: {error}"));
+                            self.files.failed_opens.insert(document);
                         }
                     }
                     damage.full = self.active_id() == document;
@@ -1200,6 +1263,9 @@ impl Workspace {
         if checkpoint {
             self.checkpoint_session();
         }
+        if destinations_changed {
+            self.refresh_save_destinations();
+        }
         let retried = self.flush_receipts();
         damage.full |= retried.full;
         damage.status |= retried.status;
@@ -1248,7 +1314,17 @@ impl Workspace {
                     damage.status = true;
                 }
                 if let Some(path) = &view.path
-                    && let Err(error) = self.session.set_path(document, path.clone())
+                    && let Err(error) = if self.session.tabs().iter().any(|tab| {
+                        tab.id != document
+                            && tab
+                                .path
+                                .as_ref()
+                                .is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, path))
+                    }) {
+                        Err(io::Error::other("Save As target aliases another tab"))
+                    } else {
+                        self.session.set_path(document, path.clone())
+                    }
                 {
                     // Admission reserves destinations, but a stale or inconsistent
                     // metadata result must still fail visibly and never close.
@@ -1297,6 +1373,7 @@ impl Workspace {
             self.cancel_close_intent();
             self.files.save_all.clear();
         }
+        self.refresh_save_destinations();
         damage
     }
 
@@ -1472,6 +1549,10 @@ impl Workspace {
             .into_iter()
             .map(|(id, save)| (*mapping.get(&id).unwrap_or(&id), save))
             .collect();
+        self.files.failed_opens = std::mem::take(&mut self.files.failed_opens)
+            .into_iter()
+            .filter_map(|id| mapping.get(&id).copied())
+            .collect();
         if let Some(prompt) = &mut self.files.prompt
             && let Some(id) = mapping.get(&prompt.document)
         {
@@ -1488,6 +1569,7 @@ impl Workspace {
         if self.views.is_empty() {
             let _ = self.open(View::new(None));
         }
+        self.refresh_save_destinations();
     }
 
     pub fn status_text(&self) -> String {
@@ -1674,6 +1756,63 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn pending_windows_save_path_case_alias_is_reserved_without_ui_filesystem_access() {
+        let path = std::env::temp_dir().join("kwil-virtual-NativeAlias-Note.txt");
+        let alias = path.with_file_name("KWIL-VIRTUAL-nativealias-note.TXT");
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        edit(&mut workspace, "protected");
+        workspace.save_document(first, Some(path)).unwrap();
+        take_save(&mut workspace);
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        edit(&mut workspace, "other");
+        assert!(workspace.save_document(second, Some(alias)).is_err());
+        assert!(!workspace.files.saves.contains_key(&second));
+    }
+
+    #[test]
+    fn failed_open_placeholder_does_not_block_an_unrelated_worker_save() {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-failed-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.files.worker = Some(
+            DocumentWorker::spawn(move |result| {
+                let _ = sender.send(result);
+            })
+            .unwrap(),
+        );
+        let failed = workspace.open_path(root.join("missing-parent/failed.txt")).unwrap();
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(matches!(&result, DocumentResult::Opened { document, result: Err(_), .. } if *document == failed));
+        workspace.document_result(result);
+        workspace.file_command("file.new").unwrap();
+        let saving = workspace.active_id();
+        edit(&mut workspace, "saved");
+        let path = root.join("saved.txt");
+        workspace.save_document(saving, Some(path.clone())).unwrap();
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(matches!(&result, DocumentResult::Saved { document, result: Ok(_), .. } if *document == saving));
+        workspace.document_result(result);
+        assert_eq!(std::fs::read(&path).unwrap(), b"saved");
+        assert!(workspace.view(failed).is_some(), "failed placeholder stays visible to its owner");
+        drop(workspace);
+        loop {
+            if matches!(receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), DocumentResult::Stopped(_)) {
+                break;
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn closed_history_eviction_waits_for_its_prior_metadata_to_be_durable() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         for _ in 0..kwil_core_workspace::session::MAX_CLOSED {
@@ -1715,6 +1854,12 @@ mod tests {
         assert_eq!(workspace.files.close.front(), Some(&original[64]));
         assert!(original[..64].iter().all(|id| workspace.session.closed().iter().any(|tab| tab.id == *id)));
         assert!(original[64..].iter().all(|id| workspace.view(*id).is_some()));
+        let active_before_retry = workspace.active_id();
+        workspace.files.metadata_durable = true;
+        workspace.file_command("file.close").unwrap();
+        assert!(workspace.view(original[64]).is_none(), "retry closes the captured unapplied target");
+        assert!(workspace.view(active_before_retry).is_some(), "retry cannot close the unrelated active tab");
+        assert!(workspace.files.close.is_empty());
     }
 
     #[test]
