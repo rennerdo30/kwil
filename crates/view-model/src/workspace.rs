@@ -1571,6 +1571,57 @@ mod tests {
     }
 
     #[test]
+    fn pending_save_as_reserves_destination_before_any_worker_completion() {
+        let path = std::env::temp_dir().join(format!("kwil-reserved-save-{}.txt", std::process::id()));
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        edit(&mut workspace, "first");
+        workspace.save_document(first, Some(path.clone())).unwrap();
+        let (_, request) = take_save(&mut workspace);
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        edit(&mut workspace, "second");
+        assert!(
+            workspace.save_document(second, Some(path.clone())).is_err(),
+            "pending SaveFlight.path must reserve its destination"
+        );
+        assert!(!workspace.files.saves.contains_key(&second));
+        assert!(workspace.files.queue.is_empty());
+        assert_eq!(request.path, path);
+    }
+
+    #[test]
+    fn unexpected_save_metadata_collision_is_visible_and_cannot_close() {
+        let path = std::env::temp_dir().join(format!(
+            "kwil-save-metadata-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        edit(&mut workspace, "first");
+        workspace.save_document(first, Some(path.clone())).unwrap();
+        let (_, request) = take_save(&mut workspace);
+        let revision = request.revision;
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        workspace.session.set_path(second, path.clone()).unwrap();
+        workspace.files.close.push_back(first);
+        workspace.document_result(DocumentResult::Saved {
+            document: first,
+            revision,
+            result: kwil_core_workspace::save_snapshot(request),
+        });
+        let notice = workspace.status_text();
+        assert!(!workspace.close_pending(), "metadata failure cannot complete a close");
+        assert!(notice.contains("metadata") && notice.contains("Save As"), "collision must be visible: {notice}");
+        assert!(workspace.view(first).unwrap().editor().unwrap().document().is_dirty());
+        assert!(workspace.view(first).unwrap().path.is_none());
+        drop(workspace);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn inactive_save_completion_keeps_active_text_and_concurrent_source_edits() {
         let path = std::env::temp_dir().join(format!(
             "kwil-inactive-save-{}-{}.txt",

@@ -921,6 +921,122 @@ mod tests {
         }
     }
 
+    fn fixture_journal(root: &std::path::Path, tab: &Tab, bytes: &[u8]) {
+        let mut buffer = Buffer::empty();
+        buffer.insert(0, bytes).unwrap();
+        let mut service = JournalService::spawn(Duration::from_secs(1)).unwrap();
+        let handle = service
+            .try_create(JournalSeed {
+                path: root.join(format!("{}.kwj", tab.id.0)),
+                base: JournalBase {
+                    document: tab.id,
+                    revision: tab.revision,
+                    original_path: tab.path.clone(),
+                    original_identity: [0; 4],
+                    codec: b"raw-v1".to_vec(),
+                    byte_len: bytes.len() as u64,
+                },
+                source: Box::new(SnapshotReader::new(buffer.snapshot())),
+            })
+            .unwrap();
+        handle.ready.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        service.finish();
+        service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    }
+
+    fn recovery_tab(path: Option<PathBuf>) -> Tab {
+        let mut session = Session::default();
+        let id = session.open(path).unwrap();
+        session.tab_mut(id).unwrap().revision = 3;
+        session.tab_mut(id).unwrap().saved_revision = 2;
+        session.tabs()[0].clone()
+    }
+
+    #[test]
+    fn recovered_typing_has_resident_budget_and_can_be_undone() {
+        let scratch = Scratch::new();
+        let tab = recovery_tab(None);
+        fixture_journal(&scratch.0, &tab, b"restored");
+        let (document, _, _) = recover_document(scratch.0.join("1.kwj"), &tab).unwrap();
+        let mut editor = crate::Editor::new(document);
+        editor
+            .execute("edit.insert", &crate::CommandArgs { text: Some("new".into()), ..Default::default() }, 1)
+            .unwrap();
+        assert!(editor.document().buffer().add_memory_bytes() > 0, "interactive typing must not spill every key");
+        editor.execute("edit.undo", &Default::default(), 1).unwrap();
+        let mut actual = Vec::new();
+        editor.document().snapshot().write_to(&mut actual).unwrap();
+        assert_eq!(actual, b"restored");
+    }
+
+    #[test]
+    fn clean_named_recovery_conflicts_preserve_old_bytes_without_overwriting_changed_disk() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("named.txt");
+        let mut tab = recovery_tab(Some(path.clone()));
+        tab.saved_revision = tab.revision;
+        fixture_journal(&scratch.0, &tab, b"old bytes");
+        std::fs::write(&path, b"new bytes").unwrap();
+        let (document, _, _) = recover_document(scratch.0.join("1.kwj"), &tab).unwrap();
+        assert!(document.is_dirty(), "changed disk cannot make stale recovered bytes clean");
+        assert!(document.path().is_none(), "conflict must require Save As");
+        let mut actual = Vec::new();
+        document.snapshot().write_to(&mut actual).unwrap();
+        assert_eq!(actual, b"old bytes");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn recovered_crlf_controls_newline_insertion() {
+        let scratch = Scratch::new();
+        let tab = recovery_tab(None);
+        fixture_journal(&scratch.0, &tab, b"one\r\ntwo\r\n");
+        let (document, _, _) = recover_document(scratch.0.join("1.kwj"), &tab).unwrap();
+        let mut editor = crate::Editor::new(document);
+        editor.execute("edit.newline", &Default::default(), 1).unwrap();
+        let mut actual = Vec::new();
+        editor.document().snapshot().write_to(&mut actual).unwrap();
+        assert_eq!(actual, b"\r\none\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn durable_closed_eviction_does_not_return_as_orphan_and_marked_explicit_reopen_survives() {
+        let scratch = Scratch::new();
+        let mut prior = Session::default();
+        let id = prior.open(None).unwrap();
+        fixture_journal(&scratch.0, &prior.tabs()[0], b"retained");
+        assert!(prior.close(id));
+        session::store_session(&scratch.0.join("session.kws"), &prior).unwrap();
+        let (_, mut storage) = prepare_root(scratch.0.clone()).unwrap();
+        let mut next = prior.clone();
+        for _ in 0..session::MAX_CLOSED {
+            let id = next.open(None).unwrap();
+            assert!(next.close(id));
+        }
+        // Simulate a crash between marker fsync and the metadata replacement.
+        retire_evicted(&storage, &next).unwrap();
+        drop(storage);
+        let (prepared, state) = prepare_root(scratch.0.clone()).unwrap();
+        assert!(prepared.session.closed().iter().any(|tab| tab.id == id));
+        drop(state);
+        let mut reopened = prior.clone();
+        assert_eq!(reopened.reopen_closed().unwrap(), Some(id));
+        session::store_session(&scratch.0.join("session.kws"), &reopened).unwrap();
+        let (prepared, state) = prepare_root(scratch.0.clone()).unwrap();
+        assert!(prepared.documents.iter().any(|(document, result)| *document == id && result.is_ok()));
+        drop(state);
+        session::store_session(&scratch.0.join("session.kws"), &prior).unwrap();
+        let (_, state) = prepare_root(scratch.0.clone()).unwrap();
+        storage = state;
+        persist_session(&mut storage, &next).unwrap();
+        drop(storage);
+        let (prepared, state) = prepare_root(scratch.0.clone()).unwrap();
+        assert!(!prepared.session.tabs().iter().any(|tab| tab.id == id));
+        assert_eq!(prepared.session.closed().len(), session::MAX_CLOSED);
+        assert!(scratch.0.join("1.kwj").is_file(), "retirement never deletes journal data");
+        drop(state);
+    }
+
     #[test]
     fn recovery_streams_invalid_bytes_and_adopts_orphan_identity() {
         let scratch = Scratch::new();
@@ -1190,6 +1306,7 @@ mod tests {
             .unwrap();
         drive(&mut workspace, &receiver, crate::Workspace::recovery_ready);
         let first = workspace.active_id();
+        workspace.set_horizontal_window(2, 64 << 10);
         let second = workspace.open_path(named.clone()).unwrap();
         drive(&mut workspace, &receiver, |workspace| {
             workspace.view(second).is_some_and(|view| view.editor().is_some())
@@ -1208,6 +1325,8 @@ mod tests {
             .unwrap();
         workspace.sync_all();
         let expected = workspace.session().clone();
+        let expected_horizontal: HashMap<_, _> =
+            expected.tabs().iter().map(|tab| (tab.id, workspace.view(tab.id).unwrap().first_byte_column)).collect();
         let expected_bytes: HashMap<_, _> = expected
             .tabs()
             .iter()
@@ -1241,6 +1360,11 @@ mod tests {
         assert_eq!(restarted.session().active(), expected.active());
         assert_eq!(restarted.session().tabs(), expected.tabs());
         for tab in expected.tabs() {
+            assert_eq!(
+                restarted.view(tab.id).unwrap().first_byte_column,
+                expected_horizontal[&tab.id],
+                "requested horizontal byte origin must survive recovery"
+            );
             let document = restarted.view(tab.id).unwrap().editor().unwrap().document();
             let mut bytes = Vec::new();
             document.snapshot().write_to(&mut bytes).unwrap();
