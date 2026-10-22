@@ -207,6 +207,8 @@ fn obsolete_completion_at(stage: PublishStage) {
     let go_rx = Mutex::new(go_rx);
     let first = std::sync::atomic::AtomicBool::new(true);
     let (wake_tx, wake_rx) = mpsc::channel();
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let seen_rx = Mutex::new(seen_rx);
     let (cache_tx, cache_rx) = mpsc::channel();
     let cache_path = f.config().active_cache;
     let worker = ThemeWorker::start_with(
@@ -216,6 +218,9 @@ fn obsolete_completion_at(stage: PublishStage) {
         None,
         move || {
             let _ = wake_tx.send(());
+            // Hold publication stable until the observer has cloned it. A fast
+            // newer completion must not hide an obsolete wake in a mutant.
+            let _ = seen_rx.lock().unwrap().recv_timeout(Duration::from_secs(8));
         },
         move |at| {
             if at == stage && first.swap(false, Ordering::AcqRel) {
@@ -244,6 +249,7 @@ fn obsolete_completion_at(stage: PublishStage) {
     }
     wake_rx.recv_timeout(Duration::from_secs(8)).unwrap();
     let snapshot = worker.snapshot();
+    seen_tx.send(()).unwrap();
     assert_eq!(snapshot.revision, revision, "obsolete result must never wake the UI");
     assert_eq!(snapshot.active.scheme(), Scheme::Light);
     assert_eq!(
