@@ -6,6 +6,8 @@ A blazing fast plain text editor for GUI and terminal, written in Rust.
 - One binary: a native window when a desktop is available, a terminal UI when not (`--gui` / `--tui` to force).
 - Built for remote desktops: no frame loop, no idle redraws, damage-only drawing and scrolling by copy.
 
+Try the current state: `scriptsun.bat` on Windows or `scripts/run.sh` elsewhere. It builds and opens the README; add `--pull` to update first, `--release` for full speed, `--big` for the 1 GB test log, or `--tui` for the terminal UI.
+
 Status: early development (M0 done; see [docs/SPEC.md](docs/SPEC.md) and [docs/decisions](docs/decisions)).
 
 ## Known limitations
