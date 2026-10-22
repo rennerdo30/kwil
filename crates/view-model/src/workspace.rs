@@ -131,6 +131,8 @@ struct FileFlow {
     hot_exit: bool,
     manual_guard: bool,
     history_wait: Option<DocumentId>,
+    reopen: Option<(DocumentId, u64)>,
+    next_reopen: u64,
     exit_without_metadata: bool,
 }
 
@@ -424,6 +426,80 @@ impl Workspace {
         self.session.closed().iter().find_map(|tab| tab.path.clone())
     }
 
+    fn check_reopen_destination(&self) -> io::Result<()> {
+        let Some(tab) = self.session.closed().front() else { return Ok(()) };
+        if let Some(path) = &tab.path
+            && (self.session.tabs().iter().any(|open| {
+                open.path.as_ref().is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, path))
+            }) || self.files.saves.values().any(|save| {
+                save.path.as_ref().is_some_and(|reserved| kwil_core_workspace::paths_may_alias(reserved, path))
+            }))
+        {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Closed path is open or reserved by a save"));
+        }
+        Ok(())
+    }
+
+    fn reopen_closed(&mut self, keep_path: bool) -> io::Result<()> {
+        self.check_reopen_destination()?;
+        if let Some(tab) = self.session.closed().front() {
+            let cached = self.closed_views.get(&tab.id);
+            if cached.is_none_or(|view| view.editor().is_none()) && self.files.queue.len() >= 256 {
+                return Err(io::Error::other("File worker queue is full; retry reopening"));
+            }
+            if cached.is_some_and(|view| view.editor().is_none() && view.path.is_none()) && tab.revision == 0 {
+                return Err(io::Error::other("Closed document requires recovery"));
+            }
+        }
+        if let Some(id) = self.session.reopen_closed()? {
+            if !keep_path {
+                self.session.tab_mut(id).unwrap().path = None;
+                if let Some(view) = self.closed_views.get_mut(&id) {
+                    view.path = None;
+                    if let Some(editor) = view.editor_mut() {
+                        editor.document.path = None;
+                        editor.document.original = None;
+                        editor.document.saved_revision = editor.document.revision.wrapping_add(1);
+                    }
+                    view.set_notice("Closed backing cannot be verified; use Save As".into());
+                }
+            }
+            // Publish before recovery/index requests can pump more saves. The
+            // worker also retains its provisional reservation until release.
+            self.refresh_save_destinations();
+            if let Some(view) = self.closed_views.remove(&id) {
+                self.views.insert(id, view);
+                if self.views[&id].editor().is_none() {
+                    let tab = self.session.tabs().iter().find(|tab| tab.id == id).unwrap().clone();
+                    self.files.queue.retain(|request|!matches!(request,DocumentRequest::Open {document,..}|DocumentRequest::Index {document,..} if *document==id));
+                    let request = if tab.revision != 0 {
+                        DocumentRequest::Recover { tab }
+                    } else if let (Some(path), Some(file)) = (&self.views[&id].path, self.views[&id].file()) {
+                        DocumentRequest::Index { document: id, revision: 0, path: path.clone(), file: file.clone() }
+                    } else if let Some(path) = &self.views[&id].path {
+                        DocumentRequest::Open { document: id, revision: 0, path: path.clone() }
+                    } else {
+                        return Err(io::Error::other("Closed document requires recovery"));
+                    };
+                    self.files.queue.push_back(request);
+                    self.pump_files();
+                }
+            } else {
+                let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap().clone();
+                let mut view = View::new(None);
+                view.path = tab.path.clone();
+                view.editor = None;
+                view.top = tab.first_visible_line;
+                view.set_horizontal_window(tab.first_byte_column, 64 << 10);
+                view.set_notice("Recovering closed tab…".into());
+                self.views.insert(id, view);
+                self.files.queue.push_back(DocumentRequest::Recover { tab });
+                self.pump_files();
+            }
+        }
+        Ok(())
+    }
+
     pub fn sync_active(&mut self) {
         let id = self.active_id();
         let Some(view) = self.views.get(&id) else { return };
@@ -528,6 +604,11 @@ impl Workspace {
                     break;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(request)) => {
+                    if let DocumentRequest::ValidateReopen { document, generation, .. } = &*request
+                        && self.files.reopen == Some((*document, *generation))
+                    {
+                        self.files.reopen = None;
+                    }
                     if let DocumentRequest::Save { document, .. } = *request {
                         self.files.saves.remove(&document);
                         if let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut) {
@@ -890,43 +971,35 @@ impl Workspace {
                 }
             }
             "file.reopenClosed" => {
+                if self.files.reopen.is_some() {
+                    return Err(io::Error::other("Closed-tab admission already in progress"));
+                }
+                self.check_reopen_destination()?;
                 self.cancel_file_prompt();
                 self.sync_active();
-                if let Some(id) = self.session.reopen_closed()? {
-                    if let Some(view) = self.closed_views.remove(&id) {
-                        self.views.insert(id, view);
-                        if self.views[&id].editor().is_none() {
-                            let tab = self.session.tabs().iter().find(|tab| tab.id == id).unwrap().clone();
-                            self.files.queue.retain(|request|!matches!(request,DocumentRequest::Open {document,..}|DocumentRequest::Index {document,..} if *document==id));
-                            let request = if tab.revision != 0 {
-                                DocumentRequest::Recover { tab }
-                            } else if let (Some(path), Some(file)) = (&self.views[&id].path, self.views[&id].file()) {
-                                DocumentRequest::Index {
-                                    document: id,
-                                    revision: 0,
-                                    path: path.clone(),
-                                    file: file.clone(),
-                                }
-                            } else if let Some(path) = &self.views[&id].path {
-                                DocumentRequest::Open { document: id, revision: 0, path: path.clone() }
-                            } else {
-                                return Err(io::Error::other("Closed document requires recovery"));
-                            };
-                            self.files.queue.push_back(request);
-                            self.pump_files();
-                        }
-                    } else {
-                        let tab = self.session.tabs().iter().find(|t| t.id == id).unwrap().clone();
-                        let mut view = View::new(None);
-                        view.path = tab.path.clone();
-                        view.editor = None;
-                        view.top = tab.first_visible_line;
-                        view.set_horizontal_window(tab.first_byte_column, 64 << 10);
-                        view.set_notice("Recovering closed tab…".into());
-                        self.views.insert(id, view);
-                        self.files.queue.push_back(DocumentRequest::Recover { tab });
-                        self.pump_files();
+                if let Some(tab) = self.session.closed().front()
+                    && let Some(path) = &tab.path
+                    && self.files.worker.is_some()
+                {
+                    if self.files.queue.len() >= 256 {
+                        return Err(io::Error::other("File worker queue is full; retry reopening"));
                     }
+                    self.files.next_reopen = self.files.next_reopen.wrapping_add(1);
+                    let generation = self.files.next_reopen;
+                    let document = tab.id;
+                    let cached = self.closed_views.get(&document).and_then(View::editor);
+                    let original = cached.and_then(|editor| editor.document().original.clone());
+                    self.files.queue.push_back(DocumentRequest::ValidateReopen {
+                        document,
+                        generation,
+                        path: path.clone(),
+                        original,
+                        cached: cached.is_some(),
+                    });
+                    self.files.reopen = Some((document, generation));
+                    self.pump_files();
+                } else {
+                    self.reopen_closed(true)?;
                 }
             }
             _ => return Ok(false),
@@ -1047,6 +1120,7 @@ impl Workspace {
             || !self.files.metadata_durable
             || self.files.persist_inflight
             || self.files.persist_pending
+            || self.files.reopen.is_some()
             || !self.files.saves.is_empty()
             || self.files.prompt.is_some()
         {
@@ -1100,6 +1174,31 @@ impl Workspace {
                 if let Err(error) = result {
                     damage = self.set_notice(error.to_string());
                 }
+            }
+            DocumentResult::ReopenValidated { document, generation, result } => {
+                let current = self.files.reopen == Some((document, generation));
+                if current {
+                    self.files.reopen = None;
+                    let result = result.and_then(|keep_path| {
+                        if self.session.closed().front().is_none_or(|tab| tab.id != document) {
+                            return Err(io::Error::other("Closed history changed; retry reopening"));
+                        }
+                        self.reopen_closed(keep_path)
+                    });
+                    match result {
+                        Ok(()) => {
+                            damage.full = true;
+                            self.checkpoint_session();
+                        }
+                        Err(error) => {
+                            self.set_notice(format!("Reopen failed: {error}"));
+                        }
+                    }
+                }
+                // Publish the committed registry before releasing worker-owned
+                // admission. Stale/error receipts consume no closed history.
+                self.refresh_save_destinations();
+                self.files.queue.push_back(DocumentRequest::ReleaseReopen { document, generation });
             }
             DocumentResult::Prepared(result) => {
                 self.files.preparing = false;
@@ -1753,6 +1852,248 @@ mod tests {
         assert!(!workspace.files.saves.contains_key(&second));
         assert!(workspace.files.queue.is_empty());
         assert_eq!(request.path, path);
+    }
+
+    fn pending_save_blocks_cached_reopen(path: PathBuf, destination: PathBuf) {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let saving = workspace.active_id();
+        let mut closed = View::new(None);
+        closed.path = Some(path.clone());
+        closed.editor_mut().unwrap().document.path = Some(path);
+        let reopening = workspace.open(closed).unwrap();
+        edit(&mut workspace, "cached bytes");
+        workspace.close(reopening, true).unwrap();
+        edit(&mut workspace, "pending save");
+        workspace.save_document(saving, Some(destination)).unwrap();
+        let history = workspace.session.closed().front().unwrap().clone();
+        let queued = workspace.files.queue.len();
+        assert!(workspace.file_command("file.reopenClosed").is_err(), "pending save must block cached reopen");
+        assert_eq!(workspace.active_id(), saving);
+        assert_eq!(workspace.session.closed().front().unwrap().id, history.id);
+        assert_eq!(workspace.session.closed().front().unwrap().path, history.path);
+        assert_eq!(workspace.session.closed().front().unwrap().revision, history.revision);
+        assert!(!workspace.views.contains_key(&reopening));
+        assert_eq!(workspace.closed_views[&reopening].editor().unwrap().document().snapshot().len(), 12);
+        assert_eq!(workspace.files.queue.len(), queued);
+        assert!(workspace.files.saves.contains_key(&saving));
+        // A rejected request leaves the same stable closed entry available to retry.
+        workspace.files.saves.clear();
+        workspace.files.queue.clear();
+        workspace.file_command("file.reopenClosed").unwrap();
+        assert_eq!(workspace.active_id(), reopening);
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 12);
+    }
+
+    #[test]
+    fn cached_reopen_preserves_history_and_cache_when_save_destination_is_pending() {
+        let path = std::env::temp_dir().join("kwil-virtual-cached-reopen.txt");
+        pending_save_blocks_cached_reopen(path.clone(), path);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cached_reopen_honors_pending_windows_path_alias_without_filesystem_access() {
+        let path = std::env::temp_dir().join("kwil-virtual-CachedReopen.txt");
+        let alias = path.with_file_name("KWIL-VIRTUAL-cachedreopen.TXT");
+        pending_save_blocks_cached_reopen(path, alias);
+    }
+
+    #[test]
+    fn cached_reopen_refreshes_worker_reservations_before_pending_native_alias_save() {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-reopen-admission-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("protected.txt");
+        let alias = root.join("hard-link.txt");
+        std::fs::write(&path, b"protected").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let saving = workspace.active_id();
+        let mut closed = View::new(None);
+        closed.path = Some(path.clone());
+        closed.editor = Some(Editor::new(
+            crate::Document::from_file(path.clone(), kwil_core_workspace::open_for_editing(&path).unwrap()).unwrap(),
+        ));
+        let reopening = workspace.open(closed).unwrap();
+        workspace.close(reopening, true).unwrap();
+        edit(&mut workspace, "must not overwrite");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        workspace.files.worker = Some(
+            DocumentWorker::spawn(move |result| {
+                let pause = matches!(&result, DocumentResult::ReopenValidated { .. });
+                let _ = sender.send(result);
+                if pause {
+                    blocked.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                }
+            })
+            .unwrap(),
+        );
+        workspace.file_command("file.reopenClosed").unwrap();
+        assert!(
+            matches!(receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), DocumentResult::JournalClosed { document, .. } if document == reopening)
+        );
+        let admitted = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&admitted, DocumentResult::ReopenValidated { document, result: Ok(true), .. } if *document == reopening)
+        );
+        assert!(
+            workspace.closed_views.contains_key(&reopening),
+            "worker receipt must precede consuming cached history"
+        );
+        assert!(workspace.file_command("file.reopenClosed").is_err(), "duplicate admission must stay bounded");
+        // The worker admitted the reopen but the UI has not attached it yet.
+        // Its provisional reservation must survive an ordinary UI refresh.
+        workspace.save_document(saving, Some(alias.clone())).unwrap();
+        release.send(()).unwrap();
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&result, DocumentResult::Saved { document, result: Err(error), .. } if *document == saving && error.kind() == io::ErrorKind::AlreadyExists),
+            "reopened native destination must be reserved before the worker writes"
+        );
+        workspace.document_result(result);
+        workspace.document_result(admitted);
+        assert_eq!(workspace.active_id(), reopening);
+        assert_eq!(workspace.session.tabs().iter().find(|tab| tab.id == reopening).unwrap().path, Some(path.clone()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"protected");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"protected");
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 9);
+        assert!(workspace.view(saving).unwrap().editor().unwrap().document().is_dirty());
+        assert!(!workspace.files.saves.contains_key(&saving));
+        // After provisional release, the committed UI registry must continue
+        // protecting the reopened tab from a later native alias save.
+        workspace.save_document(saving, Some(alias.clone())).unwrap();
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&result, DocumentResult::Saved { result: Err(error), .. } if error.kind() == io::ErrorKind::AlreadyExists)
+        );
+        workspace.document_result(result);
+        assert_eq!(std::fs::read(&path).unwrap(), b"protected");
+        drop(workspace);
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            DocumentResult::Stopped(Ok(()))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_reopen_native_pending_reservation_preserves_history_until_rejected_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-reopen-pending-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("protected.txt");
+        let alias = root.join("hard-link.txt");
+        std::fs::write(&path, b"protected").unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let saving = workspace.active_id();
+        let mut view = View::new(None);
+        view.path = Some(path.clone());
+        view.editor = Some(Editor::new(
+            crate::Document::from_file(path.clone(), kwil_core_workspace::open_for_editing(&path).unwrap()).unwrap(),
+        ));
+        let reopening = workspace.open(view).unwrap();
+        workspace.close(reopening, true).unwrap();
+        edit(&mut workspace, "saved elsewhere");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        workspace.files.worker = Some(
+            DocumentWorker::spawn(move |result| {
+                let pause = matches!(&result, DocumentResult::JournalClosed { .. });
+                let _ = sender.send(result);
+                if pause {
+                    blocked.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                }
+            })
+            .unwrap(),
+        );
+        workspace.file_command("file.reopenClosed").unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            DocumentResult::JournalClosed { .. }
+        ));
+        workspace.save_document(saving, Some(alias.clone())).unwrap();
+        assert_eq!(workspace.session.closed().front().unwrap().id, reopening);
+        assert!(workspace.closed_views.contains_key(&reopening));
+        release.send(()).unwrap();
+        let rejected = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&rejected, DocumentResult::ReopenValidated { result: Err(error), .. } if error.kind() == io::ErrorKind::AlreadyExists)
+        );
+        workspace.document_result(rejected);
+        assert_eq!(workspace.active_id(), saving);
+        assert_eq!(workspace.session.closed().front().unwrap().id, reopening);
+        assert_eq!(workspace.closed_views[&reopening].editor().unwrap().document().snapshot().len(), 9);
+        let saved = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(matches!(&saved, DocumentResult::Saved { result: Ok(_), .. }));
+        workspace.document_result(saved);
+        assert_eq!(std::fs::read(&path).unwrap(), b"protected");
+        // The atomic alias save replaced only that hardlink name. After its
+        // completion the unchanged closed backing is safe to admit and retry.
+        workspace.file_command("file.reopenClosed").unwrap();
+        let admitted = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(matches!(&admitted, DocumentResult::ReopenValidated { result: Ok(true), .. }));
+        workspace.document_result(admitted);
+        assert_eq!(workspace.active_id(), reopening);
+        drop(workspace);
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            DocumentResult::Stopped(Ok(()))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_reopen_without_original_keeps_bytes_and_requires_save_as() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let reopening = workspace.active_id();
+        let path = std::env::temp_dir().join("kwil-virtual-unverified-closed.txt");
+        workspace.views.get_mut(&reopening).unwrap().path = Some(path.clone());
+        workspace.editor_mut().unwrap().document.path = Some(path);
+        edit(&mut workspace, "recovered bytes");
+        workspace.close(reopening, true).unwrap();
+        workspace.files.reopen = Some((reopening, 1));
+        workspace.document_result(DocumentResult::ReopenValidated {
+            document: reopening,
+            generation: 1,
+            result: Ok(false),
+        });
+        assert_eq!(workspace.active_id(), reopening);
+        assert!(workspace.path.is_none());
+        assert!(workspace.session.tabs().iter().find(|tab| tab.id == reopening).unwrap().path.is_none());
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 15);
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        assert!(workspace.status_text().contains("Save As"));
+    }
+
+    #[test]
+    fn stale_reopen_receipt_preserves_cache_and_releases_its_own_generation() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        workspace.close(first, true).unwrap();
+        let newest = workspace.active_id();
+        workspace.close(newest, true).unwrap();
+        workspace.files.queue.clear();
+        workspace.files.reopen = Some((first, 7));
+        workspace.document_result(DocumentResult::ReopenValidated { document: first, generation: 6, result: Ok(true) });
+        assert_eq!(workspace.files.reopen, Some((first, 7)), "stale receipt cannot cancel the live admission");
+        workspace.document_result(DocumentResult::ReopenValidated { document: first, generation: 7, result: Ok(true) });
+        assert!(workspace.files.reopen.is_none());
+        assert_eq!(workspace.session.closed().front().unwrap().id, newest);
+        assert!(workspace.closed_views.contains_key(&first));
+        assert!(workspace.closed_views.contains_key(&newest));
+        assert!(!workspace.views.contains_key(&first));
+        assert!(
+            matches!(workspace.files.queue.back(), Some(DocumentRequest::ReleaseReopen { document, generation: 7 }) if *document == first)
+        );
     }
 
     #[test]

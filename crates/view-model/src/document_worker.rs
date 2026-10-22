@@ -88,6 +88,17 @@ pub enum DocumentRequest {
         document: DocumentId,
         request: SaveRequest,
     },
+    ValidateReopen {
+        document: DocumentId,
+        generation: u64,
+        path: PathBuf,
+        original: Option<TextFile>,
+        cached: bool,
+    },
+    ReleaseReopen {
+        document: DocumentId,
+        generation: u64,
+    },
     SeedJournal {
         document: DocumentId,
         revision: u64,
@@ -120,6 +131,7 @@ pub enum DocumentResult {
     Opened { document: DocumentId, revision: u64, result: io::Result<(PathBuf, TextFile)> },
     Indexed { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
     Saved { document: DocumentId, revision: u64, result: io::Result<SavedSnapshot> },
+    ReopenValidated { document: DocumentId, generation: u64, result: io::Result<bool> },
     JournalQueued { document: DocumentId, revision: u64, sequence: u64, result: io::Result<()> },
     JournalDurable { document: DocumentId, revision: u64, sequence: u64, result: io::Result<()> },
     JournalClosed { document: DocumentId, result: io::Result<()> },
@@ -227,6 +239,9 @@ impl DocumentWorker {
             let mut storage: Option<Storage> = None;
             let mut deferred = std::collections::VecDeque::new();
             let mut session_due = None;
+            // Worker-owned until the UI publishes the admitted tab and releases
+            // this reservation. UI registry refreshes cannot erase it early.
+            let mut reopening: Option<(DocumentId, u64, PathBuf)> = None;
             loop {
                 let waiting = session_due.is_some()
                     || storage.as_ref().is_some_and(|state| {
@@ -358,11 +373,48 @@ impl DocumentWorker {
                         }
                         DocumentRequest::Save { document, request } => {
                             let revision = request.revision;
-                            let reserved =
+                            let mut reserved =
                                 destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if let Some((owner, _, path)) = &reopening {
+                                reserved.push((*owner, path.clone()));
+                            }
                             let result = validate_save_destination(document, &request.path, &reserved)
                                 .and_then(|()| kwil_core_workspace::save_snapshot(request));
                             complete(DocumentResult::Saved { document, revision, result });
+                        }
+                        DocumentRequest::ValidateReopen { document, generation, path, original, cached } => {
+                            let reserved =
+                                destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            let result = (|| {
+                                if reopening.is_some() {
+                                    return Err(io::Error::other("Closed-tab admission already in progress"));
+                                }
+                                validate_save_destination(document, &path, &reserved)?;
+                                if let Some(original) = &original
+                                    && original.check()? != kwil_core_text::FileState::Unchanged
+                                {
+                                    return Err(io::Error::other(
+                                        "Closed file changed on disk; closed contents retained",
+                                    ));
+                                }
+                                // A recovered cached editor without an original
+                                // cannot prove its named backing. Preserve its
+                                // bytes but require Save As when attaching it.
+                                let keep_path = !cached || original.is_some();
+                                if keep_path {
+                                    reopening = Some((document, generation, path));
+                                }
+                                Ok(keep_path)
+                            })();
+                            complete(DocumentResult::ReopenValidated { document, generation, result });
+                        }
+                        DocumentRequest::ReleaseReopen { document, generation } => {
+                            if reopening
+                                .as_ref()
+                                .is_some_and(|(owner, token, _)| *owner == document && *token == generation)
+                            {
+                                reopening = None;
+                            }
                         }
                         DocumentRequest::SeedJournal {
                             document,
@@ -1128,6 +1180,76 @@ mod tests {
         let mut actual = Vec::new();
         editor.document().snapshot().write_to(&mut actual).unwrap();
         assert_eq!(actual, b"restored");
+    }
+
+    #[test]
+    fn reopen_admission_retains_provisional_identity_until_matching_release_and_refuses_stale_backing() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("protected.txt");
+        std::fs::write(&path, b"protected").unwrap();
+        let original = kwil_core_workspace::open_for_editing(&path).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = sender.send(result);
+        })
+        .unwrap();
+        worker
+            .try_submit(DocumentRequest::ValidateReopen {
+                document: DocumentId(1),
+                generation: 7,
+                path: path.clone(),
+                original: Some(original.clone()),
+                cached: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            DocumentResult::ReopenValidated { result: Ok(true), .. }
+        ));
+        let request = || {
+            let mut editor = crate::Editor::new(Document::new());
+            editor
+                .execute(
+                    "edit.insert",
+                    &crate::CommandArgs { text: Some("replacement".into()), ..Default::default() },
+                    1,
+                )
+                .unwrap();
+            editor.save_request(Some(path.clone())).unwrap()
+        };
+        // Refreshing UI destinations and an old release cannot erase admission.
+        worker.set_save_destinations(Vec::new());
+        worker.try_submit(DocumentRequest::ReleaseReopen { document: DocumentId(1), generation: 6 }).unwrap();
+        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request: request() }).unwrap();
+        assert!(
+            matches!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), DocumentResult::Saved { result: Err(error), .. } if error.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"protected");
+        worker.try_submit(DocumentRequest::ReleaseReopen { document: DocumentId(1), generation: 7 }).unwrap();
+        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request: request() }).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            DocumentResult::Saved { result: Ok(_), .. }
+        ));
+        worker
+            .try_submit(DocumentRequest::ValidateReopen {
+                document: DocumentId(1),
+                generation: 8,
+                path: path.clone(),
+                original: Some(original),
+                cached: true,
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+                DocumentResult::ReopenValidated { result: Err(_), .. }
+            ),
+            "cached backing replaced by an earlier save must not attach"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        drop(worker);
+        wait_stopped(&receiver);
     }
 
     #[test]
