@@ -1228,20 +1228,20 @@ impl Workspace {
                     damage = edited;
                     damage.status = true;
                 }
-                if let Some(path) = &view.path {
-                    if let Err(error) = self.session.set_path(document, path.clone()) {
-                        // Admission reserves destinations, but a stale or inconsistent
-                        // metadata result must still fail visibly and never close.
-                        may_close = false;
-                        warning = true;
-                        view.path = None;
-                        if let Some(editor) = view.editor_mut() {
-                            editor.document.path = None;
-                            editor.document.original = None;
-                            editor.document.saved_revision = editor.document.revision.wrapping_add(1);
-                        }
-                        notice = format!("Save metadata conflict: {error}; recovered contents require Save As");
+                if let Some(path) = &view.path
+                    && let Err(error) = self.session.set_path(document, path.clone())
+                {
+                    // Admission reserves destinations, but a stale or inconsistent
+                    // metadata result must still fail visibly and never close.
+                    may_close = false;
+                    warning = true;
+                    view.path = None;
+                    if let Some(editor) = view.editor_mut() {
+                        editor.document.path = None;
+                        editor.document.original = None;
+                        editor.document.saved_revision = editor.document.revision.wrapping_add(1);
                     }
+                    notice = format!("Save metadata conflict: {error}; recovered contents require Save As");
                 }
                 notice
             }
@@ -1639,6 +1639,10 @@ mod tests {
         assert_eq!(workspace.session.closed().back().unwrap().id, oldest);
         assert!(workspace.view(current).is_some());
         assert!(workspace.files.persist_inflight);
+        workspace.document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
+        assert_eq!(workspace.session.closed().back().unwrap().id, oldest);
+        assert!(workspace.view(current).is_some());
+        assert!(!workspace.files.metadata_durable);
         workspace.files.metadata_durable = true;
         workspace.close(current, true).unwrap();
         assert!(!workspace.session.closed().iter().any(|tab| tab.id == oldest));

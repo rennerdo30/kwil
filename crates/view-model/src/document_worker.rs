@@ -1117,6 +1117,21 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_clean_named_recovery_keeps_original_path_and_clean_state() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("named.txt");
+        let mut tab = recovery_tab(Some(path.clone()));
+        tab.saved_revision = tab.revision;
+        fixture_journal(&scratch.0, &tab, b"same\r\n");
+        std::fs::write(&path, b"same\r\n").unwrap();
+        let (document, _, _) = recover_document(scratch.0.join("1.kwj"), &tab).unwrap();
+        assert!(!document.is_dirty());
+        assert_eq!(document.path(), Some(path.as_path()));
+        assert_eq!(document.line_ending, crate::DocumentLineEnding::CrLf);
+        assert!(document.original.is_some(), "clean restored disk state must retain external-change checks");
+    }
+
+    #[test]
     fn recovered_crlf_controls_newline_insertion() {
         let scratch = Scratch::new();
         let tab = recovery_tab(None);
