@@ -19,6 +19,9 @@ env:
 jobs:
   build:
     name: build (${{ matrix.target }})
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +44,9 @@ jobs:
             exit 1
           fi
       - run: rustup target add ${{ matrix.target }}
+      - name: Configure compiler cache
+        id: sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       # Dependencies cached per target; tags are rare, so this mainly helps
       # re-runs of a failed release.
       - uses: Swatinem/rust-cache@v2
@@ -49,6 +55,9 @@ jobs:
           key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           cache-on-failure: true
       - run: cargo build --release --locked -p kwil --target ${{ matrix.target }}
+      - name: Compiler cache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        run: sccache --show-stats
       - name: Stage the binary
         shell: bash
         run: |
