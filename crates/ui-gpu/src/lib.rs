@@ -13,6 +13,7 @@ mod font;
 mod hit;
 mod ime;
 mod input;
+mod palette_ui;
 mod scrollbar;
 mod tabs;
 mod zoom;
@@ -76,6 +77,8 @@ impl std::fmt::Display for GuiError {
 }
 
 enum UserEvent {
+    PaletteRoot(Result<std::path::PathBuf, String>),
+    PaletteReady,
     Document(kwil_view_model::document_worker::DocumentResult),
     OpenExternal,
     Notice(String),
@@ -222,6 +225,9 @@ mod input_dispatch_tests {
 }
 
 struct App {
+    palette: Option<kwil_view_model::palette_session::PaletteSession>,
+    palette_dirty: bool,
+    palette_area: Option<Rect>,
     view: Workspace,
     frontend_document: kwil_view_model::SessionDocumentId,
     frontend_epoch: u64,
@@ -311,6 +317,9 @@ pub fn run_with_external_open(
     let frontend_epoch = view.input_epoch();
     let horizontal = view.horizontal_origin();
     let mut app = App {
+        palette: None,
+        palette_dirty: false,
+        palette_area: None,
         view,
         frontend_document,
         frontend_epoch,
@@ -355,7 +364,16 @@ pub fn run_with_external_open(
         #[cfg(feature = "frame-harness")]
         metrics: Default::default(),
     };
-    event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
+    let result = event_loop.run_app(&mut app);
+    if let Some(palette) = &mut app.palette {
+        let handles = palette.stop();
+        std::thread::spawn(move || {
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+    }
+    result.map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
         Some(e) => Err(e),
         None => Ok(()),
@@ -438,7 +456,7 @@ impl App {
     }
 
     fn apply(&mut self, d: Damage) {
-        if d == Damage::default() && !self.chrome_dirty {
+        if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty {
             return;
         }
         queue_damage(&mut self.pending, d, self.view.rows(), self.font.as_mut());
@@ -505,6 +523,9 @@ impl App {
             self.update_file_prompt();
             return;
         }
+        if self.palette_key(ev) {
+            return;
+        }
         if self.close_pending && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             self.view.cancel_file_prompt();
             self.sync_file_ui();
@@ -524,6 +545,9 @@ impl App {
                 match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
+                        if self.dispatch_palette(call.id) {
+                            return;
+                        }
                         if self.dispatch_zoom(call.id) {
                             return;
                         }
@@ -614,7 +638,7 @@ impl App {
             input::Action::Command(id) => (id, None),
             input::Action::Text(text) => ("edit.insert", Some(text)),
         };
-        if self.dispatch_zoom(id) || self.dispatch_file(id) {
+        if self.dispatch_palette(id) || self.dispatch_zoom(id) || self.dispatch_file(id) {
             return;
         }
         let args =
@@ -739,7 +763,7 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
-        if self.pending == Damage::default() && !self.chrome_dirty {
+        if self.pending == Damage::default() && !self.chrome_dirty && !self.palette_dirty {
             return true;
         }
         let (w, h) = self.size;
@@ -757,10 +781,18 @@ impl App {
         self.body_pixels.resize(bw.saturating_mul(bh), BG);
         let bars = self.bars();
         let rows = geometry.text.height / ch;
+        let palette_open = self.palette_open();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
         let pixels = &mut gfx.pixels;
         let body_pixels = &mut self.body_pixels;
         let mut p = std::mem::take(&mut self.pending);
+        let palette_dirty = std::mem::take(&mut self.palette_dirty);
+        if palette_open && p.scroll != 0 {
+            // A pending document scroll predates opening the overlay. Avoid
+            // copying overlay pixels through the native scroll seam.
+            p.full = true;
+            p.scroll = 0;
+        }
         let mut damage = Vec::new();
         #[cfg(feature = "frame-harness")]
         let mut copied = 0u64;
@@ -807,6 +839,15 @@ impl App {
             if !p.full {
                 damage.push(tabs::rect(geometry.chrome));
             }
+        }
+        if palette_dirty
+            && !palette_open
+            && let Some(area) = self.palette_area.take()
+        {
+            tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
+            tabs::draw(self.chrome_frame.as_ref().unwrap(), pixels, w, font);
+            p.status = true;
+            damage.push(area);
         }
         if p.status {
             let height = ch.min(h);
@@ -864,6 +905,12 @@ impl App {
                 if !p.full {
                     damage.push(tabs::translated(area, body));
                 }
+            }
+        }
+        if let Some(palette) = self.palette.as_ref().filter(|palette| palette.model().is_open()) {
+            self.palette_area = palette_ui::draw(palette.model(), pixels, (w, h), font);
+            if let Some(area) = self.palette_area {
+                damage.push(area);
             }
         }
         let rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
@@ -1320,7 +1367,17 @@ impl ApplicationHandler<UserEvent> for App {
         self.apply_native_theme();
         (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
         let proxy = self.proxy.clone();
+        let hidden = self.opts.hidden;
         std::thread::spawn(move || {
+            let root = if hidden {
+                std::env::var_os("KWIL_WORKSPACE_ROOT")
+                    .map(std::path::PathBuf::from)
+                    .filter(|root| root.is_absolute())
+                    .ok_or_else(|| "Hidden palette requires an absolute isolated workspace root".to_string())
+            } else {
+                std::env::current_dir().map_err(|error| error.to_string())
+            };
+            let _ = proxy.send_event(UserEvent::PaletteRoot(root));
             let result = std::env::current_exe()
                 .map_err(|e| e.to_string())
                 .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()))
@@ -1352,6 +1409,43 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
+            UserEvent::PaletteRoot(root) => {
+                match root.and_then(|root| {
+                    let proxy = self.proxy.clone();
+                    kwil_view_model::palette_session::PaletteSession::new(
+                        root,
+                        std::sync::Arc::new(move || {
+                            let _ = proxy.send_event(UserEvent::PaletteReady);
+                        }),
+                    )
+                    .map_err(|error| error.to_string())
+                }) {
+                    Ok(palette) => self.palette = Some(palette),
+                    Err(error) => {
+                        self.view.set_notice(format!("Palette: {error}"));
+                    }
+                }
+                Damage { status: true, ..Default::default() }
+            }
+            UserEvent::PaletteReady => {
+                let mut notice = false;
+                if let Some(palette) = &mut self.palette {
+                    let changed = palette.worker_ready();
+                    if let Some(report) = palette.take_discovery_report() {
+                        if report.errors > 0 || report.end != kwil_core_workspace::catalogue::WalkEnd::Complete {
+                            notice = true;
+                            self.view.set_notice(format!(
+                                "File catalogue: {} files, {} skipped; {:?}",
+                                report.files, report.errors, report.end
+                            ));
+                        }
+                    }
+                    if changed {
+                        self.palette_redraw();
+                    }
+                }
+                Damage { status: notice, ..Default::default() }
+            }
             UserEvent::Document(result) => {
                 let damage = self.view.document_result(result);
                 if let Some(editor) = self.view.editor_mut() {
@@ -1379,6 +1473,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
+                self.palette_dirty |= self.palette.as_ref().is_some_and(|palette| palette.model().is_open());
                 if matches!(tile.key.bg, tabs::ACTIVE | tabs::INACTIVE) {
                     font.accept(tile);
                     self.chrome_dirty = true;
@@ -1543,6 +1638,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                if self.palette_open() {
+                    if state == ElementState::Pressed {
+                        self.palette_mouse();
+                    }
+                    if self.view.wants_exit() {
+                        el.exit();
+                    }
+                    return;
+                }
                 if state == ElementState::Pressed {
                     let cw = self.font.as_ref().map_or(8, |f| f.cw);
                     let geometry = self.view.tab_geometry(
@@ -1589,19 +1693,38 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 self.key(el, &event);
                 self.view.checkpoint_session();
+                if self.view.wants_exit() {
+                    el.exit();
+                }
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
                 if ime::starts_composition(self.composing, &text) {
-                    self.ime_destination = Some(ime::capture(&self.view, self.insert_mode()));
+                    self.ime_destination = Some(self.capture_input_destination());
                 }
                 // An empty preedit can precede Commit. Keep its captured destination.
                 self.composing = !text.is_empty();
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.composing = false;
-                let destination =
-                    self.ime_destination.take().unwrap_or_else(|| ime::capture(&self.view, self.insert_mode()));
-                let (damage, follow_active) = ime::commit(&mut self.view, destination, text, self.started.elapsed());
+                let destination = self.ime_destination.take().unwrap_or_else(|| self.capture_input_destination());
+                let (damage, follow_active) = match destination {
+                    ime::Destination::Palette { epoch } => {
+                        if self
+                            .palette
+                            .as_ref()
+                            .is_some_and(|palette| palette.model().is_open() && palette.input_epoch() == epoch)
+                        {
+                            self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text));
+                            (Damage::default(), false)
+                        } else {
+                            (
+                                self.view.set_notice("IME palette input cancelled: the query changed or closed".into()),
+                                false,
+                            )
+                        }
+                    }
+                    destination => ime::commit(&mut self.view, destination, text, self.started.elapsed()),
+                };
                 self.sync_file_ui();
                 self.apply(damage);
                 if follow_active {
@@ -1624,6 +1747,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.palette_open() {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(point) => point.y > 0.0,
+                    };
+                    self.palette_input(if up {
+                        kwil_view_model::palette_session::PaletteInput::Previous
+                    } else {
+                        kwil_view_model::palette_session::PaletteInput::Next
+                    });
+                    return;
+                }
                 let (horizontal, vertical) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (-(x * 3.0) as i64, -(y * 3.0) as i64),
                     MouseScrollDelta::PixelDelta(p) => {

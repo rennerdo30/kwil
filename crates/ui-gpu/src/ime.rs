@@ -4,6 +4,9 @@ use std::time::Duration;
 
 pub(super) enum Destination {
     Cancelled,
+    Palette {
+        epoch: u64,
+    },
     Prompt {
         epoch: u64,
         generation: u64,
@@ -75,6 +78,9 @@ fn commit_inner(
     }
     let stale = "IME input cancelled: its original destination changed or closed";
     match destination {
+        Destination::Palette { .. } => {
+            (workspace.set_notice("IME palette destination is no longer active".into()), false)
+        }
         Destination::Cancelled => workspace.set_notice(stale.into()),
         Destination::Prompt { epoch, generation, document, revision } => {
             let valid = epoch == workspace.input_epoch()

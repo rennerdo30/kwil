@@ -30,6 +30,7 @@ pub enum PaletteInput<'a> {
 }
 
 pub struct PaletteSession {
+    input_epoch: u64,
     model: Palette,
     worker: PaletteWorker,
     discovery: Option<JoinHandle<()>>,
@@ -65,11 +66,22 @@ impl PaletteSession {
                 return Err(error);
             }
         };
-        Ok(Self { model: Palette::new(limits.result_limit), worker, discovery: Some(discovery), cancel, report })
+        Ok(Self {
+            input_epoch: 0,
+            model: Palette::new(limits.result_limit),
+            worker,
+            discovery: Some(discovery),
+            cancel,
+            report,
+        })
     }
 
     pub fn model(&self) -> &Palette {
         &self.model
+    }
+
+    pub fn input_epoch(&self) -> u64 {
+        self.input_epoch
     }
 
     /// `tabs` is rebuilt only on tab metadata changes, never per query key.
@@ -82,6 +94,7 @@ impl PaletteSession {
     }
 
     pub fn open(&mut self, query: &str) -> Result<(), QueryError> {
+        self.input_epoch = self.input_epoch.checked_add(1).expect("palette input identity exhausted");
         for mode in [PaletteMode::Commands, PaletteMode::Tabs, PaletteMode::Files] {
             self.model.prime_results(self.worker.cached(mode));
         }
@@ -93,6 +106,7 @@ impl PaletteSession {
         if !self.model.is_open() {
             return Ok(None);
         }
+        self.input_epoch = self.input_epoch.checked_add(1).expect("palette input identity exhausted");
         let request = match input {
             PaletteInput::Text(text) => self.model.insert(text)?,
             PaletteInput::Backspace => self.model.backspace(),
