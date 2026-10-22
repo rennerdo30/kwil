@@ -56,7 +56,7 @@ impl LineIndex {
                             let mut local = Vec::new();
                             for pos in memchr_iter(b'\n', &bytes[start..end]) {
                                 newlines += 1;
-                                if newlines % every == 0 {
+                                if newlines.is_multiple_of(every) {
                                     local.push((newlines, (start + pos + 1) as u64));
                                 }
                             }
