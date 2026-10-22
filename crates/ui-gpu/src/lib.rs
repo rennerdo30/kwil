@@ -1196,7 +1196,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.size = (sz.width as usize, sz.height as usize);
         self.gfx = Some(Gfx { native: None, window, surface, hwnd, pixels: vec![BG; self.size.0 * self.size.1] });
         self.resize_surface();
-        let d = self.view.set_rows(self.text_rows());
+        let rows = self.text_rows();
+        let d = self.view.set_rows(rows);
         self.apply(d);
         if !self.render() {
             el.exit();
@@ -1336,7 +1337,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
                 });
                 self.font = Some(*font);
-                self.view.set_rows(self.text_rows())
+                let rows = self.text_rows();
+                self.view.set_rows(rows)
             }
             UserEvent::FontReady(None) => {
                 self.font_loading = false;
@@ -1389,7 +1391,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.size = (sz.width as usize, sz.height as usize);
                 self.resize_surface();
-                let d = self.view.set_rows(self.text_rows());
+                let rows = self.text_rows();
+                let d = self.view.set_rows(rows);
                 self.apply(d);
             }
             WindowEvent::RedrawRequested => {
