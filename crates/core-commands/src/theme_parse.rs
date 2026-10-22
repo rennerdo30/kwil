@@ -327,12 +327,16 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
     let mut nodes = 0;
     // A small structural plist reader on top of a real XML tokenizer. No DTD,
     // external entity resolver, filesystem include or network path exists.
-    fn next<'a>(r: &mut Reader<&'a [u8]>) -> Result<Event<'a>, ThemeError> {
+    fn next<'a>(r: &mut Reader<&'a [u8]>, mut allow_declaration: bool) -> Result<Event<'a>, ThemeError> {
         loop {
             let event = r.read_event().map_err(|e| error(format!("tmTheme XML: {e}")))?;
             match &event {
                 Event::Comment(_) => continue,
                 Event::Decl(d) => {
+                    if !allow_declaration {
+                        return Err(error("XML declaration is only allowed once before the plist root"));
+                    }
+                    allow_declaration = false;
                     if d.version().map_err(|e| error(e.to_string()))?.as_ref() != b"1.0" {
                         return Err(error("only XML 1.0 is supported"));
                     }
@@ -392,7 +396,7 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
             b"array" => {
                 let mut out = Vec::new();
                 loop {
-                    let event = next(r)?;
+                    let event = next(r, false)?;
                     if matches!(&event, Event::End(e) if e.name().as_ref() == b"array") {
                         return Ok(Value::Array(out));
                     }
@@ -402,7 +406,7 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
             b"dict" => {
                 let mut out = Map::new();
                 loop {
-                    let event = next(r)?;
+                    let event = next(r, false)?;
                     if matches!(&event, Event::End(e) if e.name().as_ref() == b"dict") {
                         return Ok(Value::Object(out));
                     }
@@ -411,7 +415,7 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
                         return Err(error("expected plist key"));
                     }
                     let key = text(r, b"key")?;
-                    let event = next(r)?;
+                    let event = next(r, false)?;
                     if out.insert(key, value(r, event, depth + 1, nodes)?).is_some() {
                         return Err(error("duplicate plist key"));
                     }
@@ -420,7 +424,7 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
             _ => Err(error("unsupported plist value type")),
         }
     }
-    let Event::Start(root) = next(&mut reader)? else {
+    let Event::Start(root) = next(&mut reader, true)? else {
         return Err(error("expected XML plist"));
     };
     if root.name().as_ref() != b"plist" {
@@ -432,10 +436,10 @@ fn xml_plist(source: &str) -> Result<Value, ThemeError> {
             return Err(error("unsupported plist root attribute"));
         }
     }
-    let event = next(&mut reader)?;
+    let event = next(&mut reader, false)?;
     let result = value(&mut reader, event, 0, &mut nodes)?;
-    if !matches!(next(&mut reader)?, Event::End(e) if e.name().as_ref() == b"plist")
-        || !matches!(next(&mut reader)?, Event::Eof)
+    if !matches!(next(&mut reader, false)?, Event::End(e) if e.name().as_ref() == b"plist")
+        || !matches!(next(&mut reader, false)?, Event::Eof)
     {
         return Err(error("trailing or unclosed plist"));
     }

@@ -1,4 +1,4 @@
-param([string]$Case = '', [int]$TimeoutSeconds = 180)
+param([string]$Case = '', [int]$TimeoutSeconds = 180, [switch]$VerifyRecipes)
 $ErrorActionPreference = 'Stop'
 # Run only under the coordinator's shared Cargo lane. Mutations are sequential,
 # assertion-checked and restored byte-for-byte, including on failure. No Git
@@ -47,6 +47,7 @@ function Mutant([string]$Label,[string]$File,[string]$Package,[string]$Test,[str
     $source = [Text.Encoding]::UTF8.GetString($original)
     $index = $source.IndexOf($Before,[StringComparison]::Ordinal)
     if ($index -lt 0 -or $source.IndexOf($Before,$index + $Before.Length,[StringComparison]::Ordinal) -ge 0) { throw "Mutation must match exactly once: $Label" }
+    if ($VerifyRecipes) { Write-Output "Recipe matched exactly once: $Label"; return }
     try {
         [IO.File]::WriteAllText($path,$source.Replace($Before,$After),[Text.UTF8Encoding]::new($false))
         Invoke-Focused $Package $Test $Label $true
@@ -59,7 +60,7 @@ $worker = 'crates/core-commands/src/theme_worker.rs'
 $commands = 'kwil-core-commands'
 Mutant 'rgba-alpha' $model $commands 'theme::tests::rgba_alpha_and_remote_background_contract' 'if hex.len() == 8 { byte(&hex[6..8])? } else { 255 }' 'if false { byte(&hex[6..8])? } else { 255 }'
 Mutant 'remote-opacity' $model $commands 'theme::tests::rgba_alpha_and_remote_background_contract' 'if role.is_background() {' 'if false && role.is_background() {'
-Mutant 'builtin-bg' $model $commands 'theme::tests::builtins_and_native_round_trip_contract' '0x0d1424, 0xd6e4f0' '0x010203, 0xd6e4f0'
+Mutant 'builtin-bg' $model $commands 'theme::tests::builtins_and_native_round_trip_contract' '0x0d1424, 0xd6e4f0, 0x0a101d, 0x5b6b85' '0x010203, 0xd6e4f0, 0x0a101d, 0x5b6b85'
 Mutant 'source-byte-bound' $parse $commands 'theme::tests::native_parser_bounds_and_strictness_contract' 'if bytes.len() > MAX_THEME_BYTES {' 'if false && bytes.len() > MAX_THEME_BYTES {'
 Mutant 'native-unknown-field' $parse $commands 'theme::tests::native_parser_bounds_and_strictness_contract' "#[serde(deny_unknown_fields)]`nstruct Native {" 'struct Native {'
 Mutant 'scope-bound' $model $commands 'theme::tests::native_parser_bounds_and_strictness_contract' 'if self.syntax.len() > MAX_SCOPES {' 'if false && self.syntax.len() > MAX_SCOPES {'
