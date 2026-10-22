@@ -260,9 +260,12 @@ impl SaveFlow {
         let requested = self.revision.take();
         let closing = std::mem::take(&mut self.closing);
         let Some(editor) = view.editor_mut() else { return false };
+        // A successful worker trim can install a new, clean revision during
+        // finish_save. Compare the source revision before that installation.
+        let current_revision = revision == Some(editor.document().revision());
         match editor.finish_save(saved) {
             Ok(result) => {
-                let clean_revision = revision == Some(editor.document().revision()) && !editor.document().is_dirty();
+                let clean_revision = current_revision && !editor.document().is_dirty();
                 let notice = match result.status {
                     CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => message,
                     _ if !clean_revision => "Saved earlier revision; current changes remain unsaved".into(),
@@ -800,14 +803,13 @@ mod tests {
         let mut save = SaveFlow::default();
         let request = save.request(&mut view, Some(file.0.clone()), false).unwrap();
         let saved = kwil_core_workspace::save_snapshot(request).unwrap();
-        let stale = kwil_core_workspace::SavedSnapshot {
-            path: saved.path.clone(),
-            file: saved.file.clone(),
-            snapshot: saved.snapshot.clone(),
-            revision: saved.revision,
-            warnings: saved.warnings.clone(),
-        };
         assert!(!save.finish(&mut view, Ok(saved)));
+        // Produce a real earlier-revision worker result without relying on
+        // the storage result's fields beyond its public revision contract.
+        let stale = kwil_core_workspace::save_snapshot(
+            kwil_view_model::Editor::new(kwil_view_model::Document::new()).save_request(Some(file.0.clone())).unwrap(),
+        )
+        .unwrap();
         execute(&mut view, "edit.insert", Some("new revision".into()), false, Duration::ZERO);
         let request = save.request(&mut view, None, true).unwrap();
         assert_ne!(request.revision, stale.revision);
@@ -815,6 +817,21 @@ mod tests {
         assert!(!view.editor().unwrap().document().is_dirty());
         assert!(!save.finish(&mut view, Ok(stale)), "a duplicate old completion is not the pending :wq save");
         assert!(!save.closing);
+    }
+
+    #[test]
+    fn savequit_successful_trim_installs_a_clean_saved_revision() {
+        let file = SaveFile::new();
+        let mut view = View::new(None);
+        view.set_rows(3);
+        view.editor_mut().unwrap().settings.editor.trim_trailing_whitespace_on_save = true;
+        execute(&mut view, "edit.insert", Some("trim me  ".into()), false, Duration::ZERO);
+        let mut save = SaveFlow::default();
+        let request = save.request(&mut view, Some(file.0.clone()), true).unwrap();
+        assert!(save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
+        assert!(!view.editor().unwrap().document().is_dirty());
+        assert_eq!(std::fs::read(&file.0).unwrap(), b"trim me");
+        assert_eq!(view.line(0), Some(b"trim me".as_slice()));
     }
 
     #[test]
