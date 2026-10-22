@@ -87,6 +87,7 @@ impl Session {
                 return Err(invalid("session paths must be absolute"));
             }
             if let Some(id) = self.tabs.iter().find(|t| t.path.as_ref() == Some(path)).map(|t| t.id) {
+                self.touch_recent(path.clone());
                 self.active = Some(id);
                 return Ok(id);
             }
@@ -142,6 +143,9 @@ impl Session {
             return Err(invalid("path is already open"));
         }
         let id = tab.id;
+        if let Some(path) = &tab.path {
+            self.touch_recent(path.clone());
+        }
         self.tabs.push(tab);
         self.active = Some(id);
         Ok(Some(id))

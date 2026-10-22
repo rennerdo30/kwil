@@ -18,7 +18,7 @@ use std::{
 
 pub const JOURNAL_CHUNK: usize = 64 * 1024;
 pub const JOURNAL_QUEUE: usize = 16;
-const MAX_RECORD: usize = JOURNAL_CHUNK + 128;
+const MAX_RECORD: usize = JOURNAL_CHUNK + 1;
 const MAGIC: &[u8; 4] = b"KWJ1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -570,28 +570,33 @@ impl JournalService {
         })?;
         Ok(Self { tx: Some(tx), closing, cancel: stop, next: std::sync::atomic::AtomicU64::new(1), finished })
     }
-    pub fn try_create(&self, seed: JournalSeed) -> Result<JournalSession, TrySendError<JournalSeed>> {
+    pub fn try_create(&self, seed: JournalSeed) -> Result<JournalSession, TrySendError<Box<JournalSeed>>> {
         if self.closing.load(Ordering::Acquire)
             || seed.base.codec.len() > 128
             || seed.base.document.0 == 0
             || seed.base.original_path.as_deref().is_some_and(|p| crate::session::validate_path(p).is_err())
         {
-            return Err(TrySendError::Disconnected(seed));
+            return Err(TrySendError::Disconnected(Box::new(seed)));
         }
         let token = self.next.fetch_add(1, Ordering::Relaxed);
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let (done, finished) = mpsc::sync_channel(1);
         let request = ServiceRequest::Create { seed, token, ready: ready_tx, done };
         self.tx.as_ref().unwrap().try_send(request).map_err(|e| match e {
-            TrySendError::Full(ServiceRequest::Create { seed, .. }) => TrySendError::Full(seed),
-            TrySendError::Disconnected(ServiceRequest::Create { seed, .. }) => TrySendError::Disconnected(seed),
+            TrySendError::Full(ServiceRequest::Create { seed, .. }) => TrySendError::Full(Box::new(seed)),
+            TrySendError::Disconnected(ServiceRequest::Create { seed, .. }) => {
+                TrySendError::Disconnected(Box::new(seed))
+            }
             _ => unreachable!(),
         })?;
         Ok(JournalSession { tx: self.tx.clone(), token, closing: self.closing.clone(), ready, finished })
     }
-    pub fn try_resume(&self, recovered: RecoveredJournal) -> Result<JournalSession, TrySendError<RecoveredJournal>> {
+    pub fn try_resume(
+        &self,
+        recovered: RecoveredJournal,
+    ) -> Result<JournalSession, TrySendError<Box<RecoveredJournal>>> {
         if self.closing.load(Ordering::Acquire) {
-            return Err(TrySendError::Disconnected(recovered));
+            return Err(TrySendError::Disconnected(Box::new(recovered)));
         }
         let token = self.next.fetch_add(1, Ordering::Relaxed);
         let (ready_tx, ready) = mpsc::sync_channel(1);
@@ -601,9 +606,9 @@ impl JournalService {
             .unwrap()
             .try_send(ServiceRequest::Resume { recovered, token, ready: ready_tx, done })
             .map_err(|e| match e {
-                TrySendError::Full(ServiceRequest::Resume { recovered, .. }) => TrySendError::Full(recovered),
+                TrySendError::Full(ServiceRequest::Resume { recovered, .. }) => TrySendError::Full(Box::new(recovered)),
                 TrySendError::Disconnected(ServiceRequest::Resume { recovered, .. }) => {
-                    TrySendError::Disconnected(recovered)
+                    TrySendError::Disconnected(Box::new(recovered))
                 }
                 _ => unreachable!(),
             })?;
