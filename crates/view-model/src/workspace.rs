@@ -455,11 +455,11 @@ impl Workspace {
             match self.files.worker.as_ref().unwrap().try_submit(request) {
                 Ok(()) => {}
                 Err(std::sync::mpsc::TrySendError::Full(request)) => {
-                    self.files.queue.push_front(request);
+                    self.files.queue.push_front(*request);
                     break;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(request)) => {
-                    if let DocumentRequest::Save { document, .. } = request {
+                    if let DocumentRequest::Save { document, .. } = *request {
                         self.files.saves.remove(&document);
                         if let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut) {
                             let _ = editor.finish_save(Err(io::Error::other("document worker disconnected")));

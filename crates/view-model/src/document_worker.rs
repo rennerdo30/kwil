@@ -460,8 +460,11 @@ impl DocumentWorker {
 
     /// Full admission returns ownership. Callers must retain/retry or explicitly
     /// reject it; a rejected save must clear the model's in-flight save state.
-    pub fn try_submit(&self, request: DocumentRequest) -> Result<(), TrySendError<DocumentRequest>> {
-        self.tx.try_send(request)
+    pub fn try_submit(&self, request: DocumentRequest) -> Result<(), TrySendError<Box<DocumentRequest>>> {
+        self.tx.try_send(request).map_err(|error| match error {
+            TrySendError::Full(request) => TrySendError::Full(Box::new(request)),
+            TrySendError::Disconnected(request) => TrySendError::Disconnected(Box::new(request)),
+        })
     }
 }
 
