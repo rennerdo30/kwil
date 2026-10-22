@@ -109,6 +109,9 @@ pub fn chord(key: &Key, mods: ModifiersState) -> Option<kwil_core_commands::KeyC
             }
             K::Character(c)
         }
+        Key::Named(key) if FUNCTION_KEYS.contains(key) => {
+            K::Function((FUNCTION_KEYS.iter().position(|candidate| candidate == key)? + 1) as u8)
+        }
         Key::Named(key) => K::Named(match key {
             NamedKey::Enter => N::Enter,
             NamedKey::Escape => N::Escape,
@@ -139,9 +142,25 @@ pub fn chord(key: &Key, mods: ModifiersState) -> Option<kwil_core_commands::KeyC
     ))
 }
 
+const FUNCTION_KEYS: [NamedKey; 24] = [
+    NamedKey::F1, NamedKey::F2, NamedKey::F3, NamedKey::F4, NamedKey::F5, NamedKey::F6,
+    NamedKey::F7, NamedKey::F8, NamedKey::F9, NamedKey::F10, NamedKey::F11, NamedKey::F12,
+    NamedKey::F13, NamedKey::F14, NamedKey::F15, NamedKey::F16, NamedKey::F17, NamedKey::F18,
+    NamedKey::F19, NamedKey::F20, NamedKey::F21, NamedKey::F22, NamedKey::F23, NamedKey::F24,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn function_chords_preserve_numbers_and_modifiers() {
+        for (index, named) in FUNCTION_KEYS.into_iter().enumerate() {
+            let chord = chord(&Key::Named(named), ModifiersState::CONTROL | ModifiersState::SHIFT).unwrap();
+            assert_eq!(chord.key, kwil_core_commands::Key::Function(index as u8 + 1));
+            assert!(chord.modifiers.ctrl && chord.modifiers.shift);
+        }
+        assert!(chord(&Key::Named(NamedKey::F25), ModifiersState::empty()).is_none());
+    }
     #[test]
     fn ime_commit_targets_the_save_prompt_and_respects_normal_mode() {
         let mut path = Some("notes-".to_string());
