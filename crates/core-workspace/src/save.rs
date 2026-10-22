@@ -394,6 +394,11 @@ mod tests {
         b.insert(1, b" edited").unwrap();
         let worker = b.snapshot();
         let saved = save_snapshot(f.request(original.clone(), &b)).unwrap();
+        assert_eq!(
+            original.check().unwrap(),
+            kwil_core_text::FileState::Replaced,
+            "watchers must still check the live pathname, while snapshots read the pinned object"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"a edited\r\nb\r\n");
         let mut out = Vec::new();
         worker.write_to(&mut out).unwrap();

@@ -181,6 +181,9 @@ pub struct Buffer {
     history: History,
     transaction: Option<Snapshot>,
     typing: Option<Typing>,
+    // Stable document identity, carried by original pieces across checkpoints.
+    // No file list, byte ownership or weak backing retention is stored here.
+    owner: Arc<()>,
 }
 
 impl Default for Buffer {
@@ -202,6 +205,7 @@ impl Buffer {
             history: History::new(UNDO_MEMORY),
             transaction: None,
             typing: None,
+            owner: Arc::new(()),
         }
     }
 
@@ -211,9 +215,11 @@ impl Buffer {
     /// Inherits TextFile's external-file-mutation safety contract.
     /// Refuses changed files even when an index is already cached.
     pub fn from_file(file: TextFile) -> Result<Self, ReadError> {
-        let root = piece_tree::original(file.clone())?;
+        let mut buffer = Self::empty();
+        let root = piece_tree::original(file.clone(), buffer.owner.clone())?;
         let originals = Arc::new(piece_tree::original_uses(&root, 0..file.len()));
-        Ok(Self { snapshot: Snapshot { root, originals }, ..Self::empty() })
+        buffer.snapshot = Snapshot { root, originals };
+        Ok(buffer)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -270,7 +276,7 @@ impl Buffer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
         let (_, tail) = piece_tree::split(source.root.clone(), range.start).map_err(io::Error::other)?;
         let (inserted, _) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
-        let inserted = piece_tree::import_added(inserted, &self.added, &self.snapshot.originals)?;
+        let inserted = piece_tree::import_added(inserted, &self.added, &self.owner)?;
         let uses = piece_tree::original_uses(&inserted, 0..range.end - range.start);
         let before = self.snapshot();
         let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
@@ -389,21 +395,35 @@ impl Buffer {
     /// Rebase the current version onto an equivalent, reopened saved original.
     /// Caller must establish byte equivalence and finish any pending batch.
     /// History and already issued snapshots retain their old backing objects.
-    pub fn checkpoint_current(&mut self, saved: Snapshot) -> io::Result<()> {
+    pub fn checkpoint_current(&mut self, mut saved: Snapshot) -> io::Result<()> {
         if self.transaction.is_some() || saved.len() != self.len() || saved.line_count() != self.line_count() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid saved checkpoint"));
         }
+        if !piece_tree::saved_original(&saved.root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint requires a complete file-backed saved original",
+            ));
+        }
         self.typing = None;
+        saved.root = piece_tree::own_saved_original(saved.root, &self.owner);
         self.snapshot = saved;
         Ok(())
     }
 
     /// Install a worker-prepared changed version as one undo step (for example
     /// streamed trim-on-save). No scan/copy occurs on the completion thread.
-    pub fn install_worker_edit(&mut self, snapshot: Snapshot) -> io::Result<()> {
+    pub fn install_worker_edit(&mut self, mut snapshot: Snapshot) -> io::Result<()> {
         if self.transaction.is_some() {
             return Err(io::Error::other("cannot install worker edit during a transaction"));
         }
+        if !piece_tree::saved_original(&snapshot.root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker save edit requires a complete file-backed saved original",
+            ));
+        }
+        snapshot.root = piece_tree::own_saved_original(snapshot.root, &self.owner);
         let before = std::mem::replace(&mut self.snapshot, snapshot);
         self.typing = None;
         self.record(before, false);
@@ -532,7 +552,12 @@ mod editing_contract_tests {
         let mut target = Buffer::empty();
         target.set_undo_memory_limit(0);
         for _ in 0..8 {
-            target.install_worker_edit(source.clone()).unwrap();
+            target.insert_snapshot_range(0, &source, 0..source.len()).unwrap();
+            // This empty destination deliberately imports foreign data. Check
+            // pruning separately on its own original below.
+            target.delete(0..target.len()).unwrap();
+            target = Buffer::from_file(fixture.file(1)).unwrap();
+            target.set_undo_memory_limit(0);
             assert_eq!(target.snapshot.originals.len(), 1);
             assert!(target.snapshot.retained_bytes() > target.snapshot.root.as_ref().unwrap().metrics.retained);
             target.delete(0..target.len()).unwrap();
@@ -560,6 +585,46 @@ mod editing_contract_tests {
         assert_eq!(target.snapshot.originals.values().next().unwrap().1, target.len());
         assert!(target.undo());
         assert_eq!(target.len(), 65536);
+        target.delete(0..target.len()).unwrap();
+        target.set_undo_memory_limit(0);
+        assert!(target.snapshot.originals.is_empty());
+        target.insert_snapshot_range(0, &source, 0..source.len()).unwrap();
+        assert_eq!(
+            target.add_memory_bytes(),
+            0,
+            "restoring this document's own original after delete-all must still share"
+        );
+        let path = fixture.0.join("saved.txt");
+        std::fs::write(&path, [b'x'; 65536]).unwrap();
+        let checkpoint = Buffer::from_file(TextFile::open_saved_version(&path).unwrap()).unwrap().snapshot();
+        target.checkpoint_current(checkpoint).unwrap();
+        target.begin();
+        target.delete(0..target.len()).unwrap();
+        target.insert_snapshot_range(0, &source, 0..source.len()).unwrap();
+        target.commit();
+        assert_eq!(target.add_memory_bytes(), 0, "old clipboard pieces retain document ownership across a checkpoint");
+    }
+
+    #[test]
+    fn saved_baseline_shortcuts_reject_foreign_resident_slices() {
+        let fixture = OriginalsFixture::new();
+        let source = Buffer::from_file(fixture.file(0)).unwrap().snapshot();
+        let foreign = source.slice(0..1).unwrap();
+        let mut target = Buffer::with_add_memory_limit(0);
+        target.set_undo_memory_limit(0);
+        target.insert(0, b"z").unwrap();
+        assert!(target.checkpoint_current(foreign.clone()).is_err(), "checkpoint must not bypass foreign-source caps");
+        assert!(
+            target.install_worker_edit(foreign).is_err(),
+            "worker edit must not promote a resident slice to a new baseline"
+        );
+        assert!(
+            target.install_worker_edit(source).is_err(),
+            "worker edit must not adopt a whole foreign resident copy either"
+        );
+        let mut bytes = Vec::new();
+        target.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"z");
     }
     #[test]
     fn batch_cancel_coalescing_shared_ranges_and_checkpoint_keep_history() {
@@ -579,7 +644,10 @@ mod editing_contract_tests {
         assert!(b.undo());
         assert!(b.is_empty());
         assert!(b.redo());
-        let checkpoint = b.snapshot();
+        let fixture = OriginalsFixture::new();
+        let path = fixture.0.join("checkpoint.txt");
+        std::fs::write(&path, b"abcab").unwrap();
+        let checkpoint = Buffer::from_file(TextFile::open_saved_version(&path).unwrap()).unwrap().snapshot();
         b.checkpoint_current(checkpoint).unwrap();
         assert!(b.undo());
         assert!(b.is_empty());

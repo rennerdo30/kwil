@@ -157,6 +157,7 @@ impl Storage {
 #[derive(Clone)]
 pub(crate) struct Piece {
     storage: Arc<Storage>,
+    owner: Option<Arc<()>>,
     start: u64,
     end: u64,
     first_line: u64,
@@ -292,13 +293,20 @@ pub(crate) fn split(tree: Tree, at: u64) -> Result<(Tree, Tree), ReadError> {
     })
 }
 
-pub(crate) fn original(file: TextFile) -> Result<Tree, ReadError> {
+pub(crate) fn original(file: TextFile, owner: Arc<()>) -> Result<Tree, ReadError> {
     let breaks = file.build_index(4)?.line_count() - 1;
     if file.is_empty() {
         return Ok(None);
     }
     let len = file.len();
-    Ok(Some(leaf(Piece { storage: Arc::new(Storage::Original(file)), start: 0, end: len, first_line: 0, breaks })))
+    Ok(Some(leaf(Piece {
+        storage: Arc::new(Storage::Original(file)),
+        owner: Some(owner),
+        start: 0,
+        end: len,
+        first_line: 0,
+        breaks,
+    })))
 }
 
 pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
@@ -318,7 +326,14 @@ pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
         let breaks = memchr_iter(b'\n', chunk).count() as u64;
         tree = join(
             tree,
-            Some(leaf(Piece { storage: Arc::new(storage), start: 0, end: chunk.len() as u64, first_line: 0, breaks })),
+            Some(leaf(Piece {
+                storage: Arc::new(storage),
+                owner: None,
+                start: 0,
+                end: chunk.len() as u64,
+                first_line: 0,
+                breaks,
+            })),
         );
     }
     Ok(tree)
@@ -326,13 +341,13 @@ pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
 
 /// Import foreign original ranges and resident add blocks into the destination
 /// cap. Its own originals/add blocks and immutable spill blocks remain shared.
-pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>, originals: &OriginalUses) -> io::Result<Tree> {
+pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>) -> io::Result<Tree> {
     let Some(node) = tree else { return Ok(None) };
     match &node.kind {
         Kind::Leaf(piece) => {
             let foreign = match piece.storage.as_ref() {
                 Storage::Memory { budget: source, .. } => !Arc::ptr_eq(source, budget),
-                Storage::Original(file) => !originals.contains_key(&file.history_backing_ref().id()),
+                Storage::Original(_) => !piece.owner.as_ref().is_some_and(|source| Arc::ptr_eq(source, owner)),
                 Storage::Disk(_) => false,
             };
             if foreign {
@@ -343,8 +358,8 @@ pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>, originals: &Orig
             }
         }
         Kind::Branch(left, right) => {
-            let a = import_added(Some(left.clone()), budget, originals)?;
-            let b = import_added(Some(right.clone()), budget, originals)?;
+            let a = import_added(Some(left.clone()), budget, owner)?;
+            let b = import_added(Some(right.clone()), budget, owner)?;
             if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, left)) && b.as_ref().is_some_and(|b| Arc::ptr_eq(b, right)) {
                 Ok(Some(node))
             } else {
@@ -377,6 +392,34 @@ pub(crate) fn original_uses(tree: &Tree, range: Range<u64>) -> OriginalUses {
         }
     }
     result
+}
+
+/// Only a complete mapped original (or empty file) may become a saved baseline.
+/// Arbitrary slices/composites use capped insertion rather than this shortcut.
+pub(crate) fn saved_original(tree: &Tree) -> bool {
+    let Some(node) = tree else { return true };
+    match &node.kind {
+        Kind::Leaf(piece) => match &*piece.storage {
+            Storage::Original(file) => {
+                piece.start == 0 && piece.end == file.len() && file.resident_original_bytes() == 0
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A saved baseline has one original leaf, so bind it to the document lineage
+/// in O(1). Prior snapshots keep the same stable token across checkpoints.
+pub(crate) fn own_saved_original(tree: Tree, owner: &Arc<()>) -> Tree {
+    let node = tree?;
+    match &node.kind {
+        Kind::Leaf(piece) => match &*piece.storage {
+            Storage::Original(_) => Some(leaf(Piece { owner: Some(owner.clone()), ..piece.clone() })),
+            _ => Some(node),
+        },
+        _ => Some(node),
+    }
 }
 
 /// Offset immediately after the `nth` newline (one-based).

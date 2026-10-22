@@ -640,6 +640,43 @@ fn view_defers_goto_and_caches_bounded_long_line_windows() {
 }
 
 #[test]
+fn whole_document_line_move_and_clipboard_reuse_keep_original_pieces_owned() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "kwil-owned-recipes-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("f.txt");
+    let mut content = vec![b'a'; 32768];
+    content.push(b'\n');
+    content.extend(std::iter::repeat_n(b'b', 32767));
+    std::fs::write(&path, &content).unwrap();
+    let file = kwil_core_workspace::open_for_editing(&path).unwrap();
+    let mut e = Editor::new(Document::from_file(path.clone(), file).unwrap());
+    e.move_lines(true).unwrap();
+    assert_eq!(e.document().buffer().add_memory_bytes(), 0);
+    assert_eq!(e.document().snapshot().chunks(0..1).unwrap().next().unwrap().unwrap(), b"b");
+    e.undo().unwrap();
+    let mut clipboard = MemoryClipboard::default();
+    e.select_all().unwrap();
+    e.cut(&mut clipboard).unwrap();
+    e.paste(&mut clipboard).unwrap();
+    assert_eq!(e.document().buffer().add_memory_bytes(), 0);
+    assert_eq!(bytes(&e), content);
+    let request = e.save_request(None).unwrap();
+    e.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+    e.select_all().unwrap();
+    e.delete(false, false).unwrap();
+    e.paste(&mut clipboard).unwrap();
+    assert_eq!(e.document().buffer().add_memory_bytes(), 0);
+    assert_eq!(bytes(&e), content);
+    drop((e, clipboard));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 #[ignore = "one-shot model measurements on the generated 1 GB fixture"]
 fn measure_model_typing_1gb_one_and_100_cursors() {
     let path = std::env::var_os("KWIL_MODEL_FIXTURE")
