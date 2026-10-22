@@ -161,6 +161,14 @@ recorded in the PR and KW-33.
 
 ### Acceptance evidence
 
+- [Paired-protocol deliberate delayed-index red run](https://github.com/rennerdo30/kwil/actions/runs/39832069461),
+  head `f4fd7d305efd8a46275e1938b083b2335257636e`: the actual one-second
+  index delay fails both OSes. Linux reaches **1.0026 GB/s**, above the hard
+  limit, but fails the relative gate versus **13.4645 GB/s** reference
+  (**+1,243% time/byte**); startup-to-index fails too. This proves the approved
+  calibration still detects an actual regression independently of hard limits.
+  Windows fails the index hard limit. Both frame scenarios pass with present
+  acknowledgements. The delay is removed after this run.
 - Baseline seed: [hosted run 39827665077](https://github.com/rennerdo30/kwil/actions/runs/39827665077),
   source merge `c2530a2699c6afa5744bf33f9b36f98e6eb8bf13`; exact result files
   stored on `bench-baseline` at `8dadd5d76ea71ea67c2c3c703619897171b56721`.
