@@ -1769,8 +1769,12 @@ dependencies = [
 name = "kwil-core-commands"
 version = "0.1.0"
 dependencies = [
+ "kwil-core-workspace",
+ "libc",
  "serde",
  "toml",
+ "toml_edit",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3576,6 +3580,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
