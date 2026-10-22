@@ -221,6 +221,7 @@ mod input_dispatch_tests {
 
 struct App {
     view: Workspace,
+    frontend_document: kwil_view_model::SessionDocumentId,
     opts: GuiOptions,
     proxy: EventLoopProxy<UserEvent>,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
@@ -301,8 +302,11 @@ pub fn run_with_external_open(
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GUI closed"))
     });
     let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
+    let frontend_document = view.active_id();
+    let horizontal = view.horizontal_origin();
     let mut app = App {
         view,
+        frontend_document,
         opts,
         proxy,
         on_first_frame: Some(on_first_frame),
@@ -316,7 +320,7 @@ pub fn run_with_external_open(
         mods: ModifiersState::empty(),
         pending: Damage::default(),
         error: None,
-        horizontal: 0,
+        horizontal,
         pointer: (0, 0),
         drag: None,
         started: std::time::Instant::now(),

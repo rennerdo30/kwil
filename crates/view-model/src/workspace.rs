@@ -154,6 +154,9 @@ impl Workspace {
     pub fn recovery_ready(&self) -> bool {
         self.files.storage_ready
     }
+    pub fn horizontal_origin(&self) -> u64 {
+        self.deref().first_byte_column
+    }
     pub fn active_id(&self) -> DocumentId {
         self.session.active().expect("workspace always has a tab")
     }
