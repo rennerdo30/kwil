@@ -1,5 +1,5 @@
 //! Windows console attachment and the console-to-GUI startup handshake.
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::{Command, ExitCode, Stdio};
 
 pub fn attach_parent_console() {
@@ -13,11 +13,74 @@ pub fn gui_child() -> bool {
 }
 
 pub fn first_frame() {
-    if gui_child() {
-        let mut out = std::io::stdout().lock();
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleCP, GetStdHandle, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // Keep a private, non-inheritable copy of the startup IPC while releasing
+    // the process's standard handles and console. Only GUI readiness calls this.
+    let mut ipc = if gui_child() {
+        let mut handle = std::ptr::null_mut();
+        let process = unsafe { GetCurrentProcess() };
+        if unsafe {
+            DuplicateHandle(process, GetStdHandle(STD_OUTPUT_HANDLE), process, &mut handle, 0, 0, DUPLICATE_SAME_ACCESS)
+        } == 0
+        {
+            report_gui_failure(&std::io::Error::last_os_error());
+            std::process::exit(75);
+        }
+        Some(std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(handle.cast()) }))
+    } else {
+        None
+    };
+    if unsafe { GetConsoleCP() } != 0 && unsafe { FreeConsole() } == 0 {
+        let error = std::io::Error::last_os_error();
+        if let Some(out) = ipc.as_mut() {
+            let _ = writeln!(out, "cannot detach GUI console: {error}");
+        } else {
+            eprintln!("kwil: cannot detach GUI console: {error}");
+        }
+        std::process::exit(75);
+    }
+    release_standard_handles();
+    if let Some(out) = ipc.as_mut() {
         let _ = writeln!(out, "kwil: GUI ready");
         let _ = out.flush();
     }
+}
+
+fn release_standard_handles() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let kinds = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    let handles = kinds.map(|kind| unsafe { GetStdHandle(kind) });
+    for (i, kind) in kinds.into_iter().enumerate() {
+        unsafe { SetStdHandle(kind, std::ptr::null_mut()) };
+        let handle = handles[i];
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE && !handles[..i].contains(&handle) {
+            unsafe { CloseHandle(handle) };
+        }
+    }
+}
+
+fn protect_shell_handles() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    // The launcher's own shell pipes may themselves be inheritable. Clearing
+    // those flags prevents extra inherited references beyond the assigned IPC
+    // stdio. Command creates the child-specific handles below independently.
+    for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(kind) };
+        if !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            return Err(format!("cannot protect shell handle: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
 }
 
 /// Wait for first-frame acknowledgement, not the lifetime of the editor.
@@ -25,10 +88,13 @@ pub fn first_frame() {
 /// fall back without racing the shell for terminal input.
 pub fn launch_gui() -> Result<ExitCode, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("kwil.exe");
+    protect_shell_handles()?;
     let mut child = Command::new(&exe)
         .args(std::env::args_os().skip(1))
         .env("KWIL_CONSOLE_LAUNCH", "1")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
     let pid = child.id();
@@ -37,10 +103,17 @@ pub fn launch_gui() -> Result<ExitCode, String> {
         eprintln!("kwil: GUI PID {pid}");
     }
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (error_send, errors) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.take(65536).read_to_string(&mut text);
+        let _ = error_send.send(text);
+    });
     let (send, recv) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        let result = std::io::BufReader::new(stdout).read_line(&mut line).map(|_| line);
+        let result = std::io::BufReader::new(stdout).take(65536).read_line(&mut line).map(|_| line);
         let _ = send.send(result);
     });
     match recv.recv_timeout(std::time::Duration::from_secs(15)) {
@@ -63,6 +136,11 @@ pub fn launch_gui() -> Result<ExitCode, String> {
                     .trim()
                     .to_owned())
             } else {
+                if let Ok(text) = errors.recv_timeout(std::time::Duration::from_secs(1))
+                    && !text.trim().is_empty()
+                {
+                    eprintln!("{}", text.trim_end());
+                }
                 Ok(ExitCode::from(status.code().unwrap_or(1).clamp(1, 255) as u8))
             }
         }

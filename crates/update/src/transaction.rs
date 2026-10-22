@@ -119,19 +119,35 @@ impl Journal {
     }
 }
 
+#[cfg(test)]
 fn retire(target: &Path, stage: &Path) -> Result<(), Error> {
+    retire_with(target, stage, &mut || Ok(()))
+}
+
+fn retire_with(target: &Path, stage: &Path, after_rename: &mut impl FnMut() -> Result<(), Error>) -> Result<(), Error> {
     if target.try_exists()? {
         // Windows permits moving the running image but not overwriting it.
         fs::rename(target, stage.join(format!("retired-{}", unique())))?;
+        after_rename()?;
     }
     Ok(())
 }
 
 fn replace(from: &Path, target: &Path, stage: &Path) -> Result<(), Error> {
+    replace_with(from, target, stage, &mut || Ok(()))
+}
+
+fn replace_with(
+    from: &Path,
+    target: &Path,
+    stage: &Path,
+    after_rename: &mut impl FnMut() -> Result<(), Error>,
+) -> Result<(), Error> {
     let incoming = stage.join(format!("incoming-{}", unique()));
     copy_synced(from, &incoming)?;
-    retire(target, stage)?;
+    retire_with(target, stage, after_rename)?;
     fs::rename(incoming, target)?;
+    after_rename()?;
     Ok(())
 }
 
@@ -143,6 +159,14 @@ fn matches(path: &Path, expected: &str) -> Result<(), Error> {
 }
 
 fn rollback(dir: &Path, journal: &Journal) -> Result<(), Error> {
+    rollback_with(dir, journal, &mut || Ok(()))
+}
+
+fn rollback_with(
+    dir: &Path,
+    journal: &Journal,
+    after_rename: &mut impl FnMut() -> Result<(), Error>,
+) -> Result<(), Error> {
     // Verify *every* backup before changing either installed path. Backups
     // remain immutable, so recovery can itself be interrupted and retried.
     for (i, hash) in journal.old.iter().enumerate() {
@@ -150,16 +174,20 @@ fn rollback(dir: &Path, journal: &Journal) -> Result<(), Error> {
             matches(&journal.stage.join(format!("old-{i}")), hash)?;
         }
     }
-    for (i, name) in FILES.iter().enumerate() {
+    // Restore a missing path before retiring the surviving executable. This
+    // keeps an entry point available even if recovery stops after a rename.
+    let order = if journal.old[1].is_some() && !dir.join(FILES[1]).try_exists()? { [1, 0] } else { [0, 1] };
+    for i in order {
+        let name = FILES[i];
         let target = dir.join(name);
         if let Some(hash) = &journal.old[i] {
             if digest(&target).is_ok_and(|actual| actual == *hash) {
                 continue;
             }
-            replace(&journal.stage.join(format!("old-{i}")), &target, &journal.stage)?;
+            replace_with(&journal.stage.join(format!("old-{i}")), &target, &journal.stage, after_rename)?;
             matches(&target, hash)?;
         } else {
-            retire(&target, &journal.stage)?;
+            retire_with(&target, &journal.stage, after_rename)?;
         }
     }
     fs::remove_file(dir.join(JOURNAL))?;
@@ -320,8 +348,10 @@ mod tests {
             fs::create_dir(&stage).unwrap();
             let mut old = [None, None];
             for (i, name) in FILES.iter().enumerate() {
-                copy_synced(&self.0.join(name), &stage.join(format!("old-{i}"))).unwrap();
-                old[i] = Some(digest(&self.0.join(name)).unwrap());
+                if self.0.join(name).exists() {
+                    copy_synced(&self.0.join(name), &stage.join(format!("old-{i}"))).unwrap();
+                    old[i] = Some(digest(&self.0.join(name)).unwrap());
+                }
                 write_synced(&stage.join(format!("new-{i}")), ASSETS[i].1).unwrap();
             }
             let j = Journal { stage, old, new: [hex(&Sha256::digest(EXE)), hex(&Sha256::digest(COM))] };
@@ -418,6 +448,50 @@ mod tests {
         assert!(startup(&f.0).unwrap_err().0.contains("recovered; restart"));
         f.old();
         startup(&f.0).unwrap();
+    }
+
+    #[test]
+    fn every_rollback_rename_keeps_a_launch_path_and_can_recover() {
+        // Each case starts at a reachable interruption point: neither path
+        // missing, or the gap after retiring either executable. Interrupt
+        // recovery after each rename, including after retiring the sole
+        // remaining path if the ordering is wrong.
+        for (legacy, missing, renames) in
+            [(false, None, 4), (false, Some(0), 3), (false, Some(1), 3), (true, None, 3), (true, Some(0), 2)]
+        {
+            for interrupt_after in 1..=renames {
+                let f = Fixture::new();
+                if legacy {
+                    fs::remove_file(f.0.join(FILES[1])).unwrap();
+                }
+                let j = f.prepared();
+                for (i, name) in FILES.iter().enumerate() {
+                    replace(&j.stage.join(format!("new-{i}")), &f.0.join(name), &j.stage).unwrap();
+                }
+                if let Some(i) = missing {
+                    retire(&f.0.join(FILES[i]), &j.stage).unwrap();
+                }
+                let mut count = 0;
+                let result = rollback_with(&f.0, &j, &mut || {
+                    count += 1;
+                    assert!(
+                        f.0.join(FILES[0]).exists() || f.0.join(FILES[1]).exists(),
+                        "both launch paths missing after rollback rename {count}, original gap {missing:?}"
+                    );
+                    if count == interrupt_after { Err(Error("simulated recovery interruption".into())) } else { Ok(()) }
+                });
+                assert!(result.is_err());
+                assert_eq!(count, interrupt_after);
+                assert!(startup(&f.0).unwrap_err().0.contains("recovered; restart"));
+                assert_eq!(fs::read(f.0.join(FILES[0])).unwrap(), b"old GUI");
+                if legacy {
+                    assert!(!f.0.join(FILES[1]).exists());
+                } else {
+                    f.old();
+                }
+                startup(&f.0).unwrap();
+            }
+        }
     }
 
     #[test]

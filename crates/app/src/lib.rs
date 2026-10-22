@@ -124,10 +124,16 @@ fn run_app(console_launcher: bool) -> ExitCode {
         Some(p) => open(p),
         None => Ok(View::new(None)),
     };
-    let on_first_frame = || -> Box<dyn FnOnce(Notify)> {
-        Box::new(|notify: Notify| {
+    let on_first_frame = |_gui: bool| -> Box<dyn FnOnce(Notify)> {
+        Box::new(move |notify: Notify| {
             #[cfg(windows)]
-            windows::first_frame();
+            if _gui {
+                windows::first_frame();
+            }
+            #[cfg(all(windows, debug_assertions))]
+            if !_gui && std::env::var_os("KWIL_TRACE_LAUNCH").is_some() {
+                eprintln!("kwil: TUI ready");
+            }
             kwil_update::spawn_background(VERSION, notify);
         })
     };
@@ -167,7 +173,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
         };
 
         let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden };
-        match kwil_ui_gpu::run(view, opts, on_first_frame()) {
+        match kwil_ui_gpu::run(view, opts, on_first_frame(true)) {
             Ok(()) => return ExitCode::SUCCESS,
             #[cfg(windows)]
             Err(e) if windows::gui_child() => {
@@ -197,7 +203,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match kwil_ui_tui::run(view, on_first_frame()) {
+    match kwil_ui_tui::run(view, on_first_frame(false)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kwil: {e}");
