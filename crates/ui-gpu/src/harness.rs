@@ -68,6 +68,23 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
         Step::Idle => {
+            // Prime the retained GPU image without an onscreen present, so the
+            // following scroll/readback exercises GPU copies, not a fresh upload.
+            #[cfg(feature = "gpu")]
+            if let (Some(gpu), Some(gfx), Some(font)) = (&mut app.gpu, &app.gfx, &app.font) {
+                gpu.update(
+                    &gfx.pixels,
+                    app.size,
+                    &[super::Rect { x: 0, y: 0, w: app.size.0, h: app.size.1 }],
+                    0,
+                    font.ch,
+                    app.view.rows(),
+                );
+            }
+            #[cfg(windows)]
+            if let Some(gfx) = &app.gfx {
+                native_probe(gfx.hwnd);
+            }
             println!("kwil-frame glyphs_pending={}", app.font.as_ref().map_or(0, |f| f.pending_glyphs()));
             app.metrics.phase = 1;
             capture(app, dir.as_deref(), "first.bmp");
@@ -139,6 +156,27 @@ fn capture(app: &App, dir: Option<&Path>, name: &str) {
         {
             let _ = (dir, gfx, name);
         }
+    }
+}
+#[cfg(windows)]
+fn native_probe(hwnd: isize) {
+    use windows_sys::Win32::{
+        Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
+        UI::WindowsAndMessaging::*,
+    };
+    unsafe {
+        let hwnd = hwnd as _;
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let required = WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+        let controls = style & required == required;
+        let small = SendMessageW(hwnd, WM_GETICON, ICON_SMALL as usize, 0) != 0;
+        let big = SendMessageW(hwnd, WM_GETICON, ICON_BIG as usize, 0) != 0;
+        let mut cloaked = 0u32;
+        let hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&mut cloaked as *mut u32).cast(), 4);
+        println!(
+            "kwil-native caption_resize_min_max={controls} small_icon={small} taskbar_icon={big} cloaked={}",
+            hr >= 0 && cloaked != 0
+        );
     }
 }
 // Based on the admitted M0 window-DC capture; the HWND comes directly from the

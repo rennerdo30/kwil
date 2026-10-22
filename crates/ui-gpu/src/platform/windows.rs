@@ -112,8 +112,8 @@ impl Drop for Native {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _id: usize, data: usize) -> LRESULT {
     if msg == WM_WTSSESSION_CHANGE {
         let remote = match w as u32 {
-            WTS_REMOTE_CONNECT => true,
-            WTS_REMOTE_DISCONNECT | WTS_CONSOLE_CONNECT => false,
+            WTS_REMOTE_CONNECT | WTS_REMOTE_DISCONNECT => true,
+            WTS_CONSOLE_CONNECT => false,
             _ => super::super::remote::detect(),
         };
         // SAFETY: Native owns this stable Box and removes the subclass before drop.

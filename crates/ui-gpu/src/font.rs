@@ -6,21 +6,22 @@ use crate::shaping::{Rasterizer, Tile, TileKey};
 use std::collections::HashMap;
 
 /// System monospace fonts, first found wins: (path, index in collection).
-const CANDIDATES: &[(&str, u32)] = &[
-    (r"C:\Windows\Fonts\consola.ttf", 0),
-    (r"C:\Windows\Fonts\CascadiaMono.ttf", 0),
-    ("/System/Library/Fonts/SFNSMono.ttf", 0),
-    ("/System/Library/Fonts/Menlo.ttc", 0),
-    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0),
-    ("/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf", 0),
-    ("/usr/share/fonts/TTF/DejaVuSansMono.ttf", 0),
-    ("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 0),
-    ("/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf", 0),
+const CANDIDATES: &[(&str, u32, &str)] = &[
+    (r"C:\Windows\Fonts\consola.ttf", 0, "Consolas"),
+    (r"C:\Windows\Fonts\CascadiaMono.ttf", 0, "Cascadia Mono"),
+    ("/System/Library/Fonts/SFNSMono.ttf", 0, "SF Mono"),
+    ("/System/Library/Fonts/Menlo.ttc", 0, "Menlo"),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0, "DejaVu Sans Mono"),
+    ("/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf", 0, "DejaVu Sans Mono"),
+    ("/usr/share/fonts/TTF/DejaVuSansMono.ttf", 0, "DejaVu Sans Mono"),
+    ("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 0, "Liberation Mono"),
+    ("/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf", 0, "Noto Sans Mono"),
 ];
 
 pub struct Font {
     pub cw: usize,
     pub ch: usize,
+    family: String,
     glyphs: Vec<(fontdue::Metrics, Vec<u8>)>,
     baseline: i32,
     tiles: HashMap<(u8, u32, u32), Vec<u32>>,
@@ -37,8 +38,9 @@ pub struct Font {
 
 impl Font {
     pub fn load(px: f32) -> Option<Font> {
-        let (data, index) = CANDIDATES.iter().find_map(|(p, i)| Some((std::fs::read(p).ok()?, *i)))?;
-        Self::from_bytes(data, index, px)
+        let (data, index, family) =
+            CANDIDATES.iter().find_map(|(p, i, family)| Some((std::fs::read(p).ok()?, *i, *family)))?;
+        Self::from_bytes(data, index, px, family)
     }
     pub fn load_named(px: f32, family: &str) -> Option<Font> {
         if family == "monospace" {
@@ -47,9 +49,9 @@ impl Font {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
         let id = db.query(&fontdb::Query { families: &[fontdb::Family::Name(family)], ..Default::default() })?;
-        db.with_face_data(id, |data, index| Self::from_bytes(data.to_vec(), index, px))?
+        db.with_face_data(id, |data, index| Self::from_bytes(data.to_vec(), index, px, family))?
     }
-    fn from_bytes(data: Vec<u8>, index: u32, px: f32) -> Option<Font> {
+    fn from_bytes(data: Vec<u8>, index: u32, px: f32, family: &str) -> Option<Font> {
         let settings = fontdue::FontSettings { collection_index: index, ..Default::default() };
         let font = fontdue::Font::from_bytes(data, settings).ok()?;
         let lm = font.horizontal_line_metrics(px)?;
@@ -60,6 +62,7 @@ impl Font {
         Some(Font {
             cw,
             ch,
+            family: family.into(),
             glyphs,
             baseline: lm.ascent.ceil() as i32 + 1,
             tiles: HashMap::new(),
@@ -76,6 +79,7 @@ impl Font {
     }
 
     pub fn enable_unicode(&mut self, family: String, ready: impl Fn(Tile, u64) + Send + 'static) {
+        let family = if family == "monospace" { self.family.clone() } else { family };
         if self.sender.is_some() {
             return;
         }

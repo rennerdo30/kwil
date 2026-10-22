@@ -244,14 +244,14 @@ impl App {
         self.apply(d);
     }
 
-    fn render(&mut self) {
+    fn render(&mut self) -> bool {
         if self.pending == Damage::default() {
-            return;
+            return true;
         }
         let (w, h) = self.size;
-        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return };
+        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
         if w == 0 || h == 0 {
-            return;
+            return true;
         }
         let buf = &mut gfx.pixels;
         let mut p = std::mem::take(&mut self.pending);
@@ -328,17 +328,33 @@ impl App {
         {
             gpu.update(buf, (w, h), &damage, p.scroll, ch, rows);
         }
-        if !rects.is_empty()
-            && let Ok(mut target) = gfx.surface.buffer_mut()
-        {
+        if !rects.is_empty() {
+            let mut target = match gfx.surface.buffer_mut() {
+                Ok(target) => target,
+                Err(error) => {
+                    self.error = Some(GuiError::Unavailable(error.to_string()));
+                    return false;
+                }
+            };
             // Retain a canonical framebuffer: Wayland/macOS may rotate or
             // replace buffers. Age never forces re-layout or glyph repaint.
+            if target.len() != buf.len() {
+                self.error = Some(GuiError::Unavailable("CPU surface resize failed".into()));
+                return false;
+            }
             target.copy_from_slice(buf);
-            if target.present_with_damage(&rects).is_ok() {
-                #[cfg(feature = "frame-harness")]
-                self.metrics.present(p.full, damage.iter().map(|r| (r.w * r.h) as u64).sum(), copied);
+            match target.present_with_damage(&rects) {
+                Ok(()) => {
+                    #[cfg(feature = "frame-harness")]
+                    self.metrics.present(p.full, damage.iter().map(|r| (r.w * r.h) as u64).sum(), copied);
+                }
+                Err(error) => {
+                    self.error = Some(GuiError::Unavailable(error.to_string()));
+                    return false;
+                }
             }
         }
+        true
     }
 }
 
@@ -499,17 +515,19 @@ impl ApplicationHandler<UserEvent> for App {
         // Drag and drop starts OLE, which costs ~10 ms of window creation;
         // it is registered after the first frame (KW-11).
         #[allow(unused_mut)]
+        let icon = winit::window::Icon::from_rgba(include_bytes!("icon.rgba").to_vec(), 32, 32).ok();
+        #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title("Kwil")
             .with_inner_size(PhysicalSize::new(1280, 800))
             .with_decorations(true)
             .with_transparent(false)
-            .with_window_icon(winit::window::Icon::from_rgba(include_bytes!("icon.rgba").to_vec(), 32, 32).ok())
+            .with_window_icon(icon.clone())
             .with_visible(!self.opts.hidden);
         #[cfg(windows)]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
-            attrs = attrs.with_drag_and_drop(false);
+            attrs = attrs.with_drag_and_drop(false).with_taskbar_icon(icon);
             if self.opts.hidden {
                 attrs = attrs.with_active(false).with_skip_taskbar(true);
             }
@@ -554,7 +572,10 @@ impl ApplicationHandler<UserEvent> for App {
         self.resize_surface();
         let d = self.view.set_rows(self.text_rows());
         self.apply(d);
-        self.render();
+        if !self.render() {
+            el.exit();
+            return;
+        }
         trace::mark("first frame presented");
         let proxy = self.proxy.clone();
         if let Some(gfx) = self.gfx.as_mut() {
@@ -709,7 +730,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if !std::mem::take(&mut self.redraw_requested) && self.pending == Damage::default() {
                     self.pending.full = true;
                 }
-                self.render();
+                if !self.render() {
+                    el.exit();
+                }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::ScaleFactorChanged { .. } => self.reload_font(),
