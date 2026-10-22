@@ -1,0 +1,21 @@
+[package]
+name = "renderer-a"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+gpui = "0.2.2"
+futures = "0.3"
+raw-window-handle = "0.6"
+kwil-core-text = { path = "../../crates/core-text" }
+spiketrace = { path = "../spiketrace" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
