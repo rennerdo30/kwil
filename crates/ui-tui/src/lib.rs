@@ -81,8 +81,7 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
             let _ = settings_sender.send(Msg::Settings(Box::new(settings)));
         });
         let started = std::time::Instant::now();
-        let mut closing = false;
-        let mut save_path: Option<String> = None;
+        let mut save = SaveFlow::default();
         let mut horizontal = 0u64;
         let mut settings = Settings::default();
         let mut keys = KeymapEngine::new(settings.keymap, &settings.bindings).expect("bundled keymap");
@@ -100,23 +99,8 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     true
                 }
                 Msg::Saved(saved) => {
-                    if let Some(editor) = view.editor_mut() {
-                        match editor.finish_save(saved) {
-                            Ok(result) => {
-                                let notice = match result.status {
-                                    CommandStatus::Message(message) => message,
-                                    _ => "Saved".into(),
-                                };
-                                view.refresh_after_edit(result.damage);
-                                if closing && view.editor().is_some_and(|editor| !editor.document().is_dirty()) {
-                                    break;
-                                }
-                                view.set_notice(notice);
-                            }
-                            Err(error) => {
-                                view.set_notice(format!("Save failed: {error}"));
-                            }
-                        }
+                    if save.finish(&mut view, saved) {
+                        break;
                     }
                     true
                 }
@@ -136,17 +120,17 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     true
                 }
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    let intent = if save_path.is_some() {
-                        path_key(&mut view, &mut save_path, k)
+                    let intent = if save.path.is_some() {
+                        path_key(&mut view, &mut save.path, k)
                     } else {
                         key(&mut view, k, started.elapsed(), &mut keys, settings.keymap)
                     };
                     match intent {
                         KeyResult::Quit => {
                             if view.editor().is_some_and(|editor| editor.document().is_dirty())
-                                && !(closing && k.modifiers.contains(KeyModifiers::SHIFT))
+                                && !(save.closing && k.modifiers.contains(KeyModifiers::SHIFT))
                             {
-                                closing = true;
+                                save.closing = true;
                                 view.set_notice(
                                     "Unsaved changes: Ctrl+S to save; Ctrl+Shift+Q to discard; Esc to cancel".into(),
                                 );
@@ -155,32 +139,22 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                                 break;
                             }
                         }
-                        KeyResult::Save(path) => {
-                            if path.is_none() && view.editor().is_some_and(|editor| editor.document().path().is_none())
-                            {
-                                save_path = Some(String::new());
-                                view.set_notice("Save as:  (Enter a path, Enter to save, Esc to cancel)".into());
-                            } else {
-                                if let Some(editor) = view.editor_mut() {
-                                    match editor.save_request(path) {
-                                        Ok(request) => {
-                                            let sender = tx.clone();
-                                            std::thread::spawn(move || {
-                                                let _ = sender
-                                                    .send(Msg::Saved(kwil_core_workspace::save_snapshot(request)));
-                                            });
-                                            view.set_notice("Saving…".into());
-                                        }
-                                        Err(error) => {
-                                            view.set_notice(error.to_string());
-                                        }
-                                    }
-                                }
+                        KeyResult::Save(_) | KeyResult::SaveAndQuit => {
+                            let (path, quit) = match intent {
+                                KeyResult::Save(path) => (path, false),
+                                KeyResult::SaveAndQuit => (None, true),
+                                _ => unreachable!(),
+                            };
+                            if let Some(request) = save.request(&mut view, path, quit) {
+                                let sender = tx.clone();
+                                std::thread::spawn(move || {
+                                    let _ = sender.send(Msg::Saved(kwil_core_workspace::save_snapshot(request)));
+                                });
                             }
                             true
                         }
                         KeyResult::Cancel => {
-                            closing = false;
+                            save.closing = false;
                             view.set_notice(String::new());
                             true
                         }
@@ -188,7 +162,7 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
                     }
                 }
                 Msg::Input(Event::Paste(text)) => {
-                    if let Some(path) = &mut save_path {
+                    if let Some(path) = &mut save.path {
                         if !text.chars().any(char::is_control) {
                             path.push_str(&text);
                         }
@@ -235,8 +209,75 @@ pub fn run(mut view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::
 enum KeyResult {
     Quit,
     Save(Option<std::path::PathBuf>),
+    SaveAndQuit,
     Cancel,
     Changed(bool),
+}
+
+/// Close only for the successful completion of the requested revision.
+/// A prompt, failed request, failed write or concurrent edit never exits.
+#[derive(Default)]
+struct SaveFlow {
+    closing: bool,
+    path: Option<String>,
+    revision: Option<u64>,
+}
+
+impl SaveFlow {
+    fn request(
+        &mut self,
+        view: &mut View,
+        path: Option<std::path::PathBuf>,
+        quit: bool,
+    ) -> Option<kwil_core_workspace::SaveRequest> {
+        self.closing |= quit;
+        let Some(editor) = view.editor_mut() else {
+            self.closing = false;
+            view.set_notice("Indexing: editing will be available when ready".into());
+            return None;
+        };
+        if path.is_none() && editor.document().path().is_none() {
+            self.path = Some(String::new());
+            view.set_notice("Save as:  (Enter a path, Enter to save, Esc to cancel)".into());
+            return None;
+        }
+        match editor.save_request(path) {
+            Ok(request) => {
+                self.revision = Some(request.revision);
+                view.set_notice("Saving…".into());
+                Some(request)
+            }
+            Err(error) => {
+                self.closing = false;
+                view.set_notice(format!("Save failed: {error}"));
+                None
+            }
+        }
+    }
+
+    fn finish(&mut self, view: &mut View, saved: std::io::Result<kwil_core_workspace::SavedSnapshot>) -> bool {
+        let revision = saved.as_ref().ok().map(|saved| saved.revision);
+        let requested = self.revision.take();
+        let closing = std::mem::take(&mut self.closing);
+        let Some(editor) = view.editor_mut() else { return false };
+        match editor.finish_save(saved) {
+            Ok(result) => {
+                let clean_revision = revision == Some(editor.document().revision()) && !editor.document().is_dirty();
+                let notice = match result.status {
+                    CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => message,
+                    _ if !clean_revision => "Saved earlier revision; current changes remain unsaved".into(),
+                    _ => "Saved".into(),
+                };
+                view.refresh_after_edit(result.damage);
+                view.set_notice(notice);
+                closing && requested.is_some() && revision == requested && clean_revision
+            }
+            Err(error) => {
+                view.set_notice(format!("Save failed: {error}"));
+                false
+            }
+        }
+    }
 }
 
 fn path_key(view: &mut View, prompt: &mut Option<String>, key: KeyEvent) -> KeyResult {
@@ -247,7 +288,7 @@ fn path_key(view: &mut View, prompt: &mut Option<String>, key: KeyEvent) -> KeyR
         KeyCode::Esc => {
             *prompt = None;
             view.set_notice(String::new());
-            return KeyResult::Changed(true);
+            return KeyResult::Cancel;
         }
         KeyCode::Enter if !path.trim().is_empty() => {
             return KeyResult::Save(prompt.take().map(Into::into));
@@ -284,16 +325,31 @@ fn key(
                 if call.id == "file.quit" {
                     return KeyResult::Quit;
                 }
+                if call.id == "file.saveAndQuit" {
+                    return KeyResult::SaveAndQuit;
+                }
                 if preset == Preset::Vim {
                     if let Some(editor) = view.editor_mut() {
                         match editor.execute_vim(&call) {
                             Ok(result) => {
                                 view.refresh_after_edit(result.damage);
+                                match result.status {
+                                    CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
+                                        view.set_notice(message);
+                                    }
+                                    CommandStatus::IndexNotReady => {
+                                        view.set_notice("Indexing: editing will be available when ready".into());
+                                    }
+                                    CommandStatus::SaveRequested => return KeyResult::Save(None),
+                                    CommandStatus::Applied => {}
+                                }
                             }
                             Err(error) => {
                                 view.set_notice(error.to_string());
                             }
                         }
+                    } else {
+                        view.set_notice("Indexing: editing will be available when ready".into());
                     }
                     return KeyResult::Changed(true);
                 }
@@ -310,6 +366,9 @@ fn key(
                 return KeyResult::Changed(true);
             }
             VimResult::Unbound => {
+                if keys.suppresses_fallback() {
+                    return KeyResult::Changed(false);
+                }
                 if keys.mode() != kwil_core_commands::Mode::Insert {
                     return KeyResult::Changed(false);
                 }
@@ -485,6 +544,278 @@ fn keep_visible(view: &mut View, horizontal: &mut u64, columns: usize, tab: usiz
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn binding(keys: &str, command: &str) -> kwil_core_commands::Binding {
+        kwil_core_commands::Binding { keys: keys.into(), command: command.into(), context: None, mode: None }
+    }
+
+    #[test]
+    fn input_shift_left_tombstone_suppresses_selection_fallback() {
+        let mut view = View::new(None);
+        view.set_rows(3);
+        execute(&mut view, "edit.insert", Some("abc".into()), false, Duration::ZERO);
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("shift+left", ""), binding("ctrl+q", "")]).unwrap();
+        key(&mut view, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), Duration::ZERO, &mut keys, Preset::VsCode);
+        assert!(view.editor().unwrap().primary_cursor().is_caret(), "tombstone must suppress selection fallback");
+        assert_eq!(view.editor().unwrap().primary_cursor().head, 3);
+    }
+
+    #[test]
+    fn input_ctrl_q_tombstone_suppresses_quit_fallback() {
+        let mut view = View::new(None);
+        view.set_rows(3);
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+q", "")]).unwrap();
+        assert!(
+            matches!(
+                key(
+                    &mut view,
+                    KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                    Duration::ZERO,
+                    &mut keys,
+                    Preset::VsCode
+                ),
+                KeyResult::Changed(false)
+            ),
+            "tombstone must suppress quit fallback"
+        );
+    }
+
+    #[test]
+    fn vim_command_status_is_visible_in_test_backend() {
+        let mut view = View::new(None);
+        view.set_rows(3);
+        let mut keys = KeymapEngine::new(Preset::Vim, &[binding("z", "file.open")]).unwrap();
+        key(&mut view, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        assert!(view.status_text().contains("command not implemented: file.open"));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+        terminal.draw(|frame| draw(frame, &view)).unwrap();
+        let status: String = (0..80).map(|x| terminal.backend().buffer()[(x, 3)].symbol()).collect();
+        assert!(status.contains("command not implemented: file.open"));
+        key(&mut view, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        assert!(view.status_text().contains("register is empty"));
+        for c in ":unknown".chars() {
+            key(&mut view, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        }
+        key(&mut view, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        assert!(view.status_text().contains("unknown ex command"));
+        let file = SaveFile::new();
+        std::fs::write(&file.0, b"not indexed yet").unwrap();
+        let file_source = kwil_core_workspace::open_for_editing(&file.0).unwrap();
+        let mut view = View::new(Some((file.0.clone(), file_source)));
+        assert!(view.editor().is_none());
+        key(&mut view, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        assert!(view.status_text().contains("Indexing: editing will be available when ready"));
+    }
+
+    #[test]
+    fn input_preserves_exact_notepad_line_move_and_printable_fallback() {
+        let mut view = View::new(None);
+        view.set_rows(3);
+        execute(&mut view, "edit.insert", Some("first\nsecond".into()), false, Duration::ZERO);
+        let mut keys = KeymapEngine::new(Preset::NotepadPlusPlus, &[]).unwrap();
+        key(
+            &mut view,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            Duration::ZERO,
+            &mut keys,
+            Preset::NotepadPlusPlus,
+        );
+        assert_eq!(view.line(0), Some(b"second".as_slice()));
+        assert_eq!(view.line(1), Some(b"first".as_slice()));
+        assert!(view.editor().unwrap().primary_cursor().is_caret());
+        key(
+            &mut view,
+            KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE),
+            Duration::ZERO,
+            &mut keys,
+            Preset::NotepadPlusPlus,
+        );
+        assert!(std::str::from_utf8(view.line(0).unwrap()).unwrap().contains('界'));
+        let before = view.editor().unwrap().document().revision();
+        key(
+            &mut view,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::SUPER),
+            Duration::ZERO,
+            &mut keys,
+            Preset::NotepadPlusPlus,
+        );
+        assert_eq!(view.editor().unwrap().document().revision(), before, "Cmd is not Ctrl or printable text");
+    }
+
+    #[test]
+    fn input_chord_tombstone_blocks_restart_but_invalid_continuation_types() {
+        let mut view = View::new(None);
+        view.set_rows(3);
+        let mut keys =
+            KeymapEngine::new(Preset::VsCode, &[binding("ctrl+k ctrl+q", ""), binding("ctrl+k x", "")]).unwrap();
+        for last in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        ] {
+            key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            assert!(matches!(
+                key(&mut view, last, Duration::ZERO, &mut keys, Preset::VsCode),
+                KeyResult::Changed(false)
+            ));
+        }
+        assert!(view.editor().unwrap().document().snapshot().is_empty());
+        key(
+            &mut view,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            Duration::ZERO,
+            &mut keys,
+            Preset::VsCode,
+        );
+        key(
+            &mut view,
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE),
+            Duration::ZERO,
+            &mut keys,
+            Preset::VsCode,
+        );
+        assert_eq!(view.line(0), Some(b"Y".as_slice()));
+    }
+
+    struct SaveFile(std::path::PathBuf);
+    impl SaveFile {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            Self(std::env::temp_dir().join(format!(
+                "kwil-input-savequit-{}-{}-{}.txt",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )))
+        }
+    }
+    impl Drop for SaveFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn vim_wq(view: &mut View) -> KeyResult {
+        let mut keys = KeymapEngine::new(Preset::Vim, &[]).unwrap();
+        for c in ":wq".chars() {
+            key(view, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        }
+        key(view, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim)
+    }
+
+    #[test]
+    fn vim_wq_prompts_untitled_and_closes_only_after_successful_save() {
+        let file = SaveFile::new();
+        let mut view = View::new(None);
+        view.set_rows(3);
+        execute(&mut view, "edit.insert", Some("keep me".into()), false, Duration::ZERO);
+        assert!(matches!(vim_wq(&mut view), KeyResult::SaveAndQuit));
+        let mut save = SaveFlow::default();
+        assert!(save.request(&mut view, None, true).is_none());
+        assert!(save.closing);
+        for c in file.0.to_str().unwrap().chars() {
+            path_key(&mut view, &mut save.path, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(view.line(0), Some(b"keep me".as_slice()));
+        let KeyResult::Save(path) =
+            path_key(&mut view, &mut save.path, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("path must submit save")
+        };
+        let request = save.request(&mut view, path, false).unwrap();
+        assert!(view.editor().unwrap().document().is_dirty(), "request must not mark document saved");
+        let result = std::thread::spawn(move || kwil_core_workspace::save_snapshot(request)).join().unwrap();
+        assert!(save.finish(&mut view, result));
+        assert!(!view.editor().unwrap().document().is_dirty());
+        assert_eq!(std::fs::read(&file.0).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn savequit_failure_and_concurrent_edits_keep_document_open() {
+        let file = SaveFile::new();
+        let mut view = View::new(None);
+        view.set_rows(3);
+        execute(&mut view, "edit.insert", Some("before".into()), false, Duration::ZERO);
+        let mut save = SaveFlow::default();
+        save.request(&mut view, Some(file.0.clone()), true).unwrap();
+        assert!(!save.finish(&mut view, Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))));
+        assert!(view.status_text().contains("Save failed: denied"));
+        assert!(!save.closing);
+        let request = save.request(&mut view, Some(file.0.clone()), true).unwrap();
+        execute(&mut view, "edit.insert", Some(" after".into()), false, Duration::from_secs(1));
+        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
+        assert!(view.editor().unwrap().document().is_dirty());
+        assert_eq!(view.line(0), Some(b"before after".as_slice()));
+        assert_eq!(std::fs::read(&file.0).unwrap(), b"before");
+        assert!(!save.closing);
+    }
+
+    #[test]
+    fn savequit_cancelled_prompt_and_failed_request_do_not_close_later() {
+        let file = SaveFile::new();
+        let mut view = View::new(None);
+        view.set_rows(3);
+        let mut save = SaveFlow::default();
+        assert!(save.request(&mut view, None, true).is_none());
+        assert!(matches!(
+            path_key(&mut view, &mut save.path, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            KeyResult::Cancel
+        ));
+        // The run-loop Cancel branch clears the close intent.
+        save.closing = false;
+        let request = save.request(&mut view, Some(file.0.clone()), false).unwrap();
+        assert!(
+            save.request(&mut view, Some(file.0.clone()), true).is_none(),
+            "second save is rejected while worker is active"
+        );
+        assert!(view.status_text().contains("save already in progress"));
+        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
+        let request = save.request(&mut view, None, false).unwrap();
+        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
+    }
+
+    #[test]
+    fn savequit_unrequested_completion_never_exits_even_when_clean() {
+        let file = SaveFile::new();
+        let mut view = View::new(None);
+        view.set_rows(3);
+        let request = view.editor_mut().unwrap().save_request(Some(file.0.clone())).unwrap();
+        // A close request alone must not make an unsolicited/stale completion
+        // equivalent to the save requested by :wq.
+        let mut save = SaveFlow { closing: true, ..Default::default() };
+        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
+        assert!(!view.editor().unwrap().document().is_dirty());
+    }
+
+    #[test]
+    fn savequit_stale_completion_does_not_close_after_undo_to_clean_revision() {
+        let file = SaveFile::new();
+        let mut view = View::new(None);
+        view.set_rows(3);
+        let mut save = SaveFlow::default();
+        let request = save.request(&mut view, Some(file.0.clone()), false).unwrap();
+        let saved = kwil_core_workspace::save_snapshot(request).unwrap();
+        let stale = kwil_core_workspace::SavedSnapshot {
+            path: saved.path.clone(),
+            file: saved.file.clone(),
+            snapshot: saved.snapshot.clone(),
+            revision: saved.revision,
+            warnings: saved.warnings.clone(),
+        };
+        assert!(!save.finish(&mut view, Ok(saved)));
+        execute(&mut view, "edit.insert", Some("new revision".into()), false, Duration::ZERO);
+        let request = save.request(&mut view, None, true).unwrap();
+        assert_ne!(request.revision, stale.revision);
+        execute(&mut view, "edit.undo", None, false, Duration::from_secs(1));
+        assert!(!view.editor().unwrap().document().is_dirty());
+        assert!(!save.finish(&mut view, Ok(stale)), "a duplicate old completion is not the pending :wq save");
+        assert!(!save.closing);
+    }
 
     #[test]
     fn untitled_save_prompt_keeps_text_out_of_document_and_provides_a_path() {
