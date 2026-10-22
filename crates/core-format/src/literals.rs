@@ -70,7 +70,12 @@ pub fn tidy(
         let line = &text[start..end];
         let leading = start + line.len() - line.trim_start_matches([' ', '\t']).len();
         let trailing = start + line.trim_end_matches([' ', '\t']).len();
-        let (mut protect_indent, mut protect_trim, mut protect_eol) = (false, false, false);
+        // A selection boundary is not a physical line ending. Trimming its
+        // final spaces could join tokens to following, unselected bytes.
+        let partial_final_line = selected && end == range.end && end < text.len();
+        let partial_crlf =
+            selected && next == range.end && b.get(next) == Some(&b'\n') && text.get(end..next) == Some("\r");
+        let (mut protect_indent, mut protect_trim, mut protect_eol) = (false, partial_final_line, partial_crlf);
         while let Some(token) = &span {
             if token.start > next {
                 break;
@@ -353,6 +358,13 @@ impl Iterator for Scanner<'_> {
     type Item = Range<usize>;
     fn next(&mut self) -> Option<Self::Item> {
         let b = self.text.as_bytes();
+        if self.pos == 0 && self.kind == Kind::Java && self.text.contains("\\u") {
+            // Java translates Unicode escapes before tokenizing even comments
+            // and literal delimiters. Without that preprocessing pass there is
+            // no proven lexical context anywhere in this compilation unit.
+            self.pos = self.uncertain();
+            return Some(0..self.pos);
+        }
         while self.pos < b.len() {
             let start = self.pos;
             let c = b[start];

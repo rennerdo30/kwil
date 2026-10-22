@@ -153,9 +153,24 @@ fn selection_is_one_replacement_without_touching_surroundings() {
     let mut applied = input.to_owned();
     applied.replace_range(a.replacement.unwrap(), std::str::from_utf8(&a.bytes).unwrap());
     assert_eq!(applied, "prefix {\n  \"a\": 1\n} suffix");
+    // R6: an embedded XML fragment has no proven inherited xml:space context.
+    // The former reindent expectation silently discarded that context.
     let a = selection("x<a><b/></a>y", 1..12, Language::Xml);
-    assert_eq!(a.bytes, b"<a>\n  <b/>\n</a>");
-    assert_eq!(selection("x a  y", 1..5, Language::Generic).bytes, b" a");
+    assert_eq!(a.bytes, b"<a><b/></a>");
+    assert_eq!(a.replacement, None);
+    // Trimming a partial final line would merge the selected `a` with `y`.
+    let a = selection("x a  y", 1..5, Language::Generic);
+    assert_eq!(a.bytes, b" a  ");
+    assert_eq!(a.replacement, None);
+    // Complete/root XML and generic selections ending at true EOF still format.
+    assert_eq!(selection("<a><b/></a>", 0..11, Language::Xml).bytes, b"<a>\n  <b/>\n</a>");
+    assert_eq!(
+        kwil_core_format::format_selection(b"<a><b/></a>", Language::Xml, "xml", 0, 1, &Settings::default())
+            .unwrap()
+            .bytes,
+        b"<a>\n  <b/>\n</a>"
+    );
+    assert_eq!(selection("x a  ", 1..5, Language::Generic).bytes, b" a");
 }
 
 #[test]

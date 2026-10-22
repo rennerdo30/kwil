@@ -1,8 +1,10 @@
-# Formatter preservation audit after five review rounds
+# Formatter preservation audit after six review rounds
 
-Base audited: `4540af270c4e3b08387549f6f66c0d2ebbde9360` plus the round-5 changes
-in this commit. Every prior failure class below retains its existing contracts;
-none was removed or weakened. This is a source audit and test map, not a claim
+Base audited: `72f87e00d09184882cd92753562fd03763f9f48f` plus the round-6 changes
+in this commit. Every prior failure class below retains its safety contracts.
+R6 corrects two unsafe legacy selection output assertions with explicit parent
+approval; JSON and root/document XML positive selection checks remain. No test
+is removed. This is a source audit and test map, not a claim
 that local tests replace macOS/Linux CI or prove every language grammar.
 
 | Failure class | Preservation boundary / current approach | Existing contracts |
@@ -29,8 +31,12 @@ that local tests replace macOS/Linux CI or prove every language grammar.
 | R5 SQL parameter/variable names expose reserved words | Refuse ambiguous `:`, `@`, `?` introducers outside literal/comment spans before they can bind a keyword-looking name | `round5_regressions::sql_parameter_names_are_not_keyword_tokens` |
 | R5 Oracle alternative quoting mistaken for ordinary quotes | Refuse atoms adjoining quote delimiters (optionally via `&`) without inferring a dialect; no formatted replacement is returned | `round5_regressions::sql_prefixed_literals_are_preserved_or_refused` |
 | R5 C++ spliced block-comment terminator hides a later raw string opener | Backslash/trigraph syntax in a C/C++ block comment protects the entire uncertain suffix through EOF; raw-byte comment termination is no longer guessed | `round5_regressions::cpp_spliced_block_comments_cannot_hide_raw_string_openers` |
+| R6 SQL backslash quote boundaries depend on standard-conforming vs escape-enabled dialect | Refuse backslashes inside quoted tokens without returning an edit; retain known dollar-quote support | `round6_regressions::sql_backslash_quote_ambiguity_is_preserved_or_refused` |
+| R6 generic selection ends before a physical line ending and joins tokens | Preserve trailing selected separator bytes at that boundary; preserve clipped CRLF components too | `round6_regressions::generic_selection_does_not_trim_token_separator_at_partial_line_end`; corrected selection contract |
+| R6 nested XML selection loses inherited xml:space | Nonzero-offset/rootless fragment selections preserve bytes with a context notice; complete root/document selections retain positive formatting coverage | `round6_regressions::xml_selection_does_not_lose_inherited_space_context`; corrected root XML/JSON selection positives |
+| R6 Java Unicode preprocessing changes comment/literal delimiters before raw-source scanning | A Java Unicode escape introducer preserves the entire compilation unit when preprocessing context is unproven | `round6_regressions::java_unicode_preprocessing_cannot_hide_text_block_openers` |
 
 The existing malformed-input, UTF-8, input/output cap, nesting, selection offset,
 external timeout/error and one-replacement contracts remain part of the focused
-formatter suite. R5 changes neither the process-tree code nor the public admission
+formatter suite. R6 changes neither the process-tree code nor the public admission
 ceilings. The parent retains independent review, cross-platform CI and merge.

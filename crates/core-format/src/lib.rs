@@ -131,6 +131,10 @@ pub fn format(
         } else {
             match language {
                 Language::Json => languages::json(fragment, settings)?,
+                Language::Xml if selected && range.start != 0 => {
+                    notices.push(XML_SELECTION_CONTEXT.into());
+                    fragment.to_owned()
+                }
                 Language::Xml | Language::Html => {
                     languages::markup(fragment, language == Language::Html, selected, settings)?
                 }
@@ -197,7 +201,8 @@ pub fn check_size(size: usize, settings: &Settings) -> Result<(), FormatError> {
 
 /// Format an already-admitted small selection from a file of ANY size. The
 /// caller reads only these bytes from its snapshot. `start_byte` and `start_line`
-/// locate the fragment in the original document; no surrounding text is needed.
+/// locate the fragment in the original document. JSON needs no surrounding text;
+/// nested XML and generic fragments preserve bytes when inherited context is absent.
 pub fn format_selection(
     input: &[u8],
     language: Language,
@@ -209,18 +214,21 @@ pub fn format_selection(
     let end = start_byte
         .checked_add(input.len())
         .ok_or_else(|| FormatError::new("Format", "selection offset overflow", start_line))?;
-    if language == Language::Generic {
+    if language == Language::Generic || language == Language::Xml && (start_byte != 0 || start_line > 1) {
         check_size(input.len(), settings)?;
         let text =
             std::str::from_utf8(input).map_err(|_| FormatError::new("Format", "input is not UTF-8", start_line))?;
         let mut output = Output::new(settings.max_output_bytes);
         output.push(text)?;
-        // This entry point has no surrounding literal context. `format` with
-        // the complete admitted snapshot can safely tokenize a generic selection.
+        // This entry point has no surrounding literal/ancestor context. `format`
+        // with the full snapshot can tokenize generic selections; nested XML is
+        // preserved unless its inherited space context can be established.
         return Ok(FormatResult {
             bytes: output.text.into_bytes(),
             replacement: None,
-            notices: vec![if literals::kind(file_type).is_none() {
+            notices: vec![if language == Language::Xml {
+                XML_SELECTION_CONTEXT.into()
+            } else if literals::kind(file_type).is_none() {
                 NO_SAFE_FORMATTER.into()
             } else {
                 "No safe formatter for this selection without full document literal context. Use Format document or 'Trim trailing whitespace' explicitly.".into()
@@ -287,6 +295,7 @@ impl Output {
 }
 
 const NO_SAFE_FORMATTER: &str = "No safe formatter for this file type. Configure an external formatter, or use 'Trim trailing whitespace' explicitly.";
+const XML_SELECTION_CONTEXT: &str = "No safe XML selection formatter without inherited xml:space context. Use Format document or select the complete root element.";
 
 /// Explicit `edit.trimTrailingWhitespace` worker operation. This deliberately
 /// ignores literal syntax; callers must display its notice before invocation.

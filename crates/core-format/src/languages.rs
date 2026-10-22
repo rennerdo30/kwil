@@ -173,6 +173,16 @@ fn quoted_end(text: &str, start: usize, quote: u8, doubled: bool, kind: &str) ->
     let mut i = start + 1;
     while i < b.len() {
         if b[i] == b'\\' {
+            if kind == "SQL" {
+                // Standard-conforming SQL strings keep this byte literally;
+                // other dialect/settings use it to escape the next quote.
+                // Without that grammar, no quoted boundary is proven safe.
+                return Err(FormatError::new(
+                    "SQL",
+                    "backslash in quoted token requires an explicit dialect; configure an external formatter",
+                    line_at(b, i),
+                ));
+            }
             i += 2;
             continue;
         }

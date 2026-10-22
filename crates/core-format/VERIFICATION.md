@@ -235,3 +235,35 @@ commit on the first line; `round5-source-provenance.json` records input hashes a
 timestamps under `E:/Development/_cache/cargo-target/kwil-kw-7-format`.
 No local full workspace suite, native GUI/TUI/macOS/Linux execution, benchmark or
 owner acceptance ran. The parent retains independent review and merge.
+
+## Review round 6 source candidate (2026-10-23)
+
+Base: `72f87e00d09184882cd92753562fd03763f9f48f`, same isolated `fix-7b`.
+The parent supplied four exact **source-derived, not executed** review cases:
+SQL standard-conforming backslash ambiguity, a Rust selection ending after
+`value ` but before `as`, XML selection inheriting `xml:space="preserve"`, and a
+Java Unicode escape inside a block comment hiding a later text-block opener.
+
+The source candidate conservatively:
+
+- Refuses SQL quoted-token backslashes without inferring a string-escape dialect.
+- Preserves a partial final selected line's separator bytes and clipped CRLF.
+- Preserves nonroot XML selections with a missing-context notice. Complete root
+  and document formatting remains available, with explicit positive tests.
+- Preserves Java compilation units containing a literal Unicode escape introducer
+  before raw-source tokenization can assume any comment or literal boundaries.
+
+The parent explicitly approved correcting two unsafe legacy selection assertions:
+one merged `a` and `y` by trimming a partial selection, and one formatted embedded
+XML without ancestor context. The existing test remains, and positive JSON,
+complete root XML (both APIs), and generic true-EOF selection checks are retained.
+All prior named safety contracts and the R1-R6 failure matrix remain in scope.
+
+Four new exact fixtures and `verify-round6-fail-first.ps1` are prepared against
+unchanged `72f87e0`. The pending finite block must demonstrate all four red, then
+the restored **60-test** focused formatter selection plus targeted offline/locked
+Clippy/fmt, with input hashes/timestamps and owned PIDs recorded.
+
+**Source-only, validation pending:** no Cargo/test/Clippy grant has been received
+and none has run. Standalone rustfmt passed, PID **80600**, exit 0;
+`git diff --check` passed. No native/full-suite/benchmark/cache bypass or merge.

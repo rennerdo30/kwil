@@ -9,10 +9,15 @@ does not own the document or undo history. `None` means no edit.
 
 For a selection in a huge file, read only the selected bytes and call
 `format_selection` with their original byte offset and line. JSON requires a
-complete value; markup requires one complete element. Generic selections require
+complete value; markup requires one complete element. XML selections at nonzero
+offsets retain all bytes with a context notice: an ancestor's `xml:space` cannot
+be inferred from the fragment. Complete root selections at offset zero still
+format. Generic selections require
 the full admitted snapshot (`format` with a range) so the tokenizer can observe
-the opening literal. `format_selection` lacks this context and returns no edit
-with a clear notice for generic selections. Selection results add no final newline. Other languages and
+the opening literal. A partial final selected line retains its trailing separator
+bytes so applying the replacement cannot join tokens to following text.
+`format_selection` lacks literal/ancestor context and returns no edit with a
+clear notice for generic or nonroot XML selections. Selection results add no final newline. Other languages and
 external commands report “not supported for a selection”.
 
 Input defaults to at most 16 MiB and output to at most 64 MiB. Callers can lower
@@ -67,6 +72,9 @@ input ceiling; a lower output limit is checked after its serialization.
   literal delimiters/escapes require an explicit dialect. This includes Oracle
   alternative quoting; an ordinary quoted-string scanner must not guess its end.
   A configured external formatter can handle that dialect explicitly.
+  Backslashes inside SQL quoted tokens are refused too: standard-conforming and
+  escape-enabled dialects disagree on which quote ends the token. Dollar-quoted
+  spans retain their known delimiters and are not subject to this ambiguity.
   SQL keyword classification operates on complete identifier/number atoms. An
   unquoted non-ASCII atom is refused before keyword classification because this
   formatter has no selected dialect's Unicode identifier rules. Unicode quoted
@@ -100,6 +108,9 @@ input ceiling; a lower output limit is checked after its serialization.
   C/C++ block comments encountering backslash or trigraph syntax protect the
   suffix: translation-phase line splicing can change where the comment closes
   and expose later raw-string openers that a raw-byte scan would otherwise hide.
+  Java compilation units containing a literal `\u` introducer retain all bytes:
+  Unicode escapes are translated before comments and literal delimiters, so a
+  raw-source tokenizer cannot establish their lexical context safely.
   Comments are preserved too (trimming them is allowed by policy, but not needed).
   Boundary references: [PHP heredoc expressions](https://www.php.net/manual/en/language.types.string.php#language.types.string.syntax.heredoc),
   [PHP attributes](https://www.php.net/manual/en/language.attributes.syntax.php),
@@ -187,6 +198,8 @@ identifier and uncertain-header tests must fail (three failures); the Unicode
 SQL literal/comment control must pass. It restores sources in `finally` too.
 `verify-round5-fail-first.ps1` requires all three parameter/prefixed-literal/C++
 comment-splice regressions to fail on unchanged `4540af2`, then restores sources.
+`verify-round6-fail-first.ps1` requires all four exact source-derived R6 review
+fixtures to fail on unchanged `72f87e0`, then restores all three source files.
 
 One-shot measurement (run only when authorized):
 
