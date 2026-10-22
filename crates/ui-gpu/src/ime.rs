@@ -79,7 +79,7 @@ fn commit_inner(
     let stale = "IME input cancelled: its original destination changed or closed";
     match destination {
         Destination::Palette { .. } => {
-            (workspace.set_notice("IME palette destination is no longer active".into()), false)
+            workspace.set_notice("IME palette destination is no longer active".into())
         }
         Destination::Cancelled => workspace.set_notice(stale.into()),
         Destination::Prompt { epoch, generation, document, revision } => {
