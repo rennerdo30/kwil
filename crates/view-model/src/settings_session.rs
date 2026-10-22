@@ -24,7 +24,8 @@
 //! screen.edit_document(|doc| doc.map_extension("rs", Some("rust"))).unwrap();
 //! // Accepted edits/reset enqueue saves. Only a Saved event applies them.
 //! let shutdown = screen.stop(); // nonblocking, safe on the UI thread
-//! std::thread::spawn(move || shutdown.shutdown()); // join away from the UI
+//! // After closing the interactive loop, wait before allowing process exit:
+//! shutdown.shutdown().map_err(std::io::Error::other)?;
 //! # Ok(()) }
 //! ```
 use kwil_core_commands::{
@@ -91,11 +92,15 @@ pub struct SettingsApplied {
 struct Mailbox {
     events: VecDeque<SettingsWorkerEvent>,
     closed: bool,
+    producer_finished: bool,
+    #[cfg(test)]
+    waiting: Option<mpsc::SyncSender<()>>,
 }
 #[derive(Default)]
 struct EventQueue {
     mailbox: Mutex<Mailbox>,
     space: Condvar,
+    ready: Condvar,
 }
 impl EventQueue {
     // Backpressure belongs exclusively to the producer. Every event survives a
@@ -111,6 +116,7 @@ impl EventQueue {
         }
         let needs_wake = mailbox.events.is_empty();
         mailbox.events.push_back(event);
+        self.ready.notify_all();
         drop(mailbox);
         if needs_wake {
             wake();
@@ -127,6 +133,41 @@ impl EventQueue {
         mailbox.closed = true;
         mailbox.events.clear();
         self.space.notify_all();
+        self.ready.notify_all();
+    }
+    // Only explicit shutdown waits here, after leaving the interactive loop.
+    // Queue notification is independent of a frontend wake that can no longer
+    // be delivered once its event loop has closed.
+    fn wait(&self) -> Result<(), String> {
+        let mut mailbox = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
+        while mailbox.events.is_empty() && !mailbox.closed && !mailbox.producer_finished {
+            #[cfg(test)]
+            if let Some(waiting) = &mailbox.waiting {
+                let _ = waiting.try_send(());
+            }
+            mailbox = self.ready.wait(mailbox).unwrap_or_else(|e| e.into_inner());
+        }
+        if !mailbox.events.is_empty() {
+            Ok(())
+        } else {
+            Err("settings worker stopped before acknowledging accepted settings".into())
+        }
+    }
+}
+
+// The callback owns this guard. Worker exit (including panic) wakes a drain
+// waiting for an acknowledgement that can no longer arrive.
+struct EventProducer(Arc<EventQueue>);
+impl EventProducer {
+    fn push(&self, event: SettingsWorkerEvent, wake: &dyn Fn()) {
+        self.0.push(event, wake);
+    }
+}
+impl Drop for EventProducer {
+    fn drop(&mut self) {
+        let mut mailbox = self.0.mailbox.lock().unwrap_or_else(|e| e.into_inner());
+        mailbox.producer_finished = true;
+        self.0.ready.notify_all();
     }
 }
 
@@ -208,6 +249,8 @@ enum Client {
     Worker(Arc<SettingsWorker>),
     #[cfg(test)]
     Fake(TestRequests),
+    #[cfg(test)]
+    FakeWorker(mpsc::SyncSender<(u64, Option<String>, String)>),
 }
 impl Client {
     fn save(&self, request: u64, expected: Option<String>, source: String) -> Result<(), SettingsError> {
@@ -218,6 +261,10 @@ impl Client {
                 requests.lock().unwrap().push((request, expected, source));
                 Ok(())
             }
+            #[cfg(test)]
+            Self::FakeWorker(requests) => requests
+                .try_send((request, expected, source))
+                .map_err(|e| SettingsError(format!("fake settings queue unavailable: {e}"))),
         }
     }
     fn reload(&self) -> Result<(), SettingsError> {
@@ -225,20 +272,27 @@ impl Client {
             Self::Worker(worker) => worker.reload(),
             #[cfg(test)]
             Self::Fake(_) => Ok(()),
+            #[cfg(test)]
+            Self::FakeWorker(_) => Ok(()),
         }
     }
 }
 
-/// Owns a retirement-thread handle, never a SettingsWorker on the UI thread.
-/// Dropping this handle detaches cleanup; `shutdown` explicitly waits off UI.
+/// Owns the stopped session until its accepted saves have been acknowledged.
+/// Call `shutdown` after closing the interactive loop and wait for its result
+/// before process exit. Dropping the handle only requests immediate retirement;
+/// it cannot guarantee accepted saves are drained.
 pub struct SettingsShutdown {
-    retirement: Option<JoinHandle<()>>,
+    session: Option<SettingsSession>,
 }
 impl SettingsShutdown {
-    pub fn shutdown(mut self) {
-        if let Some(retirement) = self.retirement.take() {
-            let _ = retirement.join();
-        }
+    pub fn shutdown(mut self) -> Result<(), String> {
+        let Some(mut session) = self.session.take() else { return Ok(()) };
+        let result = session.drain_accepted();
+        let retired = session.retire_now().map_or(Ok(()), |retirement| {
+            retirement.join().map_err(|_| "settings retirement worker panicked".to_owned())
+        });
+        result.and(retired)
     }
 }
 
@@ -263,6 +317,7 @@ pub struct SettingsSession {
     editing: Option<Editing>,
     panel: Option<SettingsPanel>,
     error: Option<String>,
+    save_error: Option<String>,
     status: String,
 }
 
@@ -272,7 +327,7 @@ impl SettingsSession {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "settings path must be absolute"));
         }
         let events = Arc::new(EventQueue::default());
-        let worker_events = events.clone();
+        let worker_events = EventProducer(events.clone());
         // Create the retirement thread first. If worker creation fails, channel
         // disconnection ends it; there is no worker to drop/join on the caller.
         let (own_tx, own_rx) = mpsc::sync_channel::<Arc<SettingsWorker>>(1);
@@ -324,6 +379,7 @@ impl SettingsSession {
             editing: None,
             panel: None,
             error: None,
+            save_error: None,
             status: "Loading settings…".into(),
         }
     }
@@ -363,6 +419,9 @@ impl SettingsSession {
         self.menu.as_ref()?.selected()
     }
     pub fn select(&mut self, index: usize) {
+        if self.editing.is_some() {
+            return;
+        }
         let current = self.selected();
         if let Some(menu) = &mut self.menu {
             menu.move_selection(index.min(isize::MAX as usize) as isize - current as isize);
@@ -429,6 +488,9 @@ impl SettingsSession {
         self.update_status();
     }
     pub fn set_category(&mut self, category: Option<Category>) {
+        if self.editing.is_some() {
+            return;
+        }
         self.category = category;
         if let Some(menu) = &mut self.menu {
             menu.select_category(category);
@@ -600,6 +662,13 @@ impl SettingsSession {
         Ok(())
     }
     fn save(&mut self) -> Result<(), String> {
+        let result = self.enqueue_save();
+        if let Err(error) = &result {
+            self.save_error = Some(error.clone());
+        }
+        result
+    }
+    fn enqueue_save(&mut self) -> Result<(), String> {
         if self.external.is_some() {
             return Err("settings changed on disk; resolve the reload conflict before saving".into());
         }
@@ -621,6 +690,7 @@ impl SettingsSession {
             .map_err(|e| e.to_string())?;
         self.pending = Some(PendingSave { request, document });
         self.save_again = false;
+        self.save_error = None;
         Ok(())
     }
 
@@ -653,15 +723,18 @@ impl SettingsSession {
             SettingsWorkerEvent::Saved { request, source } => {
                 let Some(pending) = self.pending.as_ref().filter(|pending| pending.request == request) else {
                     self.error = Some("unexpected settings save acknowledgement".into());
+                    self.save_error = self.error.clone();
                     return;
                 };
                 if source != pending.document.source() {
                     self.error = Some("settings save acknowledgement has different contents".into());
+                    self.save_error = self.error.clone();
                     return;
                 }
                 let pending = self.pending.take().unwrap();
                 self.publish(&pending.document, Some(source.clone()), SettingsAppliedReason::Saved { request });
                 self.baseline = Some(External { source: Some(source), document: pending.document });
+                self.save_error = None;
                 if self.save_again {
                     self.save_again = false;
                     if let Err(error) = self.save() {
@@ -673,6 +746,7 @@ impl SettingsSession {
                 if request.is_some() && request == self.pending.as_ref().map(|pending| pending.request) {
                     self.pending = None;
                     self.save_again = false;
+                    self.save_error = Some(message.clone());
                 }
                 self.error = Some(message);
             }
@@ -711,6 +785,7 @@ impl SettingsSession {
             self.editing = None;
             self.panel = None;
             self.save_again = false;
+            self.save_error = None;
             self.adopt(external.source, external.document, SettingsAppliedReason::Loaded);
             Ok(())
         })();
@@ -747,9 +822,32 @@ impl SettingsSession {
         }
     }
 
-    /// Nonblocking handoff. Call handle.shutdown() from an existing shutdown
-    /// worker, after leaving the UI event loop. Repeated stop is harmless.
+    /// Nonblocking ownership handoff. Call handle.shutdown() after leaving the
+    /// interactive event loop, and wait for completion before process exit.
+    /// Unaccepted scalar drafts are never committed by shutdown.
     pub fn stop(&mut self) -> SettingsShutdown {
+        let mut stopped = Self::state(self.path.clone(), Arc::new(EventQueue::default()));
+        stopped.update_status();
+        let mut session = std::mem::replace(self, stopped);
+        session.open = false;
+        SettingsShutdown { session: Some(session) }
+    }
+    fn drain_accepted(&mut self) -> Result<(), String> {
+        self.worker_ready();
+        loop {
+            if let Some(error) = &self.save_error {
+                return Err(error.clone());
+            }
+            if self.pending.is_none() {
+                return Ok(());
+            }
+            self.events.wait()?;
+            self.worker_ready();
+        }
+    }
+    // Shared by explicit shutdown after draining, and implicit Drop without a
+    // drain. Never call stop here: the shutdown handle itself owns a session.
+    fn retire_now(&mut self) -> Option<JoinHandle<()>> {
         self.open = false;
         self.events.close(); // releases a producer blocked by event backpressure
         self.client = None; // reaper retains the final worker Arc
@@ -757,12 +855,12 @@ impl SettingsSession {
             let _ = retire.try_send(());
         }
         self.update_status();
-        SettingsShutdown { retirement: self.retirement.take() }
+        self.retirement.take()
     }
 }
 impl Drop for SettingsSession {
     fn drop(&mut self) {
-        let _ = self.stop();
+        let _ = self.retire_now();
     }
 }
 
@@ -1083,7 +1181,7 @@ mod tests {
         session.worker_ready();
         assert_eq!(session.take_applied().unwrap().settings.editor.tab_size, 6);
         let shutdown = session.stop();
-        thread::spawn(move || shutdown.shutdown()).join().unwrap();
+        thread::spawn(move || shutdown.shutdown()).join().unwrap().unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("tab_size = 6"));
         std::fs::remove_dir_all(folder).unwrap();
     }
@@ -1105,6 +1203,225 @@ mod tests {
         let _ = release_tx.send(());
         dropper.join().unwrap();
         assert!(dropped.is_ok(), "UI teardown waited for the retirement worker");
+    }
+
+    fn shutdown_fixture() -> (SettingsSession, mpsc::Receiver<(u64, Option<String>, String)>) {
+        let (mut session, _) = fixture(Some("[editor]\ntab_size = 4\n"));
+        let (tx, rx) = mpsc::sync_channel(1);
+        session.client = Some(Client::FakeWorker(tx));
+        (session, rx)
+    }
+
+    fn observe_event_wait(events: &EventQueue) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        events.mailbox.lock().unwrap().waiting = Some(tx);
+        rx
+    }
+
+    #[test]
+    fn settings_shutdown_waits_for_slow_a_then_drains_latest_accepted_b_without_frontend_wake() {
+        let (mut session, requests) = shutdown_fixture();
+        let events = session.events.clone();
+        let waiting = observe_event_wait(&events);
+        session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(6))).unwrap();
+        let a = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(7))).unwrap();
+        session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(8))).unwrap();
+        // A raw scalar draft after accepted B must never become an autosave.
+        select(&mut session, "editor.tab_size");
+        session.input(SettingsInput::Accept).unwrap();
+        session.input(SettingsInput::Home).unwrap();
+        session.input(SettingsInput::Delete).unwrap();
+        session.input(SettingsInput::Text("9")).unwrap();
+        let (retire_tx, retire_rx) = mpsc::sync_channel(1);
+        let (retiring_tx, retiring_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        session.retire = Some(retire_tx);
+        session.retirement = Some(thread::spawn(move || {
+            retire_rx.recv().unwrap();
+            retiring_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        }));
+        let shutdown = session.stop();
+        assert!(!session.is_open());
+        assert!(!session.worker_ready(), "stopped UI must not consume the drain's events");
+        let (done_tx, done_rx) = mpsc::channel();
+        let drain = thread::spawn(move || done_tx.send(shutdown.shutdown()).unwrap());
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done_rx.try_recv().is_err());
+        assert!(requests.try_recv().is_err(), "B must await A's optimistic baseline");
+        assert!(retiring_rx.try_recv().is_err(), "stop must retain the worker until saves drain");
+        // A frontend event proxy is gone. The independent Condvar must wake
+        // the drain even though this callback deliberately does nothing.
+        events.push(SettingsWorkerEvent::Saved { request: a.0, source: a.2.clone() }, &|| {});
+        let b = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(b.1, Some(a.2.clone()), "B must compare against acknowledged A");
+        assert!(b.2.contains("tab_size = 8"), "save only latest accepted B, not raw draft 9");
+        assert_ne!(a.0, b.0);
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done_rx.try_recv().is_err(), "exit must wait for B's acknowledgement too");
+        events.push(
+            SettingsWorkerEvent::Loaded {
+                source: Some(a.2.clone()),
+                document: Box::new(SettingsDocument::parse(&a.2).unwrap()),
+            },
+            &|| {},
+        );
+        events.push(SettingsWorkerEvent::Saved { request: b.0, source: b.2 }, &|| {});
+        retiring_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done_rx.try_recv().is_err(), "explicit shutdown must also wait for worker retirement");
+        release_tx.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        drain.join().unwrap();
+        assert!(requests.try_recv().is_err());
+        assert!(events.mailbox.lock().unwrap().closed);
+        // Late callbacks after retirement cannot block or resurrect events.
+        for request in 0..EVENT_LIMIT as u64 + 1 {
+            events.push(SettingsWorkerEvent::Saved { request, source: String::new() }, &|| panic!("closed wake"));
+        }
+        assert!(events.drain().is_empty());
+        assert_eq!(session.stop().shutdown(), Ok(()), "repeated stop is harmless");
+    }
+
+    #[test]
+    fn settings_shutdown_reports_save_failure_and_never_saves_unaccepted_draft() {
+        let (mut session, requests) = shutdown_fixture();
+        select(&mut session, "editor.tab_size");
+        session.input(SettingsInput::Accept).unwrap();
+        session.input(SettingsInput::Text("0")).unwrap();
+        assert_eq!(session.stop().shutdown(), Ok(()));
+        assert!(requests.try_recv().is_err(), "unaccepted draft must not create a save");
+
+        let (mut session, requests) = shutdown_fixture();
+        session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(6))).unwrap();
+        let a = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(8))).unwrap();
+        let events = session.events.clone();
+        let shutdown = session.stop();
+        let (done_tx, done_rx) = mpsc::channel();
+        let drain = thread::spawn(move || done_tx.send(shutdown.shutdown()).unwrap());
+        events.push(SettingsWorkerEvent::Error { request: Some(a.0), message: "disk unavailable".into() }, &|| {});
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Err("disk unavailable".into()));
+        drain.join().unwrap();
+        assert!(requests.try_recv().is_err(), "failed A must not enqueue B or claim Saved");
+        assert!(events.mailbox.lock().unwrap().closed);
+    }
+
+    #[test]
+    fn settings_shutdown_reports_external_conflict_and_bad_acknowledgement() {
+        for bad_ack in [false, true] {
+            let (mut session, requests) = shutdown_fixture();
+            session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(6))).unwrap();
+            let a = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(8))).unwrap();
+            let events = session.events.clone();
+            let shutdown = session.stop();
+            if !bad_ack {
+                events.push(
+                    SettingsWorkerEvent::Loaded {
+                        source: Some("[editor]\ntab_size = 9\n".into()),
+                        document: Box::new(SettingsDocument::parse("[editor]\ntab_size = 9\n").unwrap()),
+                    },
+                    &|| {},
+                );
+            }
+            events.push(
+                SettingsWorkerEvent::Saved { request: a.0, source: if bad_ack { String::new() } else { a.2 } },
+                &|| {},
+            );
+            let error = shutdown.shutdown().unwrap_err();
+            assert!(error.contains(if bad_ack { "different contents" } else { "reload conflict" }), "{error}");
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn settings_shutdown_producer_exit_or_closed_mailbox_releases_event_wait() {
+        for closed in [false, true] {
+            let (mut session, requests) = shutdown_fixture();
+            session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(6))).unwrap();
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            let events = session.events.clone();
+            let producer = EventProducer(events.clone());
+            let waiting = observe_event_wait(&events);
+            let shutdown = session.stop();
+            let (done_tx, done_rx) = mpsc::channel();
+            let drain = thread::spawn(move || done_tx.send(shutdown.shutdown()).unwrap());
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done_rx.try_recv().is_err());
+            if closed {
+                events.close();
+            } else {
+                drop(producer);
+            }
+            let error = done_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+            assert!(error.contains("before acknowledging"));
+            drain.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn settings_shutdown_implicit_drop_with_pending_saves_does_not_drain_or_join() {
+        for handoff in [false, true] {
+            let (mut session, requests) = shutdown_fixture();
+            session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(6))).unwrap();
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            session.edit_document(|doc| doc.edit("editor.tab_size", SettingValue::Integer(8))).unwrap();
+            let events = session.events.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            session.retirement = Some(thread::spawn(move || {
+                let _ = release_rx.recv();
+            }));
+            let (done_tx, done_rx) = mpsc::channel();
+            let dropper = thread::spawn(move || {
+                if handoff {
+                    drop(session.stop());
+                } else {
+                    drop(session);
+                }
+                done_tx.send(()).unwrap();
+            });
+            let dropped = done_rx.recv_timeout(Duration::from_secs(5));
+            let _ = release_tx.send(());
+            assert!(dropped.is_ok(), "implicit Drop waited for acknowledgement or joined retirement");
+            dropper.join().unwrap();
+            assert!(events.mailbox.lock().unwrap().closed);
+            assert!(requests.try_recv().is_err(), "implicit Drop must not enqueue a coalesced save");
+        }
+    }
+
+    #[test]
+    fn settings_scalar_edit_keeps_visible_row_and_category_until_explicit_accept_or_cancel() {
+        let (mut session, requests) = fixture(Some("[editor]\ntab_size = 4\n"));
+        let row = session.rows().iter().position(|row| row.spec.id == "editor.tab_size").unwrap();
+        session.select(row);
+        session.input(SettingsInput::Accept).unwrap();
+        session.input(SettingsInput::Home).unwrap();
+        session.input(SettingsInput::Delete).unwrap();
+        session.input(SettingsInput::Text("6")).unwrap();
+        session.select(usize::MAX);
+        assert_eq!(session.selected_row().unwrap().spec.id, "editor.tab_size");
+        assert_eq!(session.editing.as_ref().unwrap().id, "editor.tab_size");
+        session.set_category(Some(Category::Appearance));
+        assert_eq!(session.category(), None);
+        session.cycle_category(false);
+        assert_eq!(session.category(), None);
+        assert_eq!(session.selected_row().unwrap().spec.id, "editor.tab_size");
+        assert_eq!(session.input_text(), "6");
+        assert!(session.is_editing());
+        session.input(SettingsInput::Accept).unwrap();
+        assert_eq!(session.document().unwrap().settings().editor.tab_size, 6);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        session.cycle_category(false);
+        assert_eq!(session.category(), Some(Category::Editor));
+        let row = session.rows().iter().position(|row| row.spec.id == "editor.tab_size").unwrap();
+        session.select(row);
+        session.input(SettingsInput::Accept).unwrap();
+        assert!(session.is_editing());
+        session.input(SettingsInput::Cancel).unwrap();
+        session.set_category(None);
+        session.select(usize::MAX);
+        assert_ne!(session.selected_row().unwrap().spec.id, "editor.tab_size");
     }
 
     #[test]
