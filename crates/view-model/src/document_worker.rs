@@ -18,6 +18,52 @@ use std::{
     time::Duration,
 };
 
+/// Ok acknowledges bounded queue admission, not display. If shutdown races the
+/// wake after admission, the accepted request is not retried (which could open
+/// it twice); a shutdown notice is emitted and later calls return Disconnected.
+pub type ExternalOpen = Box<
+    dyn Fn(
+            kwil_core_workspace::instance::OpenFiles,
+        ) -> Result<(), TrySendError<kwil_core_workspace::instance::OpenFiles>>
+        + Send,
+>;
+pub struct ExternalOpenInbox {
+    rx: mpsc::Receiver<kwil_core_workspace::instance::OpenFiles>,
+    pending: std::sync::Arc<AtomicBool>,
+}
+
+pub fn external_open_channel(
+    wake: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+) -> (ExternalOpen, ExternalOpenInbox) {
+    let (tx, rx) = mpsc::sync_channel(16);
+    let pending = std::sync::Arc::new(AtomicBool::new(false));
+    let wake_pending = pending.clone();
+    let closed = AtomicBool::new(false);
+    let open = Box::new(move |request: kwil_core_workspace::instance::OpenFiles| {
+        // Reuse the transport's native-path, count and byte limits even when
+        // an embedder calls this seam without going through IPC.
+        if closed.load(std::sync::atomic::Ordering::Acquire) || request.encode().is_err() {
+            return Err(TrySendError::Disconnected(request));
+        }
+        tx.try_send(request)?;
+        if !wake_pending.swap(true, std::sync::atomic::Ordering::AcqRel) && wake().is_err() {
+            closed.store(true, std::sync::atomic::Ordering::Release);
+            eprintln!("Kwil is closing; an admitted open request may not have been displayed");
+        }
+        Ok(())
+    });
+    (open, ExternalOpenInbox { rx, pending })
+}
+
+impl ExternalOpenInbox {
+    pub fn drain(&self) -> Vec<kwil_core_workspace::instance::OpenFiles> {
+        // Clear first: a concurrent producer either joins this bounded drain
+        // or schedules another wake, so no request can be stranded.
+        self.pending.store(false, std::sync::atomic::Ordering::Release);
+        (0..16).map_while(|_| self.rx.try_recv().ok()).collect()
+    }
+}
+
 pub enum DocumentRequest {
     Prepare { root: Option<PathBuf> },
     Persist(Session),
@@ -144,7 +190,13 @@ impl DocumentWorker {
 }
 
 fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
-    let root = match root {
+    let root = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
+    std::fs::create_dir_all(&root)?;
+    prepare_root(root)
+}
+
+fn resolve_root(root: Option<PathBuf>, override_root: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
+    Ok(match root.or_else(|| override_root.map(PathBuf::from)) {
         Some(root) if root.is_absolute() => root,
         Some(_) => return Err(io::Error::other("Recovery directory must be absolute")),
         None => {
@@ -155,8 +207,10 @@ fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
                 .ok_or_else(|| io::Error::other("No recovery directory"))?
                 .join("workspace")
         }
-    };
-    std::fs::create_dir_all(&root)?;
+    })
+}
+
+fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
     let ownership = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -234,6 +288,7 @@ fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
 
 fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, RecoveredJournal, JournalBase)> {
     let mut buffer = Buffer::with_add_memory_limit(0);
+    buffer.set_undo_memory_limit(0);
     let mut edit = None;
     let mut base = None;
     let recovered = RecoveredJournal::open(path, tab.id, &AtomicBool::new(false), |event| {
@@ -248,16 +303,29 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
             RecoveryEvent::BeginEdit(recipe) => {
                 buffer.begin();
                 buffer.delete(recipe.offset..recipe.offset + recipe.removed)?;
-                edit = Some((recipe, 0));
+                edit = Some((recipe.offset, 0));
             }
             RecoveryEvent::EditBytes(bytes) => {
-                let (recipe, written) = edit.as_mut().ok_or_else(|| io::Error::other("Missing recovery edit"))?;
-                buffer.insert(recipe.offset + *written, bytes)?;
+                let (offset, written) = edit.as_mut().ok_or_else(|| io::Error::other("Missing recovery edit"))?;
+                buffer.insert(*offset + *written, bytes)?;
                 *written += bytes.len() as u64;
             }
             RecoveryEvent::CommitEdit => {
                 buffer.commit();
                 edit = None;
+            }
+            RecoveryEvent::BeginBatch(_) => {
+                buffer.begin();
+            }
+            RecoveryEvent::BeginReplacement(recipe) => {
+                buffer.delete(recipe.offset..recipe.offset + recipe.removed)?;
+                edit = Some((recipe.offset, 0));
+            }
+            RecoveryEvent::EndReplacement => {
+                edit = None;
+            }
+            RecoveryEvent::CommitBatch => {
+                buffer.commit();
             }
         }
         Ok(())
@@ -321,7 +389,7 @@ impl io::Read for SnapshotReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kwil_core_workspace::journal::{JournalCommand, JournalEdit, JournalSeed};
+    use kwil_core_workspace::journal::{JournalBatch, JournalCommand, JournalEdit, JournalReplacement, JournalSeed};
 
     struct Scratch(PathBuf);
     impl Scratch {
@@ -434,7 +502,99 @@ mod tests {
     }
 
     #[test]
+    fn recovery_publishes_all_batch_replacements_or_the_previous_revision() {
+        for commit in [false, true] {
+            let scratch = Scratch::new();
+            let mut buffer = Buffer::empty();
+            buffer.insert(0, b"abcdef").unwrap();
+            let snapshot = buffer.snapshot();
+            let mut service = JournalService::spawn(Duration::from_secs(1)).unwrap();
+            let handle = service
+                .try_create(JournalSeed {
+                    path: scratch.0.join("11.kwj"),
+                    base: JournalBase {
+                        document: DocumentId(11),
+                        revision: 3,
+                        original_path: None,
+                        original_identity: [0; 4],
+                        codec: b"raw-v1".to_vec(),
+                        byte_len: snapshot.len(),
+                    },
+                    source: Box::new(SnapshotReader::new(snapshot)),
+                })
+                .unwrap();
+            handle.ready.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            for command in [
+                JournalCommand::BeginBatch(JournalBatch { from_revision: 3, to_revision: 4, replacements: 2 }),
+                JournalCommand::BeginReplacement(JournalReplacement { offset: 1, removed: 2, inserted: 2 }),
+                JournalCommand::Bytes(b"XY".to_vec()),
+                JournalCommand::EndReplacement,
+                JournalCommand::BeginReplacement(JournalReplacement { offset: 4, removed: 1, inserted: 1 }),
+                JournalCommand::Bytes(b"Z".to_vec()),
+                JournalCommand::EndReplacement,
+            ] {
+                handle.try_submit(command).unwrap();
+            }
+            if commit {
+                handle.try_submit(JournalCommand::CommitBatch).unwrap();
+            }
+            service.finish();
+            let _ = service.finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(handle);
+            drop(service);
+            let (mut prepared, mut storage) = prepare(Some(scratch.0.clone())).unwrap();
+            let (_, document) = prepared.documents.pop().unwrap();
+            let document = document.unwrap();
+            let mut bytes = Vec::new();
+            document.snapshot().write_to(&mut bytes).unwrap();
+            assert_eq!(bytes, if commit { b"aXYdZf" } else { b"abcdef" });
+            assert_eq!(document.revision(), if commit { 4 } else { 3 });
+            storage.service.finish();
+            storage.service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            drop(document);
+            drop(storage);
+        }
+    }
+
+    #[test]
     fn malformed_recovery_override_never_uses_default_storage() {
         assert!(prepare(Some("relative-recovery-directory".into())).is_err());
+        assert!(resolve_root(None, Some("".into())).is_err());
+        assert!(resolve_root(None, Some("relative".into())).is_err());
+        assert!(
+            resolve_root(Some(PathBuf::new()), None).is_err(),
+            "missing required isolated root must not use the profile"
+        );
+    }
+
+    #[test]
+    fn external_open_is_bounded_retains_rejected_requests_and_coalesces_wakes() {
+        use kwil_core_workspace::instance::{OpenFile, OpenFiles};
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        let (open, inbox) = external_open_channel(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let path = std::env::temp_dir().join("kwil-virtual-日本語.txt");
+        let request = OpenFiles { files: vec![OpenFile { path, line: Some(3), column: Some(5) }] };
+        for _ in 0..16 {
+            open(request.clone()).unwrap();
+        }
+        let Err(TrySendError::Full(rejected)) = open(request.clone()) else {
+            panic!("seventeenth request must retain ownership on Full")
+        };
+        assert_eq!(rejected, request);
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let accepted = inbox.drain();
+        assert_eq!(accepted.len(), 16);
+        assert!(accepted.iter().all(|r| r == &request));
+        open(rejected).unwrap();
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(inbox.drain(), vec![request.clone()]);
+        let malformed = OpenFiles { files: vec![OpenFile { path: "relative.txt".into(), line: None, column: None }] };
+        assert!(matches!(open(malformed.clone()), Err(TrySendError::Disconnected(r)) if r == malformed));
+        drop(inbox);
+        assert!(matches!(open(request.clone()), Err(TrySendError::Disconnected(r)) if r == request));
     }
 }

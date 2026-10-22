@@ -41,12 +41,32 @@ pub struct JournalEdit {
     pub removed: u64,
     pub inserted: u64,
 }
+/// One model transaction/revision, regardless of how many replacements it contains.
+/// Replacement coordinates are sequential: each refers to the preceding result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalBatch {
+    pub from_revision: u64,
+    pub to_revision: u64,
+    pub replacements: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalReplacement {
+    pub offset: u64,
+    pub removed: u64,
+    pub inserted: u64,
+}
 #[derive(Debug)]
 pub enum JournalCommand {
     Begin(JournalEdit),
     /// At most JOURNAL_CHUNK bytes. Large pastes stream chunks under one Begin/Commit.
     Bytes(Vec<u8>),
     Commit,
+    /// BeginBatch -> (BeginReplacement -> Bytes* -> EndReplacement)* -> CommitBatch.
+    /// No new revision or recoverable replacement is published before CommitBatch.
+    BeginBatch(JournalBatch),
+    BeginReplacement(JournalReplacement),
+    EndReplacement,
+    CommitBatch,
     /// Receipt means sync_all completed, covering all preceding committed edits.
     Flush(SyncSender<io::Result<u64>>),
     Finish,
@@ -301,18 +321,59 @@ fn decode_edit(b: &[u8]) -> io::Result<JournalEdit> {
     r.end()?;
     Ok(e)
 }
+fn batch_bytes(batch: JournalBatch) -> Vec<u8> {
+    let mut b = vec![7];
+    for v in [batch.from_revision, batch.to_revision, batch.replacements] {
+        put64(&mut b, v);
+    }
+    b
+}
+fn decode_batch(b: &[u8]) -> io::Result<JournalBatch> {
+    let mut r = Decoder::new(b);
+    if r.take(1)? != [7] {
+        return Err(invalid("batch header"));
+    }
+    let batch = JournalBatch { from_revision: r.u64()?, to_revision: r.u64()?, replacements: r.u64()? };
+    r.end()?;
+    Ok(batch)
+}
+fn replacement_bytes(replacement: JournalReplacement) -> Vec<u8> {
+    let mut b = vec![8];
+    for v in [replacement.offset, replacement.removed, replacement.inserted] {
+        put64(&mut b, v);
+    }
+    b
+}
+fn decode_replacement(b: &[u8]) -> io::Result<JournalReplacement> {
+    let mut r = Decoder::new(b);
+    if r.take(1)? != [8] {
+        return Err(invalid("replacement header"));
+    }
+    let replacement = JournalReplacement { offset: r.u64()?, removed: r.u64()?, inserted: r.u64()? };
+    r.end()?;
+    Ok(replacement)
+}
+#[derive(Clone, Copy)]
+struct BatchState {
+    header: JournalBatch,
+    completed: u64,
+    len: u64,
+    pending: Option<(JournalReplacement, u64)>,
+}
 #[derive(Clone, Copy)]
 struct State {
     revision: u64,
     len: u64,
     pending: Option<(JournalEdit, u64)>,
+    batch: Option<BatchState>,
 }
 impl State {
     fn new(revision: u64, len: u64) -> Self {
-        Self { revision, len, pending: None }
+        Self { revision, len, pending: None, batch: None }
     }
     fn begin(&mut self, e: JournalEdit) -> io::Result<()> {
         if self.pending.is_some()
+            || self.batch.is_some()
             || e.from_revision != self.revision
             || e.to_revision == e.from_revision
             || e.offset > self.len
@@ -325,6 +386,15 @@ impl State {
         Ok(())
     }
     fn bytes(&mut self, n: usize) -> io::Result<()> {
+        if let Some(batch) = &mut self.batch {
+            let (replacement, bytes) =
+                batch.pending.as_mut().ok_or_else(|| invalid("bytes outside batch replacement"))?;
+            *bytes = bytes.checked_add(n as u64).ok_or_else(|| invalid("edit overflow"))?;
+            if *bytes > replacement.inserted {
+                return Err(invalid("too many replacement bytes"));
+            }
+            return Ok(());
+        }
         let (e, nbytes) = self.pending.as_mut().ok_or_else(|| invalid("bytes outside edit"))?;
         *nbytes = nbytes.checked_add(n as u64).ok_or_else(|| invalid("edit overflow"))?;
         if *nbytes > e.inserted {
@@ -341,6 +411,52 @@ impl State {
         self.revision = e.to_revision;
         self.len = self.len - e.removed + e.inserted;
         Ok(e)
+    }
+    fn begin_batch(&mut self, header: JournalBatch) -> io::Result<()> {
+        if self.pending.is_some()
+            || self.batch.is_some()
+            || header.from_revision != self.revision
+            || header.to_revision == header.from_revision
+            || header.replacements == 0
+        {
+            return Err(invalid("journal batch revision/order/count"));
+        }
+        self.batch = Some(BatchState { header, completed: 0, len: self.len, pending: None });
+        Ok(())
+    }
+    fn begin_replacement(&mut self, replacement: JournalReplacement) -> io::Result<()> {
+        let batch = self.batch.as_mut().ok_or_else(|| invalid("replacement outside batch"))?;
+        if batch.pending.is_some()
+            || batch.completed >= batch.header.replacements
+            || replacement.offset > batch.len
+            || replacement.removed > batch.len - replacement.offset
+            || batch.len.checked_sub(replacement.removed).and_then(|n| n.checked_add(replacement.inserted)).is_none()
+        {
+            return Err(invalid("batch replacement range/order"));
+        }
+        batch.pending = Some((replacement, 0));
+        Ok(())
+    }
+    fn end_replacement(&mut self) -> io::Result<()> {
+        let batch = self.batch.as_mut().ok_or_else(|| invalid("replacement end outside batch"))?;
+        let (replacement, bytes) = batch.pending.ok_or_else(|| invalid("replacement end without begin"))?;
+        if bytes != replacement.inserted {
+            return Err(invalid("incomplete replacement"));
+        }
+        batch.pending = None;
+        batch.len = batch.len - replacement.removed + replacement.inserted;
+        batch.completed += 1;
+        Ok(())
+    }
+    fn commit_batch(&mut self) -> io::Result<JournalBatch> {
+        let batch = self.batch.ok_or_else(|| invalid("batch commit outside batch"))?;
+        if batch.pending.is_some() || batch.completed != batch.header.replacements {
+            return Err(invalid("incomplete batch"));
+        }
+        self.revision = batch.header.to_revision;
+        self.len = batch.len;
+        self.batch = None;
+        Ok(batch.header)
     }
 }
 fn run(
@@ -389,6 +505,22 @@ fn run(
             JournalCommand::Commit => {
                 state.commit()?;
                 write_frame(f, &[6])?;
+            }
+            JournalCommand::BeginBatch(b) => {
+                state.begin_batch(b)?;
+                write_frame(f, &batch_bytes(b))?;
+            }
+            JournalCommand::BeginReplacement(r) => {
+                state.begin_replacement(r)?;
+                write_frame(f, &replacement_bytes(r))?;
+            }
+            JournalCommand::EndReplacement => {
+                state.end_replacement()?;
+                write_frame(f, &[9])?;
+            }
+            JournalCommand::CommitBatch => {
+                state.commit_batch()?;
+                write_frame(f, &[10])?;
             }
             JournalCommand::Flush(reply) => {
                 let result = f.sync_all().map(|_| state.revision);
@@ -509,6 +641,9 @@ pub struct JournalSession {
     pub finished: Receiver<io::Result<u64>>,
 }
 impl JournalSession {
+    /// Each command is admitted completely or returned intact. On Full retain and
+    /// retry this exact command before later commands for this document; do not
+    /// restart the batch or skip a payload chunk. Other documents may proceed.
     pub fn try_submit(&self, command: JournalCommand) -> Result<(), TrySendError<JournalCommand>> {
         if self.closing.load(Ordering::Acquire)
             || matches!(&command,JournalCommand::Bytes(b) if b.is_empty() || b.len()>JOURNAL_CHUNK)
@@ -733,6 +868,22 @@ impl ServiceEntry {
             JournalCommand::Commit => {
                 self.state.commit()?;
                 write_frame(file, &[6])?;
+            }
+            JournalCommand::BeginBatch(b) => {
+                self.state.begin_batch(b)?;
+                write_frame(file, &batch_bytes(b))?;
+            }
+            JournalCommand::BeginReplacement(r) => {
+                self.state.begin_replacement(r)?;
+                write_frame(file, &replacement_bytes(r))?;
+            }
+            JournalCommand::EndReplacement => {
+                self.state.end_replacement()?;
+                write_frame(file, &[9])?;
+            }
+            JournalCommand::CommitBatch => {
+                self.state.commit_batch()?;
+                write_frame(file, &[10])?;
             }
             JournalCommand::Flush(reply) => {
                 if !matches!(self.phase, SeedPhase::Ready) {
@@ -1054,6 +1205,9 @@ pub struct RecoverySummary {
 }
 /// Callbacks run on the recovery worker. Each edit is validated completely before
 /// BeginEdit is emitted. A model should stage callbacks and publish at CommitEdit.
+/// For a batch, no batch event (including BeginBatch) is emitted until the entire
+/// outer commit is verified. Apply replacement coordinates sequentially; publish
+/// the model revision only at CommitBatch. Bytes are still bounded to 64 KiB.
 pub enum RecoveryEvent<'a> {
     Base(&'a JournalBase),
     BaseBytes(&'a [u8]),
@@ -1061,6 +1215,10 @@ pub enum RecoveryEvent<'a> {
     BeginEdit(JournalEdit),
     EditBytes(&'a [u8]),
     CommitEdit,
+    BeginBatch(JournalBatch),
+    BeginReplacement(JournalReplacement),
+    EndReplacement,
+    CommitBatch,
 }
 pub struct JournalReader {
     file: File,
@@ -1121,7 +1279,11 @@ impl JournalReader {
                     revision: state.revision,
                     byte_len: state.len,
                     committed_end,
-                    tail: if state.pending.is_some() { RecoveryTail::Interrupted } else { RecoveryTail::Complete },
+                    tail: if state.pending.is_some() || state.batch.is_some() {
+                        RecoveryTail::Interrupted
+                    } else {
+                        RecoveryTail::Complete
+                    },
                 });
             }
             let Some(b) = read_frame(&mut self.file, self.limit)? else {
@@ -1150,6 +1312,29 @@ impl JournalReader {
                         Ok(())
                     })?;
                     emit(RecoveryEvent::CommitEdit)?;
+                    committed_end = end;
+                }
+                7 => {
+                    state.begin_batch(decode_batch(&b)?)?;
+                    edit_start = self.file.stream_position()?;
+                }
+                8 => state.begin_replacement(decode_replacement(&b)?)?,
+                9 if b.len() == 1 => state.end_replacement()?,
+                10 if b.len() == 1 => {
+                    let batch = state.commit_batch()?;
+                    let end = self.file.stream_position()?;
+                    emit(RecoveryEvent::BeginBatch(batch))?;
+                    replay(&mut self.file, edit_start, end, cancel, |b| {
+                        match b[0] {
+                            8 => emit(RecoveryEvent::BeginReplacement(decode_replacement(b)?))?,
+                            5 => emit(RecoveryEvent::EditBytes(&b[1..]))?,
+                            9 => emit(RecoveryEvent::EndReplacement)?,
+                            10 => (),
+                            _ => return Err(invalid("batch replay order")),
+                        }
+                        Ok(())
+                    })?;
+                    emit(RecoveryEvent::CommitBatch)?;
                     committed_end = end;
                 }
                 _ => return Err(invalid("journal record order")),
