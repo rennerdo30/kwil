@@ -18,7 +18,7 @@ fn main() {
 #[divan::bench(sample_count = 3, sample_size = 1)]
 fn open_first_screen() {
     let file = TextFile::open(&path()).unwrap();
-    divan::black_box(file.first_lines(SCREEN));
+    divan::black_box(file.first_lines(SCREEN).unwrap());
 }
 
 #[divan::bench(sample_count = 3, sample_size = 1)]
@@ -27,7 +27,7 @@ fn line_index(bencher: divan::Bencher) {
         .with_inputs(|| TextFile::open(&path()).unwrap())
         .input_counter(|f| divan::counter::BytesCount::new(f.len()))
         .bench_values(|f| {
-            divan::black_box(f.build_index(THREADS));
+            divan::black_box(f.build_index(THREADS).unwrap());
         });
 }
 
@@ -36,10 +36,10 @@ fn jump_to_line_15m(bencher: divan::Bencher) {
     static FILE: OnceLock<TextFile> = OnceLock::new();
     let f = FILE.get_or_init(|| {
         let f = TextFile::open(&path()).unwrap();
-        f.build_index(THREADS);
+        f.build_index(THREADS).unwrap();
         f
     });
-    bencher.bench(|| assert!(divan::black_box(f.lines(JUMP, SCREEN)).is_some()));
+    bencher.bench(|| assert!(divan::black_box(f.lines(JUMP, SCREEN).unwrap()).is_some()));
 }
 
 // Private memory is sampled in a fresh-process harness, rather than divan's

@@ -1,6 +1,9 @@
 # Speed budgets
 
-KW-33 measures only APIs present at `b1b5c55`. The benchmark crate is unpublished.
+KW-33 measures only operations present at `b1b5c55`. Main was merged after KW-9
+landed; the same TextFile methods now return checked Results, which the harness
+propagates rather than bypassing file-safety checks. No new search/diff/edit API
+is benchmarked. The benchmark crate is unpublished.
 Its linked library has no default features, sampling thread or periodic timer.
 The `harness` feature enables the binary and text measurements. Divan **0.1.21**
 (MIT OR Apache-2.0, published 2025-10-04, checked through the crates.io API

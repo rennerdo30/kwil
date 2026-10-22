@@ -103,11 +103,17 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
         let p = proxy.clone();
         let trace = opts.trace.clone();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-        file.index_in_background(threads, move || {
-            if let Some(trace) = trace {
-                trace.index_done();
-            }
-            let _ = p.send_event(UserEvent::IndexDone);
+        file.index_in_background(threads, move |result| {
+            let event = match result {
+                Ok(()) => {
+                    if let Some(trace) = trace {
+                        trace.index_done();
+                    }
+                    UserEvent::IndexDone
+                }
+                Err(e) => UserEvent::Notice(e.to_string()),
+            };
+            let _ = p.send_event(event);
         });
     }
     let mut app = App {
@@ -466,7 +472,14 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
             UserEvent::IndexDone => self.view.index_ready(),
-            UserEvent::Notice(msg) => self.view.set_notice(msg),
+            UserEvent::Notice(msg) => {
+                if self.opts.trace.is_some() {
+                    self.error = Some(GuiError::Unavailable(msg));
+                    el.exit();
+                    return;
+                }
+                self.view.set_notice(msg)
+            }
             #[cfg(feature = "frame-harness")]
             UserEvent::Script(step) => {
                 use kwil_bench::frames::Step;

@@ -9,15 +9,16 @@ pub const THREADS: usize = 4;
 pub fn measure(path: &Path) -> std::io::Result<serde_json::Value> {
     let start = Instant::now();
     let file = TextFile::open(path)?;
-    let first: usize = std::hint::black_box(file.first_lines(SCREEN)).iter().map(|l| l.len()).sum();
+    let first: usize =
+        std::hint::black_box(file.first_lines(SCREEN).map_err(std::io::Error::other)?).iter().map(|l| l.len()).sum();
     let open_ms = start.elapsed().as_secs_f64() * 1000.0;
     assert!(first > 0);
     let start = Instant::now();
-    let count = file.build_index(THREADS).line_count();
+    let count = file.build_index(THREADS).map_err(std::io::Error::other)?.line_count();
     let index_ms = start.elapsed().as_secs_f64() * 1000.0;
     assert!(count > JUMP);
     let start = Instant::now();
-    let jump = file.lines(JUMP, SCREEN).expect("index ready and fixture has 15M lines");
+    let jump = file.lines(JUMP, SCREEN).map_err(std::io::Error::other)?.expect("index ready and fixture has 15M lines");
     assert!(String::from_utf8_lossy(jump[0]).contains("line=15000000"));
     let jump_ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok(

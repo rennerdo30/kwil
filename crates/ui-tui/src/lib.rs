@@ -35,11 +35,17 @@ pub fn run_traced(
         let t = tx.clone();
         let trace = trace.clone();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-        file.index_in_background(threads, move || {
-            if let Some(trace) = trace {
-                trace.index_done();
-            }
-            let _ = t.send(Msg::IndexDone);
+        file.index_in_background(threads, move |result| {
+            let event = match result {
+                Ok(()) => {
+                    if let Some(trace) = trace {
+                        trace.index_done();
+                    }
+                    Msg::IndexDone
+                }
+                Err(e) => Msg::Notice(e.to_string()),
+            };
+            let _ = t.send(event);
         });
     }
     let mut terminal = ratatui::init();
@@ -92,6 +98,9 @@ pub fn run_traced(
                     true
                 }
                 Msg::Notice(n) => {
+                    if trace.is_some() {
+                        return Err(std::io::Error::other(n));
+                    }
                     view.set_notice(n);
                     true
                 }
