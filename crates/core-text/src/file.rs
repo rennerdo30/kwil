@@ -64,9 +64,7 @@ impl TextFile {
                 }
             }
         };
-        Ok(TextFile {
-            shared: Arc::new(Shared { bytes, index: OnceLock::new(), scanned: AtomicU64::new(0) }),
-        })
+        Ok(TextFile { shared: Arc::new(Shared { bytes, index: OnceLock::new(), scanned: AtomicU64::new(0) }) })
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -167,14 +165,16 @@ mod tests {
         }
         text.extend_from_slice(b"last line without newline");
 
-        let naive: Vec<u64> = std::iter::once(0)
-            .chain(memchr_iter(b'\n', &text).map(|p| p as u64 + 1))
-            .collect();
+        let naive: Vec<u64> = std::iter::once(0).chain(memchr_iter(b'\n', &text).map(|p| p as u64 + 1)).collect();
         for (every, chunk) in [(1, 1 << 20), (7, 4096), (1024, 1000), (1024, 16 << 20)] {
             let idx = LineIndex::build_chunked(&text, every, chunk, 4, &AtomicU64::new(0));
             assert_eq!(idx.line_count(), naive.len() as u64);
             for (line, &start) in naive.iter().enumerate() {
-                assert_eq!(idx.line_start(&text, line as u64), Some(start), "line {line}, every {every}, chunk {chunk}");
+                assert_eq!(
+                    idx.line_start(&text, line as u64),
+                    Some(start),
+                    "line {line}, every {every}, chunk {chunk}"
+                );
             }
             assert_eq!(idx.line_start(&text, naive.len() as u64), None);
         }

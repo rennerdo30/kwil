@@ -3,6 +3,7 @@ name = "kwil"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "A blazing fast plain text editor for GUI and terminal."
 publish = false
 
 [[bin]]
@@ -10,5 +11,11 @@ name = "kwil"
 path = "src/main.rs"
 
 [dependencies]
+kwil-core-text = { path = "../core-text" }
+kwil-view-model = { path = "../view-model" }
 kwil-ui-gpu = { path = "../ui-gpu" }
 kwil-ui-tui = { path = "../ui-tui" }
+kwil-update = { path = "../update" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }

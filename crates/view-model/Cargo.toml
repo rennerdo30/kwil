@@ -7,4 +7,3 @@ publish = false
 
 [dependencies]
 kwil-core-text = { path = "../core-text" }
-kwil-core-commands = { path = "../core-commands" }

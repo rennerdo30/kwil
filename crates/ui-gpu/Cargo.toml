@@ -7,3 +7,15 @@ publish = false
 
 [dependencies]
 kwil-view-model = { path = "../view-model" }
+winit = "0.30.13"
+softbuffer = "0.4.8"
+fontdue = "0.9.5"
+raw-window-handle = "0.6.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

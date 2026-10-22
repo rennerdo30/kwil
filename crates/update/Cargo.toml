@@ -1,0 +1,12 @@
+[package]
+name = "kwil-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ureq = { version = "3.5.0", features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+self-replace = "1.5.0"

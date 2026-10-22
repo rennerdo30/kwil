@@ -27,13 +27,7 @@ impl LineIndex {
         Self::build_chunked(bytes, every, CHUNK, threads, progress)
     }
 
-    pub(crate) fn build_chunked(
-        bytes: &[u8],
-        every: u64,
-        chunk: usize,
-        threads: usize,
-        progress: &AtomicU64,
-    ) -> Self {
+    pub(crate) fn build_chunked(bytes: &[u8], every: u64, chunk: usize, threads: usize, progress: &AtomicU64) -> Self {
         let every = every.max(1);
         let chunks = bytes.len().div_ceil(chunk).max(1);
         let next = AtomicUsize::new(0);
@@ -104,8 +98,6 @@ impl LineIndex {
             return Some(off);
         }
         let tail = &bytes[off as usize..self.len as usize];
-        memchr_iter(b'\n', tail)
-            .nth((skip - 1) as usize)
-            .map(|p| off + p as u64 + 1)
+        memchr_iter(b'\n', tail).nth((skip - 1) as usize).map(|p| off + p as u64 + 1)
     }
 }

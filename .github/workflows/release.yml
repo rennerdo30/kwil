@@ -1,0 +1,77 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds every platform and creates a DRAFT release.
+# Only the owner publishes it (docs/RELEASING.md); once published, installed
+# copies pick it up through auto-update (crates/update).
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: .exe }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, ext: .exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: '' }
+          - { os: macos-latest, target: x86_64-apple-darwin, ext: '' }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: '' }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: '' }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches the workspace version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked -p kwil --target ${{ matrix.target }}
+      - name: Stage the binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/kwil${{ matrix.ext }}" "dist/kwil-${{ matrix.target }}${{ matrix.ext }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kwil-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum kwil-* > SHA256SUMS && cat SHA256SUMS
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "Kwil $GITHUB_REF_NAME" \
+            --generate-notes

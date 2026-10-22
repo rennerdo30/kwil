@@ -76,6 +76,7 @@ crates/
   ui-gpu         GPU frontend (winit + renderer, see §6)
   ui-tui         terminal frontend (ratatui + crossterm)
   app            binary: argument parsing, picks a frontend, wires threads
+  update         auto-update from GitHub Releases (owner wish KW-5; added 2026-10-23)
 ```
 
 Threading: the UI thread, plus a small fixed pool of worker threads (`std::thread` + channels; no async runtime in v1). Workers own disk I/O, indexing, parsing, search and save. The UI thread reads immutable snapshots: the buffer is persistent (copy-on-write nodes), so a worker can search or highlight a snapshot while the user keeps typing.

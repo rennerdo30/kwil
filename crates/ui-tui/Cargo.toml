@@ -7,3 +7,5 @@ publish = false
 
 [dependencies]
 kwil-view-model = { path = "../view-model" }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
