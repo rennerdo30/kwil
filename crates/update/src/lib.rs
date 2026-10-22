@@ -1,11 +1,12 @@
 //! Auto-update from GitHub Releases (owner wish KW-5, spec §7).
 //!
-//! - Never on the startup path: frontends call `spawn_background` after the
-//!   first frame; the check runs on its own thread at most once a day.
-//! - The release must carry `kwil-<target>[.exe]` and `SHA256SUMS`; the
-//!   download is verified against the checksum before it replaces the
-//!   binary on disk. The running editor keeps running; the new version is
-//!   used from the next start. Unsaved work is never touched.
+//! - Network checks never run on the startup path: frontends call
+//!   `spawn_background` after the first frame, at most once a day. Windows
+//!   startup checks only the local update lock and recovery journal.
+//! - Releases carry `kwil-<target>[.exe]`, Windows `.com`, and `SHA256SUMS`.
+//!   Windows installs a verified pair with backups and journal recovery;
+//!   other platforms replace one binary. The running editor keeps running;
+//!   the next start uses the new version. Unsaved work is never touched.
 //! - Off when `KWIL_NO_UPDATE` is set, when a `kwil.no-update` file sits next
 //!   to the executable (package managers, portable installs), in debug
 //!   builds, and for version 0.0.0.
@@ -15,9 +16,25 @@
 //! KW-5) and a prerelease channel setting.
 
 use serde::Deserialize;
+#[cfg(not(windows))]
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(any(windows, test))]
+mod transaction;
+
+/// Check the Windows update lock and recover an interrupted pair before any
+/// CLI or frontend work. A repaired startup asks for a restart because the
+/// Windows loader may already have mapped one of the interrupted images.
+pub fn recover_on_startup() -> Result<(), Error> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe()?;
+        transaction::startup(exe.parent().ok_or_else(|| Error("executable has no folder".into()))?)?;
+    }
+    Ok(())
+}
 
 pub const REPO: &str = "rennerdo30/kwil";
 const TARGET: &str = env!("KWIL_TARGET");
@@ -134,16 +151,33 @@ pub fn check_and_install(current: &str) -> Result<Outcome, Error> {
         Ok(agent.get(u).header("User-Agent", &ua).call()?.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec()?)
     };
     let sums = String::from_utf8(download(&sums_url)?)?;
-    let expected = expected_sha256(&sums, &want).ok_or_else(|| Error(format!("SHA256SUMS lists no {want}")))?;
     let bytes = download(&bin_url)?;
-    let actual = hex(&Sha256::digest(&bytes));
-    if actual != expected {
-        return Err(Error(format!("checksum mismatch for {want}: expected {expected}, got {actual}")));
+    #[cfg(windows)]
+    {
+        let console_name = want.trim_end_matches(".exe").to_owned() + ".com";
+        let console_url = url(&console_name).ok_or_else(|| Error(format!("release {latest} has no {console_name}")))?;
+        let console = download(&console_url)?;
+        let exe = std::env::current_exe()?;
+        let name = exe.file_name().and_then(|v| v.to_str()).unwrap_or_default();
+        if !name.eq_ignore_ascii_case("kwil.exe") && !name.eq_ignore_ascii_case("kwil.com") {
+            return Err(Error("install the Windows pair as kwil.exe and kwil.com before updating".into()));
+        }
+        let dir = exe.parent().ok_or_else(|| Error("executable has no folder".into()))?;
+        transaction::install(dir, [(&want, &bytes), (&console_name, &console)], &sums)?;
     }
-    install(&bytes)?;
+    #[cfg(not(windows))]
+    {
+        let expected = expected_sha256(&sums, &want).ok_or_else(|| Error(format!("SHA256SUMS lists no {want}")))?;
+        let actual = hex(&Sha256::digest(&bytes));
+        if actual != expected {
+            return Err(Error(format!("checksum mismatch for {want}: expected {expected}, got {actual}")));
+        }
+        install(&bytes)?;
+    }
     Ok(Outcome::Installed(format!("v{latest}")))
 }
 
+#[cfg(not(windows))]
 fn install(bytes: &[u8]) -> Result<(), Error> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().ok_or_else(|| Error("executable has no folder".into()))?;
