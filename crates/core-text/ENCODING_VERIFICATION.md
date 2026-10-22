@@ -7,6 +7,10 @@ Starting base: `778e875098a04badc3c4e3d14afefecd5cf5301c`.
 
 - `EncodedFile::new` detects from first/last at most 64 KiB. Detection is a
   heuristic; `reinterpret` is the explicit user override.
+- `EncodedFile::new_with_encoding` accepts an explicit choice before automatic
+  sniffing, so callers can recover with a retained TextFile after detection
+  fails. For example, `FF FE 00 00` is ambiguous between UTF-32LE and a UTF-16LE
+  BOM followed by U+0000; explicitly choosing UTF-16LE opens it correctly.
 - `decode_range` takes original **raw byte offsets**, including the BOM. It
   returns the actual character-aligned source range and display segments.
   UTF-8 text is borrowed; invalid byte segments retain the original bytes.
@@ -23,8 +27,13 @@ Starting base: `778e875098a04badc3c4e3d14afefecd5cf5301c`.
 - `Snapshot::source_chunks` retains Original vs Added provenance without copying.
   Original offsets remain source byte offsets; Added chunks contain UTF-8 and
   may split a UTF-8 scalar across adjacent chunks. Saves join that scalar with
-  at most three pending bytes. Edits inside encoded original characters are
-  rejected with `SplitCharacter`; use the decoded range's boundaries.
+  at most three pending bytes. Byte-preserving non-UTF-8 saves reject edits
+  inside original encoded characters with `SplitCharacter`; use the decoded
+  range's boundaries. During conversion, logically adjacent original pieces
+  share decoder state even when their source offsets are discontiguous. They
+  can form a complete character after deleting intervening bytes. The decoder
+  finalizes at an actual transition to added UTF-8 or EOF, and incomplete data
+  still returns `MalformedSource` before touching the output writer.
 - `save_plan` preserves encoding and BOM. `convert_to` changes the next save
   target. `change_line_endings` normalizes the next save; the streamed
   `plan_line_ending_edits` API produces raw snapshot-byte replacements with
@@ -118,3 +127,23 @@ the latter is a small proc macro, with no new syn dependency. The first focused
 debug test build took 3.59 s; the release example build took 4.78 s in this
 branch-specific target directory. These are build observations, not isolated
 per-dependency compile-cost estimates.
+
+## Independent review fixes
+
+Review of `5cfb3a5` found two P2 defects: explicit choices lost to the UTF-32
+sniff, and conversion finalized a decoder at each original-piece boundary.
+Two regressions first failed on that implementation with constructor API glue
+added: `UnsupportedEncoding("UTF-32")` and `MalformedSource`, respectively.
+
+The explicit constructor now honors the choice before sniffing. Conversion
+retains decoder state across original pieces. Tests join UTF-8, Shift_JIS and
+UTF-16 surrogate bytes after a deletion, and still require errors for an
+incomplete source at EOF or an actual transition to added UTF-8.
+
+The updated mutation script checks all **26 encoding tests** against **16
+behavioral mutations**, including reintroducing each review defect. Every new
+test fails in at least one broken copy; restored focused tests pass. Updated
+logs are under `E:/AgentData/scratch/kwil-kw10/review-1/`; original measurement
+and mutation receipts above remain historical evidence on their named commits.
+The one-shot 1 GiB measurement was not repeated for these detection-override
+and save-stream fixes.

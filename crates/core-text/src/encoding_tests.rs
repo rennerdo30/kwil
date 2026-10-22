@@ -407,3 +407,68 @@ fn iso2022_jp_is_known_limitation_never_garbled() {
     let error = Encoding::for_label("iso-2022-jp").unwrap_err();
     assert_eq!(error.to_string(), "ISO-2022-JP is not supported yet (known limitation, KW-45)");
 }
+
+#[test]
+fn review_explicit_override_recovers_ambiguous_utf32_detection() {
+    let dir = TempDir::new();
+    let bytes = encode("\0Hello\r\n", Encoding::UTF16_LE, true);
+    assert!(bytes.starts_with(b"\xff\xfe\0\0"));
+    let file = dir.open("utf16-leading-nul", &bytes);
+    assert!(matches!(EncodedFile::new(file.clone()), Err(EncodingError::UnsupportedEncoding(_))));
+    let source = EncodedFile::new_with_encoding(file.clone(), Encoding::UTF16_LE).unwrap();
+    assert_eq!(source.detection().encoding, Encoding::UTF16_LE);
+    assert_eq!(source.detection().bom_len, 2);
+    assert_eq!(text(&source.decode_range(0..bytes.len() as u64).unwrap()), "\0Hello\r\n");
+    let buffer = Buffer::from_file(file).unwrap();
+    let mut saved = Vec::new();
+    source.write_to(&buffer.snapshot(), source.save_plan(), &mut saved).unwrap();
+    assert_eq!(saved, bytes);
+    assert_eq!(source.reinterpret(Encoding::UTF16_LE).unwrap().detection().encoding, Encoding::UTF16_LE);
+
+    // Another unsupported automatic detection is recoverable from the retained
+    // TextFile too. The user's choice is explicit; automatic ISO refusal stays.
+    let (iso, _, errors) = encoding_rs::ISO_2022_JP.encode("日本語のメールです。");
+    assert!(!errors);
+    let file = dir.open("override-iso", &iso);
+    assert!(EncodedFile::new(file.clone()).is_err());
+    let explicit = EncodedFile::new_with_encoding(file, Encoding::UTF8).unwrap();
+    assert_eq!(explicit.detection().encoding, Encoding::UTF8);
+}
+
+#[test]
+fn review_conversion_decodes_logically_adjacent_original_pieces() {
+    let dir = TempDir::new();
+    for (i, (encoding, bytes, deletion, expected)) in [
+        (Encoding::UTF8, b"\xc3x\xa9Z".as_slice(), 1..2, "éZ"),
+        (Encoding::for_label("shift_jis").unwrap(), b"\x93x\xfaZ".as_slice(), 1..2, "日Z"),
+        (Encoding::UTF16_LE, b"\x3d\xd8x\0\0\xdeZ\0".as_slice(), 2..4, "😀Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = dir.open(&format!("joined-{i}"), bytes);
+        let source = EncodedFile::new_with_encoding(file.clone(), encoding).unwrap();
+        let mut buffer = Buffer::from_file(file).unwrap();
+        buffer.delete(deletion).unwrap();
+        let target = if encoding == Encoding::UTF16_LE { Encoding::UTF8 } else { Encoding::UTF16_BE };
+        let plan = source.save_plan().convert_to(target, true);
+        let mut saved = Vec::new();
+        source.write_to(&buffer.snapshot(), plan, &mut saved).unwrap();
+        assert_eq!(saved, encode(expected, target, true));
+
+        // An actual transition to added UTF-8 finalizes the original stream;
+        // a dangling lead byte must not be completed from added text.
+        if encoding == Encoding::UTF8 {
+            buffer.insert(1, b"x").unwrap();
+            let mut untouched = b"sentinel".to_vec();
+            assert!(matches!(
+                source.write_to(&buffer.snapshot(), plan, &mut untouched),
+                Err(EncodingError::MalformedSource)
+            ));
+            assert_eq!(untouched, b"sentinel");
+            buffer.undo();
+            buffer.delete(1..buffer.len()).unwrap();
+            assert!(matches!(source.validate_save(&buffer.snapshot(), plan), Err(EncodingError::MalformedSource)));
+        }
+    }
+}

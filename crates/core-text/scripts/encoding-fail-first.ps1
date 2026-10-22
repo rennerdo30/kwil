@@ -3,7 +3,8 @@ $env:CARGO_TARGET_DIR = 'E:/Development/_cache/cargo-target/kwil-kw-10-encodings
 $sourcePath = Join-Path (Get-Location) 'crates/core-text/src/encoding.rs'
 $originalSource = [IO.File]::ReadAllText($sourcePath)
 $baseCommit = (git rev-parse HEAD).Trim()
-$evidenceRoot = 'E:/AgentData/scratch/kwil-kw10'
+$evidenceRoot = 'E:/AgentData/scratch/kwil-kw10/review-1'
+New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
 $cargoExe = (Get-Command cargo).Source
 $cases = @(
     @{ name='corrupt-original-copy'; old='output.writer.write_all(bytes)?;'; new='output.writer.write_all(&bytes[..bytes.len().saturating_sub(1)])?;' },
@@ -19,7 +20,9 @@ $cases = @(
     @{ name='invert-ending-edit-plan'; old='if self.target != current {'; new='if self.target == current {' },
     @{ name='allow-split-character-edit'; old='if aligned.start != at as usize {'; new='if false && aligned.start != at as usize {' },
     @{ name='decode-malformed-during-normalization'; old='} else if plan.encoding == self.detection.encoding {'; new='} else if false && plan.encoding == self.detection.encoding {' },
-    @{ name='allow-stateful-iso2022-jp'; old='encoding == encoding_rs::ISO_2022_JP || encoding == encoding_rs::REPLACEMENT'; new='encoding == encoding_rs::REPLACEMENT' }
+    @{ name='allow-stateful-iso2022-jp'; old='encoding == encoding_rs::ISO_2022_JP || encoding == encoding_rs::REPLACEMENT'; new='encoding == encoding_rs::REPLACEMENT' },
+    @{ name='override-loses-to-utf32-sniff'; old='if chosen.is_none() && (bytes.starts_with(b"\xff\xfe\0\0") || bytes.starts_with(b"\0\0\xfe\xff")) {'; new='if bytes.starts_with(b"\xff\xfe\0\0") || bytes.starts_with(b"\0\0\xfe\xff") {' },
+    @{ name='finalize-each-original-piece'; old='transcode(decoder, bytes, false, &mut output)?;'; new='transcode(decoder, bytes, true, &mut output)?; source_decoder = None;' }
 )
 $proved = [Collections.Generic.HashSet[string]]::new()
 $summaries = [Collections.Generic.List[string]]::new()
@@ -56,4 +59,4 @@ $summaries.Add("Unique tests proven to fail: $($proved.Count)")
 $summaries.AddRange([string[]]($proved | Sort-Object))
 [IO.File]::WriteAllLines((Join-Path $evidenceRoot 'failfirst-summary.txt'), @("commit=$baseCommit") + $summaries)
 Write-Output "Unique tests proven to fail: $($proved.Count)"
-if ($proved.Count -ne 24) { throw 'Not every new test has fail-first evidence' }
+if ($proved.Count -ne 26) { throw 'Not every new test has fail-first evidence' }

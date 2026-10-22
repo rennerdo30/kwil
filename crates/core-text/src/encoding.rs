@@ -229,7 +229,7 @@ fn sample_utf8(bytes: &[u8], range: Range<usize>) -> bool {
 }
 
 fn detect_bytes(bytes: &[u8], chosen: Option<Encoding>) -> Result<Detection, EncodingError> {
-    if bytes.starts_with(b"\xff\xfe\0\0") || bytes.starts_with(b"\0\0\xfe\xff") {
+    if chosen.is_none() && (bytes.starts_with(b"\xff\xfe\0\0") || bytes.starts_with(b"\0\0\xfe\xff")) {
         return Err(EncodingError::UnsupportedEncoding("UTF-32".to_owned()));
     }
     let ranges = samples(bytes);
@@ -424,6 +424,12 @@ pub struct EncodedFile {
 impl EncodedFile {
     pub fn new(file: TextFile) -> Result<Self, EncodingError> {
         let detection = detect(&file)?;
+        Ok(Self::with_detection(file, detection))
+    }
+    /// Explicit interpretation, including recovery when automatic detection
+    /// refuses an ambiguous BOM or an unsupported detected encoding.
+    pub fn new_with_encoding(file: TextFile, encoding: Encoding) -> Result<Self, EncodingError> {
+        let detection = detect_bytes(file.bytes()?, Some(encoding))?;
         Ok(Self::with_detection(file, detection))
     }
     fn with_detection(file: TextFile, detection: Detection) -> Self {
@@ -810,10 +816,10 @@ impl EncodedFile {
         }
         let mut output = TextOutput::new(plan, writer);
         let mut added = Utf8Input::default();
+        let mut source_decoder = None;
         for chunk in snapshot.source_chunks(0..snapshot.len())? {
             match chunk? {
                 SourceChunk::Original { file, range, bytes } => {
-                    added.finish()?;
                     // Original references are immutable handles; pointer
                     // equality identifies this source without comparing data.
                     if !std::ptr::eq(file.bytes()?.as_ptr(), original.as_ptr()) || file.len() != self.file.len() {
@@ -823,7 +829,8 @@ impl EncodedFile {
                     if start >= range.end {
                         continue;
                     }
-                    if self.detection.encoding != Encoding::UTF8 {
+                    added.finish()?;
+                    if plan.encoding == self.detection.encoding && self.detection.encoding != Encoding::UTF8 {
                         self.require_boundary(original, start)?;
                         self.require_boundary(original, range.end)?;
                     }
@@ -833,13 +840,22 @@ impl EncodedFile {
                     } else if plan.encoding == self.detection.encoding {
                         output.copy_raw(bytes, self.detection.encoding)?;
                     } else {
-                        transcode(bytes, self.detection.encoding, &mut output)?;
+                        let decoder = source_decoder
+                            .get_or_insert_with(|| self.detection.encoding.0.new_decoder_without_bom_handling());
+                        transcode(decoder, bytes, false, &mut output)?;
                     }
                 }
-                SourceChunk::Added(bytes) => added.feed(bytes, |text| output.feed(text))?,
+                SourceChunk::Added(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    finish_source(&mut source_decoder, &mut output)?;
+                    added.feed(bytes, |text| output.feed(text))?;
+                }
             }
         }
         added.finish()?;
+        finish_source(&mut source_decoder, &mut output)?;
         output.finish()
     }
 
@@ -900,12 +916,23 @@ impl Utf8Input {
     }
 }
 
-fn transcode(bytes: &[u8], encoding: Encoding, output: &mut TextOutput<'_, impl Write>) -> Result<(), EncodingError> {
-    let mut decoder = encoding.0.new_decoder_without_bom_handling();
+fn finish_source(decoder: &mut Option<Decoder>, output: &mut TextOutput<'_, impl Write>) -> Result<(), EncodingError> {
+    if let Some(mut decoder) = decoder.take() {
+        transcode(&mut decoder, b"", true, output)?;
+    }
+    Ok(())
+}
+
+fn transcode(
+    decoder: &mut Decoder,
+    bytes: &[u8],
+    last: bool,
+    output: &mut TextOutput<'_, impl Write>,
+) -> Result<(), EncodingError> {
     let mut scratch = [0u8; SCRATCH];
     let mut at = 0;
     loop {
-        let (result, read, written) = decoder.decode_to_utf8_without_replacement(&bytes[at..], &mut scratch, true);
+        let (result, read, written) = decoder.decode_to_utf8_without_replacement(&bytes[at..], &mut scratch, last);
         output.feed(std::str::from_utf8(&scratch[..written]).unwrap())?;
         at += read;
         match result {
