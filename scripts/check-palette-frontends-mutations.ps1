@@ -10,8 +10,10 @@ $cases = @(
     @{Name='palette-paste';File='crates/core-commands/presets/vscode.toml';Old="keys = `"ctrl+v`"`ncommand = `"edit.paste`"`ncontext = `"palette`"";New="keys = `"ctrl+v`"`ncommand = `"edit.copy`"`ncontext = `"palette`"";Package='kwil-ui-gpu';Test='palette_ui::tests::palette_paste_binding_respects_unbind_and_pending_chords'},
     @{Name='tab-publication';File='crates/view-model/src/palette_session.rs';Old='let request = self.model.set_tabs(tabs.clone())?;';New='let request = self.model.set_tabs(self.tabs.clone())?;';Package='kwil-view-model';Test='palette_session::tests::tab_snapshot_replacement_invalidates_acceptance_and_publishes_new_tabs'}
 )
+$executed = 0
 foreach($case in $cases) {
     if($Only.Count -and $case.Name -notin $Only) {continue}
+    $executed += 1
     $file = Join-Path $root $case.File
     $original = [IO.File]::ReadAllBytes($file)
     $source = [IO.File]::ReadAllText($file)
@@ -35,4 +37,5 @@ foreach($case in $cases) {
         if((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $hash) {throw "Source restore hash failed: $file"}
     }
 }
+if($executed -eq 0) {throw 'No mutation cases selected; pass -Only as a PowerShell string array'}
 Write-Output "Proof $proof"

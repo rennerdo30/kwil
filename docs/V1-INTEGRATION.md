@@ -88,3 +88,11 @@ Product commit `f0bb765` adds the terminal palette controller and `KeymapEngine:
 Validation: TUI library 19 passed before adding the two controller regressions (PID73776); all three palette tests passed afterward (PID79016). Strict GUI/TUI all-target/all-feature Clippy passed (PID72872). Initial syntax and needless-return failures were corrected, not counted as passing checks. The latest GUI prefix helper from PR21 was merged at `9d43cfd`; its two integrated tests pass (PID27388). Formatting and diff checks pass. Every recorded process exited.
 
 No terminal/native palette-action capture, 100k-file latency measurement, full suite or full-v1 acceptance ran for these commits. Read-only palette and final tabs/session reviews are active. Existing native screenshot evidence remains pinned to `6d660f2`.
+
+### Palette frontend review R1 corrections
+
+`dc0aca6` / `bbd60a1` correct all five R1 source findings: TUI mouse dismissal restores Editor context; a previously displayed overlay blocks native scroll-copy through accepted actions; frontend-owned Go to Line dispatch precedes Vim model execution; palette-context Ctrl+V/Cmd+V bindings preserve tombstones/chords; open palette tab metadata refreshes after addressed workspace events without restarting unchanged queries.
+
+Proof: mouse-context compiled/assertion-failed PID67988 in `E:/Development/_cache/kwil-palette-frontends-proof-c6281d21d48446c2ae9d1ef089490f21`; overlay-copy, paste and tab-publication independently compiled/assertion-failed PIDs45100/49576/11140 in `E:/Development/_cache/kwil-palette-frontends-proof-57185a6fbba94c3b80c8b181f6a8fdf2`. Source restore hashes are checked. The first overlay proof was rejected by the harness because its custom panic text omitted the word assertion; the retained log still shows compilation and the intended failure. A later empty selection executed zero cases and is not evidence; the script now refuses zero selected cases.
+
+Restored frontend palette tests: 6 passed PID38512. Restored tab publication: 1 passed PID18620. Strict three-crate all-target/all-feature Clippy PID18824 and formatting/diff checks pass. All owned processes exited. Go-to dispatch is source corrected; no accepted GUI action/native artifact or 100k-file latency result is claimed.
