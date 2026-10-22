@@ -1954,6 +1954,7 @@ dependencies = [
  "arborium-typescript",
  "arborium-xml",
  "arborium-yaml",
+ "globset",
  "memmap2",
  "tree-sitter",
  "tree-sitter-rust",
@@ -2029,6 +2030,7 @@ name = "kwil-view-model"
 version = "0.1.0"
 dependencies = [
  "kwil-core-commands",
+ "kwil-core-syntax",
  "kwil-core-text",
  "kwil-core-workspace",
  "unicode-segmentation",

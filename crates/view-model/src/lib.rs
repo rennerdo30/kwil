@@ -8,6 +8,7 @@ use kwil_core_text::TextFile;
 use std::path::PathBuf;
 
 mod document;
+pub mod highlighting;
 mod editor;
 pub mod grid;
 pub mod hex;

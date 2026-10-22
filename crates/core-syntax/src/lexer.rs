@@ -38,6 +38,8 @@ pub(crate) fn highlight(
             i = bytes.len().min(i.saturating_add(table.close.len()));
             class = if table.open.contains('"') { Class::String } else { Class::Comment };
         } else if (!table.line.is_empty() && starts_comment(tail, table.line, language))
+            || (language == Language::Generic
+                && [b"#".as_slice(), b"//", b";", b"--"].iter().any(|marker| tail.starts_with(marker)))
             || (language == Language::Ini && tail.starts_with(b"#"))
             || (language == Language::Php && tail.starts_with(b"#"))
         {
@@ -72,12 +74,24 @@ pub(crate) fn highlight(
                 i += 1;
             }
             class = Class::Number;
+        } else if language == Language::Generic && matches!(bytes[i], b'(' | b')' | b'[' | b']' | b'{' | b'}') {
+            i += 1;
+            class = Class::Punctuation;
         } else if word(bytes[i]) {
             i += 1;
             while i < bytes.len() && word(bytes[i]) {
                 i += 1;
             }
             let token = &bytes[start..i];
+            if language == Language::Generic {
+                if let Some(class) = crate::detection::log_class(token) {
+                    let range = (window.start + start).max(requested.start)..(window.start + i).min(requested.end);
+                    if !range.is_empty() {
+                        spans.push(Span { range, class });
+                    }
+                }
+                continue;
+            }
             let insensitive = matches!(
                 language,
                 Language::Sql
