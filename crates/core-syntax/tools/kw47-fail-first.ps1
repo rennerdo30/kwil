@@ -63,4 +63,7 @@ Mutant 'snapshot-chunk' 'crates/view-model/src/highlighting.rs' 'max_len.min(SOU
 Mutant 'parser-document' 'crates/view-model/src/highlighting.rs' 'engine.reset_document();' '/* deliberately retain another document tree */' 'kwil-view-model' 'highlighting::tests::same_revision_different_document_resets_parser'
 Mutant 'retirement' 'crates/view-model/src/highlighting.rs' 'state.retired[index] = state.pending.take();' 'drop(state.pending.take());' 'kwil-view-model' 'highlighting::tests::latest_bounded_queue_retires_on_worker'
 Mutant 'result-cap' 'crates/view-model/src/highlighting.rs' 'highlights.spans.len() > MAX_RESULT_SPANS' 'false' 'kwil-view-model' 'highlighting::tests::result_and_config_caps'
+Mutant 'prior-highlights' 'crates/view-model/src/highlighting.rs' 'self.previous = Some(update);' 'self.previous = None;' 'kwil-view-model' 'highlighting::tests::errors_keep_prior_highlights_and_state_rejects_stale'
+Mutant 'stop-retirement' 'crates/view-model/src/highlighting.rs' 'state.stopped = true;' 'state.stopped = true; drop(state.pending.take());' 'kwil-view-model' 'highlighting::tests::cancel_and_drop_retire_pending_on_worker'
+Mutant 'generic-margin' 'crates/core-syntax/src/engine.rs' 'self.config.margin_bytes' '0' 'kwil-core-syntax' 'generic_large_source_reads_only_margin' 'kw47'
 Write-Output "Fail-first evidence: $evidence"
