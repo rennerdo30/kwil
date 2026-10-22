@@ -496,7 +496,9 @@ impl App {
                 _ => None,
             };
             if let Some(command) = command {
-                if self.dispatch_palette(command) || self.dispatch_zoom(command) { return; }
+                if self.dispatch_palette(command) || self.dispatch_zoom(command) {
+                    return;
+                }
                 self.dispatch_file(command);
                 return;
             }
@@ -1434,14 +1436,14 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut notice = false;
                 if let Some(palette) = &mut self.palette {
                     let changed = palette.worker_ready();
-                    if let Some(report) = palette.take_discovery_report() {
-                        if report.errors > 0 || report.end != kwil_core_workspace::catalogue::WalkEnd::Complete {
-                            notice = true;
-                            self.view.set_notice(format!(
-                                "File catalogue: {} files, {} skipped; {:?}",
-                                report.files, report.errors, report.end
-                            ));
-                        }
+                    if let Some(report) = palette.take_discovery_report()
+                        && (report.errors > 0 || report.end != kwil_core_workspace::catalogue::WalkEnd::Complete)
+                    {
+                        notice = true;
+                        self.view.set_notice(format!(
+                            "File catalogue: {} files, {} skipped; {:?}",
+                            report.files, report.errors, report.end
+                        ));
                     }
                     if changed {
                         self.palette_redraw();

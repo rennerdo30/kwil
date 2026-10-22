@@ -57,21 +57,6 @@ pub(super) fn draw(palette: &Palette, pixels: &mut [u32], size: (usize, usize), 
     Some(panel)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn panel_is_inside_tiny_and_scaled_windows() {
-        assert!(area((10, 10), 8, 16).is_none());
-        for (size, cell) in [((800, 600), (8, 16)), ((3840, 2160), (24, 48)), ((33, 49), (8, 16))] {
-            let rect = area(size, cell.0, cell.1).unwrap();
-            assert!(rect.x + rect.w <= size.0 && rect.y + rect.h <= size.1);
-            assert_eq!(rect.w % cell.0, 0);
-            assert_eq!(rect.h % cell.1, 0);
-        }
-    }
-}
-
 impl App {
     pub(super) fn capture_input_destination(&self) -> ime::Destination {
         match self.palette.as_ref().filter(|palette| palette.model().is_open()) {
@@ -313,5 +298,20 @@ impl App {
             let _ = palette.input(PaletteInput::Previous);
         }
         self.palette_input(PaletteInput::Accept);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn panel_is_inside_tiny_and_scaled_windows() {
+        assert!(area((10, 10), 8, 16).is_none());
+        for (size, cell) in [((800, 600), (8, 16)), ((3840, 2160), (24, 48)), ((33, 49), (8, 16))] {
+            let rect = area(size, cell.0, cell.1).unwrap();
+            assert!(rect.x + rect.w <= size.0 && rect.y + rect.h <= size.1);
+            assert_eq!(rect.w % cell.0, 0);
+            assert_eq!(rect.h % cell.1, 0);
+        }
     }
 }
