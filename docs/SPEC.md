@@ -35,6 +35,7 @@ Maybe later, only if speed stays intact: plugins (v2, as WASM components), split
 4. **Measured, not assumed.** Every budget in §3 has a benchmark in CI. A regression fails the build.
 5. **Small dependency graph.** Each dependency costs compile time and startup time and has to earn its place (§9).
 6. **Event-driven, damage-only drawing.** No frame loop. Draw only what changed, and present only that region. This has to hold over RDP and VNC (§6).
+7. **Memory is bounded by the viewport, never by the file** (owner, 2026-10-23, KW-40). Machines may have less RAM than the file is large. Files are mapped, not loaded; indexes are sparse; search, save, decode and diff stream in chunks; edit and undo buffers have caps and spill to disk. No code path builds a file-sized buffer in memory.
 
 ## 3. Speed budgets (proposed; the owner sets the final numbers)
 
@@ -89,7 +90,7 @@ Threading: the UI thread, plus a small fixed pool of worker threads (`std::threa
 4. A background pass builds the line index. It scans the bytes with `memchr` in parallel chunks, recording line starts sparsely (one checkpoint per N lines) so the index for a 20M-line file stays a few MB. The scrollbar and line count show "≈" until the pass ends.
 5. UTF-8 is checked lazily per chunk (`simdutf8`). Invalid bytes are shown as escape glyphs and kept byte-exact on save.
 
-Legacy encodings (Shift-JIS, Windows-1252, UTF-16, …) are decoded to UTF-8 with `encoding_rs`, chunk by chunk in the background, and encoded back on save.
+Legacy encodings (Shift-JIS, Windows-1252, UTF-16, …) are decoded to UTF-8 with `encoding_rs` per viewport and per search chunk, using a sparse decode index built in the background, and encoded back on save. There is never a full decoded copy in RAM (principle 7).
 
 **mmap safety:** if another program truncates a mapped file, reading it can crash the process (SIGBUS on Unix). Rule: files under 64 MB (configurable) are read fully into memory, which takes a few ms. Larger files are mapped, watched with `notify`, and re-checked by size and mtime before each region read. If they changed, the editor shows "file changed on disk" instead of reading stale pages.
 
@@ -182,7 +183,9 @@ Flags: `--tui` forces the terminal UI and `--gui` forces a window. The check cos
 - **Motion that never waits:** optional smooth scrolling, driven only while the scroll is moving (no idle frames). It is off in remote mode. No other animations.
 - **Markdown preview:** side by side, one key away.
 - **Diff view:** aligned side by side, word-level highlights, collapsed unchanged regions and change navigation (`F7` / `Shift+F7`).
-- **Themes:** one dark and one light theme designed for long sessions, plus colour overrides in the settings file.
+- **Themes** (owner, 2026-10-23, KW-37): theme files in TOML (UI colours plus syntax scopes), with a built-in dark and light theme designed for long sessions, a live-reloaded user theme folder, hover preview in the palette, optional OS dark/light follow, and import of VS Code and TextMate colour themes. The active theme is cached so theme parsing never runs on the startup path.
+- **Window controls** (owner, 2026-10-23, KW-39): native on every platform. Windows uses the system caption buttons with snap layouts and a theme-matched dark/Mica title bar; macOS uses native traffic lights and full-screen tiling; Linux uses server-side decorations, or libdecor on GNOME/Wayland. Any drawn title-bar content keeps native hit-testing.
+- **Logo** (owner, 2026-10-23, KW-38): an original SVG logo, with the app icon set (`.ico`, `.icns`, PNG sizes) generated from it.
 - **Typography:** good default font size, line height and ligature support; crisp text at fractional DPI scales on Windows.
 
 ## 7. Feature specification
