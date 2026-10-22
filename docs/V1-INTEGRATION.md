@@ -51,3 +51,32 @@ were `--help`/`--version`, with no GUI window. All owned Cargo processes exited.
 Main advanced separately through reviewed launcher PR #10, merged as
 `f37e23f9d93544e0cf5fe8142645afbb848f5665`; that merge does not imply approval of
 this complete integration branch. Only the owner publishes releases.
+
+## GUI palette/native checkpoint
+
+GUI event wiring was added in `9618120` and corrected through `6d660f2624cbe0def180a72b8f8b3ebe4b0c31bb`.
+The earlier statement that the GUI overlay is unregistered is superseded here;
+the TUI overlay remains unwired. Native execution proves display/query filtering,
+not full palette action or performance acceptance.
+
+- Palette overlay geometry test passed after correcting an initial IME fallback
+  return-type compilation error. No compiler failure was counted as a pass.
+- Integrated session R2 checks at `db16771`: workspace 21, document worker 13,
+  IME 6 passed. Native destination helper at `ad90390`: 15 Windows tests passed;
+  symlink-dependent cases are conditional on OS permission.
+- Targeted three-package all-feature/all-target Clippy passed at `01c187a` after
+  fixing two palette lint errors. Workspace formatting passed at `6d660f2`.
+- Debug/frame-harness build at `6d660f2` completed in 12.39 seconds (Cargo PID 73324).
+- Copied executable SHA256:
+  `FBA8E871C38ECD12A1386E4FE206471FCA4517CD81A405D77341B1C774CCDAE6`.
+- Hidden capture runner PID 63684 and GUI PID 31952 both exited 0. Native caption,
+  controls, small/big icons and DWM cloak were verified before interaction.
+- Captures show two tabs, typed document text, worker-filtered `>save` results,
+  and visibly larger text after real zoom dispatch. Scoped hidden/debug function
+  keys exercised commands; no global keyboard, clipboard, display or owner
+  profile manipulation occurred. Actual Ctrl shortcuts and monitor movement
+  were not exercised natively.
+
+Evidence: `E:/Development/_cache/kwil-palette-native-20261023/` contains the copied
+binary, identity, build/check logs, probe script, isolated profiles and captures.
+No agent-launched window appeared on the owner's desktop.
