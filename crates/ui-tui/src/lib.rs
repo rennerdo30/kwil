@@ -877,7 +877,8 @@ mod tests {
         keep_visible(&mut view, &mut horizontal, 22, 4);
         assert!(horizontal > 0);
         terminal.draw(|frame| draw(frame, &view)).unwrap();
-        assert!(terminal.get_cursor_position().unwrap().x < 30);
+        assert!(terminal.backend().cursor_visible(), "horizontal scrolling must keep the caret visible");
+        assert_eq!(terminal.get_cursor_position().unwrap(), ratatui::layout::Position::new(8, 0));
     }
 
     fn press(view: &mut View, code: KeyCode, modifiers: KeyModifiers, seconds: u64) {

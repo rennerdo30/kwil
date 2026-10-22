@@ -110,10 +110,48 @@ enum UnboundKey {
     Ignore,
 }
 
+fn cancel_save_prompt(path: &mut Option<String>, close_pending: &mut bool) {
+    *path = None;
+    *close_pending = false;
+}
+
+fn command_notice(status: CommandStatus) -> Option<String> {
+    match status {
+        CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => Some(message),
+        CommandStatus::IndexNotReady => Some("Indexing: editing will be available when ready".into()),
+        CommandStatus::Applied | CommandStatus::SaveRequested => None,
+    }
+}
+
 #[cfg(test)]
 mod input_dispatch_tests {
     use super::*;
     use kwil_core_commands::{Binding, Preset, keymap::KeymapEngine, vim::VimResult};
+
+    #[test]
+    fn cancelling_save_as_cancels_its_close_intent() {
+        let mut path = Some("unfinished.txt".into());
+        let mut close_pending = true;
+        cancel_save_prompt(&mut path, &mut close_pending);
+        assert!(path.is_none());
+        assert!(!close_pending, "a later ordinary save must not close the window");
+    }
+
+    #[test]
+    fn vim_and_bound_command_notices_remain_visible() {
+        for status in [
+            CommandStatus::Message("register is empty".into()),
+            CommandStatus::NotImplemented("command not implemented: view.settings".into()),
+            CommandStatus::IndexNotReady,
+        ] {
+            let mut view = View::new(None);
+            let notice = command_notice(status).expect("non-applied command must explain its result");
+            let damage = view.set_notice(notice.clone());
+            assert!(damage.status);
+            assert!(view.status_text().contains(&notice));
+        }
+        assert!(command_notice(CommandStatus::Applied).is_none());
+    }
 
     #[test]
     fn gui_tombstones_suppress_selection_quit_and_chord_fallbacks() {
@@ -383,7 +421,7 @@ impl App {
         if self.save_path.is_some() {
             match &ev.logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    self.save_path = None;
+                    cancel_save_prompt(&mut self.save_path, &mut self.close_pending);
                 }
                 Key::Named(NamedKey::Enter) => {
                     let path = self.save_path.take().unwrap();
@@ -451,6 +489,7 @@ impl App {
                                         let damage = self.view.refresh_after_edit(result.damage);
                                         self.apply(damage);
                                         self.keep_caret_visible();
+                                        self.command_status(result.status);
                                     }
                                     Err(error) => {
                                         let damage = self.view.set_notice(error.to_string());
@@ -530,22 +569,21 @@ impl App {
             Ok(result) => {
                 self.apply(result.damage);
                 self.keep_caret_visible();
-                let notice = match result.status {
-                    CommandStatus::Applied => return,
-                    CommandStatus::SaveRequested => {
-                        self.save();
-                        return;
-                    }
-                    CommandStatus::IndexNotReady => "Indexing: editing will be available when ready".to_string(),
-                    CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => message,
-                };
-                let damage = self.view.set_notice(notice);
-                self.apply(damage);
+                self.command_status(result.status);
             }
             Err(error) => {
                 let damage = self.view.set_notice(error.to_string());
                 self.apply(damage);
             }
+        }
+    }
+
+    fn command_status(&mut self, status: CommandStatus) {
+        if status == CommandStatus::SaveRequested {
+            self.save();
+        } else if let Some(notice) = command_notice(status) {
+            let damage = self.view.set_notice(notice);
+            self.apply(damage);
         }
     }
 
