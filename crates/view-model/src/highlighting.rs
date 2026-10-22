@@ -158,6 +158,7 @@ struct Job {
 struct State {
     pending: Option<Job>,
     retired: [Option<Job>; RETIRE_CAPACITY],
+    retired_sources: [Option<Arc<dyn TextSource>>; RETIRE_CAPACITY],
     result: Option<(u64, HighlightKey, Result<Arc<PublishedHighlights>, Error>)>,
     stopped: bool,
 }
@@ -168,7 +169,8 @@ struct Shared {
 }
 
 /// One active + one latest pending job, eight retirement slots and one result.
-/// At most eighteen accepted source handles including a draining retire batch.
+/// At most eighteen accepted job handles including a draining retire batch,
+/// plus sixteen standalone source handles across queued/draining retirement.
 pub struct HighlightWorker {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -205,6 +207,7 @@ impl HighlightWorker {
             state: Mutex::new(State {
                 pending: None,
                 retired: [const { None }; RETIRE_CAPACITY],
+                retired_sources: [const { None }; RETIRE_CAPACITY],
                 result: None,
                 stopped: false,
             }),
@@ -219,18 +222,27 @@ impl HighlightWorker {
                 let mut settings: Option<Arc<[LanguageMapping]>> = None;
                 let mut detector = None;
                 loop {
-                    let (job, retired, stopped) = {
+                    let (job, retired, sources, stopped) = {
                         let mut state = worker.state.lock().unwrap();
-                        while state.pending.is_none() && !state.stopped {
+                        while state.pending.is_none()
+                            && state.retired_sources.iter().all(Option::is_none)
+                            && !state.stopped
+                        {
                             state = worker.ready.wait(state).unwrap();
                         }
                         (
                             state.pending.take(),
                             std::mem::replace(&mut state.retired, [const { None }; RETIRE_CAPACITY]),
+                            std::mem::replace(&mut state.retired_sources, [const { None }; RETIRE_CAPACITY]),
                             state.stopped,
                         )
                     };
                     drop(retired);
+                    let drained = sources.iter().any(Option::is_some);
+                    drop(sources);
+                    if drained {
+                        wake();
+                    }
                     if stopped {
                         drop(job);
                         break;
@@ -321,6 +333,19 @@ impl HighlightWorker {
         self.shared.ready.notify_one();
     }
 
+    /// Retire frontend-held source handles on this same fixed worker. A full
+    /// queue returns ownership for retry on a worker event.
+    pub fn retire_source(&self, source: Arc<dyn TextSource>) -> Result<(), Arc<dyn TextSource>> {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.stopped {
+            return Err(source);
+        }
+        let Some(slot) = state.retired_sources.iter_mut().find(|slot| slot.is_none()) else { return Err(source) };
+        *slot = Some(source);
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
     /// Consume on wake; reject a different DocumentId, revision OR viewport.
     /// Matching errors leave the frontend's HighlightState unchanged.
     pub fn take_update(&self, current: HighlightKey) -> Option<Result<Arc<PublishedHighlights>, Error>> {
@@ -385,6 +410,30 @@ mod tests {
     }
     fn wait(events: &mpsc::Receiver<()>) {
         events.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn idle_source_retirement_runs_on_the_existing_worker_and_wakes_host() {
+        struct Retired(mpsc::Sender<Option<String>>);
+        impl TextSource for Retired {
+            fn len(&self) -> usize {
+                0
+            }
+            fn chunk(&self, _: usize, _: usize) -> io::Result<Cow<'_, [u8]>> {
+                Ok(Cow::Borrowed(b""))
+            }
+        }
+        impl Drop for Retired {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().name().map(str::to_owned));
+            }
+        }
+        let (worker, events) = worker(Config::default());
+        let (sender, receiver) = mpsc::channel();
+        assert!(worker.retire_source(Arc::new(Retired(sender))).is_ok());
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap().as_deref(), Some("kwil-highlighting"));
+        wait(&events);
+        worker.shutdown().unwrap();
     }
 
     #[test]

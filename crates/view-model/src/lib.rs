@@ -11,6 +11,7 @@ mod document;
 mod editor;
 pub mod grid;
 pub mod hex;
+pub mod highlight_session;
 pub mod highlighting;
 pub mod palette_session;
 mod workspace;
@@ -48,6 +49,7 @@ pub struct View {
     rows: usize,
     lines: Vec<Vec<u8>>,
     line_offsets: Vec<u64>,
+    line_sources: Vec<std::ops::Range<u64>>,
     notice: String,
     editor: Option<Editor>,
     pending_goto: Option<(u64, u64, bool)>,
@@ -69,6 +71,7 @@ impl View {
             rows: 0,
             lines: Vec::new(),
             line_offsets: Vec::new(),
+            line_sources: Vec::new(),
             notice: String::new(),
             editor,
             pending_goto: None,
@@ -109,6 +112,12 @@ impl View {
     /// Source-byte column of this row's UTF-8-aligned visible window.
     pub fn line_offset(&self, row: usize) -> u64 {
         self.line_offsets.get(row).copied().unwrap_or(0)
+    }
+
+    /// Cached absolute byte window, computed during viewport reload. Styling
+    /// reads no file bytes and performs no line-index lookup on the input path.
+    pub fn line_source(&self, row: usize) -> Option<std::ops::Range<u64>> {
+        self.line_sources.get(row).cloned()
     }
 
     /// 1-based line number shown in the gutter for `row`.
@@ -221,19 +230,29 @@ impl View {
                     let bytes = text::read(&snapshot, context..end, self.line_byte_limit as u64 + 7)?;
                     let start = grid::boundary(&bytes, (wanted - context) as usize);
                     let end = grid::boundary(&bytes, (start + self.line_byte_limit).min(bytes.len()));
-                    Ok((context - range.start + start as u64, bytes[start..end].to_vec()))
+                    Ok((
+                        context - range.start + start as u64,
+                        context + start as u64..context + end as u64,
+                        bytes[start..end].to_vec(),
+                    ))
                 })
                 .collect::<std::io::Result<Vec<_>>>();
             match result {
                 Ok(lines) => {
-                    let (offsets, lines) = lines.into_iter().unzip();
-                    self.line_offsets = offsets;
-                    self.lines = lines;
+                    self.line_offsets.clear();
+                    self.line_sources.clear();
+                    self.lines.clear();
+                    for (offset, source, bytes) in lines {
+                        self.line_offsets.push(offset);
+                        self.line_sources.push(source);
+                        self.lines.push(bytes);
+                    }
                 }
                 Err(error) => self.notice = error.to_string(),
             }
             return;
         }
+        self.line_sources.clear();
         let Some(file) = &self.file else {
             self.lines = vec![b"No file open. Usage: kwil <file>".to_vec()];
             return;

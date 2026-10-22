@@ -19,9 +19,18 @@ fn rect(area: TabArea, origin: Rect) -> Rect {
 }
 
 pub(super) fn draw(frame: &mut ratatui::Frame, workspace: &Workspace, layout: TabLayout) {
+    draw_highlighted(frame, workspace, layout, &[]);
+}
+
+pub(super) fn draw_highlighted(
+    frame: &mut ratatui::Frame,
+    workspace: &Workspace,
+    layout: TabLayout,
+    highlights: &[&kwil_view_model::highlighting::Span],
+) {
     let area = frame.area();
     let geometry = geometry(workspace, area.width, area.height, layout);
-    super::draw_area(frame, workspace, rect(geometry.body, area), false);
+    super::draw_area_highlighted(frame, workspace, rect(geometry.body, area), false, highlights);
     let idle = Color::Rgb(0x10, 0x1d, 0x31);
     let foreground = Color::Rgb(0xd6, 0xe4, 0xf0);
     frame.render_widget(Paragraph::new("").style(Style::default().bg(idle)), rect(geometry.chrome, area));

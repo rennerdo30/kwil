@@ -19,6 +19,7 @@ use ratatui::widgets::Paragraph;
 use std::sync::mpsc;
 
 enum Msg {
+    HighlightsReady,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
     Input(Event),
@@ -73,6 +74,7 @@ pub fn run_with_external_open(
     }
 
     let mut palette: Option<kwil_view_model::palette_session::PaletteSession> = None;
+    let mut highlighting: Option<kwil_view_model::highlight_session::HighlightSession> = None;
     let result = (|| -> std::io::Result<()> {
         let size = terminal.size()?;
         let geometry = tabs::geometry(&view, size.width, size.height, Settings::default().tabs.layout);
@@ -87,6 +89,14 @@ pub fn run_with_external_open(
             let _ = t.send(Msg::Notice(msg));
         }));
         on_external_ready(external_open);
+        let highlight_sender = tx.clone();
+        highlighting = kwil_view_model::highlight_session::HighlightSession::new(move || {
+            let _ = highlight_sender.send(Msg::HighlightsReady);
+        })
+        .ok();
+        if let Some(host) = &mut highlighting {
+            host.update(&view);
+        }
         let settings_sender = tx.clone();
         std::thread::spawn(move || {
             let root = match std::env::var_os("KWIL_WORKSPACE_ROOT") {
@@ -117,6 +127,7 @@ pub fn run_with_external_open(
         while let Ok(msg) = rx.recv() {
             let user_input = matches!(&msg, Msg::Input(_));
             let changed = match msg {
+                Msg::HighlightsReady => highlighting.as_mut().is_some_and(|host| !host.worker_ready(&view).is_empty()),
                 Msg::PaletteRoot(root) => {
                     match root.and_then(|root| {
                         let sender = tx.clone();
@@ -333,8 +344,12 @@ pub fn run_with_external_open(
                 if let Some(editor) = view.editor_mut() {
                     editor.settings = settings.clone();
                 }
+                if let Some(host) = &mut highlighting {
+                    host.update(&view);
+                }
+                let spans: Vec<_> = highlighting.as_ref().into_iter().flat_map(|host| host.spans(&view)).collect();
                 terminal.draw(|f| {
-                    tabs::draw(f, &view, settings.tabs.layout);
+                    tabs::draw_highlighted(f, &view, settings.tabs.layout, &spans);
                     if let Some(host) = &palette {
                         palette_ui::draw(f, host.model());
                     }
@@ -343,6 +358,10 @@ pub fn run_with_external_open(
         }
         Ok(())
     })();
+
+    if let Some(host) = &mut highlighting {
+        host.stop();
+    }
 
     if let Some(host) = &mut palette {
         let handles = host.stop();
@@ -659,7 +678,18 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
     draw_area(f, view, area, true);
 }
 
+#[cfg(test)]
 fn draw_area(f: &mut ratatui::Frame, view: &View, area: Rect, status: bool) {
+    draw_area_highlighted(f, view, area, status, &[]);
+}
+
+fn draw_area_highlighted(
+    f: &mut ratatui::Frame,
+    view: &View,
+    area: Rect,
+    status: bool,
+    highlights: &[&kwil_view_model::highlighting::Span],
+) {
     let gutter_style = Style::default().fg(Color::Rgb(0x5b, 0x6b, 0x85));
     for row in 0..view.rows().min(area.height.saturating_sub(u16::from(status)) as usize) {
         let y = area.y + row as u16;
@@ -678,7 +708,13 @@ fn draw_area(f: &mut ratatui::Frame, view: &View, area: Rect, status: bool) {
             let selected = selections.iter().any(|range| {
                 range.start < source + cell.bytes.end as u64 && source + (cell.bytes.start as u64) < range.end
             });
-            let style = if selected { Style::default().bg(Color::Rgb(0x30, 0x58, 0x80)) } else { Style::default() };
+            let mut style = if selected { Style::default().bg(Color::Rgb(0x30, 0x58, 0x80)) } else { Style::default() };
+            let offset = source as usize + cell.bytes.start;
+            let index = highlights.partition_point(|span| span.range.end <= offset);
+            if let Some(span) = highlights.get(index).filter(|span| span.range.start <= offset) {
+                let rgb = kwil_view_model::highlight_session::syntax_rgb(span.class);
+                style = style.fg(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
+            }
             spans.push(Span::styled(if cell.text == "\t" { " ".repeat(cell.width) } else { cell.text }, style));
         }
         let line = Line::from(spans);
@@ -741,6 +777,24 @@ fn keep_visible(view: &mut View, horizontal: &mut u64, columns: usize, tab: usiz
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn syntax_foreground_preserves_selection_background_and_horizontal_bytes() {
+        use kwil_view_model::highlighting::{Class, Span as SyntaxSpan};
+        let mut view = View::new(None);
+        view.set_rows(1);
+        view.execute("edit.insert", &CommandArgs { text: Some("abc123".into()), ..Default::default() }, 1).unwrap();
+        view.execute("edit.selectAll", &Default::default(), 1).unwrap();
+        view.set_horizontal_window(3, 16);
+        let span = SyntaxSpan { range: 3..6, class: Class::Number };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 2)).unwrap();
+        terminal.draw(|frame| draw_area_highlighted(frame, &view, frame.area(), false, &[&span])).unwrap();
+        let rgb = kwil_view_model::highlight_session::syntax_rgb(Class::Number);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(8, 0)].symbol(), "1");
+        assert_eq!(buffer[(8, 0)].fg, Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
+        assert_eq!(buffer[(8, 0)].bg, Color::Rgb(0x30, 0x58, 0x80));
+    }
 
     fn binding(keys: &str, command: &str) -> kwil_core_commands::Binding {
         kwil_core_commands::Binding { keys: keys.into(), command: command.into(), context: None, mode: None }

@@ -77,6 +77,7 @@ impl std::fmt::Display for GuiError {
 }
 
 enum UserEvent {
+    HighlightsReady,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
     Document(kwil_view_model::document_worker::DocumentResult),
@@ -225,6 +226,7 @@ mod input_dispatch_tests {
 }
 
 struct App {
+    highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
     palette: Option<kwil_view_model::palette_session::PaletteSession>,
     palette_dirty: bool,
     palette_area: Option<Rect>,
@@ -317,6 +319,7 @@ pub fn run_with_external_open(
     let frontend_epoch = view.input_epoch();
     let horizontal = view.horizontal_origin();
     let mut app = App {
+        highlighting: None,
         palette: None,
         palette_dirty: false,
         palette_area: None,
@@ -456,6 +459,10 @@ impl App {
     }
 
     fn apply(&mut self, d: Damage) {
+        if let Some(highlighting) = &mut self.highlighting {
+            highlighting.invalidate_painted(&self.view, &d);
+            highlighting.update(&self.view);
+        }
         if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty {
             return;
         }
@@ -787,6 +794,7 @@ impl App {
         let bars = self.bars();
         let rows = geometry.text.height / ch;
         let palette_open = self.palette_open();
+        let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
         let pixels = &mut gfx.pixels;
         let body_pixels = &mut self.body_pixels;
@@ -807,7 +815,7 @@ impl App {
             pixels.fill(BG);
             body_pixels.fill(BG);
             for row in 0..rows {
-                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal);
+                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
             }
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
@@ -832,7 +840,7 @@ impl App {
             p.rows.sort_unstable();
             p.rows.dedup();
             for &row in p.rows.iter().filter(|&&r| r < rows) {
-                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal);
+                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
                 let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
@@ -1028,7 +1036,15 @@ fn horizontal_suffix_start(bytes: &[u8], columns: usize, tab_size: usize) -> usi
     left
 }
 
-fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, _horizontal: u64) {
+fn draw_row(
+    buf: &mut [u32],
+    w: usize,
+    font: &mut Font,
+    view: &View,
+    r: usize,
+    _horizontal: u64,
+    spans: &[&kwil_view_model::highlighting::Span],
+) {
     let (cw, ch) = (font.cw, font.ch);
     let y = r * ch;
     let gutter = GUTTER_COLS * cw;
@@ -1038,6 +1054,25 @@ fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize, _
         let num = format!("{:>7} ", view.line_number(r));
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, GUTTER_FG, GUTTER_BG);
         draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, FG, BG);
+        if let Some(source) = view.line_source(r) {
+            let cells = text::cells(text, w.saturating_sub(gutter + BAR) / cw, font.tab_size());
+            // The existing RTL renderer owns visual placement for the whole
+            // paragraph; logical cell overlays must not disturb that ordering.
+            if !cells.iter().any(|cell| shaping::needs_bidi(&cell.text)) {
+                for cell in cells {
+                    let offset = source.start as usize + cell.bytes.start;
+                    let index = spans.partition_point(|span| span.range.end <= offset);
+                    if let Some(span) = spans.get(index).filter(|span| span.range.start <= offset)
+                        && cell.text != "\t"
+                    {
+                        let color = kwil_view_model::highlight_session::syntax_rgb(span.class);
+                        let x = gutter + cell.column * cw;
+                        fill(buf, w, Rect { x, y, w: cell.width * cw, h: ch }, BG);
+                        draw_text(buf, w, font, x, y, cell.text.as_bytes(), cell.width, color, BG);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1350,6 +1385,14 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         trace::mark("first frame presented");
+        let highlight_proxy = self.proxy.clone();
+        self.highlighting = kwil_view_model::highlight_session::HighlightSession::new(move || {
+            let _ = highlight_proxy.send_event(UserEvent::HighlightsReady);
+        })
+        .ok();
+        if let Some(highlighting) = &mut self.highlighting {
+            highlighting.update(&self.view);
+        }
         let document_proxy = self.proxy.clone();
         let complete = move |result| {
             let _ = document_proxy.send_event(UserEvent::Document(result));
@@ -1414,6 +1457,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
+            UserEvent::HighlightsReady => {
+                let rows = self.highlighting.as_mut().map_or_else(Vec::new, |host| host.worker_ready(&self.view));
+                Damage { rows, ..Default::default() }
+            }
             UserEvent::PaletteRoot(root) => {
                 match root.and_then(|root| {
                     let proxy = self.proxy.clone();
