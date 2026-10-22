@@ -11,6 +11,7 @@ fn output(binary: &str, arg: &str) -> std::process::Output {
     }
     #[allow(unused_mut)]
     let mut child = command.spawn().unwrap();
+    eprintln!("CLI PID {}: {arg}", child.id());
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
