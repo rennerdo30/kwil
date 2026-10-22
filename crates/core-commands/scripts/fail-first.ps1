@@ -1,3 +1,4 @@
+param([switch]$FixRoundOne)
 # Run only the focused contract tests, in a disposable standalone crate copy.
 # Each deliberate defect must compile and fail its named tests. The source
 # worktree is never mutated. Output/logs stay in the branch's external cache.
@@ -47,9 +48,17 @@ function Mutate([string]$name, [string]$file, [string]$before, [string]$after, [
         Run-Tests $name $tests
     } finally { [IO.File]::WriteAllText($path, $original) }
 }
+if ($FixRoundOne) {
+    Mutate 'notepad-save-all' 'presets/notepad++.toml' 'command = "file.saveAll"' 'command = "file.saveAs"' @('reviewed_presets_match_windows_shortcuts')
+    Mutate 'vscode-delete-line' 'presets/vscode.toml' 'keys = "ctrl+shift+k"' 'keys = "ctrl+shift+j"' @('reviewed_presets_match_windows_shortcuts')
+    Mutate 'punctuation-alias' 'src/key.rs' 'let key = match key {' 'if matches!(key, Key::Character(c) if c.is_ascii_punctuation()) { modifiers.shift = false; } let key = match key {' @('punctuation_preserves_logical_key_and_explicit_shift', 'adapters_normalize_logical_keys_without_conflating_ctrl_and_cmd')
+    Mutate 'discard-source-lines' 'src/settings.rs' "line: prefix.bytes().filter(|&b| b == b'\n').count() + 1," 'line: 1,' @('settings_parse_errors_keep_locations', 'settings_validation_errors_keep_locations', 'settings_unknown_warnings_keep_key_spans')
+    Write-Output "All five new fix-round-1 contracts rejected compiling defects. Evidence: $summary"
+    exit 0
+}
 Mutate 'registry-id' 'src/registry.rs' '"file.save" => "Save"' '"file.missing" => "Save"' @('registry_covers_v1_and_has_unique_palette_metadata', 'presets_load_and_reference_registered_commands')
 Mutate 'shortcut-case' 'src/key.rs' 'parts.len() > 1' 'parts.len() > 99' @('chords_parse_valid_aliases_and_reject_invalid_input')
-Mutate 'punctuation-shift' 'src/key.rs' 'modifiers.shift = false;' 'modifiers.shift = true;' @('adapters_normalize_logical_keys_without_conflating_ctrl_and_cmd')
+Mutate 'punctuation-shift' 'src/key.rs' 'let key = match key {' 'if matches!(key, Key::Character(c) if c.is_ascii_punctuation()) { modifiers.shift = false; } let key = match key {' @('adapters_normalize_logical_keys_without_conflating_ctrl_and_cmd')
 Mutate 'drop-overrides' 'src/keymap.rs' 'for binding in bindings {' 'for binding in bindings.iter().take(0) {' @('overrides_add_rebind_unbind_and_validate_atomically', 'resolution_handles_sequences_contexts_modes_and_prefix_conflicts', 'settings_validate_values_and_apply_binding_overrides')
 Mutate 'override-precedence' 'src/keymap.rs' 'e.layer,' '0,' @('overrides_add_rebind_unbind_and_validate_atomically')
 Mutate 'motion-direction' 'src/vim.rs' "'h' => Some(Motion::Left)" "'h' => Some(Motion::Right)" @('vim_motions_and_counts_table')
@@ -61,4 +70,4 @@ Mutate 'ignore-vim-unbind' 'src/keymap.rs' 'let blocked = self.keymap.explicitly
 Mutate 'unknown-diagnostics' 'src/settings.rs' 'unknown(&value, "", &mut unknown_keys);' 'unknown(&value, "", &mut unknown_keys); unknown_keys.clear();' @('settings_defaults_unknown_keys_and_typed_values')
 Mutate 'reload-callback' 'src/settings.rs' '(self.callback)(&report);' 'if false { (self.callback)(&report); }' @('settings_reload_hook_keeps_last_valid_and_delivers_changes')
 Mutate 'portable-path' 'src/settings.rs' 'folder.join("settings.toml")' 'folder.join("wrong.toml")' @('settings_paths_cover_portable_and_all_platforms_without_env_mutation')
-Write-Output "All 16 contracts rejected their deliberately broken implementation. Sources restored in copy. Evidence: $summary"
+Write-Output "All original 16 contracts rejected their deliberately broken implementation. Sources restored in copy. Evidence: $summary"

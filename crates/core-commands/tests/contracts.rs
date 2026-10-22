@@ -153,13 +153,188 @@ fn chords_parse_valid_aliases_and_reject_invalid_input() {
 #[test]
 fn adapters_normalize_logical_keys_without_conflating_ctrl_and_cmd() {
     let shifted = Modifiers { shift: true, ..Modifiers::default() };
-    assert_eq!(KeyChord::new(Key::Character('$'), shifted), chord("$"));
-    assert_eq!(KeyChord::new(Key::Character('$'), shifted).modifiers, Modifiers::default());
+    assert_eq!(KeyChord::new(Key::Character('$'), shifted), chord("shift+$"));
+    assert_eq!(KeyChord::new(Key::Character('$'), shifted).modifiers, shifted);
     assert_eq!(KeyChord::new(Key::Character('G'), Modifiers::default()), chord("shift+g"));
     assert_eq!(KeyChord::new(Key::Character('g'), shifted).character(), Some('G'));
     assert_ne!(chord("ctrl+p"), chord("cmd+p"));
     assert_eq!(chord("ctrl+p").character(), None);
     assert_eq!(chord("enter").key, Key::Named(NamedKey::Enter));
+}
+
+#[test]
+fn punctuation_preserves_logical_key_and_explicit_shift() {
+    for (plain, symbol) in
+        "/? [{ ]} 1! 2@ 3# 4$ 5% 6^ 7& 8* 9( 0) -_ =+ ;: '\" ,< .> `~ \\|".split_whitespace().map(|s| {
+            let mut chars = s.chars();
+            (chars.next().unwrap(), chars.next().unwrap())
+        })
+    {
+        for c in [plain, symbol] {
+            let name = if c == '+' { "Plus".into() } else { c.to_string() };
+            let shifted = Modifiers { ctrl: true, shift: true, ..Modifiers::default() };
+            assert_eq!(chord(&format!("ctrl+shift+{name}")), KeyChord::new(Key::Character(c), shifted));
+            assert_ne!(chord(&format!("ctrl+{name}")), chord(&format!("ctrl+shift+{name}")));
+        }
+        assert_ne!(
+            KeyChord::new(Key::Character(plain), Modifiers { shift: true, ..Modifiers::default() }),
+            chord(&symbol.to_string().replace('+', "Plus"))
+        );
+    }
+    assert_ne!(chord("ctrl+shift+/"), chord("ctrl+/"));
+    assert_ne!(chord("ctrl+shift+/"), chord("ctrl+?"));
+    let map = Keymap::default()
+        .with_overrides(&[
+            binding("ctrl+/", "edit.comment", None, None),
+            binding("ctrl+shift+/", "edit.uncomment", None, None),
+            binding("ctrl+shift+?", "search.find", None, None),
+        ])
+        .unwrap();
+    for (c, shift, expected) in
+        [('/', false, "edit.comment"), ('/', true, "edit.uncomment"), ('?', true, "search.find")]
+    {
+        let input = KeyChord::new(Key::Character(c), Modifiers { ctrl: true, shift, ..Modifiers::default() });
+        assert_eq!(map.resolve(&[input], Context::Editor, Mode::Insert), Resolution::Command(expected));
+    }
+}
+
+#[test]
+fn reviewed_presets_match_windows_shortcuts() {
+    let common = [
+        ("ctrl+n", "file.new"),
+        ("ctrl+o", "file.open"),
+        ("ctrl+s", "file.save"),
+        ("ctrl+w", "file.close"),
+        ("ctrl+shift+t", "file.reopenClosed"),
+        ("ctrl+z", "edit.undo"),
+        ("ctrl+y", "edit.redo"),
+        ("ctrl+x", "edit.cut"),
+        ("ctrl+c", "edit.copy"),
+        ("ctrl+v", "edit.paste"),
+        ("ctrl+a", "edit.selectAll"),
+        ("ctrl+f", "search.find"),
+        ("ctrl+h", "search.replace"),
+        ("ctrl+shift+f", "search.findInFiles"),
+        ("f3", "search.findNext"),
+        ("shift+f3", "search.findPrevious"),
+        ("ctrl+g", "navigation.goToLine"),
+        ("ctrl+tab", "file.nextTab"),
+        ("ctrl+shift+tab", "file.previousTab"),
+        ("ctrl+shift+p", "view.commandPalette"),
+    ];
+    let vscode = [
+        ("ctrl+shift+k", "edit.deleteLine"),
+        ("ctrl+shift+s", "file.saveAs"),
+        ("ctrl+d", "edit.selectNextMatch"),
+        ("alt+shift+down", "edit.duplicateLine"),
+        ("alt+shift+up", "edit.duplicateLine"),
+        ("alt+up", "edit.moveLineUp"),
+        ("alt+down", "edit.moveLineDown"),
+        ("ctrl+k ctrl+c", "edit.comment"),
+        ("ctrl+k ctrl+u", "edit.uncomment"),
+        ("ctrl+/", "edit.toggleComment"),
+        ("alt+z", "view.toggleWordWrap"),
+        ("alt+shift+f", "edit.formatDocument"),
+        ("ctrl+]", "edit.indent"),
+        ("ctrl+[", "edit.outdent"),
+        ("ctrl+shift+\\", "navigation.matchBracket"),
+        ("ctrl+k s", "file.saveAll"),
+        ("ctrl+shift+|", "navigation.matchBracket"),
+        ("ctrl+k ctrl+w", "file.closeAll"),
+        ("ctrl+k ctrl+f", "edit.formatSelection"),
+        ("ctrl+k ctrl+x", "edit.trimTrailingWhitespace"),
+        ("ctrl+k m", "file.setType"),
+        ("ctrl+shift+h", "search.replaceInFiles"),
+        ("ctrl+,", "view.settings"),
+        ("f1", "view.commandPalette"),
+        ("ctrl+alt+up", "edit.addCursorAbove"),
+        ("ctrl+alt+down", "edit.addCursorBelow"),
+    ];
+    let notepad = [
+        ("ctrl+shift+s", "file.saveAll"),
+        ("ctrl+alt+s", "file.saveAs"),
+        ("ctrl+l", "edit.cutLine"),
+        ("ctrl+shift+l", "edit.deleteLine"),
+        ("ctrl+d", "edit.duplicateLine"),
+        ("ctrl+q", "edit.toggleComment"),
+        ("ctrl+k", "edit.comment"),
+        ("ctrl+shift+k", "edit.uncomment"),
+        ("ctrl+b", "navigation.matchBracket"),
+        ("ctrl+r", "file.reload"),
+        ("ctrl+shift+w", "file.closeAll"),
+        ("ctrl+pageDown", "file.nextTab"),
+        ("ctrl+pageUp", "file.previousTab"),
+        ("ctrl+shift+z", "edit.redo"),
+        ("tab", "edit.indent"),
+        ("shift+tab", "edit.outdent"),
+        ("ctrl+shift+up", "edit.moveLineUp"),
+        ("ctrl+shift+down", "edit.moveLineDown"),
+    ];
+    for (preset, extra) in [(Preset::VsCode, vscode.as_slice()), (Preset::NotepadPlusPlus, notepad.as_slice())] {
+        let map = Keymap::preset(preset).unwrap();
+        for (input, expected) in common.iter().chain(extra) {
+            assert_eq!(
+                map.resolve(&keys(input), Context::Editor, Mode::Insert),
+                Resolution::Command(expected),
+                "{preset:?}: {input}"
+            );
+        }
+    }
+    assert_eq!(
+        Keymap::preset(Preset::Vim).unwrap().resolve(&keys("ctrl+shift+p"), Context::Editor, Mode::Normal),
+        Resolution::Command("view.commandPalette")
+    );
+}
+
+#[test]
+fn settings_validation_errors_keep_locations() {
+    for (source, path, line) in [
+        ("[editor]\ntab_size=0", "editor.tab_size", 2),
+        ("[font]\nsize=-1", "font.size", 2),
+        ("[font]\nline_height=nan", "font.line_height", 2),
+        ("[font]\nfamily=''", "font.family", 2),
+        ("[files]\njournal_interval_seconds=0", "files.journal_interval_seconds", 2),
+        ("[undo]\nmemory_limit_bytes=0", "undo.memory_limit_bytes", 2),
+        ("[formatters.'c++']\nexecutable='clang-format'\ntimeout_ms=0", "formatters.c++.timeout_ms", 3),
+        ("[[bindings]]\nkeys='a'\ncommand='unknown'", "bindings[0].command", 3),
+        ("bindings=[{keys='ctrl+', command='file.save'}]", "bindings[0].keys", 1),
+    ] {
+        let error = Settings::parse(source).unwrap_err().to_string();
+        assert!(error.starts_with(&format!("{path} at line {line},")), "{source:?}: {error}");
+    }
+}
+
+#[test]
+fn settings_parse_errors_keep_locations() {
+    for (source, path, line) in [
+        ("# comment\n[font]\nsize='large'", "font.size", 3),
+        ("[render]\nremote='sometimes'", "render.remote", 2),
+        ("[editor]\ntab_size=", "editor.tab_size", 2),
+        (
+            "[[bindings]]\nkeys='a'\ncommand='edit.copy'\n[[bindings]]\nkeys=42\ncommand='edit.copy'",
+            "bindings[1].keys",
+            5,
+        ),
+        ("editor = { tab_size = 'bad' }", "editor.tab_size", 1),
+    ] {
+        let error = Settings::parse(source).unwrap_err().to_string();
+        assert!(error.starts_with(&format!("{path} at line {line},")), "{source:?}: {error}");
+    }
+}
+
+#[test]
+fn settings_unknown_warnings_keep_key_spans() {
+    let source = "# comment\n[font]\n\"odd.key\" = 1\n[formatters.'c++']\nexecutable='clang-format'\ntypo=2\n[[bindings]]\nkeys='a'\ncommand='edit.copy'\ntypo=3\n[[bindings]]\nkeys='b'\ncommand='edit.copy'\ntypo=4";
+    let report = Settings::parse(source).unwrap();
+    for (path, line) in
+        [("font.odd.key", 3), ("formatters.c++.typo", 6), ("bindings[0].typo", 10), ("bindings[1].typo", 14)]
+    {
+        assert!(report.unknown_keys.contains(&path.to_string()));
+        assert!(
+            report.unknown_key_diagnostics.iter().any(|d| d.path == path && d.line == line && d.column == 1),
+            "{path}"
+        );
+    }
 }
 
 #[test]

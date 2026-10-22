@@ -12,11 +12,19 @@ chord directly from a platform scan code. Handle presses (and repeats if the
 frontend wants them), ignore releases. Multi-scalar winit strings and IME/text
 commits belong to text input, not keymaps. Preserve Ctrl and Super separately.
 
-ASCII letters are stored lowercase with Shift; logical punctuation already
-encodes Shift (`$`, `(`, `+`), so its Shift flag is removed. In settings,
+ASCII letters are stored lowercase with Shift. For punctuation, digits and
+other characters, both the logical character and supplied Shift flag are kept.
+Notation and adapter input use this same contract: `Ctrl+Shift+/`, `Ctrl+/`,
+`Ctrl+?` and `Ctrl+Shift+?` are four distinct chords. No US keyboard translation
+from `/` to `?`, `[` to `{`, or `1` to `!` is inferred. In settings,
 `Ctrl+K Ctrl+C` is case-insensitive shortcut notation; bare `G` means Shift+g.
 Write `Plus` for the plus key and `Space` for a space. Ctrl+Plus and Ctrl+=
-are different logical keys. Terminal protocols cannot represent every modified
+are different logical keys. On a US layout, Shift+/ normally produces logical
+`?` with Shift, so bind it as `Ctrl+Shift+?` when Ctrl is held. Non-US layouts
+can produce different symbols or use AltGr; use the logical character and the
+modifiers actually reported by the adapter, or override the binding. The VS Code
+bracket-matching shortcut includes both `Ctrl+Shift+\\` and its US logical
+`Ctrl+Shift+|` equivalent. Terminal protocols cannot represent every modified
 key; frontend adapters should report those limitations rather than invent keys.
 
 ```rust,ignore
@@ -41,6 +49,13 @@ input is handled by the editor. Ex/search text is held by the parser; use
 All three presets are embedded TOML. VS Code is the default; its Ctrl+D selects
 the next match. Notepad++ Ctrl+D duplicates a line. The Vim preset has explicit
 global/palette/diff bindings and delegates modal grammar to `Vim`.
+
+**Ctrl+Shift+P opens the command palette in all three presets.** This deliberately
+replaces Notepad++ macro playback; macros are outside v1. Notepad++ uses
+Ctrl+Shift+S for Save All, Ctrl+Alt+S for Save As, Ctrl+L for Cut Line and
+Ctrl+Shift+L for Delete Line. Both desktop presets bind Ctrl+Tab / Ctrl+Shift+Tab
+to next/previous tab; the frontend will own MRU ordering. Palette-context keys
+and diff-context F7/Shift+F7 are Kwil additions, not upstream Notepad++ defaults.
 
 ```toml
 keymap = "vscode" # also "notepad++", "vim"
@@ -167,7 +182,11 @@ timeout_ms = 5000
 ```
 
 Unknown keys are returned as dotted paths in `SettingsReport::unknown_keys` and
-are nonfatal. Invalid known types/values, commands and keys are errors. Settings
+are nonfatal. Matching `unknown_key_diagnostics` entries carry the path and
+one-based line/character column of each key. Parse/type errors retain TOML source
+spans; validation errors identify the exact key path and its line/column,
+including formatter names and indexed bindings. Malformed syntax without a
+recoverable key is labelled `<document>`. Invalid known types/values, commands and keys are errors. Settings
 files have a 1 MiB read cap; this is configuration, never document content.
 Formatting configuration is data; workers own execution and timeout enforcement.
 Themes, syntax and log settings are also data for their respective executors.
@@ -194,6 +213,7 @@ inputs for tests without process-wide environment changes.
 ## Verification
 
 Run `cargo test -p kwil-core-commands -j 4 --locked` with the branch target dir.
-`scripts/fail-first.ps1` proves all 16 contract tests reject deliberate defects
+`scripts/fail-first.ps1` proves the original 16 contract tests reject deliberate defects
 in an isolated copy. It never mutates the source worktree and records each
-owned PID with a 120-second timeout. See `VERIFICATION.md` for the receipt.
+owned PID with a 120-second timeout. `-FixRoundOne` checks the five additional
+regressions against compiling defects. See `VERIFICATION.md` for the receipts.

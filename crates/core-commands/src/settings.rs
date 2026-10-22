@@ -81,6 +81,15 @@ group!(Settings {
 pub struct SettingsReport {
     pub settings: Settings,
     pub unknown_keys: Vec<String>,
+    /// Source positions for the corresponding nonfatal unknown-key warnings.
+    pub unknown_key_diagnostics: Vec<SettingsDiagnostic>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsDiagnostic {
+    pub path: String,
+    /// One-based line and character column of the key.
+    pub line: usize,
+    pub column: usize,
 }
 #[derive(Debug)]
 pub struct SettingsError(pub String);
@@ -93,34 +102,81 @@ impl std::error::Error for SettingsError {}
 
 impl Settings {
     pub fn parse(source: &str) -> Result<SettingsReport, SettingsError> {
-        let value: toml::Value = toml::from_str(source).map_err(|e| SettingsError(e.to_string()))?;
+        let (table, errors) = toml::de::DeTable::parse_recoverable(source);
+        let value = toml::de::DeValue::Table(table.into_inner());
+        let mut locations = Vec::new();
+        collect_locations(&value, "", &mut locations);
+        let locate = |path: &str, message: &str| {
+            let offset = locations.iter().find(|l| l.path == path).map_or(0, |l| l.key);
+            let diagnostic = diagnostic(source, path, offset);
+            SettingsError(format!("{path} at line {}, column {}: {message}", diagnostic.line, diagnostic.column))
+        };
+        let parse_error = |error: toml::de::Error| {
+            let offset = error.span().map_or(0, |s| s.start);
+            let path = locations
+                .iter()
+                .filter(|l| l.range.contains(&offset) || l.key <= offset && offset <= l.range.end)
+                .min_by_key(|l| l.range.len())
+                .map_or("<document>", |l| l.path.as_str());
+            let diagnostic = diagnostic(source, path, offset);
+            SettingsError(format!("{path} at line {}, column {}: {error}", diagnostic.line, diagnostic.column))
+        };
+        if let Some(error) = errors.into_iter().next() {
+            return Err(parse_error(error));
+        }
         let mut unknown_keys = Vec::new();
         unknown(&value, "", &mut unknown_keys);
-        let settings: Self = value.try_into().map_err(|e| SettingsError(e.to_string()))?;
-        settings.validate()?;
-        Ok(SettingsReport { settings, unknown_keys })
+        // Deserialize from the original source, not Value::try_into, so Serde
+        // type/enum errors retain the parser's byte spans and key context.
+        let settings: Self = toml::from_str(source).map_err(parse_error)?;
+        settings.validate(locate)?;
+        let unknown_key_diagnostics = unknown_keys
+            .iter()
+            .map(|path| {
+                let offset = locations.iter().find(|l| l.path == *path).map_or(0, |l| l.key);
+                diagnostic(source, path, offset)
+            })
+            .collect();
+        Ok(SettingsReport { settings, unknown_keys, unknown_key_diagnostics })
     }
     pub fn keymap(&self) -> Result<Keymap, SettingsError> {
         Keymap::preset(self.keymap)
             .and_then(|map| map.with_overrides(&self.bindings))
             .map_err(|e| SettingsError(e.to_string()))
     }
-    fn validate(&self) -> Result<(), SettingsError> {
-        if self.font.family.trim().is_empty()
-            || !self.font.size.is_finite()
-            || self.font.size <= 0.0
-            || !self.font.line_height.is_finite()
-            || self.font.line_height <= 0.0
-        {
-            return Err(SettingsError("font family, size and line_height must be nonempty/positive and finite".into()));
-        }
-        if self.editor.tab_size == 0 || self.files.journal_interval_seconds == 0 || self.undo.memory_limit_bytes == 0 {
-            return Err(SettingsError("tab size, journal interval and undo memory cap must be positive".into()));
+    fn validate(&self, error: impl Fn(&str, &str) -> SettingsError) -> Result<(), SettingsError> {
+        for (path, invalid, message) in [
+            ("font.family", self.font.family.trim().is_empty(), "must be nonempty"),
+            ("font.size", !self.font.size.is_finite() || self.font.size <= 0.0, "must be positive and finite"),
+            (
+                "font.line_height",
+                !self.font.line_height.is_finite() || self.font.line_height <= 0.0,
+                "must be positive and finite",
+            ),
+            ("editor.tab_size", self.editor.tab_size == 0, "must be positive"),
+            ("files.journal_interval_seconds", self.files.journal_interval_seconds == 0, "must be positive"),
+            ("undo.memory_limit_bytes", self.undo.memory_limit_bytes == 0, "must be positive"),
+        ] {
+            if invalid {
+                return Err(error(path, message));
+            }
         }
         for (kind, formatter) in &self.formatters {
-            if formatter.executable.trim().is_empty() || formatter.timeout_ms == 0 {
-                return Err(SettingsError(format!("formatter {kind} needs an executable and positive timeout")));
+            if formatter.executable.trim().is_empty() {
+                return Err(error(&format!("formatters.{kind}.executable"), "needs an executable"));
             }
+            if formatter.timeout_ms == 0 {
+                return Err(error(&format!("formatters.{kind}.timeout_ms"), "must be positive"));
+            }
+        }
+        for (i, binding) in self.bindings.iter().enumerate() {
+            if !binding.command.is_empty() && crate::command(&binding.command).is_none() {
+                return Err(error(&format!("bindings[{i}].command"), &format!("unknown command: {}", binding.command)));
+            }
+            binding
+                .keys
+                .parse::<crate::KeySequence>()
+                .map_err(|e| error(&format!("bindings[{i}].keys"), &e.to_string()))?;
         }
         self.keymap()?;
         Ok(())
@@ -236,6 +292,44 @@ impl SettingsLocation {
     }
 }
 
+struct SourceLocation {
+    path: String,
+    key: usize,
+    range: std::ops::Range<usize>,
+}
+
+fn diagnostic(source: &str, path: &str, offset: usize) -> SettingsDiagnostic {
+    let prefix = &source[..offset.min(source.len())];
+    SettingsDiagnostic {
+        path: path.into(),
+        line: prefix.bytes().filter(|&b| b == b'\n').count() + 1,
+        column: prefix.rsplit('\n').next().unwrap_or_default().chars().count() + 1,
+    }
+}
+
+// Parser-owned spans handle quoted/dotted keys, inline tables, multiline
+// values and repeated array tables without guessing from source text.
+fn collect_locations(value: &toml::de::DeValue<'_>, path: &str, result: &mut Vec<SourceLocation>) {
+    match value {
+        toml::de::DeValue::Table(table) => {
+            for (key, value) in table {
+                let full =
+                    if path.is_empty() { key.get_ref().to_string() } else { format!("{path}.{}", key.get_ref()) };
+                result.push(SourceLocation { path: full.clone(), key: key.span().start, range: value.span() });
+                collect_locations(value.get_ref(), &full, result);
+            }
+        }
+        toml::de::DeValue::Array(array) => {
+            for (i, value) in array.iter().enumerate() {
+                let full = format!("{path}[{i}]");
+                result.push(SourceLocation { path: full.clone(), key: value.span().start, range: value.span() });
+                collect_locations(value.get_ref(), &full, result);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn known(path: &str) -> &'static [&'static str] {
     match path {
         "" => &[
@@ -277,20 +371,25 @@ fn known(path: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
-fn unknown(value: &toml::Value, path: &str, result: &mut Vec<String>) {
+fn unknown(value: &toml::de::DeValue, path: &str, result: &mut Vec<String>) {
     if let Some(table) = value.as_table() {
         for (key, value) in table {
-            let full = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
-            if !known(path).contains(&key.as_str()) {
+            let key = key.get_ref();
+            let value = value.get_ref();
+            let full = if path.is_empty() { key.to_string() } else { format!("{path}.{key}") };
+            if !known(path).contains(&key.as_ref()) {
                 result.push(full);
                 continue;
             }
             if full == "formatters" {
                 if let Some(formatters) = value.as_table() {
                     for (name, formatter) in formatters {
+                        let name = name.get_ref();
+                        let formatter = formatter.get_ref();
                         if let Some(fields) = formatter.as_table() {
                             for field in fields.keys() {
-                                if !known("formatters.*").contains(&field.as_str()) {
+                                let field = field.get_ref();
+                                if !known("formatters.*").contains(&field.as_ref()) {
                                     result.push(format!("formatters.{name}.{field}"));
                                 }
                             }
@@ -301,7 +400,7 @@ fn unknown(value: &toml::Value, path: &str, result: &mut Vec<String>) {
                 if let Some(bindings) = value.as_array() {
                     for (i, binding) in bindings.iter().enumerate() {
                         let mut fields = Vec::new();
-                        unknown(binding, "bindings[]", &mut fields);
+                        unknown(binding.get_ref(), "bindings[]", &mut fields);
                         result.extend(fields.into_iter().map(|s| s.replace("bindings[]", &format!("bindings[{i}]"))));
                     }
                 }

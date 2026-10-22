@@ -1,9 +1,11 @@
+# Ctrl+Shift+P opens the command palette in all presets. This intentionally
+# replaces Notepad++ macro playback: macros are outside Kwil v1.
 [[bindings]]
 keys = "ctrl+s"
 command = "file.save"
 [[bindings]]
 keys = "ctrl+shift+s"
-command = "file.saveAs"
+command = "file.saveAll"
 [[bindings]]
 keys = "ctrl+n"
 command = "file.new"
@@ -45,7 +47,7 @@ command = "edit.duplicateLine"
 context = "editor"
 [[bindings]]
 keys = "ctrl+l"
-command = "edit.deleteLine"
+command = "edit.cutLine"
 context = "editor"
 [[bindings]]
 keys = "ctrl+g"
@@ -96,3 +98,61 @@ context = "palette"
 keys = "up"
 command = "palette.previous"
 context = "palette"
+
+[[bindings]]
+keys = "ctrl+alt+s"
+command = "file.saveAs"
+[[bindings]]
+keys = "ctrl+shift+l"
+command = "edit.deleteLine"
+context = "editor"
+[[bindings]]
+keys = "ctrl+tab"
+command = "file.nextTab"
+[[bindings]]
+keys = "ctrl+shift+tab"
+command = "file.previousTab"
+[[bindings]]
+keys = "ctrl+k"
+command = "edit.comment"
+context = "editor"
+[[bindings]]
+keys = "ctrl+shift+k"
+command = "edit.uncomment"
+context = "editor"
+[[bindings]]
+keys = "ctrl+b"
+command = "navigation.matchBracket"
+context = "editor"
+[[bindings]]
+keys = "ctrl+r"
+command = "file.reload"
+[[bindings]]
+keys = "ctrl+shift+w"
+command = "file.closeAll"
+[[bindings]]
+keys = "ctrl+pageDown"
+command = "file.nextTab"
+[[bindings]]
+keys = "ctrl+pageUp"
+command = "file.previousTab"
+[[bindings]]
+keys = "ctrl+shift+z"
+command = "edit.redo"
+context = "editor"
+[[bindings]]
+keys = "tab"
+command = "edit.indent"
+context = "editor"
+[[bindings]]
+keys = "shift+tab"
+command = "edit.outdent"
+context = "editor"
+[[bindings]]
+keys = "ctrl+shift+up"
+command = "edit.moveLineUp"
+context = "editor"
+[[bindings]]
+keys = "ctrl+shift+down"
+command = "edit.moveLineDown"
+context = "editor"

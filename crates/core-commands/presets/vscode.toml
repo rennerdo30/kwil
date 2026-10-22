@@ -128,3 +128,69 @@ context = "palette"
 keys = "up"
 command = "palette.previous"
 context = "palette"
+
+[[bindings]]
+keys = "ctrl+shift+k"
+command = "edit.deleteLine"
+context = "editor"
+[[bindings]]
+keys = "ctrl+tab"
+command = "file.nextTab"
+[[bindings]]
+keys = "ctrl+shift+tab"
+command = "file.previousTab"
+[[bindings]]
+keys = "alt+shift+up"
+command = "edit.duplicateLine"
+context = "editor"
+[[bindings]]
+keys = "ctrl+]"
+command = "edit.indent"
+context = "editor"
+[[bindings]]
+keys = "ctrl+["
+command = "edit.outdent"
+context = "editor"
+[[bindings]]
+keys = 'ctrl+shift+\'
+command = "navigation.matchBracket"
+context = "editor"
+# US logical-key equivalent when the adapter reports the shifted character.
+[[bindings]]
+keys = 'ctrl+shift+|'
+command = "navigation.matchBracket"
+context = "editor"
+[[bindings]]
+keys = "ctrl+k s"
+command = "file.saveAll"
+[[bindings]]
+keys = "ctrl+k ctrl+w"
+command = "file.closeAll"
+[[bindings]]
+keys = "ctrl+k ctrl+f"
+command = "edit.formatSelection"
+context = "editor"
+[[bindings]]
+keys = "ctrl+k ctrl+x"
+command = "edit.trimTrailingWhitespace"
+context = "editor"
+[[bindings]]
+keys = "ctrl+k m"
+command = "file.setType"
+[[bindings]]
+keys = "ctrl+shift+h"
+command = "search.replaceInFiles"
+[[bindings]]
+keys = "ctrl+,"
+command = "view.settings"
+[[bindings]]
+keys = "f1"
+command = "view.commandPalette"
+[[bindings]]
+keys = "ctrl+alt+up"
+command = "edit.addCursorAbove"
+context = "editor"
+[[bindings]]
+keys = "ctrl+alt+down"
+command = "edit.addCursorBelow"
+context = "editor"

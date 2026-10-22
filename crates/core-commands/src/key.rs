@@ -47,17 +47,13 @@ pub struct KeyChord {
 
 impl KeyChord {
     /// Canonicalizes adapter input: ASCII letters are lowercase plus Shift;
-    /// punctuation already carries its shifted meaning, so Shift is removed.
-    /// This makes winit logical `$` and crossterm Char('$') identical.
+    /// all other logical characters preserve the supplied modifiers exactly.
+    /// No keyboard-layout translation is inferred (Shift+/ is not '?').
     pub fn new(key: Key, mut modifiers: Modifiers) -> Self {
         let key = match key {
             Key::Character(c) if c.is_ascii_uppercase() => {
                 modifiers.shift = true;
                 Key::Character(c.to_ascii_lowercase())
-            }
-            Key::Character(c) if c.is_ascii_punctuation() => {
-                modifiers.shift = false;
-                Key::Character(c)
             }
             key => key,
         };

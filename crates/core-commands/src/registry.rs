@@ -36,7 +36,7 @@ commands! {
         "edit.addCursorAbove" => "Add Cursor Above", "edit.addCursorBelow" => "Add Cursor Below",
         "edit.columnSelection" => "Column Selection", "edit.moveLineUp" => "Move Line Up",
         "edit.moveLineDown" => "Move Line Down", "edit.duplicateLine" => "Duplicate Line",
-        "edit.deleteLine" => "Delete Line", "edit.indent" => "Indent",
+        "edit.deleteLine" => "Delete Line", "edit.cutLine" => "Cut Line", "edit.indent" => "Indent",
         "edit.outdent" => "Outdent", "edit.toggleComment" => "Toggle Comment",
         "edit.comment" => "Comment Selection", "edit.uncomment" => "Uncomment Selection",
         "edit.trimTrailingWhitespace" => "Trim Trailing Whitespace",
