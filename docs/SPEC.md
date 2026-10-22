@@ -100,7 +100,7 @@ A **piece tree**, the same idea as VS Code's: the document is a balanced tree of
 
 The tree's nodes are immutable and shared between versions. Snapshots are free, which gives undo and background readers without locks.
 
-Library options: `ropey 1.6.1` and `crop 0.4.3` are good ropes, but both need the whole text in memory as validated UTF-8, which breaks the "1 GB opens instantly" goal. `qem` (a file-backed engine for huge files with a sparse on-disk line index; the author's own figures are 3 GB opening in ~5 ms) is the closest existing match and should be benchmarked in week 1. Default plan: our own piece tree, with `qem` as the benchmark baseline.
+Library options: `ropey 1.6.1` and `crop 0.4.3` are good ropes, but both need the whole text in memory as validated UTF-8, which breaks the "1 GB opens instantly" goal. `qem` (a file-backed engine for huge files with a sparse on-disk line index; the author's own figures are 3 GB opening in ~5 ms) is the closest existing match and should be benchmarked in week 1. Decided (M0, `docs/decisions/0002-text-engine.md`): our own engine. `core-text` opens the 1 GB fixture with its first screen in 0.09 ms (qem: 60 ms), indexes at ~10 GB/s (qem: 2 GB/s) and uses 4 MB private memory (qem: 85 MB). The piece tree is built on it in M2; `qem` stays the baseline.
 
 ### Long lines
 
@@ -116,7 +116,11 @@ Write to a temp file in the same folder, `fsync`, then an atomic rename. File pe
 
 ## 6. Rendering and UI
 
-### Decision: run a week-1 spike between two paths
+### Decision: path B, own thin renderer (M0, `docs/decisions/0001-renderer.md`)
+
+Decided 2026-10-23 from measured numbers. B reaches the first frame in ~37 ms (A: 173 ms), uses 0 idle wakeups (A: ~160/s), presents one line + status per key (A: the full window) and scrolls by copy (A: full repaint). It builds clean in 7.4 s (A: 166 s). gpui has no CPU renderer and no dirty or scroll rects. wgpu device creation takes ≥ 175 ms even on DX12 only, so the CPU first frame is required, and wgpu uses DX12 only on Windows (Vulkan adds ~200 ms and ~170 MB).
+
+The spike compared these two paths
 
 | | A. `gpui` (Zed's UI framework) | B. Own thin renderer |
 |---|---|---|
@@ -124,7 +128,7 @@ Write to a temp file in the same folder, `fsync`, then an atomic rename. File pe
 | Pros | Proven for a top-speed code editor; a polished UI comes quickly | Full control of startup, frame timing and look; a small graph; the same model drives the TUI |
 | Cons | Pre-1.0 with breaking changes; heavy dependency graph (compile time); macOS was its strongest platform; several unofficial distributions; built around redrawing the whole window each frame, which is the wrong model for RDP/VNC (check in the spike) | More work: text input/IME, accessibility and widgets are ours to build |
 
-The spike builds the same three screens with both: a 1 GB file, scrolling, and the command palette. It measures cold start, frame time and clean/incremental compile time. The numbers decide, and the result is recorded in `docs/decisions/`. Expected: B, because startup in milliseconds is P0 and because remote mode needs damage-only presents and a CPU renderer, which only our own renderer controls fully. The spike also measures both paths over a real RDP and VNC session.
+The spike built the same three screens with both: a 1 GB file, scrolling, and the command palette. Real RDP and VNC sessions were not measured, because an RDP loopback would take over the owner's console session; that moved to KW-30.
 
 ### First frame in milliseconds
 
@@ -296,7 +300,7 @@ debug = "line-tables-only"
 
 | Milestone | Content |
 |---|---|
-| M0 Spike (1–2 weeks), KW-1 | Renderer A vs. B, text engine vs. `qem` baseline, startup measured on all three platforms; decision record |
+| M0 Spike, KW-1 (done 2026-10-23: renderer B, own text engine) | Renderer A vs. B, text engine vs. `qem` baseline, startup measured on all three platforms; decision record |
 | M1 Viewer | Instant open of any file, damage-only rendering and scroll copy, remote-mode detection, GUI/TUI auto-select, TUI, go to line, encodings, hex viewer |
 | M2 Editor | Piece tree editing, cursors, undo, save, tabs, session restore |
 | M3 Find & palette | Search/replace, find in files, command palette, file finder, keymaps with VS Code / Notepad++ / Vim presets, settings, log watcher mode |
