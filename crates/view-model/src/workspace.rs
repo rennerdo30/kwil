@@ -345,7 +345,10 @@ impl Workspace {
             // the worker may retire its journal. Preserve intent until then.
             self.checkpoint_session();
             self.persist_snapshot();
-            return Err(io::Error::other("Preserving closed-tab history; repeat close after recovery finishes"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Preserving closed-tab history; repeat close after recovery finishes",
+            ));
         }
         // Prepare the replacement before mutating the last tab.
         self.sync_active();
@@ -390,6 +393,7 @@ impl Workspace {
                 tab.path.clone_from(&view.path);
             }
             tab.first_visible_line = view.top();
+            tab.first_byte_column = view.first_byte_column;
             if let Some(editor) = view.editor() {
                 tab.revision = editor.document().revision();
                 tab.saved_revision = editor.document().saved_revision();
@@ -406,6 +410,7 @@ impl Workspace {
                     metadata.path.clone_from(&view.path);
                 }
                 metadata.first_visible_line = view.top();
+                metadata.first_byte_column = view.first_byte_column;
                 if let Some(editor) = view.editor() {
                     metadata.revision = editor.document().revision();
                     metadata.saved_revision = editor.document().saved_revision();
@@ -1374,6 +1379,7 @@ impl Workspace {
                     view.set_notice(format!("Recovery failed: {error}; journal retained"));
                 }
             }
+            view.set_horizontal_window(tab.first_byte_column, 64 << 10);
             self.views.insert(id, view);
         }
         let mut mapping = HashMap::new();

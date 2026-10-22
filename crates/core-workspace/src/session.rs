@@ -30,6 +30,8 @@ pub struct Tab {
     pub cursor: u64,
     pub anchor: u64,
     pub first_visible_line: u64,
+    /// Requested horizontal byte origin; frontends align each visible row independently.
+    pub first_byte_column: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,7 +102,16 @@ impl Session {
         if let Some(path) = &path {
             self.touch_recent(path.clone());
         }
-        self.tabs.push(Tab { id, path, revision: 0, saved_revision: 0, cursor: 0, anchor: 0, first_visible_line: 0 });
+        self.tabs.push(Tab {
+            id,
+            path,
+            revision: 0,
+            saved_revision: 0,
+            cursor: 0,
+            anchor: 0,
+            first_visible_line: 0,
+            first_byte_column: 0,
+        });
         self.active = Some(id);
         Ok(id)
     }
@@ -220,7 +231,7 @@ impl Session {
     fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
         let mut b = Vec::new();
-        b.extend_from_slice(b"KWS1");
+        b.extend_from_slice(b"KWS2");
         put64(&mut b, self.next_id);
         put64(&mut b, self.active.map_or(0, |id| id.0));
         let closed: Vec<_> = self.closed.iter().collect();
@@ -228,7 +239,7 @@ impl Session {
             put32(&mut b, group.len() as u32);
             for t in group {
                 put64(&mut b, t.id.0);
-                for v in [t.revision, t.saved_revision, t.cursor, t.anchor, t.first_visible_line] {
+                for v in [t.revision, t.saved_revision, t.cursor, t.anchor, t.first_visible_line, t.first_byte_column] {
                     put64(&mut b, v);
                 }
                 put_path(&mut b, t.path.as_deref())?;
@@ -251,9 +262,11 @@ impl Session {
             return Err(invalid("metadata checksum"));
         }
         let mut r = Decoder::new(body);
-        if r.take(4)? != b"KWS1" {
-            return Err(invalid("metadata version"));
-        }
+        let horizontal = match r.take(4)? {
+            b"KWS1" => false,
+            b"KWS2" => true,
+            _ => return Err(invalid("metadata version")),
+        };
         let next_id = r.u64()?;
         let active = match r.u64()? {
             0 => None,
@@ -271,6 +284,7 @@ impl Session {
                     cursor: r.u64()?,
                     anchor: r.u64()?,
                     first_visible_line: r.u64()?,
+                    first_byte_column: if horizontal { r.u64()? } else { 0 },
                     path: r.path()?,
                 });
             }
@@ -537,5 +551,49 @@ pub(crate) fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod horizontal_codec_tests {
+    use super::*;
+
+    #[test]
+    fn horizontal_origin_round_trips_for_open_and_closed_tabs() {
+        let mut session = Session::default();
+        let first = session.open(None).unwrap();
+        session.tab_mut(first).unwrap().first_byte_column = 123_456;
+        assert!(session.close(first));
+        let second = session.open(None).unwrap();
+        session.tab_mut(second).unwrap().first_byte_column = u64::MAX;
+        let bytes = session.encode().unwrap();
+        assert_eq!(&bytes[..4], b"KWS2");
+        let decoded = Session::decode(&bytes).unwrap();
+        assert_eq!(decoded, session);
+        assert_eq!(decoded.closed()[0].first_byte_column, 123_456);
+        assert_eq!(decoded.tabs()[0].first_byte_column, u64::MAX);
+    }
+
+    #[test]
+    fn prior_metadata_decodes_with_zero_horizontal_origin_and_migrates() {
+        // Exact v1 layout, independent of the new encoder. One untitled open tab.
+        let mut bytes = b"KWS1".to_vec();
+        put64(&mut bytes, 2); // next ID
+        put64(&mut bytes, 1); // active ID
+        put32(&mut bytes, 1); // tabs
+        for value in [1, 7, 7, 3, 3, 15] {
+            put64(&mut bytes, value);
+        }
+        put_path(&mut bytes, None).unwrap();
+        put32(&mut bytes, 0); // closed
+        put32(&mut bytes, 0); // recents
+        let crc = checksum(&bytes);
+        put32(&mut bytes, crc);
+        let session = Session::decode(&bytes).unwrap();
+        let tab = &session.tabs()[0];
+        assert_eq!(tab.id, DocumentId(1));
+        assert_eq!((tab.revision, tab.cursor, tab.first_visible_line), (7, 3, 15));
+        assert_eq!(tab.first_byte_column, 0);
+        assert_eq!(Session::decode(&session.encode().unwrap()).unwrap(), session);
     }
 }

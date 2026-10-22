@@ -224,6 +224,7 @@ mod input_dispatch_tests {
 struct App {
     view: Workspace,
     frontend_document: kwil_view_model::SessionDocumentId,
+    frontend_epoch: u64,
     opts: GuiOptions,
     proxy: EventLoopProxy<UserEvent>,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
@@ -307,10 +308,12 @@ pub fn run_with_external_open(
     });
     let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     let frontend_document = view.active_id();
+    let frontend_epoch = view.input_epoch();
     let horizontal = view.horizontal_origin();
     let mut app = App {
         view,
         frontend_document,
+        frontend_epoch,
         opts,
         proxy,
         on_first_frame: Some(on_first_frame),

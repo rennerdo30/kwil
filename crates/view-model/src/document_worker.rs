@@ -533,8 +533,16 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
         if session.tabs().iter().chain(session.closed()).any(|t| t.id == *id) {
             continue;
         }
-        let metadata =
-            Tab { id: *id, path: None, revision: 0, saved_revision: 0, cursor: 0, anchor: 0, first_visible_line: 0 };
+        let metadata = Tab {
+            id: *id,
+            path: None,
+            revision: 0,
+            saved_revision: 0,
+            cursor: 0,
+            anchor: 0,
+            first_visible_line: 0,
+            first_byte_column: 0,
+        };
         let (mut document, recovered, base) = recover_document(path.clone(), &metadata)?;
         let summary = recovered.summary();
         let path = base.original_path.filter(|path| !session.tabs().iter().any(|t| t.path.as_ref() == Some(path)));
@@ -547,6 +555,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             cursor: 0,
             anchor: 0,
             first_visible_line: 0,
+            first_byte_column: 0,
         })?;
         orphans.insert(*id, (document, recovered));
     }
@@ -1067,6 +1076,12 @@ mod tests {
         session.tabs()[0].clone()
     }
 
+    fn stop_storage(mut storage: Storage) {
+        storage.service.finish();
+        storage.service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        drop(storage);
+    }
+
     #[test]
     fn recovered_typing_has_resident_budget_and_can_be_undone() {
         let scratch = Scratch::new();
@@ -1130,16 +1145,16 @@ mod tests {
         }
         // Simulate a crash between marker fsync and the metadata replacement.
         retire_evicted(&storage, &next).unwrap();
-        drop(storage);
+        stop_storage(storage);
         let (prepared, state) = prepare_root(scratch.0.clone()).unwrap();
         assert!(prepared.session.closed().iter().any(|tab| tab.id == id));
-        drop(state);
+        stop_storage(state);
         let mut reopened = prior.clone();
         assert_eq!(reopened.reopen_closed().unwrap(), Some(id));
         session::store_session(&scratch.0.join("session.kws"), &reopened).unwrap();
         let (prepared, state) = prepare_root(scratch.0.clone()).unwrap();
         assert!(prepared.documents.iter().any(|(document, result)| *document == id && result.is_ok()));
-        drop(state);
+        stop_storage(state);
         session::store_session(&scratch.0.join("session.kws"), &prior).unwrap();
         let (_, state) = prepare_root(scratch.0.clone()).unwrap();
         storage = state;
@@ -1159,12 +1174,12 @@ mod tests {
         assert_eq!(session::load_session(&scratch.0.join("session.kws")).unwrap(), prior);
         drop(lock);
         persist_session(&mut storage, &next).unwrap();
-        drop(storage);
+        stop_storage(storage);
         let (prepared, state) = prepare_root(scratch.0.clone()).unwrap();
         assert!(!prepared.session.tabs().iter().any(|tab| tab.id == id));
         assert_eq!(prepared.session.closed().len(), session::MAX_CLOSED);
         assert!(scratch.0.join("1.kwj").is_file(), "retirement never deletes journal data");
-        drop(state);
+        stop_storage(state);
     }
 
     #[test]
