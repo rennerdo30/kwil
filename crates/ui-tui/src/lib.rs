@@ -11,6 +11,7 @@ use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
 mod file_prompt;
 mod palette_ui;
+mod settings_ui;
 mod tabs;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -22,6 +23,8 @@ enum Msg {
     HighlightsReady,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
+    SettingsPath(Result<std::path::PathBuf, String>),
+    SettingsPanelReady,
     Input(Event),
     Document(kwil_view_model::document_worker::DocumentResult),
     OpenExternal,
@@ -75,6 +78,8 @@ pub fn run_with_external_open(
 
     let mut palette: Option<kwil_view_model::palette_session::PaletteSession> = None;
     let mut highlighting: Option<kwil_view_model::highlight_session::HighlightSession> = None;
+    let mut settings_panel: Option<kwil_view_model::settings_session::SettingsSession> = None;
+    let mut settings_file_pending = false;
     let result = (|| -> std::io::Result<()> {
         let size = terminal.size()?;
         let geometry = tabs::geometry(&view, size.width, size.height, Settings::default().tabs.layout);
@@ -111,13 +116,10 @@ pub fn run_with_external_open(
                 None => std::env::current_dir().map_err(|error| error.to_string()),
             };
             let _ = settings_sender.send(Msg::PaletteRoot(root));
-            let settings = std::env::current_exe()
-                .ok()
-                .and_then(|exe| Settings::path(&exe).ok())
-                .and_then(|path| Settings::load(&path).ok())
-                .map(|report| report.settings)
-                .unwrap_or_default();
-            let _ = settings_sender.send(Msg::Settings(Box::new(settings)));
+            let path = std::env::current_exe()
+                .map_err(|error| error.to_string())
+                .and_then(|exe| Settings::path(&exe).map_err(|error| error.to_string()));
+            let _ = settings_sender.send(Msg::SettingsPath(path));
         });
         let started = std::time::Instant::now();
         let mut horizontal = 0u64;
@@ -166,14 +168,57 @@ pub fn run_with_external_open(
                     changed
                 }
                 Msg::InputClosed => break,
+                Msg::SettingsPath(path) => {
+                    let sender = tx.clone();
+                    match path.and_then(|path| {
+                        kwil_view_model::settings_session::SettingsSession::start(
+                            path,
+                            std::sync::Arc::new(move || {
+                                let _ = sender.send(Msg::SettingsPanelReady);
+                            }),
+                        )
+                        .map_err(|error| error.to_string())
+                    }) {
+                        Ok(panel) => settings_panel = Some(panel),
+                        Err(error) => {
+                            view.set_notice(format!("Settings: {error}"));
+                        }
+                    }
+                    true
+                }
+                Msg::SettingsPanelReady => {
+                    let mut open_path = None;
+                    if let Some(panel) = &mut settings_panel {
+                        panel.worker_ready();
+                        if let Some(applied) = panel.take_applied() {
+                            let _ = tx.send(Msg::Settings(Box::new(applied.settings)));
+                        }
+                        if settings_file_pending && panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
+                            open_path = Some(panel.path().to_path_buf());
+                            panel.close();
+                            settings_file_pending = false;
+                        } else if panel.last_error().is_some() {
+                            settings_file_pending = false;
+                        }
+                    }
+                    let opened = open_path.is_some();
+                    if let Some(path) = open_path
+                        && let Err(error) = view.open_path(path)
+                    {
+                        view.set_notice(format!("Open settings: {error}"));
+                    }
+                    opened || settings_panel.as_ref().is_some_and(|panel| panel.is_open())
+                }
                 Msg::Settings(next) => {
-                    if let Ok(next_keys) = KeymapEngine::new(next.keymap, &next.bindings) {
+                    if next.keymap == settings.keymap && next.bindings == settings.bindings {
+                        settings = *next;
+                    } else if let Ok(next_keys) = KeymapEngine::new(next.keymap, &next.bindings) {
                         keys = next_keys;
                         settings = *next;
-                        view.set_session_restore(settings.files.restore_session);
-                        if let Some(editor) = view.editor_mut() {
-                            editor.settings = settings.clone();
-                        }
+                    }
+                    view.set_session_restore(settings.files.restore_session);
+                    if let Some(editor) = view.editor_mut() {
+                        editor.settings = settings.clone();
                     }
                     true
                 }
@@ -205,7 +250,15 @@ pub fn run_with_external_open(
                 }
                 Msg::Input(Event::Resize(_, _)) => true,
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
-                    let intent = if view.file_prompt().is_some() {
+                    let intent = if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
+                        if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                            && matches!(k.code, KeyCode::Char('o' | 'O'))
+                        {
+                            KeyResult::SettingsFile
+                        } else {
+                            KeyResult::Changed(settings_ui::key(panel, k))
+                        }
+                    } else if view.file_prompt().is_some() {
                         file_prompt::key(&mut view, k)
                     } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
                         palette_ui::key(&mut view, host, k, &mut keys, started.elapsed(), settings.keymap)
@@ -215,6 +268,39 @@ pub fn run_with_external_open(
                         key(&mut view, k, started.elapsed(), &mut keys, settings.keymap)
                     };
                     match intent {
+                        KeyResult::SettingsFile => {
+                            if let Some(panel) = &mut settings_panel {
+                                panel.open();
+                                panel.clear_error();
+                                settings_file_pending = true;
+                                if let Err(error) = panel.input(kwil_view_model::settings_session::SettingsInput::Save)
+                                {
+                                    view.set_notice(format!("Settings: {error}"));
+                                    settings_file_pending = false;
+                                } else if panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
+                                    let path = panel.path().to_path_buf();
+                                    panel.close();
+                                    settings_file_pending = false;
+                                    if let Err(error) = view.open_path(path) {
+                                        view.set_notice(format!("Open settings: {error}"));
+                                    }
+                                }
+                            }
+                            true
+                        }
+                        KeyResult::Settings => {
+                            if let Some(host) = &mut palette {
+                                let _ = host.input(kwil_view_model::palette_session::PaletteInput::Cancel);
+                            }
+                            keys.set_context(kwil_core_commands::Context::Editor);
+                            keys.cancel_pending();
+                            if let Some(panel) = &mut settings_panel {
+                                panel.open();
+                            } else {
+                                view.set_notice("Settings are starting; try again shortly".into());
+                            }
+                            true
+                        }
                         KeyResult::Palette(query) => {
                             palette_ui::open(&mut view, palette.as_mut(), &mut keys, query);
                             true
@@ -268,7 +354,10 @@ pub fn run_with_external_open(
                     }
                 }
                 Msg::Input(Event::Paste(text)) => {
-                    if let Some(prompt) = view.file_prompt_mut() {
+                    if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
+                        let _ = panel.input(kwil_view_model::settings_session::SettingsInput::Text(&text));
+                        true
+                    } else if let Some(prompt) = view.file_prompt_mut() {
                         if !text.chars().any(char::is_control) {
                             prompt.text.push_str(&text);
                         }
@@ -291,6 +380,7 @@ pub fn run_with_external_open(
                         false
                     }
                 }
+                Msg::Input(Event::Mouse(_)) if settings_panel.as_ref().is_some_and(|panel| panel.is_open()) => true,
                 Msg::Input(Event::Mouse(m)) if palette.as_ref().is_some_and(|host| host.model().is_open()) => {
                     let size = terminal.size()?;
                     palette_ui::mouse(
@@ -353,6 +443,9 @@ pub fn run_with_external_open(
                     if let Some(host) = &palette {
                         palette_ui::draw(f, host.model());
                     }
+                    if let Some(panel) = &settings_panel {
+                        settings_ui::draw(f, panel);
+                    }
                 })?;
             }
         }
@@ -361,6 +454,10 @@ pub fn run_with_external_open(
 
     if let Some(host) = &mut highlighting {
         host.stop();
+    }
+    if let Some(panel) = &mut settings_panel {
+        let shutdown = panel.stop();
+        std::thread::spawn(move || shutdown.shutdown());
     }
 
     if let Some(host) = &mut palette {
@@ -381,6 +478,8 @@ pub fn run_with_external_open(
 }
 
 enum KeyResult {
+    Settings,
+    SettingsFile,
     Quit,
     Save(Option<std::path::PathBuf>),
     SaveAndQuit,
@@ -568,6 +667,12 @@ fn invoke(
     elapsed: std::time::Duration,
     preset: Preset,
 ) -> KeyResult {
+    if call.id == "view.settings" {
+        return KeyResult::Settings;
+    }
+    if call.id == "view.settingsFile" {
+        return KeyResult::SettingsFile;
+    }
     if let Some(query) = palette_ui::command_query(call.id) {
         return KeyResult::Palette(query);
     }

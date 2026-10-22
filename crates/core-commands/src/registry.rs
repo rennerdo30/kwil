@@ -75,7 +75,8 @@ commands! {
         "view.toggleHex" => "Toggle Hex View", "view.toggleWordWrap" => "Toggle Word Wrap",
         "view.toggleWhitespace" => "Toggle Whitespace", "view.zoomIn" => "Zoom In",
         "view.zoomOut" => "Zoom Out", "view.zoomReset" => "Reset Zoom",
-        "view.toggleMarkdown" => "Toggle Markdown Preview", "view.settings" => "Open Settings"
+        "view.toggleMarkdown" => "Toggle Markdown Preview", "view.settings" => "Open Settings",
+        "view.settingsFile" => "Open Settings File"
     },
     "Search" => {
         "search.find" => "Find", "search.findNext" => "Find Next",

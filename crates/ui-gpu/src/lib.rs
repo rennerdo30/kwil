@@ -15,6 +15,7 @@ mod ime;
 mod input;
 mod palette_ui;
 mod scrollbar;
+mod settings_ui;
 mod tabs;
 mod zoom;
 
@@ -80,6 +81,8 @@ enum UserEvent {
     HighlightsReady,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
+    SettingsPath(Result<std::path::PathBuf, String>),
+    SettingsPanelReady,
     Document(kwil_view_model::document_worker::DocumentResult),
     OpenExternal,
     Notice(String),
@@ -230,6 +233,9 @@ struct App {
     palette: Option<kwil_view_model::palette_session::PaletteSession>,
     palette_dirty: bool,
     palette_area: Option<Rect>,
+    settings_panel: Option<kwil_view_model::settings_session::SettingsSession>,
+    settings_epoch: u64,
+    settings_file_pending: bool,
     view: Workspace,
     frontend_document: kwil_view_model::SessionDocumentId,
     frontend_epoch: u64,
@@ -323,6 +329,9 @@ pub fn run_with_external_open(
         palette: None,
         palette_dirty: false,
         palette_area: None,
+        settings_panel: None,
+        settings_epoch: 0,
+        settings_file_pending: false,
         view,
         frontend_document,
         frontend_epoch,
@@ -368,6 +377,10 @@ pub fn run_with_external_open(
         metrics: Default::default(),
     };
     let result = event_loop.run_app(&mut app);
+    if let Some(panel) = &mut app.settings_panel {
+        let shutdown = panel.stop();
+        std::thread::spawn(move || shutdown.shutdown());
+    }
     if let Some(palette) = &mut app.palette {
         let handles = palette.stop();
         std::thread::spawn(move || {
@@ -484,6 +497,9 @@ impl App {
         if self.composing && !matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             return;
         }
+        if self.settings_key(ev) {
+            return;
+        }
         // A scoped native-window probe can exercise the actual asynchronous
         // save callback without injecting global Ctrl state or taking focus.
         #[cfg(feature = "frame-harness")]
@@ -503,7 +519,7 @@ impl App {
                 _ => None,
             };
             if let Some(command) = command {
-                if self.dispatch_palette(command) || self.dispatch_zoom(command) {
+                if self.dispatch_settings(command) || self.dispatch_palette(command) || self.dispatch_zoom(command) {
                     return;
                 }
                 self.dispatch_file(command);
@@ -557,7 +573,7 @@ impl App {
                 match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
-                        if self.dispatch_palette(call.id) {
+                        if self.dispatch_settings(call.id) || self.dispatch_palette(call.id) {
                             return;
                         }
                         if self.dispatch_zoom(call.id) {
@@ -650,7 +666,7 @@ impl App {
             input::Action::Command(id) => (id, None),
             input::Action::Text(text) => ("edit.insert", Some(text)),
         };
-        if self.dispatch_palette(id) || self.dispatch_zoom(id) || self.dispatch_file(id) {
+        if self.dispatch_settings(id) || self.dispatch_palette(id) || self.dispatch_zoom(id) || self.dispatch_file(id) {
             return;
         }
         let args =
@@ -793,7 +809,7 @@ impl App {
         self.body_pixels.resize(bw.saturating_mul(bh), BG);
         let bars = self.bars();
         let rows = geometry.text.height / ch;
-        let palette_open = self.palette_open();
+        let palette_open = self.palette_open() || self.settings_open();
         let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
         let pixels = &mut gfx.pixels;
@@ -922,6 +938,16 @@ impl App {
         }
         if let Some(palette) = self.palette.as_ref().filter(|palette| palette.model().is_open()) {
             self.palette_area = palette_ui::draw(palette.model(), pixels, (w, h), font);
+            if let Some(area) = self.palette_area {
+                damage.push(area);
+            }
+        }
+        if let Some(panel) = self.settings_panel.as_ref().filter(|panel| panel.is_open()) {
+            if panel.menu().is_some() {
+                self.palette_area = settings_ui::draw(panel, pixels, (w, h), font);
+            } else {
+                self.palette_area = settings_ui::loading(pixels, (w, h), font);
+            }
             if let Some(area) = self.palette_area {
                 damage.push(area);
             }
@@ -1459,17 +1485,8 @@ impl ApplicationHandler<UserEvent> for App {
             let _ = proxy.send_event(UserEvent::PaletteRoot(root));
             let result = std::env::current_exe()
                 .map_err(|e| e.to_string())
-                .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()))
-                .and_then(|path| Settings::load(&path).map_err(|e| e.to_string()));
-            match result {
-                Ok(report) => {
-                    let _ = proxy.send_event(UserEvent::SettingsReady(Box::new(report.settings)));
-                }
-                Err(message) => {
-                    let _ = proxy.send_event(UserEvent::Notice(format!("Settings: {message}")));
-                    let _ = proxy.send_event(UserEvent::SettingsReady(Box::default()));
-                }
-            }
+                .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()));
+            let _ = proxy.send_event(UserEvent::SettingsPath(result));
         });
         #[cfg(feature = "frame-harness")]
         if self.opts.hidden && std::env::var_os("KWIL_FRAME_SCRIPT").is_some() {
@@ -1586,12 +1603,64 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 return;
             }
+            UserEvent::SettingsPath(path) => {
+                let proxy = self.proxy.clone();
+                match path.and_then(|path| {
+                    kwil_view_model::settings_session::SettingsSession::start(
+                        path,
+                        std::sync::Arc::new(move || {
+                            let _ = proxy.send_event(UserEvent::SettingsPanelReady);
+                        }),
+                    )
+                    .map_err(|error| error.to_string())
+                }) {
+                    Ok(panel) => self.settings_panel = Some(panel),
+                    Err(error) => {
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default()));
+                        let damage = self.view.set_notice(format!("Settings: {error}"));
+                        self.apply(damage);
+                    }
+                }
+                return;
+            }
+            UserEvent::SettingsPanelReady => {
+                let mut open_path = None;
+                if let Some(panel) = &mut self.settings_panel {
+                    panel.worker_ready();
+                    if let Some(applied) = panel.take_applied() {
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::new(applied.settings)));
+                    } else if !self.settings_loaded && panel.menu().is_none() && panel.last_error().is_some() {
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default()));
+                    }
+                    if self.settings_file_pending && panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
+                        open_path = Some(panel.path().to_path_buf());
+                        panel.close();
+                        self.settings_file_pending = false;
+                    } else if panel.last_error().is_some() {
+                        self.settings_file_pending = false;
+                    }
+                }
+                if let Some(path) = open_path {
+                    if let Err(error) = self.view.open_path(path) {
+                        self.view.set_notice(format!("Open settings: {error}"));
+                    }
+                    self.sync_file_ui();
+                    self.apply(Damage { full: true, status: true, ..Default::default() });
+                }
+                self.settings_epoch = self.settings_epoch.wrapping_add(1);
+                if self.settings_open() {
+                    self.palette_redraw();
+                }
+                return;
+            }
             UserEvent::SettingsReady(settings) => {
                 self.settings_loaded = true;
                 let font_changed =
                     settings.font.family != self.settings.font.family || settings.font.size != self.settings.font.size;
                 let tabs_changed = settings.editor.tab_size != self.settings.editor.tab_size;
                 let layout_changed = settings.tabs.layout != self.settings.tabs.layout;
+                let keymap_changed =
+                    settings.keymap != self.settings.keymap || settings.bindings != self.settings.bindings;
                 self.settings = *settings;
                 self.view.set_session_restore(self.settings.files.restore_session);
                 if layout_changed {
@@ -1601,8 +1670,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.apply(damage);
                     self.keep_caret_visible();
                 }
-                self.keys =
-                    kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
+                if keymap_changed || self.keys.is_none() {
+                    self.keys =
+                        kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings)
+                            .ok();
+                }
                 if let Some(editor) = self.view.editor_mut() {
                     editor.settings = self.settings.clone();
                 }
@@ -1721,6 +1793,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                if self.settings_open() {
+                    if state == ElementState::Pressed {
+                        self.settings_mouse();
+                    }
+                    return;
+                }
                 if self.palette_open() {
                     if state == ElementState::Pressed {
                         self.palette_mouse();
@@ -1791,6 +1869,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.composing = false;
                 let destination = self.ime_destination.take().unwrap_or_else(|| self.capture_input_destination());
                 let (damage, follow_active) = match destination {
+                    ime::Destination::Settings { epoch } => {
+                        if self.settings_open() && self.settings_epoch == epoch {
+                            self.settings_input(kwil_view_model::settings_session::SettingsInput::Text(&text));
+                        } else {
+                            self.view.set_notice("IME settings input cancelled: its destination changed".into());
+                        }
+                        (Damage::default(), false)
+                    }
                     ime::Destination::Palette { epoch } => {
                         if self
                             .palette
@@ -1830,6 +1916,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.settings_open() {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(point) => point.y > 0.0,
+                    };
+                    for _ in 0..3 {
+                        self.settings_input(if up {
+                            kwil_view_model::settings_session::SettingsInput::Previous
+                        } else {
+                            kwil_view_model::settings_session::SettingsInput::Next
+                        });
+                    }
+                    return;
+                }
                 if self.palette_open() {
                     let up = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y > 0.0,

@@ -69,6 +69,9 @@ pub(super) fn draw(palette: &Palette, pixels: &mut [u32], size: (usize, usize), 
 
 impl App {
     pub(super) fn capture_input_destination(&self) -> ime::Destination {
+        if self.settings_open() {
+            return ime::Destination::Settings { epoch: self.settings_epoch };
+        }
         match self.palette.as_ref().filter(|palette| palette.model().is_open()) {
             Some(palette) => ime::Destination::Palette { epoch: palette.input_epoch() },
             None => ime::capture(&self.view, self.insert_mode()),
@@ -150,7 +153,7 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
-                if self.dispatch_palette(command) {
+                if self.dispatch_settings(command) || self.dispatch_palette(command) {
                     return;
                 }
                 use kwil_core_commands::vim::VimResult;

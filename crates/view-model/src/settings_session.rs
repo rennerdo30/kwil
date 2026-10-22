@@ -362,6 +362,25 @@ impl SettingsSession {
     pub fn selected_row(&self) -> Option<SettingsRow> {
         self.menu.as_ref()?.selected()
     }
+    pub fn select(&mut self, index: usize) {
+        let current = self.selected();
+        if let Some(menu) = &mut self.menu {
+            menu.move_selection(index.min(isize::MAX as usize) as isize - current as isize);
+        }
+    }
+    pub fn category(&self) -> Option<Category> {
+        self.category
+    }
+    pub fn cycle_category(&mut self, backwards: bool) {
+        use kwil_core_commands::settings_ui::CATEGORIES;
+        let count = CATEGORIES.len() + 1;
+        let current = self
+            .category
+            .and_then(|category| CATEGORIES.iter().position(|c| *c == category))
+            .map_or(0, |index| index + 1);
+        let next = if backwards { (current + count - 1) % count } else { (current + 1) % count };
+        self.set_category(next.checked_sub(1).map(|index| CATEGORIES[index]));
+    }
     pub fn input_text(&self) -> &str {
         &self.active_input().text
     }
@@ -383,6 +402,12 @@ impl SettingsSession {
     }
     pub fn status(&self) -> &str {
         &self.status
+    }
+    pub fn source_exists(&self) -> bool {
+        self.baseline.as_ref().is_some_and(|base| base.source.is_some())
+    }
+    pub fn last_error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
     pub fn has_conflict(&self) -> bool {
         self.external.is_some()
@@ -453,6 +478,10 @@ impl SettingsSession {
                     return Ok(());
                 }
                 if self.searching {
+                    self.query = TextInput::default();
+                    if let Some(menu) = &mut self.menu {
+                        menu.search("");
+                    }
                     self.searching = false;
                 } else {
                     self.close();
@@ -578,7 +607,7 @@ impl SettingsSession {
             self.save_again = true;
             return Ok(());
         }
-        if !self.is_dirty() {
+        if !self.is_dirty() && self.source_exists() {
             return Ok(());
         }
         let document = self.document().ok_or("settings have not loaded")?.clone();
@@ -1076,6 +1105,31 @@ mod tests {
         let _ = release_tx.send(());
         dropper.join().unwrap();
         assert!(dropped.is_ok(), "UI teardown waited for the retirement worker");
+    }
+
+    #[test]
+    fn settings_file_creation_waits_for_ack_and_navigation_keeps_search_separate() {
+        let (mut session, requests) = fixture(None);
+        session.input(SettingsInput::Save).unwrap();
+        assert!(!session.source_exists());
+        assert!(session.take_applied().is_none());
+        assert_eq!(requests.lock().unwrap().len(), 1, "missing settings file must be queued for creation");
+        let request = requests.lock().unwrap()[0].clone();
+        assert_eq!(request.1, None);
+        saved(&mut session, &request);
+        assert!(session.source_exists());
+        assert!(matches!(session.take_applied().unwrap().reason, SettingsAppliedReason::Saved { .. }));
+        session.cycle_category(false);
+        assert_eq!(session.category(), Some(Category::Editor));
+        session.cycle_category(true);
+        assert_eq!(session.category(), None);
+        session.input(SettingsInput::Search).unwrap();
+        session.input(SettingsInput::Text("tabs layout")).unwrap();
+        session.input(SettingsInput::Cancel).unwrap();
+        assert_eq!(session.search_text(), "");
+        assert!(!session.is_searching());
+        session.select(usize::MAX);
+        assert_eq!(session.selected(), session.rows().len() - 1);
     }
 
     #[test]

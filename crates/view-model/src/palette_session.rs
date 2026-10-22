@@ -373,6 +373,11 @@ pub struct QueryWindow {
 /// Bound layout by the palette's 4 KiB query cap, with grapheme-safe horizontal
 /// scrolling. Both frontends use this to keep the input caret visible.
 pub fn query_window(palette: &Palette, columns: usize) -> QueryWindow {
+    text_window(palette.query(), palette.cursor(), columns)
+}
+
+/// Grapheme-safe single-line viewport for caller-bounded palette/settings input.
+pub fn text_window(input: &str, input_cursor: usize, columns: usize) -> QueryWindow {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
     if columns == 0 {
@@ -380,8 +385,8 @@ pub fn query_window(palette: &Palette, columns: usize) -> QueryWindow {
     }
     let mut cells = Vec::new();
     let mut caret = 0;
-    for (byte, cluster) in palette.query().grapheme_indices(true) {
-        if byte < palette.cursor() {
+    for (byte, cluster) in input.grapheme_indices(true) {
+        if byte < input_cursor {
             caret += 1;
         }
         let display = display_text(cluster);
