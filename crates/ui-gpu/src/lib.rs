@@ -87,6 +87,8 @@ struct App {
     frame_stats: kwil_bench::frames::Stats,
     #[cfg(feature = "frame-harness")]
     script_started: bool,
+    #[cfg(feature = "frame-harness")]
+    script_ack: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 /// Runs the GUI until the window closes. `on_first_frame` runs once the
@@ -133,6 +135,8 @@ pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>
         frame_stats: Default::default(),
         #[cfg(feature = "frame-harness")]
         script_started: false,
+        #[cfg(feature = "frame-harness")]
+        script_ack: None,
     };
     event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
@@ -294,6 +298,11 @@ impl App {
                 expected,
                 started,
             );
+            if p.scroll != 0
+                && let Some(ack) = &self.script_ack
+            {
+                let _ = ack.try_send(());
+            }
         }
     }
 }
@@ -556,7 +565,12 @@ impl App {
         if self.opts.frame_script && !self.script_started {
             self.script_started = true;
             let proxy = self.proxy.clone();
-            kwil_bench::frames::spawn_script(move |step| proxy.send_event(UserEvent::Script(step)).is_ok());
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            self.script_ack = Some(tx);
+            kwil_bench::frames::spawn_script(
+                move |step| proxy.send_event(UserEvent::Script(step)).is_ok(),
+                move || rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            );
         }
     }
 

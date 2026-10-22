@@ -55,10 +55,29 @@ jobs:
           mkdir -p baseline
           if git fetch origin bench-baseline; then
             git show FETCH_HEAD:${{ matrix.os }}.json > baseline/current.json
+            git show FETCH_HEAD:reference.json > baseline/reference.json
+            git rev-parse FETCH_HEAD > baseline/commit.txt
           fi
       - name: Python environment
         shell: bash
         run: python -m venv .bench-venv
+      - name: Read the trusted reference source
+        id: baseline
+        shell: bash
+        run: |
+          py=.bench-venv/bin/python
+          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
+          "$py" -c 'import json,re; from pathlib import Path; s=json.loads(Path("baseline/reference.json").read_text())["source_head"]; assert re.fullmatch("[0-9a-f]{40}",s); print("source="+s)' >> "$GITHUB_OUTPUT"
+      - name: Check out the pinned baseline code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.baseline.outputs.source }}
+          path: .bench-reference
+      - name: Build the baseline measurement binaries before sampling either version
+        working-directory: .bench-reference
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-reference
+        run: cargo build --release --locked -j 4 -p kwil-bench --features harness -p kwil --features frame-harness
       - name: Divan API benchmarks (five samples, one operation per sample)
         shell: bash
         env:
@@ -83,28 +102,16 @@ jobs:
           py=.bench-venv/bin/python
           [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
           if [ '${{ runner.os }}' = Linux ]; then
-            xvfb-run -a "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/${{ matrix.os }}.json --baseline baseline/current.json
+            xvfb-run -a "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
           else
-            "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/${{ matrix.os }}.json --baseline baseline/current.json
+            "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
           fi
-      - name: Check out the baseline code for a paired Linux diagnostic
-        id: reference
-        if: failure() && runner.os == 'Linux' && hashFiles('results/ubuntu-24.04.json') != ''
-        uses: actions/checkout@v7
-        with:
-          # Exact PR head whose merge produced the baseline samples. This
-          # diagnostic never changes the gate or writes a baseline.
-          ref: 8a315ff2e3e0dd3659de01e033f1f36e18de2384
-          path: .bench-reference
-      - name: Measure reference text code on the same Linux runner
-        if: failure() && steps.reference.outcome == 'success'
-        working-directory: .bench-reference
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target-reference
+      - name: Retain the exact trusted baseline inputs
+        if: always()
         shell: bash
         run: |
-          cargo build --release --locked -j 4 -p kwil-bench --features harness
-          "$GITHUB_WORKSPACE/.bench-venv/bin/python" crates/bench/run.py --text-only --bin-dir "$GITHUB_WORKSPACE/target-reference/release" --fixtures "$GITHUB_WORKSPACE/fixtures" --runner ubuntu-24.04 --runs 5 --output "$GITHUB_WORKSPACE/results/reference.json"
+          mkdir -p results/baseline
+          cp baseline/*.json baseline/commit.txt results/baseline/
       - name: Retain raw samples, medians and commit even on gate failure
         if: always()
         uses: actions/upload-artifact@v7

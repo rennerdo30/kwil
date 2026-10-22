@@ -53,13 +53,18 @@ def trace(app, file=None):
     return marks
 
 
-def check(current, baseline):
+def check(current, baseline, reference=None):
     errors = []
     if baseline.get("schema") != SCHEMA or baseline.get("runner") != current["runner"] or baseline.get("fixture") != current["fixture"]:
         return ["baseline schema, runner OS/image or fixture mismatch"]
+    if reference is not None and any(reference.get(k) != current.get(k) for k in ("schema", "runner", "fixture")):
+        return ["paired reference schema, runner OS/image or fixture mismatch"]
     for metric, (direction, limit) in LIMITS.items():
         value = current["medians"][metric]
-        before = baseline["medians"].get(metric)
+        # CPU/host speed calibrates timings; private bytes retain their stored
+        # OS comparison. A timing calibration cannot waive memory growth.
+        comparison = reference if reference is not None and metric != "private_mb" else baseline
+        before = comparison["medians"].get(metric)
         if not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
             errors.append(f"invalid measurement: {metric}")
             continue
@@ -75,6 +80,25 @@ def check(current, baseline):
     return errors
 
 
+def sample(bin_dir, log, text_only):
+    suffix = ".exe" if os.name == "nt" else ""
+    result = json.loads(run([bin_dir / ("kwil-bench" + suffix), "measure", log]).stdout)
+    if not text_only:
+        app = bin_dir / ("kwil" + suffix)
+        file_trace = trace(app, log)
+        empty_trace = trace(app)
+        result.update(startup_file_ms=file_trace["first_frame"],
+                      startup_empty_ms=empty_trace["first_frame"],
+                      startup_index_ms=file_trace["index_done"])
+    return result
+
+
+def summarize(samples, runner, commit):
+    return {"schema": SCHEMA, "runner": runner, "fixture": "v1", "commit": commit,
+            "runs": len(samples), "samples": samples,
+            "medians": {k: statistics.median(s[k] for s in samples) for k in samples[0]}}
+
+
 def main():
     p = argparse.ArgumentParser(__doc__)
     p.add_argument("--bin-dir", type=Path, required=True)
@@ -83,12 +107,23 @@ def main():
     p.add_argument("--runs", type=int, default=5, choices=range(3, 10, 2))
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--baseline", type=Path)
+    p.add_argument("--reference-bin-dir", type=Path)
+    p.add_argument("--reference-source", type=Path)
+    p.add_argument("--reference-manifest", type=Path)
     p.add_argument("--text-only", action="store_true")
     a = p.parse_args()
     suffix = ".exe" if os.name == "nt" else ""
-    bench = a.bin_dir / ("kwil-bench" + suffix)
     app = a.bin_dir / ("kwil" + suffix)
     samples = []
+    reference_samples = []
+    reference_commit = None
+    if any((a.reference_bin_dir, a.reference_source, a.reference_manifest)):
+        if not all((a.reference_bin_dir, a.reference_source, a.reference_manifest)):
+            raise RuntimeError("paired measurement requires binary directory, source and trusted manifest")
+        expected = json.loads(a.reference_manifest.read_text(encoding="utf-8-sig"))["source_head"]
+        reference_commit = run(["git", "-C", a.reference_source, "rev-parse", "HEAD"]).stdout.strip()
+        if not re.fullmatch("[0-9a-f]{40}", expected) or reference_commit != expected:
+            raise RuntimeError("reference checkout does not match the trusted baseline source")
     log = a.fixtures / "log-1g.log"
     if log.stat().st_size < 1 << 30:
         raise RuntimeError("canonical 1 GiB fixture required")
@@ -96,23 +131,24 @@ def main():
     with log.open("rb") as f:
         while f.read(1 << 20):
             pass
-    for _ in range(a.runs):
-        sample = json.loads(run([bench, "measure", log]).stdout)
-        if not a.text_only:
-            file_trace = trace(app, log)
-            empty_trace = trace(app)
-            sample.update(startup_file_ms=file_trace["first_frame"],
-                          startup_empty_ms=empty_trace["first_frame"],
-                          startup_index_ms=file_trace["index_done"])
-        samples.append(sample)
-    keys = samples[0].keys()
-    result = {"schema": SCHEMA, "runner": a.runner, "fixture": "v1",
-              "commit": run(["git", "rev-parse", "HEAD"]).stdout.strip(),
-              "runs": a.runs, "samples": samples,
-              "medians": {k: statistics.median(s[k] for s in samples) for k in keys}}
+    for iteration in range(a.runs):
+        order = [(a.bin_dir, samples)]
+        if a.reference_bin_dir:
+            order.append((a.reference_bin_dir, reference_samples))
+            if iteration % 2:
+                order.reverse()
+        for bin_dir, bucket in order:
+            bucket.append(sample(bin_dir, log, a.text_only))
+    result = summarize(samples, a.runner, run(["git", "rev-parse", "HEAD"]).stdout.strip())
+    reference = None
+    if reference_samples:
+        reference = summarize(reference_samples, a.runner, reference_commit)
+        result["reference"] = reference
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result["medians"], indent=2))
+    if reference:
+        print("Paired baseline-code medians:", json.dumps(reference["medians"], indent=2))
     if not a.text_only:
         # Separate process, after startup samples; never pollutes launch timing.
         frames = run([app, "--gui", "--hidden", "--frame-script", log]).stdout
@@ -127,10 +163,15 @@ def main():
             raise RuntimeError("\n".join(errors))
         if not a.baseline.is_file():
             raise RuntimeError("baseline missing; results saved, reviewed explicit seeding required")
-        errors = check(result, json.loads(a.baseline.read_text(encoding="utf-8-sig")))
+        baseline = json.loads(a.baseline.read_text(encoding="utf-8-sig"))
+        result["stored_baseline"] = baseline
+        a.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        if reference is None:
+            raise RuntimeError("paired baseline-code measurements required; no literal-number fallback")
+        errors = check(result, baseline, reference)
         if errors:
             raise RuntimeError("\n".join(errors))
-        print("PASS: all §3 hard limits and <=10% cost regression against OS baseline")
+        print("PASS: all §3 hard limits, <=10% timing regression against paired OS baseline code, and stored private-memory regression limit")
 
 
 if __name__ == "__main__":

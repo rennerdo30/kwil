@@ -41,6 +41,42 @@ class GateTests(unittest.TestCase):
             self.assertTrue(run.check(bad, self.base))
             self.assertTrue(run.check(self.base, bad))
 
+    def test_paired_timing_compensates_host_speed_but_keeps_ten_percent_gate(self):
+        reference = copy.deepcopy(self.base)
+        current = copy.deepcopy(self.base)
+        # Both binaries run on a host twice as slow as the stored sample.
+        for metric, (direction, _) in run.LIMITS.items():
+            if metric == "private_mb":
+                continue
+            reference["medians"][metric] *= 2 if direction == "max" else 0.5
+            current["medians"][metric] = reference["medians"][metric]
+        self.assertEqual(run.check(current, self.base, reference), [])
+        self.assertTrue(run.check(current, self.base))
+        for metric, (direction, _) in run.LIMITS.items():
+            if metric == "private_mb":
+                continue
+            slow = copy.deepcopy(current)
+            slow["medians"][metric] *= 1.101 if direction == "max" else 1 / 1.101
+            self.assertTrue(any("regression" in e for e in run.check(slow, self.base, reference)), metric)
+
+    def test_paired_reference_cannot_waive_hard_or_stored_memory_limits(self):
+        reference = copy.deepcopy(self.base)
+        reference["medians"]["private_mb"] = 200
+        current = copy.deepcopy(self.base)
+        current["medians"]["private_mb"] *= 1.101
+        self.assertTrue(any("regression" in e for e in run.check(current, self.base, reference)))
+        for metric, (direction, limit) in run.LIMITS.items():
+            if limit is None:
+                continue
+            bad = copy.deepcopy(self.base)
+            bad["medians"][metric] = limit * (1.01 if direction == "max" else 0.99)
+            self.assertTrue(any("hard limit" in e for e in run.check(bad, bad, bad)), metric)
+
+    def test_paired_reference_must_match_runner_and_fixture(self):
+        wrong = copy.deepcopy(self.base)
+        wrong["runner"] = "ubuntu-24.04"
+        self.assertTrue(run.check(self.base, self.base, wrong))
+
 
 if __name__ == "__main__":
     unittest.main()

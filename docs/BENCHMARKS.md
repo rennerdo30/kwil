@@ -49,7 +49,10 @@ It never turns a failed present into a successful startup measurement.
 
 The `frame-harness` app feature links the scenario seam. `--frame-script` starts a
 bounded script worker only after the first frame and index: settle, idle 500 ms,
-20 scroll steps, idle 500 ms, exit. The UI remains event-driven. Actual present
+20 scroll steps, idle 500 ms, exit. Each step waits for a successful present
+acknowledgement before the worker sends another step (five-second deadline).
+The 20 ms interval is a minimum gap, not an assumption that a hosted Windows
+present completes within 20 ms. CPU p99 is still recorded. The UI remains event-driven. Actual present
 damage and successful native screen copies feed the statistics; a model-only
 damage test cannot pass this gate. p99 is reported from the 20 measured CPU frame
 durations (nearest rank = maximum); this is not input-to-display latency.
@@ -103,32 +106,50 @@ in the spec/issue. Linux uses Xvfb for actual window creation/presents.
 Both OSes also smoke the TUI trace in a real terminal (Linux PTY and hidden
 Windows console). These functional smokes are separate from GUI launch budgets.
 
-The runner warms the mapped file cache using a 1 MiB buffer, then measures a
-median of **five fresh processes**, separately for text, GUI file and GUI empty.
-Every numeric budget fails both on its hard limit and on **cost >110% of the
-stored OS median**. Throughput compares inverse GB/s, i.e. time per byte. A slow
-baseline can never waive a hard limit. Raw samples, medians and source commit
+The runner builds candidate and pinned baseline code before sampling, warms the
+mapped file cache using a 1 MiB buffer, then measures **five fresh processes per
+version**, separately for text, GUI file and GUI empty. Samples are interleaved;
+the version measured first alternates each round. Every numeric budget retains
+its hard limit. Timings fail on **cost >110% of the baseline-code median measured
+on the same OS runner**. Throughput compares inverse GB/s, i.e. time per byte.
+Private memory keeps its original **stored OS median** comparison: CPU speed is
+not a memory calibration. A slow reference can never waive a hard limit. Raw
+candidate/reference samples, medians, exact baseline inputs and source commits
 are uploaded on success or failure. Tests inject slow timings to check every
-hard limit, regression direction and missing/mismatched baseline rejection.
+hard limit, regression direction, paired calibration, memory growth and
+missing/mismatched baseline rejection.
 
-Baselines are `windows-2025.json` and `ubuntu-24.04.json` on the separate
+The parent approved paired timing comparison on 2026-10-23 after
+[run 39830020650](https://github.com/rennerdo30/kwil/actions/runs/39830020650)
+measured unchanged baseline code at 10.96 GB/s versus its stored 17.35 GB/s;
+the candidate measured 10.27 GB/s on that same host. Literal OS numbers were
+mostly measuring hosted-machine variation. The threshold remains >10% and
+hard limits remain independent of the calibration.
+
+Baselines are `windows-2025.json`, `ubuntu-24.04.json` and a `reference.json`
+source pointer on the separate
 **`bench-baseline` branch**. CI reads that branch with `contents: read`, never
 writes to it or `main`, and fails closed if it is absent or incompatible. Files
-use the same schema as the uploaded result JSON. This choice keeps baseline
+use the same schema as the uploaded result JSON; `reference.json` pins the
+reviewed source head for both OSes. CI verifies the checked-out SHA before
+measuring it. This choice keeps baseline
 updates explicit and reviewable, avoids artifact expiry silently resetting the
 comparison, and prevents a PR from blessing its own results through CI writes.
 Branch protection/review of baseline changes belongs to the coordinator.
 
-To bootstrap or deliberately update a baseline:
+To deliberately update the initialized baseline:
 
-1. Run the workflow on the intended reviewed source. A missing baseline fails
-   **after** recording results; that is not a passing benchmark gate.
+1. Run the workflow on the intended reviewed source. A missing or incompatible
+   baseline fails closed; samples are retained if execution reached measurement.
 2. Download both `bench-<runner>` artifacts. Check their source commit, raw
    samples, hard limits and frame results. Investigate any slowdown first.
 3. Commit the exact result JSON files to `bench-baseline` in a separate checkout
    (identity through environment; explicit-ref push). Never copy owner-PC numbers
    into a hosted baseline or mix runner OS/images. Record the reason and source
-   run links in the baseline commit and KW-33.
+   run links in the baseline commit and KW-33. Update `reference.json`'s
+   `source_head` to the corresponding reviewed head whose merge produced the
+   result files. Both OS files must represent that source. Never change the
+   pointer merely to make an unexplained regression pass.
 4. Re-run the candidate gate against those stored files. Baseline updates do not
    change the §3 limits or the >10% comparison.
 
