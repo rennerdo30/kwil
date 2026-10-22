@@ -41,6 +41,12 @@ jobs:
             exit 1
           fi
       - run: rustup target add ${{ matrix.target }}
+      # Dependencies cached per target; tags are rare, so this mainly helps
+      # re-runs of a failed release.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
       - run: cargo build --release --locked -p kwil --target ${{ matrix.target }}
       - name: Stage the binary
         shell: bash

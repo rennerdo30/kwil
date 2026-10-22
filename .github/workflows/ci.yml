@@ -16,7 +16,12 @@ env:
   CARGO_TERM_COLOR: always
   # .cargo/config.toml points at the owner PC's cache folder; CI builds in-tree.
   CARGO_TARGET_DIR: target
+  # CI builds from scratch or from the cache: incremental state and debug
+  # info only make the cache bigger and the links slower.
   CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_NET_RETRY: 10
 
 jobs:
   fmt:
@@ -37,14 +42,23 @@ jobs:
       - uses: actions/checkout@v7
       # rust-toolchain.toml pins the version; rustup installs it on first use.
       - run: rustup show active-toolchain
+      # Caches ~/.cargo (registry, git) and target/ dependencies, keyed by
+      # OS, toolchain and Cargo.lock. Only main writes the cache, so pull
+      # requests reuse it without churning it; failed runs still save, so a
+      # red build does not cost the next run a cold compile.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo build --release --locked -p kwil
+      # The release profile (thin LTO, 1 codegen unit) is built only by the
+      # release workflow; the smoke test uses the debug binary from the tests.
       - name: Smoke test
         shell: bash
         run: |
-          exe=target/release/kwil
+          cargo build --locked -p kwil
+          exe=target/debug/kwil
           [ -f "$exe.exe" ] && exe="$exe.exe"
           "$exe" --version
           "$exe" --help > /dev/null

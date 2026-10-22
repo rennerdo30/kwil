@@ -157,7 +157,9 @@ mod tests {
     fn index_matches_naive_split() {
         let mut text = Vec::new();
         let mut seed = 7u64;
-        for i in 0..50_000u64 {
+        // ~8k lines keep the debug-build test fast while still crossing many
+        // chunk borders with the small chunk sizes below.
+        for i in 0..8_000u64 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             let n = (seed >> 58) as usize; // 0..63 bytes per line
             text.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, n));
@@ -166,7 +168,7 @@ mod tests {
         text.extend_from_slice(b"last line without newline");
 
         let naive: Vec<u64> = std::iter::once(0).chain(memchr_iter(b'\n', &text).map(|p| p as u64 + 1)).collect();
-        for (every, chunk) in [(1, 1 << 20), (7, 4096), (1024, 1000), (1024, 16 << 20)] {
+        for (every, chunk) in [(1, 1 << 20), (7, 4096), (64, 1000), (1024, 1000), (1024, 16 << 20)] {
             let idx = LineIndex::build_chunked(&text, every, chunk, 4, &AtomicU64::new(0));
             assert_eq!(idx.line_count(), naive.len() as u64);
             for (line, &start) in naive.iter().enumerate() {
