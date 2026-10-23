@@ -1215,6 +1215,16 @@ fn recover_prepared(
     path: PathBuf,
     tab: &Tab,
 ) -> io::Result<(Document, RecoveredJournal, JournalBase, Option<provenance::OriginRegistry>)> {
+    recover_prepared_with_add_limit(root, encoding, path, tab, 8 * 1024 * 1024)
+}
+
+fn recover_prepared_with_add_limit(
+    root: &std::path::Path,
+    encoding: &mut encoding_runtime::EncodingRuntime,
+    path: PathBuf,
+    tab: &Tab,
+    add_memory_bytes: usize,
+) -> io::Result<(Document, RecoveredJournal, JournalBase, Option<provenance::OriginRegistry>)> {
     use provenance::{
         decode::DecodeLimits,
         journal::{JournalRecovery, JournalReplayLimits},
@@ -1232,7 +1242,7 @@ fn recover_prepared(
         JournalReplayLimits {
             replay: ReplayLimits {
                 core: kwil_core_text::RecoveryLimits {
-                    add_memory_bytes: 8 * 1024 * 1024,
+                    add_memory_bytes,
                     undo_memory_bytes: usize::try_from(
                         kwil_core_commands::settings::Settings::default().undo.memory_limit_bytes,
                     )
@@ -1263,7 +1273,10 @@ fn recover_prepared(
         // The authenticated consumer identifies the old raw base explicitly.
         // Other framing, checksum, policy and cap failures retain their error.
         Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-            recover_document(path, tab).map(|(document, journal, base)| (document, journal, base, None))
+            recover_document(path, tab).and_then(|(document, journal, base)| {
+                encoding.retain_recovered_spills(&document.snapshot(), &AtomicBool::new(false))?;
+                Ok((document, journal, base, None))
+            })
         }
         Err(error) => Err(error),
     }
@@ -2379,6 +2392,68 @@ mod tests {
         storage.service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         drop(document);
         drop(storage);
+    }
+
+    #[test]
+    fn recovered_raw_and_encoded_spills_remain_worker_owned_after_frontend_drop() {
+        use std::sync::Arc;
+        for encoded in [false, true] {
+            let root = Scratch::new();
+            let tab = recovery_tab(None);
+            let path = root.0.join(format!("{}.kwj", tab.id.0));
+            if encoded {
+                let mut buffer = Buffer::empty();
+                buffer.insert(0, b"recovered capsule").unwrap();
+                let registry = provenance::OriginRegistry::new(8, 1 << 20);
+                let plan = registry.plan(buffer.snapshot(), 0..buffer.len(), Arc::new(AtomicBool::new(false))).unwrap();
+                let base = JournalBase {
+                    document: tab.id,
+                    revision: tab.revision,
+                    original_path: None,
+                    original_identity: [0; 4],
+                    codec: encoding_runtime::document_policy(&Document::new()).to_codec().unwrap(),
+                    byte_len: plan.physical_len(),
+                }
+                .with_logical_len(plan.logical_len())
+                .unwrap();
+                let mut service = JournalService::spawn(Duration::from_secs(1)).unwrap();
+                let handle = service
+                    .try_create_encoded(kwil_core_workspace::journal::EncodedJournalSeed {
+                        path: path.clone(),
+                        base,
+                        source: Box::new(registry.start(plan).unwrap()),
+                    })
+                    .unwrap();
+                handle.ready.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+                service.finish();
+                service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            } else {
+                fixture_journal(&root.0, &tab, b"legacy recovered");
+            }
+            let mut runtime = encoding_runtime::EncodingRuntime::new(
+                root.0.clone(),
+                retirement::BackingLimits {
+                    max_backings: 8,
+                    max_private_path_bytes: session::MAX_PATH_BYTES,
+                    max_metadata_bytes: 256 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+            // A zero resident budget forces real spills with a tiny fixture.
+            let (document, journal, _, origins) =
+                recover_prepared_with_add_limit(&root.0, &mut runtime, path, &tab, 0).unwrap();
+            let blocks = runtime.retained_spill_blocks();
+            assert!(blocks > 0, "every recovered spill must be leased before publication: encoded={encoded}");
+            assert!(runtime.retire().live >= blocks);
+            let snapshot = document.snapshot();
+            std::thread::spawn(move || drop((document, snapshot, origins))).join().unwrap();
+            assert_eq!(runtime.retained_spill_blocks(), blocks, "UI drop must leave the worker lease intact");
+            drop(journal);
+            let report = runtime.retire();
+            assert_eq!(report.cleanup_pending, 0);
+            assert_eq!(runtime.retained_spill_blocks(), 0);
+            assert!(report.retired >= blocks);
+        }
     }
 
     #[test]

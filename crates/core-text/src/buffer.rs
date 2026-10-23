@@ -59,6 +59,24 @@ impl SnapshotImporter {
 }
 
 impl Snapshot {
+    /// Worker-only, before publishing this recovered snapshot to a frontend.
+    /// The non-Send lease keeps physical spill cleanup on its owning worker.
+    ///
+    /// ```compile_fail
+    /// use kwil_core_text::{Snapshot, SpillRetirementLimits};
+    /// let lease = Snapshot::default().retain_spills(SpillRetirementLimits {
+    ///     max_block_references: 0, max_metadata_bytes: 4096, max_path_bytes: 4096,
+    /// }, || false).unwrap();
+    /// std::thread::spawn(move || drop(lease));
+    /// ```
+    pub fn retain_spills(
+        &self,
+        limits: crate::SpillRetirementLimits,
+        cancelled: impl FnMut() -> bool,
+    ) -> io::Result<crate::SpillRetirement> {
+        crate::SpillRetirement::collect(&self.root, limits, cancelled)
+    }
+
     pub fn storage_resources(&self) -> crate::StorageResources {
         self.root.as_ref().map_or(crate::StorageResources::default(), |node| node.metrics.resources)
     }

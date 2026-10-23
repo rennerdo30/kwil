@@ -19,4 +19,5 @@ pub use file::{OriginalSavePin, cleanup_stale_save_backups};
 pub use line_index::LineIndex;
 pub use piece_tree::Chunks;
 pub use piece_tree::{SourceChunk, SourceChunks, StorageResources};
+pub use piece_tree::{SpillRetirement, SpillRetirementLimits, SpillRetirementReport};
 pub use recovery::{RecoveryAssembler, RecoveryLimits, RecoveryRevision, RecoveryUsage};

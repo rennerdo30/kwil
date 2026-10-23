@@ -5,7 +5,7 @@ use super::provenance::{OriginRegistry, journal::JournalRecovery};
 use super::retirement::{BackingLimits, RetirementReport, WorkerBackings};
 use crate::{Document, DocumentLineEnding};
 use kwil_core_text::{
-    TextFile,
+    SpillRetirement, SpillRetirementLimits, TextFile,
     decoded_backing::DecodedPreview,
     encoding::{Encoding, LineEnding, SavePlan},
 };
@@ -19,15 +19,22 @@ use std::{io, path::PathBuf, sync::atomic::AtomicBool};
 pub(super) struct EncodingRuntime {
     backings: WorkerBackings,
     recovered: Vec<Option<JournalRecovery>>,
+    spills: Vec<Option<SpillRetirement>>,
+    spill_metadata_cap: usize,
+    spill_metadata_reserved: usize,
+    spill_path_cap: usize,
 }
 
 impl EncodingRuntime {
     pub(super) fn new(parent: PathBuf, limits: BackingLimits) -> io::Result<Self> {
         let slots = limits.max_backings;
         let metadata_cap = limits.max_metadata_bytes;
+        let spill_path_cap = limits.max_private_path_bytes;
         let backings = WorkerBackings::new(parent, limits)?;
         let extra = slots
-            .checked_mul(std::mem::size_of::<Option<JournalRecovery>>())
+            .checked_mul(
+                std::mem::size_of::<Option<JournalRecovery>>() + std::mem::size_of::<Option<SpillRetirement>>(),
+            )
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
             .ok_or_else(|| io::Error::other("recovery registry metadata overflow"))?;
         if backings.metadata_reserved().checked_add(extra).is_none_or(|bytes| bytes > metadata_cap) {
@@ -36,7 +43,45 @@ impl EncodingRuntime {
         let mut recovered = Vec::new();
         recovered.try_reserve_exact(slots).map_err(|_| io::Error::other("recovery owner allocation failed"))?;
         recovered.resize_with(slots, || None);
-        Ok(Self { backings, recovered })
+        let mut spills = Vec::new();
+        spills.try_reserve_exact(slots).map_err(|_| io::Error::other("spill owner allocation failed"))?;
+        spills.resize_with(slots, || None);
+        let spill_metadata_cap = metadata_cap - backings.metadata_reserved() - extra;
+        Ok(Self { backings, recovered, spills, spill_metadata_cap, spill_metadata_reserved: 0, spill_path_cap })
+    }
+
+    /// Pin every ordinary spill before a recovered Buffer reaches the UI.
+    /// Origins alone do not own added logical/opaque spill blocks.
+    pub(super) fn retain_recovered_spills(
+        &mut self,
+        snapshot: &kwil_core_text::Snapshot,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        if snapshot.storage_resources().spilled_blocks == 0 {
+            return Ok(());
+        }
+        let slot = self
+            .spills
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "recovered spill capacity retained"))?;
+        let available = self.spill_metadata_cap - self.spill_metadata_reserved;
+        let lease = snapshot.retain_spills(
+            SpillRetirementLimits {
+                max_block_references: available / std::mem::size_of::<usize>(),
+                max_metadata_bytes: available,
+                max_path_bytes: self.spill_path_cap,
+            },
+            || cancel.load(std::sync::atomic::Ordering::Relaxed),
+        )?;
+        self.spill_metadata_reserved += lease.metadata_reserved();
+        *slot = Some(lease);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_spill_blocks(&self) -> usize {
+        self.spills.iter().flatten().map(SpillRetirement::retained).sum()
     }
 
     pub(super) fn open(
@@ -78,6 +123,20 @@ impl EncodingRuntime {
 
     pub(super) fn retire(&mut self) -> RetirementReport {
         let mut report = self.backings.retire();
+        for slot in &mut self.spills {
+            let Some(lease) = slot else { continue };
+            let retired = lease.retire();
+            report.retired += retired.retired;
+            report.live += retired.live;
+            report.cleanup_pending += retired.cleanup_pending;
+            if report.first_error.is_none() {
+                report.first_error = retired.first_error;
+            }
+            if lease.retained() == 0 {
+                self.spill_metadata_reserved -= lease.metadata_reserved();
+                *slot = None;
+            }
+        }
         for slot in &mut self.recovered {
             let Some(recovery) = slot else { continue };
             match recovery.retry_retirement() {
@@ -111,12 +170,12 @@ impl EncodingRuntime {
     ) -> io::Result<(Document, RecoveredJournal, JournalBase, OriginRegistry)> {
         let slot = self
             .recovered
-            .iter_mut()
-            .find(|slot| slot.is_none())
+            .iter()
+            .position(|slot| slot.is_none())
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "recovery backing capacity retained"))?;
         // Keep ownership even if opening, replay, adoption or extraction fails.
-        *slot = Some(recovery);
-        let recovery = slot.as_mut().expect("worker recovery owner");
+        self.recovered[slot] = Some(recovery);
+        let recovery = self.recovered[slot].as_mut().expect("worker recovery owner");
         let result = (|| {
             let journal = recovery.recover_owned(path, tab.id, cancel)?;
             let summary = recovery.summary().ok_or_else(|| io::Error::other("recovery summary missing"))?;
@@ -202,10 +261,14 @@ impl EncodingRuntime {
             }
             Ok((document, journal, base, origins))
         })();
+        let result = result.and_then(|(document, journal, base, origins)| {
+            self.retain_recovered_spills(&document.snapshot(), cancel)?;
+            Ok((document, journal, base, origins))
+        });
         if result.is_err() {
             // Drops replay roots before trying cleanup; pins from a successful
             // returned Buffer and writer directory keep their owners live.
-            let _ = recovery.abandon();
+            let _ = self.recovered[slot].as_mut().expect("worker recovery owner").abandon();
         }
         result
     }

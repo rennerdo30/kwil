@@ -19,6 +19,10 @@ const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
 pub(crate) type Tree = Option<Arc<Node>>;
 pub(crate) type OriginalUses = BTreeMap<(u8, usize), (SourceRef, u64)>;
 
+#[path = "spill_retirement.rs"]
+mod spill_retirement;
+pub use spill_retirement::{SpillRetirement, SpillRetirementLimits, SpillRetirementReport};
+
 #[derive(Clone)]
 pub(crate) enum SourceRef {
     Raw(crate::file::OriginalRef),
@@ -118,6 +122,9 @@ struct DiskBlock {
     map: Option<memmap2::Mmap>,
     file: Option<File>,
     path: PathBuf,
+    // Once leased, only an explicit worker retirement may unlink this block.
+    // Worker shutdown must not hand deletion back to a surviving UI snapshot.
+    explicit_retirement: std::sync::atomic::AtomicBool,
 }
 
 impl DiskBlock {
@@ -147,7 +154,8 @@ impl DiskBlock {
             #[cfg(not(unix))]
             let path = std::env::temp_dir().join(format!("kwil-add-{}-{id}.tmp", std::process::id()));
             // Own the private directory before any fallible file operation.
-            let mut block = Self { map: None, file: None, path };
+            let mut block =
+                Self { map: None, file: None, path, explicit_retirement: std::sync::atomic::AtomicBool::new(false) };
             let mut options = OpenOptions::new();
             options.read(true).write(true).create_new(true);
             #[cfg(unix)]
@@ -177,6 +185,9 @@ impl Drop for DiskBlock {
     fn drop(&mut self) {
         self.map.take();
         let owns_file = self.file.take().is_some();
+        if self.explicit_retirement.load(Ordering::Relaxed) {
+            return;
+        }
         // A failed create_new must never delete somebody else's file.
         // Only a successfully opened file belongs to this block.
         // file.take() above closes the handle before removal on Windows.
