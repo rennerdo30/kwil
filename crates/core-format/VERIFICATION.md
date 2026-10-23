@@ -322,3 +322,31 @@ explicit restored-source timestamp advance to prevent stale mutant reuse.
 Evidence: `E:/AgentData/scratch/kwil-v1-wave-formatter-r7-c8a173e`.
 Source preparation only; Cargo/tests/Clippy and behavioral fail-first execution
 have NOT RUN for this R7 candidate. A finite ROOT grant is required first.
+
+## R8 source candidate after independent review (2026-10-23)
+
+Pinned review/source baseline: `de1ef1486b94cc7c379041caa88214760d5ccfae`.
+R8 confirmed both R7 repairs, then found two inherited P1s: SQL universal block
+comment nesting can hide a literal opener under SQLite-style first-close rules,
+and a bare `<?php` prefix can misclassify inline output without a tag boundary.
+
+The candidate refuses a nested SQL block-comment opener before returning any
+replacement, without inferring a dialect. PHP long-tag recognition now requires
+following proven space/tab/CR/LF; unknown prefix/inline output remains byte-exact.
+Existing short echo support and case-insensitive PHP halt protection stay intact.
+All public APIs, manifests, dependencies and ceilings are unchanged.
+
+The R0-R8 matrix retains all prior protections and 66 named tests. ROOT explicitly
+approved correcting only the R1 nested-comment positive and the R7 nested atom
+positive into ambiguity refusal cases (message081f417a-202e-45be-b811-9f7b40312a20).
+Original inputs/counts are retained; positive nonnested/quoted-marker formatting
+is covered. Every other prior assertion remains unchanged.
+
+Four new R8 tests include both exact counterexamples, nested/quoted/nonnested
+boundaries, PHP prefix/case/whitespace/EOF variants and safe formatting controls.
+Historical de1ef148 and separate universal-nesting/PHP-prefix fault plans are
+prepared. The wrapper retains byte/SHA restoration and explicit freshness logs.
+No compilation, fault execution or native/platform acceptance is claimed here.
+
+Evidence: `E:/AgentData/scratch/kwil-v1-wave-formatter-r8-de1ef14`.
+Source-only pending a fresh direct ROOT Cargo grant.

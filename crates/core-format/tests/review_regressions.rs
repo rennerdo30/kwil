@@ -67,7 +67,15 @@ fn sql_newline_literal_concat() {
 #[test]
 fn sql_nested_comments() {
     let s = "select /* outer /* inner */ 'ignored */ 1;";
-    assert_eq!(out(s, Language::Sql, "sql"), "SELECT /* outer /* inner */ 'ignored */ 1;\n");
+    // R8: the former positive assumed universal nesting and could hide a real
+    // literal opener under a nonnesting dialect. An error returns no replacement.
+    let error = format(s.as_bytes(), Language::Sql, "sql", None, &Settings::default()).unwrap_err();
+    assert!(error.message.contains("nested block comment boundary") && error.message.contains("dialect"), "{error}");
+    assert_eq!(out("select /* nonnested 'from' */ 1;", Language::Sql, "sql"), "SELECT /* nonnested 'from' */ 1;\n");
+    assert_eq!(
+        out("select '/* nested /* marker */' from t;", Language::Sql, "sql"),
+        "SELECT '/* nested /* marker */'\nFROM t;\n"
+    );
 }
 
 #[test]

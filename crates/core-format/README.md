@@ -74,7 +74,10 @@ input ceiling; a lower output limit is checked after its serialization.
   Both preserve quoted text/comments and validate balanced delimiters, not the
   full language grammar. SQL also preserves bracket and dollar-quoted content.
   SQL retains original whitespace separators so newline-concatenated literals
-  remain concatenated, and supports nested block comments.
+  remain concatenated. A nested opener inside a SQL block comment is refused:
+  nested and first-close dialects disagree on where ordinary code resumes.
+  The formatter selects neither grammar without proof. Nonnested comments and
+  comment-marker text inside a proven quoted span remain supported.
   Unproven SQL constructs outside literals/comments are refused with a dialect
   explanation and no returned edit: `#` has dialect-specific comment/operator
   meanings, and `:`, `@`, `?` can introduce parameters or variables. Complete
@@ -117,6 +120,10 @@ input ceiling; a lower output limit is checked after its serialization.
   PHP's `__halt_compiler` introducer is ASCII-case-insensitive; every case
   protects its trailing data through EOF. Text inside an already-proven string
   or comment does not activate that halt boundary, and ordinary code still tidies.
+  PHP code context requires `<?php` (case-insensitive) followed by proven
+  space/tab/CR/LF, or the existing `<?=` echo tag. A prefix such as `<?phpx`, a
+  missing boundary, an unsupported short tag or other inline output preserves
+  the complete unit including EOF. No short-tag configuration is guessed.
   Heredoc body scanning requires a proven simple header made only of heredoc
   operators, simple delimiter words (optionally quoted) and spaces/tabs. Any
   other header token protects the suffix through EOF: a physical LF inside a
@@ -224,6 +231,10 @@ guard faults and require the corresponding two tests to fail. Each invocation
 must fit the parent's finite grant. It restores exact source bytes/SHA/mtime,
 then logs an explicit timestamp advance for only those restored source files so
 the next positive run rebuilds repaired source without reusing a mutant binary.
+`verify-round8-fail-first.ps1` similarly selects Base (de1ef148, four failures),
+Sql (universal nesting, two failures) or Php (unbounded tag prefix, two failures).
+Use the approved pinned-toolchain/child-RUSTC runner; all invocations must fit
+the finite parent grant. Exact restoration and explicit freshness logs are kept.
 
 All harnesses require a direct parent Cargo grant and no concurrent reader of
 this package. `verify-support.ps1` uses the configured shared cache without

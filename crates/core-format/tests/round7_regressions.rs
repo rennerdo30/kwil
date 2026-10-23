@@ -28,17 +28,23 @@ fn sql_comment_boundaries_are_proven_without_entering_literals_or_comments() {
     }
     let result = format(b"select 1--\nfrom t;", Language::Sql, "sql", None, &Settings::default()).unwrap();
     assert_eq!(result.bytes, b"SELECT 1--\nFROM t;\n");
-    for atom in [
-        "'--2 from'",
-        "'a\n--2 from b\n '",
-        "\"--from\"",
-        "[--from]",
-        "$$--2 from$$",
-        "$tag$--2 from$tag$",
-        "/* --2 'from' */ 1",
-        "/* outer /* --2 */ 'from' */ 1",
+    for (atom, nested) in [
+        ("'--2 from'", false),
+        ("'a\n--2 from b\n '", false),
+        ("\"--from\"", false),
+        ("[--from]", false),
+        ("$$--2 from$$", false),
+        ("$tag$--2 from$tag$", false),
+        ("/* --2 'from' */ 1", false),
+        ("/* outer /* --2 */ 'from' */ 1", true),
     ] {
         let input = format!("select {atom} from t;");
+        if nested {
+            // R8: retain this case as an explicit ambiguity refusal instead of
+            // the former positive that silently selected nested-comment grammar.
+            sql_refuses_unproven_boundary(&input);
+            continue;
+        }
         let result = format(input.as_bytes(), Language::Sql, "sql", None, &Settings::default()).unwrap();
         assert_eq!(result.bytes, format!("SELECT {atom}\nFROM t;\n").as_bytes(), "{atom}");
     }

@@ -691,8 +691,13 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
             i += 2;
             while i < b.len() && nesting > 0 {
                 if sql && text[i..].starts_with("/*") {
-                    nesting += 1;
-                    i += 2;
+                    // Dialects disagree: SQLite closes at the first */, while
+                    // PostgreSQL nests. Neither lexical boundary is proven here.
+                    return Err(FormatError::new(
+                        "SQL",
+                        "nested block comment boundary requires an explicit dialect; configure an external formatter",
+                        line_at(b, i),
+                    ));
                 } else if text[i..].starts_with("*/") {
                     nesting -= 1;
                     i += 2;

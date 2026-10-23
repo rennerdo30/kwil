@@ -1,6 +1,6 @@
-# Formatter preservation audit after seven review rounds
+# Formatter preservation audit after eight review rounds
 
-Base audited: `c8a173e0cbdaea5c87aed18c898c23e3bb8edb49` plus the R7 source
+Base audited: `de1ef1486b94cc7c379041caa88214760d5ccfae` plus the R8 source
 candidate. Every prior failure class below retains its safety contracts.
 R6 corrects two unsafe legacy selection output assertions with explicit parent
 approval; JSON and root/document XML positive selection checks remain. No test
@@ -14,7 +14,7 @@ that local tests replace macOS/Linux CI or prove every language grammar.
 | R1 Markdown hard breaks, fenced/indented code | No generic tokenizer: no edit, including EOF | `review_regressions::{markdown_hard_break,markdown_code_bytes}` |
 | R1 HTML adjacent inline elements, images, unknown/mixed containers; XML mixed whitespace | Markup changes only admitted structural whitespace; inherited XML space is retained | `review_regressions::{html_inline_labels,html_inline_images,html_unknown_mixed_and_existing_spaces,xml_mixed_content_and_inherited_space}`; markup contracts |
 | R1 CSS escaped punctuation; R2 escaped/case-insensitive URL identifiers | Escape-aware atomic identifiers; decoded recognition with original URL/function bytes emitted | `review_regressions::css_escaped_semicolon`; `round2_regressions::css_decoded_url_identifiers_keep_original_bytes` |
-| R1 SQL newline-concatenated literals and nested comments | Keep original separators and complete quoted/comment spans before keyword handling | `review_regressions::{sql_newline_literal_concat,sql_nested_comments}`; dialect literal contract |
+| R1 SQL newline-concatenated literals and comment boundaries | Keep original separators and complete proven spans; R8 refuses nested/non-nested ambiguity instead of choosing universal nesting | `review_regressions::{sql_newline_literal_concat,sql_nested_comments}`; dialect literal contract |
 | R1 YAML keep-chomping and EOF | Preserve all YAML bytes; no final newline insertion | `review_regressions::yaml_no_final_break_literal`; YAML contract |
 | R1 TOML mixed structural/literal endings | Structural ending restoration is separate from raw multiline literal contents | `review_regressions::toml_crlf`; TOML golden |
 | R1 Windows descendant cleanup; R2 macOS zombie-only success | Owned job/group containment precedes leader reap, retaining Unix PID reservation; EPERM needs no-live-member proof | `review_regressions::external_timeout_terminates_grandchild`; `round2_regressions::successful_external_formatter_reaps_and_stops_descendant`; external contracts |
@@ -39,15 +39,28 @@ that local tests replace macOS/Linux CI or prove every language grammar.
 | R6 Java Unicode preprocessing changes comment/literal delimiters before raw-source scanning | A Java Unicode escape introducer preserves the entire compilation unit when preprocessing context is unproven | `round6_regressions::java_unicode_preprocessing_cannot_hide_text_block_openers` |
 | R7 SQL -- without following whitespace/control hides a quote under a different dialect | Refuse the entire request when a code-level -- boundary is unproven; shared comment boundaries and atomic quoted/comment spans remain supported | `round7_regressions::{sql_mysql_minus_operators_cannot_hide_a_literal_opener,sql_comment_boundaries_are_proven_without_entering_literals_or_comments}` |
 | R7 PHP mixed-case halt keyword exposes opaque trailing data to tidy | Match the halt introducer ASCII-case-insensitively outside already-proven comments/literals; preserve the suffix through EOF, with all tidy settings | `round7_regressions::{php_mixed_case_halt_compiler_preserves_payload_eof,php_halt_case_variants_protect_data_without_disabling_code_tidy}` |
+| R8 SQL universal comment nesting hides a literal opener under SQLite-style first-close rules | Refuse a nested opener inside a SQL block comment without choosing either grammar; nonnested comments and marker text inside proven literals remain supported | `round8_regressions::{sql_sqlite_comment_closure_cannot_hide_a_literal_opener,sql_nested_boundaries_are_refused_without_disabling_proven_atoms}`; corrected R1/R7 cases |
+| R8 PHP prefix without an opening-tag boundary exposes inline output | Require case-insensitive long tag followed by proven space/tab/CR/LF, or the existing short echo tag; otherwise protect all inline bytes and EOF | `round8_regressions::{php_prefix_without_a_tag_boundary_is_inline_output,php_requires_proven_opening_whitespace_and_retains_benign_code_tidy}` |
 
 The existing malformed-input, UTF-8, input/output cap, nesting, selection offset,
 external timeout/error and one-replacement contracts remain part of the focused
-formatter suite. R7 changes neither the process-tree code nor the public admission
+formatter suite. R8 changes neither the process-tree code nor the public admission
 ceilings. The parent retains independent review, cross-platform CI and merge.
 
-R7 continues the same conservative contract rather than introducing a SQL dialect
-guess or a special case for the reported input. Earlier rounds' failures remain
-listed above; all 62 existing tests are unchanged. Four R7 tests add the two exact
-review counterexamples, spelling/line-ending/literal/comment variants and benign
-SQL/CSS/PHP counterparts. Historical c8a173e and separate SQL/PHP guard faults
-must compile and fail behaviorally before these source-only claims are accepted.
+All 66 previous named tests and counts are retained. With direct ROOT approval
+(2026-10-23, message `081f417a-202e-45be-b811-9f7b40312a20`), two unsafe positives
+now assert dialect refusal before a replacement is returned:
+
+- R1 `sql_nested_comments` formerly required `SELECT /* outer /* inner */ 'ignored */ 1;\n`.
+  That expectation assumed universal nesting. Its original input remains, now
+  requiring an explicit ambiguity error, plus positive nonnested/literal cases.
+- R7's benign atom array formerly required formatting `/* outer /* --2 */ 'from' */ 1`.
+  The exact atom remains in the same test as an explicit refusal case; every other
+  atom and assertion retains its original formatting expectation.
+
+This corrects the contract instead of selecting SQLite, PostgreSQL or a fixture
+special case. All other prior test files are unchanged. Four R8 tests add exact
+counterexamples, dialect-boundary/tag variants and positive safe formatting.
+Historical de1ef148 plus independent universal-nesting/prefix faults must compile
+and fail behaviorally before this source-only candidate is accepted. No Cargo
+execution has run yet; ROOT retains the finite grant and independent review.

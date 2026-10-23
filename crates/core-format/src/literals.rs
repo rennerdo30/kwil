@@ -41,6 +41,14 @@ pub fn kind(file_type: &str) -> Option<Kind> {
     })
 }
 
+fn php_opening_tag(text: &str) -> bool {
+    let long = text.get(..5).is_some_and(|name| name.eq_ignore_ascii_case("<?php"));
+    // Without following tag whitespace, <?phpx is inline output when short tags
+    // are disabled. Preserve it; raw prefix spelling does not establish PHP code.
+    let boundary = matches!(text.as_bytes().get(5), Some(b' ' | b'\t' | b'\r' | b'\n'));
+    text.starts_with("<?=") || long && boundary
+}
+
 pub fn tidy(
     text: &str,
     range: Range<usize>,
@@ -48,9 +56,15 @@ pub fn tidy(
     kind: Kind,
     settings: &Settings,
 ) -> Result<String, FormatError> {
+    let mut out = Output::new(settings.max_output_bytes);
+    if kind == Kind::Php && !php_opening_tag(text) {
+        // Admission applies to the whole unit, including empty input and EOF;
+        // no raw-prefix/short-tag assumption may turn inline output into code.
+        out.push(&text[range])?;
+        return Ok(out.text);
+    }
     let mut scanner = Scanner { text, kind, pos: 0 };
     let mut span = scanner.next();
-    let mut out = Output::new(settings.max_output_bytes);
     let b = text.as_bytes();
     let mut start = range.start;
     let mut eol = None;
@@ -376,13 +390,8 @@ impl Iterator for Scanner<'_> {
             let hash_comment = matches!(k, Kind::Python | Kind::Ruby | Kind::Php)
                 || (k == Kind::Shell && (start == 0 || b" \t\n;|&()".contains(&b[start - 1])));
             let slash_comments = !matches!(k, Kind::Python | Kind::Shell | Kind::Ruby | Kind::Lua);
-            let end = if k == Kind::Php
-                && (rest.starts_with("#[")
-                    || (start == 0
-                        && !rest.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("<?php"))
-                        && !rest.starts_with("<?=")))
-            {
-                // Inline output and attributes may contain multiline literals.
+            let end = if k == Kind::Php && rest.starts_with("#[") {
+                // Attributes may contain multiline literals.
                 self.uncertain()
             } else if c == b'#' && hash_comment || slash_comments && rest.starts_with("//") {
                 // A spliced line comment can hide literal delimiters on the next
