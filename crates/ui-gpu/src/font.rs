@@ -36,11 +36,28 @@ pub struct Font {
     canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Parsed on the font worker while the event loop creates its window. Only
+/// rasterization waits for that window's actual monitor scale.
+struct PreparedFont {
+    face: fontdue::Font,
+    family: String,
+}
+
 impl Font {
     pub fn load(px: f32) -> Option<Font> {
+        let prepared = Self::prepare_default()?;
+        Self::from_face(prepared.face, px, &prepared.family)
+    }
+    fn prepare_default() -> Option<PreparedFont> {
         let (data, index, family) =
             CANDIDATES.iter().find_map(|(p, i, family)| Some((std::fs::read(p).ok()?, *i, *family)))?;
-        Self::from_bytes(data, index, px, family)
+        let settings = fontdue::FontSettings { collection_index: index, ..Default::default() };
+        Some(PreparedFont { face: fontdue::Font::from_bytes(data, settings).ok()?, family: family.into() })
+    }
+    pub fn startup(size: std::sync::mpsc::Receiver<f32>) -> Option<Font> {
+        let prepared = Self::prepare_default()?;
+        let px = size.recv().ok()?;
+        Self::from_face(prepared.face, px, &prepared.family)
     }
     pub fn load_named(px: f32, family: &str) -> Option<Font> {
         if family == "monospace" {
@@ -54,6 +71,9 @@ impl Font {
     fn from_bytes(data: Vec<u8>, index: u32, px: f32, family: &str) -> Option<Font> {
         let settings = fontdue::FontSettings { collection_index: index, ..Default::default() };
         let font = fontdue::Font::from_bytes(data, settings).ok()?;
+        Self::from_face(font, px, family)
+    }
+    fn from_face(font: fontdue::Font, px: f32, family: &str) -> Option<Font> {
         let lm = font.horizontal_line_metrics(px)?;
         let glyphs: Vec<_> = (32u8..127).map(|c| font.rasterize(c as char, px)).collect();
         let cw = glyphs[(b'M' - 32) as usize].0.advance_width.round().max(1.0) as usize;
@@ -208,6 +228,22 @@ fn move_rows(rows: &mut Vec<usize>, delta: i64, ch: usize, visible: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn startup_font_uses_requested_monitor_pixels_before_first_frame() {
+        for scale in [1.25, 1.5, 2.0] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || Font::startup(rx));
+            let expected = crate::zoom::Zoom::default().physical_px(14.0, scale);
+            crate::zoom::start_font_rasterization(tx, 14.0, scale, crate::zoom::Zoom::default()).unwrap();
+            let font = worker.join().unwrap().expect("Windows default monospace font");
+            assert_eq!(font.px, expected, "first-frame rasterization must use the actual monitor DPI");
+            let reference = Font::load(expected).unwrap();
+            assert_eq!((font.cw, font.ch), (reference.cw, reference.ch));
+            assert!(font.cw > Font::load(14.0).unwrap().cw);
+        }
+    }
     #[test]
     fn deferred_glyph_damage_follows_scroll_copy() {
         let mut rows = vec![0, 40, 100, 180];

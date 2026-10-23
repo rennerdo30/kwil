@@ -28,6 +28,12 @@ use std::sync::{Arc, OnceLock};
 #[path = "encoding_tests.rs"]
 mod tests;
 
+#[path = "encoded_snapshot.rs"]
+mod snapshot_save;
+pub use snapshot_save::{
+    validate_snapshot_save, validate_snapshot_save_cancellable, write_snapshot, write_snapshot_cancellable,
+};
+
 const SAMPLE: usize = 64 << 10;
 const STRIDE: usize = 64 << 10;
 const SCRATCH: usize = 16 << 10;
@@ -100,6 +106,7 @@ pub enum EncodingError {
     SplitCharacter(u64),
     InvalidUtf8,
     MalformedSource,
+    Cancelled,
     Unmappable { character: char, encoding: &'static str },
 }
 
@@ -121,6 +128,7 @@ impl std::fmt::Display for EncodingError {
             Self::MalformedSource => {
                 f.write_str("conversion contains malformed source bytes; reinterpret or repair first")
             }
+            Self::Cancelled => f.write_str("snapshot save cancelled"),
             Self::Unmappable { character, encoding } => write!(f, "{character:?} cannot be saved as {encoding}"),
         }
     }
@@ -766,6 +774,7 @@ impl EncodedFile {
                     (bytes, self.detection.encoding)
                 }
                 SourceChunk::Added(bytes) => (bytes, Encoding::UTF8),
+                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } => return Err(EncodingError::WrongSource),
             };
             if encoding.utf16() {
                 for at in (0..bytes.len().saturating_sub(1)).step_by(2) {
@@ -852,6 +861,7 @@ impl EncodedFile {
                     finish_source(&mut source_decoder, &mut output)?;
                     added.feed(bytes, |text| output.feed(text))?;
                 }
+                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } => return Err(EncodingError::WrongSource),
             }
         }
         added.finish()?;

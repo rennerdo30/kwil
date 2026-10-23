@@ -12,6 +12,80 @@ pub enum Context {
     Diff,
 }
 
+#[cfg(test)]
+mod selection_dispatch_tests {
+    use super::*;
+    #[test]
+    fn exact_shift_shortcuts_win_before_selection_fallback() {
+        let mut keys = KeymapEngine::new(Preset::NotepadPlusPlus, &[]).unwrap();
+        let call = keys.feed_with_selection("ctrl+shift+up".parse().unwrap());
+        assert!(matches!(call,crate::vim::VimResult::Command(call) if call.id=="edit.moveLineUp"));
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
+        assert!(
+            matches!(keys.feed_with_selection("shift+left".parse().unwrap()),crate::vim::VimResult::Command(call) if call.id=="motion.left")
+        );
+    }
+
+    fn binding(keys: &str, context: Option<Context>, mode: Option<Mode>) -> Binding {
+        Binding { keys: keys.into(), command: String::new(), context, mode }
+    }
+
+    #[test]
+    fn tombstones_distinguish_suppression_from_text_fallback() {
+        use crate::vim::VimResult;
+        let mut keys =
+            KeymapEngine::new(Preset::VsCode, &[binding("shift+left", None, None), binding("ctrl+q", None, None)])
+                .unwrap();
+        for key in ["shift+left", "ctrl+q"] {
+            assert_eq!(keys.feed_with_selection(key.parse().unwrap()), VimResult::Unbound);
+            assert!(keys.suppresses_fallback());
+        }
+        assert_eq!(keys.feed_with_selection("界".parse().unwrap()), VimResult::Unbound);
+        assert!(!keys.suppresses_fallback(), "ordinary printable input belongs to the frontend");
+        assert_eq!(keys.feed_with_selection("cmd+s".parse().unwrap()), VimResult::Unbound);
+        assert!(!keys.suppresses_fallback(), "Cmd must remain distinct from Ctrl");
+    }
+
+    #[test]
+    fn chord_tombstone_wins_before_continuation_restart_or_shift_fallback() {
+        use crate::vim::VimResult;
+        let mut keys = KeymapEngine::new(
+            Preset::VsCode,
+            &[binding("ctrl+k ctrl+s", None, None), binding("ctrl+k shift+left", None, None)],
+        )
+        .unwrap();
+        for end in ["ctrl+s", "shift+left"] {
+            assert_eq!(keys.feed_with_selection("ctrl+k".parse().unwrap()), VimResult::Pending);
+            assert_eq!(keys.feed_with_selection(end.parse().unwrap()), VimResult::Unbound);
+            assert!(keys.suppresses_fallback());
+        }
+        assert_eq!(keys.feed("ctrl+k".parse().unwrap()), VimResult::Pending);
+        assert_eq!(keys.feed("x".parse().unwrap()), VimResult::Unbound);
+        assert!(!keys.suppresses_fallback(), "invalid continuation still releases printable text");
+    }
+
+    #[test]
+    fn tombstones_respect_context_mode_and_live_chord_prefixes() {
+        use crate::vim::VimResult;
+        let mut keys =
+            KeymapEngine::new(Preset::Vim, &[binding("x", Some(Context::Editor), Some(Mode::Normal))]).unwrap();
+        assert_eq!(keys.feed("x".parse().unwrap()), VimResult::Unbound);
+        assert!(keys.suppresses_fallback());
+        assert!(matches!(keys.feed("i".parse().unwrap()), VimResult::Command(call) if call.id == "edit.insert"));
+        assert_eq!(keys.feed("x".parse().unwrap()), VimResult::Unbound);
+        assert!(!keys.suppresses_fallback());
+        keys.set_context(Context::Palette);
+        assert_eq!(keys.feed("x".parse().unwrap()), VimResult::Unbound);
+        assert!(!keys.suppresses_fallback());
+        let mut keys =
+            KeymapEngine::new(Preset::VsCode, &[binding("ctrl+k", None, None), binding("ctrl+k ctrl+c", None, None)])
+                .unwrap();
+        assert_eq!(keys.feed("ctrl+k".parse().unwrap()), VimResult::Pending, "live longer sequences remain reachable");
+        assert_eq!(keys.feed("ctrl+c".parse().unwrap()), VimResult::Unbound);
+        assert!(keys.suppresses_fallback());
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
@@ -175,6 +249,7 @@ pub struct KeymapEngine {
     vim: Option<crate::vim::Vim>,
     context: Context,
     pending: Vec<KeyChord>,
+    fallback_suppressed: bool,
 }
 impl KeymapEngine {
     pub fn new(preset: Preset, overrides: &[Binding]) -> Result<Self, KeymapError> {
@@ -183,6 +258,7 @@ impl KeymapEngine {
             vim: (preset == Preset::Vim).then(crate::vim::Vim::default),
             context: Context::Editor,
             pending: Vec::new(),
+            fallback_suppressed: false,
         })
     }
     pub fn mode(&self) -> Mode {
@@ -190,6 +266,12 @@ impl KeymapEngine {
     }
     pub fn vim(&self) -> Option<&crate::vim::Vim> {
         self.vim.as_ref()
+    }
+    /// Whether the last input matched an explicit unbind. `Unbound` alone
+    /// also means ordinary text or a missing shortcut; frontends must check
+    /// this before using their own command or text fallback.
+    pub fn suppresses_fallback(&self) -> bool {
+        self.fallback_suppressed
     }
     pub fn set_context(&mut self, context: Context) {
         if self.context != context {
@@ -203,15 +285,38 @@ impl KeymapEngine {
             vim.cancel_input();
         }
     }
+    /// Dispatch a palette/menu command through the same Vim state transition as
+    /// an explicit binding. Counts/operators from an earlier chord never leak.
+    pub fn invoke_named(&mut self, id: &str) -> crate::vim::VimResult {
+        use crate::vim::{Argument, Invocation, VimResult};
+        let Some(command) = command(id) else { return VimResult::Error(format!("Unknown command: {id}")) };
+        self.cancel_pending();
+        self.fallback_suppressed = false;
+        if let Some(vim) = &mut self.vim {
+            return vim.invoke(command.id);
+        }
+        VimResult::Command(Invocation {
+            id: command.id,
+            count: 1,
+            explicit_count: false,
+            motion: None,
+            register: None,
+            argument: Argument::None,
+        })
+    }
     pub fn feed(&mut self, key: KeyChord) -> crate::vim::VimResult {
         use crate::vim::{Argument, Invocation, VimResult};
+        self.fallback_suppressed = false;
         if key.key == crate::Key::Named(crate::NamedKey::Escape) {
             self.pending.clear();
         }
         self.pending.push(key);
         let mode = self.mode();
         let mut resolution = self.keymap.resolve(&self.pending, self.context, mode);
-        if resolution == Resolution::Unbound && self.pending.len() > 1 {
+        if resolution == Resolution::Unbound
+            && self.pending.len() > 1
+            && !self.keymap.explicitly_unbound(&self.pending, self.context, mode)
+        {
             // An invalid continuation may itself start a shortcut. Never eat
             // an ordinary key after a failed multi-key sequence.
             self.pending.clear();
@@ -243,6 +348,7 @@ impl KeymapEngine {
                 self.pending.clear();
                 if blocked {
                     self.cancel_pending();
+                    self.fallback_suppressed = true;
                     return VimResult::Unbound;
                 }
                 if self.context == Context::Editor
@@ -252,6 +358,36 @@ impl KeymapEngine {
                 }
                 VimResult::Unbound
             }
+        }
+    }
+
+    /// Resolve an exact shifted shortcut before falling back to extending a
+    /// navigation command. Explicit unbinds continue to suppress the fallback.
+    pub fn feed_with_selection(&mut self, key: KeyChord) -> crate::vim::VimResult {
+        let result = self.feed(key);
+        if matches!(result, crate::vim::VimResult::Unbound)
+            && !self.suppresses_fallback()
+            && key.modifiers.shift
+            && matches!(
+                key.key,
+                crate::Key::Named(
+                    crate::NamedKey::Left
+                        | crate::NamedKey::Right
+                        | crate::NamedKey::Up
+                        | crate::NamedKey::Down
+                        | crate::NamedKey::Home
+                        | crate::NamedKey::End
+                        | crate::NamedKey::PageUp
+                        | crate::NamedKey::PageDown
+                )
+            )
+            && !self.keymap.explicitly_unbound(&[key], self.context, self.mode())
+        {
+            let mut plain = key;
+            plain.modifiers.shift = false;
+            self.feed(plain)
+        } else {
+            result
         }
     }
 }

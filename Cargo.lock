@@ -567,6 +567,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
 dependencies = [
  "memchr",
+ "regex-automata",
+ "serde_core",
 ]
 
 [[package]]
@@ -834,6 +836,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -1107,6 +1128,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs_io"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba3fe847045ecff794b9c138293a80db914678c453ad63fbf0c6a9eb6e00b22"
+dependencies = [
+ "encoding_rs",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1268,6 +1298,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzy-matcher"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54614a3312934d066701a80f20f15fa3b56d67ac7722b39eea5b4c9dd1d66c94"
+dependencies = [
+ "thread_local",
+]
+
+[[package]]
 name = "gethostname"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1323,6 +1362,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1355,6 +1407,43 @@ dependencies = [
  "presser",
  "thiserror 2.0.21",
  "windows",
+]
+
+[[package]]
+name = "grep-matcher"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9417543f4870fc8f1c8e1af870afae2431007626d9e703fce6471c468d33847"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "grep-regex"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce0c256c3ad82bcc07b812c15a45ec1d398122e8e15124f96695234db7112ef"
+dependencies = [
+ "bstr",
+ "grep-matcher",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "grep-searcher"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72348823a0eafc4bc2e9051064f28b5b42cc100b571b3a35d67918d711efcbc6"
+dependencies = [
+ "bstr",
+ "encoding_rs",
+ "encoding_rs_io",
+ "grep-matcher",
+ "log",
+ "memchr",
+ "memmap2",
 ]
 
 [[package]]
@@ -1547,6 +1636,22 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]
@@ -1758,6 +1863,7 @@ name = "kwil"
 version = "0.1.0"
 dependencies = [
  "kwil-core-text",
+ "kwil-core-workspace",
  "kwil-ui-gpu",
  "kwil-ui-tui",
  "kwil-update",
@@ -1769,8 +1875,16 @@ dependencies = [
 name = "kwil-core-commands"
 version = "0.1.0"
 dependencies = [
+ "fuzzy-matcher",
+ "kwil-core-workspace",
+ "libc",
+ "quick-xml",
  "serde",
+ "serde_json",
  "toml",
+ "toml_edit",
+ "unicode-segmentation",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1779,6 +1893,17 @@ version = "0.1.0"
 dependencies = [
  "imara-diff",
  "similar",
+]
+
+[[package]]
+name = "kwil-core-format"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+ "toml_edit",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1794,7 +1919,15 @@ dependencies = [
 name = "kwil-core-search"
 version = "0.1.0"
 dependencies = [
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
  "kwil-core-text",
+ "memchr",
+ "regex",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -1832,6 +1965,7 @@ dependencies = [
  "arborium-typescript",
  "arborium-xml",
  "arborium-yaml",
+ "globset",
  "memmap2",
  "tree-sitter",
  "tree-sitter-rust",
@@ -1853,8 +1987,11 @@ dependencies = [
 name = "kwil-core-workspace"
 version = "0.1.0"
 dependencies = [
+ "flate2",
+ "ignore",
  "kwil-core-text",
  "notify",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1864,6 +2001,7 @@ dependencies = [
  "fontdb",
  "fontdue",
  "kwil-core-commands",
+ "kwil-core-workspace",
  "kwil-view-model",
  "pollster",
  "raw-window-handle",
@@ -1883,6 +2021,8 @@ name = "kwil-ui-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "kwil-core-commands",
+ "kwil-core-workspace",
  "kwil-view-model",
  "ratatui",
 ]
@@ -1901,7 +2041,13 @@ dependencies = [
 name = "kwil-view-model"
 version = "0.1.0"
 dependencies = [
+ "kwil-core-commands",
+ "kwil-core-search",
+ "kwil-core-syntax",
  "kwil-core-text",
+ "kwil-core-workspace",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -3441,6 +3587,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3568,6 +3723,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

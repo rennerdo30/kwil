@@ -1,5 +1,38 @@
 # KW-13 verification and pending gate
 
+## Integrated CLI and instance routing (2026-10-23)
+
+Production routing fixes: `420be26`; independent proof harness: `0f80fca` / `8870a4d`.
+Combined validation head: `7201fcc194b700cbefd24dc537d747c871e75fa9`.
+
+- Native file arguments preserve non-Unicode names, accept multiple files and positive
+  `file:line:column` suffixes, and resolve Windows drive-relative paths without opening them.
+  `--` makes subsequent names literal. Requests retain the transport's 128-file / 64 KiB limits.
+- Hidden TUI and hidden GUI fallback require an absolute isolated workspace root; malformed
+  or missing roots fail before the TUI can select live recovery storage.
+- Losing concurrent instance ownership retries only pre-admission absence errors within
+  a fixed deadline. Authentication failures, busy admission and ambiguous timeouts are not replayed.
+- A disconnected GUI route retains its unadmitted request while waiting for a replacement
+  TUI route. Shutdown wakes this wait; idle relay operation blocks on receive.
+- Restored focused app checks: **42 passed, one measurement ignored**, PID `77800` exited 0.
+  Earlier iteration PID `36084` exposed a numeric-type compile error; it was corrected.
+- Strict app all-target/all-feature Clippy passed, PID `18612` exited 0; rustfmt checks passed.
+- Twelve independent compiling mutations failed the intended assertions. Proofs are
+  `E:/Development/_cache/kwil-app-mutants/e5105b67d0b740b9a9ab98cec85a7487`
+  (first eight cases) and `11327280c4fc42b994dd08981b1848f4` (last four).
+  A first claim-race run did assertion-fail, but the proof runner rejected its multiline
+  custom panic message; the matcher was corrected and that case was rerun.
+  All source bytes were restored and every owned Cargo process exited.
+- Combined log: `E:/Development/_cache/kwil-app-validation-7201fcc.log`.
+- Receipt hardening at the same integrated head: the stale transformed-save test passed
+  (PID `33620`); payload and stale-deferral mutants compiled and rejected their selected
+  contracts (PIDs `53840` / `76056`, proof `26bc2583882c47768bf988ad2debfde2`).
+
+These checks use fake routing callbacks and deterministic startup budgets. Native IPC
+authentication, simultaneous Unix lock-to-bind delivery, real GUI-to-TUI failure,
+process lifetime, and the 20 ms second-launch budget remain unverified. No full local
+suite, benchmark, real owner profile, shell associations, release or publication ran.
+
 Base: `778e875098a04badc3c4e3d14afefecd5cf5301c`; branch: `kw/13-launcher`.
 
 ## Implemented

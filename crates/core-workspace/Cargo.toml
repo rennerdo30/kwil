@@ -6,5 +6,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+ignore = "=0.4.33"
 kwil-core-text = { path = "../core-text" }
 notify = "8.2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_Threading", "Win32_System_Memory"] }

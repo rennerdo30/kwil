@@ -8,13 +8,14 @@ struct Entry {
     before: Snapshot,
     after: Snapshot,
     cost: usize,
+    model_cost: usize,
 }
 
 impl Entry {
     fn new(before: Snapshot, after: Snapshot) -> Self {
         let cost =
             before.retained_bytes().saturating_add(after.retained_bytes()).saturating_add(std::mem::size_of::<Self>());
-        Self { before, after, cost }
+        Self { before, after, cost, model_cost: 0 }
     }
 }
 
@@ -71,6 +72,15 @@ impl History {
         self.redo.shrink_to_fit();
     }
 
+    pub fn charge_latest_model(&mut self, cost: usize) {
+        if let Some(entry) = self.undo.back_mut() {
+            self.bytes = self.bytes.saturating_sub(entry.model_cost).saturating_add(cost);
+            entry.cost = entry.cost.saturating_sub(entry.model_cost).saturating_add(cost);
+            entry.model_cost = cost;
+        }
+        self.trim();
+    }
+
     fn trim(&mut self) {
         while self.bytes > self.limit {
             // Evict oldest undo first. Once only redo remains, trim its
@@ -84,6 +94,10 @@ impl History {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub fn depth(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
     }
 }
 

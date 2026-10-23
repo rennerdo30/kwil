@@ -11,6 +11,7 @@ fn output(binary: &str, arg: &str) -> std::process::Output {
     }
     #[allow(unused_mut)]
     let mut child = command.spawn().unwrap();
+    eprintln!("CLI PID {}: {arg}", child.id());
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
@@ -53,7 +54,7 @@ fn version(binary: &str) {
 fn help(binary: &str) {
     let out = output(binary, "--help");
     assert!(out.status.success(), "{:?}", out);
-    assert!(String::from_utf8(out.stdout).unwrap().contains("Usage: kwil [options] [file]"));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("Usage: kwil [options] [file[:line[:column]] ...]"));
 }
 #[test]
 fn gui_version() {

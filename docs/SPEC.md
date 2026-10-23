@@ -223,6 +223,8 @@ Two files, or a buffer vs. its saved version. Line diff with `imara-diff 0.2` (h
 ### Markdown
 Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, strikethrough). Rendered natively by our renderer, without a webview (a webview would cost startup time and memory). Code blocks are highlighted with the same syntax engine. Images are decoded lazily on a worker.
 
+**Approved v1 exception (owner, 2026-10-23): bounded-document Markdown preview.** The owner explicitly approved the bounded-preview scope change instead of requiring the new all-size disk-backed parser for v1. The initial product limit is 256 KiB of logical source text; larger documents show a clear preview-unavailable message without parsing or presenting a prefix as the complete document. This limit applies only to rendered Markdown preview: opening, editing, searching and saving text retain their any-size requirements. Preview parsing and image decoding remain worker-owned, with bounded model/image admission and native GUI/TUI presentation. An all-size parser remains follow-up work, not a v1 completion gate. The owner also approved implementing the concrete image adapter after ROOT's dependency review and manifest change; that approval does not waive codec limits, licensing, verification or host integration.
+
 ### Syntax highlighting
 - `tree-sitter 0.27` with `tree-sitter-highlight`. Grammars come from `arborium` (a tree-sitter distribution with ~70–96 permissively licensed grammars, with a feature flag per language).
 - Incremental parse on a worker after each edit. The UI keeps the last highlights until new ones arrive, so typing never waits on the parser.

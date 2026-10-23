@@ -18,7 +18,14 @@ impl Native {
 /// X11 has an actual server-side copy command (VNC can encode it as CopyRect).
 /// Wayland has no copy protocol: the moved pixels must be included in damage.
 #[cfg(target_os = "linux")]
-pub(crate) fn x11_copy(window: &winit::window::Window, w: usize, h: usize, from: usize, to: usize) -> bool {
+pub(crate) fn x11_copy(
+    window: &winit::window::Window,
+    origin_x: usize,
+    w: usize,
+    h: usize,
+    from: usize,
+    to: usize,
+) -> bool {
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
     let (Ok(display), Ok(handle)) = (window.display_handle(), window.window_handle()) else { return false };
     let (RawDisplayHandle::Xlib(display), RawWindowHandle::Xlib(handle)) = (display.as_raw(), handle.as_raw()) else {
@@ -34,7 +41,18 @@ pub(crate) fn x11_copy(window: &winit::window::Window, w: usize, h: usize, from:
             return false;
         }
         (x.XSetGraphicsExposures)(display, gc, 0);
-        (x.XCopyArea)(display, handle.window, handle.window, gc, 0, from as i32, w as u32, h as u32, 0, to as i32);
+        (x.XCopyArea)(
+            display,
+            handle.window,
+            handle.window,
+            gc,
+            origin_x as i32,
+            from as i32,
+            w as u32,
+            h as u32,
+            origin_x as i32,
+            to as i32,
+        );
         (x.XFreeGC)(display, gc);
         (x.XFlush)(display);
     }

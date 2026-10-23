@@ -7,7 +7,20 @@
 //! Scrolling moves existing pixels and draws only the newly exposed rows.
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
+mod clipboard;
+mod file_prompt;
 mod font;
+mod hit;
+mod ime;
+mod input;
+mod palette_ui;
+mod scrollbar;
+mod settings_ui;
+mod tabs;
+mod zoom;
+
+use font::Font;
+use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View, Workspace};
 #[cfg(feature = "gpu")]
 mod gpu;
 #[cfg(feature = "frame-harness")]
@@ -19,15 +32,14 @@ pub mod text;
 mod trace;
 pub use remote::RenderPolicy;
 
-use font::Font;
 use kwil_core_commands::settings::Settings;
-use kwil_view_model::{Damage, Notify, View};
+
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -39,6 +51,7 @@ const GUTTER_FG: u32 = 0x5b6b85;
 const STATUS_BG: u32 = 0x080d18;
 const STATUS_FG: u32 = 0x8fe3ff;
 const GUTTER_COLS: usize = 9;
+const BAR: usize = 14;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GuiOptions {
@@ -53,6 +66,9 @@ pub enum GuiError {
     /// to the terminal UI.
     Unavailable(String),
     NoFont,
+    /// The window closed, but accepted settings could not be durably drained.
+    /// This is not a display failure and must not launch another frontend.
+    Settings(String),
 }
 
 impl std::fmt::Display for GuiError {
@@ -60,12 +76,19 @@ impl std::fmt::Display for GuiError {
         match self {
             GuiError::Unavailable(e) => write!(f, "no window available: {e}"),
             GuiError::NoFont => write!(f, "no monospace font found"),
+            GuiError::Settings(error) => write!(f, "settings save failed during exit: {error}"),
         }
     }
 }
 
 enum UserEvent {
-    IndexDone,
+    HighlightsReady,
+    PaletteRoot(Result<std::path::PathBuf, String>),
+    PaletteReady,
+    SettingsPath(Result<std::path::PathBuf, String>),
+    SettingsPanelReady,
+    Document(kwil_view_model::document_worker::DocumentResult),
+    OpenExternal,
     Notice(String),
     GlyphReady(shaping::Tile, u64),
     SettingsReady(Box<Settings>),
@@ -95,19 +118,157 @@ struct Gfx {
     pixels: Vec<u32>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UnboundKey {
+    Quit,
+    Edit(input::Action),
+    Ignore,
+}
+
+fn command_notice(status: CommandStatus) -> Option<String> {
+    match status {
+        CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => Some(message),
+        CommandStatus::IndexNotReady => Some("Indexing: editing will be available when ready".into()),
+        CommandStatus::Applied | CommandStatus::SaveRequested => None,
+    }
+}
+
+#[cfg(test)]
+mod input_dispatch_tests {
+    use super::*;
+    use kwil_core_commands::{Binding, Preset, keymap::KeymapEngine, vim::VimResult};
+
+    #[test]
+    fn cancelling_save_as_cancels_its_close_intent() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.file_command("file.saveAndQuit").unwrap();
+        workspace.file_prompt_mut().unwrap().text = "unfinished.txt".into();
+        file_prompt::cancel(&mut workspace);
+        assert!(workspace.file_prompt().is_none());
+        assert!(!workspace.close_pending(), "a later ordinary save must not close the window");
+    }
+
+    #[test]
+    fn blank_save_submission_keeps_the_input_destination_and_cancel_intent() {
+        for value in ["", "   ", "\t"] {
+            let mut workspace = Workspace::new(View::new(None)).unwrap();
+            workspace
+                .execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1)
+                .unwrap();
+            workspace.request_window_close(false).unwrap();
+            workspace.file_command("file.save").unwrap();
+            workspace.file_prompt_mut().unwrap().text = value.into();
+            file_prompt::submit(&mut workspace);
+            assert_eq!(workspace.file_prompt().unwrap().text, value);
+            assert!(workspace.close_pending());
+            let mut prompt = Some(workspace.file_prompt().unwrap().text.clone());
+            assert!(input::commit("日本語.txt".into(), &mut prompt, false).is_none());
+            workspace.file_prompt_mut().unwrap().text = prompt.unwrap();
+            assert!(workspace.file_prompt().unwrap().text.ends_with("日本語.txt"));
+            assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 4);
+            file_prompt::cancel(&mut workspace);
+            assert!(!workspace.close_pending());
+        }
+    }
+
+    #[test]
+    fn vim_and_bound_command_notices_remain_visible() {
+        for status in [
+            CommandStatus::Message("register is empty".into()),
+            CommandStatus::NotImplemented("command not implemented: view.settings".into()),
+            CommandStatus::IndexNotReady,
+        ] {
+            let mut view = View::new(None);
+            let notice = command_notice(status).expect("non-applied command must explain its result");
+            let damage = view.set_notice(notice.clone());
+            assert!(damage.status);
+            assert!(view.status_text().contains(&notice));
+        }
+        assert!(command_notice(CommandStatus::Applied).is_none());
+    }
+
+    #[test]
+    fn gui_tombstones_suppress_selection_quit_and_chord_fallbacks() {
+        let bindings = ["shift+left", "ctrl+q", "ctrl+k ctrl+q"].map(|keys| Binding {
+            keys: keys.into(),
+            command: String::new(),
+            context: None,
+            mode: None,
+        });
+        let mut keys = KeymapEngine::new(Preset::VsCode, &bindings).unwrap();
+        for (key, mods) in [
+            (Key::Named(NamedKey::ArrowLeft), ModifiersState::SHIFT),
+            (Key::Character("q".into()), ModifiersState::CONTROL),
+        ] {
+            assert_eq!(keys.feed_with_selection(input::chord(&key, mods).unwrap()), VimResult::Unbound);
+            assert_eq!(App::unbound_key(&keys, &key, None, mods), UnboundKey::Ignore);
+        }
+        assert_eq!(keys.feed_with_selection("ctrl+k".parse().unwrap()), VimResult::Pending);
+        assert_eq!(keys.feed_with_selection("ctrl+q".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("q".into()), None, ModifiersState::CONTROL),
+            UnboundKey::Ignore
+        );
+        assert_eq!(keys.feed_with_selection("界".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("界".into()), Some("界"), ModifiersState::empty()),
+            UnboundKey::Edit(input::Action::Text("界".into()))
+        );
+        assert_eq!(keys.feed_with_selection("cmd+s".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("s".into()), Some("s"), ModifiersState::SUPER),
+            UnboundKey::Ignore
+        );
+        let mut keys = KeymapEngine::new(Preset::NotepadPlusPlus, &[]).unwrap();
+        assert!(
+            matches!(keys.feed_with_selection("ctrl+shift+up".parse().unwrap()), VimResult::Command(call) if call.id == "edit.moveLineUp")
+        );
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
+        assert_eq!(keys.feed_with_selection("ctrl+q".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(
+            App::unbound_key(&keys, &Key::Character("q".into()), None, ModifiersState::CONTROL),
+            UnboundKey::Quit
+        );
+    }
+}
+
 struct App {
-    view: View,
+    highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
+    palette: Option<kwil_view_model::palette_session::PaletteSession>,
+    palette_dirty: bool,
+    palette_area: Option<Rect>,
+    settings_panel: Option<kwil_view_model::settings_session::SettingsSession>,
+    settings_epoch: u64,
+    settings_file_pending: bool,
+    view: Workspace,
+    frontend_document: kwil_view_model::SessionDocumentId,
+    frontend_epoch: u64,
     opts: GuiOptions,
     proxy: EventLoopProxy<UserEvent>,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
+    on_external_ready: Option<Box<dyn FnOnce(ExternalOpen)>>,
+    external_open: Option<ExternalOpen>,
+    external_inbox: kwil_view_model::document_worker::ExternalOpenInbox,
     font_thread: Option<std::thread::JoinHandle<Option<Font>>>,
+    font_size: Option<std::sync::mpsc::SyncSender<f32>>,
     font: Option<Font>,
     gfx: Option<Gfx>,
     size: (usize, usize),
     mods: ModifiersState,
     pending: Damage,
     error: Option<GuiError>,
+    horizontal: u64,
+    pointer: (usize, usize),
+    drag: Option<(bool, usize)>,
+    started: std::time::Instant,
+    composing: bool,
+    ime_destination: Option<ime::Destination>,
+    selecting: bool,
+    close_pending: bool,
+    save_path: Option<String>,
+    keys: Option<kwil_core_commands::keymap::KeymapEngine>,
     settings: Settings,
+    zoom: zoom::Zoom,
     policy: RenderPolicy,
     on_event: Box<dyn FnMut(GuiEvent)>,
     #[cfg(feature = "gpu")]
@@ -118,6 +279,9 @@ struct App {
     font_reload_pending: bool,
     redraw_requested: bool,
     settings_loaded: bool,
+    body_pixels: Vec<u32>,
+    chrome_frame: Option<tabs::Frame>,
+    chrome_dirty: bool,
     #[cfg(feature = "frame-harness")]
     metrics: harness::Metrics,
 }
@@ -135,37 +299,74 @@ pub fn run_with_events(
     on_first_frame: Box<dyn FnOnce(Notify)>,
     on_event: Box<dyn FnMut(GuiEvent)>,
 ) -> Result<(), GuiError> {
+    run_with_external_open(view, opts, on_first_frame, on_event, Box::new(|_| {}))
+}
+
+pub use kwil_view_model::document_worker::ExternalOpen;
+
+/// The launcher can wire CLI/IPC requests without owning a frontend event loop.
+pub fn run_with_external_open(
+    view: View,
+    opts: GuiOptions,
+    on_first_frame: Box<dyn FnOnce(Notify)>,
+    on_event: Box<dyn FnMut(GuiEvent)>,
+    on_external_ready: Box<dyn FnOnce(ExternalOpen)>,
+) -> Result<(), GuiError> {
     trace::mark("gui entry");
     // Font loading runs while the event loop and window are created.
-    let font_thread = Some(std::thread::spawn(|| Font::load(14.0)));
+    let (font_size, font_size_rx) = std::sync::mpsc::sync_channel(1);
+    let font_thread = Some(std::thread::spawn(move || Font::startup(font_size_rx)));
     let event_loop =
         EventLoop::<UserEvent>::with_user_event().build().map_err(|e| GuiError::Unavailable(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    if let Some(file) = view.file() {
-        let p = proxy.clone();
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-        file.index_in_background(threads, move |result| {
-            let event = match result {
-                Ok(()) => UserEvent::IndexDone,
-                Err(e) => UserEvent::Notice(e.to_string()),
-            };
-            let _ = p.send_event(event);
-        });
-    }
+    let open_proxy = proxy.clone();
+    let (external_open, external_inbox) = kwil_view_model::document_worker::external_open_channel(move || {
+        open_proxy
+            .send_event(UserEvent::OpenExternal)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GUI closed"))
+    });
+    let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
+    let frontend_document = view.active_id();
+    let frontend_epoch = view.input_epoch();
+    let horizontal = view.horizontal_origin();
     let mut app = App {
+        highlighting: None,
+        palette: None,
+        palette_dirty: false,
+        palette_area: None,
+        settings_panel: None,
+        settings_epoch: 0,
+        settings_file_pending: false,
         view,
+        frontend_document,
+        frontend_epoch,
         opts,
         proxy,
         on_first_frame: Some(on_first_frame),
+        on_external_ready: Some(on_external_ready),
+        external_open: Some(external_open),
+        external_inbox,
         font_thread,
+        font_size: Some(font_size),
         font: None,
         gfx: None,
         size: (0, 0),
         mods: ModifiersState::empty(),
         pending: Damage::default(),
         error: None,
+        horizontal,
+        pointer: (0, 0),
+        drag: None,
+        started: std::time::Instant::now(),
+        composing: false,
+        ime_destination: None,
+        selecting: false,
+        close_pending: false,
+        save_path: None,
+        keys: None,
         settings: Settings::default(),
+        zoom: zoom::Zoom::default(),
         policy: RenderPolicy::new(Default::default(), remote::detect()),
         on_event,
         #[cfg(feature = "gpu")]
@@ -176,10 +377,31 @@ pub fn run_with_events(
         font_reload_pending: false,
         redraw_requested: false,
         settings_loaded: false,
+        body_pixels: Vec::new(),
+        chrome_frame: None,
+        chrome_dirty: true,
         #[cfg(feature = "frame-harness")]
         metrics: Default::default(),
     };
-    event_loop.run_app(&mut app).map_err(|e| GuiError::Unavailable(e.to_string()))?;
+    let result = event_loop.run_app(&mut app);
+    if let Some(panel) = &mut app.settings_panel {
+        let shutdown = panel.stop();
+        // The interactive event loop has ended. Keep the process alive while
+        // the settings worker drains accepted/coalesced changes off that loop.
+        std::thread::spawn(move || shutdown.shutdown())
+            .join()
+            .map_err(|_| GuiError::Settings("settings shutdown worker panicked".into()))?
+            .map_err(GuiError::Settings)?;
+    }
+    if let Some(palette) = &mut app.palette {
+        let handles = palette.stop();
+        std::thread::spawn(move || {
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+    }
+    result.map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
         Some(e) => Err(e),
         None => Ok(()),
@@ -192,11 +414,81 @@ impl App {
     }
 
     fn text_rows(&self) -> usize {
-        self.size.1.saturating_sub(self.ch()) / self.ch()
+        self.body_area().height.saturating_sub(BAR) / self.ch()
+    }
+
+    fn body_area(&self) -> kwil_view_model::TabArea {
+        tabs::body(self.size, self.font.as_ref().map_or(8, |font| font.cw), self.ch(), self.settings.tabs.layout)
+    }
+
+    fn columns(&self) -> u64 {
+        let cw = self.font.as_ref().map_or(8, |f| f.cw);
+        (self.body_area().width.saturating_sub(BAR + GUTTER_COLS * cw) / cw) as u64
+    }
+
+    fn bars(&self) -> (scrollbar::Bar, scrollbar::Bar) {
+        let body = self.body_area();
+        let height = body.height.saturating_sub(BAR);
+        let (page, total) =
+            horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize);
+        (
+            scrollbar::Bar::new(
+                0,
+                height,
+                self.view.rows() as u64,
+                self.view.line_count().unwrap_or(self.view.rows() as u64),
+                self.view.top(),
+            ),
+            scrollbar::Bar::new(0, body.width.saturating_sub(BAR), page, total, self.horizontal),
+        )
+    }
+
+    fn page_bytes(&self) -> u64 {
+        horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize).0
+    }
+
+    fn scroll_bar(&mut self, vertical: bool, offset: u64) {
+        if vertical {
+            let delta = (offset as i128 - self.view.top() as i128).clamp(i64::MIN as i128, i64::MAX as i128);
+            let damage = self.view.scroll(delta as i64);
+            self.apply(damage);
+        } else if self.horizontal != offset {
+            self.horizontal = offset;
+            let damage = self.view.set_horizontal_window(offset, 64 << 10);
+            self.apply(damage);
+        }
+    }
+
+    fn pointer_down(&mut self) {
+        let body = self.body_area();
+        if !body.contains(self.pointer.0, self.pointer.1) {
+            return;
+        }
+        let (x, y) = (self.pointer.0 - body.x, self.pointer.1 - body.y);
+        let (v, h) = self.bars();
+        let vertical = x >= body.width.saturating_sub(BAR) && y < v.length;
+        let horizontal = y >= v.length && y < v.length + BAR && x < h.length;
+        if !vertical && !horizontal {
+            return;
+        }
+        let (bar, pixel, offset, page) = if vertical {
+            (v, y, self.view.top(), self.view.rows() as u64)
+        } else {
+            (h, x, self.horizontal, self.page_bytes())
+        };
+        if bar.contains_thumb(pixel) {
+            self.drag = Some((vertical, pixel - bar.thumb_start));
+        } else {
+            self.scroll_bar(vertical, bar.page(pixel, offset, page));
+        }
     }
 
     fn apply(&mut self, d: Damage) {
-        if d == Damage::default() {
+        if let Some(highlighting) = &mut self.highlighting {
+            highlighting.invalidate_painted(&self.view, &d);
+            highlighting.update(&self.view);
+        }
+        if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty {
             return;
         }
         queue_damage(&mut self.pending, d, self.view.rows(), self.font.as_mut());
@@ -206,106 +498,479 @@ impl App {
         }
     }
 
-    fn key(&mut self, ev: &KeyEvent) {
+    fn key(&mut self, el: &ActiveEventLoop, ev: &KeyEvent) {
         if ev.state != ElementState::Pressed {
             return;
         }
-        let page = self.view.rows().max(1) as i64;
-        let ctrl = self.mods.control_key();
-        let d = match &ev.logical_key {
-            Key::Named(NamedKey::ArrowDown) => self.view.scroll(1),
-            Key::Named(NamedKey::ArrowUp) => self.view.scroll(-1),
-            Key::Named(NamedKey::PageDown) => self.view.scroll(page),
-            Key::Named(NamedKey::PageUp) => self.view.scroll(-page),
-            Key::Named(NamedKey::End) if ctrl => self.view.scroll_to_end(),
-            Key::Named(NamedKey::Home) if ctrl => self.view.scroll_to_start(),
-            _ => return,
+        if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            self.ime_destination = Some(ime::Destination::Cancelled);
+            self.composing = false;
+        }
+        if self.composing && !matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            return;
+        }
+        if self.settings_key(ev) {
+            return;
+        }
+        // A scoped native-window probe can exercise the actual asynchronous
+        // save callback without injecting global Ctrl state or taking focus.
+        #[cfg(feature = "frame-harness")]
+        if self.opts.hidden && matches!(ev.logical_key, Key::Named(NamedKey::F12)) {
+            self.save();
+            return;
+        }
+        #[cfg(all(feature = "frame-harness", debug_assertions))]
+        if self.opts.hidden {
+            let command = match ev.logical_key {
+                Key::Named(NamedKey::F11) => Some("file.new"),
+                Key::Named(NamedKey::F10) => Some("file.nextTab"),
+                Key::Named(NamedKey::F9) => Some("file.previousTab"),
+                Key::Named(NamedKey::F8) => Some("file.close"),
+                Key::Named(NamedKey::F6) => Some("view.commandPalette"),
+                Key::Named(NamedKey::F2) => Some("view.zoomIn"),
+                _ => None,
+            };
+            if matches!(ev.logical_key, Key::Named(NamedKey::F3)) {
+                self.apply(Damage { full: true, status: true, ..Default::default() });
+                return;
+            }
+            if let Some(command) = command {
+                if self.dispatch_settings(command) || self.dispatch_palette(command) || self.dispatch_zoom(command) {
+                    return;
+                }
+                self.dispatch_file(command);
+                return;
+            }
+        }
+        if self.save_path.is_some() {
+            match &ev.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    file_prompt::cancel(&mut self.view);
+                    self.sync_file_ui();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.update_file_prompt();
+                    let damage = file_prompt::submit(&mut self.view);
+                    self.sync_file_ui();
+                    self.apply(damage);
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.save_path.as_mut().unwrap().pop();
+                }
+                _ => {
+                    if let Some(text) = ev.text.as_deref().filter(|text| !text.chars().any(char::is_control)) {
+                        self.save_path.as_mut().unwrap().push_str(text);
+                    }
+                }
+            }
+            self.update_file_prompt();
+            return;
+        }
+        if self.palette_key(ev) {
+            return;
+        }
+        if self.close_pending && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            self.view.cancel_file_prompt();
+            self.sync_file_ui();
+            let damage = self.view.set_notice(String::new());
+            self.apply(damage);
+            return;
+        }
+        if !self.composing
+            && let Some(chord) = input::chord(&ev.logical_key, self.mods)
+        {
+            if self.keys.is_none() {
+                self.keys =
+                    kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
+            }
+            if let Some(keys) = &mut self.keys {
+                use kwil_core_commands::vim::VimResult;
+                match keys.feed_with_selection(chord) {
+                    VimResult::Pending => return,
+                    VimResult::Command(call) => {
+                        if self.dispatch_settings(call.id) || self.dispatch_palette(call.id) {
+                            return;
+                        }
+                        if self.dispatch_zoom(call.id) {
+                            return;
+                        }
+                        if self.dispatch_file(call.id) {
+                            if self.view.wants_exit() {
+                                el.exit();
+                            }
+                            return;
+                        }
+                        if self.settings.keymap == kwil_core_commands::Preset::Vim {
+                            if call.id == "file.save" {
+                                self.save();
+                                return;
+                            }
+                            if call.id == "file.quit" {
+                                self.request_close(el, false);
+                                return;
+                            }
+                            if call.id == "file.saveAndQuit" {
+                                self.close_pending = true;
+                                self.save();
+                                return;
+                            }
+                            if let Some(editor) = self.view.editor_mut() {
+                                match editor.execute_vim(&call) {
+                                    Ok(result) => {
+                                        let damage = self.view.refresh_after_edit(result.damage);
+                                        self.apply(damage);
+                                        self.keep_caret_visible();
+                                        self.command_status(result.status);
+                                    }
+                                    Err(error) => {
+                                        let damage = self.view.set_notice(error.to_string());
+                                        self.apply(damage);
+                                    }
+                                }
+                            }
+                        } else {
+                            self.edit(input::Action::Command(call.id));
+                        }
+                        return;
+                    }
+                    VimResult::Error(error) => {
+                        let damage = self.view.set_notice(error);
+                        self.apply(damage);
+                        return;
+                    }
+                    VimResult::Unbound => {
+                        match Self::unbound_key(keys, &ev.logical_key, ev.text.as_deref(), self.mods) {
+                            UnboundKey::Quit => {
+                                if !ev.repeat {
+                                    self.request_close(el, self.close_pending && self.mods.shift_key());
+                                }
+                            }
+                            UnboundKey::Edit(action) => self.edit(action),
+                            UnboundKey::Ignore => {}
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(action) = input::translate(&ev.logical_key, ev.text.as_deref(), self.mods, self.composing) {
+            self.edit(action);
+        }
+    }
+
+    fn unbound_key(
+        keys: &kwil_core_commands::keymap::KeymapEngine,
+        key: &Key,
+        text: Option<&str>,
+        mods: ModifiersState,
+    ) -> UnboundKey {
+        if keys.suppresses_fallback() {
+            return UnboundKey::Ignore;
+        }
+        if mods.control_key() && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("q")) {
+            return UnboundKey::Quit;
+        }
+        if keys.mode() != kwil_core_commands::Mode::Insert || mods.control_key() || mods.super_key() || mods.alt_key() {
+            return UnboundKey::Ignore;
+        }
+        input::translate(key, text, mods, false).map_or(UnboundKey::Ignore, UnboundKey::Edit)
+    }
+
+    fn edit(&mut self, action: input::Action) {
+        let (id, text) = match action {
+            input::Action::Command(id) => (id, None),
+            input::Action::Text(text) => ("edit.insert", Some(text)),
         };
-        self.apply(d);
+        if self.dispatch_settings(id) || self.dispatch_palette(id) || self.dispatch_zoom(id) || self.dispatch_file(id) {
+            return;
+        }
+        let args =
+            CommandArgs { text, at: self.started.elapsed(), extend: self.mods.shift_key(), ..Default::default() };
+        let result = if matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
+            let hwnd = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
+            self.view
+                .editor_mut()
+                .map(|editor| editor.execute_with_clipboard(id, &args, 1, Some(&mut clipboard::SystemClipboard(hwnd))))
+                .unwrap_or_else(|| self.view.execute(id, &args, 1))
+                .map(|mut result| {
+                    result.damage = self.view.refresh_after_edit(result.damage);
+                    result
+                })
+        } else {
+            self.view.execute(id, &args, 1)
+        };
+        match result {
+            Ok(result) => {
+                self.apply(result.damage);
+                self.keep_caret_visible();
+                self.command_status(result.status);
+            }
+            Err(error) => {
+                let damage = self.view.set_notice(error.to_string());
+                self.apply(damage);
+            }
+        }
+    }
+
+    fn command_status(&mut self, status: CommandStatus) {
+        if status == CommandStatus::SaveRequested {
+            self.save();
+        } else if let Some(notice) = command_notice(status) {
+            let damage = self.view.set_notice(notice);
+            self.apply(damage);
+        }
+    }
+
+    fn keep_caret_visible(&mut self) {
+        let Some(editor) = self.view.editor() else {
+            return;
+        };
+        let Ok((row, byte)) = editor.byte_position(editor.primary_cursor().head) else {
+            return;
+        };
+        if row < self.view.top() || row - self.view.top() >= self.view.rows() as u64 {
+            return;
+        }
+        let line = self.view.line((row - self.view.top()) as usize).unwrap_or_default();
+        let cells = text::cells(line, self.columns() as usize, self.settings.editor.tab_size as usize);
+        let last_byte = cells.last().map_or(0, |cell| cell.bytes.end as u64);
+        let last_column = cells.last().map_or(0, |cell| cell.column + cell.width);
+        let start = self.view.line_offset((row - self.view.top()) as usize);
+        if byte < start
+            || byte > start + last_byte
+            || (byte == start + last_byte && last_column >= self.columns() as usize)
+        {
+            self.scroll_bar(false, byte);
+        }
+    }
+
+    fn request_close(&mut self, el: &ActiveEventLoop, discard: bool) {
+        if let Err(error) = self.view.request_window_close(discard) {
+            self.view.set_notice(error.to_string());
+        }
+        self.sync_file_ui();
+        self.apply(Damage { full: true, status: true, ..Default::default() });
+        if self.view.wants_exit() {
+            el.exit();
+        }
+    }
+
+    fn save(&mut self) {
+        self.dispatch_file("file.save");
+    }
+
+    fn place_caret(&mut self, extend: bool) {
+        let body = self.body_area();
+        let Some(font) = &self.font else {
+            return;
+        };
+        let row = self.view.top()
+            + (self.pointer.1.saturating_sub(body.y) / font.ch).min(self.view.rows().saturating_sub(1)) as u64;
+        let screen_row = row.saturating_sub(self.view.top()) as usize;
+        let column = self.pointer.0.saturating_sub(body.x + GUTTER_COLS * font.cw) / font.cw;
+        let columns = self.columns() as usize;
+        let bytes = self.view.line(screen_row).unwrap_or_default();
+        let cells = text::cells(bytes, columns, self.settings.editor.tab_size as usize);
+        let byte = hit::byte_at(&cells, column);
+        let first = self.view.line_offset(screen_row);
+        // Anchor the window to the bytes actually displayed on the clicked
+        // row. A requested offset inside a scalar was aligned down by View;
+        // retaining that request would hide the first inserted ASCII byte.
+        let aligned_window = if first != self.horizontal {
+            self.horizontal = first;
+            Some(self.view.set_horizontal_window(first, 64 << 10))
+        } else {
+            None
+        };
+        let Some(editor) = self.view.editor_mut() else {
+            return;
+        };
+        let result = editor.line_range(row).and_then(|range| {
+            let offset = (range.start + first + byte as u64).min(range.end);
+            let anchor = if extend { editor.primary_cursor().anchor } else { offset };
+            editor.set_cursors(vec![kwil_view_model::Cursor { anchor, head: offset, desired_column: None }], 0)
+        });
+        match result {
+            Ok(damage) => {
+                let damage = self.view.refresh_after_edit(damage);
+                self.apply(damage);
+                if let Some(damage) = aligned_window {
+                    self.apply(damage);
+                }
+            }
+            Err(error) => {
+                let damage = self.view.set_notice(error.to_string());
+                self.apply(damage);
+            }
+        }
     }
 
     fn render(&mut self) -> bool {
-        if self.pending == Damage::default() {
+        if self.pending == Damage::default() && !self.chrome_dirty && !self.palette_dirty {
             return true;
         }
         let (w, h) = self.size;
-        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
-        if w == 0 || h == 0 {
+        let (cw, ch) = (self.font.as_ref().map_or(8, |f| f.cw), self.ch());
+        if w == 0 || h < ch {
             return true;
         }
-        let buf = &mut gfx.pixels;
+        let frame = tabs::frame(&self.view, self.size, cw, ch, self.settings.tabs.layout);
+        let geometry = frame.geometry.clone();
+        let chrome_changed = self.chrome_dirty || self.chrome_frame.as_ref() != Some(&frame);
+        self.chrome_frame = Some(frame);
+        self.chrome_dirty = false;
+        let body = geometry.body;
+        let (bw, bh) = (body.width, body.height);
+        self.body_pixels.resize(bw.saturating_mul(bh), BG);
+        let bars = self.bars();
+        let rows = geometry.text.height / ch;
+        let palette_open = self.palette_open() || self.settings_open();
+        let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
+        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
+        let pixels = &mut gfx.pixels;
+        let body_pixels = &mut self.body_pixels;
         let mut p = std::mem::take(&mut self.pending);
-        let ch = font.ch;
-        let rows = h.saturating_sub(ch) / ch;
-        let mut damage: Vec<Rect> = Vec::new();
+        let palette_dirty = std::mem::take(&mut self.palette_dirty);
+        if palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some()) && p.scroll != 0 {
+            // A pending document scroll predates opening the overlay. Avoid
+            // copying overlay pixels through the native scroll seam.
+            p.full = true;
+            p.scroll = 0;
+        }
+        let mut damage = Vec::new();
         #[cfg(feature = "frame-harness")]
         let mut copied = 0u64;
-
+        let body_changed = p.full || p.scroll != 0 || !p.rows.is_empty();
         if p.full {
             font.invalidate_rows();
-            fill(buf, w, Rect { x: 0, y: 0, w, h }, BG);
-            for r in 0..rows {
-                draw_row(buf, w, font, &self.view, r);
+            pixels.fill(BG);
+            body_pixels.fill(BG);
+            for row in 0..rows {
+                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
+                draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
             }
+            tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             p.status = true;
             damage.push(Rect { x: 0, y: 0, w, h });
         } else {
-            if p.scroll != 0 {
-                let d = p.scroll.unsigned_abs() as usize;
-                let keep = (rows - d) * ch;
-                if p.scroll > 0 {
-                    buf.copy_within(d * ch * w..(d * ch + keep) * w, 0);
-                    if !screen_copy(&gfx.window, gfx.hwnd, w, keep, d * ch, 0) {
-                        damage.push(Rect { x: 0, y: 0, w, h: keep });
-                    }
-                    #[cfg(feature = "frame-harness")]
-                    {
-                        copied = (w * keep) as u64;
-                    }
-                } else {
-                    buf.copy_within(0..keep * w, d * ch * w);
-                    if !screen_copy(&gfx.window, gfx.hwnd, w, keep, 0, d * ch) {
-                        damage.push(Rect { x: 0, y: d * ch, w, h: keep });
-                    }
-                    #[cfg(feature = "frame-harness")]
-                    {
-                        copied = (w * keep) as u64;
-                    }
+            if let Some((source, target)) = geometry.scroll_copy(p.scroll) {
+                let dy = p.scroll.unsigned_abs() as usize * ch;
+                let keep = source.height;
+                let (from, to) = if p.scroll > 0 { (dy, 0) } else { (0, dy) };
+                body_pixels.copy_within(from * bw..(from + keep) * bw, to * bw);
+                let moved = Rect { x: 0, y: to, w: bw, h: keep };
+                tabs::composite(body_pixels, bw, pixels, w, body, moved);
+                if !screen_copy_region(&gfx.window, gfx.hwnd, source, target) {
+                    damage.push(tabs::rect(target));
+                }
+                #[cfg(feature = "frame-harness")]
+                {
+                    copied = (source.width * source.height) as u64;
                 }
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for &r in p.rows.iter().filter(|&&r| r < rows) {
-                draw_row(buf, w, font, &self.view, r);
-                damage.push(Rect { x: 0, y: r * ch, w, h: ch });
+            for &row in p.rows.iter().filter(|&&r| r < rows) {
+                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
+                draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
+                let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
+                tabs::composite(body_pixels, bw, pixels, w, body, area);
+                damage.push(tabs::translated(area, body));
             }
         }
+        if p.full || chrome_changed {
+            tabs::draw(self.chrome_frame.as_ref().unwrap(), pixels, w, font);
+            if !p.full {
+                damage.push(tabs::rect(geometry.chrome));
+            }
+        }
+        if palette_dirty && let Some(area) = self.palette_area.take() {
+            tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
+            tabs::draw(self.chrome_frame.as_ref().unwrap(), pixels, w, font);
+            p.status = true;
+            damage.push(area);
+        }
         if p.status {
-            let status_height = ch.min(h);
-            let sr = Rect { x: 0, y: h - status_height, w, h: status_height };
-            fill(buf, w, sr, STATUS_BG);
-            let cols = w / font.cw;
+            let height = ch.min(h);
+            let area = Rect { x: 0, y: h - height, w, h: height };
+            fill(pixels, w, area, STATUS_BG);
             draw_text(
-                buf,
+                pixels,
                 w,
                 font,
                 font.cw,
-                sr.y,
+                area.y,
                 self.view.status_text().as_bytes(),
-                cols.saturating_sub(2),
+                (w / font.cw).saturating_sub(2),
                 STATUS_FG,
                 STATUS_BG,
             );
             if !p.full {
-                damage.push(sr);
+                damage.push(area);
             }
         }
-        let rects: Vec<_> = damage.iter().filter_map(|r| r.to_softbuffer()).collect();
+        if body_changed || p.status {
+            let (vertical, horizontal) = bars;
+            let vr = Rect { x: bw.saturating_sub(BAR), y: 0, w: BAR.min(bw), h: vertical.length };
+            let hr = Rect { x: 0, y: vertical.length, w: bw, h: BAR.min(bh.saturating_sub(vertical.length)) };
+            fill(body_pixels, bw, vr, GUTTER_BG);
+            fill(body_pixels, bw, hr, GUTTER_BG);
+            if vertical.maximum > 0 {
+                fill(
+                    body_pixels,
+                    bw,
+                    Rect {
+                        x: vr.x + 2.min(vr.w),
+                        y: vertical.thumb_start,
+                        w: vr.w.saturating_sub(4),
+                        h: vertical.thumb_length,
+                    },
+                    GUTTER_FG,
+                );
+            }
+            if horizontal.maximum > 0 {
+                fill(
+                    body_pixels,
+                    bw,
+                    Rect {
+                        x: horizontal.thumb_start,
+                        y: hr.y + 2.min(hr.h),
+                        w: horizontal.thumb_length,
+                        h: hr.h.saturating_sub(4),
+                    },
+                    GUTTER_FG,
+                );
+            }
+            for area in [vr, hr] {
+                tabs::composite(body_pixels, bw, pixels, w, body, area);
+                if !p.full {
+                    damage.push(tabs::translated(area, body));
+                }
+            }
+        }
+        if let Some(palette) = self.palette.as_ref().filter(|palette| palette.model().is_open()) {
+            self.palette_area = palette_ui::draw(palette.model(), pixels, (w, h), font);
+            if let Some(area) = self.palette_area {
+                damage.push(area);
+            }
+        }
+        if let Some(panel) = self.settings_panel.as_ref().filter(|panel| panel.is_open()) {
+            if panel.menu().is_some() {
+                self.palette_area = settings_ui::draw(panel, pixels, (w, h), font);
+            } else {
+                self.palette_area = settings_ui::loading(panel, pixels, (w, h), font);
+            }
+            if let Some(area) = self.palette_area {
+                damage.push(area);
+            }
+        }
+        let rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
         if !self.policy.remote()
             && let Some(gpu) = &mut self.gpu
         {
-            gpu.update(buf, (w, h), &damage, p.scroll, ch, rows);
+            gpu.update_body(pixels, (w, h), &damage, p.scroll, ch, rows, Some(tabs::rect(geometry.text)));
         }
         if !rects.is_empty() {
             let mut target = match gfx.surface.buffer_mut() {
@@ -315,17 +980,15 @@ impl App {
                     return false;
                 }
             };
-            // Retain a canonical framebuffer: Wayland/macOS may rotate or
-            // replace buffers. Age never forces re-layout or glyph repaint.
-            if target.len() != buf.len() {
+            if target.len() != pixels.len() {
                 self.error = Some(GuiError::Unavailable("CPU surface resize failed".into()));
                 return false;
             }
-            target.copy_from_slice(buf);
+            target.copy_from_slice(pixels);
             match target.present_with_damage(&rects) {
                 Ok(()) => {
                     #[cfg(feature = "frame-harness")]
-                    self.metrics.present(p.full, damage.iter().map(|r| (r.w * r.h) as u64).sum(), copied);
+                    self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
                 }
                 Err(error) => {
                     self.error = Some(GuiError::Unavailable(error.to_string()));
@@ -337,7 +1000,90 @@ impl App {
     }
 }
 
-fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize) {
+fn horizontal_extent(view: &View, columns: usize, tab_size: usize) -> (u64, u64) {
+    // The scroll offset is a source-byte column, not a display column. Find
+    // each visible row's last screen in those same units, even if a shorter
+    // byte row occupies more grid columns (tabs, escapes and wide glyphs).
+    // Use the row that needs the greatest byte offset for both range and page.
+    // Reading its suffix independently of the current window keeps the thumb
+    // and right endpoint stable as the window approaches EOF.
+    let columns = columns.clamp(1, 4096);
+    let limit = columns.saturating_mul(256).min(64 << 10);
+    let snapshot = view.editor().map(|editor| editor.document().snapshot());
+    let (mut maximum, mut page) = (0, columns as u64);
+    for row in 0..view.rows() {
+        let Some(line) = view.line(row) else { continue };
+        let (end, visible) = if let Some((snapshot, range)) =
+            snapshot.as_ref().zip(view.editor().and_then(|editor| editor.line_range(view.top() + row as u64).ok()))
+        {
+            let length = range.end - range.start;
+            let wanted = range.end.saturating_sub(limit as u64).max(range.start);
+            let context = wanted.saturating_sub(3).max(range.start);
+            // Only one bounded suffix is held at a time; neither the rest of
+            // this line nor any offscreen row is scanned or materialized.
+            let tail = (|| -> std::io::Result<Vec<u8>> {
+                let mut tail = Vec::with_capacity((range.end - context) as usize);
+                for chunk in snapshot.chunks(context..range.end)? {
+                    tail.extend_from_slice(chunk.map_err(std::io::Error::other)?);
+                }
+                Ok(tail)
+            })();
+            match tail {
+                Ok(tail) => {
+                    let mut first = (wanted - context) as usize;
+                    while kwil_view_model::grid::boundary(&tail, first) != first {
+                        first += 1;
+                    }
+                    let end = context - range.start
+                        + first as u64
+                        + horizontal_suffix_start(&tail[first..], columns, tab_size) as u64;
+                    (end, length.saturating_sub(end).max(1))
+                }
+                // A failed source read must not hide an already known range.
+                Err(_) => (length.saturating_sub(1), 1),
+            }
+        } else {
+            // Before the index is ready only the bounded loaded rows are known.
+            let end = horizontal_suffix_start(line, columns, tab_size) as u64;
+            (view.line_offset(row) + end, (line.len() as u64 - end).max(1))
+        };
+        if end > maximum || (end == maximum && visible < page) {
+            maximum = end;
+            page = visible;
+        }
+    }
+    (page, maximum.saturating_add(page))
+}
+
+fn horizontal_suffix_start(bytes: &[u8], columns: usize, tab_size: usize) -> usize {
+    // Binary search only within a grid-sized suffix. Every candidate starts
+    // at a safe scalar boundary; the final fitting suffix reaches the end.
+    let (mut left, mut right) = (0, bytes.len());
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let start = kwil_view_model::grid::boundary(bytes, mid);
+        let cells = text::cells(&bytes[start..], columns, tab_size);
+        if cells.last().map_or(0, |cell| cell.bytes.end) == bytes.len() - start {
+            right = start;
+        } else {
+            left = mid + 1;
+            while kwil_view_model::grid::boundary(bytes, left) != left {
+                left += 1;
+            }
+        }
+    }
+    left
+}
+
+fn draw_row(
+    buf: &mut [u32],
+    w: usize,
+    font: &mut Font,
+    view: &View,
+    r: usize,
+    _horizontal: u64,
+    spans: &[&kwil_view_model::highlighting::Span],
+) {
     let (cw, ch) = (font.cw, font.ch);
     let y = r * ch;
     let gutter = GUTTER_COLS * cw;
@@ -346,7 +1092,103 @@ fn draw_row(buf: &mut [u32], w: usize, font: &mut Font, view: &View, r: usize) {
     if let Some(text) = view.line(r) {
         let num = format!("{:>7} ", view.line_number(r));
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, GUTTER_FG, GUTTER_BG);
-        draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter) / cw, FG, BG);
+        draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, FG, BG);
+        if let Some(source) = view.line_source(r) {
+            let columns = w.saturating_sub(gutter + BAR) / cw;
+            let first = spans.partition_point(|span| span.range.end <= source.start as usize);
+            let last = spans.partition_point(|span| span.range.start < source.end as usize);
+            let row_spans = &spans[first..last.max(first)];
+            if row_spans.is_empty() {
+                return;
+            }
+            // Draw whole ASCII coloured runs, never one String per cell.
+            if text.iter().take(columns).all(|byte| (32..127).contains(byte)) {
+                for span in row_spans {
+                    let start = span.range.start.saturating_sub(source.start as usize).min(text.len()).min(columns);
+                    let end = span.range.end.saturating_sub(source.start as usize).min(text.len()).min(columns);
+                    if start >= end {
+                        continue;
+                    }
+                    let x = gutter + start * cw;
+                    fill(buf, w, Rect { x, y, w: (end - start) * cw, h: ch }, BG);
+                    draw_text(
+                        buf,
+                        w,
+                        font,
+                        x,
+                        y,
+                        &text[start..end],
+                        end - start,
+                        kwil_view_model::highlight_session::syntax_rgb(span.class),
+                        BG,
+                    );
+                }
+                return;
+            }
+            let cells = text::cells(text, columns, font.tab_size());
+            // The existing RTL renderer owns visual placement for the whole
+            // paragraph; logical cell overlays must not disturb that ordering.
+            if !cells.iter().any(|cell| shaping::needs_bidi(&cell.text)) {
+                for cell in cells {
+                    let offset = source.start as usize + cell.bytes.start;
+                    let index = spans.partition_point(|span| span.range.end <= offset);
+                    if let Some(span) = spans.get(index).filter(|span| span.range.start <= offset)
+                        && cell.text != "\t"
+                    {
+                        let color = kwil_view_model::highlight_session::syntax_rgb(span.class);
+                        let x = gutter + cell.column * cw;
+                        fill(buf, w, Rect { x, y, w: cell.width * cw, h: ch }, BG);
+                        draw_text(buf, w, font, x, y, cell.text.as_bytes(), cell.width, color, BG);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: usize, horizontal: u64) {
+    let Some(editor) = view.editor() else {
+        return;
+    };
+    let absolute_row = view.top() + row as u64;
+    let gutter = GUTTER_COLS * font.cw;
+    let columns = w.saturating_sub(gutter + BAR) / font.cw;
+    if let (Ok(range), Ok(selections), Some(line)) =
+        (editor.line_range(absolute_row), editor.selection_ranges(absolute_row), view.line(row))
+    {
+        for cell in text::cells(line, columns, font.tab_size()) {
+            let source =
+                range.start + horizontal + cell.bytes.start as u64..range.start + horizontal + cell.bytes.end as u64;
+            if !selections.iter().any(|selection| selection.start < source.end && source.start < selection.end) {
+                continue;
+            }
+            let start = cell.column;
+            let end = (cell.column + cell.width).min(columns);
+            if end <= start {
+                continue;
+            }
+            for y in row * font.ch..(row + 1) * font.ch {
+                for x in gutter + start * font.cw..gutter + end * font.cw {
+                    let pixel = &mut buf[y * w + x];
+                    *pixel = ((*pixel & 0xfefefe) >> 1) + 0x183454;
+                }
+            }
+        }
+    }
+    for cursor in editor.cursors() {
+        if let Ok((cursor_row, byte)) = editor.byte_position(cursor.head)
+            && cursor_row == absolute_row
+            && byte >= horizontal
+        {
+            let line = view.line(row).unwrap_or_default();
+            let cells = text::cells(line, columns, font.tab_size());
+            let local = byte - horizontal;
+            let column = hit::column_at(&cells, local.min(usize::MAX as u64) as usize);
+            if column >= columns {
+                continue;
+            }
+            fill(buf, w, Rect { x: gutter + column * font.cw, y: row * font.ch, w: 2, h: font.ch }, STATUS_FG);
+        }
     }
 }
 
@@ -485,26 +1327,46 @@ fn copy_tile(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, h: us
 /// a copy instead of new pixels. Returns false where unsupported; the caller
 /// then presents the moved area as damage.
 #[cfg(windows)]
-fn screen_copy(_window: &Window, hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> bool {
+fn screen_copy_region(
+    _window: &Window,
+    hwnd: isize,
+    source: kwil_view_model::TabArea,
+    target: kwil_view_model::TabArea,
+) -> bool {
     use windows_sys::Win32::Graphics::Gdi::{BitBlt, GetDC, ReleaseDC, SRCCOPY};
     unsafe {
         let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
         let dc = GetDC(hwnd);
-        let ok = BitBlt(dc, 0, to_y as i32, w as i32, h as i32, dc, 0, from_y as i32, SRCCOPY) != 0;
+        let ok = BitBlt(
+            dc,
+            target.x as i32,
+            target.y as i32,
+            source.width as i32,
+            source.height as i32,
+            dc,
+            source.x as i32,
+            source.y as i32,
+            SRCCOPY,
+        ) != 0;
         ReleaseDC(hwnd, dc);
         ok
     }
 }
 
 #[cfg(not(windows))]
-fn screen_copy(window: &Window, _hwnd: isize, w: usize, h: usize, from_y: usize, to_y: usize) -> bool {
+fn screen_copy_region(
+    window: &Window,
+    _hwnd: isize,
+    source: kwil_view_model::TabArea,
+    target: kwil_view_model::TabArea,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
-        platform::x11_copy(window, w, h, from_y, to_y)
+        platform::x11_copy(window, source.x, source.width, source.height, source.y, target.y)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (window, w, h, from_y, to_y);
+        let _ = (window, source, target);
         false
     }
 }
@@ -529,7 +1391,6 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // Drag and drop starts OLE, which costs ~10 ms of window creation;
         // it is registered after the first frame (KW-11).
-        #[allow(unused_mut)]
         let icon = winit::window::Icon::from_rgba(include_bytes!("icon.rgba").to_vec(), 32, 32).ok();
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
@@ -555,6 +1416,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        window.set_ime_allowed(true);
         let surface = Context::new(window.clone()).and_then(|c| Surface::new(&c, window.clone()));
         let surface = match surface {
             Ok(s) => s,
@@ -573,6 +1435,10 @@ impl ApplicationHandler<UserEvent> for App {
         if self.opts.hidden {
             cloak_and_show(hwnd);
         }
+        if let Some(font_size) = self.font_size.take() {
+            let _ =
+                zoom::start_font_rasterization(font_size, self.settings.font.size, window.scale_factor(), self.zoom);
+        }
         match self.font_thread.take().and_then(|t| t.join().ok()).flatten() {
             Some(f) => self.font = Some(f),
             None => {
@@ -585,13 +1451,35 @@ impl ApplicationHandler<UserEvent> for App {
         self.size = (sz.width as usize, sz.height as usize);
         self.gfx = Some(Gfx { native: None, window, surface, hwnd, pixels: vec![BG; self.size.0 * self.size.1] });
         self.resize_surface();
-        let d = self.view.set_rows(self.text_rows());
+        let rows = self.text_rows();
+        let d = self.view.set_rows(rows);
         self.apply(d);
         if !self.render() {
             el.exit();
             return;
         }
         trace::mark("first frame presented");
+        let highlight_proxy = self.proxy.clone();
+        self.highlighting = kwil_view_model::highlight_session::HighlightSession::new(move || {
+            let _ = highlight_proxy.send_event(UserEvent::HighlightsReady);
+        })
+        .ok();
+        if let Some(highlighting) = &mut self.highlighting {
+            highlighting.update(&self.view);
+        }
+        let document_proxy = self.proxy.clone();
+        let complete = move |result| {
+            let _ = document_proxy.send_event(UserEvent::Document(result));
+        };
+        let worker = if self.opts.hidden {
+            self.view.start_isolated_document_worker(complete)
+        } else {
+            self.view.start_document_worker(complete)
+        };
+        if let Err(error) = worker {
+            let damage = self.view.set_notice(format!("File worker: {error}"));
+            self.apply(damage);
+        }
         let proxy = self.proxy.clone();
         if let Some(gfx) = self.gfx.as_mut() {
             gfx.native = Some(platform::Native::register(gfx.hwnd, move |e| {
@@ -601,20 +1489,21 @@ impl ApplicationHandler<UserEvent> for App {
         self.apply_native_theme();
         (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
         let proxy = self.proxy.clone();
+        let hidden = self.opts.hidden;
         std::thread::spawn(move || {
+            let root = if hidden {
+                std::env::var_os("KWIL_WORKSPACE_ROOT")
+                    .map(std::path::PathBuf::from)
+                    .filter(|root| root.is_absolute())
+                    .ok_or_else(|| "Hidden palette requires an absolute isolated workspace root".to_string())
+            } else {
+                std::env::current_dir().map_err(|error| error.to_string())
+            };
+            let _ = proxy.send_event(UserEvent::PaletteRoot(root));
             let result = std::env::current_exe()
                 .map_err(|e| e.to_string())
-                .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()))
-                .and_then(|path| Settings::load(&path).map_err(|e| e.to_string()));
-            match result {
-                Ok(report) => {
-                    let _ = proxy.send_event(UserEvent::SettingsReady(Box::new(report.settings)));
-                }
-                Err(message) => {
-                    let _ = proxy.send_event(UserEvent::Notice(format!("Settings: {message}")));
-                    let _ = proxy.send_event(UserEvent::SettingsReady(Box::default()));
-                }
-            }
+                .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()));
+            let _ = proxy.send_event(UserEvent::SettingsPath(result));
         });
         #[cfg(feature = "frame-harness")]
         if self.opts.hidden && std::env::var_os("KWIL_FRAME_SCRIPT").is_some() {
@@ -626,15 +1515,87 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = p.send_event(UserEvent::Notice(msg));
             }));
         }
+        if let Some(callback) = self.on_external_ready.take() {
+            callback(self.external_open.take().unwrap());
+        }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, ev: UserEvent) {
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
-            UserEvent::IndexDone => self.view.index_ready(),
+            UserEvent::HighlightsReady => {
+                let rows = self.highlighting.as_mut().map_or_else(Vec::new, |host| host.worker_ready(&self.view));
+                Damage { rows, ..Default::default() }
+            }
+            UserEvent::PaletteRoot(root) => {
+                match root.and_then(|root| {
+                    let proxy = self.proxy.clone();
+                    kwil_view_model::palette_session::PaletteSession::new(
+                        root,
+                        std::sync::Arc::new(move || {
+                            let _ = proxy.send_event(UserEvent::PaletteReady);
+                        }),
+                    )
+                    .map_err(|error| error.to_string())
+                }) {
+                    Ok(palette) => self.palette = Some(palette),
+                    Err(error) => {
+                        self.view.set_notice(format!("Palette: {error}"));
+                    }
+                }
+                Damage { status: true, ..Default::default() }
+            }
+            UserEvent::PaletteReady => {
+                let mut notice = false;
+                if let Some(palette) = &mut self.palette {
+                    let changed = palette.worker_ready();
+                    if let Some(report) = palette.take_discovery_report()
+                        && (report.errors > 0 || report.end != kwil_core_workspace::catalogue::WalkEnd::Complete)
+                    {
+                        notice = true;
+                        self.view.set_notice(format!(
+                            "File catalogue: {} files, {} skipped; {:?}",
+                            report.files, report.errors, report.end
+                        ));
+                    }
+                    if changed {
+                        self.palette_redraw();
+                    }
+                }
+                Damage { status: notice, ..Default::default() }
+            }
+            UserEvent::Document(result) => {
+                let damage = self.view.document_result(result);
+                self.sync_file_ui();
+                if self.view.wants_exit() {
+                    el.exit();
+                }
+                damage
+            }
+            UserEvent::OpenExternal => {
+                let requests = self.external_inbox.drain();
+                if requests.is_empty() {
+                    return;
+                }
+                for request in requests {
+                    if let Err(error) = self.view.open_files(request) {
+                        self.view.set_notice(format!("Open failed: {error}"));
+                    }
+                }
+                self.sync_file_ui();
+                Damage { full: true, status: true, ..Default::default() }
+            }
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
-                glyph_damage(font, tile, self.view.rows())
+                self.palette_dirty |= self.palette.as_ref().is_some_and(|palette| palette.model().is_open());
+                self.palette_dirty |= self.settings_panel.as_ref().is_some_and(|panel| panel.is_open());
+                if matches!(tile.key.bg, tabs::ACTIVE | tabs::INACTIVE) {
+                    font.accept(tile);
+                    self.chrome_dirty = true;
+                    Damage::default()
+                } else {
+                    glyph_damage(font, tile, self.view.rows())
+                }
             }
             UserEvent::SessionChanged(detected) => {
                 #[cfg(feature = "gpu")]
@@ -657,19 +1618,82 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 return;
             }
+            UserEvent::SettingsPath(path) => {
+                let proxy = self.proxy.clone();
+                match path.and_then(|path| {
+                    kwil_view_model::settings_session::SettingsSession::start(
+                        path,
+                        std::sync::Arc::new(move || {
+                            let _ = proxy.send_event(UserEvent::SettingsPanelReady);
+                        }),
+                    )
+                    .map_err(|error| error.to_string())
+                }) {
+                    Ok(panel) => self.settings_panel = Some(panel),
+                    Err(error) => {
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default()));
+                        let damage = self.view.set_notice(format!("Settings: {error}"));
+                        self.apply(damage);
+                    }
+                }
+                return;
+            }
+            UserEvent::SettingsPanelReady => {
+                let mut open_path = None;
+                if let Some(panel) = &mut self.settings_panel {
+                    panel.worker_ready();
+                    if let Some(applied) = panel.take_applied() {
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::new(applied.settings)));
+                    } else if !self.settings_loaded && panel.menu().is_none() && panel.last_error().is_some() {
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default()));
+                    }
+                    if self.settings_file_pending && panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
+                        open_path = Some(panel.path().to_path_buf());
+                        panel.close();
+                        self.settings_file_pending = false;
+                    } else if panel.last_error().is_some() {
+                        self.settings_file_pending = false;
+                    }
+                }
+                if let Some(path) = open_path {
+                    if let Err(error) = self.view.open_path(path) {
+                        self.view.set_notice(format!("Open settings: {error}"));
+                    }
+                    self.sync_file_ui();
+                    self.apply(Damage { full: true, status: true, ..Default::default() });
+                }
+                if self.settings_open() {
+                    self.palette_redraw();
+                }
+                return;
+            }
             UserEvent::SettingsReady(settings) => {
                 self.settings_loaded = true;
                 let font_changed =
                     settings.font.family != self.settings.font.family || settings.font.size != self.settings.font.size;
                 let tabs_changed = settings.editor.tab_size != self.settings.editor.tab_size;
+                let layout_changed = settings.tabs.layout != self.settings.tabs.layout;
+                let keymap_changed =
+                    settings.keymap != self.settings.keymap || settings.bindings != self.settings.bindings;
                 self.settings = *settings;
+                self.view.set_editor_settings(&self.settings);
+                self.view.set_session_restore(self.settings.files.restore_session);
+                if layout_changed {
+                    self.chrome_dirty = true;
+                    let rows = self.text_rows();
+                    let damage = self.view.set_rows(rows);
+                    self.apply(damage);
+                    self.keep_caret_visible();
+                }
+                if keymap_changed || self.keys.is_none() {
+                    self.keys =
+                        kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings)
+                            .ok();
+                }
                 self.policy = RenderPolicy::new(self.settings.render.clone(), self.policy.detected());
                 self.apply_native_theme();
                 (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
-                let scale = self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()) as f32;
-                if font_changed
-                    || self.font.as_ref().is_some_and(|f| (f.px - self.settings.font.size * scale).abs() > 0.01)
-                {
+                if font_changed || self.font.as_ref().is_some_and(|f| (f.px - self.font_physical_px()).abs() > 0.01) {
                     self.reload_font();
                 } else {
                     self.activate_unicode(tabs_changed);
@@ -690,7 +1714,11 @@ impl ApplicationHandler<UserEvent> for App {
                     let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
                 });
                 self.font = Some(*font);
-                self.view.set_rows(self.text_rows())
+                self.chrome_dirty = true;
+                let rows = self.text_rows();
+                let damage = self.view.set_rows(rows);
+                self.keep_caret_visible();
+                damage
             }
             UserEvent::FontReady(None) => {
                 self.font_loading = false;
@@ -706,8 +1734,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.set_notice("Configured font is unavailable".into())
             }
             UserEvent::DroppedFile(path) => {
-                (self.on_event)(GuiEvent::DroppedFile(path));
-                return;
+                (self.on_event)(GuiEvent::DroppedFile(path.clone()));
+                if let Err(error) = self.view.open_path(path) {
+                    self.view.set_notice(format!("Open failed: {error}"));
+                }
+                self.sync_file_ui();
+                Damage { full: true, status: true, ..Default::default() }
             }
             #[cfg(feature = "gpu")]
             UserEvent::GpuReady(result, ms) => {
@@ -722,7 +1754,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             #[cfg(feature = "frame-harness")]
             UserEvent::Harness(step) => {
-                harness::step(self, _el, step);
+                harness::step(self, el, step);
                 return;
             }
         };
@@ -731,7 +1763,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
         match ev {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => self.request_close(el, false),
             WindowEvent::Resized(sz) => {
                 // The first Resized repeats the creation size.
                 if (sz.width as usize, sz.height as usize) == self.size {
@@ -739,7 +1771,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.size = (sz.width as usize, sz.height as usize);
                 self.resize_surface();
-                let d = self.view.set_rows(self.text_rows());
+                let rows = self.text_rows();
+                let d = self.view.set_rows(rows);
                 self.apply(d);
             }
             WindowEvent::RedrawRequested => {
@@ -753,6 +1786,76 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
+                if let Some((vertical, grab)) = self.drag {
+                    let (v, h) = self.bars();
+                    let body = self.body_area();
+                    let (bar, pixel) = if vertical {
+                        (v, self.pointer.1.saturating_sub(body.y))
+                    } else {
+                        (h, self.pointer.0.saturating_sub(body.x))
+                    };
+                    self.scroll_bar(vertical, bar.drag(pixel, grab));
+                } else if self.selecting {
+                    self.place_caret(true);
+                }
+                if self.drag.is_some() || self.selecting {
+                    self.view.checkpoint_session();
+                }
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                if self.settings_open() {
+                    if state == ElementState::Pressed {
+                        self.settings_mouse();
+                    }
+                    return;
+                }
+                if self.palette_open() {
+                    if state == ElementState::Pressed {
+                        self.palette_mouse();
+                    }
+                    if self.view.wants_exit() {
+                        el.exit();
+                    }
+                    return;
+                }
+                if state == ElementState::Pressed {
+                    let cw = self.font.as_ref().map_or(8, |f| f.cw);
+                    let geometry = self.view.tab_geometry(
+                        kwil_view_model::TabMetrics {
+                            width: self.size.0,
+                            height: self.size.1,
+                            cell_width: cw,
+                            cell_height: self.ch(),
+                            scrollbar: BAR,
+                        },
+                        self.settings.tabs.layout,
+                    );
+                    if let Some(action) = geometry.hit(self.pointer.0, self.pointer.1) {
+                        if let Err(error) = self.view.tab_action(action, &geometry) {
+                            self.view.set_notice(error.to_string());
+                        }
+                        self.sync_file_ui();
+                        self.apply(Damage { full: true, status: true, ..Default::default() });
+                        return;
+                    }
+                    self.pointer_down();
+                    let body = self.body_area();
+                    if self.drag.is_none()
+                        && body.contains(self.pointer.0, self.pointer.1)
+                        && self.pointer.0 - body.x < body.width.saturating_sub(BAR)
+                        && self.pointer.1 - body.y < self.bars().0.length
+                    {
+                        self.selecting = true;
+                        self.place_caret(self.mods.shift_key());
+                    }
+                    self.view.checkpoint_session();
+                } else {
+                    self.drag = None;
+                    self.selecting = false;
+                }
+            }
             WindowEvent::ScaleFactorChanged { .. } => self.reload_font(),
             WindowEvent::ThemeChanged(_) => self.apply_native_theme(),
             WindowEvent::DroppedFile(path) => {
@@ -761,21 +1864,111 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(true) => self.user_event(el, UserEvent::SessionChanged(remote::detect())),
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.mods.control_key()
-                    && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
-                {
+                self.key(el, &event);
+                self.view.checkpoint_session();
+                if self.view.wants_exit() {
                     el.exit();
-                } else {
-                    self.key(&event);
+                }
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                if ime::starts_composition(self.composing, &text) {
+                    self.ime_destination = Some(self.capture_input_destination());
+                }
+                // An empty preedit can precede Commit. Keep its captured destination.
+                self.composing = !text.is_empty();
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.composing = false;
+                let destination = self.ime_destination.take().unwrap_or_else(|| self.capture_input_destination());
+                let (damage, follow_active) = match destination {
+                    ime::Destination::Settings { epoch } => {
+                        if self.settings_open() && self.settings_epoch == epoch {
+                            self.settings_input(kwil_view_model::settings_session::SettingsInput::Text(&text));
+                        } else {
+                            self.view.set_notice("IME settings input cancelled: its destination changed".into());
+                        }
+                        (Damage::default(), false)
+                    }
+                    ime::Destination::Palette { epoch } => {
+                        if self
+                            .palette
+                            .as_ref()
+                            .is_some_and(|palette| palette.model().is_open() && palette.input_epoch() == epoch)
+                        {
+                            self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text));
+                            (Damage::default(), false)
+                        } else {
+                            (
+                                self.view.set_notice("IME palette input cancelled: the query changed or closed".into()),
+                                false,
+                            )
+                        }
+                    }
+                    destination => ime::commit(&mut self.view, destination, text, self.started.elapsed()),
+                };
+                self.sync_file_ui();
+                self.apply(damage);
+                if follow_active {
+                    self.keep_caret_visible();
+                }
+                self.view.checkpoint_session();
+            }
+            WindowEvent::Ime(Ime::Disabled) => {
+                self.composing = false;
+                self.ime_destination = Some(ime::Destination::Cancelled);
+            }
+            WindowEvent::Ime(Ime::Enabled) => ime::reset(&mut self.composing, &mut self.ime_destination),
+            WindowEvent::Focused(false) => {
+                self.drag = None;
+                self.selecting = false;
+                self.composing = false;
+                self.ime_destination = Some(ime::Destination::Cancelled);
+                if let Some(keys) = &mut self.keys {
+                    keys.cancel_pending();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -(y * 3.0) as i64,
-                    MouseScrollDelta::PixelDelta(p) => -(p.y / self.ch() as f64) as i64,
+                if self.settings_open() {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(point) => point.y > 0.0,
+                    };
+                    for _ in 0..3 {
+                        self.settings_input(if up {
+                            kwil_view_model::settings_session::SettingsInput::Previous
+                        } else {
+                            kwil_view_model::settings_session::SettingsInput::Next
+                        });
+                    }
+                    return;
+                }
+                if self.palette_open() {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(point) => point.y > 0.0,
+                    };
+                    self.palette_input(if up {
+                        kwil_view_model::palette_session::PaletteInput::Previous
+                    } else {
+                        kwil_view_model::palette_session::PaletteInput::Next
+                    });
+                    return;
+                }
+                let (horizontal, vertical) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-(x * 3.0) as i64, -(y * 3.0) as i64),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        (-(p.x / self.ch() as f64) as i64, -(p.y / self.ch() as f64) as i64)
+                    }
                 };
-                let d = self.view.scroll(lines);
-                self.apply(d);
+                if horizontal != 0 || self.mods.shift_key() {
+                    let delta = if horizontal != 0 { horizontal } else { vertical };
+                    let maximum = self.bars().1.maximum;
+                    self.scroll_bar(false, self.horizontal.saturating_add_signed(delta).min(maximum));
+                } else {
+                    let d = self.view.scroll(vertical);
+                    self.apply(d);
+                }
+                self.view.checkpoint_session();
             }
             _ => {}
         }
@@ -835,7 +2028,7 @@ impl App {
             return;
         }
         self.font_loading = true;
-        let px = self.settings.font.size * self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()) as f32;
+        let px = self.font_physical_px();
         let proxy = self.proxy.clone();
         let family = self.settings.font.family.clone();
         std::thread::spawn(move || {
@@ -843,6 +2036,7 @@ impl App {
         });
     }
     fn activate_unicode(&mut self, tabs_changed: bool) {
+        self.chrome_dirty = true;
         let proxy = self.proxy.clone();
         if let Some(font) = self.font.as_mut() {
             font.tab_size = self.settings.editor.tab_size as usize;

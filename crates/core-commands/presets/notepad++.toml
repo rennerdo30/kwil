@@ -156,3 +156,99 @@ context = "editor"
 keys = "ctrl+shift+down"
 command = "edit.moveLineDown"
 context = "editor"
+[[bindings]]
+keys = "enter"
+command = "edit.newline"
+context = "editor"
+[[bindings]]
+keys = "backspace"
+command = "edit.backspace"
+context = "editor"
+[[bindings]]
+keys = "delete"
+command = "edit.delete"
+context = "editor"
+[[bindings]]
+keys = "ctrl+backspace"
+command = "edit.deleteWordBackward"
+context = "editor"
+[[bindings]]
+keys = "ctrl+delete"
+command = "edit.deleteWordForward"
+context = "editor"
+[[bindings]]
+keys = "left"
+command = "motion.left"
+context = "editor"
+[[bindings]]
+keys = "right"
+command = "motion.right"
+context = "editor"
+[[bindings]]
+keys = "up"
+command = "motion.up"
+context = "editor"
+[[bindings]]
+keys = "down"
+command = "motion.down"
+context = "editor"
+[[bindings]]
+keys = "ctrl+left"
+command = "motion.wordBackward"
+context = "editor"
+[[bindings]]
+keys = "ctrl+right"
+command = "motion.wordForward"
+context = "editor"
+[[bindings]]
+keys = "home"
+command = "motion.smartHome"
+context = "editor"
+[[bindings]]
+keys = "end"
+command = "motion.lineEnd"
+context = "editor"
+[[bindings]]
+keys = "ctrl+home"
+command = "motion.firstLine"
+context = "editor"
+[[bindings]]
+keys = "ctrl+end"
+command = "motion.lastLine"
+context = "editor"
+[[bindings]]
+keys = "pageUp"
+command = "motion.pageUp"
+context = "editor"
+[[bindings]]
+keys = "pageDown"
+command = "motion.pageDown"
+context = "editor"
+
+# Editor zoom: Plus is the literal '+' key, independent of keyboard layout.
+[[bindings]]
+keys = "ctrl+Plus"
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+shift+Plus"
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+="
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+shift+="
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+-"
+command = "view.zoomOut"
+[[bindings]]
+keys = "ctrl+0"
+command = "view.zoomReset"
+[[bindings]]
+keys = "ctrl+v"
+command = "edit.paste"
+context = "palette"
+[[bindings]]
+keys = "cmd+v"
+command = "edit.paste"
+context = "palette"

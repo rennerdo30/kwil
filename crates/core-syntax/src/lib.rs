@@ -2,6 +2,7 @@
 //!
 //! Submit immutable snapshots; retain the last `Highlights` while a new request runs.
 //! See the crate README for bounds, integration and grammar-provider contracts.
+pub mod detection;
 mod engine;
 mod language;
 mod lexer;

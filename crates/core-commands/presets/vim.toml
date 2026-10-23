@@ -38,3 +38,116 @@ context = "palette"
 keys = "up"
 command = "palette.previous"
 context = "palette"
+[[bindings]]
+keys = "enter"
+command = "edit.newline"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "backspace"
+command = "edit.backspace"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "delete"
+command = "edit.delete"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "ctrl+backspace"
+command = "edit.deleteWordBackward"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "ctrl+delete"
+command = "edit.deleteWordForward"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "left"
+command = "motion.left"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "right"
+command = "motion.right"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "up"
+command = "motion.up"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "down"
+command = "motion.down"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "ctrl+left"
+command = "motion.wordBackward"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "ctrl+right"
+command = "motion.wordForward"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "home"
+command = "motion.smartHome"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "end"
+command = "motion.lineEnd"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "ctrl+home"
+command = "motion.firstLine"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "ctrl+end"
+command = "motion.lastLine"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "pageUp"
+command = "motion.pageUp"
+context = "editor"
+mode = "insert"
+[[bindings]]
+keys = "pageDown"
+command = "motion.pageDown"
+context = "editor"
+mode = "insert"
+
+# Editor zoom: Plus is the literal '+' key, independent of keyboard layout.
+[[bindings]]
+keys = "ctrl+Plus"
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+shift+Plus"
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+="
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+shift+="
+command = "view.zoomIn"
+[[bindings]]
+keys = "ctrl+-"
+command = "view.zoomOut"
+[[bindings]]
+keys = "ctrl+0"
+command = "view.zoomReset"
+[[bindings]]
+keys = "ctrl+v"
+command = "edit.paste"
+context = "palette"
+[[bindings]]
+keys = "cmd+v"
+command = "edit.paste"
+context = "palette"

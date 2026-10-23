@@ -1,11 +1,14 @@
 //! Shared application used by the GUI and console entry points.
 
+mod file_argument;
 pub mod frontend;
+mod instance;
 mod startup;
 #[cfg(windows)]
 mod windows;
 use frontend::{Flags, Frontend, ProcessEnv, after_gui_failure, choose_frontend, current_platform};
 
+use file_argument::FileArgument;
 use kwil_core_text::TextFile;
 use kwil_view_model::{Notify, View};
 use std::io::IsTerminal;
@@ -17,7 +20,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str = "\
 Kwil - a blazing fast plain text editor
 
-Usage: kwil [options] [file]
+Usage: kwil [options] [file[:line[:column]] ...]
 
 Options:
   --gui        Force the window UI
@@ -25,6 +28,7 @@ Options:
   --update     Check for an update now and install it
   --version    Print the version
   -h, --help   Print this help
+  --           Treat following arguments as literal file names
 
 Keys: arrows, PageUp/PageDown, Ctrl+Home/End to move; Ctrl+Q to quit (Esc in the terminal UI).
 Auto-update: checked once a day after start-up; set KWIL_NO_UPDATE=1 or put a
@@ -36,13 +40,22 @@ struct Args {
     tui: bool,
     hidden: bool,
     update: bool,
-    file: Option<PathBuf>,
+    files: Vec<FileArgument>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args::default();
+    let mut literal = false;
     for arg in std::env::args_os().skip(1) {
+        if literal {
+            a.files.push(FileArgument::parse(arg, true)?);
+            if a.files.len() > kwil_core_workspace::instance::MAX_OPEN_FILES {
+                return Err("too many files (maximum 128)".into());
+            }
+            continue;
+        }
         match arg.to_str() {
+            Some("--") => literal = true,
             Some("--gui") => a.gui = true,
             Some("--tui") => a.tui = true,
             // Agent and test runs: window composed but never shown (Windows).
@@ -57,12 +70,21 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             Some(s) if s.starts_with("--") => return Err(format!("unknown option {s}")),
-            _ if a.file.is_none() => a.file = Some(PathBuf::from(arg)),
-            _ => return Err("only one file can be opened for now".into()),
+            _ => {
+                a.files.push(FileArgument::parse(arg, false)?);
+                if a.files.len() > kwil_core_workspace::instance::MAX_OPEN_FILES {
+                    return Err("too many files (maximum 128)".into());
+                }
+            }
         }
     }
     if a.gui && a.tui {
         return Err("--gui and --tui exclude each other".into());
+    }
+    if !a.files.is_empty() {
+        let directory =
+            std::env::current_dir().map_err(|error| format!("cannot resolve working directory: {error}"))?;
+        a.files = a.files.into_iter().map(|file| file.resolve(&directory)).collect::<Result<_, _>>()?;
     }
     Ok(a)
 }
@@ -130,14 +152,41 @@ fn run_app(console_launcher: bool) -> ExitCode {
         };
     }
 
-    let open = |path: &PathBuf| match TextFile::open(path) {
-        Ok(f) => Ok(View::new(Some((path.clone(), f)))),
-        Err(e) => Err(format!("cannot open {}: {e}", path.display())),
+    let open = |path: &PathBuf| -> Result<View, String> {
+        let file = TextFile::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let encoded = kwil_core_text::encoding::EncodedFile::new(file.clone())
+            .map_err(|e| format!("cannot interpret {}: {e}", path.display()))?;
+        let detection = encoded.detection();
+        let interpretation =
+            kwil_core_text::decoded_backing::Interpretation::new(detection.encoding, detection.bom_len)
+                .map_err(|e| format!("cannot interpret {}: {e}", path.display()))?;
+        let preview = kwil_core_text::decoded_backing::decode_preview(
+            &file,
+            interpretation,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .map_err(|e| format!("cannot preview {}: {e}", path.display()))?;
+        Ok(View::from_preview(path.clone(), file, preview.text))
     };
-    let make_view = || match &args.file {
-        Some(p) => open(p),
+    let make_view = || match args.files.first() {
+        Some(file) => open(&file.path),
         None => Ok(View::new(None)),
     };
+    let requests = kwil_core_workspace::instance::OpenFiles {
+        files: args
+            .files
+            .iter()
+            .map(|file| kwil_core_workspace::instance::OpenFile {
+                path: file.path.clone(),
+                line: file.line,
+                column: file.column,
+            })
+            .collect(),
+    };
+    if let Err(error) = requests.encode() {
+        eprintln!("kwil: {error}");
+        return ExitCode::from(2);
+    }
     let on_first_frame = |_gui: bool| -> Box<dyn FnOnce(Notify)> {
         Box::new(move |notify: Notify| {
             #[cfg(windows)]
@@ -160,6 +209,36 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
     #[allow(unused_mut)]
     let mut use_gui = frontend == Frontend::Gui;
+    // Hidden verification runs never join or claim the owner's live instance.
+    let endpoint = if args.hidden {
+        None
+    } else {
+        match instance::endpoint() {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                eprintln!("kwil: instance setup failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    if let Some(endpoint) = &endpoint {
+        match instance::try_forward(endpoint, &requests) {
+            Ok(true) => {
+                #[cfg(windows)]
+                if use_gui && !console_launcher {
+                    // The existing UI accepted the request. Complete the console
+                    // launch handshake without constructing a second window.
+                    windows::first_frame();
+                }
+                return ExitCode::SUCCESS;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("kwil: cannot contact the running instance: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     #[cfg(windows)]
     if console_launcher && use_gui {
         match windows::launch_gui() {
@@ -175,6 +254,37 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         }
     }
+    let instance_owner = match endpoint {
+        Some(endpoint) => match instance::claim(endpoint, &requests) {
+            Ok(instance::Start::Primary(owner)) => Some(owner),
+            Ok(instance::Start::Forwarded) => {
+                #[cfg(windows)]
+                if use_gui {
+                    windows::first_frame();
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("kwil: cannot own an editor instance: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let external_ready = || {
+        if let Some(owner) = &instance_owner {
+            owner.ready(requests.clone())
+        } else {
+            let requests = requests.clone();
+            Box::new(move |open: kwil_ui_gpu::ExternalOpen| {
+                if !requests.files.is_empty()
+                    && let Err(error) = open(requests)
+                {
+                    eprintln!("kwil: initial file delivery failed: {error}");
+                }
+            }) as Box<dyn FnOnce(kwil_ui_gpu::ExternalOpen)>
+        }
+    };
     if use_gui {
         let view = match make_view() {
             Ok(v) => v,
@@ -185,8 +295,13 @@ fn run_app(console_launcher: bool) -> ExitCode {
         };
 
         let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden };
-        match kwil_ui_gpu::run(view, opts, on_first_frame(true)) {
+        match kwil_ui_gpu::run_with_external_open(view, opts, on_first_frame(true), Box::new(|_| {}), external_ready())
+        {
             Ok(()) => return ExitCode::SUCCESS,
+            Err(e @ kwil_ui_gpu::GuiError::Settings(_)) => {
+                presentation.report(&format!("kwil: {e}"), |message| eprintln!("{message}"), dialog);
+                return ExitCode::FAILURE;
+            }
             #[cfg(windows)]
             Err(e) if windows::gui_child() => {
                 windows::report_gui_failure(&e);
@@ -202,6 +317,13 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         }
     }
+    if let Err(error) = validate_hidden_tui_root(
+        args.hidden,
+        std::env::var_os("KWIL_WORKSPACE_ROOT").as_deref().map(std::path::Path::new),
+    ) {
+        eprintln!("kwil: {error}");
+        return ExitCode::FAILURE;
+    }
     if !in_terminal {
         eprintln!("kwil: the terminal UI needs an interactive terminal");
         return ExitCode::FAILURE;
@@ -213,11 +335,32 @@ fn run_app(console_launcher: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match kwil_ui_tui::run(view, on_first_frame(false)) {
+    match kwil_ui_tui::run_with_external_open(view, on_first_frame(false), external_ready()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kwil: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn validate_hidden_tui_root(hidden: bool, root: Option<&std::path::Path>) -> Result<(), &'static str> {
+    if hidden && root.is_none_or(|root| !root.is_absolute()) {
+        Err("hidden terminal runs require an absolute KWIL_WORKSPACE_ROOT; live recovery storage was not accessed")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    #[test]
+    fn hidden_terminal_missing_empty_and_relative_roots_fail_closed() {
+        for root in [None, Some(std::path::Path::new("")), Some(std::path::Path::new("relative"))] {
+            assert!(validate_hidden_tui_root(true, root).is_err());
+        }
+        assert!(validate_hidden_tui_root(false, None).is_ok());
+        assert!(validate_hidden_tui_root(true, Some(&std::env::temp_dir())).is_ok());
     }
 }
