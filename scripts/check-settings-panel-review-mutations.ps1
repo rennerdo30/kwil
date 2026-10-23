@@ -12,7 +12,9 @@ let window = panel.window(doc, 0, 0).map_err(|e| e.to_string())?;
             }
 '@
 $cases = @(
-    @{Name='terminal-repeat'; File='crates/ui-tui/src/settings_ui.rs'; Old='event.kind == KeyEventKind::Repeat && (host.panel_is_capturing() || host.panel_is_confirming())'; New='false'; Package='kwil-ui-tui'; Test='terminal_compound_capture_keeps_modified_escape_and_cancels_in_stages'},
+    @{Name='terminal-repeat'; File='crates/ui-tui/src/settings_ui.rs'; Old='event.kind == KeyEventKind::Repeat'; New='false'; Package='kwil-ui-tui'; Test='terminal_compound_capture_keeps_modified_escape_and_cancels_in_stages'},
+    @{Name='terminal-transition-repeat'; File='crates/ui-tui/src/settings_ui.rs'; Old='|| matches!(event.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab)'; New=''; Package='kwil-ui-tui'; Test='terminal_compound_capture_keeps_modified_escape_and_cancels_in_stages'},
+    @{Name='review-over-limit'; File='crates/view-model/src/settings_panels.rs'; Old='conflict.keys.split_whitespace().take(MAX_REBIND_CHORDS + 1).count() > MAX_REBIND_CHORDS'; New='false'; Package='kwil-view-model'; Test='settings_confirmation_refuses_sequences_beyond_backend_edit_limit'},
     @{Name='terminal-detail-page'; File='crates/ui-tui/src/settings_ui.rs'; Old='(view.page + 1).min(view.pages - 1)'; New='view.page'; Package='kwil-ui-tui'; Test='terminal_compound_capture_keeps_modified_escape_and_cancels_in_stages'},
     @{Name='review-page-content'; File='crates/view-model/src/settings_panels.rs'; Old='lines.into_iter().skip(page * rows).take(rows).collect()'; New='lines.into_iter().take(rows).collect()'; Package='kwil-view-model'; Test='settings_confirmation_pages_preserve_long_fields_in_compact_cards'},
     @{Name='review-wrap'; File='crates/view-model/src/settings_panels.rs'; Old='columns + cell.width > width && !line.is_empty()'; New='false'; Package='kwil-view-model'; Test='settings_confirmation_pages_preserve_long_fields_in_compact_cards'},
