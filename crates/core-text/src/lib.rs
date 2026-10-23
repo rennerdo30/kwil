@@ -9,6 +9,7 @@ pub mod encoding;
 mod file;
 mod line_index;
 mod piece_tree;
+mod recovery;
 mod undo;
 
 pub use buffer::{Buffer, Lines, Snapshot, SnapshotImporter};
@@ -18,3 +19,4 @@ pub use file::{OriginalSavePin, cleanup_stale_save_backups};
 pub use line_index::LineIndex;
 pub use piece_tree::Chunks;
 pub use piece_tree::{SourceChunk, SourceChunks, StorageResources};
+pub use recovery::{RecoveryAssembler, RecoveryLimits, RecoveryRevision, RecoveryUsage};

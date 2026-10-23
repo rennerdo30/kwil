@@ -305,6 +305,51 @@ impl Buffer {
         self.snapshot.clone()
     }
 
+    // Explicit trusted worker construction only. These seams do not relax the
+    // complete-saved-original guards on public checkpoint/worker-edit APIs.
+    pub(crate) fn recovery_origin(
+        &self,
+        origin: crate::decoded_backing::DecodedSnapshot,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Snapshot> {
+        let root = piece_tree::decoded_checked(origin, self.owner.clone(), check)?;
+        let len = root.as_ref().map_or(0, |node| node.metrics.bytes);
+        Ok(Snapshot { originals: Arc::new(piece_tree::original_uses(&root, 0..len)), root })
+    }
+
+    pub(crate) fn recovery_bytes(&self, bytes: &[u8]) -> io::Result<Tree> {
+        piece_tree::added(bytes, &self.added)
+    }
+
+    pub(crate) fn recovery_opaque(
+        &self,
+        encoding: crate::encoding::Encoding,
+        raw: &[u8],
+        offsets: &[u8],
+        count: u64,
+    ) -> io::Result<Tree> {
+        piece_tree::recovery_opaque(encoding, raw, offsets, count, &self.added)
+    }
+
+    pub(crate) fn recovery_snapshot(root: Tree) -> Snapshot {
+        let len = root.as_ref().map_or(0, |node| node.metrics.bytes);
+        Snapshot { originals: Arc::new(piece_tree::original_uses(&root, 0..len)), root }
+    }
+
+    pub(crate) fn recovery_install(&mut self, snapshot: Snapshot) {
+        self.snapshot = snapshot;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_live_source_count(&self) -> usize {
+        self.snapshot.originals.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_own_import_visits(&self, source: &Snapshot) -> usize {
+        piece_tree::import_visit_count(source.root.clone(), &self.added, &self.owner)
+    }
+
     /// Capture before dispatching foreign clipboard/register imports to a
     /// worker. Insert the returned snapshot through insert_snapshot_range;
     /// its already admitted blocks then share in O(1), without spill writes.

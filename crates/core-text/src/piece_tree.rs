@@ -514,6 +514,112 @@ fn opaque_run(encoding: Encoding, raw: &[u8], offsets: &[u8], budget: &Arc<AddBu
     detached_block(encoding, &vec![0xff; count], raw, offsets, budget)
 }
 
+/// Validate external detached data before entering the internal trusted block
+/// constructors. One FF byte denotes one opaque atom, never replacement text.
+pub(crate) fn validate_recovery_opaque(raw: &[u8], offsets: &[u8], count: u64) -> io::Result<()> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid recovery opaque block");
+    let count = usize::try_from(count).map_err(|_| invalid())?;
+    if count == 0
+        || count >= ADD_BLOCK / 4
+        || raw.is_empty()
+        || raw.len() > ADD_BLOCK
+        || offsets.len() != (count + 1) * 4
+        || offsets.len() > ADD_BLOCK
+    {
+        return Err(invalid());
+    }
+    let mut previous = None;
+    for bytes in offsets.as_chunks::<4>().0 {
+        let at = u32::from_le_bytes(*bytes) as usize;
+        if at > raw.len() || previous.is_none() && at != 0 || previous.is_some_and(|before| at <= before) {
+            return Err(invalid());
+        }
+        previous = Some(at);
+    }
+    if previous != Some(raw.len()) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+pub(crate) fn recovery_opaque(
+    encoding: Encoding,
+    raw: &[u8],
+    offsets: &[u8],
+    count: u64,
+    budget: &Arc<AddBudget>,
+) -> io::Result<Tree> {
+    validate_recovery_opaque(raw, offsets, count)?;
+    opaque_run(encoding, raw, offsets, budget)
+}
+
+/// Conservative transient AVL allocation reservation for two splits and joins.
+/// Every recursive join allocates at most a constant number of branch nodes;
+/// split's joins visit at most height squared nodes. Original storage/index
+/// allocations are charged separately, once when their registry entry is built.
+pub(crate) fn recovery_tree_work(tree: &Tree) -> Option<usize> {
+    let height = tree.as_ref().map_or(0, |node| node.height as usize).checked_add(1)?;
+    height.checked_mul(height)?.checked_mul(64)?.checked_mul(std::mem::size_of::<Node>() + ARC_HEADER)
+}
+
+pub(crate) fn recovery_block_work(blocks: usize) -> Option<usize> {
+    // PathBuf growth, platform temp prefix and maximum decimal PID/counter
+    // suffix are reserved before any spill path/storage allocation.
+    let paths = std::env::temp_dir().as_os_str().len().checked_add(128)?.checked_mul(4)?;
+    blocks.checked_mul(paths.checked_add(4 * (std::mem::size_of::<Storage>() + ARC_HEADER))?)
+}
+
+pub(crate) fn recovery_validate_range(
+    origin: &DecodedSnapshot,
+    range: Range<u64>,
+    check: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    use crate::decoded_backing::{AtomKind, Boundary};
+    if range.start > range.end || range.end > origin.logical_bytes().len() as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "range outside recovery origin"));
+    }
+    for at in [range.start, range.end] {
+        check()?;
+        let boundary = origin.resolve_logical(at).map_err(io::Error::other)?;
+        check()?;
+        if let Boundary::Interior { logical, kind, .. } = boundary
+            && (kind != AtomKind::Text
+                || !std::str::from_utf8(&origin.logical_bytes()[logical.start as usize..logical.end as usize])
+                    .is_ok_and(|text| text.is_char_boundary((at - logical.start) as usize)))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "recovery range splits a decoded scalar"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn recovery_cut(tree: &Tree, at: u64, check: &mut impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let mut node = tree.as_deref();
+    let mut at = at;
+    while let Some(current) = node {
+        if at == 0 || at == current.metrics.bytes {
+            return Ok(());
+        }
+        match &current.kind {
+            Kind::Branch(left, right) => {
+                if at < left.metrics.bytes {
+                    node = Some(left);
+                } else {
+                    at -= left.metrics.bytes;
+                    node = Some(right);
+                }
+            }
+            Kind::Leaf(piece) => {
+                if let Storage::Decoded(source) = &*piece.storage {
+                    recovery_validate_range(&source.origin, piece.start + at..piece.start + at, check)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn detached_block(
     encoding: Encoding,
     bytes: &[u8],
