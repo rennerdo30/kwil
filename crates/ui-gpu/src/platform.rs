@@ -1,9 +1,14 @@
 //! Native caption controls stay owned by winit/OS. All deferred Windows work
 //! lives in one UI-thread guard, which unregisters before the window dies.
 #[cfg(windows)]
+pub(crate) mod file_dialog_windows;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
+
+#[cfg(not(windows))]
+pub(crate) fn decorate_window(_hwnd: isize, _dark: bool, _remote: bool, _dialog: bool) {}
 
 #[cfg(not(windows))]
 pub(crate) struct Native;

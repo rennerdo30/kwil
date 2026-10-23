@@ -151,3 +151,24 @@ context = "palette"
 keys = "cmd+v"
 command = "edit.paste"
 context = "palette"
+
+# GUI Find / Go to Line use explicit chords; Cmd remains distinct from Ctrl.
+[[bindings]]
+keys = "cmd+f"
+command = "search.find"
+[[bindings]]
+keys = "cmd+g"
+command = "navigation.goToLine"
+# Missing explicit GUI routes; normal Vim /, n, N and modes remain intact.
+[[bindings]]
+keys = "ctrl+f"
+command = "search.find"
+[[bindings]]
+keys = "ctrl+g"
+command = "navigation.goToLine"
+[[bindings]]
+keys = "f3"
+command = "search.findNext"
+[[bindings]]
+keys = "shift+f3"
+command = "search.findPrevious"

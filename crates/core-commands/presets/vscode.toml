@@ -290,3 +290,11 @@ context = "palette"
 keys = "cmd+v"
 command = "edit.paste"
 context = "palette"
+
+# GUI Find / Go to Line use explicit chords; Cmd remains distinct from Ctrl.
+[[bindings]]
+keys = "cmd+f"
+command = "search.find"
+[[bindings]]
+keys = "cmd+g"
+command = "navigation.goToLine"

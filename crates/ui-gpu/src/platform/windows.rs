@@ -78,14 +78,40 @@ impl Native {
         Self { hwnd, state, ole, target, session, subclass }
     }
     pub fn theme(&self, dark: bool, remote: bool) {
-        let dark = i32::from(dark);
-        // DWMSBT_NONE in remote mode; DWMSBT_MAINWINDOW (Mica) locally.
-        // Windows 10 ignores the unsupported backdrop attribute safely.
-        let backdrop = if remote { 1i32 } else { 2 };
-        unsafe {
-            DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, (&dark as *const i32).cast(), 4);
-            DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE as u32, (&backdrop as *const i32).cast(), 4);
-        }
+        decorate_window(self.hwnd as isize, dark, remote, false);
+    }
+}
+
+/// Keep OS-drawn Windows 11 caption buttons, Snap and hit-testing. Unsupported
+/// attributes are ignored by Windows 10; remote mode retains opaque surfaces.
+pub(crate) fn decorate_window(hwnd: isize, dark: bool, remote: bool, dialog: bool) {
+    let dark = i32::from(dark);
+    let backdrop = if remote {
+        1i32
+    } else if dialog {
+        3
+    } else {
+        2
+    };
+    let round = 2i32; // DWMWCP_ROUND
+    let enabled = 2i32; // DWMNCRP_ENABLED
+    let theme = super::super::theme_ui::chrome();
+    let colorref = |role| {
+        let rgb = super::super::theme_ui::rgb(theme, role);
+        ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff)
+    };
+    let caption = colorref(kwil_core_commands::theme::UiRole::PanelBackground);
+    let text = colorref(kwil_core_commands::theme::UiRole::PanelForeground);
+    let border = colorref(kwil_core_commands::theme::UiRole::Border);
+    unsafe {
+        let hwnd = hwnd as HWND;
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, (&dark as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE as u32, (&backdrop as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 33, (&round as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 2, (&enabled as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 35, (&caption as *const u32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 36, (&text as *const u32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 34, (&border as *const u32).cast(), 4);
     }
 }
 impl Drop for Native {

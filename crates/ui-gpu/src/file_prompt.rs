@@ -28,6 +28,11 @@ pub(super) fn cancel(workspace: &mut Workspace) -> Damage {
 }
 
 pub(super) fn submit(workspace: &mut Workspace) -> Damage {
+    // GUI Enter must never submit a native chooser's blank/text path. TUI owns
+    // its separate inline implementation. Recent-number selection stays inline.
+    if file_dialog::native_supported() && workspace.native_file_prompt().is_some() {
+        return Damage::default();
+    }
     let opens_tab = workspace.file_prompt().is_some_and(|p| {
         matches!(p.kind, kwil_view_model::FilePromptKind::Open | kwil_view_model::FilePromptKind::Recent)
     });
@@ -39,6 +44,16 @@ pub(super) fn submit(workspace: &mut Workspace) -> Damage {
 
 impl App {
     pub(super) fn dispatch_file(&mut self, command: &str) -> bool {
+        if self.close_dialog.is_some() || self.file_dialogs.exiting() {
+            return true;
+        }
+        if self.file_dialogs.busy() && command.starts_with("file.") {
+            // Modal ownership: reject competing file actions without replacing
+            // the captured prompt or its close/Save All continuation.
+            self.view.set_notice("Finish or cancel the system file dialog first".into());
+            self.apply(Damage { status: true, ..Default::default() });
+            return true;
+        }
         match self.view.file_command(command) {
             Ok(false) => return false,
             Ok(true) => {}
@@ -53,6 +68,16 @@ impl App {
         true
     }
 
+    pub(super) fn file_dialog_event(&mut self, event: file_dialog::Event) {
+        // Receipts cannot commit text from a composition started in the old
+        // inline GUI prompt. The OS chooser owns its own IME.
+        if self.file_modal() {
+            ime::reset(&mut self.composing, &mut self.ime_destination);
+        }
+        self.file_dialogs.event(&mut self.view, event);
+        self.sync_file_ui();
+    }
+
     pub(super) fn sync_file_ui(&mut self) {
         if let Some(palette) = self.palette.as_mut().filter(|palette| palette.model().is_open()) {
             match palette.refresh_tabs(&self.view) {
@@ -62,12 +87,21 @@ impl App {
                 }
             }
         }
-        self.save_path = self.view.file_prompt().map(|p| p.text.clone());
-        // The prompt card repaints while open and restores the body once it leaves.
+        let owner = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
+        let proxy = self.proxy.clone();
+        self.file_dialogs.sync(&mut self.view, owner, self.opts.hidden, move |event| {
+            let _ = proxy.send_event(UserEvent::FileDialog(event));
+        });
+        self.save_path = self
+            .view
+            .file_prompt()
+            .filter(|prompt| !file_dialog::native_supported() || prompt.kind == kwil_view_model::FilePromptKind::Recent)
+            .map(|prompt| prompt.text.clone());
         if self.save_path.is_some() || self.prompt_view.area.take().is_some() {
             self.palette_dirty = true;
         }
         self.close_pending = self.view.close_pending();
+        self.sync_close_dialog();
         sync_active_document(
             &self.view,
             &mut self.frontend_document,
@@ -91,7 +125,6 @@ impl App {
             prompt.text = text.clone();
         }
         let damage = self.view.prompt_notice();
-        self.palette_dirty = true;
         self.apply(damage);
     }
 }
@@ -101,11 +134,29 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
+    fn existing_explicit_path_submission_survives_until_native_backend_is_available() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1).unwrap();
+        workspace.file_command("file.save").unwrap();
+        let target = std::env::temp_dir().join(format!(
+            "kw56-explicit-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        workspace.file_prompt_mut().unwrap().text = target.to_str().unwrap().into();
+        submit(&mut workspace);
+        assert!(workspace.file_prompt().is_none());
+        assert!(workspace.file_saves_pending());
+        assert!(!target.exists(), "without a worker no write has been admitted to the filesystem");
+    }
+
+    #[test]
     fn worker_receipts_preserve_drag_and_per_row_windows_until_the_active_document_changes() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         workspace.set_rows(2);
         workspace
-            .execute("edit.insert", &CommandArgs { text: Some("界a\nxyz".into()), ..Default::default() }, 1)
+            .execute("edit.insert", &CommandArgs { text: Some("Ã§â€¢Å’a\nxyz".into()), ..Default::default() }, 1)
             .unwrap();
         workspace.set_horizontal_window(2, 64 << 10);
         let first = workspace.active_id();

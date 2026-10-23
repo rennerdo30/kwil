@@ -9,7 +9,10 @@
 
 mod chrome;
 mod clipboard;
+mod close_dialog;
 mod desktop;
+mod desktop_window;
+mod file_dialog;
 mod file_prompt;
 // Until ROOT adopts the file-type registration backend; then `mod filetypes_ui;`.
 mod filetypes_ui;
@@ -23,6 +26,8 @@ mod palette_view;
 mod prompt_ui;
 mod registration_host;
 mod scrollbar;
+mod search_ui;
+mod search_view;
 mod settings_ui;
 mod tabs;
 mod theme_ui;
@@ -42,6 +47,7 @@ mod shaping;
 mod shutdown;
 pub mod text;
 mod trace;
+pub use kwil_core_commands::settings::RenderBackend;
 pub use remote::RenderPolicy;
 
 use kwil_core_commands::settings::Settings;
@@ -56,13 +62,25 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-const BG: u32 = 0x0d1424;
-const FG: u32 = 0xd6e4f0;
-const GUTTER_BG: u32 = 0x0a101d;
-const GUTTER_FG: u32 = 0x5b6b85;
+fn bg() -> u32 {
+    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::Background)
+}
+fn fg() -> u32 {
+    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::Foreground)
+}
+fn gutter_bg() -> u32 {
+    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::GutterBackground)
+}
+fn gutter_fg() -> u32 {
+    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::GutterForeground)
+}
 #[cfg(test)]
-const STATUS_BG: u32 = 0x080d18;
-const STATUS_FG: u32 = 0x8fe3ff;
+fn status_bg() -> u32 {
+    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::StatusBackground)
+}
+fn status_fg() -> u32 {
+    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::StatusForeground)
+}
 const GUTTER_COLS: usize = 9;
 /// Minimum clip reserved by the row painters; the DPI-sized scrollbar
 /// (`chrome::Metrics::bar`) is always painted over the body edge afterwards.
@@ -73,6 +91,8 @@ pub struct GuiOptions {
     /// Agent and test runs: the window is DWM-cloaked (composed but never
     /// shown), unfocused and has no taskbar entry (Windows only).
     pub hidden: bool,
+    /// An explicit CLI choice wins over the settings file for this invocation.
+    pub renderer: Option<kwil_core_commands::settings::RenderBackend>,
 }
 
 #[derive(Debug)]
@@ -81,7 +101,7 @@ pub enum GuiError {
     /// to the terminal UI.
     Unavailable(String),
     NoFont,
-    /// The window closed, but accepted settings could not be durably drained.
+    /// The window closed, but accepted settings or a worker could not drain.
     /// This is not a display failure and must not launch another frontend.
     Settings(String),
 }
@@ -97,7 +117,10 @@ impl std::fmt::Display for GuiError {
 }
 
 enum UserEvent {
+    FileDialog(file_dialog::Event),
+    CloseDialog(close_dialog::Reply),
     HighlightsReady,
+    SearchReady,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
     SettingsPath(Result<std::path::PathBuf, String>),
@@ -121,6 +144,32 @@ enum UserEvent {
     GpuReady(Result<Box<gpu::Gpu>, String>, f64),
     #[cfg(feature = "frame-harness")]
     Harness(harness::Step),
+}
+
+/// The same host can receive bounded worker wake events in dispatch tests
+/// without constructing a native event loop or window.
+#[derive(Clone)]
+enum HostProxy {
+    Native(EventLoopProxy<UserEvent>),
+    #[cfg(test)]
+    Test(std::sync::mpsc::Sender<UserEvent>),
+}
+impl HostProxy {
+    fn send_event(&self, event: UserEvent) -> Result<(), ()> {
+        match self {
+            Self::Native(proxy) => proxy.send_event(event).map_err(|_| ()),
+            #[cfg(test)]
+            Self::Test(sender) => sender.send(event).map_err(|_| ()),
+        }
+    }
+    #[cfg(feature = "frame-harness")]
+    fn native(&self) -> Option<EventLoopProxy<UserEvent>> {
+        match self {
+            Self::Native(proxy) => Some(proxy.clone()),
+            #[cfg(test)]
+            Self::Test(_) => None,
+        }
+    }
 }
 
 /// Events for the app integration package. A dropped file is a request, never
@@ -184,9 +233,9 @@ mod input_dispatch_tests {
             assert_eq!(workspace.file_prompt().unwrap().text, value);
             assert!(workspace.close_pending());
             let mut prompt = Some(workspace.file_prompt().unwrap().text.clone());
-            assert!(input::commit("日本語.txt".into(), &mut prompt, false).is_none());
+            assert!(input::commit("Ã¦â€”Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt".into(), &mut prompt, false).is_none());
             workspace.file_prompt_mut().unwrap().text = prompt.unwrap();
-            assert!(workspace.file_prompt().unwrap().text.ends_with("日本語.txt"));
+            assert!(workspace.file_prompt().unwrap().text.ends_with("Ã¦â€”Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt"));
             assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 4);
             file_prompt::cancel(&mut workspace);
             assert!(!workspace.close_pending());
@@ -231,10 +280,10 @@ mod input_dispatch_tests {
             App::unbound_key(&keys, &Key::Character("q".into()), None, ModifiersState::CONTROL),
             UnboundKey::Ignore
         );
-        assert_eq!(keys.feed_with_selection("界".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(keys.feed_with_selection("Ã§â€¢Å’".parse().unwrap()), VimResult::Unbound);
         assert_eq!(
-            App::unbound_key(&keys, &Key::Character("界".into()), Some("界"), ModifiersState::empty()),
-            UnboundKey::Edit(input::Action::Text("界".into()))
+            App::unbound_key(&keys, &Key::Character("Ã§â€¢Å’".into()), Some("Ã§â€¢Å’"), ModifiersState::empty()),
+            UnboundKey::Edit(input::Action::Text("Ã§â€¢Å’".into()))
         );
         assert_eq!(keys.feed_with_selection("cmd+s".parse().unwrap()), VimResult::Unbound);
         assert_eq!(
@@ -254,7 +303,25 @@ mod input_dispatch_tests {
     }
 }
 
+/// Logical key seam used by the real window host and its dispatch tests.
+/// Settings capture stays ahead of this seam in `key`.
+struct HostKey<'a> {
+    logical_key: Key,
+    text: Option<&'a str>,
+    repeat: bool,
+}
+
 struct App {
+    search: Option<kwil_view_model::search_session::SearchSession>,
+    search_panel: kwil_view_model::search_panel::SearchPanel,
+    search_origin: Option<search_ui::Origin>,
+    search_ime: Option<search_ui::Composition>,
+    search_dirty: bool,
+    search_area: Option<Rect>,
+    search_view: search_view::View,
+    goto: Option<palette_ui::GoToPrompt>,
+    goto_epoch: u64,
+    goto_reveal: Option<(kwil_view_model::SessionDocumentId, u64)>,
     highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
     palette: Option<kwil_view_model::palette_session::PaletteSession>,
     palette_dirty: bool,
@@ -276,7 +343,7 @@ struct App {
     frontend_document: kwil_view_model::SessionDocumentId,
     frontend_epoch: u64,
     opts: GuiOptions,
-    proxy: EventLoopProxy<UserEvent>,
+    proxy: HostProxy,
     on_first_frame: Option<Box<dyn FnOnce(Notify)>>,
     on_external_ready: Option<Box<dyn FnOnce(ExternalOpen)>>,
     external_open: Option<ExternalOpen>,
@@ -285,6 +352,9 @@ struct App {
     font_size: Option<std::sync::mpsc::SyncSender<f32>>,
     font: Option<Font>,
     gfx: Option<Gfx>,
+    desktop_window: Option<desktop_window::Dialog>,
+    desktop_dispatch: bool,
+    pending_resize: Option<(usize, usize)>,
     size: (usize, usize),
     mods: ModifiersState,
     pending: Damage,
@@ -298,6 +368,8 @@ struct App {
     selecting: bool,
     close_pending: bool,
     save_path: Option<String>,
+    file_dialogs: file_dialog::Dialogs,
+    close_dialog: Option<close_dialog::Ticket>,
     keys: Option<kwil_core_commands::keymap::KeymapEngine>,
     settings: Settings,
     zoom: zoom::Zoom,
@@ -368,7 +440,7 @@ pub fn run_with_external_open(
     let event_loop =
         EventLoop::<UserEvent>::with_user_event().build().map_err(|e| GuiError::Unavailable(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let proxy = event_loop.create_proxy();
+    let proxy = HostProxy::Native(event_loop.create_proxy());
     let open_proxy = proxy.clone();
     // The chrome face is read in parallel and rasterized at the monitor scale.
     let (ui_font_size, ui_font_size_rx) = std::sync::mpsc::sync_channel(1);
@@ -383,6 +455,16 @@ pub fn run_with_external_open(
     let frontend_epoch = view.input_epoch();
     let horizontal = view.horizontal_origin();
     let mut app = App {
+        search: None,
+        search_panel: Default::default(),
+        search_origin: None,
+        search_ime: None,
+        search_dirty: false,
+        search_area: None,
+        search_view: Default::default(),
+        goto: None,
+        goto_epoch: 0,
+        goto_reveal: None,
         highlighting: None,
         palette: None,
         palette_dirty: false,
@@ -413,6 +495,9 @@ pub fn run_with_external_open(
         font_size: Some(font_size),
         font: None,
         gfx: None,
+        desktop_window: None,
+        desktop_dispatch: false,
+        pending_resize: None,
         size: (0, 0),
         mods: ModifiersState::empty(),
         pending: Damage::default(),
@@ -426,6 +511,8 @@ pub fn run_with_external_open(
         selecting: false,
         close_pending: false,
         save_path: None,
+        file_dialogs: file_dialog::Dialogs::default(),
+        close_dialog: None,
         keys: None,
         settings: Settings::default(),
         zoom: zoom::Zoom::default(),
@@ -458,6 +545,7 @@ pub fn run_with_external_open(
         metrics: Default::default(),
     };
     let result = event_loop.run_app(&mut app);
+    app.desktop_window.take();
     // Transfer every owner before awaiting any result. The GUI loop has ended;
     // these jobs await existing workers, which keep all I/O off the frontend.
     let prep_job = app.registration_prep.take().map(|handle| {
@@ -492,7 +580,25 @@ pub fn run_with_external_open(
         let handle = panel.stop();
         Box::new(move || handle.shutdown()) as shutdown::Job
     });
-    let shutdown_result = shutdown::drain([prep_job, welcome_job, registration_job, settings_job]);
+    let search_job = app.search.take().map(|mut session| {
+        let mut panel = std::mem::take(&mut app.search_panel);
+        Box::new(move || {
+            std::thread::spawn(move || match panel.take_shutdown(&mut session) {
+                Ok(worker) => {
+                    drop(panel);
+                    drop(session);
+                    worker.shutdown().map_err(|_| "search worker panicked".to_owned())
+                }
+                Err(owner) => {
+                    drop(owner);
+                    Ok(())
+                }
+            })
+            .join()
+            .map_err(|_| "search shutdown lane panicked".to_owned())?
+        }) as shutdown::Job
+    });
+    let shutdown_result = shutdown::drain([prep_job, welcome_job, registration_job, settings_job, search_job]);
     if let Some(palette) = &mut app.palette {
         let handles = palette.stop();
         std::thread::spawn(move || {
@@ -671,15 +777,36 @@ impl App {
         self.reload_font();
     }
 
-    fn apply(&mut self, d: Damage) {
+    fn apply(&mut self, mut d: Damage) {
+        // Addressed events/edits invalidate search by document + revision.
+        // This only captures an existing typed Editor snapshot, never decodes.
+        if let Some(session) = &mut self.search {
+            match self.search_panel.sync_document(session, &self.view) {
+                Ok(outcome) => {
+                    self.search_dirty |= outcome.damage.panel || outcome.damage.signal;
+                    d.status |= outcome.damage.status;
+                    d.rows.extend(outcome.damage.hit_rows);
+                }
+                Err(error) => {
+                    self.search_panel.set_error(error);
+                    self.search_dirty = true;
+                }
+            }
+        }
+        self.sync_goto_identity();
+
         if let Some(highlighting) = &mut self.highlighting {
             highlighting.invalidate_painted(&self.view, &d);
             highlighting.update(&self.view);
         }
-        if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty && !self.menu_dirty {
+        if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty && !self.menu_dirty && !self.search_dirty
+        {
             return;
         }
         queue_damage(&mut self.pending, d, self.view.rows(), self.font.as_mut());
+        if let Some(dialog) = &self.desktop_window {
+            dialog.gfx.window.request_redraw();
+        }
         if let Some(g) = &self.gfx {
             self.redraw_requested = true;
             g.window.request_redraw();
@@ -697,7 +824,60 @@ impl App {
         if self.composing && !matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             return;
         }
-        if self.settings_key(ev) {
+        // A file prompt owns input ahead of every overlay, including settings.
+        if self.save_path.is_none() && self.settings_key(ev) {
+            return;
+        }
+        self.key_after_settings(
+            Some(el),
+            &HostKey { logical_key: ev.logical_key.clone(), text: ev.text.as_deref(), repeat: ev.repeat },
+        );
+    }
+
+    fn key_after_settings(&mut self, el: Option<&ActiveEventLoop>, ev: &HostKey<'_>) {
+        if self.file_modal() {
+            if self.close_dialog.is_none() && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+                self.view.cancel_file_prompt();
+                self.sync_file_ui();
+                self.apply(Damage { status: true, ..Default::default() });
+            }
+            return;
+        }
+        if self.composing && !matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            return;
+        }
+        if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+            self.ime_destination = Some(ime::Destination::Cancelled);
+            self.search_ime = None;
+            self.composing = false;
+        }
+        if self.save_path.is_some() {
+            if matches!(ev.logical_key, Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown)) {
+                self.prompt_step(matches!(ev.logical_key, Key::Named(NamedKey::ArrowUp)));
+                return;
+            }
+            match &ev.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    file_prompt::cancel(&mut self.view);
+                    self.sync_file_ui();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.update_file_prompt();
+                    let damage = file_prompt::submit(&mut self.view);
+                    self.sync_file_ui();
+                    self.apply(damage);
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.save_path.as_mut().unwrap().pop();
+                }
+                _ => {
+                    if let Some(text) = ev.text.filter(|text| !text.chars().any(char::is_control)) {
+                        self.save_path.as_mut().unwrap().push_str(text);
+                    }
+                }
+            }
+            self.update_file_prompt();
             return;
         }
         // A scoped native-window probe can exercise the actual asynchronous
@@ -718,45 +898,20 @@ impl App {
                 Key::Named(NamedKey::F2) => Some("view.zoomIn"),
                 _ => None,
             };
-            if matches!(ev.logical_key, Key::Named(NamedKey::F3)) {
-                self.apply(Damage { full: true, status: true, ..Default::default() });
-                return;
-            }
+
             if let Some(command) = command {
-                if self.dispatch_settings(command) || self.dispatch_palette(command) || self.dispatch_zoom(command) {
+                if self.dispatch_search(command)
+                    || self.dispatch_settings(command)
+                    || self.dispatch_palette(command)
+                    || self.dispatch_zoom(command)
+                {
                     return;
                 }
                 self.dispatch_file(command);
                 return;
             }
         }
-        if self.save_path.is_some() {
-            match &ev.logical_key {
-                Key::Named(NamedKey::Escape) => {
-                    file_prompt::cancel(&mut self.view);
-                    self.sync_file_ui();
-                }
-                Key::Named(NamedKey::Enter) => {
-                    self.update_file_prompt();
-                    let damage = file_prompt::submit(&mut self.view);
-                    self.sync_file_ui();
-                    self.apply(damage);
-                    return;
-                }
-                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown) => {
-                    // Open recent: steps the typed row number that Enter submits.
-                    self.prompt_step(matches!(ev.logical_key, Key::Named(NamedKey::ArrowUp)));
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    self.save_path.as_mut().unwrap().pop();
-                }
-                _ => {
-                    if let Some(text) = ev.text.as_deref().filter(|text| !text.chars().any(char::is_control)) {
-                        self.save_path.as_mut().unwrap().push_str(text);
-                    }
-                }
-            }
-            self.update_file_prompt();
+        if self.search_key(ev) {
             return;
         }
         if self.palette_key(ev) {
@@ -784,14 +939,19 @@ impl App {
                 match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
-                        if self.dispatch_settings(call.id) || self.dispatch_palette(call.id) {
+                        if self.dispatch_search_call(&call)
+                            || self.dispatch_settings(call.id)
+                            || self.dispatch_palette(call.id)
+                        {
                             return;
                         }
                         if self.dispatch_zoom(call.id) {
                             return;
                         }
                         if self.dispatch_file(call.id) {
-                            if self.view.wants_exit() {
+                            if self.may_exit()
+                                && let Some(el) = el
+                            {
                                 el.exit();
                             }
                             return;
@@ -802,7 +962,9 @@ impl App {
                                 return;
                             }
                             if call.id == "file.quit" {
-                                self.request_close(el, false);
+                                if let Some(el) = el {
+                                    self.request_close(el, false);
+                                }
                                 return;
                             }
                             if call.id == "file.saveAndQuit" {
@@ -835,9 +997,11 @@ impl App {
                         return;
                     }
                     VimResult::Unbound => {
-                        match Self::unbound_key(keys, &ev.logical_key, ev.text.as_deref(), self.mods) {
+                        match Self::unbound_key(keys, &ev.logical_key, ev.text, self.mods) {
                             UnboundKey::Quit => {
-                                if !ev.repeat {
+                                if !ev.repeat
+                                    && let Some(el) = el
+                                {
                                     self.request_close(el, self.close_pending && self.mods.shift_key());
                                 }
                             }
@@ -849,7 +1013,7 @@ impl App {
                 }
             }
         }
-        if let Some(action) = input::translate(&ev.logical_key, ev.text.as_deref(), self.mods, self.composing) {
+        if let Some(action) = input::translate(&ev.logical_key, ev.text, self.mods, self.composing) {
             self.edit(action);
         }
     }
@@ -873,11 +1037,19 @@ impl App {
     }
 
     fn edit(&mut self, action: input::Action) {
+        if self.file_modal() {
+            return;
+        }
         let (id, text) = match action {
             input::Action::Command(id) => (id, None),
             input::Action::Text(text) => ("edit.insert", Some(text)),
         };
-        if self.dispatch_settings(id) || self.dispatch_palette(id) || self.dispatch_zoom(id) || self.dispatch_file(id) {
+        if self.dispatch_search(id)
+            || self.dispatch_settings(id)
+            || self.dispatch_palette(id)
+            || self.dispatch_zoom(id)
+            || self.dispatch_file(id)
+        {
             return;
         }
         let args =
@@ -940,13 +1112,36 @@ impl App {
         }
     }
 
+    fn may_exit(&mut self) -> bool {
+        if self.file_dialogs.exiting() || self.view.wants_exit() {
+            self.external_inbox.close();
+        }
+        if self.close_dialog.is_some() {
+            return false;
+        }
+        self.file_dialogs.may_exit(&mut self.view)
+    }
+    fn force_exit(&mut self) -> bool {
+        if self.close_dialog.is_some() {
+            return false;
+        }
+        self.external_inbox.close();
+        self.file_dialogs.force_exit(&mut self.view)
+    }
     fn request_close(&mut self, el: &ActiveEventLoop, discard: bool) {
+        if self.file_dialogs.exiting() {
+            if self.may_exit() {
+                el.exit();
+            }
+            return;
+        }
+
         if let Err(error) = self.view.request_window_close(discard) {
             self.view.set_notice(error.to_string());
         }
         self.sync_file_ui();
         self.apply(Damage { full: true, status: true, ..Default::default() });
-        if self.view.wants_exit() {
+        if self.may_exit() {
             el.exit();
         }
     }
@@ -1002,6 +1197,14 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
+        if let Some(size) = self.pending_resize.take() {
+            self.size = size;
+            self.resize_surface();
+            let rows = self.text_rows();
+            let damage = self.view.set_rows(rows);
+            queue_damage(&mut self.pending, damage, rows, self.font.as_mut());
+            self.pending.full = true;
+        }
         if self.pending == Damage::default()
             && !self.chrome_dirty
             && !self.palette_dirty
@@ -1050,11 +1253,14 @@ impl App {
         let theme = theme_ui::chrome();
         let body = geometry.body;
         let (bw, bh) = (body.width, body.height);
-        self.body_pixels.resize(bw.saturating_mul(bh), BG);
+        self.body_pixels.resize(bw.saturating_mul(bh), bg());
         let bars = self.bars();
         let rows = geometry.text.height / ch;
-        let palette_open =
-            self.welcome.visible() || self.palette_open() || self.settings_open() || self.save_path.is_some();
+        let palette_open = self.welcome.visible()
+            || self.palette_open()
+            || self.settings_open()
+            || self.search_panel.is_open()
+            || self.save_path.is_some();
         let menu_list = self.menu.dropdown.is_some() || self.menu_area.is_some();
         let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else {
@@ -1069,7 +1275,12 @@ impl App {
         let mut p = std::mem::take(&mut self.pending);
         let palette_dirty = std::mem::take(&mut self.palette_dirty);
         let menu_dirty = std::mem::take(&mut self.menu_dirty);
-        if (palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some()) || menu_list) && p.scroll != 0 {
+        let search_dirty = std::mem::take(&mut self.search_dirty);
+        if (palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some())
+            || search_ui::blocks_copy(self.search_panel.is_open(), self.search_area.is_some())
+            || menu_list)
+            && p.scroll != 0
+        {
             // A pending document scroll predates opening the overlay. Avoid
             // copying overlay pixels through the native scroll seam.
             p.full = true;
@@ -1081,10 +1292,11 @@ impl App {
         let body_changed = p.full || p.scroll != 0 || !p.rows.is_empty();
         if p.full {
             font.invalidate_rows();
-            pixels.fill(BG);
-            body_pixels.fill(BG);
+            pixels.fill(bg());
+            body_pixels.fill(bg());
             for row in 0..rows {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
+                search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
             }
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
@@ -1110,6 +1322,8 @@ impl App {
             p.rows.dedup();
             for &row in p.rows.iter().filter(|&&r| r < rows) {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
+                search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
+                search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
                 let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
@@ -1125,7 +1339,11 @@ impl App {
             }
         }
         // Overlays leave by restoring body and chrome pixels underneath them.
-        for (dirty, area) in [(palette_dirty, &mut self.palette_area), (menu_dirty, &mut self.menu_area)] {
+        for (dirty, area) in [
+            (palette_dirty, &mut self.palette_area),
+            (menu_dirty, &mut self.menu_area),
+            (search_dirty, &mut self.search_area),
+        ] {
             if dirty && let Some(area) = area.take() {
                 tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
                 draw_chrome(chrome_frame, &self.menu, pixels, w, self.ui_font.as_mut(), theme, &self.ui, hover);
@@ -1149,16 +1367,16 @@ impl App {
                 damage.push(tabs::rect(lay.status));
             }
         }
-        if body_changed || p.status {
+        if body_changed || p.status || search_dirty {
             let (vertical, horizontal) = bars;
             let (bar, line, inset) = (self.ui.bar, self.ui.line, self.ui.inset);
             let vr = Rect { x: bw.saturating_sub(bar), y: 0, w: bar.min(bw), h: vertical.length };
             let hr = Rect { x: 0, y: vertical.length, w: bw, h: bar.min(bh.saturating_sub(vertical.length)) };
-            let track = chrome::mix(BG, FG, 0x0a);
+            let track = chrome::mix(bg(), fg(), 0x0a);
             fill(body_pixels, bw, vr, track);
             fill(body_pixels, bw, hr, track);
             // Hairlines keep the bars distinct from text and from a signal strip.
-            let edge = chrome::mix(BG, FG, 0x1c);
+            let edge = chrome::mix(bg(), fg(), 0x1c);
             fill(body_pixels, bw, Rect { w: line.min(vr.w), ..vr }, edge);
             fill(body_pixels, bw, Rect { h: line.min(hr.h), ..hr }, edge);
             let thumb = |active: bool, hovered: bool| {
@@ -1169,7 +1387,7 @@ impl App {
                 } else {
                     0x52
                 };
-                chrome::mix(BG, FG, amount)
+                chrome::mix(bg(), fg(), amount)
             };
             if vertical.maximum > 0 && vr.w > 2 * inset {
                 let r =
@@ -1187,7 +1405,10 @@ impl App {
                 let color = thumb(dragging == Some(false), hover == chrome::Hover::HorizontalThumb);
                 chrome::round_rect(body_pixels, bw, r, r.h / 2, color);
             }
-            for area in [vr, hr] {
+            let signal =
+                Rect { x: vr.x.saturating_sub(self.ui.inset.max(2)), y: 0, w: self.ui.inset.max(2).min(vr.x), h: vr.h };
+            search_ui::draw_signal(&self.search_panel, body_pixels, bw, signal, theme);
+            for area in [signal, vr, hr] {
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
                 if !p.full {
                     damage.push(tabs::translated(area, body));
@@ -1238,9 +1459,10 @@ impl App {
                 damage.push(area);
             }
         }
-        if let (Some(panel), Some(ui_font)) =
-            (self.settings_panel.as_ref().filter(|panel| panel.is_open()), self.ui_font.as_mut())
-        {
+        if let (Some(panel), Some(ui_font)) = (
+            self.settings_panel.as_ref().filter(|panel| panel.is_open() && self.desktop_dispatch),
+            self.ui_font.as_mut(),
+        ) {
             // After adoption: self.file_types.as_mut().map(|page| page as &mut dyn settings_ui::HostedPage)
             if let Some(page) = &mut self.file_types {
                 page.ui.setup = false;
@@ -1261,7 +1483,8 @@ impl App {
                 damage.push(area);
             }
         }
-        if let Some(ui_font) = self.ui_font.as_mut()
+        if self.desktop_dispatch
+            && let Some(ui_font) = self.ui_font.as_mut()
             && let Some(area) = welcome_ui::draw(
                 &self.welcome,
                 &mut self.welcome_view,
@@ -1283,6 +1506,38 @@ impl App {
             && let Some(id) = self.ui_fallback.request(ui_font.id())
         {
             spawn_ui_fallback(&self.proxy, id);
+        }
+        if let (Some(prompt), Some(ui_font)) = (self.goto.as_ref(), self.ui_font.as_mut()) {
+            self.palette_area = palette_view::draw(
+                &prompt.model,
+                pixels,
+                (w, h),
+                ui_font,
+                theme,
+                &self.ui,
+                &self.menu.labels,
+                &mut self.palette_view,
+            );
+            if let Some(area) = self.palette_area {
+                damage.push(area);
+            }
+        }
+        if self.search_panel.is_open() {
+            if let Some(ui_font) = self.ui_font.as_mut() {
+                self.search_area = search_view::draw(
+                    &self.search_panel,
+                    pixels,
+                    (w, h),
+                    ui_font,
+                    theme,
+                    &self.ui,
+                    geometry.body.y,
+                    &mut self.search_view,
+                );
+            }
+            if let Some(area) = self.search_area {
+                damage.push(area);
+            }
         }
         let rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
@@ -1320,7 +1575,7 @@ impl App {
 }
 
 /// Reads the wide-coverage chrome face off the UI thread for face `id`.
-fn spawn_ui_fallback(proxy: &EventLoopProxy<UserEvent>, id: u64) {
+fn spawn_ui_fallback(proxy: &HostProxy, id: u64) {
     let proxy = proxy.clone();
     std::thread::spawn(move || {
         let _ = proxy.send_event(UserEvent::UiFallbackReady(id, font::UiFont::read_fallback()));
@@ -1430,12 +1685,12 @@ fn draw_row(
     let (cw, ch) = (font.cw, font.ch);
     let y = r * ch;
     let gutter = GUTTER_COLS * cw;
-    fill(buf, w, Rect { x: 0, y, w: gutter.min(w), h: ch }, GUTTER_BG);
-    fill(buf, w, Rect { x: gutter, y, w: w.saturating_sub(gutter), h: ch }, BG);
+    fill(buf, w, Rect { x: 0, y, w: gutter.min(w), h: ch }, gutter_bg());
+    fill(buf, w, Rect { x: gutter, y, w: w.saturating_sub(gutter), h: ch }, bg());
     if let Some(text) = view.line(r) {
         let num = format!("{:>7} ", view.line_number(r));
-        draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, GUTTER_FG, GUTTER_BG);
-        draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, FG, BG);
+        draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, gutter_fg(), gutter_bg());
+        draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, fg(), bg());
         if let Some(source) = view.line_source(r) {
             let columns = w.saturating_sub(gutter + BAR) / cw;
             let first = spans.partition_point(|span| span.range.end <= source.start as usize);
@@ -1453,7 +1708,7 @@ fn draw_row(
                         continue;
                     }
                     let x = gutter + start * cw;
-                    fill(buf, w, Rect { x, y, w: (end - start) * cw, h: ch }, BG);
+                    fill(buf, w, Rect { x, y, w: (end - start) * cw, h: ch }, bg());
                     draw_text(
                         buf,
                         w,
@@ -1462,8 +1717,8 @@ fn draw_row(
                         y,
                         &text[start..end],
                         end - start,
-                        kwil_view_model::highlight_session::syntax_rgb(span.class),
-                        BG,
+                        theme_ui::syntax_rgb(kwil_view_model::highlight_session::syntax_rgb(span.class)),
+                        bg(),
                     );
                 }
                 return;
@@ -1478,10 +1733,10 @@ fn draw_row(
                     if let Some(span) = spans.get(index).filter(|span| span.range.start <= offset)
                         && cell.text != "\t"
                     {
-                        let color = kwil_view_model::highlight_session::syntax_rgb(span.class);
+                        let color = theme_ui::syntax_rgb(kwil_view_model::highlight_session::syntax_rgb(span.class));
                         let x = gutter + cell.column * cw;
-                        fill(buf, w, Rect { x, y, w: cell.width * cw, h: ch }, BG);
-                        draw_text(buf, w, font, x, y, cell.text.as_bytes(), cell.width, color, BG);
+                        fill(buf, w, Rect { x, y, w: cell.width * cw, h: ch }, bg());
+                        draw_text(buf, w, font, x, y, cell.text.as_bytes(), cell.width, color, bg());
                     }
                 }
             }
@@ -1530,7 +1785,7 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
             if column >= columns {
                 continue;
             }
-            fill(buf, w, Rect { x: gutter + column * font.cw, y: row * font.ch, w: 2, h: font.ch }, STATUS_FG);
+            fill(buf, w, Rect { x: gutter + column * font.cw, y: row * font.ch, w: 2, h: font.ch }, status_fg());
         }
     }
 }
@@ -1731,6 +1986,9 @@ fn cloak_and_show(hwnd: isize) {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        self.sync_desktop_window(el);
+    }
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gfx.is_some() {
             return;
@@ -1802,16 +2060,17 @@ impl ApplicationHandler<UserEvent> for App {
         self.ui_font = self.ui_font_thread.take().and_then(|t| t.join().ok()).flatten();
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
-        self.gfx = Some(Gfx { native: None, window, surface, hwnd, pixels: vec![BG; self.size.0 * self.size.1] });
+        self.gfx = Some(Gfx { native: None, window, surface, hwnd, pixels: vec![bg(); self.size.0 * self.size.1] });
         self.resize_surface();
         let rows = self.text_rows();
         let d = self.view.set_rows(rows);
         self.apply(d);
-        if !self.render() {
+        if !self.render() && self.force_exit() {
             el.exit();
             return;
         }
         trace::mark("first frame presented");
+        self.start_search();
         let highlight_proxy = self.proxy.clone();
         self.highlighting = kwil_view_model::highlight_session::HighlightSession::new(move || {
             let _ = highlight_proxy.send_event(UserEvent::HighlightsReady);
@@ -1860,7 +2119,9 @@ impl ApplicationHandler<UserEvent> for App {
         });
         #[cfg(feature = "frame-harness")]
         if self.opts.hidden && std::env::var_os("KWIL_FRAME_SCRIPT").is_some() {
-            harness::start(self.proxy.clone());
+            if let Some(proxy) = self.proxy.native() {
+                harness::start(proxy);
+            }
         }
         if let Some(cb) = self.on_first_frame.take() {
             let p = self.proxy.clone();
@@ -1875,6 +2136,25 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
+            UserEvent::SearchReady => {
+                self.search_ready();
+                Damage::default()
+            }
+            UserEvent::CloseDialog(reply) => {
+                self.close_dialog_event(reply);
+                if self.may_exit() {
+                    el.exit();
+                }
+                Damage { full: true, status: true, ..Default::default() }
+            }
+
+            UserEvent::FileDialog(event) => {
+                self.file_dialog_event(event);
+                if self.may_exit() {
+                    el.exit();
+                }
+                Damage { full: true, status: true, ..Default::default() }
+            }
             UserEvent::HighlightsReady => {
                 let rows = self.highlighting.as_mut().map_or_else(Vec::new, |host| host.worker_ready(&self.view));
                 Damage { rows, ..Default::default() }
@@ -1919,12 +2199,25 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Document(result) => {
                 let damage = self.view.document_result(*result);
                 self.sync_file_ui();
-                if self.view.wants_exit() {
+                if let Some((document, epoch)) = self.goto_reveal {
+                    if document != self.view.active_id() || epoch != self.view.input_epoch() {
+                        self.goto_reveal = None;
+                    } else if self.view.editor().is_some() {
+                        self.goto_reveal = None;
+                        self.keep_caret_visible();
+                    }
+                }
+                if self.may_exit() {
                     el.exit();
                 }
                 damage
             }
             UserEvent::OpenExternal => {
+                if self.file_dialogs.exiting() {
+                    self.external_inbox.close();
+                    return;
+                }
+
                 if self.welcome.visible() {
                     return;
                 }
@@ -2112,6 +2405,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let keymap_changed =
                     settings.keymap != self.settings.keymap || settings.bindings != self.settings.bindings;
                 self.settings = *settings;
+                self.search_settings_ready();
                 self.view.set_editor_settings(&self.settings);
                 self.view.set_session_restore(self.settings.files.restore_session);
                 if layout_changed {
@@ -2199,11 +2493,20 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 };
                 font.install_fallback(face);
+                if let Some(dialog) = &mut self.desktop_window {
+                    if let Some(dialog_font) = &mut dialog.font {
+                        dialog_font.copy_fallback_from(font);
+                    }
+                    dialog.gfx.window.request_redraw();
+                }
                 self.chrome_dirty = true;
                 self.menu_dirty = true;
                 Damage { status: true, ..Default::default() }
             }
             UserEvent::DroppedFile(path) => {
+                if self.file_modal() {
+                    return;
+                }
                 if self.welcome.visible() {
                     let damage = self.view.set_notice("Finish or skip setup before opening a dropped file".into());
                     self.apply(damage);
@@ -2237,6 +2540,18 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        if !self.desktop_dispatch {
+            if self.desktop_window.as_ref().is_some_and(|dialog| dialog.gfx.window.id() == _id) {
+                self.desktop_window_event(el, _id, ev);
+                return;
+            }
+            if self.desktop_window.is_some() && desktop_window::owns_input(&ev) {
+                return;
+            }
+            if self.gfx.as_ref().is_some_and(|gfx| gfx.window.id() != _id) {
+                return;
+            }
+        }
         if self.welcome_input(&ev) {
             return;
         }
@@ -2244,16 +2559,18 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => self.request_close(el, false),
             WindowEvent::Resized(sz) => {
                 // The first Resized repeats the creation size.
-                if (sz.width as usize, sz.height as usize) == self.size {
+                let latest = (sz.width as usize, sz.height as usize);
+                if latest == self.pending_resize.unwrap_or(self.size) {
                     return;
                 }
                 self.drag = None;
                 self.selecting = false;
-                self.size = (sz.width as usize, sz.height as usize);
-                self.resize_surface();
-                let rows = self.text_rows();
-                let d = self.view.set_rows(rows);
-                self.apply(d);
+                self.pending_resize = Some(latest);
+                self.pending.full = true;
+                if let Some(gfx) = &self.gfx {
+                    self.redraw_requested = true;
+                    gfx.window.request_redraw();
+                }
             }
             WindowEvent::RedrawRequested => {
                 // Distinguish our already-serviced startup request from an OS
@@ -2261,7 +2578,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if !std::mem::take(&mut self.redraw_requested) && self.pending == Damage::default() {
                     self.pending.full = true;
                 }
-                if !self.render() {
+                if !self.render() && self.force_exit() {
                     el.exit();
                 }
             }
@@ -2270,6 +2587,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
                 if self.menu.state.is_open() {
                     self.menu_track();
+                }
+                if self.search_panel.is_open() {
+                    let hover = search_view::hover(&self.search_view, self.pointer);
+                    if hover != self.search_view.hover {
+                        self.search_view.hover = hover;
+                        self.search_dirty = true;
+                        self.request_frame();
+                    }
                 }
                 if self.settings_open() {
                     self.settings_track();
@@ -2297,6 +2622,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                if self.file_modal() {
+                    return;
+                }
+                if self.save_path.is_none() && self.search_panel.is_open() {
+                    if state == ElementState::Pressed {
+                        self.search_mouse();
+                    }
+                    return;
+                }
                 if self.settings_open() {
                     if state == ElementState::Pressed {
                         self.settings_mouse();
@@ -2307,7 +2641,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if state == ElementState::Pressed {
                         self.palette_mouse();
                     }
-                    if self.view.wants_exit() {
+                    if self.may_exit() {
                         el.exit();
                     }
                     return;
@@ -2336,7 +2670,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(&(_, _, command)) =
                         self.status_hits.iter().find(|(rect, _, _)| rect.contains(self.pointer))
                     {
-                        self.run_menu_command(el, command);
+                        self.run_menu_command(Some(el), command);
                         return;
                     }
                     self.pointer_down();
@@ -2361,8 +2695,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
+                if self.file_modal() {
+                    return;
+                }
                 // Middle click closes a tab, as in browsers and other editors.
-                if self.settings_open() || self.palette_open() || self.menu.state.is_open() || self.save_path.is_some()
+                if self.settings_open()
+                    || self.palette_open()
+                    || self.search_panel.is_open()
+                    || self.menu.state.is_open()
+                    || self.save_path.is_some()
                 {
                     return;
                 }
@@ -2377,7 +2718,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.sync_file_ui();
                     self.apply(Damage { full: true, status: true, ..Default::default() });
-                    if self.view.wants_exit() {
+                    if self.may_exit() {
                         el.exit();
                     }
                 }
@@ -2388,24 +2729,42 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ThemeChanged(_) => self.apply_native_theme(),
             WindowEvent::DroppedFile(path) => {
+                if self.file_modal() {
+                    return;
+                }
                 self.user_event(el, UserEvent::DroppedFile(path));
             }
             WindowEvent::Focused(true) => self.user_event(el, UserEvent::SessionChanged(remote::detect())),
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.menu_alt(&event) {
+                if self.save_path.is_none() && self.menu_alt(&event) {
                     return;
                 }
                 self.key(el, &event);
                 self.view.checkpoint_session();
-                if self.view.wants_exit() {
+                if self.may_exit() {
                     el.exit();
                 }
             }
+            WindowEvent::Ime(_) if self.file_modal() => {}
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                if ime::starts_composition(self.composing, &text) {
+                    self.search_ime = self.capture_search_composition();
+                }
                 self.ime_preedit(&text);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                if let Some(destination) = self
+                    .search_ime
+                    .take()
+                    .or_else(|| if self.ime_destination.is_none() { self.capture_search_composition() } else { None })
+                {
+                    self.composing = false;
+                    self.ime_destination = None;
+                    self.search_commit(destination, &text);
+                    return;
+                }
+
                 self.composing = false;
                 let destination = self.ime_destination.take().unwrap_or_else(|| self.ime_capture());
                 let (damage, follow_active) = match destination {
@@ -2416,6 +2775,14 @@ impl ApplicationHandler<UserEvent> for App {
                             self.view.set_notice("IME settings input cancelled: its destination changed".into());
                         }
                         (Damage::default(), false)
+                    }
+                    ime::Destination::Palette { epoch } if self.goto.is_some() => {
+                        if self.goto_epoch == epoch {
+                            self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text));
+                        } else {
+                            self.view.set_notice("Go to Line composition cancelled: input changed".into());
+                        }
+                        (Damage { status: true, ..Default::default() }, false)
                     }
                     ime::Destination::Palette { epoch } => {
                         if self
@@ -2442,11 +2809,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.checkpoint_session();
             }
             WindowEvent::Ime(Ime::Disabled) => {
+                self.search_ime = None;
                 self.composing = false;
                 self.ime_destination = Some(ime::Destination::Cancelled);
             }
-            WindowEvent::Ime(Ime::Enabled) => ime::reset(&mut self.composing, &mut self.ime_destination),
+            WindowEvent::Ime(Ime::Enabled) => {
+                self.search_ime = None;
+                ime::reset(&mut self.composing, &mut self.ime_destination);
+            }
             WindowEvent::Focused(false) => {
+                self.search_ime = None;
                 self.drag = None;
                 self.selecting = false;
                 self.composing = false;
@@ -2468,6 +2840,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.save_path.is_some() {
+                    return;
+                }
                 self.menu.alt_tap = false;
                 let up = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y > 0.0,
@@ -2479,6 +2854,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.settings_open() {
                     // Scrolls the list; selection, drafts and reviews stay put.
                     self.settings_wheel(up);
+                    return;
+                }
+                if self.search_panel.is_open() {
                     return;
                 }
                 if self.palette_open() {
@@ -2562,7 +2940,7 @@ impl App {
         let (w, h) = self.size;
         if let (Some(g), Some(w), Some(h)) = (&mut self.gfx, NonZeroU32::new(w as u32), NonZeroU32::new(h as u32)) {
             let _ = g.surface.resize(w, h);
-            g.pixels.resize(self.size.0 * self.size.1, BG);
+            g.pixels.resize(self.size.0 * self.size.1, bg());
         }
     }
     fn reload_font(&mut self) {
@@ -2612,7 +2990,26 @@ impl App {
             ..Default::default()
         });
     }
-    fn apply_native_theme(&self) {
+    fn apply_native_theme(&mut self) {
+        let dark = if self.settings.theme.follow_os {
+            self.gfx.as_ref().is_none_or(|g| g.window.theme() != Some(winit::window::Theme::Light))
+        } else {
+            self.settings.theme.name != "light"
+        };
+        if theme_ui::select(dark) {
+            self.pending.full = true;
+            self.chrome_dirty = true;
+            if let Some(gfx) = &self.gfx {
+                self.redraw_requested = true;
+                gfx.window.request_redraw();
+            }
+            if let Some(dialog) = &self.desktop_window {
+                dialog.gfx.window.request_redraw();
+            }
+        }
+        if let Some(dialog) = &self.desktop_window {
+            platform::decorate_window(dialog.gfx.hwnd, dark, self.policy.remote(), true);
+        }
         if let Some(g) = &self.gfx
             && let Some(native) = &g.native
         {
@@ -2626,7 +3023,12 @@ impl App {
     }
     fn start_gpu(&mut self) {
         #[cfg(feature = "gpu")]
-        if self.settings_loaded && !self.gpu_started && !self.policy.remote() {
+        if self.settings_loaded
+            && !self.gpu_started
+            && !self.policy.remote()
+            && self.opts.renderer.unwrap_or(self.settings.render.backend)
+                != kwil_core_commands::settings::RenderBackend::Cpu
+        {
             self.gpu_started = true;
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {

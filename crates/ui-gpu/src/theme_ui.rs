@@ -4,8 +4,23 @@
 use kwil_core_commands::theme::{Rgba, Scheme, Theme, UiRole};
 
 pub(super) fn chrome() -> &'static Theme {
-    static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
-    THEME.get_or_init(|| Theme::builtin(Scheme::Dark))
+    static DARK: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    static LIGHT: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    if DARK_SELECTED.with(std::cell::Cell::get) {
+        DARK.get_or_init(|| Theme::builtin(Scheme::Dark))
+    } else {
+        LIGHT.get_or_init(|| Theme::builtin(Scheme::Light))
+    }
+}
+
+thread_local! { static DARK_SELECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+
+pub(super) fn select(dark: bool) -> bool {
+    DARK_SELECTED.with(|selected| selected.replace(dark) != dark)
+}
+
+pub(super) fn syntax_rgb(color: u32) -> u32 {
+    if DARK_SELECTED.with(std::cell::Cell::get) { color } else { super::chrome::mix(color, 0, 0x78) }
 }
 
 pub(super) fn rgb(theme: &Theme, role: UiRole) -> u32 {
@@ -22,12 +37,12 @@ mod tests {
         // A mismatch would put a differently coloured frame around the text.
         let theme = chrome();
         for (role, painted) in [
-            (UiRole::Background, crate::BG),
-            (UiRole::Foreground, crate::FG),
-            (UiRole::GutterBackground, crate::GUTTER_BG),
-            (UiRole::GutterForeground, crate::GUTTER_FG),
-            (UiRole::StatusBackground, crate::STATUS_BG),
-            (UiRole::StatusForeground, crate::STATUS_FG),
+            (UiRole::Background, crate::bg()),
+            (UiRole::Foreground, crate::fg()),
+            (UiRole::GutterBackground, crate::gutter_bg()),
+            (UiRole::GutterForeground, crate::gutter_fg()),
+            (UiRole::StatusBackground, crate::status_bg()),
+            (UiRole::StatusForeground, crate::status_fg()),
         ] {
             assert_eq!(rgb(theme, role), painted, "{role:?}");
         }

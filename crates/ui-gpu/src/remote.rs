@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn remote_disables_motion_blink_and_translucency() {
         let p =
-            RenderPolicy::new(RenderSettings { remote: Remote::On, smooth_scrolling: true, cursor_blink: true }, false);
+            RenderPolicy::new(RenderSettings { remote: Remote::On, smooth_scrolling: true, cursor_blink: true, ..Default::default() }, false);
         assert!(!p.cursor_blink_allowed());
         assert!(!p.smooth_scrolling_allowed());
         assert!(!p.translucency_allowed());

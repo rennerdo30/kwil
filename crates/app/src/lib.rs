@@ -25,6 +25,7 @@ Usage: kwil [options] [file[:line[:column]] ...]
 Options:
   --gui        Force the window UI
   --tui        Force the terminal UI
+  --renderer auto|cpu|gpu  Select the GUI rendering backend (overrides settings)
   --update     Check for an update now and install it
   --version    Print the version
   -h, --help   Print this help
@@ -40,13 +41,18 @@ struct Args {
     tui: bool,
     hidden: bool,
     update: bool,
+    renderer: Option<kwil_ui_gpu::RenderBackend>,
     files: Vec<FileArgument>,
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_values(std::env::args_os().skip(1))
+}
+
+fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<Args, String> {
     let mut a = Args::default();
     let mut literal = false;
-    for arg in std::env::args_os().skip(1) {
+    while let Some(arg) = arguments.next() {
         if literal {
             a.files.push(FileArgument::parse(arg, true)?);
             if a.files.len() > kwil_core_workspace::instance::MAX_OPEN_FILES {
@@ -58,6 +64,17 @@ fn parse_args() -> Result<Args, String> {
             Some("--") => literal = true,
             Some("--gui") => a.gui = true,
             Some("--tui") => a.tui = true,
+            Some("--renderer") => {
+                if a.renderer.is_some() { return Err("--renderer was specified more than once".into()); }
+                let value = arguments.next().ok_or("--renderer requires auto, cpu or gpu")?;
+                a.renderer = Some(value.to_str().and_then(kwil_ui_gpu::RenderBackend::parse)
+                    .ok_or("--renderer requires auto, cpu or gpu")?);
+            }
+            Some(value) if value.starts_with("--renderer=") => {
+                if a.renderer.is_some() { return Err("--renderer was specified more than once".into()); }
+                a.renderer = Some(kwil_ui_gpu::RenderBackend::parse(&value[11..])
+                    .ok_or("--renderer requires auto, cpu or gpu")?);
+            }
             // Agent and test runs: window composed but never shown (Windows).
             Some("--hidden") => a.hidden = true,
             Some("--update") => a.update = true,
@@ -81,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
     if a.gui && a.tui {
         return Err("--gui and --tui exclude each other".into());
     }
+    if a.tui && a.renderer.is_some() { return Err("--renderer selects the GUI backend, not the terminal UI".into()); }
     if !a.files.is_empty() {
         let directory =
             std::env::current_dir().map_err(|error| format!("cannot resolve working directory: {error}"))?;
@@ -294,7 +312,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         };
 
-        let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden };
+        let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden, renderer: args.renderer };
         match kwil_ui_gpu::run_with_external_open(view, opts, on_first_frame(true), Box::new(|_| {}), external_ready())
         {
             Ok(()) => return ExitCode::SUCCESS,
@@ -355,6 +373,21 @@ fn validate_hidden_tui_root(hidden: bool, root: Option<&std::path::Path>) -> Res
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
+    #[test]
+    fn renderer_cli_accepts_all_modes_and_rejects_ambiguous_or_missing_values() {
+        use kwil_ui_gpu::RenderBackend;
+        for (name, mode) in [("auto",RenderBackend::Auto),("cpu",RenderBackend::Cpu),("gpu",RenderBackend::Gpu)] {
+            let parsed = parse_args_values(["--renderer",name].into_iter().map(std::ffi::OsString::from)).unwrap();
+            assert_eq!(parsed.renderer,Some(mode));
+            let parsed = parse_args_values([format!("--renderer={name}")].into_iter().map(std::ffi::OsString::from)).unwrap();
+            assert_eq!(parsed.renderer,Some(mode));
+        }
+        for args in [vec!["--renderer"],vec!["--renderer","other"],vec!["--renderer=GPU"],vec!["--renderer=cpu","--renderer=gpu"],vec!["--tui","--renderer=cpu"]] {
+            assert!(parse_args_values(args.into_iter().map(std::ffi::OsString::from)).is_err());
+        }
+        let literal=parse_args_values(["--","--renderer"].into_iter().map(std::ffi::OsString::from)).unwrap();
+        assert!(literal.renderer.is_none()); assert_eq!(literal.files.len(),1);
+    }
     #[test]
     fn hidden_terminal_missing_empty_and_relative_roots_fail_closed() {
         for root in [None, Some(std::path::Path::new("")), Some(std::path::Path::new("relative"))] {

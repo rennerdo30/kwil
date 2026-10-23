@@ -6,7 +6,7 @@ use kwil_core_commands::settings::TabLayout;
 use kwil_view_model::{SessionDocumentId, TabAction, TabArea, TabGeometry, TabSlot};
 
 /// Logical size of menu, tab and status text.
-pub(super) const UI_TEXT_DIP: f64 = 14.0;
+pub(super) const UI_TEXT_DIP: f64 = 15.0;
 
 /// Physical pixel sizes for one monitor scale.
 #[derive(Clone, Copy, Debug, PartialEq)]

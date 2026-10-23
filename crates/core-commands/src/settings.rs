@@ -45,7 +45,23 @@ pub enum TabLayout {
     Vertical,
 }
 
-group!(RenderSettings { remote: Remote = Remote::Auto, smooth_scrolling: bool = false, cursor_blink: bool = true });
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderBackend {
+    #[default]
+    Auto,
+    Cpu,
+    Gpu,
+}
+impl RenderBackend {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value { "auto" => Some(Self::Auto), "cpu" => Some(Self::Cpu), "gpu" => Some(Self::Gpu), _ => None }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Auto => "auto", Self::Cpu => "cpu", Self::Gpu => "gpu" }
+    }
+}
+group!(RenderSettings { backend: RenderBackend = RenderBackend::Auto, remote: Remote = Remote::Auto, smooth_scrolling: bool = false, cursor_blink: bool = true });
 group!(TabsSettings { layout: TabLayout = TabLayout::Horizontal });
 group!(UpdateSettings { check: bool = true, channel: UpdateChannel = UpdateChannel::Stable });
 group!(FontSettings {

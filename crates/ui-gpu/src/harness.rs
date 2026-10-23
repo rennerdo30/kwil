@@ -36,6 +36,14 @@ pub(crate) enum Step {
     WelcomeLateInput,
     RecentMiddleClick,
     DismissSetup,
+    ResizeProbe,
+    DesktopWindowProbe,
+    DesktopSettingsProbe,
+    ThemeLight,
+    ThemeDark,
+    FindOpen,
+    FindNext,
+    FindCheck,
     End,
 }
 #[derive(Default, Clone, Copy)]
@@ -120,7 +128,41 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (200, Step::UsabilityCapture("welcome-complete.bmp")),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_WELCOME_PROBE").is_some() {
+        let resize = [(1800, Step::DismissSetup), (200, Step::ResizeProbe), (100, Step::End)];
+        let desktop = [
+            (1800, Step::WelcomeProbe),
+            (100, Step::DesktopWindowProbe),
+            (100, Step::UsabilityCapture("desktop-welcome.bmp")),
+            (100, Step::WelcomeNext),
+            (150, Step::UsabilityCapture("desktop-file-types.bmp")),
+            (100, Step::WelcomeSkip),
+            (100, Step::SettingsOpen),
+            (200, Step::DesktopSettingsProbe),
+            (100, Step::UsabilityCapture("desktop-settings-dark.bmp")),
+            (100, Step::ThemeLight),
+            (400, Step::UsabilityCapture("desktop-settings-light.bmp")),
+            (100, Step::ThemeDark),
+            (400, Step::UsabilityCapture("desktop-theme-dropdown.bmp")),
+            (100, Step::SettingsClose),
+            (100, Step::ResizeProbe),
+            (100, Step::UsabilityCapture("desktop-editor.bmp")),
+            (100, Step::End),
+        ];
+        let find = [
+            (1800, Step::DismissSetup),
+            (200, Step::FindOpen),
+            (400, Step::FindNext),
+            (300, Step::FindCheck),
+            (100, Step::UsabilityCapture("find.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_FIND_PROBE").is_some() {
+            find.as_slice()
+        } else if std::env::var_os("KWIL_DESKTOP_WINDOW_PROBE").is_some() {
+            desktop.as_slice()
+        } else if std::env::var_os("KWIL_RESIZE_PROBE").is_some() {
+            resize.as_slice()
+        } else if std::env::var_os("KWIL_WELCOME_PROBE").is_some() {
             welcome.as_slice()
         } else if std::env::var_os("KWIL_UI_USABILITY_CAPTURE").is_some() {
             usability.as_slice()
@@ -151,6 +193,107 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::DesktopWindowProbe => {
+            app.sync_desktop_window(el);
+            let main = app.gfx.as_ref().unwrap().window.id();
+            let dialog = app.desktop_window.as_ref().expect("welcome is a separate desktop window");
+            assert_ne!(dialog.gfx.window.id(), main);
+            assert_eq!(dialog.kind, super::desktop_window::Kind::Welcome);
+            assert!(app.render_desktop_window());
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("desktop-windows.txt"),
+                    "PASS: actual owned welcome window has a distinct WindowId and native surface\n",
+                )
+                .unwrap();
+            }
+        }
+        Step::DesktopSettingsProbe => {
+            use kwil_core_commands::settings_ui::Category;
+            app.sync_desktop_window(el);
+            assert_eq!(app.desktop_window.as_ref().unwrap().kind, super::desktop_window::Kind::Settings);
+            if let Some(host) = &mut app.settings_panel {
+                host.set_category(Some(Category::Appearance));
+            }
+            app.settings_epoch = app.settings_epoch.wrapping_add(1);
+            assert!(app.render_desktop_window());
+            assert!(app.settings_view.choice_area("theme.name", None).is_some(), "theme is a real dropdown");
+            assert!(!app.settings_view.has_internal_close(), "the native window owns the only close button");
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("desktop-settings.txt"),
+                    "PASS: separate owned Settings window; theme dropdown painted\n",
+                )
+                .unwrap();
+            }
+        }
+        Step::FindOpen => {
+            use winit::keyboard::{Key, ModifiersState};
+            let press = |app: &mut App, key: Key, text: Option<&str>, mods| {
+                app.mods = mods;
+                app.key_after_settings(Some(el), &super::HostKey { logical_key: key, text, repeat: false });
+            };
+            press(app, Key::Character("f".into()), None, ModifiersState::CONTROL);
+            assert!(app.search_panel.is_open(), "real Ctrl+F route opens Find");
+            press(app, Key::Character("value".into()), Some("value"), ModifiersState::empty());
+            assert_eq!(app.search_panel.text(kwil_view_model::search_panel::SearchField::Query).0, "value");
+        }
+        Step::FindNext => {
+            assert_eq!(app.search_panel.count(), (60, true), "worker completes the actual fixture scan");
+            app.mods = winit::keyboard::ModifiersState::empty();
+            app.key_after_settings(
+                Some(el),
+                &super::HostKey {
+                    logical_key: winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+                    text: None,
+                    repeat: false,
+                },
+            );
+        }
+        Step::FindCheck => {
+            let cursor = app.view.editor().unwrap().primary_cursor().clone();
+            assert_eq!(cursor.head.abs_diff(cursor.anchor), 5, "Enter selects the actual match");
+            assert!(app.render());
+            if let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from) {
+                std::fs::write(
+                    dir.join("find-result.txt"),
+                    format!("PASS Ctrl+F query=value count=60 exact=true Enter selection={cursor:?}\n"),
+                )
+                .unwrap();
+            }
+        }
+        Step::ThemeLight => {
+            choose_theme(app, el, "light");
+        }
+        Step::ThemeDark => {
+            assert_eq!(
+                super::theme_ui::chrome().scheme(),
+                kwil_core_commands::theme::Scheme::Light,
+                "light selection changes the actual renderer"
+            );
+            choose_theme(app, el, "dark");
+        }
+        Step::ResizeProbe => {
+            use winit::application::ApplicationHandler;
+            use winit::event::WindowEvent;
+            let id = app.gfx.as_ref().unwrap().window.id();
+            let original = app.size;
+            let mut event_ms = Vec::new();
+            let mut paint_ms = Vec::new();
+            for (w, h) in [(1080, 700), (1180, 740), (1280, 800), (1380, 840), (1480, 900), original] {
+                let start = std::time::Instant::now();
+                app.window_event(el, id, WindowEvent::Resized(winit::dpi::PhysicalSize::new(w as u32, h as u32)));
+                event_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                let start = std::time::Instant::now();
+                assert!(app.render());
+                paint_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let text = format!("six bounded App resize events; event_ms={event_ms:?}; paint_ms={paint_ms:?}\n");
+            println!("{text}");
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join("resize-timing.txt"), text).unwrap();
+            }
+        }
         Step::WelcomeScrollDamage => {
             assert!(app.render());
             let phase = app.metrics.phase;
@@ -559,9 +702,8 @@ fn input_ownership(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
     app.window_event(el, window, WindowEvent::Resized(winit::dpi::PhysicalSize::new(size.0 as u32, size.1 as u32)));
 
     let before = app.view.editor().map(|editor| (editor.document().revision(), editor.cursors().to_vec()));
-    // Find is explicitly disabled until the search host is integrated. Its click must remain
-    // owned by the dropdown while an IME attempts to compose behind it.
-    assert!(!super::menu::enabled(&app.menu_available(), "search.find"));
+    // Find is now enabled: the menu must retain click ownership through cancelled preedit.
+    assert!(super::menu::enabled(&app.menu_available(), "search.find"));
     app.menu_set(super::menu::State::Open { menu: 4, item: None, keyboard: false }, true);
     assert!(app.render());
     let row = app.menu.dropdown.as_ref().unwrap().rows[0].1;
@@ -577,17 +719,57 @@ fn input_ownership(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
             button: MouseButton::Left,
         },
     );
-    assert!(app.menu.state.is_open(), "disabled dropdown row click must not fall through");
+    assert!(app.search_panel.is_open(), "the menu click opens Find without editing the document");
     app.window_event(el, window, WindowEvent::Ime(Ime::Commit("unexpected edit".into())));
     assert_eq!(app.view.editor().map(|editor| (editor.document().revision(), editor.cursors().to_vec())), before);
     app.menu_set(super::menu::State::Closed, false);
+    app.close_search();
     if let Some(dir) = dir {
         std::fs::write(dir.join("input-ownership.txt"), "PASS: App DPI/layout/resize drag cancellation; open menu Preedit/click/Commit retains document and cursors\n").unwrap();
     }
 }
 
+fn choose_theme(app: &mut App, el: &ActiveEventLoop, value: &str) {
+    use winit::{
+        application::ApplicationHandler,
+        dpi::PhysicalPosition,
+        event::{ElementState, MouseButton, WindowEvent},
+    };
+    fn click(app: &mut App, el: &ActiveEventLoop, rect: super::Rect) {
+        let id = app.desktop_window.as_ref().unwrap().gfx.window.id();
+        app.window_event(
+            el,
+            id,
+            WindowEvent::CursorMoved {
+                device_id: winit::event::DeviceId::dummy(),
+                position: PhysicalPosition::new((rect.x + rect.w / 2) as f64, (rect.y + rect.h / 2) as f64),
+            },
+        );
+        app.window_event(
+            el,
+            id,
+            WindowEvent::MouseInput {
+                device_id: winit::event::DeviceId::dummy(),
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+            },
+        );
+    }
+    assert!(app.render_desktop_window());
+    let before = app.view.editor().map(|e| (e.document().revision(), e.cursors().to_vec()));
+    click(app, el, app.settings_view.choice_area("theme.name", None).expect("theme combobox"));
+    assert!(app.render_desktop_window());
+    let rect = app.settings_view.choice_area("theme.name", Some(value)).expect("theme dropdown option");
+    click(app, el, rect);
+    assert_eq!(
+        app.view.editor().map(|e| (e.document().revision(), e.cursors().to_vec())),
+        before,
+        "settings clicks cannot edit the document"
+    );
+}
+
 fn capture(app: &App, dir: Option<&Path>, name: &str) {
-    if let (Some(dir), Some(gfx)) = (dir, &app.gfx) {
+    if let (Some(dir), Some(gfx)) = (dir, app.desktop_window.as_ref().map(|d| &d.gfx).or(app.gfx.as_ref())) {
         #[cfg(windows)]
         {
             if let Err(error) = capture_dc(gfx.hwnd, &dir.join(name), false) {
