@@ -54,7 +54,12 @@ impl App {
             self.apply(Damage { status: true, ..Default::default() });
             return true;
         }
-        match self.view.file_command(command) {
+        let outcome = if command == "file.quit" && file_dialog::native_supported() {
+            self.view.request_window_close_with_prompt().map(|()| true)
+        } else {
+            self.view.file_command(command)
+        };
+        match outcome {
             Ok(false) => return false,
             Ok(true) => {}
             Err(error) => {

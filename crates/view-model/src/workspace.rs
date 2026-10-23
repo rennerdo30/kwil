@@ -1051,11 +1051,24 @@ impl Workspace {
         Ok(())
     }
 
+    /// Existing hot-exit policy used by the terminal frontend and recovery callers.
     pub fn request_window_close(&mut self, discard: bool) -> io::Result<()> {
+        self.request_close_policy(discard, true)
+    }
+    /// Desktop close asks about dirty tabs even when restoring the session is enabled.
+    /// This retains the same accepted-save and metadata-durability gates.
+    pub fn request_window_close_with_prompt(&mut self) -> io::Result<()> {
+        self.request_close_policy(false, false)
+    }
+    pub fn discard_pending_close(&mut self) -> io::Result<()> {
+        if self.files.quit { self.request_close_policy(true, false) } else { self.discard_close_target() }
+    }
+    fn request_close_policy(&mut self, discard: bool, allow_hot_exit: bool) -> io::Result<()> {
         if discard && self.files.manual_guard {
             self.files.exit_without_metadata = true;
         }
-        if !discard
+        if allow_hot_exit
+            && !discard
             && self.files.restore_session == Some(true)
             && self.files.storage_ready
             && !self.files.journal_failed.keys().any(|id| self.views.contains_key(id))
@@ -1829,6 +1842,36 @@ mod tests {
         assert_eq!(workspace.active_id(), second);
         workspace.activate(first);
         assert_eq!(workspace.editor().unwrap().primary_cursor().head, "æ—¥æœ¬èªž".len() as u64);
+    }
+
+    #[test]
+    fn confirmed_window_close_keeps_dirty_work_pending_even_with_session_restore() {
+        let make = || {
+            let mut workspace = Workspace::new(View::new(None)).unwrap();
+            workspace
+                .execute(
+                    "edit.insert",
+                    &crate::CommandArgs { text: Some("keep unsaved changes".into()), ..Default::default() },
+                    1,
+                )
+                .unwrap();
+            workspace.files.restore_session = Some(true);
+            workspace.files.storage_ready = true;
+            workspace.files.metadata_durable = true;
+            workspace
+        };
+        let mut desktop = make();
+        desktop.request_window_close_with_prompt().unwrap();
+        assert!(desktop.close_pending());
+        assert!(!desktop.files.hot_exit);
+        assert!(!desktop.wants_exit());
+        assert!(desktop.editor().unwrap().document().is_dirty());
+        desktop.cancel_close_intent();
+        assert!(!desktop.close_pending());
+        assert!(desktop.editor().unwrap().document().is_dirty());
+        let mut terminal = make();
+        terminal.request_window_close(false).unwrap();
+        assert!(terminal.files.hot_exit, "the terminal's existing recovery policy is preserved");
     }
 
     #[test]

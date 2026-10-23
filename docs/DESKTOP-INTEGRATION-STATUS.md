@@ -8,7 +8,7 @@ This records delivered behavior separately from prepared source. A scratch recei
 - Dark and Light change the painted editor and chrome. The theme setting is a dropdown; manually choosing it disables follow-system. Dark uses neutral charcoal surfaces.
 - Resize events retain the latest size; surface allocation and viewport work happen once on paint. The GUI compositor is optimized in debug builds without disabling debug assertions.
 - Windows Open, untitled Save, and Save As use the Shell common-item chooser. Native paths enter the existing fenced save engine directly; no Windows inline-path fallback is used. Named Save keeps its destination.
-- Dirty tab close uses Windows Save / Don't save / Cancel confirmation. Acceptance is bound to the document, revision and workspace incarnation. Failure or cancellation retains the dirty document.
+- Dirty tab and app close use Windows Save / Don't save / Cancel confirmation, including when session restore is enabled. Acceptance is bound to the document, revision and workspace incarnation. Failure or cancellation retains the dirty document.
 - Find and Go to Line are connected through the effective keymap, menu and palette. Find has desktop fields/buttons, worker results, Next/Previous navigation and visible hit markers. User binding overrides/unbinds retain precedence.
 - Shutdown closes external-open admission while preserving accepted save completion drainage.
 

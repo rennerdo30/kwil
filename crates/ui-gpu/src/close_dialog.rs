@@ -12,6 +12,15 @@ pub(super) enum Choice {
     Discard,
     Cancel,
 }
+impl Choice {
+    fn from_button(button: i32) -> Self {
+        match button {
+            100 => Self::Save,
+            101 => Self::Discard,
+            _ => Self::Cancel,
+        }
+    }
+}
 pub(super) struct Reply {
     pub ticket: Ticket,
     pub outcome: Result<Choice, String>,
@@ -19,7 +28,9 @@ pub(super) struct Reply {
 impl Ticket {
     fn capture(view: &Workspace) -> Option<Self> {
         let editor = view.editor()?;
-        if editor.has_pending_edit_receipt() || editor.has_pending_save_completion() { return None; }
+        if editor.has_pending_edit_receipt() || editor.has_pending_save_completion() {
+            return None;
+        }
         (view.close_pending()
             && editor.document().is_dirty()
             && !view.file_saves_pending()
@@ -85,7 +96,7 @@ impl App {
                 self.dispatch_file("file.save");
             }
             Ok(Choice::Discard) => {
-                if let Err(error) = self.view.discard_close_target() {
+                if let Err(error) = self.view.discard_pending_close() {
                     self.view.set_notice(error.to_string());
                 }
             }
@@ -135,15 +146,11 @@ fn show(owner: isize, label: &str) -> Result<Choice, String> {
     if result < 0 {
         return Err(format!("Windows task dialog failed (0x{:08X})", result as u32));
     }
-    Ok(match button {
-        100 => Choice::Save,
-        101 => Choice::Discard,
-        _ => Choice::Cancel,
-    })
+    Ok(Choice::from_button(button))
 }
 #[cfg(not(windows))]
 fn show(_: isize, _: &str) -> Result<Choice, String> {
-    Ok(Choice::Cancel)
+    Ok(Choice::from_button(0))
 }
 #[cfg(test)]
 mod tests {

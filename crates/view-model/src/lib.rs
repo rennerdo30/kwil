@@ -19,7 +19,9 @@ pub mod search_session;
 pub mod settings_panels;
 pub mod settings_session;
 mod workspace;
-pub use workspace::{NativeFilePrompt, FilePrompt, FilePromptKind, TabAction, TabArea, TabGeometry, TabMetrics, TabSlot, Workspace};
+pub use workspace::{
+    FilePrompt, FilePromptKind, NativeFilePrompt, TabAction, TabArea, TabGeometry, TabMetrics, TabSlot, Workspace,
+};
 pub mod document_worker;
 pub use kwil_core_workspace::session::DocumentId as SessionDocumentId;
 #[cfg(test)]

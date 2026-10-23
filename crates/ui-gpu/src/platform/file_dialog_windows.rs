@@ -20,14 +20,14 @@ use windows_sys::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::Com::{
-            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
-            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance, CoInitializeEx,
+            CoTaskMemFree, CoUninitialize,
         },
         UI::{
             Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
-                IsWindow, MSG, PostMessageW, TranslateMessage, WM_APP,
+                CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, IsWindow, MSG,
+                PostMessageW, TranslateMessage, WM_APP,
             },
         },
     },
@@ -132,10 +132,7 @@ struct Apartment;
 impl Apartment {
     fn enter() -> Result<Self, String> {
         check("CoInitializeEx(STA)", unsafe {
-            CoInitializeEx(
-                null(),
-                (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-            )
+            CoInitializeEx(null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32)
         })?;
         Ok(Self)
     }
@@ -172,21 +169,15 @@ impl Worker {
     pub fn spawn(complete: impl Fn(Event) + Send + 'static) -> io::Result<Self> {
         let shared = Arc::new(Shared::default());
         let worker_shared = shared.clone();
-        let handle = thread::Builder::new()
-            .name("kwil-file-dialog-sta".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(worker_shared.clone(), &complete)
-                }))
-                .unwrap_or_else(|_| Err("STA worker panicked".into()));
-                worker_shared.hwnd.store(0, Ordering::Release);
-                worker_shared.shutdown.store(true, Ordering::Release);
-                complete(Event::Stopped(result));
-            })?;
-        Ok(Self {
-            shared,
-            _thread: handle,
-        })
+        let handle = thread::Builder::new().name("kwil-file-dialog-sta".into()).spawn(move || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(worker_shared.clone(), &complete)))
+                    .unwrap_or_else(|_| Err("STA worker panicked".into()));
+            worker_shared.hwnd.store(0, Ordering::Release);
+            worker_shared.shutdown.store(true, Ordering::Release);
+            complete(Event::Stopped(result));
+        })?;
+        Ok(Self { shared, _thread: handle })
     }
     fn wake(&self) -> bool {
         let hwnd = self.shared.hwnd.load(Ordering::Acquire) as HWND;
@@ -195,9 +186,7 @@ impl Worker {
 }
 impl Port for Worker {
     fn submit(&mut self, request: Request) -> Result<(), (Request, String)> {
-        if self.shared.shutdown.load(Ordering::Acquire)
-            || self.shared.hwnd.load(Ordering::Acquire) == 0
-        {
+        if self.shared.shutdown.load(Ordering::Acquire) || self.shared.hwnd.load(Ordering::Acquire) == 0 {
             return Err((request, "STA chooser is not ready or has stopped".into()));
         }
         if self.shared.occupied.swap(true, Ordering::AcqRel) {
@@ -214,10 +203,7 @@ impl Port for Worker {
         if !self.wake() {
             let request = slot.take().unwrap();
             self.shared.occupied.store(false, Ordering::Release);
-            return Err((
-                request,
-                format!("STA wake failed: {}", io::Error::last_os_error()),
-            ));
+            return Err((request, format!("STA wake failed: {}", io::Error::last_os_error())));
         }
         Ok(())
     }
@@ -241,20 +227,12 @@ impl Drop for Worker {
 
 // Subclass belongs to the STA, so nested modal message dispatch can call Close
 // on the SAME apartment as Show. No COM pointer is published in Shared.
-unsafe extern "system" fn window_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: WPARAM,
-    l: LPARAM,
-    _id: usize,
-    data: usize,
-) -> LRESULT {
+unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _id: usize, data: usize) -> LRESULT {
     if msg == WAKE {
         let pump = unsafe { &*(data as *const Pump) };
         let dialog = pump.active.get();
         if !dialog.is_null()
-            && (pump.shared.cancel.load(Ordering::Acquire)
-                || pump.shared.shutdown.load(Ordering::Acquire))
+            && (pump.shared.cancel.load(Ordering::Acquire) || pump.shared.shutdown.load(Ordering::Acquire))
             && !pump.closing.replace(true)
         {
             let vtable = unsafe { &**(dialog as *const *const DialogVtable) };
@@ -280,11 +258,7 @@ impl Drop for MessageWindow {
 
 fn run(shared: Arc<Shared>, complete: &impl Fn(Event)) -> Result<(), String> {
     let _apartment = Apartment::enter()?;
-    let pump = Box::new(Pump {
-        shared: shared.clone(),
-        active: Cell::new(null_mut()),
-        closing: Cell::new(false),
-    });
+    let pump = Box::new(Pump { shared: shared.clone(), active: Cell::new(null_mut()), closing: Cell::new(false) });
     // A system STATIC message-only window is a pump endpoint, never a dialog,
     // visible window, focus target or replacement for the Shell chooser.
     let hwnd = unsafe {
@@ -304,25 +278,11 @@ fn run(shared: Arc<Shared>, complete: &impl Fn(Event)) -> Result<(), String> {
         )
     };
     if hwnd.is_null() {
-        return Err(format!(
-            "STA message window: {}",
-            io::Error::last_os_error()
-        ));
+        return Err(format!("STA message window: {}", io::Error::last_os_error()));
     }
     let window = MessageWindow(hwnd);
-    if unsafe {
-        SetWindowSubclass(
-            hwnd,
-            Some(window_proc),
-            SUBCLASS,
-            (&*pump as *const Pump) as usize,
-        )
-    } == 0
-    {
-        return Err(format!(
-            "STA message subclass: {}",
-            io::Error::last_os_error()
-        ));
+    if unsafe { SetWindowSubclass(hwnd, Some(window_proc), SUBCLASS, (&*pump as *const Pump) as usize) } == 0 {
+        return Err(format!("STA message subclass: {}", io::Error::last_os_error()));
     }
     shared.hwnd.store(hwnd as isize, Ordering::Release);
     complete(Event::Ready);
@@ -339,37 +299,20 @@ fn run(shared: Arc<Shared>, complete: &impl Fn(Event)) -> Result<(), String> {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
-        let request = shared
-            .request
-            .lock()
-            .map_err(|_| "STA request mailbox poisoned")?
-            .take();
+        let request = shared.request.lock().map_err(|_| "STA request mailbox poisoned")?.take();
         if let Some(request) = request {
-            let outcome = if shared.cancel.load(Ordering::Acquire)
-                || shared.shutdown.load(Ordering::Acquire)
-            {
+            let outcome = if shared.cancel.load(Ordering::Acquire) || shared.shutdown.load(Ordering::Acquire) {
                 Outcome::Cancelled
             } else {
                 choose(&request, &pump)
             };
             shared.occupied.store(false, Ordering::Release);
-            complete(Event::Completed {
-                ticket: *request.ticket,
-                outcome,
-            });
+            complete(Event::Completed { ticket: *request.ticket, outcome });
         }
     }
     // Shutdown may precede message dispatch, including startup. Settle the slot.
-    if let Some(request) = shared
-        .request
-        .lock()
-        .map_err(|_| "STA request mailbox poisoned")?
-        .take()
-    {
-        complete(Event::Completed {
-            ticket: *request.ticket,
-            outcome: Outcome::Cancelled,
-        });
+    if let Some(request) = shared.request.lock().map_err(|_| "STA request mailbox poisoned")?.take() {
+        complete(Event::Completed { ticket: *request.ticket, outcome: Outcome::Cancelled });
     }
     shared.hwnd.store(0, Ordering::Release);
     drop(window); // remove subclass before Pump, COM apartment and owner lifetime end
@@ -377,11 +320,7 @@ fn run(shared: Arc<Shared>, complete: &impl Fn(Event)) -> Result<(), String> {
 }
 
 fn check(stage: &str, hr: HRESULT) -> Result<(), String> {
-    if hr < 0 {
-        Err(format!("{stage}: HRESULT 0x{:08x}", hr as u32))
-    } else {
-        Ok(())
-    }
+    if hr < 0 { Err(format!("{stage}: HRESULT 0x{:08x}", hr as u32)) } else { Ok(()) }
 }
 fn show_accepted(hr: HRESULT) -> Result<bool, String> {
     if hr == CANCELLED {
@@ -441,21 +380,15 @@ fn choose_inner(request: &Request, pump: &Pump) -> Result<Outcome, String> {
     }
     let vtable = unsafe { dialog.dialog() };
     let mut flags = 0;
-    check("IFileDialog::GetOptions", unsafe {
-        (vtable.get_options)(dialog.0, &mut flags)
-    })?;
-    check("IFileDialog::SetOptions", unsafe {
-        (vtable.set_options)(dialog.0, options(request.ticket.kind(), flags))
-    })?;
+    check("IFileDialog::GetOptions", unsafe { (vtable.get_options)(dialog.0, &mut flags) })?;
+    check("IFileDialog::SetOptions", unsafe { (vtable.set_options)(dialog.0, options(request.ticket.kind(), flags)) })?;
     if let Some(name) = &request.suggested_name {
         let mut wide: Vec<u16> = name.encode_wide().take(MAX_PATH_UNITS).collect();
         if wide.len() == MAX_PATH_UNITS || wide.contains(&0) {
             return Err("suggested file name is invalid or too long".into());
         }
         wide.push(0);
-        check("IFileDialog::SetFileName", unsafe {
-            (vtable.set_file_name)(dialog.0, wide.as_ptr())
-        })?;
+        check("IFileDialog::SetFileName", unsafe { (vtable.set_file_name)(dialog.0, wide.as_ptr()) })?;
     }
     if pump.shared.cancel.load(Ordering::Acquire) || pump.shared.shutdown.load(Ordering::Acquire) {
         return Ok(Outcome::Cancelled);
@@ -544,10 +477,8 @@ mod tests {
             if kind != SIGDN_FILESYSPATH {
                 return 0x80070057u32 as i32;
             }
-            let memory = unsafe {
-                windows_sys::Win32::System::Com::CoTaskMemAlloc(std::mem::size_of_val(PATH))
-            }
-            .cast::<u16>();
+            let memory =
+                unsafe { windows_sys::Win32::System::Com::CoTaskMemAlloc(std::mem::size_of_val(PATH)) }.cast::<u16>();
             if memory.is_null() {
                 return 0x8007000eu32 as i32;
             }
@@ -574,21 +505,13 @@ mod tests {
             -1
         }
         let item_table = ShellItemVtable {
-            unknown: UnknownVtable {
-                query: 0,
-                add_ref: 0,
-                release: item_release,
-            },
+            unknown: UnknownVtable { query: 0, add_ref: 0, release: item_release },
             unused3_4: [0; 2],
             get_display_name: name,
             unused6_7: [0; 2],
         };
         let dialog_table = DialogVtable {
-            unknown: UnknownVtable {
-                query: 0,
-                add_ref: 0,
-                release: dialog_release,
-            },
+            unknown: UnknownVtable { query: 0, add_ref: 0, release: dialog_release },
             show,
             unused4_8: [0; 5],
             set_options: flags,
@@ -601,31 +524,14 @@ mod tests {
             close,
             unused24_26: [0; 3],
         };
-        let mut item = Item {
-            table: &item_table,
-            names: 0,
-            releases: 0,
-        };
-        let mut dialog = Dialog {
-            table: &dialog_table,
-            item: &mut item,
-            results: 0,
-            releases: 0,
-        };
+        let mut item = Item { table: &item_table, names: 0, releases: 0 };
+        let mut dialog = Dialog { table: &dialog_table, item: &mut item, results: 0, releases: 0 };
         let pointer = ComPtr((&mut dialog as *mut Dialog).cast());
-        let pump = Pump {
-            shared: Arc::new(Shared::default()),
-            active: Cell::new(null_mut()),
-            closing: Cell::new(false),
-        };
+        let pump =
+            Pump { shared: Arc::new(Shared::default()), active: Cell::new(null_mut()), closing: Cell::new(false) };
         let outcome = collect_after_show(&pointer, &pump, 0).unwrap();
-        let Outcome::Accepted(path) = outcome else {
-            panic!("successful result must own its exact path")
-        };
-        assert_eq!(
-            path.as_os_str().encode_wide().collect::<Vec<_>>(),
-            &PATH[..PATH.len() - 1]
-        );
+        let Outcome::Accepted(path) = outcome else { panic!("successful result must own its exact path") };
+        assert_eq!(path.as_os_str().encode_wide().collect::<Vec<_>>(), &PATH[..PATH.len() - 1]);
         assert_eq!((dialog.results, item.names, item.releases), (1, 1, 1));
         drop(pointer);
         assert_eq!(dialog.releases, 1);
@@ -636,13 +542,9 @@ mod tests {
         assert_ne!(flags & OVERWRITE_PROMPT, 0);
         assert_ne!(flags & NO_TEST_FILE_CREATE, 0);
         assert_ne!(flags & FORCE_FILESYSTEM, 0);
+        assert_eq!(flags & (0x80 | 0x100 | 0x200 | 0x20 | 0x2000 | FILE_MUST_EXIST), 0);
         assert_eq!(
-            flags & (0x80 | 0x100 | 0x200 | 0x20 | 0x2000 | FILE_MUST_EXIST),
-            0
-        );
-        assert_eq!(
-            options(FilePromptKind::SaveAs, u32::MAX)
-                & (0x80 | 0x100 | 0x200 | 0x20 | 0x2000 | FILE_MUST_EXIST),
+            options(FilePromptKind::SaveAs, u32::MAX) & (0x80 | 0x100 | 0x200 | 0x20 | 0x2000 | FILE_MUST_EXIST),
             0
         );
     }
@@ -650,27 +552,12 @@ mod tests {
     fn native_cancel_is_distinct_from_access_denied_and_open_requires_existing_file() {
         assert!(!show_accepted(CANCELLED).unwrap());
         assert!(show_accepted(0).unwrap());
-        assert!(
-            show_accepted(0x80070005u32 as i32)
-                .unwrap_err()
-                .contains("80070005")
-        );
+        assert!(show_accepted(0x80070005u32 as i32).unwrap_err().contains("80070005"));
         assert_ne!(options(FilePromptKind::Open, 0) & FILE_MUST_EXIST, 0);
     }
     #[test]
     fn native_utf16_round_trips_unpaired_surrogate_without_replacement() {
-        let units = [
-            b'C' as u16,
-            58,
-            92,
-            0x65e5,
-            0x672c,
-            0xd800,
-            46,
-            116,
-            120,
-            116,
-        ];
+        let units = [b'C' as u16, 58, 92, 0x65e5, 0x672c, 0xd800, 46, 116, 120, 116];
         let path = path_from_native_units(&units).unwrap();
         assert!(path.is_absolute());
         assert_eq!(path.as_os_str().encode_wide().collect::<Vec<_>>(), units);
@@ -727,11 +614,7 @@ mod tests {
             0
         }
         let table = DialogVtable {
-            unknown: UnknownVtable {
-                query: 0,
-                add_ref: 0,
-                release,
-            },
+            unknown: UnknownVtable { query: 0, add_ref: 0, release },
             show,
             unused4_8: [0; 5],
             set_options: set,
@@ -744,11 +627,7 @@ mod tests {
             close,
             unused24_26: [0; 3],
         };
-        let mut mock = Mock {
-            table: &table,
-            calls: 0,
-            releases: 0,
-        };
+        let mut mock = Mock { table: &table, calls: 0, releases: 0 };
         let pointer = ComPtr((&mut mock as *mut Mock).cast());
         unsafe {
             let table = pointer.dialog();
@@ -756,15 +635,9 @@ mod tests {
             (table.get_options)(pointer.0, &mut flags);
             (table.set_options)(pointer.0, options(FilePromptKind::SaveAs, flags));
             assert_eq!((table.show)(pointer.0, 56isize as HWND), CANCELLED);
-            let pump = Pump {
-                shared: Arc::new(Shared::default()),
-                active: Cell::new(null_mut()),
-                closing: Cell::new(false),
-            };
-            assert!(matches!(
-                collect_after_show(&pointer, &pump, CANCELLED),
-                Ok(Outcome::Cancelled)
-            ));
+            let pump =
+                Pump { shared: Arc::new(Shared::default()), active: Cell::new(null_mut()), closing: Cell::new(false) };
+            assert!(matches!(collect_after_show(&pointer, &pump, CANCELLED), Ok(Outcome::Cancelled)));
             (table.close)(pointer.0, CANCELLED);
         }
         drop(pointer);

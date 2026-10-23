@@ -463,7 +463,7 @@ pub(super) fn icon(
         Icon::Check => icons::Icon::Check,
     };
     let _ = (bg, s); // SVG masks blend against the actual destination surface.
-    icons::draw(buf, stride, kind, center, size.saturating_mul(3)/2, color);
+    icons::draw(buf, stride, kind, center, size.saturating_mul(3) / 2, color);
 }
 
 /// Square icon button (close, back, page arrows).

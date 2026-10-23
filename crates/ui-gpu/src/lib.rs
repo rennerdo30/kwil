@@ -125,6 +125,7 @@ enum UserEvent {
     SearchReady,
     WindowPlacementLoaded(Result<Option<window_placement::Placement>, String>),
     WindowPlacementProgress,
+    #[cfg(windows)]
     WindowPlacementTouched,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
@@ -1167,7 +1168,9 @@ impl App {
             return;
         }
 
-        if let Err(error) = self.view.request_window_close(discard) {
+        let result =
+            if discard { self.view.request_window_close(true) } else { self.view.request_window_close_with_prompt() };
+        if let Err(error) = result {
             self.view.set_notice(error.to_string());
         }
         self.sync_file_ui();
@@ -2189,6 +2192,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.placement_progress();
                 Damage::default()
             }
+            #[cfg(windows)]
             UserEvent::WindowPlacementTouched => {
                 self.window_touched = true;
                 Damage::default()
