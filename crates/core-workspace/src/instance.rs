@@ -695,16 +695,27 @@ mod platform {
         if !m.is_dir() || m.uid() != uid() || m.mode() & 0o077 != 0 {
             return Err(invalid("unsafe IPC directory"));
         }
-        let mut s = connect(&directory.join("open.sock"), deadline)?;
-        authenticate(s.as_raw_fd())?;
-        write_deadline(&mut s, &(b.len() as u32).to_le_bytes(), deadline)?;
-        write_deadline(&mut s, b, deadline)?;
+        let mut s = stage("connect", connect(&directory.join("open.sock"), deadline))?;
+        stage("authenticate", authenticate(s.as_raw_fd()))?;
+        stage("write length", write_deadline(&mut s, &(b.len() as u32).to_le_bytes(), deadline))?;
+        stage("write payload", write_deadline(&mut s, b, deadline))?;
         let mut ack = [0];
-        read_deadline(&mut s, &mut ack, deadline)?;
+        stage("read acknowledgement", read_deadline(&mut s, &mut ack, deadline))?;
         if ack != [1] {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "instance inbox full"));
         }
         Ok(())
+    }
+    // Preserve the original error and its OS code. Development builds identify
+    // which platform operation failed; release builds retain no diagnostic I/O.
+    fn stage<T>(name: &'static str, result: io::Result<T>) -> io::Result<T> {
+        #[cfg(debug_assertions)]
+        if let Err(error) = &result {
+            eprintln!("Unix IPC {name}: {error:?}");
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = name;
+        result
     }
     fn remaining(deadline: Instant) -> io::Result<Duration> {
         let d = deadline.saturating_duration_since(Instant::now());
@@ -713,8 +724,8 @@ mod platform {
     fn read_deadline(s: &mut UnixStream, b: &mut [u8], deadline: Instant) -> io::Result<()> {
         let mut p = 0;
         while p < b.len() {
-            s.set_read_timeout(Some(remaining(deadline)?))?;
-            let n = s.read(&mut b[p..])?;
+            stage("set read timeout", s.set_read_timeout(Some(remaining(deadline)?)))?;
+            let n = stage("read", s.read(&mut b[p..]))?;
             if n == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "IPC closed"));
             }
@@ -725,8 +736,8 @@ mod platform {
     fn write_deadline(s: &mut UnixStream, b: &[u8], deadline: Instant) -> io::Result<()> {
         let mut p = 0;
         while p < b.len() {
-            s.set_write_timeout(Some(remaining(deadline)?))?;
-            let n = s.write(&b[p..])?;
+            stage("set write timeout", s.set_write_timeout(Some(remaining(deadline)?)))?;
+            let n = stage("write", s.write(&b[p..]))?;
             if n == 0 {
                 return Err(io::Error::new(io::ErrorKind::WriteZero, "IPC closed"));
             }
@@ -754,16 +765,16 @@ mod platform {
         }
         let fd = unsafe { socket(1, 1, 0) };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            return stage("socket", Err(io::Error::last_os_error()));
         }
         // SAFETY: freshly owned descriptor; UnixStream closes it on every error.
         let stream = unsafe { UnixStream::from_raw_fd(fd) };
         if unsafe { fcntl(fd, 2, 1) } < 0 {
-            return Err(io::Error::last_os_error());
+            return stage("set close-on-exec", Err(io::Error::last_os_error()));
         }
         let flags = unsafe { fcntl(fd, 3) };
         if flags < 0 || unsafe { fcntl(fd, 4, flags | nonblock) } < 0 {
-            return Err(io::Error::last_os_error());
+            return stage("set nonblocking", Err(io::Error::last_os_error()));
         }
         let mut address = [0u8; 110];
         let n = 2 + bytes.len() + 1;
@@ -778,7 +789,7 @@ mod platform {
         if unsafe { connect(fd, address.as_ptr().cast(), n as u32) } < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() != Some(progress) {
-                return Err(e);
+                return stage("connect syscall", Err(e));
             }
             let mut ready = PollFd { fd, events: 4, revents: 0 };
             loop {
@@ -792,19 +803,19 @@ mod platform {
                 }
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(e);
+                    return stage("connect poll", Err(e));
                 }
             }
             let mut error = 0i32;
             let mut len = 4u32;
             if unsafe { getsockopt(fd, sol, soerror, (&mut error as *mut i32).cast(), &mut len) } < 0 {
-                return Err(io::Error::last_os_error());
+                return stage("get connect error", Err(io::Error::last_os_error()));
             }
             if error != 0 {
-                return Err(io::Error::from_raw_os_error(error));
+                return stage("pending connect error", Err(io::Error::from_raw_os_error(error)));
             }
         }
-        stream.set_nonblocking(false)?;
+        stage("restore blocking", stream.set_nonblocking(false))?;
         Ok(stream)
     }
 }
