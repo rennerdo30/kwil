@@ -78,25 +78,27 @@ impl CapsulePayload {
     }
 
     fn spill(&mut self, cancel: &AtomicBool) -> io::Result<()> {
+        self.spill_with_create(cancel, create_private_directory)
+    }
+
+    fn spill_with_create(
+        &mut self,
+        cancel: &AtomicBool,
+        mut create: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         poll(cancel)?;
         let directory = loop {
+            poll(cancel)?;
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = self.parent.join(format!("kwil-capsule-{}-{id}", std::process::id()));
-            let builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            let mut builder = builder;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
+            match create(&path) {
                 Ok(()) => break path,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
         };
         self.directory = Some(directory);
+        poll(cancel)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -123,9 +125,9 @@ impl CapsulePayload {
             poll(cancel)?;
             file.seek(SeekFrom::Start(0))?;
             poll(cancel)?;
-            Ok(PayloadReader::File(file))
+            Ok(PayloadReader { inner: PayloadSource::File(file) })
         } else {
-            Ok(PayloadReader::Memory(Cursor::new(&self.memory)))
+            Ok(PayloadReader { inner: PayloadSource::Memory(Cursor::new(&self.memory)) })
         }
     }
 
@@ -156,17 +158,41 @@ impl CapsulePayload {
     }
 }
 
-pub enum PayloadReader<'a> {
+/// Opaque read-only borrow: writable spool handles cannot escape.
+///
+/// ```compile_fail
+/// use kwil_view_model::document_worker::provenance::payload::PayloadReader;
+/// fn corrupt(reader: PayloadReader<'_>) {
+///     if let PayloadReader::File(file) = reader {
+///         file.set_len(0).unwrap();
+///     }
+/// }
+/// ```
+pub struct PayloadReader<'a> {
+    inner: PayloadSource<'a>,
+}
+enum PayloadSource<'a> {
     Memory(Cursor<&'a [u8]>),
     File(&'a mut File),
 }
 impl Read for PayloadReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Memory(input) => input.read(bytes),
-            Self::File(input) => input.read(bytes),
+        match &mut self.inner {
+            PayloadSource::Memory(input) => input.read(bytes),
+            PayloadSource::File(input) => input.read(bytes),
         }
     }
+}
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -322,6 +348,43 @@ mod tests {
         assert_eq!(payload.directory.as_ref(), Some(&directory));
         assert!(!directory.join("payload").exists());
         fs::remove_file(directory.join("blocker")).unwrap();
+        payload.retire().unwrap();
+        assert_eq!(fixture.count(), 0);
+    }
+
+    #[test]
+    fn payload_creation_polls_collision_retry_and_keeps_cancelled_directory_owned() {
+        let fixture = Fixture::new();
+        let cancel = AtomicBool::new(false);
+        let mut payload =
+            CapsulePayload::new(&fixture.0, MAX_READ_BYTES as u64 + 1, MAX_READ_BYTES as u64 + 1).unwrap();
+        let mut calls = 0;
+        let error = payload
+            .spill_with_create(&cancel, |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "cancelled directory collision must not retry");
+                cancel.store(true, Ordering::Relaxed);
+                Err(io::Error::from(io::ErrorKind::AlreadyExists))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(calls, 1);
+        assert_eq!(fixture.count(), 0);
+        payload.retire().unwrap();
+        cancel.store(false, Ordering::Relaxed);
+        let mut payload =
+            CapsulePayload::new(&fixture.0, MAX_READ_BYTES as u64 + 1, MAX_READ_BYTES as u64 + 1).unwrap();
+        let error = payload
+            .spill_with_create(&cancel, |path| {
+                create_private_directory(path)?;
+                cancel.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let directory = payload.directory.as_ref().unwrap();
+        assert!(directory.is_dir());
+        assert!(!directory.join("payload").exists(), "cancelled creation must stop before opening the file");
         payload.retire().unwrap();
         assert_eq!(fixture.count(), 0);
     }
