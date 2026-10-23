@@ -7,16 +7,19 @@
 //! Scrolling moves existing pixels and draws only the newly exposed rows.
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
+mod chrome;
 mod clipboard;
 mod file_prompt;
 mod font;
 mod hit;
 mod ime;
 mod input;
+mod menu;
 mod palette_ui;
 mod scrollbar;
 mod settings_ui;
 mod tabs;
+mod theme_ui;
 mod zoom;
 
 use font::Font;
@@ -51,6 +54,8 @@ const GUTTER_FG: u32 = 0x5b6b85;
 const STATUS_BG: u32 = 0x080d18;
 const STATUS_FG: u32 = 0x8fe3ff;
 const GUTTER_COLS: usize = 9;
+/// Minimum clip reserved by the row painters; the DPI-sized scrollbar
+/// (`chrome::Metrics::bar`) is always painted over the body edge afterwards.
 const BAR: usize = 14;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -87,12 +92,16 @@ enum UserEvent {
     PaletteReady,
     SettingsPath(Result<std::path::PathBuf, String>),
     SettingsPanelReady,
-    Document(kwil_view_model::document_worker::DocumentResult),
+    /// Boxed on the worker that completes it: keeps every queued event small.
+    Document(Box<kwil_view_model::document_worker::DocumentResult>),
     OpenExternal,
     Notice(String),
     GlyphReady(shaping::Tile, u64),
     SettingsReady(Box<Settings>),
     FontReady(Option<Box<Font>>),
+    UiFontReady(Option<Box<font::UiFont>>),
+    /// Wide-coverage face read for the chrome face with this id.
+    UiFallbackReady(u64, Option<(Vec<u8>, usize)>),
     SessionChanged(bool),
     DroppedFile(std::path::PathBuf),
     #[cfg(feature = "gpu")]
@@ -259,7 +268,7 @@ struct App {
     error: Option<GuiError>,
     horizontal: u64,
     pointer: (usize, usize),
-    drag: Option<(bool, usize)>,
+    drag: Option<scrollbar::Drag>,
     started: std::time::Instant,
     composing: bool,
     ime_destination: Option<ime::Destination>,
@@ -282,6 +291,23 @@ struct App {
     body_pixels: Vec<u32>,
     chrome_frame: Option<tabs::Frame>,
     chrome_dirty: bool,
+    /// Chrome sizes for the window's monitor; independent of editor zoom.
+    ui: chrome::Metrics,
+    ui_font: Option<font::UiFont>,
+    ui_font_thread: Option<std::thread::JoinHandle<Option<font::UiFont>>>,
+    ui_font_size: Option<std::sync::mpsc::SyncSender<f32>>,
+    /// Bounded DPI reloads of the chrome face.
+    ui_font_jobs: font::Coalesce,
+    /// At most one fallback-face read per App, fenced to the asking face.
+    ui_fallback: font::FallbackJobs,
+    menu: menu::MenuBar,
+    /// Last drawn menu list, restored from the body when the list changes.
+    menu_area: Option<Rect>,
+    menu_dirty: bool,
+    hover: chrome::Hover,
+    /// Clickable status fields as drawn: area, segment index, command.
+    status_hits: Vec<(Rect, usize, &'static str)>,
+    window_title: String,
     #[cfg(feature = "frame-harness")]
     metrics: harness::Metrics,
 }
@@ -321,6 +347,9 @@ pub fn run_with_external_open(
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
     let open_proxy = proxy.clone();
+    // The chrome face is read in parallel and rasterized at the monitor scale.
+    let (ui_font_size, ui_font_size_rx) = std::sync::mpsc::sync_channel(1);
+    let ui_font_thread = Some(std::thread::spawn(move || font::UiFont::startup(ui_font_size_rx)));
     let (external_open, external_inbox) = kwil_view_model::document_worker::external_open_channel(move || {
         open_proxy
             .send_event(UserEvent::OpenExternal)
@@ -380,6 +409,18 @@ pub fn run_with_external_open(
         body_pixels: Vec::new(),
         chrome_frame: None,
         chrome_dirty: true,
+        ui: chrome::Metrics::default(),
+        ui_font: None,
+        ui_font_thread,
+        ui_font_size: Some(ui_font_size),
+        ui_font_jobs: font::Coalesce::default(),
+        ui_fallback: font::FallbackJobs::default(),
+        menu: menu::MenuBar::default(),
+        menu_area: None,
+        menu_dirty: false,
+        hover: chrome::Hover::None,
+        status_hits: Vec::new(),
+        window_title: String::new(),
         #[cfg(feature = "frame-harness")]
         metrics: Default::default(),
     };
@@ -414,33 +455,107 @@ impl App {
     }
 
     fn text_rows(&self) -> usize {
-        self.body_area().height.saturating_sub(BAR) / self.ch()
+        self.body_area().height.saturating_sub(self.ui.bar) / self.ch()
     }
 
+    /// Chrome comes from DPI metrics; only the text grid uses the editor font.
     fn body_area(&self) -> kwil_view_model::TabArea {
-        tabs::body(self.size, self.font.as_ref().map_or(8, |font| font.cw), self.ch(), self.settings.tabs.layout)
+        chrome::layout(self.size, &self.ui, self.settings.tabs.layout).body
     }
 
     fn columns(&self) -> u64 {
         let cw = self.font.as_ref().map_or(8, |f| f.cw);
-        (self.body_area().width.saturating_sub(BAR + GUTTER_COLS * cw) / cw) as u64
+        (self.body_area().width.saturating_sub(self.ui.bar + GUTTER_COLS * cw) / cw) as u64
     }
 
     fn bars(&self) -> (scrollbar::Bar, scrollbar::Bar) {
         let body = self.body_area();
-        let height = body.height.saturating_sub(BAR);
+        let height = body.height.saturating_sub(self.ui.bar);
         let (page, total) =
             horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize);
         (
-            scrollbar::Bar::new(
+            scrollbar::Bar::sized(
                 0,
                 height,
                 self.view.rows() as u64,
                 self.view.line_count().unwrap_or(self.view.rows() as u64),
                 self.view.top(),
+                self.ui.min_thumb,
             ),
-            scrollbar::Bar::new(0, body.width.saturating_sub(BAR), page, total, self.horizontal),
+            scrollbar::Bar::sized(
+                0,
+                body.width.saturating_sub(self.ui.bar),
+                page,
+                total,
+                self.horizontal,
+                self.ui.min_thumb,
+            ),
         )
+    }
+
+    /// Current tab strip, built exactly as it is drawn.
+    fn tab_frame(&mut self) -> tabs::Frame {
+        tabs::frame(
+            &self.view,
+            self.size,
+            &self.ui,
+            self.ch(),
+            self.settings.tabs.layout,
+            self.ui_font.as_mut(),
+            self.hover,
+        )
+    }
+
+    /// Scrollbar thumb under the pointer, for hover feedback.
+    fn thumb_hover(&self) -> Option<chrome::Hover> {
+        let body = self.body_area();
+        if !body.contains(self.pointer.0, self.pointer.1) {
+            return None;
+        }
+        let (x, y) = (self.pointer.0 - body.x, self.pointer.1 - body.y);
+        let track = body.height.saturating_sub(self.ui.bar);
+        // Text-area moves stay cheap: the horizontal extent reads row tails,
+        // so it is measured only while the pointer is over that track.
+        if x >= body.width.saturating_sub(self.ui.bar) && y < track {
+            let v = scrollbar::Bar::sized(
+                0,
+                track,
+                self.view.rows() as u64,
+                self.view.line_count().unwrap_or(self.view.rows() as u64),
+                self.view.top(),
+                self.ui.min_thumb,
+            );
+            return (v.maximum > 0 && v.contains_thumb(y)).then_some(chrome::Hover::VerticalThumb);
+        }
+        if y >= track && y < track + self.ui.bar {
+            let h = self.bars().1;
+            return (x < h.length && h.maximum > 0 && h.contains_thumb(x)).then_some(chrome::Hover::HorizontalThumb);
+        }
+        None
+    }
+
+    /// Recomputes the hover target; a change damages only chrome and status.
+    fn update_hover(&mut self) {
+        let (x, y) = self.pointer;
+        let lay = chrome::layout(self.size, &self.ui, self.settings.tabs.layout);
+        let hover = if let Some(index) = self.menu.titles.iter().position(|title| title.contains(x, y)) {
+            chrome::Hover::Title(index)
+        } else if lay.strip.contains(x, y) {
+            let frame = self.tab_frame();
+            tabs::hover(&frame, x, y)
+        } else if lay.status.contains(x, y) {
+            self.status_hits
+                .iter()
+                .find(|(rect, _, _)| rect.contains((x, y)))
+                .map_or(chrome::Hover::None, |(_, index, _)| chrome::Hover::Status(*index))
+        } else {
+            self.thumb_hover().unwrap_or_default()
+        };
+        if hover != self.hover {
+            self.hover = hover;
+            self.chrome_dirty = true;
+            self.apply(Damage { status: true, ..Default::default() });
+        }
     }
 
     fn page_bytes(&self) -> u64 {
@@ -466,8 +581,8 @@ impl App {
         }
         let (x, y) = (self.pointer.0 - body.x, self.pointer.1 - body.y);
         let (v, h) = self.bars();
-        let vertical = x >= body.width.saturating_sub(BAR) && y < v.length;
-        let horizontal = y >= v.length && y < v.length + BAR && x < h.length;
+        let vertical = x >= body.width.saturating_sub(self.ui.bar) && y < v.length;
+        let horizontal = y >= v.length && y < v.length + self.ui.bar && x < h.length;
         if !vertical && !horizontal {
             return;
         }
@@ -477,10 +592,23 @@ impl App {
             (h, x, self.horizontal, self.page_bytes())
         };
         if bar.contains_thumb(pixel) {
-            self.drag = Some((vertical, pixel - bar.thumb_start));
+            self.drag = Some(scrollbar::Drag::new(vertical, bar, pixel, offset));
         } else {
             self.scroll_bar(vertical, bar.page(pixel, offset, page));
         }
+    }
+
+    fn monitor_scale_changed(&mut self, scale_factor: f64) {
+        self.drag = None;
+        self.selecting = false;
+        self.ui = chrome::Metrics::new(scale_factor);
+        self.reload_ui_font();
+        self.chrome_dirty = true;
+        let rows = self.text_rows();
+        let damage = self.view.set_rows(rows);
+        self.apply(Damage { full: true, status: true, ..Default::default() });
+        self.apply(damage);
+        self.reload_font();
     }
 
     fn apply(&mut self, d: Damage) {
@@ -488,7 +616,7 @@ impl App {
             highlighting.invalidate_painted(&self.view, &d);
             highlighting.update(&self.view);
         }
-        if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty {
+        if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty && !self.menu_dirty {
             return;
         }
         queue_damage(&mut self.pending, d, self.view.rows(), self.font.as_mut());
@@ -568,6 +696,9 @@ impl App {
             return;
         }
         if self.palette_key(ev) {
+            return;
+        }
+        if self.menu_key(el, ev) {
             return;
         }
         if self.close_pending && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
@@ -807,32 +938,63 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
-        if self.pending == Damage::default() && !self.chrome_dirty && !self.palette_dirty {
+        if self.pending == Damage::default() && !self.chrome_dirty && !self.palette_dirty && !self.menu_dirty {
             return true;
         }
         let (w, h) = self.size;
-        let (cw, ch) = (self.font.as_ref().map_or(8, |f| f.cw), self.ch());
+        let ch = self.ch();
         if w == 0 || h < ch {
             return true;
         }
-        let frame = tabs::frame(&self.view, self.size, cw, ch, self.settings.tabs.layout);
+        // Chrome geometry and text measurement need the UI font mutably.
+        let frame = self.tab_frame();
+        let lay = frame.layout;
         let geometry = frame.geometry.clone();
         let chrome_changed = self.chrome_dirty || self.chrome_frame.as_ref() != Some(&frame);
         self.chrome_frame = Some(frame);
         self.chrome_dirty = false;
+        self.menu.titles = menu::title_areas(lay.menu, &self.ui, self.ui_font.as_mut());
+        if let menu::State::Open { menu: index, item: Some(item), .. } = self.menu.state
+            && std::mem::take(&mut self.menu.reveal)
+            && let Some(title) = self.menu.titles.get(index)
+        {
+            let top = title.y + title.height;
+            self.menu.scroll = menu::reveal(index, item, self.menu.scroll, top, h, &self.ui);
+        }
+        self.menu.dropdown = match (self.menu.state, self.ui_font.as_mut()) {
+            (menu::State::Open { menu: index, .. }, Some(font)) => self.menu.titles.get(index).map(|title| {
+                menu::dropdown(index, *title, (w, h), &self.ui, font, &self.menu.labels, self.menu.scroll)
+            }),
+            _ => None,
+        };
+        if let Some(dropdown) = &self.menu.dropdown {
+            self.menu.scroll = dropdown.scroll;
+        }
+        let available = self.menu_available();
+        let (notice, segments) = chrome::status(&self.view, self.zoom.percent());
+        let title = chrome::window_title(&self.view);
+        let dragging = self.drag.map(|drag| drag.vertical);
+        let hover = self.hover;
+        let theme = theme_ui::chrome();
         let body = geometry.body;
         let (bw, bh) = (body.width, body.height);
         self.body_pixels.resize(bw.saturating_mul(bh), BG);
         let bars = self.bars();
         let rows = geometry.text.height / ch;
         let palette_open = self.palette_open() || self.settings_open();
+        let menu_list = self.menu.dropdown.is_some() || self.menu_area.is_some();
         let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
+        if self.window_title != title {
+            gfx.window.set_title(&title);
+            self.window_title = title;
+        }
         let pixels = &mut gfx.pixels;
         let body_pixels = &mut self.body_pixels;
         let mut p = std::mem::take(&mut self.pending);
         let palette_dirty = std::mem::take(&mut self.palette_dirty);
-        if palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some()) && p.scroll != 0 {
+        let menu_dirty = std::mem::take(&mut self.menu_dirty);
+        if (palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some()) || menu_list) && p.scroll != 0 {
             // A pending document scroll predates opening the overlay. Avoid
             // copying overlay pixels through the native scroll seam.
             p.full = true;
@@ -879,68 +1041,76 @@ impl App {
                 damage.push(tabs::translated(area, body));
             }
         }
+        let chrome_frame = self.chrome_frame.as_ref().unwrap();
         if p.full || chrome_changed {
-            tabs::draw(self.chrome_frame.as_ref().unwrap(), pixels, w, font);
+            draw_chrome(chrome_frame, &self.menu, pixels, w, self.ui_font.as_mut(), theme, &self.ui, hover);
             if !p.full {
+                damage.push(tabs::rect(lay.menu));
                 damage.push(tabs::rect(geometry.chrome));
             }
         }
-        if palette_dirty && let Some(area) = self.palette_area.take() {
-            tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
-            tabs::draw(self.chrome_frame.as_ref().unwrap(), pixels, w, font);
-            p.status = true;
-            damage.push(area);
+        // Overlays leave by restoring body and chrome pixels underneath them.
+        for (dirty, area) in [(palette_dirty, &mut self.palette_area), (menu_dirty, &mut self.menu_area)] {
+            if dirty && let Some(area) = area.take() {
+                tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
+                draw_chrome(chrome_frame, &self.menu, pixels, w, self.ui_font.as_mut(), theme, &self.ui, hover);
+                p.status = true;
+                damage.push(area);
+            }
         }
         if p.status {
-            let height = ch.min(h);
-            let area = Rect { x: 0, y: h - height, w, h: height };
-            fill(pixels, w, area, STATUS_BG);
-            draw_text(
+            self.status_hits = chrome::draw_status(
                 pixels,
                 w,
-                font,
-                font.cw,
-                area.y,
-                self.view.status_text().as_bytes(),
-                (w / font.cw).saturating_sub(2),
-                STATUS_FG,
-                STATUS_BG,
+                lay.status,
+                self.ui_font.as_mut(),
+                theme,
+                &self.ui,
+                &notice,
+                &segments,
+                hover,
             );
             if !p.full {
-                damage.push(area);
+                damage.push(tabs::rect(lay.status));
             }
         }
         if body_changed || p.status {
             let (vertical, horizontal) = bars;
-            let vr = Rect { x: bw.saturating_sub(BAR), y: 0, w: BAR.min(bw), h: vertical.length };
-            let hr = Rect { x: 0, y: vertical.length, w: bw, h: BAR.min(bh.saturating_sub(vertical.length)) };
-            fill(body_pixels, bw, vr, GUTTER_BG);
-            fill(body_pixels, bw, hr, GUTTER_BG);
-            if vertical.maximum > 0 {
-                fill(
-                    body_pixels,
-                    bw,
-                    Rect {
-                        x: vr.x + 2.min(vr.w),
-                        y: vertical.thumb_start,
-                        w: vr.w.saturating_sub(4),
-                        h: vertical.thumb_length,
-                    },
-                    GUTTER_FG,
-                );
+            let (bar, line, inset) = (self.ui.bar, self.ui.line, self.ui.inset);
+            let vr = Rect { x: bw.saturating_sub(bar), y: 0, w: bar.min(bw), h: vertical.length };
+            let hr = Rect { x: 0, y: vertical.length, w: bw, h: bar.min(bh.saturating_sub(vertical.length)) };
+            let track = chrome::mix(BG, FG, 0x0a);
+            fill(body_pixels, bw, vr, track);
+            fill(body_pixels, bw, hr, track);
+            // Hairlines keep the bars distinct from text and from a signal strip.
+            let edge = chrome::mix(BG, FG, 0x1c);
+            fill(body_pixels, bw, Rect { w: line.min(vr.w), ..vr }, edge);
+            fill(body_pixels, bw, Rect { h: line.min(hr.h), ..hr }, edge);
+            let thumb = |active: bool, hovered: bool| {
+                let amount = if active {
+                    0xa0
+                } else if hovered {
+                    0x7c
+                } else {
+                    0x52
+                };
+                chrome::mix(BG, FG, amount)
+            };
+            if vertical.maximum > 0 && vr.w > 2 * inset {
+                let r =
+                    Rect { x: vr.x + inset, y: vertical.thumb_start, w: vr.w - 2 * inset, h: vertical.thumb_length };
+                let color = thumb(dragging == Some(true), hover == chrome::Hover::VerticalThumb);
+                chrome::round_rect(body_pixels, bw, r, r.w / 2, color);
             }
-            if horizontal.maximum > 0 {
-                fill(
-                    body_pixels,
-                    bw,
-                    Rect {
-                        x: horizontal.thumb_start,
-                        y: hr.y + 2.min(hr.h),
-                        w: horizontal.thumb_length,
-                        h: hr.h.saturating_sub(4),
-                    },
-                    GUTTER_FG,
-                );
+            if horizontal.maximum > 0 && hr.h > 2 * inset {
+                let r = Rect {
+                    x: horizontal.thumb_start,
+                    y: hr.y + inset,
+                    w: horizontal.thumb_length,
+                    h: hr.h - 2 * inset,
+                };
+                let color = thumb(dragging == Some(false), hover == chrome::Hover::HorizontalThumb);
+                chrome::round_rect(body_pixels, bw, r, r.h / 2, color);
             }
             for area in [vr, hr] {
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
@@ -948,6 +1118,19 @@ impl App {
                     damage.push(tabs::translated(area, body));
                 }
             }
+        }
+        if let (Some(dropdown), Some(ui_font)) = (self.menu.dropdown.as_ref(), self.ui_font.as_mut()) {
+            menu::draw_dropdown(&self.menu, dropdown, &available, pixels, w, ui_font, theme, &self.ui);
+            self.menu_area = Some(dropdown.area);
+            damage.push(dropdown.area);
+        }
+        // A glyph miss asks for the wide-coverage face: one read at a time per
+        // App, fenced to the face that asked (see `font::FallbackJobs`).
+        if let Some(ui_font) = self.ui_font.as_mut()
+            && ui_font.take_fallback_request()
+            && let Some(id) = self.ui_fallback.request(ui_font.id())
+        {
+            spawn_ui_fallback(&self.proxy, id);
         }
         if let Some(palette) = self.palette.as_ref().filter(|palette| palette.model().is_open()) {
             self.palette_area = palette_ui::draw(palette.model(), pixels, (w, h), font);
@@ -998,6 +1181,30 @@ impl App {
         }
         true
     }
+}
+
+/// Reads the wide-coverage chrome face off the UI thread for face `id`.
+fn spawn_ui_fallback(proxy: &EventLoopProxy<UserEvent>, id: u64) {
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let _ = proxy.send_event(UserEvent::UiFallbackReady(id, font::UiFont::read_fallback()));
+    });
+}
+
+/// Menu bar and tab strip; both depend only on chrome metrics and UI text.
+#[allow(clippy::too_many_arguments)]
+fn draw_chrome(
+    frame: &tabs::Frame,
+    bar: &menu::MenuBar,
+    pixels: &mut [u32],
+    stride: usize,
+    mut font: Option<&mut font::UiFont>,
+    theme: &kwil_core_commands::theme::Theme,
+    ui: &chrome::Metrics,
+    hover: chrome::Hover,
+) {
+    menu::draw_bar(bar, frame.layout.menu, pixels, stride, font.as_deref_mut(), theme, ui, hover);
+    tabs::draw(frame, pixels, stride, font, theme, ui);
 }
 
 fn horizontal_extent(view: &View, columns: usize, tab_size: usize) -> (u64, u64) {
@@ -1192,7 +1399,7 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Rect {
     x: usize,
     y: usize,
@@ -1201,6 +1408,9 @@ struct Rect {
 }
 
 impl Rect {
+    fn contains(self, (x, y): (usize, usize)) -> bool {
+        x >= self.x && y >= self.y && x - self.x < self.w && y - self.y < self.h
+    }
     fn to_softbuffer(self) -> Option<softbuffer::Rect> {
         Some(softbuffer::Rect {
             x: self.x as u32,
@@ -1439,6 +1649,10 @@ impl ApplicationHandler<UserEvent> for App {
             let _ =
                 zoom::start_font_rasterization(font_size, self.settings.font.size, window.scale_factor(), self.zoom);
         }
+        self.ui = chrome::Metrics::new(window.scale_factor());
+        if let Some(ui_font_size) = self.ui_font_size.take() {
+            let _ = ui_font_size.try_send(self.ui.text_px());
+        }
         match self.font_thread.take().and_then(|t| t.join().ok()).flatten() {
             Some(f) => self.font = Some(f),
             None => {
@@ -1447,6 +1661,9 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
+        // Read in parallel with window creation; chrome text is optional, so a
+        // missing face leaves shapes without labels instead of failing startup.
+        self.ui_font = self.ui_font_thread.take().and_then(|t| t.join().ok()).flatten();
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
         self.gfx = Some(Gfx { native: None, window, surface, hwnd, pixels: vec![BG; self.size.0 * self.size.1] });
@@ -1469,7 +1686,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let document_proxy = self.proxy.clone();
         let complete = move |result| {
-            let _ = document_proxy.send_event(UserEvent::Document(result));
+            let _ = document_proxy.send_event(UserEvent::Document(Box::new(result)));
         };
         let worker = if self.opts.hidden {
             self.view.start_isolated_document_worker(complete)
@@ -1564,7 +1781,7 @@ impl ApplicationHandler<UserEvent> for App {
                 Damage { status: notice, ..Default::default() }
             }
             UserEvent::Document(result) => {
-                let damage = self.view.document_result(result);
+                let damage = self.view.document_result(*result);
                 self.sync_file_ui();
                 if self.view.wants_exit() {
                     el.exit();
@@ -1679,6 +1896,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.set_editor_settings(&self.settings);
                 self.view.set_session_restore(self.settings.files.restore_session);
                 if layout_changed {
+                    self.drag = None;
+                    self.selecting = false;
                     self.chrome_dirty = true;
                     let rows = self.text_rows();
                     let damage = self.view.set_rows(rows);
@@ -1689,6 +1908,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.keys =
                         kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings)
                             .ok();
+                }
+                if keymap_changed {
+                    self.menu_settings_changed();
                 }
                 self.policy = RenderPolicy::new(self.settings.render.clone(), self.policy.detected());
                 self.apply_native_theme();
@@ -1733,6 +1955,33 @@ impl ApplicationHandler<UserEvent> for App {
                 self.activate_unicode(true);
                 self.view.set_notice("Configured font is unavailable".into())
             }
+            UserEvent::UiFontReady(font) => {
+                // One job at a time; a scale change during it gets one rerun
+                // with the latest scale. A failed load keeps the current face.
+                if self.ui_font_jobs.finished() {
+                    self.spawn_ui_font();
+                }
+                match font.filter(|font| (font.px - self.ui.text_px()).abs() < 0.01) {
+                    Some(font) => self.ui_font = Some(*font),
+                    None => return,
+                }
+                self.chrome_dirty = true;
+                self.menu_dirty = true;
+                Damage { status: true, ..Default::default() }
+            }
+            UserEvent::UiFallbackReady(id, face) => {
+                // Bind only to the face that asked; a newer face that missed
+                // glyphs meanwhile gets exactly one retry, still one read at a time.
+                let (bind, retry) = self.ui_fallback.finished(id, self.ui_font.as_ref().map(font::UiFont::id));
+                if let Some(retry) = retry {
+                    spawn_ui_fallback(&self.proxy, retry);
+                }
+                let Some(font) = self.ui_font.as_mut().filter(|_| bind) else { return };
+                font.install_fallback(face);
+                self.chrome_dirty = true;
+                self.menu_dirty = true;
+                Damage { status: true, ..Default::default() }
+            }
             UserEvent::DroppedFile(path) => {
                 (self.on_event)(GuiEvent::DroppedFile(path.clone()));
                 if let Err(error) = self.view.open_path(path) {
@@ -1769,6 +2018,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if (sz.width as usize, sz.height as usize) == self.size {
                     return;
                 }
+                self.drag = None;
+                self.selecting = false;
                 self.size = (sz.width as usize, sz.height as usize);
                 self.resize_surface();
                 let rows = self.text_rows();
@@ -1788,15 +2039,20 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
-                if let Some((vertical, grab)) = self.drag {
-                    let (v, h) = self.bars();
+                if self.menu.state.is_open() {
+                    self.menu_track();
+                }
+                if self.drag.is_none() && !self.selecting && !self.settings_open() && !self.palette_open() {
+                    self.update_hover();
+                }
+                if let Some(drag) = self.drag {
                     let body = self.body_area();
-                    let (bar, pixel) = if vertical {
-                        (v, self.pointer.1.saturating_sub(body.y))
+                    let pixel = if drag.vertical {
+                        self.pointer.1.saturating_sub(body.y)
                     } else {
-                        (h, self.pointer.0.saturating_sub(body.x))
+                        self.pointer.0.saturating_sub(body.x)
                     };
-                    self.scroll_bar(vertical, bar.drag(pixel, grab));
+                    self.scroll_bar(drag.vertical, drag.position(pixel));
                 } else if self.selecting {
                     self.place_caret(true);
                 }
@@ -1821,30 +2077,33 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if state == ElementState::Pressed {
-                    let cw = self.font.as_ref().map_or(8, |f| f.cw);
-                    let geometry = self.view.tab_geometry(
-                        kwil_view_model::TabMetrics {
-                            width: self.size.0,
-                            height: self.size.1,
-                            cell_width: cw,
-                            cell_height: self.ch(),
-                            scrollbar: BAR,
-                        },
-                        self.settings.tabs.layout,
-                    );
-                    if let Some(action) = geometry.hit(self.pointer.0, self.pointer.1) {
-                        if let Err(error) = self.view.tab_action(action, &geometry) {
+                    self.menu.alt_tap = false;
+                    if self.menu_mouse(el) {
+                        return;
+                    }
+                    let frame = self.tab_frame();
+                    if let Some(action) = frame.geometry.hit(self.pointer.0, self.pointer.1) {
+                        let ids = tabs::ids(&self.view);
+                        if let Some(action) = chrome::resolve_page(&frame.geometry, action, &ids)
+                            && let Err(error) = self.view.tab_action(action, &frame.geometry)
+                        {
                             self.view.set_notice(error.to_string());
                         }
                         self.sync_file_ui();
                         self.apply(Damage { full: true, status: true, ..Default::default() });
                         return;
                     }
+                    if let Some(&(_, _, command)) =
+                        self.status_hits.iter().find(|(rect, _, _)| rect.contains(self.pointer))
+                    {
+                        self.run_menu_command(el, command);
+                        return;
+                    }
                     self.pointer_down();
                     let body = self.body_area();
                     if self.drag.is_none()
                         && body.contains(self.pointer.0, self.pointer.1)
-                        && self.pointer.0 - body.x < body.width.saturating_sub(BAR)
+                        && self.pointer.0 - body.x < body.width.saturating_sub(self.ui.bar)
                         && self.pointer.1 - body.y < self.bars().0.length
                     {
                         self.selecting = true;
@@ -1852,11 +2111,40 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.view.checkpoint_session();
                 } else {
-                    self.drag = None;
+                    let dragged = self.drag.take().is_some();
                     self.selecting = false;
+                    if dragged {
+                        // Repaint the thumb in its resting colour.
+                        self.apply(Damage { status: true, ..Default::default() });
+                    }
+                    self.update_hover();
                 }
             }
-            WindowEvent::ScaleFactorChanged { .. } => self.reload_font(),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
+                // Middle click closes a tab, as in browsers and other editors.
+                if self.settings_open() || self.palette_open() || self.menu.state.is_open() {
+                    return;
+                }
+                let frame = self.tab_frame();
+                if let Some(slot) =
+                    frame.geometry.slots.iter().find(|slot| slot.area.contains(self.pointer.0, self.pointer.1))
+                {
+                    if let Err(error) =
+                        self.view.tab_action(kwil_view_model::TabAction::Close(slot.document), &frame.geometry)
+                    {
+                        self.view.set_notice(error.to_string());
+                    }
+                    self.sync_file_ui();
+                    self.apply(Damage { full: true, status: true, ..Default::default() });
+                    if self.view.wants_exit() {
+                        el.exit();
+                    }
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Chrome follows the monitor; the editor font keeps its zoom.
+                self.monitor_scale_changed(scale_factor);
+            }
             WindowEvent::ThemeChanged(_) => self.apply_native_theme(),
             WindowEvent::DroppedFile(path) => {
                 self.user_event(el, UserEvent::DroppedFile(path));
@@ -1864,6 +2152,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(true) => self.user_event(el, UserEvent::SessionChanged(remote::detect())),
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
             WindowEvent::KeyboardInput { event, .. } => {
+                if self.menu_alt(&event) {
+                    return;
+                }
                 self.key(el, &event);
                 self.view.checkpoint_session();
                 if self.view.wants_exit() {
@@ -1871,15 +2162,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
-                if ime::starts_composition(self.composing, &text) {
-                    self.ime_destination = Some(self.capture_input_destination());
-                }
-                // An empty preedit can precede Commit. Keep its captured destination.
-                self.composing = !text.is_empty();
+                self.ime_preedit(&text);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.composing = false;
-                let destination = self.ime_destination.take().unwrap_or_else(|| self.capture_input_destination());
+                let destination = self.ime_destination.take().unwrap_or_else(|| self.ime_capture());
                 let (damage, follow_active) = match destination {
                     ime::Destination::Settings { epoch } => {
                         if self.settings_open() && self.settings_epoch == epoch {
@@ -1926,8 +2213,28 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(keys) = &mut self.keys {
                     keys.cancel_pending();
                 }
+                // Native menus close when the window loses focus.
+                self.menu.alt_tap = false;
+                if self.menu.state.is_open() {
+                    self.menu_set(menu::State::Closed, false);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.hover != chrome::Hover::None {
+                    self.hover = chrome::Hover::None;
+                    self.chrome_dirty = true;
+                    self.apply(Damage { status: true, ..Default::default() });
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                self.menu.alt_tap = false;
+                let up = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                    MouseScrollDelta::PixelDelta(point) => point.y > 0.0,
+                };
+                if self.menu_wheel(up) {
+                    return;
+                }
                 if self.settings_open() {
                     let up = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y > 0.0,
@@ -2033,6 +2340,19 @@ impl App {
         let family = self.settings.font.family.clone();
         std::thread::spawn(move || {
             let _ = proxy.send_event(UserEvent::FontReady(Font::load_named(px, &family).map(Box::new)));
+        });
+    }
+    /// Chrome face for a new monitor scale, coalesced like `reload_font`.
+    fn reload_ui_font(&mut self) {
+        if self.ui_font_jobs.request() {
+            self.spawn_ui_font();
+        }
+    }
+    fn spawn_ui_font(&self) {
+        let px = self.ui.text_px();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(UserEvent::UiFontReady(font::UiFont::load(px).map(Box::new)));
         });
     }
     fn activate_unicode(&mut self, tabs_changed: bool) {

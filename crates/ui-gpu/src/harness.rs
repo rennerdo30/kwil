@@ -14,6 +14,11 @@ pub(crate) enum Step {
     Status,
     RemoteOn,
     RemoteOff,
+    MenuOpen,
+    MenuClose,
+    ZoomIn,
+    InputOwnership,
+    UsabilityCapture(&'static str),
     End,
 }
 #[derive(Default, Clone, Copy)]
@@ -48,7 +53,7 @@ impl Metrics {
 }
 pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
-        for (delay, step) in [
+        let usual = [
             (2000, Step::Idle),
             (250, Step::Scroll),
             (200, Step::Repaint),
@@ -56,7 +61,25 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (150, Step::RemoteOn),
             (100, Step::RemoteOff),
             (100, Step::End),
-        ] {
+        ];
+        let usability = [
+            (2000, Step::Idle),
+            (100, Step::InputOwnership),
+            (100, Step::MenuOpen),
+            (150, Step::UsabilityCapture("menu.bmp")),
+            (100, Step::MenuClose),
+            (100, Step::ZoomIn),
+            (200, Step::ZoomIn),
+            (200, Step::ZoomIn),
+            (400, Step::UsabilityCapture("zoom.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_UI_USABILITY_CAPTURE").is_some() {
+            usability.as_slice()
+        } else {
+            usual.as_slice()
+        };
+        for &(delay, step) in steps {
             std::thread::sleep(Duration::from_millis(delay));
             if proxy.send_event(UserEvent::Harness(step)).is_err() {
                 break;
@@ -83,7 +106,7 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
             }
             #[cfg(windows)]
             if let Some(gfx) = &app.gfx {
-                native_probe(gfx.hwnd);
+                native_probe(gfx.hwnd, dir.as_deref());
             }
             println!("kwil-frame glyphs_pending={}", app.font.as_ref().map_or(0, |f| f.pending_glyphs()));
             let unicode_enabled = app.font.as_ref().is_some_and(|f| f.unicode_enabled());
@@ -139,6 +162,47 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 let _ = app.proxy.send_event(UserEvent::SessionChanged(matches!(step, Step::RemoteOn)));
             }
         }
+        Step::MenuOpen => {
+            let available = app.menu_available();
+            app.menu_set(super::menu::State::open(0, &|id| super::menu::enabled(&available, id)), true);
+        }
+        Step::InputOwnership => {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input_ownership(app, el, dir.as_deref())));
+            if let Err(payload) = result {
+                if let Some(dir) = &dir {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string assertion payload");
+                    let _ = std::fs::write(dir.join("input-ownership-failure.txt"), message);
+                }
+                std::panic::resume_unwind(payload);
+            }
+        }
+        Step::MenuClose => app.menu_set(super::menu::State::Closed, false),
+        Step::ZoomIn => {
+            app.dispatch_zoom("view.zoomIn");
+        }
+        Step::UsabilityCapture(name) => {
+            let metadata = format!(
+                "kwil-ui capture={name} scale={} menu={} tabs={} status={} bar={} thumb={} zoom={} editor_cell={:?}",
+                app.ui.scale,
+                app.ui.menu,
+                app.ui.tabs,
+                app.ui.status,
+                app.ui.bar,
+                app.ui.min_thumb,
+                app.zoom.percent(),
+                app.font.as_ref().map(|font| (font.cw, font.ch)),
+            );
+            println!("{metadata}");
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join(format!("{name}.txt")), metadata).expect("capture metadata write");
+            }
+            capture(app, dir.as_deref(), name);
+        }
         Step::End => {
             capture(app, dir.as_deref(), "status.bmp");
             app.metrics.print();
@@ -151,11 +215,78 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
     }
 }
+fn input_ownership(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
+    use winit::application::ApplicationHandler;
+    use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
+    let window = app.gfx.as_ref().unwrap().window.id();
+    let arm = |app: &mut App| {
+        let body = app.body_area();
+        let offset = app.view.top();
+        let bar = super::scrollbar::Bar::sized(0, body.height, 40, 20_000_000, offset, 48);
+        app.drag = Some(super::scrollbar::Drag::new(true, bar, bar.thumb_start + 20, offset));
+    };
+    // Exercise the real App routes, not only the integer geometry object.
+    let scale = app.ui.scale;
+    arm(app);
+    app.monitor_scale_changed(scale + 0.25);
+    assert!(app.drag.is_none(), "DPI change must release the old coordinate anchor");
+    app.monitor_scale_changed(scale);
+    let settings = app.settings.clone();
+    let mut changed = settings.clone();
+    changed.tabs.layout = match settings.tabs.layout {
+        kwil_core_commands::settings::TabLayout::Horizontal => kwil_core_commands::settings::TabLayout::Vertical,
+        kwil_core_commands::settings::TabLayout::Vertical => kwil_core_commands::settings::TabLayout::Horizontal,
+    };
+    arm(app);
+    app.user_event(el, UserEvent::SettingsReady(Box::new(changed)));
+    assert!(app.drag.is_none(), "layout change must release the old coordinate anchor");
+    app.user_event(el, UserEvent::SettingsReady(Box::new(settings)));
+    let size = app.size;
+    arm(app);
+    app.window_event(el, window, WindowEvent::Resized(winit::dpi::PhysicalSize::new(size.0 as u32 + 1, size.1 as u32)));
+    assert!(app.drag.is_none(), "resize must release the old coordinate anchor");
+    app.window_event(el, window, WindowEvent::Resized(winit::dpi::PhysicalSize::new(size.0 as u32, size.1 as u32)));
+
+    let before = app.view.editor().map(|editor| (editor.document().revision(), editor.cursors().to_vec()));
+    // Find is explicitly disabled until the search host is integrated. Its click must remain
+    // owned by the dropdown while an IME attempts to compose behind it.
+    assert!(!super::menu::enabled(&app.menu_available(), "search.find"));
+    app.menu_set(super::menu::State::Open { menu: 4, item: None, keyboard: false }, true);
+    assert!(app.render());
+    let row = app.menu.dropdown.as_ref().unwrap().rows[0].1;
+    app.window_event(el, window, WindowEvent::Ime(Ime::Preedit("日本語".into(), None)));
+    assert!(!app.composing, "cancelled composition cannot suspend menu ownership");
+    app.pointer = (row.x + 2, row.y + 2);
+    app.window_event(
+        el,
+        window,
+        WindowEvent::MouseInput {
+            device_id: winit::event::DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+        },
+    );
+    assert!(app.menu.state.is_open(), "disabled dropdown row click must not fall through");
+    app.window_event(el, window, WindowEvent::Ime(Ime::Commit("unexpected edit".into())));
+    assert_eq!(app.view.editor().map(|editor| (editor.document().revision(), editor.cursors().to_vec())), before);
+    app.menu_set(super::menu::State::Closed, false);
+    if let Some(dir) = dir {
+        std::fs::write(dir.join("input-ownership.txt"), "PASS: App DPI/layout/resize drag cancellation; open menu Preedit/click/Commit retains document and cursors\n").unwrap();
+    }
+}
+
 fn capture(app: &App, dir: Option<&Path>, name: &str) {
     if let (Some(dir), Some(gfx)) = (dir, &app.gfx) {
         #[cfg(windows)]
-        if let Err(error) = capture_dc(gfx.hwnd, &dir.join(name)) {
-            eprintln!("capture failed: {error}");
+        {
+            if let Err(error) = capture_dc(gfx.hwnd, &dir.join(name), false) {
+                eprintln!("capture failed: {error}");
+            }
+            if std::env::var_os("KWIL_CAPTURE_WINDOW_FRAME").is_some()
+                && let Err(error) = capture_dc(gfx.hwnd, &dir.join(format!("frame-{name}")), true)
+            {
+                eprintln!("window frame capture failed: {error}");
+            }
         }
         #[cfg(not(windows))]
         {
@@ -164,7 +295,7 @@ fn capture(app: &App, dir: Option<&Path>, name: &str) {
     }
 }
 #[cfg(windows)]
-fn native_probe(hwnd: isize) {
+fn native_probe(hwnd: isize, output: Option<&Path>) {
     use windows_sys::Win32::{
         Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
         UI::WindowsAndMessaging::*,
@@ -178,23 +309,45 @@ fn native_probe(hwnd: isize) {
         let big = SendMessageW(hwnd, WM_GETICON, ICON_BIG as usize, 0) != 0;
         let mut cloaked = 0u32;
         let hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&mut cloaked as *mut u32).cast(), 4);
-        println!(
+        let metadata = format!(
             "kwil-native caption_resize_min_max={controls} small_icon={small} taskbar_icon={big} cloaked={}",
             hr >= 0 && cloaked != 0
         );
+        println!("{metadata}");
+        if let Some(output) = output {
+            std::fs::write(output.join("native-window.txt"), metadata).expect("native window metadata write");
+        }
     }
 }
 // Based on the admitted M0 window-DC capture; the HWND comes directly from the
 // owned window, never FindWindow/title guessing. No GPU/PrintWindow claim here.
 #[cfg(windows)]
-fn capture_dc(hwnd: isize, path: &Path) -> std::io::Result<()> {
-    use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*, UI::WindowsAndMessaging::GetClientRect};
+fn capture_dc(hwnd: isize, path: &Path, frame: bool) -> std::io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::*,
+        UI::WindowsAndMessaging::{GetClientRect, GetWindowRect},
+    };
     unsafe {
         let hwnd = hwnd as _;
+        if frame {
+            use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+            let mut cloaked = 0u32;
+            let result = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&mut cloaked as *mut u32).cast(), 4);
+            if result < 0 || cloaked != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native caption pixels are unavailable from a DWM-cloaked window",
+                ));
+            }
+        }
         let mut r: RECT = std::mem::zeroed();
-        GetClientRect(hwnd, &mut r);
-        let (w, h) = (r.right, r.bottom);
-        let dc = GetDC(hwnd);
+        let measured = if frame { GetWindowRect(hwnd, &mut r) } else { GetClientRect(hwnd, &mut r) };
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if measured == 0 || w <= 0 || h <= 0 {
+            return Err(std::io::Error::other("window capture bounds unavailable"));
+        }
+        let dc = if frame { GetWindowDC(hwnd) } else { GetDC(hwnd) };
         let memory = CreateCompatibleDC(dc);
         let bitmap = CreateCompatibleBitmap(dc, w, h);
         let old = SelectObject(memory, bitmap);

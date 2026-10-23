@@ -149,7 +149,7 @@ impl App {
         }
     }
 
-    fn palette_action(&mut self, action: kwil_core_commands::palette::PaletteAction) {
+    pub(super) fn palette_action(&mut self, action: kwil_core_commands::palette::PaletteAction) {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {

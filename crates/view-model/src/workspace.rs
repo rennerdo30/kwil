@@ -1733,18 +1733,23 @@ impl Workspace {
         self.refresh_save_destinations();
     }
 
+    /// Recovery state of the active document, for typed status fields.
+    pub fn recovery_notice(&self) -> Option<&'static str> {
+        if self.files.journal_failed.contains_key(&self.active_id())
+            || (self.files.worker.is_some() && !self.files.preparing && !self.files.storage_ready)
+        {
+            Some("Recovery unavailable")
+        } else if self.recovery_pending(self.active_id()) {
+            Some("Recovery pending")
+        } else {
+            None
+        }
+    }
+
     pub fn status_text(&self) -> String {
         let tabs = self.session.tabs();
         let position = tabs.iter().position(|t| t.id == self.active_id()).unwrap_or(0) + 1;
-        let recovery = if self.files.journal_failed.contains_key(&self.active_id())
-            || (self.files.worker.is_some() && !self.files.preparing && !self.files.storage_ready)
-        {
-            "  |  Recovery unavailable"
-        } else if self.recovery_pending(self.active_id()) {
-            "  |  Recovery pending"
-        } else {
-            ""
-        };
+        let recovery = self.recovery_notice().map_or_else(String::new, |notice| format!("  |  {notice}"));
         format!("[{position}/{}] {}{recovery}", tabs.len(), self.deref().status_text())
     }
 
