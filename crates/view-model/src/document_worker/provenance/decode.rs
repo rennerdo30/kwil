@@ -95,6 +95,43 @@ fn bounded_bytes(input: &mut impl Read, len: usize, cancel: &AtomicBool) -> io::
     Ok(bytes)
 }
 
+// A callback may use read_exact, which retries Interrupted. Return a
+// non-retryable adapter error to the callback while retaining the ORIGINAL
+// error for the decoder. Even a callback that ignores errors cannot erase it.
+struct OriginInput<'a, R: Read> {
+    input: io::Take<&'a mut R>,
+    cancel: &'a AtomicBool,
+    failure: Option<io::Error>,
+}
+impl<R: Read> OriginInput<'_, R> {
+    fn fail(&mut self, error: io::Error) -> io::Result<usize> {
+        if self.failure.is_none() {
+            self.failure = Some(error);
+        }
+        Err(io::Error::other("origin payload read failed; decoder retains cause"))
+    }
+}
+impl<R: Read> Read for OriginInput<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(io::Error::other("origin payload previously failed"));
+        }
+        if let Err(error) = poll(self.cancel) {
+            return self.fail(error);
+        }
+        let len = bytes.len().min(MAX_READ_BYTES);
+        let result = self.input.read(&mut bytes[..len]);
+        if let Err(error) = poll(self.cancel) {
+            return self.fail(error);
+        }
+        match result {
+            Ok(0) if len != 0 && self.input.limit() != 0 => self.fail(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(n) => Ok(n),
+            Err(error) => self.fail(error),
+        }
+    }
+}
+
 /// Decode exactly one authenticated physical payload. End must be its final
 /// byte. Neither short payloads nor suffix bytes are silently accepted. The
 /// reader may contain a following frame, which is never consumed.
@@ -168,9 +205,13 @@ fn decode_inner(
                 if raw_len > input.limit() {
                     return Err(invalid("origin exceeds capsule payload"));
                 }
-                let mut raw = (&mut input).take(raw_len);
-                sink.define_origin(id, interpretation, raw_len, &mut raw)?;
-                if raw.limit() != 0 {
+                let mut raw = OriginInput { input: (&mut input).take(raw_len), cancel, failure: None };
+                let result = sink.define_origin(id, interpretation, raw_len, &mut raw);
+                if let Some(error) = raw.failure.take() {
+                    return Err(error);
+                }
+                result?;
+                if raw.input.limit() != 0 {
                     return Err(invalid("origin sink did not consume raw payload"));
                 }
             }
@@ -251,6 +292,7 @@ mod tests {
         ended: Option<u64>,
         aborted: bool,
         fail_bytes: bool,
+        swallow_origin_error: bool,
     }
     impl CapsuleSink for Sink {
         fn begin_fragment(&mut self) -> io::Result<()> {
@@ -261,7 +303,12 @@ mod tests {
                 return Err(invalid("duplicate origin"));
             }
             let mut raw = vec![0; raw_len as usize];
-            input.read_exact(&mut raw)?;
+            let result = input.read_exact(&mut raw);
+            if result.is_err() && self.swallow_origin_error {
+                let _ = input.read(&mut [0; 1]);
+                return Ok(());
+            }
+            result?;
             self.origins.insert(id, raw);
             Ok(())
         }
@@ -527,5 +574,82 @@ mod tests {
         assert!(decode_capsule(&mut reader, 17, 0, &limits(), &cancel, &mut sink).is_err());
         assert!(sink.aborted);
         assert_eq!(reader.calls, 1);
+    }
+
+    struct OriginReads<'a> {
+        input: io::Cursor<Vec<u8>>,
+        raw_start: u64,
+        largest: usize,
+        raw_calls: usize,
+        interrupt_once: bool,
+        cancel: Option<&'a AtomicBool>,
+    }
+    impl Read for OriginReads<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.largest = self.largest.max(bytes.len());
+            if self.input.position() >= self.raw_start {
+                self.raw_calls += 1;
+                if self.interrupt_once {
+                    self.interrupt_once = false;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                if let Some(cancel) = self.cancel {
+                    let n = bytes.len().min(3);
+                    let result = self.input.read(&mut bytes[..n]);
+                    cancel.store(true, Ordering::Relaxed);
+                    return result;
+                }
+            }
+            self.input.read(bytes)
+        }
+    }
+    fn origin_input<'a>(raw: &[u8], cancel: Option<&'a AtomicBool>, interrupt_once: bool) -> OriginReads<'a> {
+        let mut bytes = header(0);
+        definition(&mut bytes, 1, Encoding::UTF8, 0, raw);
+        let raw_start = (bytes.len() - raw.len()) as u64;
+        bytes.push(0);
+        OriginReads { input: io::Cursor::new(bytes), raw_start, largest: 0, raw_calls: 0, interrupt_once, cancel }
+    }
+
+    #[test]
+    fn decode_origin_callback_requests_are_capped_before_underlying_read() {
+        let raw = vec![b'A'; MAX_READ_BYTES + 1];
+        let mut input = origin_input(&raw, None, false);
+        let len = input.input.get_ref().len() as u64;
+        let mut sink = Sink::default();
+        decode_capsule(&mut input, len, 0, &limits(), &AtomicBool::new(false), &mut sink).unwrap();
+        assert_eq!(sink.origins[&1], raw);
+        assert!(input.largest <= MAX_READ_BYTES, "delegated read exceeded bound: {}", input.largest);
+    }
+
+    #[test]
+    fn decode_origin_cancellation_stops_inside_read_exact_and_aborts() {
+        let cancel = AtomicBool::new(false);
+        let mut input = origin_input(b"payload", Some(&cancel), false);
+        let len = input.input.get_ref().len() as u64;
+        let mut sink = Sink::default();
+        assert_eq!(
+            decode_capsule(&mut input, len, 0, &limits(), &cancel, &mut sink).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(input.raw_calls, 1, "sink must stop before a second origin read");
+        assert!(sink.aborted);
+        assert!(sink.origins.is_empty());
+    }
+
+    #[test]
+    fn decode_origin_interrupted_failure_survives_callback_retry_or_swallow() {
+        for swallow_origin_error in [false, true] {
+            let mut input = origin_input(b"payload", None, true);
+            let len = input.input.get_ref().len() as u64;
+            let mut sink = Sink { swallow_origin_error, ..Sink::default() };
+            assert_eq!(
+                decode_capsule(&mut input, len, 0, &limits(), &AtomicBool::new(false), &mut sink).unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert_eq!(input.raw_calls, 1, "failed origin reader must remain poisoned");
+            assert!(sink.aborted);
+            assert!(sink.origins.is_empty());
+        }
     }
 }
