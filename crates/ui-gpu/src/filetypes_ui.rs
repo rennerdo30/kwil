@@ -49,14 +49,19 @@ fn group_title(group: Group) -> &'static str {
     }
 }
 
+const WINDOWS_NOTE: &str = "Adds Kwil to “Open with” for your account only. Windows keeps the default app your choice: set it in Settings › Apps › Default apps.";
+const MACOS_NOTE: &str = "Asks Launch Services to list this Kwil app for the chosen types, for your account only.";
+const LINUX_NOTE: &str =
+    "Adds a desktop entry and file-type choices for your account only. Nothing outside your home folder changes.";
+
 /// What the platform will do, stated before anything is requested.
 fn platform_note() -> &'static str {
     if cfg!(windows) {
-        "Adds Kwil to “Open with” for your account only. Windows keeps the default app your choice: set it in Settings › Apps › Default apps."
+        WINDOWS_NOTE
     } else if cfg!(target_os = "macos") {
-        "Asks Launch Services to list this Kwil app for the chosen types, for your account only."
+        MACOS_NOTE
     } else {
-        "Writes a per-user desktop entry and MIME defaults (xdg-mime). Nothing outside your home folder changes."
+        LINUX_NOTE
     }
 }
 
@@ -777,6 +782,11 @@ mod tests {
             assert!(!text.contains("registered for") && !text.contains("default app"), "{text}");
         }
         assert!(platform_note().contains("account"));
+        for note in [WINDOWS_NOTE, MACOS_NOTE, LINUX_NOTE] {
+            assert!(note.contains("account only"), "{note}");
+        }
+        assert!(WINDOWS_NOTE.contains("Open with") && WINDOWS_NOTE.contains("your choice"));
+        assert!(LINUX_NOTE.contains("home folder"));
         if cfg!(windows) {
             assert!(platform_note().contains("Open with") && platform_note().contains("your choice"));
         }
