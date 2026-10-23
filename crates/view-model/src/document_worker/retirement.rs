@@ -150,10 +150,13 @@ impl WorkerBackings {
 
     pub fn save(
         &mut self,
-        request: SaveRequest,
+        mut request: SaveRequest,
         plan: SavePlan,
         cancel: &AtomicBool,
     ) -> io::Result<WorkerSavedSnapshot> {
+        // Admission and the atomic writer must use the same destination. A
+        // relative spelling alone does not bound the retained temporary name.
+        request.path = std::path::absolute(&request.path)?;
         self.check_input_path(&request.path, 0)?;
         // The checkpoint is prepared from .kwil-save-<u32 PID>-<u64 counter>,
         // not the final destination name. Charge its maximum generated suffix.
@@ -469,5 +472,69 @@ mod tests {
     #[test]
     fn backing_save_temporary_path_bound_is_checked_before_replacement() {
         assert_save_path_refused(40);
+    }
+
+    #[test]
+    fn backing_relative_save_child() {
+        let Some(parent) = std::env::var_os("KWIL_RETIREMENT_RELATIVE_CHILD") else { return };
+        let parent = PathBuf::from(parent);
+        assert!(parent.is_absolute());
+        std::fs::write(parent.join("child-ran"), b"relative path admission").unwrap();
+        let mut registry = WorkerBackings::new(
+            parent.clone(),
+            BackingLimits {
+                max_backings: 1,
+                max_private_path_bytes: parent.as_os_str().as_encoded_bytes().len() + 64,
+                max_metadata_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
+        let mut editor = crate::Editor::new(Document::new());
+        editor.execute("edit.insert", &crate::CommandArgs { text: Some("x".into()), ..Default::default() }, 1).unwrap();
+        let request = editor.save_request(Some(PathBuf::from("out.txt"))).unwrap();
+        let result = registry.save(request, editor.document().save_plan(), &AtomicBool::new(false));
+        assert!(result.is_err(), "expanded relative destination must be refused before replacement");
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read("out.txt").unwrap(), b"keep");
+        assert_eq!(registry.retained(), 0);
+    }
+
+    #[test]
+    fn backing_relative_destination_uses_resolved_path_for_admission() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("d".repeat(100));
+        std::fs::create_dir(&directory).unwrap();
+        let destination = directory.join("out.txt");
+        std::fs::write(&destination, b"keep").unwrap();
+        // Only the child process changes directory; no global environment or
+        // cwd mutation races other tests or touches the owner's desktop.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "document_worker::retirement::tests::backing_relative_save_child", "--nocapture"])
+            .current_dir(&directory)
+            .env("KWIL_RETIREMENT_RELATIVE_CHILD", &fixture.0)
+            .spawn()
+            .unwrap();
+        eprintln!("retirement relative fixture owned child PID={}", child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                // The only child is ours. Bound reaping independently too.
+                let reap = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while child.try_wait().unwrap().is_none() && std::time::Instant::now() < reap {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                panic!("relative fixture child exceeded its deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(status.success(), "relative admission child failed: {status}");
+        assert_eq!(std::fs::read(fixture.0.join("child-ran")).unwrap(), b"relative path admission");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 2);
     }
 }
