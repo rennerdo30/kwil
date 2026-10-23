@@ -1,6 +1,8 @@
 //! One bounded file-I/O lane shared by all tabs. Callbacks wake the frontend;
 //! the UI never polls for work or launches a thread per file/save.
 use crate::Document;
+mod decoded;
+pub use decoded::{PreparedDecodedDocument, prepare_decoded_document};
 use kwil_core_text::{Buffer, TextFile};
 use kwil_core_workspace::{SaveRequest, SavedSnapshot, session::DocumentId};
 use kwil_core_workspace::{
