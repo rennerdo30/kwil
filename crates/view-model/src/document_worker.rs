@@ -956,6 +956,12 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
     let mut base = None;
     let recovered = RecoveredJournal::open(path, tab.id, &AtomicBool::new(false), |event| {
         match event {
+            RecoveryEvent::EncodedBase { .. } | RecoveryEvent::BeginEncodedReplacement { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Lossless recovery requires provenance replay; journal retained",
+                ));
+            }
             RecoveryEvent::Base(metadata) => {
                 base = Some(metadata.clone());
             }

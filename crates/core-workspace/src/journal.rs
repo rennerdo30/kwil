@@ -1,4 +1,4 @@
-//! Append-only raw-byte hot-exit journal. Disk operations belong to this worker.
+//! Append-only hot-exit journal. Disk operations belong to this worker.
 //! A base is streamed once, edits append bounded chunks; no file-sized Vec or per-key rewrite.
 //! Model integration must retain/retry a command on queue Full and only call an edit
 //! durable after a successful flush receipt. Recovery is a fixed-length snapshot.
@@ -20,6 +20,9 @@ pub const JOURNAL_CHUNK: usize = 64 * 1024;
 pub const JOURNAL_QUEUE: usize = 16;
 const MAX_RECORD: usize = JOURNAL_CHUNK + 1;
 const MAGIC: &[u8; 4] = b"KWJ1";
+const ENCODED_BASE: u8 = 11;
+const ENCODED_REPLACEMENT: u8 = 12;
+const ENCODED_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalBase {
@@ -31,7 +34,32 @@ pub struct JournalBase {
     pub original_identity: [u64; 4],
     /// Opaque model codec tag, including encoding/BOM policy. Bytes stay in original encoding.
     pub codec: Vec<u8>,
+    /// Physical base payload length. Raw journals also use this as their logical length.
     pub byte_len: u64,
+}
+impl JournalBase {
+    /// Explicitly opt into encoded framing. Codec bytes remain opaque, including
+    /// tags resembling envelopes; no raw constructor ever detects a codec tag.
+    /// `logical_len` counts model UTF-8 bytes plus opaque atoms, not stored bytes.
+    pub fn with_logical_len(self, logical_len: u64) -> io::Result<EncodedJournalBase> {
+        base_bytes(&self)?;
+        Ok(EncodedJournalBase { base: self, logical_len })
+    }
+}
+/// Validated metadata for a versioned encoded base. The backend never decodes
+/// the payload or codec; the model is responsible for provenance restoration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedJournalBase {
+    base: JournalBase,
+    logical_len: u64,
+}
+impl EncodedJournalBase {
+    pub fn base(&self) -> &JournalBase {
+        &self.base
+    }
+    pub fn logical_len(&self) -> u64 {
+        self.logical_len
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalEdit {
@@ -65,6 +93,12 @@ pub enum JournalCommand {
     /// No new revision or recoverable replacement is published before CommitBatch.
     BeginBatch(JournalBatch),
     BeginReplacement(JournalReplacement),
+    /// Coordinates and `inserted` are logical; Bytes supplies exactly payload_len
+    /// physical bytes. Used inside BeginBatch, with the same outer commit gate.
+    BeginEncodedReplacement {
+        replacement: JournalReplacement,
+        payload_len: u64,
+    },
     EndReplacement,
     CommitBatch,
     /// Receipt means sync_all completed, covering all preceding committed edits.
@@ -100,6 +134,7 @@ impl JournalWorker {
         Self::start(
             path,
             base,
+            None,
             source.map(|file| Box::new(FileReader { file, first: true }) as Box<dyn Read + Send>),
             interval,
         )
@@ -113,11 +148,23 @@ impl JournalWorker {
         source: Box<dyn Read + Send>,
         interval: Duration,
     ) -> io::Result<Self> {
-        Self::start(path, base, Some(source), interval)
+        Self::start(path, base, None, Some(source), interval)
+    }
+    /// Encoded counterpart of create_from_reader. Supplies exactly the physical
+    /// base.byte_len bytes, including a bounded EOF probe; logical_len seeds
+    /// editing coordinates. Serialization/restoration belongs to the caller.
+    pub fn create_encoded_from_reader(
+        path: PathBuf,
+        base: EncodedJournalBase,
+        source: Box<dyn Read + Send>,
+        interval: Duration,
+    ) -> io::Result<Self> {
+        Self::start(path, base.base, Some(base.logical_len), Some(source), interval)
     }
     fn start(
         path: PathBuf,
         base: JournalBase,
+        logical_len: Option<u64>,
         source: Option<Box<dyn Read + Send>>,
         interval: Duration,
     ) -> io::Result<Self> {
@@ -133,13 +180,13 @@ impl JournalWorker {
             let result = (|| {
                 let _ownership = journal_lock(&path)?;
                 let mut f = private_new(&path)?;
-                seed(&mut f, &base, source, &stop)?;
+                seed(&mut f, &base, logical_len, source, &stop)?;
                 f.sync_all()?;
                 if let Some(parent) = path.parent() {
                     sync_parent(parent)?;
                 }
                 let _ = ready_tx.try_send(Ok(base.revision));
-                run(&mut f, State::new(base.revision, base.byte_len), rx, interval, &stop)
+                run(&mut f, State::new(base.revision, logical_len.unwrap_or(base.byte_len)), rx, interval, &stop)
             })();
             if let Err(e) = &result {
                 let _ = ready_tx.try_send(Err(io::Error::new(e.kind(), e.to_string())));
@@ -243,11 +290,26 @@ fn base_bytes(base: &JournalBase) -> io::Result<Vec<u8>> {
     put_path(&mut b, base.original_path.as_deref())?;
     Ok(b)
 }
-fn decode_base(b: &[u8]) -> io::Result<JournalBase> {
+fn base_frame(base: &JournalBase, logical_len: Option<u64>) -> io::Result<Vec<u8>> {
+    let raw = base_bytes(base)?;
+    let Some(logical_len) = logical_len else { return Ok(raw) };
+    let mut b = vec![ENCODED_BASE, ENCODED_VERSION];
+    put64(&mut b, logical_len);
+    b.extend_from_slice(&raw[1..]);
+    Ok(b)
+}
+fn decode_base(b: &[u8]) -> io::Result<(JournalBase, Option<u64>)> {
     let mut r = Decoder::new(b);
-    if r.take(1)? != [1] {
-        return Err(invalid("missing journal base"));
-    }
+    let logical_len = match r.take(1)?[0] {
+        1 => None,
+        ENCODED_BASE => {
+            if r.take(1)? != [ENCODED_VERSION] {
+                return Err(invalid("encoded base version"));
+            }
+            Some(r.u64()?)
+        }
+        _ => return Err(invalid("missing journal base")),
+    };
     let document = DocumentId(r.u64()?);
     let revision = r.u64()?;
     let byte_len = r.u64()?;
@@ -259,15 +321,16 @@ fn decode_base(b: &[u8]) -> io::Result<JournalBase> {
     if document.0 == 0 {
         return Err(invalid("zero document ID"));
     }
-    Ok(JournalBase { document, revision, byte_len, original_identity, original_path, codec })
+    Ok((JournalBase { document, revision, byte_len, original_identity, original_path, codec }, logical_len))
 }
 fn seed(
     f: &mut File,
     base: &JournalBase,
+    logical_len: Option<u64>,
     mut source: Option<Box<dyn Read + Send>>,
     stop: &AtomicBool,
 ) -> io::Result<()> {
-    write_frame(f, &base_bytes(base)?)?;
+    write_frame(f, &base_frame(base, logical_len)?)?;
     let mut left = base.byte_len;
     let mut b = vec![0; JOURNAL_CHUNK + 1];
     b[0] = 2;
@@ -281,7 +344,22 @@ fn seed(
         write_frame(f, &b[..n + 1])?;
         left -= n as u64;
     }
+    // Legacy raw readers historically consume exactly byte_len and ignore any
+    // suffix. Encoded framing requires an exact physical payload, even at zero.
+    if logical_len.is_some() {
+        cancelled(stop)?;
+        if let Some(reader) = &mut source {
+            require_eof(reader)?;
+        }
+    }
     write_frame(f, &[3])
+}
+fn require_eof(reader: &mut dyn Read) -> io::Result<()> {
+    let mut byte = [0];
+    if reader.read(&mut byte)? != 0 {
+        return Err(invalid("too many encoded base bytes"));
+    }
+    Ok(())
 }
 fn cancelled(stop: &AtomicBool) -> io::Result<()> {
     if stop.load(Ordering::Acquire) {
@@ -353,12 +431,35 @@ fn decode_replacement(b: &[u8]) -> io::Result<JournalReplacement> {
     r.end()?;
     Ok(replacement)
 }
+fn encoded_replacement_bytes(replacement: JournalReplacement, payload_len: u64) -> Vec<u8> {
+    let mut b = vec![ENCODED_REPLACEMENT, ENCODED_VERSION];
+    for v in [replacement.offset, replacement.removed, replacement.inserted, payload_len] {
+        put64(&mut b, v);
+    }
+    b
+}
+fn decode_encoded_replacement(b: &[u8]) -> io::Result<(JournalReplacement, u64)> {
+    let mut r = Decoder::new(b);
+    if r.take(2)? != [ENCODED_REPLACEMENT, ENCODED_VERSION] {
+        return Err(invalid("encoded replacement version/header"));
+    }
+    let replacement = JournalReplacement { offset: r.u64()?, removed: r.u64()?, inserted: r.u64()? };
+    let payload_len = r.u64()?;
+    r.end()?;
+    Ok((replacement, payload_len))
+}
+#[derive(Clone, Copy)]
+struct ReplacementState {
+    replacement: JournalReplacement,
+    payload_len: u64,
+    received: u64,
+}
 #[derive(Clone, Copy)]
 struct BatchState {
     header: JournalBatch,
     completed: u64,
     len: u64,
-    pending: Option<(JournalReplacement, u64)>,
+    pending: Option<ReplacementState>,
 }
 #[derive(Clone, Copy)]
 struct State {
@@ -387,10 +488,9 @@ impl State {
     }
     fn bytes(&mut self, n: usize) -> io::Result<()> {
         if let Some(batch) = &mut self.batch {
-            let (replacement, bytes) =
-                batch.pending.as_mut().ok_or_else(|| invalid("bytes outside batch replacement"))?;
-            *bytes = bytes.checked_add(n as u64).ok_or_else(|| invalid("edit overflow"))?;
-            if *bytes > replacement.inserted {
+            let pending = batch.pending.as_mut().ok_or_else(|| invalid("bytes outside batch replacement"))?;
+            pending.received = pending.received.checked_add(n as u64).ok_or_else(|| invalid("edit overflow"))?;
+            if pending.received > pending.payload_len {
                 return Err(invalid("too many replacement bytes"));
             }
             return Ok(());
@@ -425,6 +525,9 @@ impl State {
         Ok(())
     }
     fn begin_replacement(&mut self, replacement: JournalReplacement) -> io::Result<()> {
+        self.begin_payload(replacement, replacement.inserted)
+    }
+    fn begin_payload(&mut self, replacement: JournalReplacement, payload_len: u64) -> io::Result<()> {
         let batch = self.batch.as_mut().ok_or_else(|| invalid("replacement outside batch"))?;
         if batch.pending.is_some()
             || batch.completed >= batch.header.replacements
@@ -434,15 +537,16 @@ impl State {
         {
             return Err(invalid("batch replacement range/order"));
         }
-        batch.pending = Some((replacement, 0));
+        batch.pending = Some(ReplacementState { replacement, payload_len, received: 0 });
         Ok(())
     }
     fn end_replacement(&mut self) -> io::Result<()> {
         let batch = self.batch.as_mut().ok_or_else(|| invalid("replacement end outside batch"))?;
-        let (replacement, bytes) = batch.pending.ok_or_else(|| invalid("replacement end without begin"))?;
-        if bytes != replacement.inserted {
+        let pending = batch.pending.ok_or_else(|| invalid("replacement end without begin"))?;
+        if pending.received != pending.payload_len {
             return Err(invalid("incomplete replacement"));
         }
+        let replacement = pending.replacement;
         batch.pending = None;
         batch.len = batch.len - replacement.removed + replacement.inserted;
         batch.completed += 1;
@@ -514,6 +618,10 @@ fn run(
                 state.begin_replacement(r)?;
                 write_frame(f, &replacement_bytes(r))?;
             }
+            JournalCommand::BeginEncodedReplacement { replacement, payload_len } => {
+                state.begin_payload(replacement, payload_len)?;
+                write_frame(f, &encoded_replacement_bytes(replacement, payload_len))?;
+            }
             JournalCommand::EndReplacement => {
                 state.end_replacement()?;
                 write_frame(f, &[9])?;
@@ -553,6 +661,18 @@ pub struct JournalSeed {
     pub base: JournalBase,
     pub source: Box<dyn Read + Send>,
 }
+/// Explicit encoded seed admission; physical and logical lengths never travel
+/// inside the caller's opaque codec. Uses the same single service worker/queue.
+pub struct EncodedJournalSeed {
+    pub path: PathBuf,
+    pub base: EncodedJournalBase,
+    pub source: Box<dyn Read + Send>,
+}
+impl std::fmt::Debug for EncodedJournalSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedJournalSeed").field("path", &self.path).field("base", &self.base).finish_non_exhaustive()
+    }
+}
 impl std::fmt::Debug for JournalSeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JournalSeed").field("path", &self.path).field("base", &self.base).finish_non_exhaustive()
@@ -589,7 +709,7 @@ impl RecoveredJournal {
         let mut reader = JournalReader { limit: file.metadata()?.len(), file: file.try_clone()? };
         let mut base = None;
         let summary = reader.recover(cancel, |event| {
-            if let RecoveryEvent::Base(b) = &event {
+            if let RecoveryEvent::Base(b) | RecoveryEvent::EncodedBase { base: b, .. } = &event {
                 if b.document != expected {
                     return Err(invalid("journal document identity mismatch"));
                 }
@@ -620,6 +740,7 @@ impl RecoveredJournal {
 enum ServiceRequest {
     Create {
         seed: JournalSeed,
+        logical_len: Option<u64>,
         token: u64,
         ready: SyncSender<io::Result<u64>>,
         done: SyncSender<io::Result<u64>>,
@@ -706,6 +827,33 @@ impl JournalService {
         Ok(Self { tx: Some(tx), closing, cancel: stop, next: std::sync::atomic::AtomicU64::new(1), finished })
     }
     pub fn try_create(&self, seed: JournalSeed) -> Result<JournalSession, TrySendError<Box<JournalSeed>>> {
+        self.try_create_base(seed, None)
+    }
+    pub fn try_create_encoded(
+        &self,
+        seed: EncodedJournalSeed,
+    ) -> Result<JournalSession, TrySendError<Box<EncodedJournalSeed>>> {
+        let logical_len = seed.base.logical_len;
+        let raw = JournalSeed { path: seed.path, base: seed.base.base, source: seed.source };
+        self.try_create_base(raw, Some(logical_len)).map_err(|e| {
+            let wrap = |seed: Box<JournalSeed>| {
+                Box::new(EncodedJournalSeed {
+                    path: seed.path,
+                    base: EncodedJournalBase { base: seed.base, logical_len },
+                    source: seed.source,
+                })
+            };
+            match e {
+                TrySendError::Full(seed) => TrySendError::Full(wrap(seed)),
+                TrySendError::Disconnected(seed) => TrySendError::Disconnected(wrap(seed)),
+            }
+        })
+    }
+    fn try_create_base(
+        &self,
+        seed: JournalSeed,
+        logical_len: Option<u64>,
+    ) -> Result<JournalSession, TrySendError<Box<JournalSeed>>> {
         if self.closing.load(Ordering::Acquire)
             || seed.base.codec.len() > 128
             || seed.base.document.0 == 0
@@ -716,7 +864,7 @@ impl JournalService {
         let token = self.next.fetch_add(1, Ordering::Relaxed);
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let (done, finished) = mpsc::sync_channel(1);
-        let request = ServiceRequest::Create { seed, token, ready: ready_tx, done };
+        let request = ServiceRequest::Create { seed, logical_len, token, ready: ready_tx, done };
         self.tx.as_ref().unwrap().try_send(request).map_err(|e| match e {
             TrySendError::Full(ServiceRequest::Create { seed, .. }) => TrySendError::Full(Box::new(seed)),
             TrySendError::Disconnected(ServiceRequest::Create { seed, .. }) => {
@@ -767,7 +915,7 @@ impl Drop for JournalService {
 }
 
 enum SeedPhase {
-    Seed { reader: Box<dyn Read + Send>, left: u64 },
+    Seed { reader: Box<dyn Read + Send>, left: u64, exact: bool },
     Merge { offset: u64 },
     Ready,
 }
@@ -793,13 +941,14 @@ fn pending_path(path: &Path) -> PathBuf {
 impl ServiceEntry {
     fn seed(
         seed: JournalSeed,
+        logical_len: Option<u64>,
         ready: SyncSender<io::Result<u64>>,
         done: SyncSender<io::Result<u64>>,
         interval: Duration,
     ) -> io::Result<Self> {
         let ownership = journal_lock(&seed.path)?;
         let mut file = private_new(&seed.path)?;
-        write_frame(&mut file, &base_bytes(&seed.base)?)?;
+        write_frame(&mut file, &base_frame(&seed.base, logical_len)?)?;
         let mut options = OpenOptions::new();
         options.read(true).append(true).create_new(true);
         #[cfg(unix)]
@@ -813,8 +962,8 @@ impl ServiceEntry {
             file,
             _ownership: ownership,
             spool: Some(spool),
-            state: State::new(seed.base.revision, seed.base.byte_len),
-            phase: SeedPhase::Seed { reader: seed.source, left: seed.base.byte_len },
+            state: State::new(seed.base.revision, logical_len.unwrap_or(seed.base.byte_len)),
+            phase: SeedPhase::Seed { reader: seed.source, left: seed.base.byte_len, exact: logical_len.is_some() },
             base: seed.base,
             ready: Some(ready),
             done,
@@ -877,6 +1026,10 @@ impl ServiceEntry {
                 self.state.begin_replacement(r)?;
                 write_frame(file, &replacement_bytes(r))?;
             }
+            JournalCommand::BeginEncodedReplacement { replacement, payload_len } => {
+                self.state.begin_payload(replacement, payload_len)?;
+                write_frame(file, &encoded_replacement_bytes(replacement, payload_len))?;
+            }
             JournalCommand::EndReplacement => {
                 self.state.end_replacement()?;
                 write_frame(file, &[9])?;
@@ -910,7 +1063,7 @@ impl ServiceEntry {
     }
     fn advance(&mut self) -> io::Result<()> {
         match &mut self.phase {
-            SeedPhase::Seed { reader, left } => {
+            SeedPhase::Seed { reader, left, exact } => {
                 if *left != 0 {
                     let n = (*left).min(JOURNAL_CHUNK as u64) as usize;
                     let mut b = vec![0; n + 1];
@@ -919,6 +1072,9 @@ impl ServiceEntry {
                     write_frame(&mut self.file, &b)?;
                     *left -= n as u64;
                     return Ok(());
+                }
+                if *exact {
+                    require_eof(reader)?;
                 }
                 write_frame(&mut self.file, &[3])?;
                 self.file.sync_all()?;
@@ -1005,7 +1161,7 @@ fn merge_pending_for_recovery(
     };
     let limit = file.metadata()?.len();
     file.seek(SeekFrom::Start(0))?;
-    let base = decode_base(&read_frame(file, limit)?.ok_or_else(|| invalid("incomplete journal base"))?)?;
+    let (base, _) = decode_base(&read_frame(file, limit)?.ok_or_else(|| invalid("incomplete journal base"))?)?;
     if base.document != expected {
         return Err(invalid("journal document identity mismatch"));
     }
@@ -1110,14 +1266,14 @@ fn service_loop(
         };
         if let Some(request) = request {
             match request {
-                ServiceRequest::Create { seed, token, ready, done } => {
+                ServiceRequest::Create { seed, logical_len, token, ready, done } => {
                     if entries.len() >= crate::session::MAX_TABS
                         || entries.values().any(|e| e.base.document == seed.base.document)
                     {
                         let _ = ready.try_send(Err(invalid("journal document limit/duplicate")));
                         let _ = done.try_send(Err(invalid("journal document limit/duplicate")));
                     } else {
-                        match ServiceEntry::seed(seed, ready.clone(), done.clone(), interval) {
+                        match ServiceEntry::seed(seed, logical_len, ready.clone(), done.clone(), interval) {
                             Ok(entry) => {
                                 entries.insert(token, entry);
                                 order.push_back(token);
@@ -1199,6 +1355,7 @@ pub enum RecoveryTail {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoverySummary {
     pub revision: u64,
+    /// Current logical model length; encoded payload sizes need not match it.
     pub byte_len: u64,
     pub committed_end: u64,
     pub tail: RecoveryTail,
@@ -1210,6 +1367,12 @@ pub struct RecoverySummary {
 /// the model revision only at CommitBatch. Bytes are still bounded to 64 KiB.
 pub enum RecoveryEvent<'a> {
     Base(&'a JournalBase),
+    /// Distinct from raw Base: the caller must explicitly restore the codec's
+    /// encoded representation. BaseBytes still streams physical payload bytes.
+    EncodedBase {
+        base: &'a JournalBase,
+        logical_len: u64,
+    },
     BaseBytes(&'a [u8]),
     BaseComplete,
     BeginEdit(JournalEdit),
@@ -1217,6 +1380,10 @@ pub enum RecoveryEvent<'a> {
     CommitEdit,
     BeginBatch(JournalBatch),
     BeginReplacement(JournalReplacement),
+    BeginEncodedReplacement {
+        replacement: JournalReplacement,
+        payload_len: u64,
+    },
     EndReplacement,
     CommitBatch,
 }
@@ -1240,7 +1407,7 @@ impl JournalReader {
         let Some(header) = read_frame(&mut self.file, self.limit)? else {
             return Err(invalid("incomplete journal base"));
         };
-        let base = decode_base(&header)?;
+        let (base, logical_len) = decode_base(&header)?;
         let base_start = self.file.stream_position()?;
         let mut base_len = 0u64;
         loop {
@@ -1260,7 +1427,10 @@ impl JournalReader {
             }
         }
         let base_end = self.file.stream_position()?;
-        emit(RecoveryEvent::Base(&base))?;
+        match logical_len {
+            Some(logical_len) => emit(RecoveryEvent::EncodedBase { base: &base, logical_len })?,
+            None => emit(RecoveryEvent::Base(&base))?,
+        }
         replay(&mut self.file, base_start, base_end, cancel, |b| {
             if b[0] == 2 {
                 emit(RecoveryEvent::BaseBytes(&b[1..]))?;
@@ -1268,7 +1438,7 @@ impl JournalReader {
             Ok(())
         })?;
         emit(RecoveryEvent::BaseComplete)?;
-        let mut state = State::new(base.revision, base.byte_len);
+        let mut state = State::new(base.revision, logical_len.unwrap_or(base.byte_len));
         let mut committed_end = base_end;
         let mut edit_start = base_end;
         loop {
@@ -1319,6 +1489,10 @@ impl JournalReader {
                     edit_start = self.file.stream_position()?;
                 }
                 8 => state.begin_replacement(decode_replacement(&b)?)?,
+                ENCODED_REPLACEMENT => {
+                    let (replacement, payload_len) = decode_encoded_replacement(&b)?;
+                    state.begin_payload(replacement, payload_len)?;
+                }
                 9 if b.len() == 1 => state.end_replacement()?,
                 10 if b.len() == 1 => {
                     let batch = state.commit_batch()?;
@@ -1327,6 +1501,10 @@ impl JournalReader {
                     replay(&mut self.file, edit_start, end, cancel, |b| {
                         match b[0] {
                             8 => emit(RecoveryEvent::BeginReplacement(decode_replacement(b)?))?,
+                            ENCODED_REPLACEMENT => {
+                                let (replacement, payload_len) = decode_encoded_replacement(b)?;
+                                emit(RecoveryEvent::BeginEncodedReplacement { replacement, payload_len })?;
+                            }
                             5 => emit(RecoveryEvent::EditBytes(&b[1..]))?,
                             9 => emit(RecoveryEvent::EndReplacement)?,
                             10 => (),
@@ -1381,3 +1559,6 @@ fn replay(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod logical_tests;
