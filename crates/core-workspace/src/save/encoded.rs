@@ -2,7 +2,9 @@
 //! separate from the actual destination file. No file-sized payload or edit list.
 use super::*;
 use kwil_core_text::decoded_backing::{DecodedBacking, Interpretation, RetirementError};
-use kwil_core_text::encoding::{Encoding, EncodingError, SavePlan, validate_snapshot_save, write_snapshot};
+use kwil_core_text::encoding::{
+    Encoding, EncodingError, SavePlan, validate_snapshot_save_cancellable, write_snapshot_cancellable,
+};
 use std::io::{BufWriter, Write};
 use std::sync::atomic::AtomicBool;
 
@@ -29,8 +31,8 @@ pub struct EncodedSavedSnapshot {
 /// temp BEFORE replacement. Any such failure leaves the destination intact.
 /// Once replacement succeeds, cancellation no longer turns it into a failed
 /// save. A subsequent raw destination reopen failure explicitly says committed.
-/// Core encoding preflight has no cancellation callback: a cancellation during
-/// that pass is observed when it returns, before creating the save temp.
+/// Core encoding preflight and streaming cooperatively poll this same flag;
+/// preflight cancellation returns before creating the save temp.
 pub fn save_encoded_snapshot(
     request: SaveRequest,
     plan: SavePlan,
@@ -42,12 +44,17 @@ pub fn save_encoded_snapshot(
 
 fn encoding_error(error: EncodingError) -> io::Error {
     match error {
+        EncodingError::Cancelled => io::Error::new(io::ErrorKind::Interrupted, error),
         EncodingError::Io(error) if error.get_ref().is_some_and(|cause| cause.is::<WriteCancelled>()) => {
             io::Error::new(io::ErrorKind::Interrupted, error)
         }
         EncodingError::Io(error) => error,
         other => io::Error::new(io::ErrorKind::InvalidData, other),
     }
+}
+
+fn validate_encoded_snapshot(snapshot: &Snapshot, plan: SavePlan, cancelled: impl FnMut() -> bool) -> io::Result<()> {
+    validate_snapshot_save_cancellable(snapshot, plan, cancelled).map_err(encoding_error)
 }
 
 #[derive(Debug)]
@@ -141,7 +148,7 @@ fn save_encoded_with_operations(
     replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
 ) -> io::Result<EncodedSavedSnapshot> {
     cancelled(cancel)?;
-    validate_snapshot_save(&request.snapshot, plan).map_err(encoding_error)?;
+    validate_encoded_snapshot(&request.snapshot, plan, || cancel.load(Ordering::Relaxed))?;
     cancelled(cancel)?;
     let mut spool = if request.trim_trailing_whitespace { Some(TrimSpool::new()?) } else { None };
     let trimmed_rows = if let Some(spool) = &mut spool {
@@ -184,6 +191,7 @@ fn save_encoded_with_operations(
             cancelled(cancel)
         },
         replace,
+        sync_parent,
     );
     let committed = match committed {
         Ok(committed) => committed,
@@ -194,10 +202,7 @@ fn save_encoded_with_operations(
         Err(error) => {
             return Err(discard_prepared(
                 prepared,
-                io::Error::other(format!(
-                    "encoded file committed at {}, but destination reopen failed: {error}; do not retry as an uncommitted save",
-                    committed.path.display()
-                )),
+                committed_error(&committed.path, "destination reopen", io::Error::from(error)),
             ));
         }
     };
@@ -220,10 +225,12 @@ fn stream(
 ) -> io::Result<()> {
     let mut writer = Cancellable { inner: writer, cancel };
     let Some(spool) = spool.filter(|spool| !spool.is_empty()) else {
-        return write_snapshot(snapshot, plan, &mut writer).map_err(encoding_error);
+        return write_snapshot_cancellable(snapshot, plan, &mut writer, || cancel.load(Ordering::Relaxed))
+            .map_err(encoding_error);
     };
     // Exactly one output BOM, even when every logical byte is trimmed.
-    write_snapshot(&Buffer::empty().snapshot(), plan, &mut writer).map_err(encoding_error)?;
+    write_snapshot_cancellable(&Buffer::empty().snapshot(), plan, &mut writer, || cancel.load(Ordering::Relaxed))
+        .map_err(encoding_error)?;
     let body = SavePlan { bom: false, ..plan };
     let mut pending_cr: Option<Snapshot> = None;
     let mut retain = |mut range: Range<u64>| -> io::Result<()> {
@@ -235,10 +242,12 @@ fn stream(
             let first = snapshot.chunks(range.start..range.start + 1)?.next().unwrap().map_err(io::Error::other)?[0];
             if first == b'\n' {
                 let pair = cr.concat(&snapshot.slice(range.start..range.start + 1)?)?;
-                write_snapshot(&pair, body, &mut writer).map_err(encoding_error)?;
+                write_snapshot_cancellable(&pair, body, &mut writer, || cancel.load(Ordering::Relaxed))
+                    .map_err(encoding_error)?;
                 range.start += 1;
             } else {
-                write_snapshot(&cr, body, &mut writer).map_err(encoding_error)?;
+                write_snapshot_cancellable(&cr, body, &mut writer, || cancel.load(Ordering::Relaxed))
+                    .map_err(encoding_error)?;
             }
         }
         if range.is_empty() {
@@ -252,7 +261,8 @@ fn stream(
             }
         }
         if !range.is_empty() {
-            write_snapshot(&snapshot.slice(range)?, body, &mut writer).map_err(encoding_error)?;
+            write_snapshot_cancellable(&snapshot.slice(range)?, body, &mut writer, || cancel.load(Ordering::Relaxed))
+                .map_err(encoding_error)?;
         }
         Ok(())
     };
@@ -264,7 +274,8 @@ fn stream(
     }
     retain(from..snapshot.len())?;
     if let Some(cr) = pending_cr {
-        write_snapshot(&cr, body, &mut writer).map_err(encoding_error)?;
+        write_snapshot_cancellable(&cr, body, &mut writer, || cancel.load(Ordering::Relaxed))
+            .map_err(encoding_error)?;
     }
     Ok(())
 }
@@ -517,6 +528,23 @@ mod tests {
         assert_eq!(fs::read(f.path()).unwrap(), b"new");
         b.checkpoint_current(saved.saved.snapshot).unwrap();
         f.owners.borrow_mut().push(saved.backing);
+    }
+
+    #[test]
+    fn encoded_preflight_cooperative_cancellation_retains_interrupted_kind() {
+        let mut b = Buffer::empty();
+        b.insert(0, b"worker preflight source").unwrap();
+        let mut polls = 0;
+        let error = validate_encoded_snapshot(&b.snapshot(), plan(Encoding::UTF16_LE, true), || {
+            polls += 1;
+            // Deterministically cancel after preflight actually started, not
+            // at the public entry-point's already-cancelled short circuit.
+            polls == 2
+        })
+        .unwrap_err();
+        assert_eq!(polls, 2, "preflight must stop on the first cooperative cancellation");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(error.to_string().contains("cancelled"), "{error}");
     }
 
     #[test]

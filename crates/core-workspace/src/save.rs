@@ -99,11 +99,24 @@ fn save_with_operations(
     write: impl FnOnce(&Snapshot, &mut File) -> io::Result<Option<Range<u64>>>,
     replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
 ) -> io::Result<SavedSnapshot> {
-    let committed = commit_with_operations(request, write, |_| Ok(()), replace)?;
+    let committed = commit_with_operations(request, write, |_| Ok(()), replace, sync_parent)?;
     // Indexing/rebase preparation stays on this same worker.
-    let file = TextFile::open_saved_version(&committed.path).map_err(io::Error::from)?;
-    let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
-    Ok(committed.finish(file, buffer.snapshot()))
+    finish_raw_save_with(
+        committed,
+        |path| TextFile::open_saved_version(path).map_err(io::Error::from),
+        |file| Buffer::from_file(file).map(|buffer| buffer.snapshot()).map_err(io::Error::other),
+    )
+}
+
+fn finish_raw_save_with(
+    committed: CommittedSave,
+    open: impl FnOnce(&Path) -> io::Result<TextFile>,
+    index: impl FnOnce(TextFile) -> io::Result<Snapshot>,
+) -> io::Result<SavedSnapshot> {
+    let file = open(&committed.path).map_err(|error| committed_error(&committed.path, "destination reopen", error))?;
+    let snapshot =
+        index(file.clone()).map_err(|error| committed_error(&committed.path, "saved checkpoint indexing", error))?;
+    Ok(committed.finish(file, snapshot))
 }
 
 struct CommittedSave {
@@ -134,6 +147,7 @@ fn commit_with_operations(
     write: impl FnOnce(&Snapshot, &mut File) -> io::Result<Option<Range<u64>>>,
     prepare: impl FnOnce(&Path) -> io::Result<()>,
     replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<CommittedSave> {
     let path = std::path::absolute(&request.path)?;
     let parent = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "save path has no parent"))?;
@@ -190,11 +204,47 @@ fn commit_with_operations(
     if let Some(pin) = pin {
         pin.commit();
     }
-    #[cfg(unix)]
-    File::open(parent)?
-        .sync_all()
-        .map_err(|e| io::Error::new(e.kind(), format!("file replaced, but directory sync failed: {e}")))?;
+    // The rename and original pin are committed. Never roll back or remove the
+    // destination if opening/syncing its parent directory now fails.
+    sync_parent(&path, parent)?;
     Ok(CommittedSave { path, revision: request.revision, warnings, trimmed_rows })
+}
+
+/// A post-replacement error must never look like a failed, uncommitted write.
+/// Keep the underlying kind for diagnostics, and explicitly identify the saved
+/// pathname so frontends can report the committed/durability-uncertain state.
+fn committed_error(path: &Path, operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "file committed at {}, but {operation} failed: {error}; do not retry as an uncommitted save",
+            path.display()
+        ),
+    )
+}
+
+fn sync_parent(destination: &Path, parent: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        sync_parent_with(destination, parent, |parent| File::open(parent), |directory| directory.sync_all())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (destination, parent);
+        Ok(())
+    }
+}
+
+/// Portable fault seam for the two distinct postcommit directory operations.
+#[cfg(any(unix, test))]
+fn sync_parent_with<Directory>(
+    destination: &Path,
+    parent: &Path,
+    open: impl FnOnce(&Path) -> io::Result<Directory>,
+    sync: impl FnOnce(Directory) -> io::Result<()>,
+) -> io::Result<()> {
+    let directory = open(parent).map_err(|error| committed_error(destination, "parent directory open", error))?;
+    sync(directory).map_err(|error| committed_error(destination, "parent directory sync", error))
 }
 
 fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io::Write) -> io::Result<()> {
@@ -537,6 +587,129 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(original.bytes().unwrap(), b"original");
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+    }
+
+    fn assert_postcommit_directory_failure_keeps_new_destination(open_fails: bool) {
+        let f = Fixture::new();
+        let path = f.path();
+        fs::write(&path, b"original").unwrap();
+        let original = open_for_editing(&path).unwrap();
+        let mut b = Buffer::from_file(original.clone()).unwrap();
+        b.insert(0, b"new ").unwrap();
+        let error = commit_with_operations(
+            f.request(original.clone(), &b),
+            |snapshot, file| snapshot.write_to(file).map(|_| None),
+            |_| Ok(()),
+            replace,
+            |destination, parent| {
+                assert_eq!(destination, path);
+                assert_eq!(parent, f.0);
+                assert_eq!(fs::read(destination).unwrap(), b"new original", "fault follows actual replacement");
+                sync_parent_with(
+                    destination,
+                    parent,
+                    |_| {
+                        if open_fails {
+                            Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected directory-open denial"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |()| {
+                        assert!(!open_fails, "a failed directory open must never attempt sync");
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected directory-sync denial"))
+                    },
+                )
+            },
+        )
+        .err()
+        .expect("postcommit durability failure must reach the caller");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let message = error.to_string();
+        assert!(message.contains("file committed at "), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        let (operation, cause) = if open_fails {
+            ("parent directory open", "injected directory-open denial")
+        } else {
+            ("parent directory sync", "injected directory-sync denial")
+        };
+        assert!(message.contains(operation) && message.contains(cause), "{message}");
+        assert_eq!(fs::read(&path).unwrap(), b"new original", "postcommit failure cannot roll back/remove saved bytes");
+        assert_eq!(original.bytes().unwrap(), b"original", "old worker/undo original remains pinned");
+        drop((b, original));
+        assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1, "retire old pins and temp without unlinking destination");
+        assert_eq!(fs::read(&path).unwrap(), b"new original");
+    }
+
+    #[test]
+    fn postcommit_directory_open_failure_reports_committed_and_retains_new_destination() {
+        assert_postcommit_directory_failure_keeps_new_destination(true);
+    }
+
+    #[test]
+    fn postcommit_directory_sync_failure_reports_committed_and_retains_new_destination() {
+        assert_postcommit_directory_failure_keeps_new_destination(false);
+    }
+
+    fn assert_postcommit_raw_checkpoint_failure_keeps_new_destination(open_fails: bool) {
+        let f = Fixture::new();
+        let path = f.path();
+        fs::write(&path, b"original").unwrap();
+        let original = open_for_editing(&path).unwrap();
+        let mut b = Buffer::from_file(original.clone()).unwrap();
+        b.insert(0, b"new ").unwrap();
+        let committed = commit_with_operations(
+            f.request(original.clone(), &b),
+            |snapshot, file| snapshot.write_to(file).map(|_| None),
+            |_| Ok(()),
+            replace,
+            sync_parent,
+        )
+        .unwrap();
+        let error = finish_raw_save_with(
+            committed,
+            |destination| {
+                assert_eq!(destination, path);
+                assert_eq!(fs::read(destination).unwrap(), b"new original");
+                if open_fails {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected saved-file reopen denial"))
+                } else {
+                    TextFile::open_saved_version(destination).map_err(io::Error::from)
+                }
+            },
+            |file| {
+                assert!(!open_fails, "failed reopen cannot reach indexing");
+                assert_eq!(file.path(), path);
+                assert_eq!(file.bytes().unwrap(), b"new original");
+                Err(io::Error::new(io::ErrorKind::InvalidData, "injected saved-checkpoint index failure"))
+            },
+        )
+        .err()
+        .expect("postcommit checkpoint failure must reach the caller");
+        let (kind, operation, cause) = if open_fails {
+            (io::ErrorKind::PermissionDenied, "destination reopen", "injected saved-file reopen denial")
+        } else {
+            (io::ErrorKind::InvalidData, "saved checkpoint indexing", "injected saved-checkpoint index failure")
+        };
+        assert_eq!(error.kind(), kind);
+        let message = error.to_string();
+        assert!(message.contains("file committed at "), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains(operation) && message.contains(cause), "{message}");
+        assert_eq!(original.bytes().unwrap(), b"original");
+        drop((b, original));
+        assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"new original", "checkpoint failure must never roll back saved bytes");
+    }
+
+    #[test]
+    fn postcommit_raw_reopen_failure_reports_committed_and_retains_new_destination() {
+        assert_postcommit_raw_checkpoint_failure_keeps_new_destination(true);
+    }
+
+    #[test]
+    fn postcommit_raw_index_failure_reports_committed_and_retains_new_destination() {
+        assert_postcommit_raw_checkpoint_failure_keeps_new_destination(false);
     }
 
     #[test]
