@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 use windows_sys::{
@@ -39,14 +39,16 @@ pub(crate) struct Native {
     target: *mut Target,
     session: bool,
     subclass: bool,
+    tips: super::tooltips_windows::Tips,
 }
 struct State {
     send: SendEvent,
+    user_placed: AtomicBool,
 }
 impl Native {
     pub fn register(hwnd: isize, send: impl Fn(UserEvent) + Send + Sync + 'static) -> Self {
         let hwnd = hwnd as HWND;
-        let state = Arc::new(State { send: Box::new(send) });
+        let state = Arc::new(State { send: Box::new(send), user_placed: AtomicBool::new(false) });
         let ptr = Arc::as_ptr(&state) as usize;
         let subclass = unsafe { SetWindowSubclass(hwnd, Some(window_proc), SUBCLASS_ID, ptr) != 0 };
         let session = subclass && unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != 0 };
@@ -75,17 +77,53 @@ impl Native {
             "kwil-native subclass={subclass} session_notifications={session} ole={ole} drop_target={}",
             !target.is_null()
         );
-        Self { hwnd, state, ole, target, session, subclass }
+        Self { hwnd, state, ole, target, session, subclass, tips: Default::default() }
+    }
+    pub fn toolbar_tooltips(
+        &mut self,
+        tools: &[super::super::menu::Tool],
+        labels: &std::collections::HashMap<&'static str, String>,
+    ) {
+        self.tips.update(self.hwnd, tools, labels);
+    }
+    pub fn user_placed(&self) -> bool {
+        self.state.user_placed.load(Ordering::Acquire)
     }
     pub fn theme(&self, dark: bool, remote: bool) {
-        let dark = i32::from(dark);
-        // DWMSBT_NONE in remote mode; DWMSBT_MAINWINDOW (Mica) locally.
-        // Windows 10 ignores the unsupported backdrop attribute safely.
-        let backdrop = if remote { 1i32 } else { 2 };
-        unsafe {
-            DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, (&dark as *const i32).cast(), 4);
-            DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE as u32, (&backdrop as *const i32).cast(), 4);
-        }
+        decorate_window(self.hwnd as isize, dark, remote, false);
+    }
+}
+
+/// Keep OS-drawn Windows 11 caption buttons, Snap and hit-testing. Unsupported
+/// attributes are ignored by Windows 10; remote mode retains opaque surfaces.
+pub(crate) fn decorate_window(hwnd: isize, dark: bool, remote: bool, dialog: bool) {
+    let dark = i32::from(dark);
+    let backdrop = if remote {
+        1i32
+    } else if dialog {
+        3
+    } else {
+        2
+    };
+    let round = 2i32; // DWMWCP_ROUND
+    let enabled = 2i32; // DWMNCRP_ENABLED
+    let theme = super::super::theme_ui::chrome();
+    let colorref = |role| {
+        let rgb = super::super::theme_ui::rgb(theme, role);
+        ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff)
+    };
+    let caption = colorref(kwil_core_commands::theme::UiRole::PanelBackground);
+    let text = colorref(kwil_core_commands::theme::UiRole::PanelForeground);
+    let border = colorref(kwil_core_commands::theme::UiRole::Border);
+    unsafe {
+        let hwnd = hwnd as HWND;
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, (&dark as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE as u32, (&backdrop as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 33, (&round as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 2, (&enabled as *const i32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 35, (&caption as *const u32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 36, (&text as *const u32).cast(), 4);
+        DwmSetWindowAttribute(hwnd, 34, (&border as *const u32).cast(), 4);
     }
 }
 impl Drop for Native {
@@ -110,6 +148,18 @@ impl Drop for Native {
     }
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _id: usize, data: usize) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, WM_ENTERSIZEMOVE, WM_SYSCOMMAND,
+    };
+    if msg == WM_ENTERSIZEMOVE
+        || (msg == WM_SYSCOMMAND
+            && [SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SC_MOVE, SC_SIZE].contains(&((w as u32) & 0xfff0)))
+    {
+        unsafe {
+            (&*(data as *const State)).user_placed.store(true, Ordering::Release);
+            ((&*(data as *const State)).send)(UserEvent::WindowPlacementTouched);
+        }
+    }
     if msg == WM_WTSSESSION_CHANGE {
         let remote = match w as u32 {
             WTS_REMOTE_CONNECT | WTS_REMOTE_DISCONNECT => true,

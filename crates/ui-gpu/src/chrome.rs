@@ -6,7 +6,7 @@ use kwil_core_commands::settings::TabLayout;
 use kwil_view_model::{SessionDocumentId, TabAction, TabArea, TabGeometry, TabSlot};
 
 /// Logical size of menu, tab and status text.
-pub(super) const UI_TEXT_DIP: f64 = 14.0;
+pub(super) const UI_TEXT_DIP: f64 = 15.0;
 
 /// Physical pixel sizes for one monitor scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -397,23 +397,6 @@ pub(super) fn disc(buf: &mut [u32], stride: usize, center: (f32, f32), radius: f
             }
         }
     }
-}
-
-/// A close cross centred in `area`.
-pub(super) fn cross(buf: &mut [u32], stride: usize, area: TabArea, size: usize, width: f32, color: u32) {
-    let (cx, cy) = (area.x as f32 + area.width as f32 / 2.0, area.y as f32 + area.height as f32 / 2.0);
-    let h = size as f32 / 2.0;
-    line(buf, stride, (cx - h, cy - h), (cx + h, cy + h), width, color);
-    line(buf, stride, (cx - h, cy + h), (cx + h, cy - h), width, color);
-}
-
-/// A chevron pointing left or right, centred in `area`.
-pub(super) fn chevron(buf: &mut [u32], stride: usize, area: TabArea, size: usize, left: bool, width: f32, color: u32) {
-    let (cx, cy) = (area.x as f32 + area.width as f32 / 2.0, area.y as f32 + area.height as f32 / 2.0);
-    let (h, q) = (size as f32 / 2.0, size as f32 / 4.0);
-    let (tip, tail) = if left { (cx - q, cx + q) } else { (cx + q, cx - q) };
-    line(buf, stride, (tail, cy - h), (tip, cy), width, color);
-    line(buf, stride, (tip, cy), (tail, cy + h), width, color);
 }
 
 /// Draws the status bar and returns clickable field rectangles.

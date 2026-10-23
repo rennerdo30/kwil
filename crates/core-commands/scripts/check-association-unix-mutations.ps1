@@ -21,7 +21,7 @@ foreach ($relative in @('Cargo.toml', 'Cargo.lock', 'crates/core-commands/Cargo.
     $pins[$relative] = (Get-FileHash -LiteralPath (Join-Path $repo $relative) -Algorithm SHA256).Hash
 }
 $cases = @(
-    @{ Name='omit-nonblock'; Old=' | libc::O_NONBLOCK'; New=''; Child='file-fifo' },
+    @{ Name='omit-nonblock'; Old='let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW;'; New='let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;'; Child='file-fifo' },
     @{ Name='omit-nofollow'; Old=' | libc::O_NOFOLLOW'; New=''; Child='file-symlink' }
 )
 # Deliberately excluded: omitting O_DIRECTORY alone still rejects a FIFO via

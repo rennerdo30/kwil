@@ -195,9 +195,14 @@ pub const SCHEMA: &[SettingSpec] = &[
     spec!("font.ligatures", "Ligatures", Appearance, "Enable font ligatures.", SettingKind::Bool, |s| {
         SettingValue::Bool(s.font.ligatures)
     }),
-    spec!("theme.name", "Theme", Appearance, "Name of the active theme.", SettingKind::Text, |s| SettingValue::Text(
-        s.theme.name.clone()
-    )),
+    spec!(
+        "theme.name",
+        "Theme",
+        Appearance,
+        "Choose the appearance of the editor and desktop windows.",
+        SettingKind::Choice(&["dark", "light"]),
+        |s| SettingValue::Text(s.theme.name.clone())
+    ),
     spec!(
         "theme.follow_os",
         "Follow system theme",
@@ -315,6 +320,14 @@ pub const SCHEMA: &[SettingSpec] = &[
             }
             .into()
         )
+    ),
+    spec!(
+        "render.backend",
+        "Renderer",
+        Appearance,
+        "Automatic uses a hardware GPU when available. CPU uses the software renderer. Remote sessions keep CPU rendering.",
+        SettingKind::Choice(&["auto", "cpu", "gpu"]),
+        |s| SettingValue::Text(s.render.backend.as_str().into())
     ),
     spec!(
         "render.smooth_scrolling",

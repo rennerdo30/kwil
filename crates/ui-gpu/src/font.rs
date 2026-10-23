@@ -239,8 +239,9 @@ fn pinned(c: char) -> bool {
     c.is_ascii() || matches!(c, '…' | '●' | '×')
 }
 
+#[derive(Clone)]
 struct UiFace {
-    data: Vec<u8>,
+    data: std::sync::Arc<[u8]>,
     offset: u32,
     key: swash::CacheKey,
 }
@@ -278,7 +279,7 @@ impl UiFace {
     fn from_data(data: Vec<u8>, index: usize) -> Option<UiFace> {
         let font = swash::FontRef::from_index(&data, index)?;
         let (offset, key) = (font.offset, font.key);
-        Some(UiFace { data, offset, key })
+        Some(UiFace { data: data.into(), offset, key })
     }
     fn font(&self) -> swash::FontRef<'_> {
         swash::FontRef { data: &self.data, offset: self.offset, key: self.key }
@@ -317,6 +318,7 @@ pub struct UiFont {
     glyphs: HashMap<char, UiGlyph>,
     /// Coverage bytes retained by `glyphs`.
     bytes: usize,
+    heading: Option<Box<UiFont>>,
     #[cfg(test)]
     rasterized: usize,
 }
@@ -333,6 +335,11 @@ impl UiFont {
         Self::from_face(UiFace::chain()?, px)
     }
     fn from_face(face: UiFace, px: f32) -> Option<UiFont> {
+        let mut font = Self::single_face(face.clone(), px)?;
+        font.heading = Some(Box::new(Self::single_face(face, px * 2.0)?));
+        Some(font)
+    }
+    fn single_face(face: UiFace, px: f32) -> Option<UiFont> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let px = if px.is_finite() { px.clamp(4.0, 160.0) } else { 14.0 };
         let metrics = face.font().metrics(&[]).scale(px);
@@ -346,11 +353,28 @@ impl UiFont {
             cap: if metrics.cap_height > 0.0 { metrics.cap_height } else { metrics.ascent * 0.7 },
             glyphs: HashMap::new(),
             bytes: 0,
+            heading: None,
             #[cfg(test)]
             rasterized: 0,
         };
         font.prepare((' '..='~').chain(['…', '●', '×']));
         Some(font)
+    }
+
+    /// Reuses immutable font bytes; no disk access or system-font scan.
+    pub(super) fn variant(&self, px: f32) -> Option<Self> {
+        let mut font = Self::from_face(self.face.clone(), px)?;
+        font.fallback = self.fallback.clone();
+        font.fallback_state = self.fallback_state;
+        if let Some(heading) = &mut font.heading {
+            heading.fallback = self.fallback.clone();
+            heading.fallback_state = self.fallback_state;
+        }
+        Some(font)
+    }
+
+    pub(super) fn heading(&mut self) -> &mut Self {
+        if self.heading.is_some() { self.heading.as_deref_mut().unwrap() } else { self }
     }
 
     /// Identity of this face; fallback results are bound only to the face
@@ -376,12 +400,24 @@ impl UiFont {
         wanted
     }
     pub fn install_fallback(&mut self, face: Option<(Vec<u8>, usize)>) {
-        self.fallback = face.and_then(|(data, index)| UiFace::from_data(data, index));
+        self.install_shared_fallback(face.and_then(|(data, index)| UiFace::from_data(data, index)));
+    }
+    fn install_shared_fallback(&mut self, face: Option<UiFace>) {
+        self.fallback = face;
         self.fallback_state = if self.fallback.is_some() { Fallback::Installed } else { Fallback::Unavailable };
         // Glyphs drawn as missing boxes are rasterized again from the new face.
         let charmap = self.face.font().charmap();
         self.glyphs.retain(|c, _| c.is_ascii() || charmap.map(*c) != 0);
         self.bytes = self.glyphs.values().map(|g| g.alpha.len()).sum();
+        if let Some(heading) = &mut self.heading {
+            heading.install_shared_fallback(self.fallback.clone());
+        }
+    }
+    pub(super) fn copy_fallback_from(&mut self, other: &Self) {
+        self.install_shared_fallback(other.fallback.clone());
+    }
+    pub(super) fn fallback_finished(&self) -> bool {
+        matches!(self.fallback_state, Fallback::Installed | Fallback::Unavailable)
     }
 
     fn prepare(&mut self, chars: impl Iterator<Item = char>) {

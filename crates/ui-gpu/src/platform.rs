@@ -1,9 +1,16 @@
 //! Native caption controls stay owned by winit/OS. All deferred Windows work
 //! lives in one UI-thread guard, which unregisters before the window dies.
 #[cfg(windows)]
+pub(crate) mod file_dialog_windows;
+#[cfg(windows)]
+mod tooltips_windows;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
+
+#[cfg(not(windows))]
+pub(crate) fn decorate_window(_hwnd: isize, _dark: bool, _remote: bool, _dialog: bool) {}
 
 #[cfg(not(windows))]
 pub(crate) struct Native;
@@ -11,6 +18,15 @@ pub(crate) struct Native;
 impl Native {
     pub fn register(_hwnd: isize, _send: impl Fn(super::UserEvent) + Send + Sync + 'static) -> Self {
         Self
+    }
+    pub fn toolbar_tooltips(
+        &mut self,
+        _tools: &[super::menu::Tool],
+        _labels: &std::collections::HashMap<&'static str, String>,
+    ) {
+    }
+    pub fn user_placed(&self) -> bool {
+        false
     }
     pub fn theme(&self, _dark: bool, _remote: bool) {}
 }

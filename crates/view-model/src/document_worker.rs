@@ -27,9 +27,11 @@ use std::{
     time::Duration,
 };
 
-/// Ok acknowledges bounded queue admission, not display. If shutdown races the
-/// wake after admission, the accepted request is not retried (which could open
-/// it twice); a shutdown notice is emitted and later calls return Disconnected.
+/// Ok acknowledges bounded queue admission, not display or durable delivery.
+/// Explicit inbox close retains admitted/racing requests until drain or drop;
+/// the frontend must gate dispatch during exit. If the wake fails after
+/// admission, the request is not retried (which could open it twice); a shutdown
+/// notice is emitted and later calls return Disconnected.
 pub type ExternalOpen = Box<
     dyn Fn(
             kwil_core_workspace::instance::OpenFiles,
@@ -39,6 +41,7 @@ pub type ExternalOpen = Box<
 pub struct ExternalOpenInbox {
     rx: mpsc::Receiver<kwil_core_workspace::instance::OpenFiles>,
     pending: std::sync::Arc<AtomicBool>,
+    closed: std::sync::Arc<AtomicBool>,
 }
 
 pub fn external_open_channel(
@@ -47,7 +50,8 @@ pub fn external_open_channel(
     let (tx, rx) = mpsc::sync_channel(16);
     let pending = std::sync::Arc::new(AtomicBool::new(false));
     let wake_pending = pending.clone();
-    let closed = AtomicBool::new(false);
+    let closed = std::sync::Arc::new(AtomicBool::new(false));
+    let inbox_closed = closed.clone();
     let open = Box::new(move |request: kwil_core_workspace::instance::OpenFiles| {
         // Reuse the transport's native-path, count and byte limits even when
         // an embedder calls this seam without going through IPC.
@@ -61,11 +65,21 @@ pub fn external_open_channel(
         }
         Ok(())
     });
-    (open, ExternalOpenInbox { rx, pending })
+    (open, ExternalOpenInbox { rx, pending, closed: inbox_closed })
 }
 
 impl ExternalOpenInbox {
+    /// Close admission without waiting for a producer or its wake callback.
+    /// Requests already admitted, including a producer racing this store, stay
+    /// in the bounded inbox. Admission acknowledges neither display nor durable
+    /// delivery; a closing frontend must not dispatch those retained requests.
+    pub fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn drain(&self) -> Vec<kwil_core_workspace::instance::OpenFiles> {
+        // Closing does not consume accepted requests. Callers can still drain
+        // their bounded ownership explicitly; the GUI skips this during exit.
         // Clear first: a concurrent producer either joins this bounded drain
         // or schedules another wake, so no request can be stranded.
         self.pending.store(false, std::sync::atomic::Ordering::Release);
@@ -2671,6 +2685,87 @@ mod tests {
         assert!(matches!(open(malformed.clone()), Err(TrySendError::Disconnected(r)) if r == malformed));
         drop(inbox);
         assert!(matches!(open(request.clone()), Err(TrySendError::Disconnected(r)) if r == request));
+    }
+
+    #[test]
+    fn external_open_close_rejects_whole_native_request_without_wake_and_retains_admitted() {
+        use kwil_core_workspace::instance::{OpenFile, OpenFiles};
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        let (open, inbox) = external_open_channel(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let first_path = std::env::temp_dir().join("kwil-ipc-閉じる-日本語.txt");
+        #[cfg(windows)]
+        let second_path = {
+            use std::os::windows::ffi::OsStringExt;
+            std::env::temp_dir().join(std::ffi::OsString::from_wide(&[0x65e5, 0xd800, 46, 116, 120, 116]))
+        };
+        #[cfg(not(windows))]
+        let second_path = std::env::temp_dir().join("kwil-ipc-第二.txt");
+        let request = OpenFiles {
+            files: vec![
+                OpenFile { path: first_path, line: Some(7), column: Some(3) },
+                OpenFile { path: second_path, line: Some(11), column: Some(5) },
+            ],
+        };
+        open(request.clone()).unwrap();
+        open(request.clone()).unwrap();
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        inbox.close();
+        inbox.close();
+        assert!(matches!(open(request.clone()), Err(TrySendError::Disconnected(rejected)) if rejected == request));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(inbox.drain(), vec![request.clone(), request.clone()]);
+        assert!(matches!(open(request.clone()), Err(TrySendError::Disconnected(rejected)) if rejected == request));
+        assert!(inbox.drain().is_empty());
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn external_open_close_during_admitted_wake_keeps_bounded_ownership() {
+        use kwil_core_workspace::instance::{OpenFile, OpenFiles};
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let resume = std::sync::Arc::new(AtomicBool::new(false));
+        let wake_resume = resume.clone();
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = wakes.clone();
+        let (open, inbox) = external_open_channel(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            entered.try_send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !wake_resume.load(std::sync::atomic::Ordering::Acquire) {
+                // Mock a waiting wake without a mutex or busy loop; tolerate
+                // spurious unparks under one fixed deadline, never UI polling.
+                let wait =
+                    deadline.checked_duration_since(std::time::Instant::now()).expect("mock wake release deadline");
+                std::thread::park_timeout(wait);
+            }
+            Ok(())
+        });
+        let request = OpenFiles {
+            files: vec![OpenFile {
+                path: std::env::temp_dir().join("kwil-ipc-racing-close-日本語.txt"),
+                line: Some(2),
+                column: Some(4),
+            }],
+        };
+        let admitted = request.clone();
+        let producer = std::thread::spawn(move || {
+            let result = open(admitted);
+            (open, result)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The callback is still waiting: close must not wait for its producer.
+        inbox.close();
+        resume.store(true, std::sync::atomic::Ordering::Release);
+        producer.thread().unpark();
+        let (open, result) = producer.join().unwrap();
+        result.unwrap();
+        assert!(matches!(open(request.clone()), Err(TrySendError::Disconnected(rejected)) if rejected == request));
+        assert_eq!(inbox.drain(), vec![request]);
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

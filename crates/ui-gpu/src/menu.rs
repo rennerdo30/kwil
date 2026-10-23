@@ -29,12 +29,12 @@ pub(super) const MENUS: &[Menu] = &[
         title: "&File",
         entries: &[
             Item("&New File", "file.new"),
-            Item("&Open File…", "file.open"),
-            Item("Open &Recent…", "file.recent"),
+            Item("&Open Fileâ€¦", "file.open"),
+            Item("Open &Recentâ€¦", "file.recent"),
             Item("Reopen Close&d Tab", "file.reopenClosed"),
             Separator,
             Item("&Save", "file.save"),
-            Item("Save &As…", "file.saveAs"),
+            Item("Save &Asâ€¦", "file.saveAs"),
             Item("Save A&ll", "file.saveAll"),
             Separator,
             Item("&Close Tab", "file.close"),
@@ -82,7 +82,7 @@ pub(super) const MENUS: &[Menu] = &[
     Menu {
         title: "&View",
         entries: &[
-            Item("&Command Palette…", "view.commandPalette"),
+            Item("&Command Paletteâ€¦", "view.commandPalette"),
             Separator,
             Item("Zoom &In", "view.zoomIn"),
             Item("Zoom &Out", "view.zoomOut"),
@@ -92,16 +92,16 @@ pub(super) const MENUS: &[Menu] = &[
     Menu {
         title: "Sea&rch",
         entries: &[
-            Item("&Find…", "search.find"),
+            Item("&Findâ€¦", "search.find"),
             Separator,
-            Item("Go to &Line…", "navigation.goToLine"),
-            Item("&Go to File…", "view.fileFinder"),
+            Item("Go to &Lineâ€¦", "navigation.goToLine"),
+            Item("&Go to Fileâ€¦", "view.fileFinder"),
             Item("Go to Matching &Bracket", "navigation.matchBracket"),
         ],
     },
     Menu {
         title: "&Help",
-        entries: &[Item("Show All &Commands…", "view.commandPalette"), Separator, Item("&About Kwil", ABOUT)],
+        entries: &[Item("Show All &Commandsâ€¦", "view.commandPalette"), Separator, Item("&About Kwil", ABOUT)],
     },
 ];
 
@@ -144,7 +144,7 @@ pub(super) struct Available {
     pub recent: bool,
     pub closed: bool,
     pub dirty: bool,
-    /// The in-file search card is not hosted by the GUI yet.
+    /// The fixed search worker and current Editor snapshot are available.
     pub search: bool,
     pub zoom_in: bool,
     pub zoom_out: bool,
@@ -159,7 +159,8 @@ pub(super) fn enabled(available: &Available, command: &str) -> bool {
         "file.reopenClosed" => available.closed,
         "file.saveAll" => available.dirty,
         "view.settings" | "view.settingsFile" => available.settings,
-        "view.commandPalette" | "view.fileFinder" | "navigation.goToLine" | "theme.select" => available.palette,
+        "navigation.goToLine" => true,
+        "view.commandPalette" | "view.fileFinder" | "theme.select" => available.palette,
         "view.zoomIn" => available.zoom_in,
         "view.zoomOut" => available.zoom_out,
         "view.zoomReset" => available.zoom_reset,
@@ -332,7 +333,7 @@ impl Keys {
     }
 }
 
-/// "ctrl+shift+p" → "Ctrl+Shift+P"; chords are separated by a space.
+/// "ctrl+shift+p" â†’ "Ctrl+Shift+P"; chords are separated by a space.
 pub(super) fn pretty(keys: &str) -> String {
     keys.split_whitespace()
         .map(|chord| {
@@ -367,6 +368,9 @@ pub(super) fn pretty(keys: &str) -> String {
 /// match the pixels on screen.
 #[derive(Default)]
 pub(super) struct MenuBar {
+    pub toolbar: Vec<Tool>,
+    pub toolbar_surface: Option<(usize, usize, u64)>,
+    pub toolbar_hover: Option<&'static str>,
     pub state: State,
     /// Mnemonic underlines, shown while navigating with the keyboard.
     pub cues: bool,
@@ -379,6 +383,41 @@ pub(super) struct MenuBar {
     pub scroll: usize,
     /// Keyboard moved the highlight; the next paint scrolls it into view.
     pub reveal: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Tool {
+    pub rect: Rect,
+    pub icon: icons::Icon,
+    pub command: &'static str,
+    pub enabled: bool,
+}
+pub(super) fn toolbar(area: TabArea, titles: &[TabArea], m: &Metrics, available: &Available) -> Vec<Tool> {
+    let first = titles.last().map_or(area.x, |r| r.x + r.width).saturating_add(m.gap);
+    let width = m.dip(30.0);
+    let mut end = area.x + area.width;
+    let mut tools = Vec::with_capacity(7);
+    for (icon, command) in [
+        (icons::Icon::Settings, "view.settings"),
+        (icons::Icon::Search, "search.find"),
+        (icons::Icon::GoTo, "navigation.goToLine"),
+        (icons::Icon::Redo, "edit.redo"),
+        (icons::Icon::Undo, "edit.undo"),
+        (icons::Icon::Save, "file.save"),
+        (icons::Icon::Open, "file.open"),
+    ] {
+        if end.saturating_sub(first) < width {
+            break;
+        }
+        end -= width;
+        tools.push(Tool {
+            rect: Rect { x: end, y: area.y, w: width, h: area.height },
+            icon,
+            command,
+            enabled: enabled(available, command),
+        });
+    }
+    tools
 }
 
 impl MenuBar {
@@ -607,6 +646,26 @@ pub(super) fn draw_bar(
             underline(pixels, stride, font, rect, x, baseline, menu.title, fg, m);
         }
     }
+    for tool in &bar.toolbar {
+        let r = tool.rect;
+        if bar.toolbar_hover == Some(tool.command) && tool.enabled {
+            chrome::round_rect(
+                pixels,
+                stride,
+                Rect { x: r.x, y: r.y + inset, w: r.w, h: r.h.saturating_sub(2 * inset) },
+                m.radius,
+                chrome::mix(bg, fg, 0x26),
+            );
+        }
+        icons::draw(
+            pixels,
+            stride,
+            tool.icon,
+            ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32),
+            m.dip(18.0),
+            if tool.enabled { fg } else { chrome::mix(bg, fg, 0x55) },
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -735,7 +794,7 @@ impl App {
                     .and_then(View::editor)
                     .map_or(tab.revision != tab.saved_revision, |editor| editor.document().is_dirty())
             }),
-            search: false,
+            search: self.search.is_some() && self.view.editor().is_some(),
             zoom_in: self.zoom.would_change("view.zoomIn"),
             zoom_out: self.zoom.would_change("view.zoomOut"),
             zoom_reset: self.zoom.would_change("view.zoomReset"),
@@ -744,7 +803,11 @@ impl App {
 
     /// Menus never compete with a modal card, the save prompt or an IME.
     fn menu_allowed(&self) -> bool {
-        !self.settings_open() && !self.palette_open() && self.save_path.is_none() && !self.composing
+        !self.settings_open()
+            && !self.palette_open()
+            && !self.search_panel.is_open()
+            && self.save_path.is_none()
+            && !self.composing
     }
 
     pub(super) fn menu_set(&mut self, state: State, cues: bool) {
@@ -795,6 +858,10 @@ impl App {
     }
 
     pub(super) fn request_frame(&mut self) {
+        if let Some(dialog) = &self.desktop_window {
+            dialog.gfx.window.request_redraw();
+            return;
+        }
         if let Some(gfx) = &self.gfx {
             self.redraw_requested = true;
             gfx.window.request_redraw();
@@ -825,7 +892,7 @@ impl App {
         true
     }
 
-    pub(super) fn menu_key(&mut self, el: &ActiveEventLoop, event: &KeyEvent) -> bool {
+    pub(super) fn menu_key(&mut self, el: Option<&ActiveEventLoop>, event: &HostKey<'_>) -> bool {
         let available = self.menu_available();
         let usable = |command: &str| enabled(&available, command);
         let open = self.menu.state.is_open();
@@ -913,6 +980,16 @@ impl App {
             return false;
         }
         let pointer = self.pointer;
+        let size = self.pending_resize.unwrap_or(self.size);
+        if self.menu.toolbar_surface == Some((size.0, size.1, self.ui.scale.to_bits()))
+            && let Some(tool) = self.menu.toolbar.iter().find(|t| t.rect.contains(pointer)).copied()
+        {
+            if tool.enabled && enabled(&self.menu_available(), tool.command) {
+                self.menu_set(State::Closed, false);
+                self.run_menu_command(Some(el), tool.command);
+            }
+            return true;
+        }
         if let Some(dropdown) = self.current_dropdown()
             && dropdown.area.contains(pointer)
         {
@@ -920,7 +997,7 @@ impl App {
                 && enabled(&self.menu_available(), command)
             {
                 self.menu_set(State::Closed, false);
-                self.run_menu_command(el, command);
+                self.run_menu_command(Some(el), command);
             }
             return true;
         }
@@ -988,21 +1065,34 @@ impl App {
         true
     }
 
+    pub(super) fn toolbar_track(&mut self) {
+        let hovered = self.menu.toolbar.iter().find(|tool| tool.rect.contains(self.pointer)).map(|tool| tool.command);
+        if hovered != self.menu.toolbar_hover {
+            self.menu.toolbar_hover = hovered;
+            self.chrome_dirty = true;
+            self.request_frame();
+        }
+    }
+
     /// Runs a menu command through the same path as the palette and bindings.
-    pub(super) fn run_menu_command(&mut self, el: &ActiveEventLoop, command: &'static str) {
+    pub(super) fn run_menu_command(&mut self, el: Option<&ActiveEventLoop>, command: &'static str) {
         if command == ABOUT {
             let damage = self.view.set_notice(format!("Kwil {} - MIT License", env!("CARGO_PKG_VERSION")));
             self.apply(damage);
             return;
         }
         if command == "file.quit" {
-            self.request_close(el, false);
+            if let Some(el) = el {
+                self.request_close(el, false);
+            }
             return;
         }
         // The palette's command path owns settings/palette dispatch and the Vim
         // model split; zoom and file commands reach their hosts through `edit`.
         self.palette_action(kwil_core_commands::palette::PaletteAction::Command(command));
-        if self.view.wants_exit() {
+        if self.may_exit()
+            && let Some(el) = el
+        {
             el.exit();
         }
     }
@@ -1180,12 +1270,12 @@ mod tests {
             ime::capture(&workspace, true)
         });
         assert!(!captured && matches!(destination, ime::Destination::Cancelled));
-        ime::commit(&mut workspace, destination, "日本".into(), std::time::Duration::ZERO);
+        ime::commit(&mut workspace, destination, "æ—¥æœ¬".into(), std::time::Duration::ZERO);
         assert_eq!(length(&workspace), 0, "IME text never lands behind the menu");
         // Closed menu: the same shared routing captures the editor as before.
         let destination = ime_target(false, || ime::capture(&workspace, true));
-        ime::commit(&mut workspace, destination, "日本".into(), std::time::Duration::ZERO);
-        assert_eq!(length(&workspace), "日本".len() as u64);
+        ime::commit(&mut workspace, destination, "æ—¥æœ¬".into(), std::time::Duration::ZERO);
+        assert_eq!(length(&workspace), "æ—¥æœ¬".len() as u64);
     }
 
     #[test]
@@ -1212,7 +1302,7 @@ mod tests {
 
     #[test]
     fn no_item_runs_a_command_this_build_does_not_host() {
-        // Theme switching and the search card are not hosted on this build.
+        // Theme switching is not hosted; Find follows the fixed worker gate.
         for entry in MENUS.iter().flat_map(|menu| menu.entries) {
             if let Item(label, command) = entry {
                 assert!(!command.starts_with("theme."), "{label}");
@@ -1229,6 +1319,8 @@ mod tests {
         assert!(!enabled(&none, "edit.undo"), "editing commands need an editor");
         assert!(!enabled(&none, "view.commandPalette"), "palette commands wait for the palette worker");
         assert!(!enabled(&none, "search.find"), "find is disabled until the GUI hosts the search card");
+        assert!(enabled(&none, "navigation.goToLine"), "line mode does not need catalogue readiness");
+        assert!(enabled(&Available { search: true, ..Default::default() }, "search.find"));
         assert!(enabled(&none, "file.new") && enabled(&none, "file.quit") && enabled(&none, ABOUT));
         let zoomed = Available { zoom_out: true, zoom_reset: true, ..none };
         assert!(!enabled(&zoomed, "view.zoomIn") && enabled(&zoomed, "view.zoomReset"));
@@ -1252,5 +1344,26 @@ mod tests {
         assert!(keys.owns(Preset::VsCode, &[], Mode::Insert, chord("alt+z")), "VS Code binds Alt+Z");
         let unbound = [Binding { keys: "alt+f".into(), command: String::new(), context: None, mode: None }];
         assert!(keys.owns(Preset::VsCode, &unbound, Mode::Insert, chord("alt+f")));
+    }
+    #[test]
+    fn svg_command_buttons_fit_without_overlapping_menu_titles_and_keep_disabled_actions() {
+        for scale in [1.0, 1.5, 2.0] {
+            let m = Metrics::new(scale);
+            let titles = [TabArea { x: 0, y: 0, width: m.dip(360.0), height: m.menu }];
+            for width in [7, 320, 800, 1600] {
+                let area = TabArea { x: 0, y: 0, width, height: m.menu };
+                let tools = toolbar(area, &titles, &m, &Available::default());
+                for tool in &tools {
+                    assert!(tool.rect.x >= titles[0].width + m.gap);
+                    assert!(tool.rect.x + tool.rect.w <= width);
+                }
+                for pair in tools.windows(2) {
+                    assert!(pair[1].rect.x + pair[1].rect.w <= pair[0].rect.x);
+                }
+                if let Some(search) = tools.iter().find(|t| t.command == "search.find") {
+                    assert!(!search.enabled);
+                }
+            }
+        }
     }
 }

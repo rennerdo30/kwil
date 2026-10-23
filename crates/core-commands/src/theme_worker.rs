@@ -101,7 +101,7 @@ impl ThemeWorker {
         scheme: Scheme,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, ThemeError> {
-        Self::start_with(config, selection, scheme, None, wake, |_| {})
+        Self::start_with(config, selection, scheme, None, true, wake, |_| {})
     }
     /// Seed the post-first-frame worker from the already validated startup
     /// cache. Invalid/deleted source themes then retain those displayed pixels
@@ -113,13 +113,14 @@ impl ThemeWorker {
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, ThemeError> {
         cached.theme.validate()?;
-        Self::start_with(config, cached.selection, scheme, Some(cached.theme), wake, |_| {})
+        Self::start_with(config, cached.selection, scheme, Some(cached.theme), true, wake, |_| {})
     }
     fn start_with(
         config: ThemeWorkerConfig,
         selection: ThemeSelection,
         scheme: Scheme,
         initial_theme: Option<Theme>,
+        watch_files: bool,
         wake: impl Fn() + Send + 'static,
         before_publish: impl Fn(PublishStage) + Send + 'static,
     ) -> Result<Self, ThemeError> {
@@ -157,8 +158,9 @@ impl ThemeWorker {
             ready: Condvar::new(),
         });
         let inner = shared.clone();
-        let worker =
-            thread::Builder::new().name("kwil-theme".into()).spawn(move || run(config, inner, wake, before_publish))?;
+        let worker = thread::Builder::new()
+            .name("kwil-theme".into())
+            .spawn(move || run(config, inner, watch_files, wake, before_publish))?;
         Ok(Self { shared, worker: Some(worker) })
     }
     /// Reduces actions into a complete desired state before replacing the slot:
@@ -301,7 +303,13 @@ fn catalogue(
     }
     Ok(out)
 }
-fn run(config: ThemeWorkerConfig, shared: Arc<Shared>, wake: impl Fn(), before_publish: impl Fn(PublishStage)) {
+fn run(
+    config: ThemeWorkerConfig,
+    shared: Arc<Shared>,
+    watch_files: bool,
+    wake: impl Fn(),
+    before_publish: impl Fn(PublishStage),
+) {
     let mut startup_errors = Vec::new();
     let setup = (|| {
         fs::create_dir_all(&config.user_directory)?;
@@ -311,13 +319,23 @@ fn run(config: ThemeWorkerConfig, shared: Arc<Shared>, wake: impl Fn(), before_p
     if let Err(e) = setup {
         diagnostic(&mut startup_errors, e);
     }
-    let invalidations = shared.clone();
-    let watcher =
-        FileWatcher::directory(&config.user_directory, Duration::from_millis(30), move |_| invalidations.invalidate());
-    if let Err(e) = &watcher {
-        diagnostic(&mut startup_errors, format!("theme live reload unavailable: {e}"));
-    }
-    let _watcher = watcher.ok();
+    // Public startup always enables the native watcher. Contract tests may
+    // instead provide explicit invalidations so OS event delivery is not
+    // mistaken for spontaneous worker activity.
+    let _watcher = if watch_files {
+        let invalidations = shared.clone();
+        match FileWatcher::directory(&config.user_directory, Duration::from_millis(30), move |_| {
+            invalidations.invalidate()
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                diagnostic(&mut startup_errors, format!("theme live reload unavailable: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut reload = 0;
     let mut themes = builtins();
     let mut last_written: Option<CachedTheme> = None;

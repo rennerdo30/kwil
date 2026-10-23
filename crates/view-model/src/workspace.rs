@@ -366,7 +366,12 @@ impl Workspace {
 
     pub fn activate(&mut self, id: DocumentId) -> bool {
         self.sync_active();
-        self.session.activate(id)
+        let previous = self.session.active();
+        let activated = self.session.activate(id);
+        if activated && previous != self.session.active() {
+            self.input_epoch = self.input_epoch.wrapping_add(1);
+        }
+        activated
     }
 
     pub fn cycle(&mut self, backwards: bool) -> Damage {
@@ -520,7 +525,7 @@ impl Workspace {
                 view.editor = None;
                 view.top = tab.first_visible_line;
                 view.set_horizontal_window(tab.first_byte_column, 64 << 10);
-                view.set_notice("Recovering closed tab…".into());
+                view.set_notice("Recovering closed tabâ€¦".into());
                 self.views.insert(id, view);
                 self.files.queue.push_back(DocumentRequest::Recover { tab });
                 self.pump_files();
@@ -835,7 +840,7 @@ impl Workspace {
         let mut view = View::new(None);
         view.editor = None;
         view.path = Some(path.clone());
-        view.set_notice("Opening…".into());
+        view.set_notice("Openingâ€¦".into());
         self.views.insert(id, view);
         self.refresh_save_destinations();
         self.files.queue.push_back(DocumentRequest::Open { document: id, revision: 0, path });
@@ -918,7 +923,7 @@ impl Workspace {
         self.refresh_save_destinations();
         self.files.queue.push_back(DocumentRequest::Save { document: id, request, plan });
         if let Some(view) = self.views.get_mut(&id) {
-            view.set_notice("Saving…".into());
+            view.set_notice("Savingâ€¦".into());
         }
         self.pump_files();
         Ok(())
@@ -1046,11 +1051,24 @@ impl Workspace {
         Ok(())
     }
 
+    /// Existing hot-exit policy used by the terminal frontend and recovery callers.
     pub fn request_window_close(&mut self, discard: bool) -> io::Result<()> {
+        self.request_close_policy(discard, true)
+    }
+    /// Desktop close asks about dirty tabs even when restoring the session is enabled.
+    /// This retains the same accepted-save and metadata-durability gates.
+    pub fn request_window_close_with_prompt(&mut self) -> io::Result<()> {
+        self.request_close_policy(false, false)
+    }
+    pub fn discard_pending_close(&mut self) -> io::Result<()> {
+        if self.files.quit { self.request_close_policy(true, false) } else { self.discard_close_target() }
+    }
+    fn request_close_policy(&mut self, discard: bool, allow_hot_exit: bool) -> io::Result<()> {
         if discard && self.files.manual_guard {
             self.files.exit_without_metadata = true;
         }
-        if !discard
+        if allow_hot_exit
+            && !discard
             && self.files.restore_session == Some(true)
             && self.files.storage_ready
             && !self.files.journal_failed.keys().any(|id| self.views.contains_key(id))
@@ -1125,7 +1143,7 @@ impl Workspace {
         self.files.manual_guard = false;
         self.files.exit = false;
         self.files.close.clear();
-        self.set_notice("Preserving tabs and unsaved work… Esc cancels; Ctrl+Shift+Q discards this tab".into());
+        self.set_notice("Preserving tabs and unsaved workâ€¦ Esc cancels; Ctrl+Shift+Q discards this tab".into());
         self.checkpoint_session();
         if !self.files.queue.iter().any(|request| matches!(request, DocumentRequest::FlushJournals)) {
             self.files.queue.push_back(DocumentRequest::FlushJournals);
@@ -1313,7 +1331,7 @@ impl Workspace {
                     view.preview = Some(preview.text);
                     let rows = view.rows();
                     view.set_rows(rows);
-                    view.set_notice("Preparing decoded document…".into());
+                    view.set_notice("Preparing decoded documentâ€¦".into());
                     damage.full = self.active_id() == document;
                 }
             }
@@ -1807,7 +1825,7 @@ mod tests {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         let first = workspace.active_id();
         workspace
-            .execute("edit.insert", &CommandArgs { text: Some("日本語".into()), ..Default::default() }, 1)
+            .execute("edit.insert", &CommandArgs { text: Some("æ—¥æœ¬èªž".into()), ..Default::default() }, 1)
             .unwrap();
         assert!(workspace.file_command("file.new").unwrap());
         let second = workspace.active_id();
@@ -1823,7 +1841,37 @@ mod tests {
         workspace.file_command("file.reopenClosed").unwrap();
         assert_eq!(workspace.active_id(), second);
         workspace.activate(first);
-        assert_eq!(workspace.editor().unwrap().primary_cursor().head, "日本語".len() as u64);
+        assert_eq!(workspace.editor().unwrap().primary_cursor().head, "æ—¥æœ¬èªž".len() as u64);
+    }
+
+    #[test]
+    fn confirmed_window_close_keeps_dirty_work_pending_even_with_session_restore() {
+        let make = || {
+            let mut workspace = Workspace::new(View::new(None)).unwrap();
+            workspace
+                .execute(
+                    "edit.insert",
+                    &crate::CommandArgs { text: Some("keep unsaved changes".into()), ..Default::default() },
+                    1,
+                )
+                .unwrap();
+            workspace.files.restore_session = Some(true);
+            workspace.files.storage_ready = true;
+            workspace.files.metadata_durable = true;
+            workspace
+        };
+        let mut desktop = make();
+        desktop.request_window_close_with_prompt().unwrap();
+        assert!(desktop.close_pending());
+        assert!(!desktop.files.hot_exit);
+        assert!(!desktop.wants_exit());
+        assert!(desktop.editor().unwrap().document().is_dirty());
+        desktop.cancel_close_intent();
+        assert!(!desktop.close_pending());
+        assert!(desktop.editor().unwrap().document().is_dirty());
+        let mut terminal = make();
+        terminal.request_window_close(false).unwrap();
+        assert!(terminal.files.hot_exit, "the terminal's existing recovery policy is preserved");
     }
 
     #[test]
@@ -1988,7 +2036,7 @@ mod tests {
         workspace.file_command("file.reopenClosed").unwrap();
         workspace.set_rows(2);
         let mut document = crate::Document::new();
-        document.buffer.insert(0, "界a\nxyz".as_bytes()).unwrap();
+        document.buffer.insert(0, "ç•Œa\nxyz".as_bytes()).unwrap();
         document.saved_revision = 1;
         workspace.document_result(DocumentResult::Recovered {
             document: first,
@@ -2907,5 +2955,225 @@ mod tests {
             assert!(tiny.hit(0, 0).is_none());
             assert!(tiny.scroll_copy(1).is_none());
         }
+    }
+}
+
+// ROOT-only proposal: insert this type in workspace.rs, re-export from lib.rs.
+// Private fields prevent GUI code from manufacturing another prompt's ticket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeFilePrompt {
+    generation: u64,
+    kind: FilePromptKind,
+    document: DocumentId,
+    revision: u64,
+    epoch: u64,
+    active: DocumentId,
+    close: Vec<DocumentId>,
+    save_all: Vec<DocumentId>,
+    quit: bool,
+}
+impl NativeFilePrompt {
+    pub fn kind(&self) -> FilePromptKind {
+        self.kind
+    }
+    pub fn document(&self) -> DocumentId {
+        self.document
+    }
+}
+
+impl Workspace {
+    /// GUI teardown must consume accepted save receipts, including a completion
+    /// deferred until existing recovery/journal admission becomes available.
+    pub fn file_saves_pending(&self) -> bool {
+        !self.files.saves.is_empty()
+            || self.views.values().any(|view| view.editor().is_some_and(|editor| editor.has_pending_save_completion()))
+    }
+
+    /// Capture only native-chooser prompt kinds. TUI's String path stays intact.
+    pub fn native_file_prompt(&self) -> Option<NativeFilePrompt> {
+        let prompt = self.files.prompt.as_ref()?;
+        if prompt.kind == FilePromptKind::Recent {
+            return None;
+        }
+        Some(NativeFilePrompt {
+            generation: prompt.generation,
+            kind: prompt.kind,
+            document: prompt.document,
+            revision: prompt.revision,
+            epoch: self.input_epoch,
+            active: self.active_id(),
+            close: self.files.close.iter().copied().collect(),
+            save_all: self.files.save_all.iter().copied().collect(),
+            quit: self.files.quit,
+        })
+    }
+
+    pub fn native_file_prompt_is_current(&self, ticket: &NativeFilePrompt) -> bool {
+        self.native_file_prompt().as_ref() == Some(ticket)
+            && self
+                .views
+                .get(&ticket.document)
+                .is_some_and(|view| view.editor().map_or(0, |editor| editor.document().revision()) == ticket.revision)
+    }
+
+    /// Cancel only the prompt this native operation owns, even if its revision
+    /// or tab context has become stale. Never cancel a newer prompt's intent.
+    pub fn cancel_native_file_prompt(&mut self, ticket: &NativeFilePrompt) {
+        if self.files.prompt.as_ref().is_some_and(|prompt| {
+            prompt.generation == ticket.generation && prompt.document == ticket.document && prompt.kind == ticket.kind
+        }) {
+            self.cancel_file_prompt();
+        }
+    }
+
+    /// Admit an explicitly accepted native path directly into the existing
+    /// prepare/save/journal engine. No lossy String round trip or cwd fallback.
+    pub fn submit_native_file_prompt(&mut self, ticket: &NativeFilePrompt, path: PathBuf) -> io::Result<()> {
+        if !self.native_file_prompt_is_current(ticket) {
+            self.cancel_native_file_prompt(ticket);
+            return Err(io::Error::other("Document or file action changed while choosing a path; retry"));
+        }
+        if !path.is_absolute() || path.file_name().is_none() {
+            self.cancel_native_file_prompt(ticket);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The native chooser must accept an absolute file path",
+            ));
+        }
+        self.files.prompt = None;
+        let result = match ticket.kind {
+            FilePromptKind::Open => self.open_path(path).map(|_| ()),
+            FilePromptKind::SaveAs => self.save_document(ticket.document, Some(path)),
+            FilePromptKind::Recent => {
+                unreachable!("native_file_prompt excludes recent-number prompts")
+            }
+        };
+        if result.is_err() {
+            // A failed Save As cannot leave a close or Save All continuation.
+            self.files.save_all.clear();
+            self.cancel_close_intent();
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod native_path_tests {
+    use super::*;
+    fn pending() -> Workspace {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace
+            .execute("edit.insert", &crate::CommandArgs { text: Some("dirty 日本語".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.file_command("file.save").unwrap();
+        workspace
+    }
+    fn save_count(workspace: &Workspace) -> usize {
+        workspace.files.queue.iter().filter(|request| matches!(request, DocumentRequest::Save { .. })).count()
+    }
+    #[test]
+    fn native_no_write_until_accept_and_relative_path_never_uses_cwd() {
+        let mut workspace = pending();
+        let ticket = workspace.native_file_prompt().unwrap();
+        assert_eq!(save_count(&workspace), 0);
+        workspace.submit_native_file_prompt(&ticket, PathBuf::from("relative.txt")).unwrap_err();
+        assert_eq!(save_count(&workspace), 0);
+        assert!(workspace.editor().unwrap().document().path().is_none());
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        assert!(!workspace.close_pending());
+    }
+    #[test]
+    fn native_accept_queues_existing_save_for_exact_path_and_revision() {
+        let mut workspace = pending();
+        let ticket = workspace.native_file_prompt().unwrap();
+        let path = std::env::temp_dir().join("KW56-日本語-accepted.txt");
+        workspace.submit_native_file_prompt(&ticket, path.clone()).unwrap();
+        assert_eq!(save_count(&workspace), 1);
+        let request = workspace
+            .files
+            .queue
+            .iter()
+            .find_map(|request| match request {
+                DocumentRequest::Save { document, request, .. } => Some((*document, request)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(request.0, ticket.document);
+        assert_eq!(request.1.revision, ticket.revision);
+        assert_eq!(request.1.path, path);
+        // No worker is attached: this is admission evidence, never disk-write proof.
+    }
+    #[test]
+    fn native_cancel_of_close_save_clears_continuations() {
+        let mut workspace = pending();
+        workspace.file_command("file.saveAndQuit").unwrap();
+        let ticket = workspace.native_file_prompt().unwrap();
+        assert!(workspace.close_pending());
+        workspace.cancel_native_file_prompt(&ticket);
+        assert!(!workspace.close_pending());
+        assert!(!workspace.wants_exit());
+        assert_eq!(save_count(&workspace), 0);
+        assert!(workspace.editor().unwrap().document().is_dirty());
+    }
+    #[test]
+    fn native_edit_while_chooser_is_open_does_not_admit_newer_bytes() {
+        let mut workspace = pending();
+        let ticket = workspace.native_file_prompt().unwrap();
+        workspace
+            .execute("edit.insert", &crate::CommandArgs { text: Some(" newer".into()), ..Default::default() }, 2)
+            .unwrap();
+        workspace.submit_native_file_prompt(&ticket, std::env::temp_dir().join("kw56-newer.txt")).unwrap_err();
+        assert_eq!(save_count(&workspace), 0);
+        assert!(workspace.editor().unwrap().document().is_dirty());
+    }
+    #[test]
+    fn native_switch_away_and_back_invalidates_original_context() {
+        let mut workspace = pending();
+        let first = workspace.active_id();
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        workspace.activate(first);
+        workspace.file_command("file.save").unwrap();
+        let ticket = workspace.native_file_prompt().unwrap();
+        workspace.activate(second);
+        workspace.activate(first);
+        assert!(!workspace.native_file_prompt_is_current(&ticket));
+        workspace.submit_native_file_prompt(&ticket, std::env::temp_dir().join("kw56-stale.txt")).unwrap_err();
+        assert_eq!(save_count(&workspace), 0);
+    }
+    #[test]
+    fn native_close_reopen_same_document_id_and_revision_rejects_old_receipt() {
+        let mut workspace = pending();
+        let ticket = workspace.native_file_prompt().unwrap();
+        let id = workspace.active_id();
+        workspace.close(id, true).unwrap();
+        workspace.file_command("file.reopenClosed").unwrap();
+        assert!(!workspace.native_file_prompt_is_current(&ticket));
+        workspace.submit_native_file_prompt(&ticket, std::env::temp_dir().join("kw56-reopen.txt")).unwrap_err();
+        assert_eq!(save_count(&workspace), 0);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn native_unpaired_utf16_path_reaches_save_request_unchanged() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut workspace = pending();
+        let ticket = workspace.native_file_prompt().unwrap();
+        let mut units: Vec<u16> = std::env::temp_dir().as_os_str().encode_wide().collect();
+        if units.last() != Some(&92) {
+            units.push(92);
+        }
+        units.extend([0x65e5, 0xd800, 46, 116, 120, 116]);
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&units));
+        workspace.submit_native_file_prompt(&ticket, path).unwrap();
+        let request = workspace
+            .files
+            .queue
+            .iter()
+            .find_map(|request| match request {
+                DocumentRequest::Save { request, .. } => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(request.path.as_os_str().encode_wide().collect::<Vec<_>>(), units);
     }
 }

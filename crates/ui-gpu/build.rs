@@ -1,0 +1,90 @@
+use std::{fmt::Write, path::Path};
+fn attr<'a>(tag: &'a str, name: &str) -> &'a str {
+    let needle = format!(" {name}=\"");
+    tag.split_once(&needle).unwrap_or_else(|| panic!("missing {name}")).1.split('"').next().unwrap()
+}
+fn number(s: &str) -> f32 {
+    let n: f32 = s.parse().expect("SVG coordinate");
+    assert!(n.is_finite() && (-1.0..=25.0).contains(&n), "SVG coordinate bounds");
+    n
+}
+fn geometry(svg: &str) -> String {
+    assert!(
+        svg.contains("viewBox=\"0 0 24 24\"") && svg.contains("stroke-width=\"1.75\"") && svg.contains("fill=\"none\""),
+        "SVG family contract"
+    );
+    let mut out = String::new();
+    let mut count = 0;
+    for element in svg.split('<').skip(1) {
+        if element.starts_with("path ") {
+            let mut words = attr(element, "d").split_ascii_whitespace();
+            let mut at = (0., 0.);
+            let mut start = at;
+            while let Some(command) = words.next() {
+                let mut next = || number(words.next().expect("SVG path coordinate"));
+                let target = match command {
+                    "M" => {
+                        at = (next(), next());
+                        start = at;
+                        continue;
+                    }
+                    "L" => (next(), next()),
+                    "H" => (next(), at.1),
+                    "V" => (at.0, next()),
+                    "Z" => start,
+                    _ => panic!("Unsupported SVG path command {command}"),
+                };
+                write!(out, "Primitive::Line([{:?},{:?},{:?},{:?}]),", at.0, at.1, target.0, target.1).unwrap();
+                at = target;
+                count += 1;
+            }
+        } else if element.starts_with("circle ") {
+            let (x, y, r) = (number(attr(element, "cx")), number(attr(element, "cy")), number(attr(element, "r")));
+            assert!(r > 0. && r <= 12.);
+            write!(out, "Primitive::Circle([{:?},{:?},{:?}]),", x, y, r).unwrap();
+            count += 1;
+        } else {
+            assert!(element.starts_with("svg ") || element.starts_with("/svg"), "Unsupported SVG element");
+        }
+    }
+    assert!((1..=64).contains(&count));
+    out
+}
+fn main() {
+    println!("cargo:rerun-if-changed=windows.manifest");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let path = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("windows.manifest");
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", path.display());
+    }
+    let dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../assets/icons");
+    let mut source = String::from("fn geometry(icon:Icon)-> &'static [Primitive] {match icon {");
+    for (name, file) in [
+        ("Close", "close"),
+        ("Back", "back"),
+        ("Forward", "forward"),
+        ("Up", "up"),
+        ("Down", "down"),
+        ("Check", "check"),
+        ("Open", "open"),
+        ("Save", "save"),
+        ("Undo", "undo"),
+        ("Redo", "redo"),
+        ("GoTo", "goto"),
+        ("Settings", "settings"),
+        ("Markdown", "markdown"),
+        ("Split", "split"),
+        ("Text", "text"),
+        ("File", "file"),
+        ("Sun", "sun"),
+        ("Moon", "moon"),
+        ("Search", "search"),
+    ] {
+        let path = dir.join(format!("{file}.svg"));
+        println!("cargo:rerun-if-changed={}", path.display());
+        let svg = std::fs::read_to_string(path).unwrap();
+        write!(source, "Icon::{name}=> &[{}],", geometry(&svg)).unwrap();
+    }
+    source.push_str("}}");
+    std::fs::write(Path::new(&std::env::var("OUT_DIR").unwrap()).join("svg_icons.rs"), source).unwrap();
+}
