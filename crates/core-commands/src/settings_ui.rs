@@ -1061,7 +1061,9 @@ impl KeyCapture {
         Ok(self.keys.iter().map(chord_name).collect::<Vec<_>>().join(" "))
     }
 }
-fn chord_name(key: &KeyChord) -> String {
+/// Canonical settings spelling of a parsed logical chord. Displaying this
+/// value avoids retaining unbounded aliases such as zero-padded function keys.
+pub fn chord_name(key: &KeyChord) -> String {
     let mut s = String::new();
     for (enabled, name) in [
         (key.modifiers.ctrl, "ctrl+"),

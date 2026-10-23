@@ -17,7 +17,7 @@
 //! ```
 use crate::settings_session::SettingsPanel;
 use kwil_core_commands::{
-    Binding, Context, Key, KeyChord, Mode, NamedKey,
+    Binding, Context, Key, KeyChord, KeySequence, Mode, NamedKey,
     settings::SettingsError,
     settings_ui::{KeyCapture, KeyConflict, SettingValue, SettingsDocument},
 };
@@ -174,10 +174,20 @@ impl PanelWindow {
         if let Some(conflict) = self.confirmation.get(self.confirmation_index) {
             fields.extend([
                 format!("Conflict {}/{}", self.confirmation_index + 1, self.confirmation.len()),
-                // Parsing treats whitespace as chord separators. Display the
-                // same sequence compactly so raw TOML spacing cannot consume
-                // the grid's bounded inspection window and hide a chord.
-                format!("Keys: {}", conflict.keys.split_whitespace().collect::<Vec<_>>().join(" ")),
+                // Display parsed identity, not an arbitrarily long equivalent
+                // spelling from TOML (whitespace, aliases or numeric padding).
+                format!(
+                    "Keys: {}",
+                    conflict.keys.parse::<KeySequence>().map_or_else(
+                        |_| "Invalid shortcut; repair settings file".into(),
+                        |sequence| sequence
+                            .0
+                            .iter()
+                            .map(kwil_core_commands::settings_ui::chord_name)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                ),
                 format!("Command: {}", conflict.command),
                 format!("Kind: {:?}", conflict.kind),
             ]);
@@ -897,7 +907,7 @@ mod tests {
 
     #[test]
     fn settings_confirmation_pages_preserve_long_fields_in_compact_cards() {
-        let raw_keys = format!("ctrl+shift+f11{}ctrl+shift+f10", " ".repeat(5000));
+        let raw_keys = format!("ctrl+shift+f{}11{}ctrl+shift+f10", "0".repeat(5000), " ".repeat(5000));
         let doc = SettingsDocument::parse(&format!("[[bindings]]\nkeys='{raw_keys}'\ncommand='file.open'\n")).unwrap();
         let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
         panel.search(&doc, "file.save").unwrap();
