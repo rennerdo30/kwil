@@ -469,6 +469,13 @@ struct Journal {
     #[cfg(test)]
     fail_sync: bool,
 }
+impl Drop for Journal {
+    fn drop(&mut self) {
+        // Closing one handle need not release the lock while a duplicated or
+        // inherited handle still refers to the same open file description.
+        let _ = self._lock.unlock();
+    }
+}
 impl Journal {
     fn open(directory: PathBuf) -> Result<Self, WorkerError> {
         check_directory(&directory)?;
@@ -986,7 +993,7 @@ mod tests {
         assert!(error.message.contains("cannot verify durable"));
         assert!(!e.journal.path(1, "retired").exists());
         drop(e);
-        assert_eq!(Journal::open(scratch.0.clone()).unwrap().active.unwrap().receipt.pending().len(), 3);
+        assert_eq!(Journal::open(scratch.0.clone()).unwrap().active.as_ref().unwrap().receipt.pending().len(), 3);
     }
 
     #[cfg(target_os = "linux")]
@@ -1216,6 +1223,23 @@ mod tests {
         assert!(e.execute(Request::Undo { journal_id: 1 }).is_err());
         drop(e);
         assert!(Journal::open(scratch.0.clone()).is_err(), "corrupt intent never silently reset");
+    }
+
+    #[test]
+    fn journal_owner_drop_releases_lock_while_inherited_descriptor_lives() {
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let owner = engine(&scratch, &fake);
+        // A concurrent Unix fork can retain this open-file description until
+        // exec, even though normal file descriptors are close-on-exec.
+        let inherited = owner.journal._lock.try_clone().unwrap();
+        assert!(Journal::open(scratch.0.clone()).is_err());
+        drop(owner);
+        let replacement = engine(&scratch, &fake);
+        drop(inherited);
+        assert!(Journal::open(scratch.0.clone()).is_err(), "replacement must retain its own exclusive lock");
+        drop(replacement);
+        assert!(Journal::open(scratch.0.clone()).is_ok());
     }
 
     #[test]
