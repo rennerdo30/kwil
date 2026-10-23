@@ -10,6 +10,8 @@ use std::{
 };
 mod trim_spool;
 pub use trim_spool::{TrimRanges, TrimSpool};
+mod encoded;
+pub use encoded::{EncodedSavedSnapshot, save_encoded_snapshot};
 
 pub struct SaveRequest {
     pub snapshot: Snapshot,
@@ -97,6 +99,42 @@ fn save_with_operations(
     write: impl FnOnce(&Snapshot, &mut File) -> io::Result<Option<Range<u64>>>,
     replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
 ) -> io::Result<SavedSnapshot> {
+    let committed = commit_with_operations(request, write, |_| Ok(()), replace)?;
+    // Indexing/rebase preparation stays on this same worker.
+    let file = TextFile::open_saved_version(&committed.path).map_err(io::Error::from)?;
+    let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
+    Ok(committed.finish(file, buffer.snapshot()))
+}
+
+struct CommittedSave {
+    path: PathBuf,
+    revision: u64,
+    warnings: Vec<String>,
+    trimmed_rows: Option<Range<u64>>,
+}
+impl CommittedSave {
+    fn finish(self, file: TextFile, snapshot: Snapshot) -> SavedSnapshot {
+        SavedSnapshot {
+            path: self.path,
+            file,
+            snapshot,
+            revision: self.revision,
+            warnings: self.warnings,
+            trimmed_rows: self.trimmed_rows,
+            trim_deletions: None,
+        }
+    }
+}
+
+/// Shared atomic envelope. Preparation sees the complete, synced temporary
+/// file, before pinning or replacing the destination. It must close temp
+/// handles before returning (Windows replacement requires that distinction).
+fn commit_with_operations(
+    request: SaveRequest,
+    write: impl FnOnce(&Snapshot, &mut File) -> io::Result<Option<Range<u64>>>,
+    prepare: impl FnOnce(&Path) -> io::Result<()>,
+    replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
+) -> io::Result<CommittedSave> {
     let path = std::path::absolute(&request.path)?;
     let parent = path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "save path has no parent"))?;
     let metadata = match fs::symlink_metadata(&path) {
@@ -126,6 +164,7 @@ fn save_with_operations(
     }
     temp.file.as_ref().unwrap().sync_all().map_err(|e| save_error(&path, e))?;
     temp.file.take();
+    prepare(&temp.path).map_err(|e| save_error(&path, e))?;
     // Do not pin an unrelated source when Save As targets a different path.
     let original = request.original.filter(|f| f.path() == path);
     let original = if original.is_none() && metadata.is_some() {
@@ -155,19 +194,7 @@ fn save_with_operations(
     File::open(parent)?
         .sync_all()
         .map_err(|e| io::Error::new(e.kind(), format!("file replaced, but directory sync failed: {e}")))?;
-    // Indexing/rebase preparation stays on this same worker. No UI-thread
-    // scan or read from the original pathname can occur during completion.
-    let file = TextFile::open_saved_version(&path).map_err(io::Error::from)?;
-    let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
-    Ok(SavedSnapshot {
-        path,
-        file,
-        snapshot: buffer.snapshot(),
-        revision: request.revision,
-        warnings,
-        trimmed_rows,
-        trim_deletions: None,
-    })
+    Ok(CommittedSave { path, revision: request.revision, warnings, trimmed_rows })
 }
 
 fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io::Write) -> io::Result<()> {
@@ -180,8 +207,18 @@ fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io
 /// Scan and emit immutable source ranges. Trailing runs are offsets, even a
 /// gigabyte of spaces/tabs costs two integers, not a buffer or per-line edits.
 fn write_trimmed(snapshot: &Snapshot, writer: &mut File, spool: &mut TrimSpool) -> io::Result<Option<Range<u64>>> {
+    visit_trimmed(snapshot, spool, || Ok(()), |range| write_range(snapshot, range, writer))
+}
+
+/// Visit retained logical ranges in order, and spool deleted coordinates.
+/// The visitor never materializes all ranges or copies source provenance.
+fn visit_trimmed(
+    snapshot: &Snapshot,
+    spool: &mut TrimSpool,
+    mut check: impl FnMut() -> io::Result<()>,
+    mut retain: impl FnMut(Range<u64>) -> io::Result<()>,
+) -> io::Result<Option<Range<u64>>> {
     let mut trail = None;
-    let mut cr = false;
     let mut offset = 0_u64;
     let mut from = 0;
     let mut row = 0;
@@ -189,8 +226,8 @@ fn write_trimmed(snapshot: &Snapshot, writer: &mut File, spool: &mut TrimSpool) 
     let mut emit_trim = |start: u64, end: u64, line_end: u64, row: u64, from: &mut u64| -> io::Result<()> {
         if start < end {
             spool.push(start..end)?;
-            write_range(snapshot, *from..start, writer)?;
-            write_range(snapshot, end..line_end, writer)?;
+            retain(*from..start)?;
+            retain(end..line_end)?;
             *from = line_end;
             if let Some(changed) = &mut changed {
                 changed.end = row + 1;
@@ -201,38 +238,39 @@ fn write_trimmed(snapshot: &Snapshot, writer: &mut File, spool: &mut TrimSpool) 
         Ok(())
     };
     for chunk in snapshot.chunks(0..snapshot.len())? {
-        for &byte in chunk.map_err(io::Error::other)? {
-            if cr && byte != b'\n' {
-                trail = None;
-                cr = false;
-            }
-            match byte {
-                b' ' | b'\t' => {
-                    trail.get_or_insert(offset);
-                }
-                b'\r' => {
-                    cr = trail.is_some();
-                }
-                b'\n' => {
-                    if let Some(start) = trail {
-                        emit_trim(start, if cr { offset - 1 } else { offset }, offset + 1, row, &mut from)?;
+        for block in chunk.map_err(io::Error::other)?.chunks(64 << 10) {
+            check()?;
+            for &byte in block {
+                match byte {
+                    b' ' | b'\t' => {
+                        trail.get_or_insert(offset);
                     }
-                    trail = None;
-                    cr = false;
-                    row += 1;
+                    b'\r' => {
+                        if let Some(start) = trail.take() {
+                            emit_trim(start, offset, offset + 1, row, &mut from)?;
+                        }
+                    }
+                    b'\n' => {
+                        if let Some(start) = trail {
+                            emit_trim(start, offset, offset + 1, row, &mut from)?;
+                        }
+                        trail = None;
+                        // Snapshot/receipt row coordinates count logical LF bytes.
+                        // A lone CR is an ending for trimming, but not another row.
+                        row += 1;
+                    }
+                    _ => {
+                        trail = None;
+                    }
                 }
-                _ => {
-                    trail = None;
-                    cr = false;
-                }
+                offset += 1;
             }
-            offset += 1;
         }
     }
     if let Some(start) = trail {
-        emit_trim(start, if cr { offset - 1 } else { offset }, offset, row, &mut from)?;
+        emit_trim(start, offset, offset, row, &mut from)?;
     }
-    write_range(snapshot, from..snapshot.len(), writer)?;
+    retain(from..snapshot.len())?;
     spool.seal()?;
     Ok(changed)
 }
@@ -450,6 +488,23 @@ mod tests {
         assert!(error.to_string().contains("simulated write failure"));
         assert_eq!(fs::read(&path).unwrap(), b"unchanged");
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn raw_trim_streams_original_coordinates_and_lf_receipt_rows() {
+        let f = Fixture::new();
+        fs::write(f.path(), b"a \t\r\nb  \rc\t\n \t").unwrap();
+        let original = open_for_editing(&f.path()).unwrap();
+        let b = Buffer::from_file(original.clone()).unwrap();
+        let mut request = f.request(original, &b);
+        request.trim_trailing_whitespace = true;
+        let saved = save_snapshot(request).unwrap();
+        assert_eq!(fs::read(f.path()).unwrap(), b"a\r\nb\rc\n");
+        assert_eq!(saved.trimmed_rows, Some(0..3));
+        assert_eq!(
+            saved.trim_deletions.unwrap().ranges().unwrap().collect::<io::Result<Vec<_>>>().unwrap(),
+            [1..3, 6..8, 10..11, 12..14]
+        );
     }
 
     #[test]
