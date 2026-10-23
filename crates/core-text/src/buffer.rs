@@ -20,7 +20,7 @@ const TYPING_GAP: Duration = Duration::from_millis(500);
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub(crate) root: Tree,
-    originals: Arc<OriginalUses>,
+    pub(crate) originals: Arc<OriginalUses>,
 }
 
 /// Send this handle and an immutable source snapshot to an import worker.
@@ -228,7 +228,7 @@ impl<'a> Iterator for Lines<'a> {
     }
 }
 
-struct Typing {
+pub(crate) struct Typing {
     next_offset: u64,
     at: Duration,
 }
@@ -239,14 +239,15 @@ struct Typing {
 /// blocks spill to private immutable mapped temp files. Disk spill may block:
 /// bulk insertion belongs on a worker. Small typing edits stay in memory.
 pub struct Buffer {
-    snapshot: Snapshot,
-    added: Arc<AddBudget>,
-    history: History,
-    transaction: Option<Snapshot>,
-    typing: Option<Typing>,
+    pub(crate) snapshot: Snapshot,
+    pub(crate) added: Arc<AddBudget>,
+    pub(crate) history: History,
+    pub(crate) transaction: Option<Snapshot>,
+    pub(crate) typing: Option<Typing>,
+    pub(crate) worker_epoch: u64,
     // Stable document identity, carried by original pieces across checkpoints.
     // No file list, byte ownership or weak backing retention is stored here.
-    owner: Arc<()>,
+    pub(crate) owner: Arc<()>,
 }
 
 impl Default for Buffer {
@@ -256,6 +257,23 @@ impl Default for Buffer {
 }
 
 impl Buffer {
+    /// Existing non-Result mutators fail closed by panicking BEFORE any state
+    /// change on exhaustion. Result mutators propagate InvalidInput instead.
+    /// Even empty/no-op transaction boundaries invalidate outstanding seeds.
+    fn advance_worker_epoch(&mut self) -> io::Result<()> {
+        let next = self.worker_epoch.checked_add(1).ok_or_else(crate::worker_edit::overflow)?;
+        // Every mutation inside a compound leaves one terminal transition.
+        // Refusal happens before changing text, typing, history or epoch.
+        if self.transaction.is_some() {
+            next.checked_add(1).ok_or_else(crate::worker_edit::overflow)?;
+        }
+        self.worker_epoch = next;
+        Ok(())
+    }
+    fn terminal_worker_epoch(&mut self) {
+        self.worker_epoch =
+            self.worker_epoch.checked_add(1).expect("core mutation epoch exhausted before terminal mutation");
+    }
     pub fn empty() -> Self {
         Self::with_add_memory_limit(ADD_MEMORY)
     }
@@ -269,6 +287,7 @@ impl Buffer {
             history: History::new(UNDO_MEMORY),
             transaction: None,
             typing: None,
+            worker_epoch: 0,
             owner,
         }
     }
@@ -364,6 +383,7 @@ impl Buffer {
     }
 
     pub(crate) fn recovery_install(&mut self, snapshot: Snapshot) {
+        self.advance_worker_epoch().expect("core mutation epoch exhausted before mutation");
         self.snapshot = snapshot;
     }
 
@@ -422,6 +442,7 @@ impl Buffer {
     }
 
     pub fn insert(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.advance_worker_epoch()?;
         self.typing = None;
         self.insert_inner(offset, bytes, false)
     }
@@ -430,6 +451,7 @@ impl Buffer {
     /// and must be prepared on a worker via snapshot_importer first. Last-drop
     /// spill cleanup also belongs on the worker retirement path.
     pub fn insert_snapshot_range(&mut self, offset: u64, source: &Snapshot, range: Range<u64>) -> io::Result<()> {
+        self.advance_worker_epoch()?;
         self.snapshot.check_range(&(offset..offset))?;
         source.check_range(&range)?;
         if range.is_empty() {
@@ -474,6 +496,7 @@ impl Buffer {
     }
 
     pub fn delete(&mut self, range: Range<u64>) -> io::Result<()> {
+        self.advance_worker_epoch()?;
         self.snapshot.check_range(&range)?;
         self.typing = None;
         if range.is_empty() {
@@ -513,6 +536,10 @@ impl Buffer {
     /// Begin one explicit batch. Returns false for a nested begin; nested
     /// transactions are not supported. A batch stays one undo step.
     pub fn begin(&mut self) -> bool {
+        if self.transaction.is_none() {
+            self.worker_epoch.checked_add(2).expect("core mutation epoch has no terminal reservation");
+        }
+        self.advance_worker_epoch().expect("core mutation epoch exhausted before mutation");
         self.typing = None;
         if self.transaction.is_some() {
             return false;
@@ -529,6 +556,11 @@ impl Buffer {
     /// Finish a batch, optionally merging it with the preceding undo step.
     /// The editing model owns burst timing and cursor-continuity checks.
     pub fn commit_coalesced(&mut self, coalesce: bool) -> bool {
+        self.terminal_worker_epoch();
+        self.commit_inner(coalesce)
+    }
+
+    fn commit_inner(&mut self, coalesce: bool) -> bool {
         self.typing = None;
         let Some(before) = self.transaction.take() else { return false };
         let unchanged = match (&before.root, &self.snapshot.root) {
@@ -544,6 +576,7 @@ impl Buffer {
 
     /// Roll back an uncommitted batch after a fallible multi-edit operation.
     pub fn cancel(&mut self) -> bool {
+        self.terminal_worker_epoch();
         self.typing = None;
         let Some(before) = self.transaction.take() else { return false };
         self.snapshot = before;
@@ -558,6 +591,7 @@ impl Buffer {
     /// Charge frontend-independent cursor/recipe metadata against the same
     /// cap as roots. Replaces the latest charge, then evicts oldest entries.
     pub fn charge_latest_model_history(&mut self, bytes: usize) {
+        self.advance_worker_epoch().expect("core mutation epoch exhausted before mutation");
         self.history.charge_latest_model(bytes);
     }
 
@@ -565,6 +599,7 @@ impl Buffer {
     /// Caller must establish byte equivalence and finish any pending batch.
     /// History and already issued snapshots retain their old backing objects.
     pub fn checkpoint_current(&mut self, mut saved: Snapshot) -> io::Result<()> {
+        self.advance_worker_epoch()?;
         if self.transaction.is_some() || saved.len() != self.len() || saved.line_count() != self.line_count() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid saved checkpoint"));
         }
@@ -583,6 +618,7 @@ impl Buffer {
     /// Install a worker-prepared changed version as one undo step (for example
     /// streamed trim-on-save). No scan/copy occurs on the completion thread.
     pub fn install_worker_edit(&mut self, mut snapshot: Snapshot) -> io::Result<()> {
+        self.advance_worker_epoch()?;
         if self.transaction.is_some() {
             return Err(io::Error::other("cannot install worker edit during a transaction"));
         }
@@ -603,6 +639,7 @@ impl Buffer {
     /// supplies monotonic elapsed time: no timer, polling or idle work is used.
     /// Cursor movement/commands should call `end_typing_burst`.
     pub fn insert_typing(&mut self, offset: u64, bytes: &[u8], at: Duration) -> io::Result<()> {
+        self.advance_worker_epoch()?;
         let coalesce = self.transaction.is_none()
             && self.typing.as_ref().is_some_and(|previous| {
                 previous.next_offset == offset && at.checked_sub(previous.at).is_some_and(|gap| gap <= TYPING_GAP)
@@ -615,12 +652,16 @@ impl Buffer {
     }
 
     pub fn end_typing_burst(&mut self) {
+        self.advance_worker_epoch().expect("core mutation epoch exhausted before mutation");
         self.typing = None;
     }
 
     /// Undo commits any pending batch first.
     pub fn undo(&mut self) -> bool {
-        self.commit();
+        // Finishing a compound plus undo is ONE preflighted authority operation.
+        // Do not call public commit and spend a second, unreserved epoch.
+        self.terminal_worker_epoch();
+        self.commit_inner(false);
         self.typing = None;
         if let Some(snapshot) = self.history.undo() {
             self.snapshot = snapshot;
@@ -631,7 +672,8 @@ impl Buffer {
     }
 
     pub fn redo(&mut self) -> bool {
-        self.commit();
+        self.terminal_worker_epoch();
+        self.commit_inner(false);
         self.typing = None;
         if let Some(snapshot) = self.history.redo() {
             self.snapshot = snapshot;
@@ -647,6 +689,7 @@ impl Buffer {
     /// a contiguous history anchored at the current state.
     /// Active transactions and externally held snapshots are not undo history.
     pub fn set_undo_memory_limit(&mut self, bytes: usize) {
+        self.advance_worker_epoch().expect("core mutation epoch exhausted before mutation");
         self.history.set_limit(bytes);
     }
 
@@ -665,6 +708,7 @@ impl Buffer {
     /// same monotonic zero-to-positive cap. Zero/repeated/nonzero reconfiguration
     /// is refused; callers retaining an explicitly configured zero skip this.
     pub fn enable_resident_additions(&mut self, limit: usize) -> io::Result<()> {
+        self.advance_worker_epoch()?;
         self.added.enable_resident_additions(limit)
     }
 }

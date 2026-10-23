@@ -245,6 +245,13 @@ pub struct DecodedBacking {
 pub struct DecodedSnapshot {
     storage: Arc<Storage>,
 }
+/// Weak identity retains no source maps/files and prevents allocator-address ABA.
+pub(crate) struct DecodedOriginKey(std::sync::Weak<Storage>);
+impl DecodedOriginKey {
+    pub(crate) fn matches(&self, origin: &DecodedSnapshot) -> bool {
+        self.0.upgrade().is_some_and(|source| Arc::ptr_eq(&source, &origin.storage))
+    }
+}
 
 pub enum RetirementError {
     LiveSnapshots(DecodedBacking),
@@ -304,6 +311,71 @@ impl RetirementError {
 }
 
 impl DecodedBacking {
+    pub(crate) fn registered_copy_metadata() -> usize {
+        // New owner plus weak source identity's allocation header/body.
+        2 * (std::mem::size_of::<Storage>() + 2 * std::mem::size_of::<usize>())
+    }
+    /// Copy an immutable origin into the caller's ALREADY created/registered
+    /// private files. The worker ledger owns every handle/path before entry and
+    /// retains them on error or unwind. No mkdir, open, cleanup or foreign pin.
+    /// Only bytes/interpretation from a real origin can construct this copy.
+    pub(crate) fn copy_registered(
+        origin: &DecodedSnapshot,
+        paths: BackingPaths,
+        files: [&mut File; 3],
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        check()?;
+        let [raw_file, logical_file, index_file] = files;
+        for (file, bytes) in [
+            (&mut *raw_file, origin.raw_bytes()),
+            (&mut *logical_file, origin.logical_bytes()),
+            (&mut *index_file, origin.storage.checkpoints.as_ref()),
+        ] {
+            if file.metadata()?.len() != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "registered copy requires empty new files"));
+            }
+            for chunk in bytes.chunks(SCRATCH) {
+                check()?;
+                file.write_all(chunk)?;
+                check()?;
+            }
+            file.flush()?;
+            check()?;
+        }
+        // All writes finished before any map is made. Partial maps/handles
+        // simply close on failure; the caller's registered ownership remains.
+        let raw = map(raw_file)?;
+        check()?;
+        let logical = map(logical_file)?;
+        check()?;
+        let checkpoints =
+            map(index_file)?.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing copied checkpoints"))?;
+        check()?;
+        Ok(Self {
+            storage: Arc::new(Storage {
+                raw,
+                logical,
+                checkpoints,
+                interpretation: origin.interpretation(),
+                source_path: paths.raw.clone(),
+                paths,
+            }),
+        })
+    }
+
+    /// Close registered-copy maps only when no snapshot pin survives. Unlike
+    /// try_retire, this performs NO unlink; its caller owns partial-file retry.
+    pub(crate) fn close_registered(self) -> Result<(), Self> {
+        match Arc::try_unwrap(self.storage) {
+            Ok(storage) => {
+                drop(storage);
+                Ok(())
+            }
+            Err(storage) => Err(Self { storage }),
+        }
+    }
+
     /// Worker only. `private_parent` must already exist and be app-private.
     /// Input is streamed into a private raw snapshot even when TextFile mapped
     /// it; externally mutable pages never become the immutable origin.
@@ -438,6 +510,9 @@ impl DecodedBacking {
 }
 
 impl DecodedSnapshot {
+    pub(crate) fn weak_identity(&self) -> DecodedOriginKey {
+        DecodedOriginKey(Arc::downgrade(&self.storage))
+    }
     /// Mapped private bytes; no metadata checks, opens, or allocation. Cold page
     /// access still belongs on a worker. Do not pass this as globally valid str.
     pub fn logical_bytes(&self) -> &[u8] {

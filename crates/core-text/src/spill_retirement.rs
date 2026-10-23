@@ -36,6 +36,47 @@ struct PendingClaims<'a> {
     blocks: &'a [Arc<Storage>],
     claimed: usize,
 }
+
+/// Only operation-ledger allocations are passed here; NEVER a composed root.
+/// Memory children are skipped, and rollback clears only successfully acquired
+/// new Disk claims. Existing recovery overlap/PendingClaims remains unchanged.
+pub(super) fn claim_worker_allocations(
+    blocks: &[Arc<Storage>],
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<()> {
+    struct Attempt<'a> {
+        blocks: &'a [Arc<Storage>],
+        scanned: usize,
+    }
+    impl Drop for Attempt<'_> {
+        fn drop(&mut self) {
+            for storage in &self.blocks[..self.scanned] {
+                if let Storage::Disk(block) = storage.as_ref() {
+                    block.retirement_leased.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+    let mut attempt = Attempt { blocks, scanned: 0 };
+    for storage in blocks {
+        check(cancelled)?;
+        if let Storage::Disk(block) = storage.as_ref() {
+            if !block.explicit_retirement.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "untracked worker allocation"));
+            }
+            if block.retirement_leased.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker spill claim overlaps an existing lease",
+                ));
+            }
+        }
+        attempt.scanned += 1;
+    }
+    check(cancelled)?;
+    attempt.scanned = 0;
+    Ok(())
+}
 impl Drop for PendingClaims<'_> {
     fn drop(&mut self) {
         for storage in &self.blocks[..self.claimed] {
@@ -100,6 +141,17 @@ fn visit_tree(
 }
 
 impl SpillRetirement {
+    pub(crate) fn covers_worker_storage(&self, storage: &Arc<Storage>) -> bool {
+        self.blocks.iter().any(|owned| Arc::ptr_eq(owned, storage))
+    }
+    pub(crate) fn worker_disk_bytes(&self) -> io::Result<u64> {
+        self.blocks.iter().try_fold(0_u64, |total, storage| {
+            let Storage::Disk(block) = storage.as_ref() else { unreachable!() };
+            total
+                .checked_add(super::worker_disk_charge(block.payload_len as u64)?)
+                .ok_or_else(crate::worker_edit::overflow)
+        })
+    }
     pub(crate) fn collect(
         tree: &Tree,
         limits: SpillRetirementLimits,

@@ -26,7 +26,38 @@ pub(crate) struct History {
     limit: usize,
 }
 
+/// Capacity and retained-root/model charges prepared on the authority worker.
+/// The same History engine installs this without allocating or scanning after
+/// the live root changes. Any intervening history policy/edit invalidates epoch.
+pub(crate) struct PreparedHistory {
+    entry: Entry,
+}
+
 impl History {
+    pub(crate) fn prepare_worker(
+        &mut self,
+        before: Snapshot,
+        after: Snapshot,
+        model_cost: usize,
+    ) -> std::io::Result<PreparedHistory> {
+        let cost = before
+            .retained_bytes()
+            .checked_add(after.retained_bytes())
+            .and_then(|n| n.checked_add(std::mem::size_of::<Entry>()))
+            .and_then(|n| n.checked_add(model_cost))
+            .ok_or_else(crate::worker_edit::overflow)?;
+        self.bytes.checked_add(cost).ok_or_else(crate::worker_edit::overflow)?;
+        self.undo.try_reserve(1).map_err(std::io::Error::other)?;
+        Ok(PreparedHistory { entry: Entry { before, after, cost, model_cost } })
+    }
+    pub(crate) fn install_prepared(&mut self, prepared: PreparedHistory) {
+        for entry in self.redo.drain(..) {
+            self.bytes -= entry.cost;
+        }
+        self.bytes += prepared.entry.cost; // overflow prechecked before commit
+        self.undo.push_back(prepared.entry); // capacity reserved on THIS history
+        self.trim(); // worker-only destruction; existing cap/eviction semantics
+    }
     pub fn new(limit: usize) -> Self {
         Self { undo: VecDeque::new(), redo: VecDeque::new(), bytes: 0, limit }
     }
