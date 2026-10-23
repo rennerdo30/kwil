@@ -21,6 +21,8 @@ use std::{
 /// Caller-owned resource policy; this module introduces no product defaults.
 pub struct BackingLimits {
     pub max_backings: usize,
+    /// Covers private paths and the source/temporary pathname retained by an
+    /// origin. Saving reserves the generated same-directory suffix as well.
     pub max_private_path_bytes: usize,
     pub max_metadata_bytes: usize,
 }
@@ -51,6 +53,7 @@ pub struct WorkerBackings {
     parent: PathBuf,
     slots: Vec<Option<Resource>>,
     metadata_reserved: usize,
+    path_cap: usize,
     // Prevent accidentally publishing this registry in a UI completion.
     _worker: PhantomData<Rc<()>>,
 }
@@ -89,7 +92,8 @@ impl WorkerBackings {
             .max_backings
             .checked_mul(per_slot)
             .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
-            .and_then(|bytes| bytes.checked_add(parent.as_os_str().as_encoded_bytes().len()))
+            // Retain the caller's allocation, including unused capacity.
+            .and_then(|bytes| bytes.checked_add(parent.capacity()))
             .ok_or_else(|| invalid("backing metadata admission overflow"))?;
         if metadata_reserved > limits.max_metadata_bytes {
             return Err(invalid("backing metadata admission limit"));
@@ -99,7 +103,7 @@ impl WorkerBackings {
             .try_reserve_exact(limits.max_backings)
             .map_err(|_| io::Error::other("backing registry allocation failed"))?;
         slots.resize_with(limits.max_backings, || None);
-        Ok(Self { parent, slots, metadata_reserved, _worker: PhantomData })
+        Ok(Self { parent, slots, metadata_reserved, path_cap: limits.max_private_path_bytes, _worker: PhantomData })
     }
 
     pub fn metadata_reserved(&self) -> usize {
@@ -110,6 +114,12 @@ impl WorkerBackings {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
 
+    fn check_input_path(&self, path: &Path, suffix: usize) -> io::Result<()> {
+        if path.as_os_str().as_encoded_bytes().len().checked_add(suffix).is_none_or(|bytes| bytes > self.path_cap) {
+            return Err(invalid("source or save path exceeds backing metadata admission cap"));
+        }
+        Ok(())
+    }
     fn prepare<T>(&mut self, make: impl FnOnce(&Path) -> io::Result<(T, DecodedBacking)>) -> io::Result<T> {
         // Poll explicitly between requests; never hide a cleanup retry or cold
         // filesystem operation inside capacity admission.
@@ -129,6 +139,9 @@ impl WorkerBackings {
         cancel: &AtomicBool,
         publish: impl FnOnce(DecodedPreview) -> io::Result<()>,
     ) -> io::Result<Document> {
+        // DecodedBacking also retains the external source name, independently
+        // of its generated private paths. Check the file's actual source name.
+        self.check_input_path(file.path(), 0)?;
         self.prepare(|parent| {
             let prepared = prepare_decoded_document(path, file, interpretation, parent, cancel, publish)?;
             Ok((prepared.document, prepared.backing))
@@ -141,6 +154,10 @@ impl WorkerBackings {
         plan: SavePlan,
         cancel: &AtomicBool,
     ) -> io::Result<WorkerSavedSnapshot> {
+        self.check_input_path(&request.path, 0)?;
+        // The checkpoint is prepared from .kwil-save-<u32 PID>-<u64 counter>,
+        // not the final destination name. Charge its maximum generated suffix.
+        self.check_input_path(request.path.parent().ok_or_else(|| invalid("save destination has no parent"))?, 64)?;
         self.prepare(|parent| {
             let prepared = kwil_core_workspace::save_encoded_snapshot(request, plan, parent, cancel)?;
             Ok((
@@ -371,5 +388,86 @@ mod tests {
         editor.finish_save(Err(error)).unwrap_err();
         drop(editor);
         assert_eq!(registry.retire().retired, 1);
+    }
+
+    #[test]
+    fn backing_parent_spare_capacity_is_charged_even_without_slots() {
+        let fixture = Fixture::new();
+        let mut parent = fixture.0.clone();
+        parent.reserve(4096);
+        let bytes = parent.as_os_str().as_encoded_bytes().len();
+        assert!(parent.capacity() > bytes + 64);
+        let result = WorkerBackings::new(
+            parent,
+            BackingLimits {
+                max_backings: 0,
+                max_private_path_bytes: 8192,
+                max_metadata_bytes: size_of::<WorkerBackings>() + bytes,
+            },
+        );
+        assert!(result.is_err(), "retained parent capacity must fit the metadata cap");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
+    }
+
+    fn registry_with_short_path_cap(fixture: &Fixture) -> WorkerBackings {
+        WorkerBackings::new(
+            fixture.0.clone(),
+            BackingLimits {
+                max_backings: 1,
+                max_private_path_bytes: fixture.0.as_os_str().as_encoded_bytes().len() + 64,
+                max_metadata_bytes: 1 << 20,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn backing_source_path_is_refused_before_preview_or_private_files() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("s".repeat(100));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("input");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut registry = registry_with_short_path_cap(&fixture);
+        let error = registry
+            .open(path.clone(), TextFile::open(&path).unwrap(), None, &AtomicBool::new(false), |_| {
+                panic!("inadmissible source path must precede preview and preparation")
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(registry.retained(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    fn assert_save_path_refused(component: usize) {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("d".repeat(component));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("f");
+        std::fs::write(&path, b"keep").unwrap();
+        let mut registry = registry_with_short_path_cap(&fixture);
+        let mut editor = crate::Editor::new(Document::new());
+        editor.execute("edit.insert", &crate::CommandArgs { text: Some("x".into()), ..Default::default() }, 1).unwrap();
+        let request = editor.save_request(Some(path.clone())).unwrap();
+        let result = registry.save(request, editor.document().save_plan(), &AtomicBool::new(false));
+        assert!(result.is_err(), "over-limit save paths must refuse before preparation or replacement");
+        let error = result.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(registry.retained(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1, "no same-directory temporary");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1, "no private checkpoint");
+    }
+
+    #[test]
+    fn backing_long_save_destination_is_refused_before_replacement() {
+        assert_save_path_refused(100);
+    }
+
+    #[test]
+    fn backing_save_temporary_path_bound_is_checked_before_replacement() {
+        assert_save_path_refused(40);
     }
 }
