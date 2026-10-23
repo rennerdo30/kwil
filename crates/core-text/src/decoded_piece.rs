@@ -31,8 +31,13 @@ impl IndexedDecoded {
     }
 }
 
-pub(crate) fn validate_range(origin: &DecodedSnapshot, range: Range<u64>) -> io::Result<()> {
-    for at in [range.start, range.end] {
+/// Validate scalar endpoints and return the complete atoms covering them.
+pub(crate) fn validate_range(origin: &DecodedSnapshot, range: Range<u64>) -> io::Result<Range<u64>> {
+    if range.start > range.end || range.end > origin.logical_bytes().len() as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "range outside decoded origin"));
+    }
+    let mut covering = range.clone();
+    for (first, at) in [(true, range.start), (false, range.end)] {
         if let Boundary::Interior { logical, kind, .. } = origin.resolve_logical(at).map_err(io::Error::other)? {
             let valid = kind == AtomKind::Text
                 && std::str::from_utf8(&origin.logical_bytes()[logical.start as usize..logical.end as usize])
@@ -43,7 +48,12 @@ pub(crate) fn validate_range(origin: &DecodedSnapshot, range: Range<u64>) -> io:
                     format!("edit splits a decoded scalar at {at}"),
                 ));
             }
+            if first {
+                covering.start = logical.start;
+            } else {
+                covering.end = logical.end;
+            }
         }
     }
-    Ok(())
+    Ok(covering)
 }

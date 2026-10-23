@@ -59,6 +59,10 @@ impl SnapshotImporter {
 }
 
 impl Snapshot {
+    pub fn storage_resources(&self) -> crate::StorageResources {
+        self.root.as_ref().map_or(crate::StorageResources::default(), |node| node.metrics.resources)
+    }
+
     pub fn len(&self) -> u64 {
         self.root.as_ref().map_or(0, |node| node.metrics.bytes)
     }
@@ -285,6 +289,11 @@ impl Buffer {
     /// its already admitted blocks then share in O(1), without spill writes.
     pub fn snapshot_importer(&self) -> SnapshotImporter {
         SnapshotImporter { added: self.added.clone(), owner: self.owner.clone() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn import_work(&self) -> crate::piece_tree::ImportWork {
+        self.added.import_work()
     }
 
     pub fn len(&self) -> u64 {

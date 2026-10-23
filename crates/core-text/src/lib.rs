@@ -17,4 +17,4 @@ pub use file::{FileKind, FileState, IndexProgress, OpenError, ReadError, TextFil
 pub use file::{OriginalSavePin, cleanup_stale_save_backups};
 pub use line_index::LineIndex;
 pub use piece_tree::Chunks;
-pub use piece_tree::{SourceChunk, SourceChunks};
+pub use piece_tree::{SourceChunk, SourceChunks, StorageResources};

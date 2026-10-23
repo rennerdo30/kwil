@@ -30,7 +30,9 @@ mod tests;
 
 #[path = "encoded_snapshot.rs"]
 mod snapshot_save;
-pub use snapshot_save::{validate_snapshot_save, write_snapshot};
+pub use snapshot_save::{
+    validate_snapshot_save, validate_snapshot_save_cancellable, write_snapshot, write_snapshot_cancellable,
+};
 
 const SAMPLE: usize = 64 << 10;
 const STRIDE: usize = 64 << 10;
@@ -104,6 +106,7 @@ pub enum EncodingError {
     SplitCharacter(u64),
     InvalidUtf8,
     MalformedSource,
+    Cancelled,
     Unmappable { character: char, encoding: &'static str },
 }
 
@@ -125,6 +128,7 @@ impl std::fmt::Display for EncodingError {
             Self::MalformedSource => {
                 f.write_str("conversion contains malformed source bytes; reinterpret or repair first")
             }
+            Self::Cancelled => f.write_str("snapshot save cancelled"),
             Self::Unmappable { character, encoding } => write!(f, "{character:?} cannot be saved as {encoding}"),
         }
     }

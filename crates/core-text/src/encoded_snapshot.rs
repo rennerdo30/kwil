@@ -11,15 +11,42 @@ use std::ops::Range;
 /// Preflight on a worker before creating/opening the destination. No bytes are
 /// retained. Use the same immutable snapshot and plan for the eventual write.
 pub fn validate_snapshot_save(snapshot: &Snapshot, plan: SavePlan) -> Result<(), EncodingError> {
-    stream(snapshot, plan, &mut io::sink())
+    validate_snapshot_save_cancellable(snapshot, plan, || false)
+}
+
+/// Worker preflight with cooperative cancellation, including empty snapshots.
+/// The callback is polled between bounded decode/write chunks and can simply
+/// read the worker's cancellation flag. It is also polled during sink output.
+pub fn validate_snapshot_save_cancellable(
+    snapshot: &Snapshot,
+    plan: SavePlan,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<(), EncodingError> {
+    stream(snapshot, plan, &mut io::sink(), &mut cancelled)
 }
 
 /// All character, malformed-source and endpoint failures occur before the
 /// first writer call. Disk failure during writing is the atomic-save envelope's
 /// responsibility. Scratch and writer requests are bounded, regardless of size.
 pub fn write_snapshot(snapshot: &Snapshot, plan: SavePlan, writer: &mut impl Write) -> Result<(), EncodingError> {
-    validate_snapshot_save(snapshot, plan)?;
-    stream(snapshot, plan, writer)
+    write_snapshot_cancellable(snapshot, plan, writer, || false)
+}
+
+/// Cancellable preflight followed by cancellable output. Character failures
+/// and cancellation during preflight leave the destination writer untouched;
+/// cancellation during output belongs to the atomic envelope's rollback path.
+pub fn write_snapshot_cancellable(
+    snapshot: &Snapshot,
+    plan: SavePlan,
+    writer: &mut impl Write,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<(), EncodingError> {
+    stream(snapshot, plan, &mut io::sink(), &mut cancelled)?;
+    stream(snapshot, plan, writer, &mut cancelled)
+}
+
+fn poll(cancelled: &mut impl FnMut() -> bool) -> Result<(), EncodingError> {
+    if cancelled() { Err(EncodingError::Cancelled) } else { Ok(()) }
 }
 
 fn backing_error(error: crate::decoded_backing::BackingError) -> EncodingError {
@@ -49,12 +76,18 @@ fn text(output: &mut TextOutput<'_, impl Write>, bytes: &[u8]) -> Result<(), Enc
     output.feed(text)
 }
 
-fn raw(output: &mut TextOutput<'_, impl Write>, bytes: &[u8]) -> Result<(), EncodingError> {
+fn raw(
+    output: &mut TextOutput<'_, impl Write>,
+    bytes: &[u8],
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), EncodingError> {
+    poll(cancelled)?;
     if output.pending_cr {
         output.encode(output.plan.line_ending.unwrap().text())?;
         output.pending_cr = false;
     }
     for chunk in bytes.chunks(64 << 10) {
+        poll(cancelled)?;
         output.writer.write_all(chunk)?;
     }
     Ok(())
@@ -64,12 +97,17 @@ fn decoded(
     origin: &DecodedSnapshot,
     range: Range<u64>,
     output: &mut TextOutput<'_, impl Write>,
+    cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(), EncodingError> {
+    poll(cancelled)?;
     let start = endpoint(origin, range.start)?;
+    poll(cancelled)?;
     let end = endpoint(origin, range.end)?;
+    poll(cancelled)?;
     if output.plan.encoding != origin.interpretation().encoding {
         let mut input = Utf8Input::default();
         for chunk in origin.logical_bytes()[range.start as usize..range.end as usize].chunks(16 << 10) {
+            poll(cancelled)?;
             input.feed(chunk, |s| output.feed(s)).map_err(|error| match error {
                 EncodingError::InvalidUtf8 => EncodingError::MalformedSource,
                 other => other,
@@ -90,16 +128,22 @@ fn decoded(
         let middle = first..last;
         if output.plan.line_ending.is_none() {
             let range = origin.raw_range(middle).map_err(backing_error)?;
-            raw(output, &origin.raw_bytes()[range.start as usize..range.end as usize])?;
+            poll(cancelled)?;
+            raw(output, &origin.raw_bytes()[range.start as usize..range.end as usize], cancelled)?;
         } else {
             // Decode atoms only to recognize newline characters, preserving
             // every other atom's bytes, including malformed runs and aliases.
             let mut run = None;
+            let mut next_poll = 0;
             for atom in origin.atoms(middle).map_err(backing_error)? {
                 let atom = atom.map_err(backing_error)?;
+                if atom.raw.end >= next_poll {
+                    poll(cancelled)?;
+                    next_poll = atom.raw.end.saturating_add(16 << 10);
+                }
                 if matches!(atom.content, AtomContent::Text("\r" | "\n")) {
                     if let Some(begin) = run.take() {
-                        raw(output, &origin.raw_bytes()[begin..atom.raw.start as usize])?;
+                        raw(output, &origin.raw_bytes()[begin..atom.raw.start as usize], cancelled)?;
                     }
                     if let AtomContent::Text(s) = atom.content {
                         output.feed(s)?;
@@ -110,7 +154,7 @@ fn decoded(
                 if atom.logical.end == last
                     && let Some(begin) = run.take()
                 {
-                    raw(output, &origin.raw_bytes()[begin..atom.raw.end as usize])?;
+                    raw(output, &origin.raw_bytes()[begin..atom.raw.end as usize], cancelled)?;
                 }
             }
         }
@@ -121,7 +165,13 @@ fn decoded(
     Ok(())
 }
 
-fn stream(snapshot: &Snapshot, plan: SavePlan, writer: &mut impl Write) -> Result<(), EncodingError> {
+fn stream(
+    snapshot: &Snapshot,
+    plan: SavePlan,
+    writer: &mut impl Write,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), EncodingError> {
+    poll(cancelled)?;
     if plan.bom && plan.encoding.bom().is_empty() {
         return Err(EncodingError::UnsupportedEncoding(format!("BOM for {}", plan.encoding.name())));
     }
@@ -131,26 +181,29 @@ fn stream(snapshot: &Snapshot, plan: SavePlan, writer: &mut impl Write) -> Resul
     let mut output = TextOutput::new(plan, writer);
     let mut input = Utf8Input::default();
     for chunk in snapshot.source_chunks(0..snapshot.len())? {
+        poll(cancelled)?;
         match chunk? {
             SourceChunk::Decoded { origin, range, .. } => {
                 input.finish()?;
-                decoded(origin, range, &mut output)?;
+                decoded(origin, range, &mut output, cancelled)?;
             }
             SourceChunk::Opaque { encoding, raw_bytes, .. } => {
                 input.finish()?;
                 if plan.encoding != encoding {
                     return Err(EncodingError::MalformedSource);
                 }
-                raw(&mut output, raw_bytes)?;
+                raw(&mut output, raw_bytes, cancelled)?;
             }
             SourceChunk::Original { bytes, .. } | SourceChunk::Added(bytes) => {
                 for chunk in bytes.chunks(16 << 10) {
+                    poll(cancelled)?;
                     input.feed(chunk, |s| output.feed(s))?;
                 }
             }
         }
     }
     input.finish()?;
+    poll(cancelled)?;
     output.finish()
 }
 
@@ -378,6 +431,205 @@ mod tests {
             validate_snapshot_save(&snapshot.slice(1..4).unwrap(), plan(encoding, false)),
             Err(EncodingError::SplitCharacter(1))
         ));
+    }
+
+    #[test]
+    fn decoded_big5_same_codec_partial_start_is_unmappable_before_writer() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        for (atom, character) in
+            [(b"\x88\x62", '\u{304}'), (b"\x88\x64", '\u{30c}'), (b"\x88\xa3", '\u{304}'), (b"\x88\xa5", '\u{30c}')]
+        {
+            let mut raw = atom.to_vec();
+            raw.extend_from_slice(b"tail");
+            let buffer = fixture.decoded(&raw, encoding, 0);
+            let partial = buffer.snapshot().slice(2..buffer.len()).unwrap();
+            // A leading valid piece ensures a missing preflight would touch
+            // the writer before reaching the partial expansion.
+            let mut prefix = Buffer::empty();
+            prefix.insert(0, b"prefix").unwrap();
+            let snapshot = prefix.snapshot().concat(&partial).unwrap();
+            assert!(matches!(validate_snapshot_save(&snapshot, plan(encoding, false)),
+                Err(EncodingError::Unmappable { character: actual, encoding: "Big5" }) if actual == character));
+            let mut writer = Untouched::default();
+            assert!(matches!(write_snapshot(&snapshot, plan(encoding, false), &mut writer),
+                Err(EncodingError::Unmappable { character: actual, encoding: "Big5" }) if actual == character));
+            assert_eq!(writer.calls, 0);
+        }
+    }
+
+    #[test]
+    fn decoded_big5_same_codec_partial_end_is_unmappable_before_writer() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        for (atom, character) in [(b"\x88\x62", 'Ê'), (b"\x88\x64", 'Ê'), (b"\x88\xa3", 'ê'), (b"\x88\xa5", 'ê')] {
+            let mut raw = b"prefix".to_vec();
+            raw.extend_from_slice(atom);
+            let buffer = fixture.decoded(&raw, encoding, 0);
+            let snapshot = buffer.snapshot().slice(0..8).unwrap(); // prefix + first two-byte scalar
+            assert!(matches!(validate_snapshot_save(&snapshot, plan(encoding, false)),
+                Err(EncodingError::Unmappable { character: actual, encoding: "Big5" }) if actual == character));
+            let mut writer = Untouched::default();
+            assert!(matches!(write_snapshot(&snapshot, plan(encoding, false), &mut writer),
+                Err(EncodingError::Unmappable { character: actual, encoding: "Big5" }) if actual == character));
+            assert_eq!(writer.calls, 0);
+        }
+    }
+
+    #[test]
+    fn decoded_foreign_alternating_spans_pack_resources_and_charge_metadata() {
+        let fixture = Fixture::new();
+        let bytes = b"A\xff".repeat(16);
+        let source = fixture.decoded(&bytes, Encoding::UTF8, 0);
+        let mut target = Buffer::with_add_memory_limit(0);
+        target.set_undo_memory_limit(0);
+        target.insert_snapshot_range(0, &source.snapshot(), 0..source.len()).unwrap();
+        let snapshot = target.snapshot();
+        let resources = snapshot.storage_resources();
+        let paths = crate::piece_tree::spill_paths(&snapshot.root);
+        assert_eq!(paths.len(), 3, "count actual backing files/maps/handles, not only cached metrics");
+        assert!(paths.iter().all(|path| path.exists()));
+        assert_eq!(resources.tree_nodes, 1, "short mixed spans must share one packed leaf");
+        assert_eq!(resources.blocks, 3);
+        assert_eq!(resources.spilled_blocks, 3, "one logical/raw/table backing, not four files per pair");
+        assert_eq!(target.add_memory_bytes(), 0);
+        assert_eq!(saved(&snapshot, plan(Encoding::UTF8, false)), bytes);
+        let mut resident = Buffer::with_add_memory_limit(1024);
+        resident.set_undo_memory_limit(0);
+        resident.insert_snapshot_range(0, &source.snapshot(), 0..source.len()).unwrap();
+        let payload = 32 + 16 + 4 * (32 + 1);
+        assert_eq!(resident.add_memory_bytes(), payload, "all logical/raw/table bytes are budgeted");
+        assert!(resident.snapshot().retained_bytes() > payload, "resource metadata is charged too");
+        assert_eq!(resident.snapshot().storage_resources().spilled_blocks, 0);
+        // Clip and reimport mixed storage under a foreign zero cap. Check raw
+        // endpoints after both valid and opaque bytes, plus line metrics.
+        let clip = resident.snapshot().slice(1..7).unwrap();
+        let mut foreign = Buffer::with_add_memory_limit(0);
+        foreign.insert_snapshot_range(0, &clip, 0..clip.len()).unwrap();
+        assert_eq!(saved(&foreign.snapshot(), plan(Encoding::UTF8, false)), bytes[1..7]);
+        assert_eq!(foreign.snapshot().storage_resources().spilled_blocks, 3);
+    }
+
+    #[test]
+    fn decoded_foreign_alternating_spans_use_one_monotonic_origin_cursor() {
+        let fixture = Fixture::new();
+        let bytes = b"A\xff".repeat(16);
+        let source = fixture.decoded(&bytes, Encoding::UTF8, 0);
+        let mut target = Buffer::with_add_memory_limit(1024);
+        target.insert_snapshot_range(0, &source.snapshot(), 0..source.len()).unwrap();
+        let work = target.import_work();
+        assert_eq!(work.streams, 1, "checkpoint replay must not restart for each opaque run");
+        assert_eq!(work.atoms, 32);
+        assert_eq!(work.raw_bytes, bytes.len() as u64);
+        assert_eq!(work.repeated_raw_bytes, 0);
+        assert_eq!(saved(&target.snapshot(), plan(Encoding::UTF8, false)), bytes);
+    }
+
+    #[test]
+    fn decoded_foreign_mixed_table_boundary_keeps_scalar_stream_and_line_metrics() {
+        let fixture = Fixture::new();
+        // 18KiB crosses one packed table boundary, inside a four-byte scalar.
+        let bytes = b"\xf0\x9f\x98\x80\n\xff".repeat(3000);
+        let source = fixture.decoded(&bytes, Encoding::UTF8, 0);
+        let mut target = Buffer::with_add_memory_limit(0);
+        target.set_undo_memory_limit(0);
+        target.insert_snapshot_range(0, &source.snapshot(), 0..source.len()).unwrap();
+        assert_eq!(target.snapshot().storage_resources().blocks, 6);
+        assert_eq!(target.line_count(), 3001);
+        assert_eq!(target.line_start(3000).unwrap(), Some(17_999));
+        // The previous LF starts this line at 16379; its opaque atom at 16379
+        // occupies the first byte column before the next four-byte scalar.
+        assert_eq!(target.offset_to_line_col(16_383).unwrap(), Some((2730, 4)));
+        assert_eq!(target.offset_to_line_col(17_999).unwrap(), Some((3000, 0)));
+        assert_eq!(saved(&target.snapshot(), plan(Encoding::UTF8, false)), bytes);
+        let source_snapshot = target.snapshot();
+        target.delete(0..target.len()).unwrap();
+        target.insert_snapshot_range(0, &source_snapshot, 0..source_snapshot.len()).unwrap();
+        assert!(Arc::ptr_eq(target.snapshot().root.as_ref().unwrap(), source_snapshot.root.as_ref().unwrap()));
+        assert_eq!(target.add_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn snapshot_cancellation_includes_empty_snapshots_and_decoded_spans() {
+        let fixture = Fixture::new();
+        let empty = fixture.decoded(b"", Encoding::UTF8, 0);
+        for snapshot in [Snapshot::default(), empty.snapshot(), empty.snapshot().slice(0..0).unwrap()] {
+            assert!(matches!(
+                validate_snapshot_save_cancellable(&snapshot, plan(Encoding::UTF8, false), || true),
+                Err(EncodingError::Cancelled)
+            ));
+            let mut writer = Untouched::default();
+            assert!(matches!(
+                write_snapshot_cancellable(&snapshot, plan(Encoding::UTF16_LE, true), &mut writer, || true),
+                Err(EncodingError::Cancelled)
+            ));
+            assert_eq!(writer.calls, 0);
+        }
+    }
+
+    #[test]
+    fn snapshot_cancellation_polls_inside_all_full_preflight_paths() {
+        let fixture = Fixture::new();
+        let text = "x".repeat(70_000);
+        for (source_encoding, target_encoding, ending) in [
+            (Encoding::UTF8, Encoding::UTF8, None),
+            (Encoding::UTF16_LE, Encoding::UTF8, None),
+            (Encoding::UTF8, Encoding::UTF8, Some(LineEnding::CrLf)),
+        ] {
+            let source = fixture.decoded(&encode(&text, source_encoding), source_encoding, 0);
+            let mut polls = 0;
+            let mut writer = Untouched::default();
+            let mut target = plan(target_encoding, false);
+            target.line_ending = ending;
+            let result = write_snapshot_cancellable(&source.snapshot(), target, &mut writer, || {
+                polls += 1;
+                polls == 7
+            });
+            assert!(matches!(result, Err(EncodingError::Cancelled)), "{source_encoding:?} {ending:?}: {result:?}");
+            assert_eq!(polls, 7);
+            assert_eq!(writer.calls, 0, "full sink preflight must remain cancellable");
+        }
+        let mut ordinary = Buffer::empty();
+        ordinary.insert(0, text.as_bytes()).unwrap();
+        let mut polls = 0;
+        let mut writer = Untouched::default();
+        assert!(matches!(
+            write_snapshot_cancellable(&ordinary.snapshot(), plan(Encoding::UTF8, false), &mut writer, || {
+                polls += 1;
+                polls == 4
+            }),
+            Err(EncodingError::Cancelled)
+        ));
+        assert_eq!(writer.calls, 0);
+    }
+
+    #[test]
+    fn snapshot_cancellation_during_output_stops_at_bounded_writer_chunks() {
+        let fixture = Fixture::new();
+        let source = fixture.decoded(&vec![b'x'; 70_000], Encoding::UTF8, 0);
+        let cancelled = Cell::new(false);
+        struct CancelWriter<'a> {
+            flag: &'a Cell<bool>,
+            bytes: usize,
+        }
+        impl Write for CancelWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(bytes.len() <= 65536);
+                self.bytes += bytes.len();
+                self.flag.set(true);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = CancelWriter { flag: &cancelled, bytes: 0 };
+        assert!(matches!(
+            write_snapshot_cancellable(&source.snapshot(), plan(Encoding::UTF8, false), &mut writer, || cancelled
+                .get()),
+            Err(EncodingError::Cancelled)
+        ));
+        assert!(writer.bytes > 0 && writer.bytes <= 65536);
     }
 
     #[test]

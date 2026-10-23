@@ -52,11 +52,65 @@ pub(crate) struct AddBudget {
     pub limit: usize,
     pub used: AtomicUsize,
     owner: Arc<()>,
+    #[cfg(test)]
+    import_streams: AtomicUsize,
+    #[cfg(test)]
+    import_atoms: AtomicUsize,
+    #[cfg(test)]
+    import_raw_bytes: AtomicU64,
+    #[cfg(test)]
+    import_raw_end: AtomicU64,
+    #[cfg(test)]
+    import_raw_repeated: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ImportWork {
+    pub streams: usize,
+    pub atoms: usize,
+    pub raw_bytes: u64,
+    pub repeated_raw_bytes: u64,
 }
 
 impl AddBudget {
     pub fn new(limit: usize, owner: Arc<()>) -> Arc<Self> {
-        Arc::new(Self { limit, used: AtomicUsize::new(0), owner })
+        Arc::new(Self {
+            limit,
+            used: AtomicUsize::new(0),
+            owner,
+            #[cfg(test)]
+            import_streams: AtomicUsize::new(0),
+            #[cfg(test)]
+            import_atoms: AtomicUsize::new(0),
+            #[cfg(test)]
+            import_raw_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            import_raw_end: AtomicU64::new(0),
+            #[cfg(test)]
+            import_raw_repeated: AtomicU64::new(0),
+        })
+    }
+
+    fn observe_import_atom(&self, _raw: &Range<u64>) {
+        #[cfg(test)]
+        {
+            self.import_atoms.fetch_add(1, Ordering::Relaxed);
+            self.import_raw_bytes.fetch_add(_raw.end - _raw.start, Ordering::Relaxed);
+            let previous = self.import_raw_end.fetch_max(_raw.end, Ordering::Relaxed);
+            self.import_raw_repeated
+                .fetch_add(previous.saturating_sub(_raw.start).min(_raw.end - _raw.start), Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn import_work(&self) -> ImportWork {
+        ImportWork {
+            streams: self.import_streams.load(Ordering::Relaxed),
+            atoms: self.import_atoms.load(Ordering::Relaxed),
+            raw_bytes: self.import_raw_bytes.load(Ordering::Relaxed),
+            repeated_raw_bytes: self.import_raw_repeated.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -142,7 +196,7 @@ enum Storage {
         budget: Arc<AddBudget>,
     },
     Disk(DiskBlock),
-    /// Bounded detached opaque run. Each payload/table block is <= ADD_BLOCK
+    /// Bounded detached mixed text/opaque block. Each payload/table is <= ADD_BLOCK
     /// and uses the destination budget (or its existing immutable spill path).
     Opaque {
         encoding: Encoding,
@@ -177,7 +231,6 @@ impl Storage {
                 file.index().expect("indexed original").line_of_offset(file.bytes()?, offset).unwrap()
             }
             Self::Decoded(source) => source.index.line_of_offset(source.origin.logical_bytes(), offset).unwrap(),
-            Self::Opaque { .. } => 0,
             // Added pieces never scan more than ADD_BLOCK bytes.
             _ => memchr_iter(b'\n', &self.bytes()?[..offset as usize]).count() as u64,
         })
@@ -187,10 +240,6 @@ impl Storage {
         Ok(match self {
             Self::Original(file) => file.index().unwrap().line_start(file.bytes()?, line).unwrap(),
             Self::Decoded(source) => source.index.line_start(source.origin.logical_bytes(), line).unwrap(),
-            Self::Opaque { .. } => {
-                assert_eq!(line, 0);
-                0
-            }
             _ if line == 0 => 0,
             _ => memchr_iter(b'\n', self.bytes()?).nth((line - 1) as usize).unwrap() as u64 + 1,
         })
@@ -206,6 +255,36 @@ impl Storage {
             _ => 0, // Original storage is baseline; mapped add bytes are page cache.
         };
         bytes + std::mem::size_of::<Self>() + ARC_HEADER
+    }
+
+    fn resources(&self) -> StorageResources {
+        match self {
+            Self::Memory { .. } => StorageResources { blocks: 1, ..StorageResources::default() },
+            Self::Disk(_) => StorageResources { blocks: 1, spilled_blocks: 1, ..StorageResources::default() },
+            Self::Opaque { logical, raw, offsets, .. } => {
+                logical.resources().plus(raw.resources()).plus(offsets.resources())
+            }
+            _ => StorageResources::default(),
+        }
+    }
+}
+
+/// Conservative add-storage resource accounting. Shared pieces can charge a
+/// block more than once; original-file baseline maps are excluded. Counts are
+/// cached, so inspecting them never walks a file or opens a handle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageResources {
+    pub tree_nodes: usize,
+    pub blocks: usize,
+    pub spilled_blocks: usize,
+}
+impl StorageResources {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            tree_nodes: self.tree_nodes.saturating_add(other.tree_nodes),
+            blocks: self.blocks.saturating_add(other.blocks),
+            spilled_blocks: self.spilled_blocks.saturating_add(other.spilled_blocks),
+        }
     }
 }
 
@@ -236,6 +315,7 @@ pub(crate) struct Metrics {
     pub bytes: u64,
     pub breaks: u64,
     pub retained: usize,
+    pub resources: StorageResources,
 }
 
 pub(crate) struct Node {
@@ -279,6 +359,10 @@ fn leaf(piece: Piece) -> Arc<Node> {
             bytes: piece.end - piece.start,
             breaks: piece.breaks,
             retained: std::mem::size_of::<Node>() + ARC_HEADER + piece.storage.retained_bytes(),
+            resources: piece
+                .storage
+                .resources()
+                .plus(StorageResources { tree_nodes: 1, ..StorageResources::default() }),
         },
         height: 1,
         affinity: piece.owner.as_ref().map_or(Affinity::Free, |owner| Affinity::Owned(owner.clone())),
@@ -296,6 +380,11 @@ fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
                 .retained
                 .saturating_add(right.metrics.retained)
                 .saturating_add(std::mem::size_of::<Node>() + ARC_HEADER),
+            resources: left
+                .metrics
+                .resources
+                .plus(right.metrics.resources)
+                .plus(StorageResources { tree_nodes: 1, ..StorageResources::default() }),
         },
         height: 1 + left.height.max(right.height),
         affinity: Affinity::joined(&left.affinity, &right.affinity),
@@ -422,7 +511,24 @@ fn opaque_run(encoding: Encoding, raw: &[u8], offsets: &[u8], budget: &Arc<AddBu
     // never an uncharged Vec retained by a snapshot.
     assert!(offsets.len().is_multiple_of(4) && offsets.len() >= 8 && offsets.len() <= ADD_BLOCK);
     let count = offsets.len() / 4 - 1;
-    let logical = capped_block(&vec![0xff; count], budget)?;
+    detached_block(encoding, &vec![0xff; count], raw, offsets, budget)
+}
+
+fn detached_block(
+    encoding: Encoding,
+    bytes: &[u8],
+    raw: &[u8],
+    offsets: &[u8],
+    budget: &Arc<AddBudget>,
+) -> io::Result<Tree> {
+    if raw.is_empty() {
+        return added(bytes, budget);
+    }
+    assert!(!bytes.is_empty() && bytes.len() < ADD_BLOCK / 4);
+    assert_eq!(offsets.len(), (bytes.len() + 1) * 4);
+    assert_eq!(offset_at(offsets, 0), 0);
+    assert_eq!(offset_at(offsets, bytes.len() as u64), raw.len());
+    let logical = capped_block(bytes, budget)?;
     let raw = capped_block(raw, budget)?;
     let offsets = capped_block(offsets, budget)?;
     let resident = [&logical, &raw, &offsets].iter().any(|storage| matches!(&***storage, Storage::Memory { .. }));
@@ -430,9 +536,9 @@ fn opaque_run(encoding: Encoding, raw: &[u8], offsets: &[u8], budget: &Arc<AddBu
         storage: Arc::new(Storage::Opaque { encoding, logical, raw, offsets }),
         owner: resident.then(|| budget.owner.clone()),
         start: 0,
-        end: count as u64,
+        end: bytes.len() as u64,
         first_line: 0,
-        breaks: 0,
+        breaks: memchr_iter(b'\n', bytes).count() as u64,
     })))
 }
 
@@ -442,39 +548,112 @@ fn offset_at(offsets: &[u8], at: u64) -> usize {
     u32::from_le_bytes(bytes.try_into().unwrap()) as usize
 }
 
-fn import_decoded(origin: &DecodedSnapshot, range: Range<u64>, budget: &Arc<AddBudget>) -> io::Result<Tree> {
-    crate::decoded_piece::validate_range(origin, range.clone())?;
-    let bytes = &origin.logical_bytes()[range.start as usize..range.end as usize];
-    let mut tree = None;
-    let mut position = 0;
-    while position < bytes.len() {
-        if bytes[position] != 0xff {
-            let end = memchr::memchr(0xff, &bytes[position..]).map_or(bytes.len(), |at| position + at);
-            tree = join(tree, added(&bytes[position..end], budget)?);
-            position = end;
-        } else {
-            let end = bytes[position..].iter().position(|&byte| byte != 0xff).map_or(bytes.len(), |at| position + at);
-            let mut raw = Vec::with_capacity(ADD_BLOCK);
-            let mut offsets = Vec::with_capacity(ADD_BLOCK);
-            offsets.extend_from_slice(&0_u32.to_le_bytes());
-            for atom in
-                origin.atoms(range.start + position as u64..range.start + end as u64).map_err(io::Error::other)?
-            {
-                let atom = atom.map_err(io::Error::other)?;
-                if offsets.len() + 4 > ADD_BLOCK || raw.len() + atom.raw_bytes.len() > ADD_BLOCK {
-                    tree = join(tree, opaque_run(origin.interpretation().encoding, &raw, &offsets, budget)?);
-                    raw.clear();
-                    offsets.clear();
-                    offsets.extend_from_slice(&0_u32.to_le_bytes());
-                }
-                raw.extend_from_slice(atom.raw_bytes);
-                offsets.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-            }
-            tree = join(tree, opaque_run(origin.interpretation().encoding, &raw, &offsets, budget)?);
-            position = end;
+/// One bounded packing buffer across all short valid/opaque runs. Valid-only
+/// blocks can fill ADD_BLOCK; mixed blocks leave room for a u32 per logical
+/// byte plus the final endpoint. The table stays flat over valid UTF-8 bytes.
+struct ImportBuilder<'a> {
+    encoding: Encoding,
+    budget: &'a Arc<AddBudget>,
+    logical: Vec<u8>,
+    raw: Vec<u8>,
+    offsets: Vec<u8>,
+    opaque_atoms: usize,
+    tree: Tree,
+}
+impl<'a> ImportBuilder<'a> {
+    fn new(encoding: Encoding, budget: &'a Arc<AddBudget>) -> Self {
+        Self {
+            encoding,
+            budget,
+            logical: Vec::with_capacity(ADD_BLOCK),
+            raw: Vec::with_capacity(ADD_BLOCK),
+            offsets: Vec::with_capacity(ADD_BLOCK),
+            opaque_atoms: 0,
+            tree: None,
         }
     }
-    Ok(tree)
+    fn flush(&mut self) -> io::Result<()> {
+        if self.logical.is_empty() {
+            return Ok(());
+        }
+        let block = if self.raw.is_empty() {
+            added(&self.logical, self.budget)?
+        } else if self.opaque_atoms == self.logical.len() {
+            opaque_run(self.encoding, &self.raw, &self.offsets, self.budget)?
+        } else {
+            detached_block(self.encoding, &self.logical, &self.raw, &self.offsets, self.budget)?
+        };
+        self.tree = join(self.tree.take(), block);
+        self.logical.clear();
+        self.raw.clear();
+        self.offsets.clear();
+        self.opaque_atoms = 0;
+        Ok(())
+    }
+    fn text(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            let limit = if self.raw.is_empty() { ADD_BLOCK } else { ADD_BLOCK / 4 - 1 };
+            let count = bytes.len().min(limit - self.logical.len());
+            self.logical.extend_from_slice(&bytes[..count]);
+            if !self.raw.is_empty() {
+                for _ in 0..count {
+                    self.offsets.extend_from_slice(&(self.raw.len() as u32).to_le_bytes());
+                }
+            }
+            bytes = &bytes[count..];
+            if self.logical.len() == limit {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+    fn opaque(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.logical.len() >= ADD_BLOCK / 4 - 1 || self.raw.len() + bytes.len() > ADD_BLOCK {
+            self.flush()?;
+        }
+        if self.raw.is_empty() {
+            self.offsets.resize((self.logical.len() + 1) * 4, 0);
+        }
+        self.logical.push(0xff);
+        self.raw.extend_from_slice(bytes);
+        self.offsets.extend_from_slice(&(self.raw.len() as u32).to_le_bytes());
+        self.opaque_atoms += 1;
+        Ok(())
+    }
+    fn finish(mut self) -> io::Result<Tree> {
+        self.flush()?;
+        Ok(self.tree)
+    }
+}
+
+fn import_atoms<'a>(
+    origin: &'a DecodedSnapshot,
+    range: Range<u64>,
+    _budget: &AddBudget,
+) -> io::Result<crate::decoded_backing::Atoms<'a>> {
+    #[cfg(test)]
+    _budget.import_streams.fetch_add(1, Ordering::Relaxed);
+    origin.atoms(range).map_err(io::Error::other)
+}
+
+fn import_decoded(origin: &DecodedSnapshot, range: Range<u64>, budget: &Arc<AddBudget>) -> io::Result<Tree> {
+    let covering = crate::decoded_piece::validate_range(origin, range.clone())?;
+    let mut builder = ImportBuilder::new(origin.interpretation().encoding, budget);
+    // Exactly one cursor: endpoint replay is constant per import, rather than
+    // once for each short opaque run. Valid partial edge atoms are clipped as
+    // UTF-8, never assigned an invented raw interior boundary.
+    for atom in import_atoms(origin, covering, budget)? {
+        let atom = atom.map_err(io::Error::other)?;
+        budget.observe_import_atom(&atom.raw);
+        match atom.content {
+            crate::decoded_backing::AtomContent::Text(_) => {
+                let clipped = atom.logical.start.max(range.start)..atom.logical.end.min(range.end);
+                builder.text(&origin.logical_bytes()[clipped.start as usize..clipped.end as usize])?;
+            }
+            crate::decoded_backing::AtomContent::Opaque => builder.opaque(atom.raw_bytes)?,
+        }
+    }
+    builder.finish()
 }
 
 pub(crate) fn decoded(origin: DecodedSnapshot, owner: Arc<()>) -> Tree {
@@ -521,7 +700,14 @@ fn import_observed(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>, visit: 
                 for at in piece.start..=piece.end {
                     rebased.extend_from_slice(&((offset_at(offsets, at) - begin) as u32).to_le_bytes());
                 }
-                return opaque_run(*encoding, &raw.bytes().map_err(io::Error::other)?[begin..end], &rebased, budget);
+                let bytes = piece.storage.bytes().map_err(io::Error::other)?;
+                return detached_block(
+                    *encoding,
+                    &bytes[piece.start as usize..piece.end as usize],
+                    &raw.bytes().map_err(io::Error::other)?[begin..end],
+                    &rebased,
+                    budget,
+                );
             }
             let foreign = match piece.storage.as_ref() {
                 Storage::Memory { budget: source, .. } => !Arc::ptr_eq(source, budget),
@@ -686,11 +872,49 @@ pub enum SourceChunk<'a> {
 }
 
 /// Read-only traversal with the same O(tree height) scratch bound as `Chunks`.
-pub struct SourceChunks<'a>(Chunks<'a>);
+pub struct SourceChunks<'a> {
+    chunks: Chunks<'a>,
+    detached: Option<DetachedChunks<'a>>,
+}
+
+struct DetachedChunks<'a> {
+    encoding: Encoding,
+    bytes: &'a [u8],
+    raw: &'a [u8],
+    table: &'a [u8],
+    next: usize,
+    end: usize,
+}
+impl<'a> Iterator for DetachedChunks<'a> {
+    type Item = SourceChunk<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            return None;
+        }
+        let start = self.next;
+        let opaque = self.bytes[start] == 0xff;
+        let end =
+            self.bytes[start..self.end].iter().position(|&b| (b == 0xff) != opaque).map_or(self.end, |at| start + at);
+        self.next = end;
+        let bytes = &self.bytes[start..end];
+        Some(if opaque {
+            let begin = offset_at(self.table, start as u64);
+            let finish = offset_at(self.table, end as u64);
+            SourceChunk::Opaque {
+                encoding: self.encoding,
+                bytes,
+                raw_bytes: &self.raw[begin..finish],
+                raw_offsets: &self.table[start * 4..(end + 1) * 4],
+            }
+        } else {
+            SourceChunk::Added(bytes)
+        })
+    }
+}
 
 impl<'a> SourceChunks<'a> {
     pub(crate) fn new(tree: &'a Tree, range: Range<u64>) -> Self {
-        Self(Chunks::new(tree, range))
+        Self { chunks: Chunks::new(tree, range), detached: None }
     }
 }
 
@@ -698,41 +922,50 @@ impl<'a> Iterator for SourceChunks<'a> {
     type Item = Result<SourceChunk<'a>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((node, offset)) = self.0.stack.pop() {
-            if offset >= self.0.range.end || offset + node.metrics.bytes <= self.0.range.start {
+        if let Some(cursor) = &mut self.detached {
+            if let Some(chunk) = cursor.next() {
+                return Some(Ok(chunk));
+            }
+            self.detached = None;
+        }
+        while let Some((node, offset)) = self.chunks.stack.pop() {
+            if offset >= self.chunks.range.end || offset + node.metrics.bytes <= self.chunks.range.start {
                 continue;
             }
             match &node.kind {
                 Kind::Branch(left, right) => {
-                    self.0.stack.push((right, offset + left.metrics.bytes));
-                    self.0.stack.push((left, offset));
+                    self.chunks.stack.push((right, offset + left.metrics.bytes));
+                    self.chunks.stack.push((left, offset));
                 }
                 Kind::Leaf(piece) => {
-                    let start = piece.start + self.0.range.start.saturating_sub(offset);
-                    let end = piece.start + (self.0.range.end - offset).min(node.metrics.bytes);
+                    let start = piece.start + self.chunks.range.start.saturating_sub(offset);
+                    let end = piece.start + (self.chunks.range.end - offset).min(node.metrics.bytes);
                     let result = piece.storage.bytes().and_then(|bytes| {
+                        if let Storage::Opaque { encoding, raw, offsets, .. } = &*piece.storage {
+                            let mut cursor = DetachedChunks {
+                                encoding: *encoding,
+                                bytes,
+                                raw: raw.bytes()?,
+                                table: offsets.bytes()?,
+                                next: start as usize,
+                                end: end as usize,
+                            };
+                            let first = cursor.next().expect("nonempty detached piece range");
+                            self.detached = Some(cursor);
+                            return Ok(first);
+                        }
                         let bytes = &bytes[start as usize..end as usize];
                         Ok(match piece.storage.as_ref() {
                             Storage::Original(file) => SourceChunk::Original { file, range: start..end, bytes },
                             Storage::Decoded(source) => {
                                 SourceChunk::Decoded { origin: &source.origin, range: start..end, bytes }
                             }
-                            Storage::Opaque { encoding, raw, offsets, .. } => {
-                                let table = offsets.bytes()?;
-                                let begin = offset_at(table, start);
-                                let finish = offset_at(table, end);
-                                SourceChunk::Opaque {
-                                    encoding: *encoding,
-                                    bytes,
-                                    raw_bytes: &raw.bytes()?[begin..finish],
-                                    raw_offsets: &table[start as usize * 4..(end as usize + 1) * 4],
-                                }
-                            }
                             _ => SourceChunk::Added(bytes),
                         })
                     });
                     if result.is_err() {
-                        self.0.stack.clear();
+                        self.chunks.stack.clear();
+                        self.detached = None;
                     }
                     return Some(result);
                 }
@@ -785,13 +1018,22 @@ impl<'a> Iterator for Chunks<'a> {
 
 #[cfg(test)]
 pub(crate) fn spill_paths(tree: &Tree) -> Vec<PathBuf> {
+    fn storage_paths(storage: &Storage, paths: &mut Vec<PathBuf>) {
+        match storage {
+            Storage::Disk(block) => paths.push(block.path.clone()),
+            Storage::Opaque { logical, raw, offsets, .. } => {
+                for storage in [logical, raw, offsets] {
+                    storage_paths(storage, paths);
+                }
+            }
+            _ => {}
+        }
+    }
     let mut paths = Vec::new();
     if let Some(node) = tree {
         match &node.kind {
             Kind::Leaf(piece) => {
-                if let Storage::Disk(block) = piece.storage.as_ref() {
-                    paths.push(block.path.clone());
-                }
+                storage_paths(&piece.storage, &mut paths);
             }
             Kind::Branch(left, right) => {
                 paths.extend(spill_paths(&Some(left.clone())));
