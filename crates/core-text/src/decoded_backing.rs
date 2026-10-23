@@ -22,7 +22,7 @@
 
 use crate::encoding::{Encoding, EncodingError};
 use crate::{FileState, ReadError, TextFile};
-use encoding_rs::{CoderResult, DecoderResult};
+use encoding_rs::DecoderResult;
 use memmap2::Mmap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Maximum raw distance between neutral checkpoints, including alignment.
+/// Maximum raw distance between complete-atom checkpoints, including alignment.
 pub const CHECKPOINT_RAW_BYTES: usize = 64 << 10;
 const SCRATCH: usize = 16 << 10;
 const RECORD: usize = 16;
@@ -571,14 +571,21 @@ fn codec(encoding: Encoding) -> &'static encoding_rs::Encoding {
     encoding_rs::Encoding::for_label_no_replacement(encoding.name().as_bytes()).unwrap()
 }
 
-/// Find a neutral endpoint with <=64KiB raw distance. UTF-16 is never Latin1
-/// compatible, so align units/surrogates explicitly. For other families the
-/// existing decoder's neutral-state query handles every stateless encoding.
+/// Find a complete-atom endpoint with <=64KiB raw distance. A pending decoder
+/// need not ever become neutral on malformed runs: each new lead can replace
+/// the previous malformed lead and itself become pending. Never extend a cut
+/// looking for eventual neutrality, or finalize an arbitrary cut as EOF.
+///
+/// Bulk decoding records exact restart points at neutral states and the end of
+/// each malformed span (excluding consumed lookahead). If the limit is pending,
+/// replay whole atoms from the last such point and cut BEFORE any crossing atom.
+/// Replay can inspect at most three lookahead bytes beyond the limit, but the
+/// published checkpoint distance and later endpoint replay stay <=64KiB.
 fn block_end(raw: &[u8], start: usize, encoding: Encoding) -> Result<usize, BackingError> {
     if raw.len() - start <= CHECKPOINT_RAW_BYTES {
         return Ok(raw.len());
     }
-    let mut end = start + CHECKPOINT_RAW_BYTES - 4;
+    let mut end = start + CHECKPOINT_RAW_BYTES;
     if encoding == Encoding::UTF16_LE || encoding == Encoding::UTF16_BE {
         end -= (end - start) % 2;
         let pair = [raw[end - 2], raw[end - 1]];
@@ -591,24 +598,34 @@ fn block_end(raw: &[u8], start: usize, encoding: Encoding) -> Result<usize, Back
     let mut decoder = codec(encoding).new_decoder_without_bom_handling();
     let mut scratch = [0; SCRATCH];
     let mut at = start;
+    let mut restart = start;
     loop {
-        let (result, read, _, _) = decoder.decode_to_utf8(&raw[at..end], &mut scratch, false);
+        let (result, read, _) = decoder.decode_to_utf8_without_replacement(&raw[at..end], &mut scratch, false);
         at += read;
-        if result == CoderResult::InputEmpty {
+        match result {
+            DecoderResult::Malformed(_, after) => {
+                // For stateless encodings this is the boundary AFTER the
+                // malformed atom, even if the decoder buffered a new lead.
+                restart = at - after as usize;
+            }
+            DecoderResult::InputEmpty | DecoderResult::OutputFull => {
+                if decoder.latin1_byte_compatible_up_to(b"").is_some() {
+                    restart = at;
+                }
+                if result == DecoderResult::InputEmpty {
+                    break;
+                }
+            }
+        }
+    }
+    while restart < end {
+        let next = restart + next_atom(encoding, &raw[restart..])?.raw;
+        if next > end {
             break;
         }
+        restart = next;
     }
-    while decoder.latin1_byte_compatible_up_to(b"").is_none() {
-        if end - start == CHECKPOINT_RAW_BYTES {
-            return Err(BackingError::DecoderContract);
-        }
-        let (result, read, _, _) = decoder.decode_to_utf8(&raw[end..end + 1], &mut scratch, false);
-        if result != CoderResult::InputEmpty || read != 1 {
-            return Err(BackingError::DecoderContract);
-        }
-        end += 1;
-    }
-    Ok(end)
+    Ok(restart)
 }
 
 fn checkpoint(writer: &mut impl Write, raw: usize, logical: u64) -> io::Result<()> {
@@ -975,6 +992,123 @@ mod tests {
             assert_eq!(reconstructed, raw, "{label}");
             drop(snapshot);
             fixture.retire(owner);
+        }
+    }
+
+    /// Independent whole-input replacement decode is only a display oracle;
+    /// raw partitioning and typed opaque bytes are checked separately. Fixtures
+    /// stay below 128KiB; no large-file benchmark or production allocation.
+    fn assert_checkpoint_round_trip(raw: &[u8], encoding: Encoding) {
+        let fixture = Fixture::new(raw);
+        let owner = fixture.prepare(encoding, 0);
+        let snapshot = owner.snapshot();
+        let expected = codec(encoding).decode_without_bom_handling(raw).0;
+        let mut display = String::new();
+        let mut raw_at = 0;
+        let mut logical_at = 0;
+        for atom in snapshot.atoms(0..snapshot.logical_bytes().len() as u64).unwrap() {
+            let atom = atom.unwrap();
+            assert_eq!(atom.raw.start, raw_at, "{}", encoding.name());
+            assert_eq!(atom.logical.start, logical_at, "{}", encoding.name());
+            assert_eq!(atom.raw_bytes, &raw[atom.raw.start as usize..atom.raw.end as usize]);
+            match atom.content {
+                AtomContent::Text(text) => display.push_str(text),
+                AtomContent::Opaque => {
+                    assert_eq!(
+                        &snapshot.logical_bytes()[atom.logical.start as usize..atom.logical.end as usize],
+                        &[0xff]
+                    );
+                    assert!(codec(encoding).decode_without_bom_handling(atom.raw_bytes).1);
+                    display.push('\u{fffd}');
+                }
+            }
+            raw_at = atom.raw.end;
+            logical_at = atom.logical.end;
+        }
+        assert_eq!(display, expected, "{}: valid text must not become opaque at a checkpoint", encoding.name());
+        assert_eq!(raw_at, raw.len() as u64);
+        assert_eq!(logical_at, snapshot.logical_bytes().len() as u64);
+        assert!(snapshot.checkpoint_count() <= 5, "{}: index must stay sparse", encoding.name());
+        for i in 1..snapshot.checkpoint_count() {
+            let (r, l) = snapshot.checkpoint(i);
+            assert!(r > snapshot.checkpoint(i - 1).0);
+            assert!(r - snapshot.checkpoint(i - 1).0 <= CHECKPOINT_RAW_BYTES as u64);
+            assert_eq!(snapshot.resolve_logical(l).unwrap(), Boundary::Exact { logical: l, raw: r });
+            for raw_point in [r - 1, r, (r + 1).min(raw.len() as u64)] {
+                match snapshot.resolve_raw(raw_point).unwrap() {
+                    Boundary::Exact { logical, raw } => {
+                        assert_eq!(snapshot.resolve_logical(logical).unwrap(), Boundary::Exact { logical, raw })
+                    }
+                    Boundary::Interior { logical, raw, .. } => assert_eq!(snapshot.raw_range(logical).unwrap(), raw),
+                    Boundary::Bom { .. } => panic!("fixture has no BOM"),
+                }
+            }
+        }
+        let mut copied = Vec::new();
+        snapshot.write_raw_range(0..logical_at, &mut copied, &AtomicBool::new(false)).unwrap();
+        assert_eq!(copied, raw, "{}: raw spans must remain byte exact", encoding.name());
+        drop(snapshot);
+        fixture.retire(owner);
+    }
+
+    #[test]
+    fn checkpoint_pending_leads_round_trip_without_eventual_neutrality() {
+        // The first case is the exact R1 reproduction: every following C2
+        // invalidates the pending lead and itself becomes pending indefinitely.
+        // Other families exercise pending leads, malformed lookahead, and
+        // incomplete 2/3/4-byte sequences rather than a special case for C2.
+        for (label, pattern) in [
+            ("utf-8", &b"\xc2"[..]),
+            ("utf-8", &b"\xe0"[..]),
+            ("utf-8", &b"\xf0"[..]),
+            ("big5", &b"\x81"[..]),
+            ("euc-jp", &b"\x8f"[..]),
+            ("shift_jis", &b"\x82\x20"[..]),
+            ("gbk", &b"\x81\x30"[..]),
+            ("gb18030", &b"\x81\x30\x81\xff"[..]),
+            ("euc-kr", &b"\x81\x20"[..]),
+            ("utf-16le", &b"\x00\xd8"[..]),
+            ("utf-16be", &b"\xd8\x00"[..]),
+        ] {
+            let raw: Vec<u8> = pattern.iter().copied().cycle().take(CHECKPOINT_RAW_BYTES + 1).collect();
+            assert_checkpoint_round_trip(&raw, Encoding::for_label(label).unwrap());
+        }
+    }
+
+    #[test]
+    fn checkpoint_valid_crossings_are_never_finalized_as_malformed() {
+        for (label, character) in [
+            ("utf-8", &b"\xc2\xa2"[..]),
+            ("utf-8", &b"\xe2\x82\xac"[..]),
+            ("utf-8", &b"\xf0\x9f\x98\x80"[..]),
+            ("big5", &b"\x88\x62"[..]),
+            ("euc-jp", &b"\x8f\xa2\xaf"[..]),
+            ("shift_jis", &b"\x82\xa0"[..]),
+            ("gbk", &b"\xd6\xd0"[..]),
+            ("gb18030", &b"\x81\x30\x81\x30"[..]),
+            ("euc-kr", &b"\xb0\xa1"[..]),
+            ("utf-16le", &b"\x3d\xd8\x00\xde"[..]),
+            ("utf-16be", &b"\xd8\x3d\xde\x00"[..]),
+        ] {
+            let encoding = Encoding::for_label(label).unwrap();
+            let utf16 = encoding == Encoding::UTF16_LE || encoding == Encoding::UTF16_BE;
+            for split in 1..character.len() {
+                if utf16 && split % 2 != 0 {
+                    continue;
+                }
+                let padding = if encoding == Encoding::UTF16_LE {
+                    &b"A\x00"[..]
+                } else if encoding == Encoding::UTF16_BE {
+                    &b"\x00A"[..]
+                } else {
+                    &b"A"[..]
+                };
+                let mut raw: Vec<u8> = padding.iter().copied().cycle().take(CHECKPOINT_RAW_BYTES - split).collect();
+                raw.extend_from_slice(character);
+                raw.extend_from_slice(padding);
+                assert!(!codec(encoding).decode_without_bom_handling(&raw).1, "valid test fixture: {label}");
+                assert_checkpoint_round_trip(&raw, encoding);
+            }
         }
     }
 
