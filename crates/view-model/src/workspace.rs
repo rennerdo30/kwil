@@ -692,7 +692,8 @@ impl Workspace {
             self.files.next_observer = self.files.next_observer.checked_add(1).expect("observer generation exhausted");
             let generation = self.files.next_observer;
             let path = editor.document().path().map(PathBuf::from);
-            let observer = worker.observer(document, path.clone(), next, generation);
+            let policy = crate::document_worker::document_policy(editor.document());
+            let observer = worker.observer(document, path.clone(), next, generation, policy);
             if let Err(error) = editor.set_edit_observer(Some(observer)) {
                 view.set_notice(format!("Recovery observer unavailable: {error}"));
                 continue;
@@ -710,6 +711,7 @@ impl Workspace {
                     path,
                     next_sequence: next,
                     generation,
+                    policy,
                 });
             }
         }
@@ -904,6 +906,7 @@ impl Workspace {
             self.prompt_notice();
             return Ok(());
         }
+        let plan = editor.document().save_plan();
         let request = match editor.save_request(path) {
             Ok(request) => request,
             Err(error) => {
@@ -913,7 +916,7 @@ impl Workspace {
         };
         self.files.saves.insert(id, SaveFlight { revision: request.revision, path: Some(request.path.clone()) });
         self.refresh_save_destinations();
-        self.files.queue.push_back(DocumentRequest::Save { document: id, request });
+        self.files.queue.push_back(DocumentRequest::Save { document: id, request, plan });
         if let Some(view) = self.views.get_mut(&id) {
             view.set_notice("Saving…".into());
         }
@@ -1179,6 +1182,7 @@ impl Workspace {
             DocumentResult::Prepared(_)
                 | DocumentResult::Recovered { .. }
                 | DocumentResult::Opened { .. }
+                | DocumentResult::Preview { .. }
                 | DocumentResult::Saved { .. }
         );
         let checkpoint = matches!(
@@ -1299,6 +1303,20 @@ impl Workspace {
                     damage.full = self.session.active() == Some(tab.id);
                 }
             }
+            DocumentResult::Preview { document, revision, path, file, preview } => {
+                if let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none() && revision == 0) {
+                    self.files.failed_opens.remove(&document);
+                    // Keep deferred navigation, viewport and tab identity. Only
+                    // the bounded worker-prepared text cache is replaced here.
+                    view.path = Some(path);
+                    view.file = Some(file);
+                    view.preview = Some(preview.text);
+                    let rows = view.rows();
+                    view.set_rows(rows);
+                    view.set_notice("Preparing decoded document…".into());
+                    damage.full = self.active_id() == document;
+                }
+            }
             DocumentResult::Opened { document, revision, result } => {
                 if let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none() && revision == 0) {
                     match result {
@@ -1331,6 +1349,7 @@ impl Workspace {
                             view.set_notice(String::new());
                         }
                         Err(error) => {
+                            self.files.failed_opens.insert(document);
                             view.set_notice(format!("Index failed: {error}"));
                         }
                     }
@@ -2002,7 +2021,7 @@ mod tests {
     }
 
     fn take_save(workspace: &mut Workspace) -> (DocumentId, kwil_core_workspace::SaveRequest) {
-        let Some(DocumentRequest::Save { document, request }) = workspace.files.queue.pop_front() else {
+        let Some(DocumentRequest::Save { document, request, .. }) = workspace.files.queue.pop_front() else {
             panic!("expected worker save")
         };
         (document, request)
@@ -2343,6 +2362,17 @@ mod tests {
             })
             .unwrap(),
         );
+        workspace
+            .files
+            .worker
+            .as_ref()
+            .unwrap()
+            .try_submit(DocumentRequest::Prepare { root: Some(root.clone()) })
+            .unwrap();
+        match receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+            DocumentResult::Prepared(result) => drop(result.unwrap()),
+            _ => panic!("expected isolated worker preparation"),
+        }
         workspace.file_command("file.reopenClosed").unwrap();
         assert!(matches!(
             receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
@@ -2472,6 +2502,17 @@ mod tests {
             })
             .unwrap(),
         );
+        workspace
+            .files
+            .worker
+            .as_ref()
+            .unwrap()
+            .try_submit(DocumentRequest::Prepare { root: Some(root.clone()) })
+            .unwrap();
+        match receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+            DocumentResult::Prepared(result) => drop(result.unwrap()),
+            _ => panic!("expected isolated worker preparation"),
+        }
         let failed = workspace.open_path(root.join("missing-parent/failed.txt")).unwrap();
         let result = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(matches!(&result, DocumentResult::Opened { document, result: Err(_), .. } if *document == failed));
@@ -2492,8 +2533,7 @@ mod tests {
                 break;
             }
         }
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,7 +1,12 @@
 //! One bounded file-I/O lane shared by all tabs. Callbacks wake the frontend;
 //! the UI never polls for work or launches a thread per file/save.
 use crate::Document;
+use kwil_core_text::{decoded_backing::DecodedPreview, encoding::SavePlan};
+use provenance::journal::RecoveryPolicy;
 mod decoded;
+mod encoding_runtime;
+mod encoding_seed;
+pub(crate) use encoding_runtime::document_policy;
 pub mod provenance;
 pub mod retirement;
 pub use decoded::{PreparedDecodedDocument, prepare_decoded_document};
@@ -91,6 +96,7 @@ pub enum DocumentRequest {
     Save {
         document: DocumentId,
         request: SaveRequest,
+        plan: SavePlan,
     },
     ValidateReopen {
         document: DocumentId,
@@ -110,6 +116,7 @@ pub enum DocumentRequest {
         path: Option<PathBuf>,
         next_sequence: u64,
         generation: u64,
+        policy: RecoveryPolicy,
     },
     Journal {
         document: DocumentId,
@@ -117,6 +124,7 @@ pub enum DocumentRequest {
         path: Option<PathBuf>,
         first_sequence: u64,
         generation: u64,
+        policy: RecoveryPolicy,
     },
     FinishJournal {
         document: DocumentId,
@@ -133,6 +141,7 @@ pub enum DocumentResult {
     Persisted(io::Result<()>),
     Recovered { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
     Opened { document: DocumentId, revision: u64, result: io::Result<(PathBuf, TextFile)> },
+    Preview { document: DocumentId, revision: u64, path: PathBuf, file: TextFile, preview: DecodedPreview },
     Indexed { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
     Saved { document: DocumentId, revision: u64, result: io::Result<SavedSnapshot> },
     ReopenValidated { document: DocumentId, generation: u64, result: io::Result<bool> },
@@ -153,10 +162,13 @@ struct Storage {
     journals: HashMap<DocumentId, JournalState>,
     order: HashMap<DocumentId, u64>,
     durable_session: Session,
+    encoding: encoding_runtime::EncodingRuntime,
 }
 
 struct JournalState {
     handle: JournalSession,
+    origins: Option<provenance::OriginRegistry>,
+    seed_origins: Option<mpsc::Receiver<io::Result<provenance::AdmissionToken>>>,
     revision: u64,
     sequence: u64,
     ready: bool,
@@ -170,6 +182,8 @@ impl JournalState {
     fn new(handle: JournalSession, revision: u64, sequence: u64) -> Self {
         Self {
             handle,
+            origins: None,
+            seed_origins: None,
             revision,
             sequence,
             ready: false,
@@ -202,6 +216,7 @@ impl DocumentWorker {
         path: Option<PathBuf>,
         first_sequence: u64,
         generation: u64,
+        policy: RecoveryPolicy,
     ) -> crate::EditObserver {
         let sender = self.tx.clone();
         let capacity = self.journal_capacity.clone();
@@ -220,6 +235,7 @@ impl DocumentWorker {
                 path: path.clone(),
                 first_sequence,
                 generation,
+                policy,
             }) {
                 Ok(()) => Ok(()),
                 Err(
@@ -240,6 +256,10 @@ impl DocumentWorker {
         let save_destinations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let destinations = save_destinations.clone();
         std::thread::Builder::new().name("kwil-documents".into()).spawn(move || {
+            // Existing requests drain on shutdown. Request-scoped cancellation
+            // remains an integration task; never cancel an accepted save merely
+            // because the UI released its sender.
+            let cancel = AtomicBool::new(false);
             let mut storage: Option<Storage> = None;
             let mut deferred = std::collections::VecDeque::new();
             let mut session_due = None;
@@ -254,6 +274,13 @@ impl DocumentWorker {
                         })
                     });
                 let available = deferred.iter().position(|request| {
+                    if let DocumentRequest::Journal { document, .. } = request
+                        && let Some(journal) = storage.as_ref().and_then(|storage| storage.journals.get(document))
+                        && !journal.ready
+                        && !journal.failed
+                    {
+                        return false;
+                    }
                     let document = match request {
                         DocumentRequest::Journal { document, .. } | DocumentRequest::SeedJournal { document, .. } => {
                             document
@@ -328,14 +355,18 @@ impl DocumentWorker {
                                     storage.as_mut().ok_or_else(|| io::Error::other("Recovery unavailable"))?;
                                 let path = storage.root.join(format!("{}.kwj", tab.id.0));
                                 if path.try_exists()? {
-                                    let (document, recovered, _) = recover_document(path, &tab)?;
+                                    let (document, recovered, _, origins) =
+                                        recover_prepared(&storage.root, &mut storage.encoding, path, &tab)?;
                                     let handle = resume(&storage.service, recovered)?;
                                     let revision = document.revision();
-                                    storage.journals.insert(tab.id, JournalState::new(handle, revision, 0));
+                                    let mut journal = JournalState::new(handle, revision, 0);
+                                    journal.origins = origins;
+                                    storage.journals.insert(tab.id, journal);
                                     Ok(document)
                                 } else if let Some(path) = &tab.path {
-                                    kwil_core_workspace::open_for_editing(path)
-                                        .and_then(|file| index(path.clone(), file))
+                                    kwil_core_workspace::open_for_editing(path).and_then(|file| {
+                                        storage.encoding.open(path.clone(), file, None, &cancel, |_| Ok(()))
+                                    })
                                 } else if tab.revision == tab.saved_revision && tab.recovery_path.is_none() {
                                     Ok(Document::new())
                                 } else {
@@ -351,12 +382,25 @@ impl DocumentWorker {
                         DocumentRequest::Open { document, revision, path } => {
                             match kwil_core_workspace::open_for_editing(&path) {
                                 Ok(file) => {
-                                    complete(DocumentResult::Opened {
-                                        document,
-                                        revision,
-                                        result: Ok((path.clone(), file.clone())),
-                                    });
-                                    let result = index(path, file);
+                                    let result = match storage.as_mut() {
+                                        Some(storage) => storage.encoding.open(
+                                            path.clone(),
+                                            file.clone(),
+                                            None,
+                                            &cancel,
+                                            |preview| {
+                                                complete(DocumentResult::Preview {
+                                                    document,
+                                                    revision,
+                                                    path,
+                                                    file,
+                                                    preview,
+                                                });
+                                                Ok(())
+                                            },
+                                        ),
+                                        None => Err(io::Error::other("Workspace storage is not prepared")),
+                                    };
                                     complete(DocumentResult::Indexed {
                                         document,
                                         revision,
@@ -369,21 +413,30 @@ impl DocumentWorker {
                             }
                         }
                         DocumentRequest::Index { document, revision, path, file } => {
-                            complete(DocumentResult::Indexed {
-                                document,
-                                revision,
-                                result: index(path, file).map(Box::new),
-                            });
+                            let result = match storage.as_mut() {
+                                Some(storage) => {
+                                    storage.encoding.open(path.clone(), file.clone(), None, &cancel, |preview| {
+                                        complete(DocumentResult::Preview { document, revision, path, file, preview });
+                                        Ok(())
+                                    })
+                                }
+                                None => Err(io::Error::other("Workspace storage is not prepared")),
+                            };
+                            complete(DocumentResult::Indexed { document, revision, result: result.map(Box::new) });
                         }
-                        DocumentRequest::Save { document, request } => {
+                        DocumentRequest::Save { document, request, plan } => {
                             let revision = request.revision;
                             let mut reserved =
                                 destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                             if let Some((owner, _, path)) = &reopening {
                                 reserved.push((*owner, path.clone()));
                             }
-                            let result = validate_save_destination(document, &request.path, &reserved)
-                                .and_then(|()| kwil_core_workspace::save_snapshot(request));
+                            let result = validate_save_destination(document, &request.path, &reserved).and_then(|()| {
+                                match storage.as_mut() {
+                                    Some(storage) => storage.encoding.save(request, plan, &cancel),
+                                    None => Err(io::Error::other("Workspace storage is not prepared")),
+                                }
+                            });
                             complete(DocumentResult::Saved { document, revision, result });
                         }
                         DocumentRequest::ValidateReopen { document, generation, path, original, cached } => {
@@ -427,6 +480,7 @@ impl DocumentWorker {
                             path,
                             next_sequence,
                             generation,
+                            policy,
                         } => {
                             let result = storage
                                 .as_mut()
@@ -435,11 +489,11 @@ impl DocumentWorker {
                                     seed_journal(
                                         storage,
                                         document,
-                                        revision,
-                                        snapshot,
+                                        SeedSnapshot { revision, snapshot },
                                         path,
                                         next_sequence.saturating_sub(1),
                                         generation,
+                                        policy,
                                     )
                                 });
                             if let Err(error) = result {
@@ -451,13 +505,63 @@ impl DocumentWorker {
                                 });
                             }
                         }
-                        DocumentRequest::Journal { document, receipt, path, first_sequence, generation } => {
+                        DocumentRequest::Journal { document, receipt, path, first_sequence, generation, policy } => {
+                            if let Some(state) = storage.as_mut() {
+                                let seeded = seed_journal(
+                                    state,
+                                    document,
+                                    SeedSnapshot {
+                                        revision: receipt.before_revision,
+                                        snapshot: receipt.before.clone(),
+                                    },
+                                    path.clone(),
+                                    first_sequence.saturating_sub(1),
+                                    generation,
+                                    policy,
+                                );
+                                if seeded.is_ok()
+                                    && state
+                                        .journals
+                                        .get(&document)
+                                        .is_some_and(|journal| !journal.ready && !journal.failed)
+                                {
+                                    deferred.push_back(DocumentRequest::Journal {
+                                        document,
+                                        receipt,
+                                        path,
+                                        first_sequence,
+                                        generation,
+                                        policy,
+                                    });
+                                    // Poll readiness once before the next event-driven wait.
+                                    poll_journals(state, &complete);
+                                    continue;
+                                }
+                                if let Err(error) = seeded {
+                                    capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                    complete(DocumentResult::JournalQueued {
+                                        document,
+                                        revision: receipt.after_revision,
+                                        sequence: receipt.sequence,
+                                        result: Err(error),
+                                    });
+                                    continue;
+                                }
+                            }
                             let (revision, sequence) = (receipt.after_revision, receipt.sequence);
                             let result = storage
                                 .as_mut()
                                 .ok_or_else(|| io::Error::other("Recovery unavailable"))
                                 .and_then(|storage| {
-                                    journal_receipt(storage, document, receipt, path, first_sequence, generation)
+                                    journal_receipt(
+                                        storage,
+                                        document,
+                                        receipt,
+                                        path,
+                                        first_sequence,
+                                        generation,
+                                        policy,
+                                    )
                                 });
                             capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
                             complete(DocumentResult::JournalQueued { document, revision, sequence, result });
@@ -499,6 +603,12 @@ impl DocumentWorker {
                 }
                 if let Some(storage) = &mut storage {
                     poll_journals(storage, &complete);
+                    // Explicit event-driven pass after worker-held receipts and
+                    // plans unwind; no cleanup timer or UI-thread unlink.
+                    let retirement = storage.encoding.retire();
+                    if let Some(error) = retirement.first_error {
+                        eprintln!("Decoded backing cleanup retained for retry: {error}");
+                    }
                 }
                 if session_due.is_some_and(|due| std::time::Instant::now() >= due) {
                     session_due = None;
@@ -508,12 +618,18 @@ impl DocumentWorker {
             let stopped = if let Some(mut storage) = storage {
                 storage.service.finish();
                 // Shutdown is on this worker. UI never waits for seeding/fsync.
-                storage
+                let result = storage
                     .service
                     .finished
                     .recv_timeout(Duration::from_secs(30))
                     .map_err(|_| io::Error::other("Journal shutdown timed out; pending seeds are not durable"))
-                    .and_then(|result| result)
+                    .and_then(|result| result);
+                storage.journals.clear();
+                let retirement = storage.encoding.retire();
+                if let Some(error) = retirement.first_error {
+                    eprintln!("Decoded backing shutdown cleanup retained for retry: {error}");
+                }
+                result
             } else {
                 Ok(())
             };
@@ -585,6 +701,18 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
         .truncate(false)
         .open(root.join("workspace.lock"))?;
     ownership.try_lock().map_err(io::Error::other)?;
+    // Reserve owner/path bookkeeping before opening any decoded document.
+    // This is a metadata admission ceiling, not a resident allocation or a
+    // file-size limit. Registry slots retain owners until snapshots retire.
+    let mut encoding = encoding_runtime::EncodingRuntime::new(
+        root.clone(),
+        retirement::BackingLimits {
+            max_backings: session::MAX_TABS + session::MAX_CLOSED,
+            max_private_path_bytes: session::MAX_PATH_BYTES,
+            max_metadata_bytes: 256 * 1024 * 1024,
+        },
+    )?;
+    let cancel = AtomicBool::new(false);
     let mut session = session::load_session(&root.join("session.kws"))?;
     let service = JournalService::spawn(Duration::from_secs(2))?;
     let mut documents = Vec::new();
@@ -631,7 +759,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             first_visible_line: 0,
             first_byte_column: 0,
         };
-        let (mut document, recovered, base) = recover_document(path.clone(), &metadata)?;
+        let (mut document, recovered, base, origins) = recover_prepared(&root, &mut encoding, path.clone(), &metadata)?;
         // Orphan metadata never proves a saved state, including revision zero.
         // Reserve an unreachable saved marker on the Document itself: sync
         // must not turn the Session dirty flag back into a clean document.
@@ -650,22 +778,26 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             first_visible_line: 0,
             first_byte_column: 0,
         })?;
-        orphans.insert(*id, (document, recovered));
+        orphans.insert(*id, (document, recovered, origins));
     }
     for tab in session.tabs() {
         let result = if paths.contains_key(&tab.id) {
             let recovered = match orphans.remove(&tab.id) {
                 Some(recovered) => Ok(recovered),
-                None => recover_document(paths[&tab.id].clone(), tab).map(|(d, r, _)| (d, r)),
+                None => recover_prepared(&root, &mut encoding, paths[&tab.id].clone(), tab)
+                    .map(|(d, r, _, origins)| (d, r, origins)),
             };
-            recovered.and_then(|(document, recovered)| {
+            recovered.and_then(|(document, recovered, origins)| {
                 let handle = resume(&service, recovered)?;
                 let revision = document.revision();
-                journals.insert(tab.id, JournalState::new(handle, revision, 0));
+                let mut journal = JournalState::new(handle, revision, 0);
+                journal.origins = origins;
+                journals.insert(tab.id, journal);
                 Ok(document)
             })
         } else if let Some(path) = &tab.path {
-            kwil_core_workspace::open_for_editing(path).and_then(|file| index(path.clone(), file))
+            kwil_core_workspace::open_for_editing(path)
+                .and_then(|file| encoding.open(path.clone(), file, None, &cancel, |_| Ok(())))
         } else if tab.revision != tab.saved_revision || tab.recovery_path.is_some() {
             Err(io::Error::other("Unsaved document has no complete recovery journal"))
         } else {
@@ -684,7 +816,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
     let durable_session = session::load_session(&root.join("session.kws"))?;
     Ok((
         PreparedWorkspace { session, documents },
-        Storage { root, _ownership: ownership, service, journals, order: HashMap::new(), durable_session },
+        Storage { root, _ownership: ownership, service, journals, order: HashMap::new(), durable_session, encoding },
     ))
 }
 
@@ -734,43 +866,82 @@ fn persist_session(storage: &mut Storage, next: &Session) -> io::Result<()> {
     Ok(())
 }
 
+struct SeedSnapshot {
+    revision: u64,
+    snapshot: kwil_core_text::Snapshot,
+}
+
 fn seed_journal(
     storage: &mut Storage,
     document: DocumentId,
-    revision: u64,
-    snapshot: kwil_core_text::Snapshot,
+    source: SeedSnapshot,
     path: Option<PathBuf>,
     sequence: u64,
     generation: u64,
+    policy: RecoveryPolicy,
 ) -> io::Result<()> {
+    let SeedSnapshot { revision, snapshot } = source;
     if let Some(journal) = storage.journals.get_mut(&document) {
         journal.generation = journal.generation.max(generation);
         return Ok(());
     }
     let sequence = (*storage.order.entry(document).or_insert(sequence)).max(sequence);
     let journal_path = storage.root.join(format!("{}.kwj", document.0));
+    let mut origins = Some(provenance::OriginRegistry::new(session::MAX_TABS + session::MAX_CLOSED, 8 * 1024 * 1024));
+    let mut seed_origins = None;
     let handle = if journal_path.try_exists()? {
-        let recovered = RecoveredJournal::open(journal_path, document, &AtomicBool::new(false), |_| Ok(()))?;
+        let metadata = storage
+            .durable_session
+            .tabs()
+            .iter()
+            .chain(storage.durable_session.closed())
+            .find(|tab| tab.id == document)
+            .cloned()
+            .unwrap_or(Tab {
+                id: document,
+                path: path.clone(),
+                recovery_path: None,
+                revision,
+                saved_revision: revision,
+                cursor: 0,
+                anchor: 0,
+                first_visible_line: 0,
+                first_byte_column: 0,
+            });
+        let (replayed, recovered, _, restored_origins) =
+            recover_prepared(&storage.root, &mut storage.encoding, journal_path, &metadata)?;
         if recovered.summary().revision != revision || recovered.summary().byte_len != snapshot.len() {
             return Err(io::Error::other("Journal revision disagrees with reopened document; recovery retained"));
         }
+        if !snapshots_equal(&replayed.snapshot(), &snapshot)? {
+            return Err(io::Error::other("Journal bytes disagree with reopened document; recovery retained"));
+        }
+        origins = restored_origins;
+        drop(replayed);
         resume(&storage.service, recovered)?
     } else {
-        let mut seed = kwil_core_workspace::journal::JournalSeed {
+        let logical_len = snapshot.len();
+        let directory = origins.as_ref().expect("new origin directory");
+        let plan = directory.plan(snapshot, 0..logical_len, std::sync::Arc::new(AtomicBool::new(false)))?;
+        let physical_len = plan.physical_len();
+        let (source, admission) = encoding_seed::SeedSource::new(directory.start(plan)?);
+        seed_origins = Some(admission);
+        let mut seed = kwil_core_workspace::journal::EncodedJournalSeed {
             path: journal_path,
             base: JournalBase {
                 document,
                 revision,
                 original_path: path,
                 original_identity: [0; 4],
-                codec: b"raw-v1".to_vec(),
-                byte_len: snapshot.len(),
-            },
-            source: Box::new(SnapshotReader::new(snapshot)),
+                codec: policy.to_codec()?,
+                byte_len: physical_len,
+            }
+            .with_logical_len(logical_len)?,
+            source: Box::new(source),
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match storage.service.try_create(seed) {
+            match storage.service.try_create_encoded(seed) {
                 Ok(handle) => break handle,
                 Err(TrySendError::Full(value)) if std::time::Instant::now() < deadline => {
                     seed = *value;
@@ -781,6 +952,8 @@ fn seed_journal(
         }
     };
     let mut state = JournalState::new(handle, revision, sequence);
+    state.origins = origins;
+    state.seed_origins = seed_origins;
     state.generation = generation;
     storage.journals.insert(document, state);
     Ok(())
@@ -820,16 +993,17 @@ fn journal_receipt(
     path: Option<PathBuf>,
     first_sequence: u64,
     generation: u64,
+    policy: RecoveryPolicy,
 ) -> io::Result<()> {
     use kwil_core_workspace::journal::{JournalBatch, JournalCommand as C, JournalReplacement};
     seed_journal(
         storage,
         document,
-        receipt.before_revision,
-        receipt.before.clone(),
+        SeedSnapshot { revision: receipt.before_revision, snapshot: receipt.before.clone() },
         path,
         first_sequence.saturating_sub(1),
         generation,
+        policy,
     )?;
     let journal = storage.journals.get_mut(&document).unwrap();
     let result = (|| {
@@ -840,6 +1014,38 @@ fn journal_receipt(
         {
             return Err(io::Error::other("Journal receipt gap, duplicate or mismatched revision; recovery retained"));
         }
+        if journal.origins.is_none() {
+            // Preserve the existing raw-v1 wire lineage. Encoded capsules must
+            // not be appended under a raw base that legacy replay cannot decode.
+            submit(
+                &journal.handle,
+                C::BeginBatch(JournalBatch {
+                    from_revision: receipt.before_revision,
+                    to_revision: receipt.after_revision,
+                    replacements: receipt.replacement_count(),
+                }),
+            )?;
+            receipt.for_each_replacement(&mut |replacement| {
+                submit(
+                    &journal.handle,
+                    C::BeginReplacement(JournalReplacement {
+                        offset: replacement.range.start,
+                        removed: replacement.range.end - replacement.range.start,
+                        inserted: replacement.insert.len(),
+                    }),
+                )?;
+                replacement.insert.write_to(&mut JournalBytes(&journal.handle))?;
+                submit(&journal.handle, C::EndReplacement)
+            })?;
+            submit(&journal.handle, C::CommitBatch)?;
+            journal.revision = receipt.after_revision;
+            journal.sequence = receipt.sequence;
+            journal.needs_flush = true;
+            return Ok(());
+        }
+        let origins = journal.origins.as_mut().expect("encoded origin directory");
+        let mut batch = origins.begin_batch()?;
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         submit(
             &journal.handle,
             C::BeginBatch(JournalBatch {
@@ -849,18 +1055,28 @@ fn journal_receipt(
             }),
         )?;
         receipt.for_each_replacement(&mut |replacement| {
+            let logical_len = replacement.insert.len();
+            let plan = batch.plan(replacement.insert.snapshot, replacement.insert.range, cancel.clone())?;
             submit(
                 &journal.handle,
-                C::BeginReplacement(JournalReplacement {
-                    offset: replacement.range.start,
-                    removed: replacement.range.end - replacement.range.start,
-                    inserted: replacement.insert.len(),
-                }),
+                C::BeginEncodedReplacement {
+                    replacement: JournalReplacement {
+                        offset: replacement.range.start,
+                        removed: replacement.range.end - replacement.range.start,
+                        inserted: logical_len,
+                    },
+                    payload_len: plan.physical_len(),
+                },
             )?;
-            replacement.insert.write_to(&mut JournalBytes(&journal.handle))?;
+            let mut reader = plan.start()?;
+            // io::copy's fixed scratch is bounded independently of the file.
+            // Both serialization and queue admission remain on this worker.
+            io::copy(&mut reader, &mut JournalBytes(&journal.handle))?;
+            reader.admit()?;
             submit(&journal.handle, C::EndReplacement)
         })?;
         submit(&journal.handle, C::CommitBatch)?;
+        batch.commit()?;
         journal.revision = receipt.after_revision;
         journal.sequence = receipt.sequence;
         journal.needs_flush = true;
@@ -881,7 +1097,34 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
         }
         if !journal.ready {
             match journal.handle.ready.try_recv() {
-                Ok(Ok(_)) => journal.ready = true,
+                Ok(Ok(_)) => {
+                    let admitted = if let Some(receiver) = journal.seed_origins.take() {
+                        receiver
+                            .try_recv()
+                            .map_err(|_| io::Error::other("Journal seed completed without origin admission"))
+                            .and_then(|token| token)
+                            .and_then(|token| {
+                                journal
+                                    .origins
+                                    .as_mut()
+                                    .ok_or_else(|| io::Error::other("Journal seed origin registry missing"))?
+                                    .admit(token)
+                            })
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = admitted {
+                        journal.failed = true;
+                        complete(DocumentResult::JournalDurable {
+                            document,
+                            revision: journal.revision,
+                            sequence: journal.sequence,
+                            result: Err(error),
+                        });
+                        continue;
+                    }
+                    journal.ready = true;
+                }
                 Err(mpsc::TryRecvError::Empty) => continue,
                 outcome => {
                     journal.failed = true;
@@ -948,6 +1191,66 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
                 }
             }
         }
+    }
+}
+
+fn recover_prepared(
+    root: &std::path::Path,
+    encoding: &mut encoding_runtime::EncodingRuntime,
+    path: PathBuf,
+    tab: &Tab,
+) -> io::Result<(Document, RecoveredJournal, JournalBase, Option<provenance::OriginRegistry>)> {
+    use provenance::{
+        decode::DecodeLimits,
+        journal::{JournalRecovery, JournalReplayLimits},
+        replay::ReplayLimits,
+    };
+    let max_origins = session::MAX_TABS + session::MAX_CLOSED;
+    let path_cap = root
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .checked_add(64)
+        .ok_or_else(|| io::Error::other("Recovery private path overflow"))?;
+    let recovery = JournalRecovery::new(
+        root.to_owned(),
+        JournalReplayLimits {
+            replay: ReplayLimits {
+                core: kwil_core_text::RecoveryLimits {
+                    add_memory_bytes: 8 * 1024 * 1024,
+                    undo_memory_bytes: usize::try_from(
+                        kwil_core_commands::settings::Settings::default().undo.memory_limit_bytes,
+                    )
+                    .unwrap_or(usize::MAX),
+                    max_origins,
+                    max_records: 1 << 20,
+                    max_pieces: 1 << 20,
+                    max_blocks: 1 << 20,
+                    max_metadata_bytes: 64 * 1024 * 1024,
+                },
+                decode: DecodeLimits {
+                    max_physical_bytes: u64::MAX,
+                    max_logical_bytes: u64::MAX,
+                    max_records: 1 << 20,
+                },
+                max_origin_storage_bytes: u64::MAX,
+                max_private_path_bytes: path_cap,
+            },
+            max_payload_bytes: u64::MAX,
+            max_base_metadata_bytes: session::MAX_PATH_BYTES + 256,
+            max_document_bytes: u64::MAX,
+            max_batches: 1 << 20,
+            max_replacements: 1 << 20,
+        },
+    )?;
+    match encoding.recover(recovery, path.clone(), tab, max_origins, 8 * 1024 * 1024, &AtomicBool::new(false)) {
+        Ok((document, journal, base, origins)) => Ok((document, journal, base, Some(origins))),
+        // The authenticated consumer identifies the old raw base explicitly.
+        // Other framing, checksum, policy and cap failures retain their error.
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            recover_document(path, tab).map(|(document, journal, base)| (document, journal, base, None))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1158,6 +1461,10 @@ mod tests {
     }
     impl Drop for Scratch {
         fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("Failed fixture retained at {}", self.0.display());
+                return;
+            }
             for entry in std::fs::read_dir(&self.0).unwrap() {
                 let path = entry.unwrap().path();
                 assert!(path.is_file(), "fixture cleanup only removes its own files");
@@ -1202,6 +1509,83 @@ mod tests {
         storage.service.finish();
         storage.service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         drop(storage);
+    }
+
+    fn prepare_test_worker(worker: &DocumentWorker, receiver: &mpsc::Receiver<DocumentResult>, root: &std::path::Path) {
+        worker.try_submit(DocumentRequest::Prepare { root: Some(root.to_owned()) }).unwrap();
+        loop {
+            if let DocumentResult::Prepared(result) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                drop(result.unwrap());
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn production_utf16_open_edit_save_uses_logical_coordinates_and_preserves_raw_codec() {
+        let root = Scratch::new();
+        let path = root.0.join("utf16.txt");
+        std::fs::write(&path, b"\xff\xfeA\0").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = tx.send(result);
+        })
+        .unwrap();
+        worker.try_submit(DocumentRequest::Prepare { root: Some(root.0.clone()) }).unwrap();
+        loop {
+            if let DocumentResult::Prepared(result) = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                drop(result.unwrap());
+                break;
+            }
+        }
+        worker.try_submit(DocumentRequest::Open { document: DocumentId(1), revision: 0, path: path.clone() }).unwrap();
+        let mut preview_seen = false;
+        let mut raw_opened = false;
+        let document = loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                DocumentResult::Preview { preview, .. } => {
+                    preview_seen = preview.text == b"A";
+                }
+                DocumentResult::Indexed { result, .. } => {
+                    break *result.unwrap();
+                }
+                DocumentResult::Opened { result: Ok(_), .. } => raw_opened = true,
+                _ => {}
+            }
+        };
+        let mut editor = crate::Editor::new(document);
+        let initial_len = editor.document().snapshot().len();
+        editor.execute("motion.lastLine", &crate::CommandArgs::default(), 0).unwrap();
+        editor.execute("edit.insert", &crate::CommandArgs { text: Some("x".into()), ..Default::default() }, 1).unwrap();
+        let request = editor.save_request(None).unwrap();
+        let plan = editor.document().save_plan();
+        worker.try_submit(DocumentRequest::Save { document: DocumentId(1), request, plan }).unwrap();
+        let save_succeeded = loop {
+            if let DocumentResult::Saved { result, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                let succeeded = result.is_ok();
+                let _ = editor.finish_save(result);
+                break succeeded;
+            }
+        };
+        let saved_bytes = std::fs::read(&path).unwrap();
+        let saved_len = editor.document().snapshot().len();
+        editor.execute("edit.undo", &crate::CommandArgs::default(), 2).unwrap();
+        let mut logical = Vec::new();
+        editor.document().snapshot().write_to(&mut logical).unwrap();
+        drop(editor);
+        drop(worker);
+        wait_stopped(&rx);
+        assert!(preview_seen, "decoded first screen must precede editable attachment");
+        assert!(!raw_opened, "raw file bytes must not be exposed before decoded preview");
+        assert!(save_succeeded, "encoded save must succeed for UTF16 append");
+        assert_eq!(initial_len, 1);
+        assert_eq!(saved_bytes, b"\xff\xfeA\0x\0");
+        assert_eq!(saved_len, 2);
+        assert_eq!(logical, b"A");
+        assert!(
+            !std::fs::read_dir(&root.0).unwrap().any(|entry| entry.unwrap().path().is_dir()),
+            "worker retires both checkpoint generations after editor release"
+        );
     }
 
     #[test]
@@ -1249,6 +1633,7 @@ mod tests {
             let _ = sender.send(result);
         })
         .unwrap();
+        prepare_test_worker(&worker, &receiver, &scratch.0);
         worker
             .try_submit(DocumentRequest::ValidateReopen {
                 document: DocumentId(1),
@@ -1276,13 +1661,25 @@ mod tests {
         // Refreshing UI destinations and an old release cannot erase admission.
         worker.set_save_destinations(Vec::new());
         worker.try_submit(DocumentRequest::ReleaseReopen { document: DocumentId(1), generation: 6 }).unwrap();
-        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request: request() }).unwrap();
+        worker
+            .try_submit(DocumentRequest::Save {
+                document: DocumentId(2),
+                request: request(),
+                plan: Document::new().save_plan(),
+            })
+            .unwrap();
         assert!(
             matches!(receiver.recv_timeout(Duration::from_secs(5)).unwrap(), DocumentResult::Saved { result: Err(error), .. } if error.kind() == io::ErrorKind::AlreadyExists)
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"protected");
         worker.try_submit(DocumentRequest::ReleaseReopen { document: DocumentId(1), generation: 7 }).unwrap();
-        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request: request() }).unwrap();
+        worker
+            .try_submit(DocumentRequest::Save {
+                document: DocumentId(2),
+                request: request(),
+                plan: Document::new().save_plan(),
+            })
+            .unwrap();
         assert!(matches!(
             receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
             DocumentResult::Saved { result: Ok(_), .. }
@@ -1320,6 +1717,7 @@ mod tests {
             let _ = sender.send(result);
         })
         .unwrap();
+        prepare_test_worker(&worker, &receiver, &scratch.0);
         worker.set_save_destinations(vec![(DocumentId(1), path.clone())]);
         let mut editor = crate::Editor::new(Document::new());
         editor
@@ -1327,7 +1725,9 @@ mod tests {
             .unwrap();
         let request = editor.save_request(Some(alias.clone())).unwrap();
         let revision = request.revision;
-        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request }).unwrap();
+        worker
+            .try_submit(DocumentRequest::Save { document: DocumentId(2), request, plan: Document::new().save_plan() })
+            .unwrap();
         match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
             DocumentResult::Saved { document, revision: source, result } => {
                 assert_eq!(document, DocumentId(2));
@@ -1343,7 +1743,9 @@ mod tests {
         // A later request sees the latest reservation set, not cached identities.
         worker.set_save_destinations(Vec::new());
         let request = editor.save_request(Some(scratch.0.join("different.txt"))).unwrap();
-        worker.try_submit(DocumentRequest::Save { document: DocumentId(2), request }).unwrap();
+        worker
+            .try_submit(DocumentRequest::Save { document: DocumentId(2), request, plan: Document::new().save_plan() })
+            .unwrap();
         match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
             DocumentResult::Saved { result, .. } => {
                 result.unwrap();
@@ -1462,8 +1864,7 @@ mod tests {
             let initial = if originally_named {
                 std::fs::write(&original, b"original\r\n\xff").unwrap();
                 let file = kwil_core_workspace::open_for_editing(&original).unwrap();
-                file.build_index(1).unwrap();
-                View::new(Some((original.clone(), file)))
+                View::from_preview(original.clone(), file, b"original\r\n\\xFF".to_vec())
             } else {
                 View::new(None)
             };
@@ -1476,6 +1877,7 @@ mod tests {
                 })
                 .unwrap();
             drive(&mut workspace, &receiver, Workspace::recovery_ready);
+            drive(&mut workspace, &receiver, |workspace| workspace.editor().is_some());
             let id = workspace.active_id();
             workspace
                 .execute("edit.insert", &CommandArgs { text: Some("seed\r\n".into()), ..Default::default() }, 1)
@@ -1495,8 +1897,11 @@ mod tests {
             let journal_path = scratch.0.join(format!("{}.kwj", id.0));
             let mut base_path = None;
             let journal = RecoveredJournal::open(journal_path, id, &AtomicBool::new(false), |event| {
-                if let RecoveryEvent::Base(base) = event {
-                    base_path = base.original_path.clone();
+                match event {
+                    RecoveryEvent::Base(base) | RecoveryEvent::EncodedBase { base, .. } => {
+                        base_path = base.original_path.clone();
+                    }
+                    _ => {}
                 }
                 Ok(())
             })
@@ -1857,7 +2262,9 @@ mod tests {
         let capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let worker = DocumentWorker { tx, journal_capacity: capacity.clone(), save_destinations: Default::default() };
         let mut editor = crate::Editor::new(Document::new());
-        editor.set_edit_observer(Some(worker.observer(DocumentId(1), None, 1, 1))).unwrap();
+        editor
+            .set_edit_observer(Some(worker.observer(DocumentId(1), None, 1, 1, document_policy(editor.document()))))
+            .unwrap();
         let args = |text: &str| crate::CommandArgs { text: Some(text.into()), ..Default::default() };
         editor.execute("edit.insert", &args("x"), 1).unwrap();
         editor.execute("edit.insert", &args("y"), 1).unwrap();
@@ -1903,6 +2310,69 @@ mod tests {
                 result.unwrap();
                 break;
             }
+        }
+    }
+
+    #[test]
+    fn production_utf16_opaque_journal_survives_two_restarts_and_save_as() {
+        use crate::{CommandArgs, View, Workspace};
+        let root = Scratch::new();
+        let path = root.0.join("malformed-utf16.txt");
+        let original = b"\xff\xfeA\0\0\xd8";
+        std::fs::write(&path, original).unwrap();
+        let mut id = None;
+        for round in 0..3 {
+            let (tx, rx) = mpsc::channel();
+            let mut workspace = Workspace::new(View::new(None)).unwrap();
+            workspace.set_session_restore(true);
+            workspace
+                .start_document_worker_at(Some(root.0.clone()), move |result| {
+                    let _ = tx.send(result);
+                })
+                .unwrap();
+            drive(&mut workspace, &rx, Workspace::recovery_ready);
+            let document = if round == 0 {
+                let opened = workspace.open_path(path.clone()).unwrap();
+                drive(&mut workspace, &rx, |workspace| {
+                    workspace.view(opened).is_some_and(|view| view.editor().is_some())
+                });
+                id = Some(opened);
+                opened
+            } else {
+                id.unwrap()
+            };
+            workspace.activate(document);
+            assert_eq!(
+                workspace.view(document).unwrap().editor().unwrap().document().save_plan().encoding,
+                kwil_core_text::encoding::Encoding::UTF16_LE
+            );
+            if round < 2 {
+                workspace.execute("motion.lastLine", &CommandArgs::default(), 1).unwrap();
+                workspace
+                    .execute(
+                        "edit.insert",
+                        &CommandArgs { text: Some(if round == 0 { "x" } else { "y" }.into()), ..Default::default() },
+                        2,
+                    )
+                    .unwrap();
+                workspace.request_window_close(false).unwrap();
+                drive(&mut workspace, &rx, Workspace::wants_exit);
+            } else {
+                let editor = workspace.view(document).unwrap().editor().unwrap();
+                assert!(editor.document().path().is_none(), "dirty recovery cannot adopt current disk baseline");
+                let mut logical = Vec::new();
+                editor.document().snapshot().write_to(&mut logical).unwrap();
+                assert_eq!(logical, b"A\xffxy");
+                let output = root.0.join("saved-as.txt");
+                workspace.save_document(document, Some(output.clone())).unwrap();
+                drive(&mut workspace, &rx, |workspace| {
+                    !workspace.view(document).unwrap().editor().unwrap().document().is_dirty()
+                });
+                assert_eq!(std::fs::read(output).unwrap(), b"\xff\xfeA\0\0\xd8x\0y\0");
+            }
+            drop(workspace);
+            wait_stopped(&rx);
+            assert_eq!(std::fs::read(&path).unwrap(), original, "recovery and Save As preserve the original");
         }
     }
 

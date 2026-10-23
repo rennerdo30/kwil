@@ -152,9 +152,21 @@ fn run_app(console_launcher: bool) -> ExitCode {
         };
     }
 
-    let open = |path: &PathBuf| match TextFile::open(path) {
-        Ok(f) => Ok(View::new(Some((path.clone(), f)))),
-        Err(e) => Err(format!("cannot open {}: {e}", path.display())),
+    let open = |path: &PathBuf| -> Result<View, String> {
+        let file = TextFile::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let encoded = kwil_core_text::encoding::EncodedFile::new(file.clone())
+            .map_err(|e| format!("cannot interpret {}: {e}", path.display()))?;
+        let detection = encoded.detection();
+        let interpretation =
+            kwil_core_text::decoded_backing::Interpretation::new(detection.encoding, detection.bom_len)
+                .map_err(|e| format!("cannot interpret {}: {e}", path.display()))?;
+        let preview = kwil_core_text::decoded_backing::decode_preview(
+            &file,
+            interpretation,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .map_err(|e| format!("cannot preview {}: {e}", path.display()))?;
+        Ok(View::from_preview(path.clone(), file, preview.text))
     };
     let make_view = || match args.files.first() {
         Some(file) => open(&file.path),
