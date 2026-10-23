@@ -272,12 +272,33 @@ impl Buffer {
     /// logical UTF-8 line metrics on the calling worker, without copying text.
     /// Keep its DecodedBacking owner on the worker retirement queue.
     pub fn from_decoded(origin: crate::decoded_backing::DecodedSnapshot) -> Self {
+        Self::from_decoded_checked(origin, &mut || Ok::<(), std::convert::Infallible>(()))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// Worker-only cancellable logical index construction. Cancellation is
+    /// checked between <=64KiB scans, including empty origins. Interrupted
+    /// returns no buffer and releases the temporary origin pin; its backing
+    /// owner still belongs to the caller's explicit worker retirement queue.
+    pub fn from_decoded_cancellable(
+        origin: crate::decoded_backing::DecodedSnapshot,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<Self> {
+        Self::from_decoded_checked(origin, &mut || {
+            if cancelled() { Err(io::Error::from(io::ErrorKind::Interrupted)) } else { Ok(()) }
+        })
+    }
+
+    fn from_decoded_checked<E>(
+        origin: crate::decoded_backing::DecodedSnapshot,
+        check: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
         let mut buffer = Self::empty();
-        let root = piece_tree::decoded(origin, buffer.owner.clone());
+        let root = piece_tree::decoded_checked(origin, buffer.owner.clone(), check)?;
         let len = root.as_ref().map_or(0, |node| node.metrics.bytes);
         let originals = Arc::new(piece_tree::original_uses(&root, 0..len));
         buffer.snapshot = Snapshot { root, originals };
-        buffer
+        Ok(buffer)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -570,6 +591,74 @@ impl Buffer {
 #[cfg(test)]
 mod editing_contract_tests {
     use super::*;
+
+    #[test]
+    fn decoded_cancellable_attach_interrupts_index_and_releases_partial_origin() {
+        use crate::decoded_backing::{DecodedBacking, Interpretation};
+        use crate::encoding::Encoding;
+        use std::sync::atomic::AtomicBool;
+        let fixture = OriginalsFixture::new();
+        let path = fixture.0.join("cancelled-logical-index");
+        std::fs::write(&path, vec![b'x'; 128 << 10]).unwrap();
+        let file = TextFile::open(&path).unwrap();
+        let owner = DecodedBacking::prepare(
+            &file,
+            Interpretation::new(Encoding::UTF8, 0).unwrap(),
+            &fixture.0,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut polls = 0;
+        let result = Buffer::from_decoded_cancellable(owner.snapshot(), || {
+            polls += 1;
+            polls == 3
+        });
+        assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(polls, 3);
+        assert!(owner.try_retire().is_ok(), "cancelled attach must not keep a partial piece/index origin alive");
+    }
+
+    #[test]
+    fn decoded_cancellable_attach_handles_empty_and_matches_existing_constructor() {
+        use crate::decoded_backing::{DecodedBacking, Interpretation};
+        use crate::encoding::Encoding;
+        use std::sync::atomic::AtomicBool;
+        let fixture = OriginalsFixture::new();
+        for (n, bytes) in [&b""[..], &b"A\r\nB\n\xffC"[..]].into_iter().enumerate() {
+            let path = fixture.0.join(format!("attach-{n}"));
+            std::fs::write(&path, bytes).unwrap();
+            let file = TextFile::open(&path).unwrap();
+            let owner = DecodedBacking::prepare(
+                &file,
+                Interpretation::new(Encoding::UTF8, 0).unwrap(),
+                &fixture.0,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let mut polls = 0;
+            let cancelled = Buffer::from_decoded_cancellable(owner.snapshot(), || {
+                polls += 1;
+                polls == 2
+            });
+            assert!(matches!(cancelled, Err(ref error) if error.kind() == io::ErrorKind::Interrupted));
+            let old = Buffer::from_decoded(owner.snapshot());
+            let new = Buffer::from_decoded_cancellable(owner.snapshot(), || false).unwrap();
+            let mut old_bytes = Vec::new();
+            let mut new_bytes = Vec::new();
+            old.write_to(&mut old_bytes).unwrap();
+            new.write_to(&mut new_bytes).unwrap();
+            assert_eq!(new_bytes, old_bytes);
+            assert_eq!(new.line_count(), old.line_count());
+            for line in 0..=old.line_count() {
+                assert_eq!(new.line_start(line).unwrap(), old.line_start(line).unwrap());
+            }
+            for offset in 0..=old.len() {
+                assert_eq!(new.offset_to_line_col(offset).unwrap(), old.offset_to_line_col(offset).unwrap());
+            }
+            drop((old, new, cancelled));
+            assert!(owner.try_retire().is_ok());
+        }
+    }
 
     #[test]
     fn decoded_source_bookkeeping_charges_index_once_and_prunes_empty_roots() {

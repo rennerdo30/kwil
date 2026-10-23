@@ -656,21 +656,27 @@ fn import_decoded(origin: &DecodedSnapshot, range: Range<u64>, budget: &Arc<AddB
     builder.finish()
 }
 
-pub(crate) fn decoded(origin: DecodedSnapshot, owner: Arc<()>) -> Tree {
+pub(crate) fn decoded_checked<E>(
+    origin: DecodedSnapshot,
+    owner: Arc<()>,
+    check: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Tree, E> {
     if origin.logical_bytes().is_empty() {
-        return None;
+        check()?;
+        check()?;
+        return Ok(None);
     }
-    let source = Arc::new(IndexedDecoded::new(origin));
+    let source = Arc::new(IndexedDecoded::new_checked(origin, check)?);
     let end = source.origin.logical_bytes().len() as u64;
     let breaks = source.index.line_count() - 1;
-    Some(leaf(Piece {
+    Ok(Some(leaf(Piece {
         storage: Arc::new(Storage::Decoded(source)),
         owner: Some(owner),
         start: 0,
         end,
         first_line: 0,
         breaks,
-    }))
+    })))
 }
 
 /// Import foreign original ranges and resident add blocks into the destination

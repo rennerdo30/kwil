@@ -14,9 +14,14 @@ pub(crate) struct IndexedDecoded {
 }
 
 impl IndexedDecoded {
-    pub fn new(origin: DecodedSnapshot) -> Self {
-        let index = LineIndex::build(origin.logical_bytes(), crate::line_index::DEFAULT_EVERY, 1, &AtomicU64::new(0));
-        Self { origin, index }
+    pub fn new_checked<E>(origin: DecodedSnapshot, check: &mut impl FnMut() -> Result<(), E>) -> Result<Self, E> {
+        let index = LineIndex::build_checked(
+            origin.logical_bytes(),
+            crate::line_index::DEFAULT_EVERY,
+            &AtomicU64::new(0),
+            check,
+        )?;
+        Ok(Self { origin, index })
     }
 
     pub fn retained_bytes(&self) -> usize {

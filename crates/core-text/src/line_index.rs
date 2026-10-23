@@ -1,4 +1,5 @@
 use memchr::memchr_iter;
+use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Sparse line index: one checkpoint every `every` lines (more at chunk
@@ -63,6 +64,68 @@ impl LineIndex {
     /// receives the number of bytes scanned so far.
     pub fn build(bytes: &[u8], every: u64, threads: usize, progress: &AtomicU64) -> Self {
         Self::build_chunked(bytes, every, CHUNK, threads, progress)
+    }
+
+    /// Sequential worker builder. Cancellation is checked before/after every
+    /// <=64KiB scan, including before/after empty input. A cancelled build
+    /// returns Interrupted and never publishes a partial index. `every` has
+    /// the same chunk-local meaning (and zero normalization) as `build`.
+    pub fn build_cancellable(
+        bytes: &[u8],
+        every: u64,
+        progress: &AtomicU64,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<Self> {
+        Self::build_checked(bytes, every, progress, &mut || {
+            if cancelled() { Err(io::Error::from(io::ErrorKind::Interrupted)) } else { Ok(()) }
+        })
+    }
+
+    /// Shared fallible/infallible construction avoids introducing an unwrap
+    /// or panic in the existing Self-returning decoded buffer constructor.
+    pub(crate) fn build_checked<E>(
+        bytes: &[u8],
+        every: u64,
+        progress: &AtomicU64,
+        check: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        Self::build_checked_chunked(bytes, every, CHUNK, progress, check)
+    }
+
+    fn build_checked_chunked<E>(
+        bytes: &[u8],
+        every: u64,
+        chunk: usize,
+        progress: &AtomicU64,
+        check: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        check()?;
+        let every = every.max(1);
+        let mut checkpoints = vec![(0, 0)];
+        let mut rank_checkpoints = vec![(0, 0)];
+        let mut lines_before = 0_u64;
+        for start in (0..bytes.len()).step_by(chunk) {
+            let end = start.saturating_add(chunk).min(bytes.len());
+            let mut newlines = 0_u64;
+            for block_start in (start..end).step_by(RANK_BYTES) {
+                check()?;
+                if block_start != 0 {
+                    rank_checkpoints.push((lines_before + newlines, block_start as u64));
+                }
+                let block_end = block_start.saturating_add(RANK_BYTES).min(end);
+                for pos in memchr_iter(b'\n', &bytes[block_start..block_end]) {
+                    newlines += 1;
+                    if newlines.is_multiple_of(every) {
+                        checkpoints.push((lines_before + newlines, (block_start + pos + 1) as u64));
+                    }
+                }
+                progress.fetch_add((block_end - block_start) as u64, Ordering::Relaxed);
+                check()?;
+            }
+            lines_before += newlines;
+        }
+        check()?;
+        Ok(Self { checkpoints, rank_checkpoints, line_count: lines_before + 1, len: bytes.len() as u64 })
     }
 
     pub(crate) fn build_chunked(bytes: &[u8], every: u64, chunk: usize, threads: usize, progress: &AtomicU64) -> Self {
@@ -187,6 +250,87 @@ impl LineIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellable_build_stops_after_first_rank_block_without_result() {
+        let bytes = vec![b'x'; 128 << 10];
+        let progress = AtomicU64::new(0);
+        let thread = std::thread::current().id();
+        let mut previous = 0;
+        let mut polls = 0;
+        let result = LineIndex::build_cancellable(&bytes, DEFAULT_EVERY, &progress, || {
+            assert_eq!(std::thread::current().id(), thread, "worker builder must not launch a scan thread");
+            let scanned = progress.load(Ordering::Relaxed);
+            assert!(scanned >= previous && scanned - previous <= RANK_BYTES as u64, "scan between polls exceeds64KiB");
+            previous = scanned;
+            polls += 1;
+            scanned >= RANK_BYTES as u64
+        });
+        assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(progress.load(Ordering::Relaxed), RANK_BYTES as u64, "cancel must stop before the second block");
+        assert!(polls >= 2);
+    }
+
+    #[test]
+    fn cancellable_build_checks_empty_before_after_and_nonempty_before_scan() {
+        let progress = AtomicU64::new(0);
+        for bytes in [&b""[..], &b"a\r\nb\n"[..]] {
+            let result = LineIndex::build_cancellable(bytes, 0, &progress, || true);
+            assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::Interrupted));
+            assert_eq!(progress.load(Ordering::Relaxed), 0);
+        }
+        let mut polls = 0;
+        let result = LineIndex::build_cancellable(b"", 0, &progress, || {
+            polls += 1;
+            polls == 2
+        });
+        assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(polls, 2, "empty input must also check at completion");
+        let index = LineIndex::build_cancellable(b"", 0, &progress, || false).unwrap();
+        assert_eq!(index.line_count(), 1);
+        assert_eq!(index.line_start(b"", 0), Some(0));
+    }
+
+    #[test]
+    fn cancellable_build_preserves_parallel_checkpoints_every_and_lookup_bounds() {
+        let mut bytes = vec![b'x'; 128 << 10];
+        for at in [0, 1000, 65_534, 65_536, 100_002, 131_071] {
+            bytes[at] = b'\n';
+        }
+        for at in [65_535, 120_001] {
+            bytes[at] = b'\r';
+        }
+        let starts: Vec<_> = std::iter::once(0).chain(memchr_iter(b'\n', &bytes).map(|at| at as u64 + 1)).collect();
+        for every in [0, 1, 3, DEFAULT_EVERY] {
+            for chunk in [65_535, 100_003, CHUNK] {
+                let old = LineIndex::build_chunked(&bytes, every, chunk, 2, &AtomicU64::new(0));
+                let progress = AtomicU64::new(0);
+                let new =
+                    LineIndex::build_checked_chunked(&bytes, every, chunk, &progress, &mut || Ok::<(), io::Error>(()))
+                        .unwrap();
+                assert_eq!(new.checkpoints, old.checkpoints, "every{every} chunk{chunk}");
+                assert_eq!(new.rank_checkpoints, old.rank_checkpoints, "every{every} chunk{chunk}");
+                assert_eq!(new.line_count(), old.line_count());
+                assert_eq!(progress.load(Ordering::Relaxed), bytes.len() as u64);
+                for (line, &start) in starts.iter().enumerate() {
+                    let mut scanned = 0;
+                    assert_eq!(new.line_start_observed(&bytes, line as u64, |n| scanned = n), Some(start));
+                    assert!(scanned <= RANK_BYTES);
+                }
+                for offset in [0, 65_535, 65_536, 65_537, 100_003, 131_071, 131_072] {
+                    let mut scanned = 0;
+                    assert_eq!(
+                        new.line_of_offset_observed(&bytes, offset, |n| scanned = n),
+                        old.line_of_offset(&bytes, offset)
+                    );
+                    assert!(scanned <= RANK_BYTES);
+                }
+                assert_eq!(new.line_start(&bytes, new.line_count()), None);
+                assert_eq!(new.line_of_offset(&bytes, bytes.len() as u64 + 1), None);
+                assert!(new.memory_bytes() <= 4096, "fixture metadata must stay sparse");
+            }
+        }
+    }
 
     #[test]
     fn inverse_line_lookup_scans_one_byte_rank_block() {

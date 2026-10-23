@@ -91,8 +91,21 @@ impl Document {
     /// retains its DecodedBacking owner until all snapshots have retired.
     /// `file` remains the external raw destination identity, never edit bytes.
     pub fn from_decoded_file(path: PathBuf, file: TextFile, origin: DecodedSnapshot) -> io::Result<Self> {
+        Self::from_decoded_file_cancellable(path, file, origin, || false)
+    }
+
+    pub fn from_decoded_file_cancellable(
+        path: PathBuf,
+        file: TextFile,
+        origin: DecodedSnapshot,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<Self> {
         let interpretation = origin.interpretation();
-        let mut document = Self::attach(path, file, Buffer::from_decoded(origin))?;
+        let buffer = Buffer::from_decoded_cancellable(origin, &mut cancelled)?;
+        let mut document = Self::attach(path, file, buffer)?;
+        if cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "decoded document indexing cancelled"));
+        }
         document.encoding = if interpretation.encoding == Encoding::UTF8 {
             DocumentEncoding::Utf8
         } else {

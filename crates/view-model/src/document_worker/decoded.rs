@@ -35,6 +35,18 @@ pub fn prepare_decoded_document(
     cancel: &AtomicBool,
     publish: impl FnOnce(DecodedPreview) -> io::Result<()>,
 ) -> io::Result<PreparedDecodedDocument> {
+    prepare_with_index_check(path, file, interpretation, private_parent, cancel, publish, || false)
+}
+
+fn prepare_with_index_check(
+    path: PathBuf,
+    file: TextFile,
+    interpretation: Option<Encoding>,
+    private_parent: &Path,
+    cancel: &AtomicBool,
+    publish: impl FnOnce(DecodedPreview) -> io::Result<()>,
+    mut index_cancelled: impl FnMut() -> bool,
+) -> io::Result<PreparedDecodedDocument> {
     let encoded = match interpretation {
         Some(encoding) => EncodedFile::new_with_encoding(file.clone(), encoding),
         None => EncodedFile::new(file.clone()),
@@ -45,7 +57,9 @@ pub fn prepare_decoded_document(
     let preview = decode_preview(&file, interpretation, cancel).map_err(backing_error)?;
     publish(preview)?;
     let backing = DecodedBacking::prepare(&file, interpretation, private_parent, cancel).map_err(backing_error)?;
-    match Document::from_decoded_file(path, file, backing.snapshot()) {
+    match Document::from_decoded_file_cancellable(path, file, backing.snapshot(), || {
+        cancel.load(std::sync::atomic::Ordering::Relaxed) || index_cancelled()
+    }) {
         Ok(document) => Ok(PreparedDecodedDocument { document, backing }),
         Err(error) => match backing.try_retire() {
             Ok(()) => Err(error),
@@ -171,5 +185,32 @@ mod tests {
         assert_eq!(prepared.document.snapshot().len(), 1);
         drop(prepared.document);
         assert!(prepared.backing.try_retire().is_ok());
+    }
+
+    #[test]
+    fn decoded_open_index_cancellation_retires_prepared_backing() {
+        let fixture = Fixture::new();
+        let (path, file) = fixture.file(&vec![b'a'; 128 << 10]);
+        let checks = std::cell::Cell::new(0);
+        let result = prepare_with_index_check(
+            path,
+            file,
+            None,
+            &fixture.0,
+            &AtomicBool::new(false),
+            |_| Ok(()),
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                assert!(
+                    std::fs::read_dir(&fixture.0).unwrap().count() > 1,
+                    "barrier must occur after backing preparation"
+                );
+                next >= 2
+            },
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(checks.get(), 2, "cancelled index must stop at its first rejection");
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1, "all private backing files must retire");
     }
 }
