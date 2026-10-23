@@ -46,6 +46,12 @@ fn wait(worker: &ThemeWorker, rx: &mpsc::Receiver<()>, revision: u64) -> Arc<The
         rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).expect("bounded worker wake");
     }
 }
+fn wait_for_startup(worker: &ThemeWorker, rx: &mpsc::Receiver<()>) -> Arc<ThemeSnapshot> {
+    // Publication precedes its callback. Observing the snapshot alone does not
+    // establish that the startup wake has reached this receiver.
+    rx.recv_timeout(Duration::from_secs(8)).expect("initial publication wake");
+    wait(worker, rx, 1)
+}
 #[test]
 fn theme_worker_preview_never_persists_and_latest_actions_survive_contract() {
     let f = Fixture::new();
@@ -173,7 +179,7 @@ fn theme_worker_import_is_bounded_no_clobber_and_round_trips_contract() {
 fn theme_worker_sleep_and_snapshot_bound_contract() {
     let f = Fixture::new();
     let (worker, rx) = f.start(ThemeSelection::Named(ThemeId::Dark));
-    wait(&worker, &rx, 1);
+    wait_for_startup(&worker, &rx);
     while rx.try_recv().is_ok() {}
     // A single bounded quiet observation, not a polling loop.
     assert!(matches!(rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
@@ -184,6 +190,36 @@ fn theme_worker_sleep_and_snapshot_bound_contract() {
     assert!(Arc::ptr_eq(&after, &worker.snapshot()));
     assert!(after.catalogue.len() <= MAX_THEMES && after.diagnostics.len() <= 16);
     drop(worker); // idle worker exits without another file event/timer.
+}
+#[test]
+fn theme_worker_startup_snapshot_precedes_delayed_wake_contract() {
+    let f = Fixture::new();
+    let (tx, rx) = mpsc::channel();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (sent_tx, sent_rx) = mpsc::sync_channel(1);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let worker = ThemeWorker::start(f.config(), ThemeSelection::Named(ThemeId::Dark), Scheme::Dark, move || {
+        if first.swap(false, Ordering::AcqRel) {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(8)).expect("release initial wake");
+            tx.send(()).unwrap();
+            sent_tx.send(()).unwrap();
+        } else {
+            let _ = tx.send(());
+        }
+    })
+    .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(8)).expect("published snapshot before wake");
+    let observed_revision = worker.snapshot().revision;
+    let wake_not_delivered = matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    release_tx.send(()).unwrap();
+    wait_for_startup(&worker, &rx);
+    sent_rx.recv_timeout(Duration::from_secs(8)).expect("startup callback completed");
+    assert!(observed_revision >= 1);
+    assert!(wake_not_delivered);
+    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "startup wake must be acknowledged");
+    drop(worker);
 }
 #[test]
 fn theme_worker_startup_cache_reader_never_parses_sources_contract() {
