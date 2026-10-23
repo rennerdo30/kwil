@@ -521,3 +521,5 @@ mod viewer_tests {
         assert_eq!(v.top(), 0);
     }
 }
+
+pub mod file_type_registration;

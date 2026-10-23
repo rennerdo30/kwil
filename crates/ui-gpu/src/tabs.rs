@@ -141,18 +141,38 @@ pub(super) fn draw(
         } else {
             chrome::mix(strip_bg, fg, 0xb4)
         };
-        if slot.active || hovered {
-            let cover = if horizontal { area } else { Rect { w: area.w.saturating_sub(m.line), ..area } };
-            chrome::fill_clipped(pixels, stride, cover, bg);
-        }
-        if slot.active {
-            let indicator = if horizontal {
-                Rect { x: area.x, y: area.y, w: area.w, h: m.indicator }
-            } else {
-                Rect { x: area.x, y: area.y, w: m.indicator, h: area.h }
+        let gap = m.dip(2.0);
+        if horizontal && slot.active {
+            // The active tab is a raised sheet joined to the editor below it:
+            // rounded top corners, square bottom, no hairline underneath.
+            let sheet = Rect { x: area.x + gap, y: area.y + m.dip(4.0), w: area.w.saturating_sub(2 * gap), h: 0 };
+            let sheet = Rect { h: (area.y + area.h).saturating_sub(sheet.y), ..sheet };
+            top_rounded(pixels, stride, sheet, m.dip(6.0), bg);
+        } else if horizontal && hovered {
+            let inset = m.dip(5.0).min(area.h / 4);
+            let pill = Rect {
+                x: area.x + gap,
+                y: area.y + inset,
+                w: area.w.saturating_sub(2 * gap),
+                h: area.h.saturating_sub(2 * inset),
             };
-            chrome::fill_clipped(pixels, stride, indicator, accent);
-        } else if horizontal && !hovered {
+            chrome::round_rect(pixels, stride, pill, m.radius, bg);
+        } else if slot.active || hovered {
+            let inset = m.dip(3.0);
+            let pill = Rect {
+                x: area.x + inset,
+                y: area.y + inset / 2,
+                w: area.w.saturating_sub(2 * inset + m.line),
+                h: area.h.saturating_sub(inset),
+            };
+            chrome::round_rect(pixels, stride, pill, m.radius, bg);
+            if slot.active {
+                let h = area.h / 2;
+                let bar = Rect { x: pill.x, y: area.y + (area.h - h) / 2, w: m.indicator, h };
+                chrome::round_rect(pixels, stride, bar, m.indicator / 2, accent);
+            }
+        }
+        if !slot.active && horizontal && !hovered {
             // Quiet separators between inactive neighbours only.
             let next_active = g.slots.get(index + 1).is_some_and(|next| next.active);
             let next_hovered = matches!(frame.hover, Hover::Tab(i) | Hover::Close(i) if i == index + 1);
@@ -219,6 +239,19 @@ pub(super) fn draw(
     }
 }
 
+/// Filled rectangle with anti-aliased top corners only. Stays inside `r`.
+fn top_rounded(buf: &mut [u32], stride: usize, r: Rect, radius: usize, color: u32) {
+    let radius = radius.min(r.w / 2).min(r.h / 2);
+    if radius == 0 {
+        chrome::fill_clipped(buf, stride, r, color);
+        return;
+    }
+    // Rounded cap of twice the radius, then the square remainder over its
+    // lower corners; every pixel written lies inside `r`.
+    chrome::round_rect(buf, stride, Rect { h: 2 * radius, ..r }, radius, color);
+    chrome::fill_clipped(buf, stride, Rect { y: r.y + radius, h: r.h - radius, ..r }, color);
+}
+
 pub(super) fn composite(
     source: &[u32],
     source_stride: usize,
@@ -258,6 +291,23 @@ mod tests {
                 for x in 0..stride {
                     let painted = x >= damage.x && x < damage.x + damage.w && y >= damage.y && y < damage.y + damage.h;
                     assert_eq!(target[y * stride + x], if painted { 0x123456 } else { 0xabcdef });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_tab_sheet_rounds_only_its_top_and_stays_inside_its_slot() {
+        let (w, h) = (60, 30);
+        let mut pixels = vec![0; w * h];
+        let r = Rect { x: 10, y: 5, w: 40, h: 20 };
+        top_rounded(&mut pixels, w, r, 6, 0xffffff);
+        assert_eq!(pixels[5 * w + 10], 0, "top-left corner is rounded off");
+        assert_eq!(pixels[24 * w + 10], 0xffffff, "bottom-left corner is square to join the editor");
+        for y in 0..h {
+            for x in 0..w {
+                if !r.contains((x, y)) {
+                    assert_eq!(pixels[y * w + x], 0, "painted outside the slot at {x},{y}");
                 }
             }
         }

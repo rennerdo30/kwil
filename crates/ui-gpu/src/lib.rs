@@ -9,17 +9,25 @@
 
 mod chrome;
 mod clipboard;
+mod desktop;
 mod file_prompt;
+// Until ROOT adopts the file-type registration backend; then `mod filetypes_ui;`.
+mod filetypes_ui;
 mod font;
 mod hit;
 mod ime;
 mod input;
 mod menu;
 mod palette_ui;
+mod palette_view;
+mod prompt_ui;
+mod registration_host;
 mod scrollbar;
 mod settings_ui;
 mod tabs;
 mod theme_ui;
+mod welcome;
+mod welcome_ui;
 mod zoom;
 
 use font::Font;
@@ -31,6 +39,7 @@ mod harness;
 mod platform;
 pub mod remote;
 mod shaping;
+mod shutdown;
 pub mod text;
 mod trace;
 pub use remote::RenderPolicy;
@@ -51,6 +60,7 @@ const BG: u32 = 0x0d1424;
 const FG: u32 = 0xd6e4f0;
 const GUTTER_BG: u32 = 0x0a101d;
 const GUTTER_FG: u32 = 0x5b6b85;
+#[cfg(test)]
 const STATUS_BG: u32 = 0x080d18;
 const STATUS_FG: u32 = 0x8fe3ff;
 const GUTTER_COLS: usize = 9;
@@ -92,6 +102,9 @@ enum UserEvent {
     PaletteReady,
     SettingsPath(Result<std::path::PathBuf, String>),
     SettingsPanelReady,
+    WelcomeReady,
+    RegistrationReady,
+    RegistrationStarted(Result<Box<kwil_view_model::file_type_registration::FileTypeRegistration>, String>),
     /// Boxed on the worker that completes it: keeps every queued event small.
     Document(Box<kwil_view_model::document_worker::DocumentResult>),
     OpenExternal,
@@ -249,6 +262,16 @@ struct App {
     settings_panel: Option<kwil_view_model::settings_session::SettingsSession>,
     settings_epoch: u64,
     settings_file_pending: bool,
+    settings_view: settings_ui::View,
+    palette_view: palette_view::View,
+    prompt_view: prompt_ui::View,
+    welcome: welcome::Model,
+    welcome_view: welcome_ui::WelcomeView,
+    welcome_worker: Option<welcome::Worker>,
+    file_types: Option<filetypes_ui::Page>,
+    registration_path: Option<std::path::PathBuf>,
+    registration_starting: bool,
+    registration_prep: Option<std::thread::JoinHandle<()>>,
     view: Workspace,
     frontend_document: kwil_view_model::SessionDocumentId,
     frontend_epoch: u64,
@@ -367,6 +390,16 @@ pub fn run_with_external_open(
         settings_panel: None,
         settings_epoch: 0,
         settings_file_pending: false,
+        settings_view: Default::default(),
+        palette_view: Default::default(),
+        prompt_view: Default::default(),
+        welcome: Default::default(),
+        welcome_view: Default::default(),
+        welcome_worker: None,
+        file_types: None,
+        registration_path: None,
+        registration_starting: false,
+        registration_prep: None,
         view,
         frontend_document,
         frontend_epoch,
@@ -425,15 +458,41 @@ pub fn run_with_external_open(
         metrics: Default::default(),
     };
     let result = event_loop.run_app(&mut app);
-    if let Some(panel) = &mut app.settings_panel {
-        let shutdown = panel.stop();
-        // The interactive event loop has ended. Keep the process alive while
-        // the settings worker drains accepted/coalesced changes off that loop.
-        std::thread::spawn(move || shutdown.shutdown())
-            .join()
-            .map_err(|_| GuiError::Settings("settings shutdown worker panicked".into()))?
-            .map_err(GuiError::Settings)?;
-    }
+    // Transfer every owner before awaiting any result. The GUI loop has ended;
+    // these jobs await existing workers, which keep all I/O off the frontend.
+    let prep_job = app.registration_prep.take().map(|handle| {
+        Box::new(move || handle.join().map_err(|_| "registration preparation panicked".to_owned())) as shutdown::Job
+    });
+    let welcome_job = app.welcome_worker.take().map(|worker| {
+        let handle = worker.stop();
+        Box::new(move || {
+            let report = handle.join();
+            let mut errors = Vec::new();
+            if report.worker_result.is_err() {
+                errors.push("setup worker panicked".to_owned());
+            }
+            for report in report.reports {
+                if let welcome::Report::Completed(completion) = report {
+                    if let Err(error) = completion.result {
+                        errors.push(format!("Setup completion: {error}"));
+                    }
+                    if let Some(path) = completion.retained_temporary {
+                        errors.push(format!("Setup cleanup retained: {}", path.display()));
+                    }
+                }
+            }
+            if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+        }) as shutdown::Job
+    });
+    let registration_job = app.file_types.take().map(|page| {
+        let handle = page.service.stop();
+        Box::new(move || handle.shutdown()) as shutdown::Job
+    });
+    let settings_job = app.settings_panel.as_mut().map(|panel| {
+        let handle = panel.stop();
+        Box::new(move || handle.shutdown()) as shutdown::Job
+    });
+    let shutdown_result = shutdown::drain([prep_job, welcome_job, registration_job, settings_job]);
     if let Some(palette) = &mut app.palette {
         let handles = palette.stop();
         std::thread::spawn(move || {
@@ -442,6 +501,7 @@ pub fn run_with_external_open(
             }
         });
     }
+    shutdown_result.map_err(GuiError::Settings)?;
     result.map_err(|e| GuiError::Unavailable(e.to_string()))?;
     match app.error {
         Some(e) => Err(e),
@@ -682,6 +742,10 @@ impl App {
                     self.sync_file_ui();
                     self.apply(damage);
                     return;
+                }
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown) => {
+                    // Open recent: steps the typed row number that Enter submits.
+                    self.prompt_step(matches!(ev.logical_key, Key::Named(NamedKey::ArrowUp)));
                 }
                 Key::Named(NamedKey::Backspace) => {
                     self.save_path.as_mut().unwrap().pop();
@@ -938,9 +1002,17 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
-        if self.pending == Damage::default() && !self.chrome_dirty && !self.palette_dirty && !self.menu_dirty {
+        if self.pending == Damage::default()
+            && !self.chrome_dirty
+            && !self.palette_dirty
+            && !self.menu_dirty
+            && !self.overlay_paint_pending()
+        {
             return true;
         }
+        // Card-only repaints (hover, wheel) are admitted once; open cards then
+        // repaint in place and damage only their own rectangles.
+        self.take_overlay_paint();
         let (w, h) = self.size;
         let ch = self.ch();
         if w == 0 || h < ch {
@@ -981,10 +1053,13 @@ impl App {
         self.body_pixels.resize(bw.saturating_mul(bh), BG);
         let bars = self.bars();
         let rows = geometry.text.height / ch;
-        let palette_open = self.palette_open() || self.settings_open();
+        let palette_open =
+            self.welcome.visible() || self.palette_open() || self.settings_open() || self.save_path.is_some();
         let menu_list = self.menu.dropdown.is_some() || self.menu_area.is_some();
         let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
-        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else { return false };
+        let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else {
+            return false;
+        };
         if self.window_title != title {
             gfx.window.set_title(&title);
             self.window_title = title;
@@ -1124,29 +1199,90 @@ impl App {
             self.menu_area = Some(dropdown.area);
             damage.push(dropdown.area);
         }
+        // Overlays are desktop cards in the DPI chrome face; the editor font
+        // and zoom never reach them. Each card repaints itself idempotently and
+        // damages only its own rectangle, hover included.
+        if let (Some(text), Some(ui_font)) = (self.save_path.as_deref(), self.ui_font.as_mut())
+            && !self.palette.as_ref().is_some_and(|palette| palette.model().is_open())
+            && !self.settings_panel.as_ref().is_some_and(|panel| panel.is_open())
+        {
+            self.palette_area = prompt_ui::draw(
+                &self.view,
+                text,
+                pixels,
+                (w, h),
+                ui_font,
+                theme,
+                &self.ui,
+                false,
+                &mut self.prompt_view,
+            );
+            if let Some(area) = self.palette_area {
+                damage.push(area);
+            }
+        }
+        if let (Some(palette), Some(ui_font)) =
+            (self.palette.as_ref().filter(|palette| palette.model().is_open()), self.ui_font.as_mut())
+        {
+            self.palette_area = palette_view::draw(
+                palette.model(),
+                pixels,
+                (w, h),
+                ui_font,
+                theme,
+                &self.ui,
+                &self.menu.labels,
+                &mut self.palette_view,
+            );
+            if let Some(area) = self.palette_area {
+                damage.push(area);
+            }
+        }
+        if let (Some(panel), Some(ui_font)) =
+            (self.settings_panel.as_ref().filter(|panel| panel.is_open()), self.ui_font.as_mut())
+        {
+            // After adoption: self.file_types.as_mut().map(|page| page as &mut dyn settings_ui::HostedPage)
+            if let Some(page) = &mut self.file_types {
+                page.ui.setup = false;
+            }
+            let hosted = self.file_types.as_mut().map(|page| page as &mut dyn settings_ui::HostedPage);
+            self.palette_area = settings_ui::draw(
+                panel,
+                pixels,
+                (w, h),
+                ui_font,
+                theme,
+                &self.ui,
+                self.settings_epoch,
+                &mut self.settings_view,
+                hosted,
+            );
+            if let Some(area) = self.palette_area {
+                damage.push(area);
+            }
+        }
+        if let Some(ui_font) = self.ui_font.as_mut()
+            && let Some(area) = welcome_ui::draw(
+                &self.welcome,
+                &mut self.welcome_view,
+                self.file_types.as_mut(),
+                pixels,
+                (w, h),
+                ui_font,
+                theme,
+                &self.ui,
+            )
+        {
+            damage.push(area);
+        }
         // A glyph miss asks for the wide-coverage face: one read at a time per
-        // App, fenced to the face that asked (see `font::FallbackJobs`).
+        // App, fenced to the face that asked (see `font::FallbackJobs`). Checked
+        // after the overlays so their misses are requested in this frame too.
         if let Some(ui_font) = self.ui_font.as_mut()
             && ui_font.take_fallback_request()
             && let Some(id) = self.ui_fallback.request(ui_font.id())
         {
             spawn_ui_fallback(&self.proxy, id);
-        }
-        if let Some(palette) = self.palette.as_ref().filter(|palette| palette.model().is_open()) {
-            self.palette_area = palette_ui::draw(palette.model(), pixels, (w, h), font);
-            if let Some(area) = self.palette_area {
-                damage.push(area);
-            }
-        }
-        if let Some(panel) = self.settings_panel.as_ref().filter(|panel| panel.is_open()) {
-            if panel.menu().is_some() {
-                self.palette_area = settings_ui::draw(panel, pixels, (w, h), font);
-            } else {
-                self.palette_area = settings_ui::loading(panel, pixels, (w, h), font);
-            }
-            if let Some(area) = self.palette_area {
-                damage.push(area);
-            }
         }
         let rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
@@ -1789,6 +1925,9 @@ impl ApplicationHandler<UserEvent> for App {
                 damage
             }
             UserEvent::OpenExternal => {
+                if self.welcome.visible() {
+                    return;
+                }
                 let requests = self.external_inbox.drain();
                 if requests.is_empty() {
                     return;
@@ -1803,7 +1942,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
-                let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else { return };
+                let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else {
+                    return;
+                };
                 self.palette_dirty |= self.palette.as_ref().is_some_and(|palette| palette.model().is_open());
                 self.palette_dirty |= self.settings_panel.as_ref().is_some_and(|panel| panel.is_open());
                 if matches!(tile.key.bg, tabs::ACTIVE | tabs::INACTIVE) {
@@ -1835,7 +1976,84 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 return;
             }
+            UserEvent::WelcomeReady => {
+                let was_visible = self.welcome.visible();
+                if let Some(worker) = &self.welcome_worker {
+                    while let Ok(report) = worker.take_report() {
+                        match report {
+                            welcome::Report::Ready { show, problem } => {
+                                self.welcome.ready(show);
+                                self.welcome_view.problem = problem;
+                            }
+                            welcome::Report::Completed(completion) => {
+                                if let Err(error) = completion.result {
+                                    self.view.set_notice(format!("Setup could not be remembered: {error}"));
+                                }
+                                if let Some(path) = completion.retained_temporary {
+                                    self.view.set_notice(format!("Setup cleanup retained: {}", path.display()));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !was_visible && self.welcome.visible() {
+                    self.ime_destination = Some(ime::Destination::Cancelled);
+                    self.composing = false;
+                    self.drag = None;
+                    self.selecting = false;
+                }
+                Damage { full: true, status: true, ..Default::default() }
+            }
+            UserEvent::RegistrationReady => {
+                self.welcome_view.hits = Default::default();
+                if let Some(page) = &mut self.file_types {
+                    page.service.worker_ready();
+                }
+                self.welcome_registration_changed();
+                Damage { full: true, status: true, ..Default::default() }
+            }
+            UserEvent::RegistrationStarted(result) => {
+                self.welcome_view.hits = Default::default();
+                self.registration_starting = false;
+                match result {
+                    Ok(mut service) => {
+                        service.worker_ready();
+                        self.file_types = Some(filetypes_ui::Page { service: *service, ui: Default::default() });
+                    }
+                    Err(error) => {
+                        self.view.set_notice(format!("File-type setup: {error}"));
+                        self.welcome_view.problem = Some(error);
+                    }
+                }
+                Damage { full: true, status: true, ..Default::default() }
+            }
             UserEvent::SettingsPath(path) => {
+                self.registration_path = path.as_ref().ok().cloned();
+                if self.welcome_worker.is_none() {
+                    let resolved = path.clone();
+                    let hidden = self.opts.hidden;
+                    let proxy = self.proxy.clone();
+                    match welcome::Worker::start(
+                        cfg!(debug_assertions),
+                        move || {
+                            let settings = resolved.map_err(std::io::Error::other)?;
+                            let isolated = std::env::var_os("KWIL_WORKSPACE_ROOT");
+                            if hidden && isolated.is_none() {
+                                return Err(std::io::Error::other("Hidden setup requires an isolated workspace"));
+                            }
+                            welcome::marker_path(if hidden { isolated.as_deref() } else { None }, &settings)
+                        },
+                        move || {
+                            let _ = proxy.send_event(UserEvent::WelcomeReady);
+                        },
+                    ) {
+                        Ok(worker) => self.welcome_worker = Some(worker),
+                        Err(error) => {
+                            self.welcome.ready(true);
+                            self.welcome_view.problem = Some(error.to_string());
+                        }
+                    }
+                }
                 let proxy = self.proxy.clone();
                 match path.and_then(|path| {
                     kwil_view_model::settings_session::SettingsSession::start(
@@ -1857,8 +2075,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SettingsPanelReady => {
                 let mut open_path = None;
+                // Drains the worker; an adopted external reload fences painted clicks.
+                self.settings_worker_ready();
                 if let Some(panel) = &mut self.settings_panel {
-                    panel.worker_ready();
                     if let Some(applied) = panel.take_applied() {
                         let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::new(applied.settings)));
                     } else if !self.settings_loaded && panel.menu().is_none() && panel.last_error().is_some() {
@@ -1976,13 +2195,20 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(retry) = retry {
                     spawn_ui_fallback(&self.proxy, retry);
                 }
-                let Some(font) = self.ui_font.as_mut().filter(|_| bind) else { return };
+                let Some(font) = self.ui_font.as_mut().filter(|_| bind) else {
+                    return;
+                };
                 font.install_fallback(face);
                 self.chrome_dirty = true;
                 self.menu_dirty = true;
                 Damage { status: true, ..Default::default() }
             }
             UserEvent::DroppedFile(path) => {
+                if self.welcome.visible() {
+                    let damage = self.view.set_notice("Finish or skip setup before opening a dropped file".into());
+                    self.apply(damage);
+                    return;
+                }
                 (self.on_event)(GuiEvent::DroppedFile(path.clone()));
                 if let Err(error) = self.view.open_path(path) {
                     self.view.set_notice(format!("Open failed: {error}"));
@@ -2011,6 +2237,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        if self.welcome_input(&ev) {
+            return;
+        }
         match ev {
             WindowEvent::CloseRequested => self.request_close(el, false),
             WindowEvent::Resized(sz) => {
@@ -2041,6 +2270,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
                 if self.menu.state.is_open() {
                     self.menu_track();
+                }
+                if self.settings_open() {
+                    self.settings_track();
+                } else if self.palette_open() {
+                    self.palette_track();
+                } else if self.save_path.is_some() {
+                    self.prompt_track();
                 }
                 if self.drag.is_none() && !self.selecting && !self.settings_open() && !self.palette_open() {
                     self.update_hover();
@@ -2078,6 +2314,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if state == ElementState::Pressed {
                     self.menu.alt_tap = false;
+                    // A file prompt card is modal: its clicks never reach menus or text.
+                    if self.save_path.is_some() && self.prompt_mouse() {
+                        return;
+                    }
                     if self.menu_mouse(el) {
                         return;
                     }
@@ -2122,7 +2362,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
                 // Middle click closes a tab, as in browsers and other editors.
-                if self.settings_open() || self.palette_open() || self.menu.state.is_open() {
+                if self.settings_open() || self.palette_open() || self.menu.state.is_open() || self.save_path.is_some()
+                {
                     return;
                 }
                 let frame = self.tab_frame();
@@ -2236,17 +2477,8 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if self.settings_open() {
-                    let up = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
-                        MouseScrollDelta::PixelDelta(point) => point.y > 0.0,
-                    };
-                    for _ in 0..3 {
-                        self.settings_input(if up {
-                            kwil_view_model::settings_session::SettingsInput::Previous
-                        } else {
-                            kwil_view_model::settings_session::SettingsInput::Next
-                        });
-                    }
+                    // Scrolls the list; selection, drafts and reviews stay put.
+                    self.settings_wheel(up);
                     return;
                 }
                 if self.palette_open() {
@@ -2259,6 +2491,10 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         kwil_view_model::palette_session::PaletteInput::Next
                     });
+                    return;
+                }
+                // A file prompt card is modal: the wheel scrolls its list, not the text.
+                if self.save_path.is_some() && self.prompt_wheel(up) {
                     return;
                 }
                 let (horizontal, vertical) = match delta {

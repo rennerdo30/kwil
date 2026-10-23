@@ -19,3 +19,5 @@ pub use key::{Key, KeyChord, KeySequence, Modifiers, NamedKey};
 pub use keymap::{Binding, Context, Keymap, Mode, Preset, Resolution};
 pub use registry::{COMMANDS, Command, command};
 pub use settings::{Settings, TabLayout, TabsSettings};
+
+pub mod file_types;
