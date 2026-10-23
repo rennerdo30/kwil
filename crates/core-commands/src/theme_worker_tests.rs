@@ -178,11 +178,27 @@ fn theme_worker_import_is_bounded_no_clobber_and_round_trips_contract() {
 #[test]
 fn theme_worker_sleep_and_snapshot_bound_contract() {
     let f = Fixture::new();
-    let (worker, rx) = f.start(ThemeSelection::Named(ThemeId::Dark));
+    let (tx, rx) = mpsc::channel();
+    let worker = ThemeWorker::start_with(
+        f.config(),
+        ThemeSelection::Named(ThemeId::Dark),
+        Scheme::Dark,
+        None,
+        false,
+        move || {
+            let _ = tx.send(());
+        },
+        |_| {},
+    )
+    .unwrap();
     wait_for_startup(&worker, &rx);
-    while rx.try_recv().is_ok() {}
-    // A single bounded quiet observation, not a polling loop.
+    // No external invalidations: a single bounded quiet observation, not a polling loop.
     assert!(matches!(rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+    // An explicit watcher invalidation still wakes the same worker path.
+    let initial = worker.snapshot();
+    worker.invalidate();
+    rx.recv_timeout(Duration::from_secs(8)).expect("explicit invalidation wake");
+    assert!(!Arc::ptr_eq(&initial, &worker.snapshot()));
     let before = worker.snapshot();
     let revision = worker.request(ThemeRequest::Preview(ThemeId::Light)).unwrap();
     let after = wait(&worker, &rx, revision);
@@ -252,6 +268,7 @@ fn obsolete_completion_at(stage: PublishStage) {
         ThemeSelection::Named(ThemeId::Dark),
         Scheme::Dark,
         None,
+        true,
         move || {
             let _ = wake_tx.send(());
             // Hold publication stable until the observer has cloned it. A fast
