@@ -3,6 +3,7 @@
 //! Mapped originals, sparse indexing and persistent byte-exact editing.
 
 mod buffer;
+pub mod decoded_backing;
 pub mod encoding;
 mod file;
 mod line_index;
