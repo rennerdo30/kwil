@@ -138,6 +138,33 @@ pub struct RecoveryRevision<'a> {
     committed: bool,
 }
 impl RecoveryRevision<'_> {
+    /// Check a fresh origin's conservative index/path charge BEFORE its raw
+    /// input is read or private files are created. This allocates nothing and
+    /// does not publish an ID or charge twice. The worker must register the
+    /// prepared origin immediately, with actual lengths within these bounds.
+    pub fn preflight_origin(
+        &mut self,
+        id: u64,
+        logical_bytes_bound: u64,
+        path_bytes_bound: usize,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let result = (|| {
+            self.ready()?;
+            poll(&mut cancelled)?;
+            if self.assembler.origins.iter().any(|entry| entry.id == id) {
+                return Err(invalid("duplicate recovery origin ID"));
+            }
+            if self.assembler.origins.len() >= self.assembler.limits.max_origins {
+                return Err(invalid("recovery work limit exceeded: origins"));
+            }
+            let len = usize::try_from(logical_bytes_bound).map_err(|_| overflow())?;
+            let metadata = origin_work_parts(len, path_bytes_bound)?;
+            self.reserve(usize::from(len != 0), 0, metadata)?;
+            poll(&mut cancelled)
+        })();
+        self.checked(result)
+    }
     fn ready(&self) -> io::Result<()> {
         if self.failed { Err(invalid("recovery revision is poisoned")) } else { Ok(()) }
     }
@@ -367,10 +394,20 @@ fn sum(parts: &[usize]) -> io::Result<usize> {
 }
 
 fn origin_work(origin: &DecodedSnapshot) -> io::Result<usize> {
+    let paths = origin.paths();
+    let path_bytes = sum(&[
+        paths.directory.capacity(),
+        paths.raw.capacity(),
+        paths.logical.capacity(),
+        paths.checkpoints.capacity(),
+        origin.source_path().as_os_str().len(),
+    ])?;
+    origin_work_parts(origin.logical_bytes().len(), path_bytes)
+}
+fn origin_work_parts(len: usize, path_bytes: usize) -> io::Result<usize> {
     // Default sparse line checkpoints can occur at most once per1024 bytes;
     // byte-rank checkpoints at most once per64KiB (chunk grid is a multiple).
     // Vec growth is conservatively four times the final checkpoint count.
-    let len = origin.logical_bytes().len();
     let lines = len
         .checked_div(crate::line_index::DEFAULT_EVERY as usize)
         .and_then(|n| n.checked_add(1))
@@ -380,18 +417,7 @@ fn origin_work(origin: &DecodedSnapshot) -> io::Result<usize> {
         .checked_add(ranks)
         .and_then(|n| n.checked_mul(4 * std::mem::size_of::<(u64, u64)>()))
         .ok_or_else(overflow)?;
-    let paths = origin.paths();
-    sum(&[
-        index,
-        std::mem::size_of::<crate::decoded_piece::IndexedDecoded>(),
-        1024,
-        paths.directory.capacity(),
-        paths.raw.capacity(),
-        paths.logical.capacity(),
-        paths.checkpoints.capacity(),
-        origin.source_path().as_os_str().len(),
-        tree_work(&None)?,
-    ])
+    sum(&[index, std::mem::size_of::<crate::decoded_piece::IndexedDecoded>(), 1024, path_bytes, tree_work(&None)?])
 }
 
 #[cfg(test)]
@@ -457,6 +483,27 @@ mod tests {
         let mut out = Vec::new();
         snapshot.write_to(&mut out).unwrap();
         out
+    }
+    #[test]
+    fn recovery_origin_preflight_allocates_nothing_and_refuses_before_registration() {
+        let mut assembler = RecoveryAssembler::new(limits()).unwrap();
+        let before = assembler.usage();
+        {
+            let mut revision = assembler.begin_revision();
+            revision.preflight_origin(1, 1024, 4096, || false).unwrap();
+            assert_eq!(revision.usage, before, "preflight must not double-charge registration");
+            assert_eq!(revision.assembler.origins.len(), 0);
+        }
+        assert_eq!(assembler.usage(), before);
+        assert_eq!(assembler.origin_count(), 0);
+        let mut cap = limits();
+        cap.max_metadata_bytes = before.metadata_bytes;
+        let mut assembler = RecoveryAssembler::new(cap).unwrap();
+        let mut revision = assembler.begin_revision();
+        assert!(revision.preflight_origin(1, 1, 1, || false).is_err());
+        assert!(revision.commit(|| false).is_err());
+        assert!(assembler.snapshot().is_empty());
+        assert_eq!(assembler.origin_count(), 0);
     }
     fn plan(encoding: Encoding, bom: bool) -> SavePlan {
         SavePlan { encoding, bom, line_ending: None }

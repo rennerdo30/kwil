@@ -58,6 +58,7 @@ struct Owners {
     storage_limit: u64,
     storage_reserved: u64,
     metadata_reserved: usize,
+    origin_path_bytes_bound: usize,
 }
 
 /// Counts after a retirement attempt. A live owner is NOT a cleanup failure;
@@ -133,6 +134,7 @@ impl ReplayState {
         }
         let metadata_reserved =
             owner_metadata(&private_parent, limits.core.max_origins, limits.max_private_path_bytes)?;
+        let origin_path_bytes_bound = limits.max_private_path_bytes.checked_mul(32).ok_or_else(overflow)?;
         limits.core.max_metadata_bytes = limits
             .core
             .max_metadata_bytes
@@ -154,6 +156,7 @@ impl ReplayState {
                 storage_limit: limits.max_origin_storage_bytes,
                 storage_reserved: 0,
                 metadata_reserved,
+                origin_path_bytes_bound,
             },
         })
     }
@@ -465,6 +468,12 @@ impl CapsuleSink for ReplayRevision<'_> {
         let result = (|| {
             self.building()?;
             let storage = self.owners.preflight(id, raw_len)?;
+            let logical_bound = raw_len.checked_mul(8).ok_or_else(overflow)?;
+            // The constructor charged all path copies in this reservation;
+            // the same upper bound also covers the core's path/index charge.
+            let path_bound = self.owners.origin_path_bytes_bound;
+            let cancel = self.cancel;
+            self.core()?.preflight_origin(id, logical_bound, path_bound, || cancelled(cancel))?;
             // Capacity and all owner metadata were charged at construction.
             let index = self.owners.slots.len();
             self.owners.slots.push(Slot { id, resource: None, storage, accepted: false });
@@ -1032,6 +1041,51 @@ mod tests {
         }
         assert!(storage_bound(u64::MAX).is_err());
         assert!(owner_metadata(Path::new("/private"), usize::MAX, 1024).is_err());
+    }
+
+    #[test]
+    fn replay_core_origin_metadata_is_checked_before_raw_input_or_files() {
+        let fixture = Fixture::new();
+        let mut probe = fixture.state();
+        let minimum = probe.owner_metadata_reserved() + probe.usage().unwrap().metadata_bytes;
+        probe.abandon().unwrap();
+        let mut config = limits();
+        config.core.max_metadata_bytes = minimum;
+        let mut state = ReplayState::new(fixture.recovered.clone(), config).unwrap();
+        let origin = fixture.origin(b"ABC", Encoding::UTF8, 0);
+        let mut registry = registry();
+        let base = seed(&mut registry, origin);
+        struct BeforeRaw<'a> {
+            input: Cursor<&'a [u8]>,
+            boundary: u64,
+            raw_reads: usize,
+        }
+        impl Read for BeforeRaw<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.input.position() >= self.boundary {
+                    self.raw_reads += 1;
+                    return Err(io::Error::new(io::ErrorKind::StorageFull, "raw input must not be requested"));
+                }
+                let len = bytes.len().min((self.boundary - self.input.position()) as usize);
+                self.input.read(&mut bytes[..len])
+            }
+        }
+        let mut input = BeforeRaw {
+            input: Cursor::new(&base.bytes),
+            boundary: 16 + 20 + Encoding::UTF8.name().len() as u64,
+            raw_reads: 0,
+        };
+        let cancel = AtomicBool::new(false);
+        let mut revision = state.begin_revision(&cancel).unwrap();
+        let error = revision.apply_capsule(&mut input, base.bytes.len() as u64, base.logical, 0..0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("metadata"), "wrong preflight error: {error}");
+        assert_eq!(input.raw_reads, 0, "metadata refusal must precede raw preparation");
+        assert!(revision.commit().is_err());
+        assert_eq!(state.accepted_origin_count(), 0);
+        assert_eq!(state.origin_storage_reserved(), 0);
+        fixture.assert_empty();
+        state.abandon().unwrap();
     }
 
     #[test]
