@@ -56,12 +56,22 @@ jobs:
           cache-on-failure: true
       - name: Build platform entry points
         shell: bash
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
         run: |
           features=()
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             features=(--features windows-console)
           fi
           cargo build --release --locked -p kwil --target ${{ matrix.target }} "${features[@]}"
+      - name: Verify Windows static runtime in both entry points
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python scripts/check-static-runtime.py \
+            target/${{ matrix.target }}/release/kwil.exe \
+            target/${{ matrix.target }}/release/kwil-console.exe
       - name: Compiler cache statistics
         if: always() && steps.sccache.outcome == 'success'
         run: sccache --show-stats

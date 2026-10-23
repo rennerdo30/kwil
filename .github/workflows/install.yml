@@ -1,0 +1,59 @@
+name: Installer checks
+
+on:
+  pull_request:
+    paths: ['scripts/install.*', 'scripts/test-install*', 'scripts/*static-runtime.py', '.github/workflows/install.yml', '.github/workflows/release.yml']
+  push:
+    branches: [main]
+    paths: ['scripts/install.*', 'scripts/test-install*', 'scripts/*static-runtime.py', '.github/workflows/install.yml', '.github/workflows/release.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  static-windows:
+    name: Static runtime (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked -j 4 -p kwil --features windows-console --target ${{ matrix.target }}
+      - name: Inspect GUI and console runtime imports
+        shell: bash
+        run: |
+          python scripts/check-static-runtime.py \
+            target/${{ matrix.target }}/release/kwil.exe \
+            target/${{ matrix.target }}/release/kwil-console.exe
+      - name: Version smoke
+        shell: pwsh
+        run: |
+          & target/${{ matrix.target }}/release/kwil-console.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+  fixtures:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Runtime import rejection fixtures
+        run: python3 -I scripts/test-static-runtime.py
+      - name: Windows installer offline fixtures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-install.ps1 -FixtureRoot (Join-Path $env:RUNNER_TEMP ('kwil-install-' + [guid]::NewGuid()))
+      - name: Unix installer offline fixtures
+        if: runner.os != 'Windows'
+        run: python3 -I scripts/test-install-unix.py
