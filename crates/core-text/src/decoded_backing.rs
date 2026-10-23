@@ -242,6 +242,35 @@ impl DecodedBacking {
         }
     }
 
+    /// Worker-only reconstruction from a framed, validated recovery payload.
+    /// Reads exactly `raw_len` bytes, leaving subsequent frame bytes untouched.
+    /// The caller owns frame authentication, payload limits and final EOF checks;
+    /// this method never trusts an external pathname or retains the reader.
+    /// Scratch and cancellation intervals match ordinary source preparation.
+    pub fn prepare_from_reader(
+        input: &mut impl Read,
+        raw_len: u64,
+        interpretation: Interpretation,
+        private_parent: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<Self, BackingError> {
+        cancelled(cancel)?;
+        Interpretation::new(interpretation.encoding, interpretation.bom_len as usize)?;
+        let paths = BackingPaths::create(private_parent)?;
+        let result = (|| {
+            let mut raw_file = private_file(&paths.raw)?;
+            copy_exact(input, &mut raw_file, raw_len, cancel)?;
+            Self::finish_private(raw_file, interpretation, &paths, paths.raw.clone(), cancel)
+        })();
+        match result {
+            Ok(storage) => Ok(Self { storage: Arc::new(storage) }),
+            Err(cause) => match paths.cleanup() {
+                Ok(()) => Err(cause),
+                Err(error) => Err(BackingError::Cleanup { cause: Box::new(cause), directory: paths.directory, error }),
+            },
+        }
+    }
+
     fn prepare_private(
         source: &TextFile,
         interpretation: Interpretation,
@@ -264,6 +293,16 @@ impl DecodedBacking {
             return Err(ReadError::Changed(FileState::Modified).into());
         }
         check_source(source)?;
+        Self::finish_private(raw_file, interpretation, paths, source.path().to_owned(), cancel)
+    }
+
+    fn finish_private(
+        mut raw_file: File,
+        interpretation: Interpretation,
+        paths: &BackingPaths,
+        source_path: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<Storage, BackingError> {
         cancelled(cancel)?;
         raw_file.flush()?;
         let raw = map(&raw_file)?;
@@ -287,7 +326,7 @@ impl DecodedBacking {
             checkpoints: map(&index_file)?.ok_or(BackingError::DecoderContract)?,
             raw,
             interpretation,
-            source_path: source.path().to_owned(),
+            source_path,
             paths: paths.clone(),
         })
     }
@@ -1207,6 +1246,140 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn reader_recovery_preserves_raw_origin_and_stops_at_frame_boundary() {
+        let fixture = Fixture::new(b"not the recovered origin");
+        let raw = b"\xff\xfeA\0\0\xd8B\0\xff";
+        let mut framed = raw.to_vec();
+        framed.extend_from_slice(b"NEXT");
+        let mut input = io::Cursor::new(framed);
+        let owner = DecodedBacking::prepare_from_reader(
+            &mut input,
+            raw.len() as u64,
+            Interpretation::new(Encoding::UTF16_LE, 2).unwrap(),
+            &fixture.directory,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let snapshot = owner.snapshot();
+        assert_eq!(snapshot.raw_bytes(), raw);
+        assert_eq!(snapshot.logical_bytes(), b"A\xffB\xff");
+        assert_eq!(snapshot.atom_at(1).unwrap().unwrap().raw_bytes, b"\0\xd8");
+        assert_eq!(snapshot.source_path(), snapshot.paths().raw);
+        assert_eq!(input.position(), raw.len() as u64);
+        let mut next = [0; 4];
+        input.read_exact(&mut next).unwrap();
+        assert_eq!(&next, b"NEXT");
+        drop(snapshot);
+        fixture.retire(owner);
+    }
+
+    #[test]
+    fn reader_recovery_empty_bom_and_legacy_aliases_are_lossless() {
+        let fixture = Fixture::new(b"unrelated");
+        let big5 = Encoding::for_label("big5").unwrap();
+        for (raw, encoding, bom_len) in [
+            (&b""[..], Encoding::UTF8, 0),
+            (&b"\xef\xbb\xbf"[..], Encoding::UTF8, 3),
+            (&b"\xff\xfe"[..], Encoding::UTF16_LE, 2),
+            (&b"\x88\x62"[..], big5, 0),
+        ] {
+            let mut input = raw;
+            let owner = DecodedBacking::prepare_from_reader(
+                &mut input,
+                raw.len() as u64,
+                Interpretation::new(encoding, bom_len).unwrap(),
+                &fixture.directory,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let snapshot = owner.snapshot();
+            assert_eq!(snapshot.raw_bytes(), raw);
+            assert_eq!(snapshot.interpretation(), Interpretation::new(encoding, bom_len).unwrap());
+            if encoding == big5 {
+                assert_eq!(snapshot.logical_bytes(), "\u{00ca}\u{0304}".as_bytes());
+                assert!(matches!(snapshot.resolve_logical(2).unwrap(), Boundary::Interior { .. }));
+            } else {
+                assert!(snapshot.logical_bytes().is_empty());
+            }
+            drop(snapshot);
+            fixture.retire(owner);
+        }
+    }
+
+    #[test]
+    fn reader_recovery_failure_and_cancellation_leave_no_private_files() {
+        let fixture = Fixture::new(b"original");
+        let interpretation = Interpretation::new(Encoding::UTF8, 0).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(matches!(
+            DecodedBacking::prepare_from_reader(&mut &b"short"[..], 6, interpretation, &fixture.directory, &cancel),
+            Err(BackingError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert!(matches!(
+            DecodedBacking::prepare_from_reader(
+                &mut &b"wrong"[..],
+                5,
+                Interpretation::new(Encoding::UTF8, 3).unwrap(),
+                &fixture.directory,
+                &cancel
+            ),
+            Err(BackingError::InvalidDescriptor)
+        ));
+        struct Cancels<'a>(&'a AtomicBool);
+        impl Read for Cancels<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                bytes.fill(b'A');
+                self.0.store(true, Ordering::Relaxed);
+                Ok(bytes.len())
+            }
+        }
+        // Cancellation on the final read must still abort before publication.
+        assert!(matches!(
+            DecodedBacking::prepare_from_reader(&mut Cancels(&cancel), 7, interpretation, &fixture.directory, &cancel),
+            Err(BackingError::Cancelled)
+        ));
+        assert_eq!(fs::read_dir(&fixture.directory).unwrap().count(), 1);
+        assert_eq!(fs::read(&fixture.source).unwrap(), b"original");
+    }
+
+    #[test]
+    fn reader_recovery_bounds_read_requests_and_retains_live_pins() {
+        let fixture = Fixture::new(b"original");
+        struct SmallReads {
+            remaining: usize,
+            largest: usize,
+        }
+        impl Read for SmallReads {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.largest = self.largest.max(bytes.len());
+                let n = bytes.len().min(self.remaining).min(3);
+                bytes[..n].fill(b'A');
+                self.remaining -= n;
+                Ok(n)
+            }
+        }
+        let mut input = SmallReads { remaining: (64 << 10) + 1, largest: 0 };
+        let owner = DecodedBacking::prepare_from_reader(
+            &mut input,
+            ((64 << 10) + 1) as u64,
+            Interpretation::new(Encoding::UTF8, 0).unwrap(),
+            &fixture.directory,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(input.largest <= SCRATCH);
+        assert_eq!(input.remaining, 0);
+        let snapshot = owner.snapshot();
+        assert_eq!(snapshot.logical_bytes().len(), (64 << 10) + 1);
+        let owner = match owner.try_retire() {
+            Err(RetirementError::LiveSnapshots(owner)) => owner,
+            _ => panic!("reader-created origins must retain live pins"),
+        };
+        drop(snapshot);
+        fixture.retire(owner);
     }
 
     #[test]

@@ -151,8 +151,10 @@ impl OriginRegistry {
     }
 
     /// No writer is touched and no registry state changes on planning failure.
-    /// Traversal is O(pieces * log(max_origins)), with bounded detached metadata
-    /// checks. No origin raw byte scan, per-character list or per-piece Vec.
+    /// Traversal is O(pieces * log(max_origins)), plus O(k^2) metadata moves
+    /// for inserting k new origins into the bounded sorted definition vector.
+    /// Detached metadata checks are bounded. No origin raw byte scan,
+    /// per-character list or per-piece Vec.
     pub fn plan(&self, snapshot: Snapshot, range: Range<u64>, cancel: Arc<AtomicBool>) -> io::Result<CapsulePlan> {
         self.plan_checked(snapshot, range, None, cancel.clone(), || poll(&cancel))
     }
