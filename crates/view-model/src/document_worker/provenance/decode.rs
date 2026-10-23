@@ -473,7 +473,10 @@ mod tests {
         }
         let mut unknown = header(0);
         unknown.extend_from_slice(&[99, 0]);
-        bad.push(unknown);
+        let mut sink = Sink::default();
+        let error = run(&unknown, 0, &mut sink).unwrap_err();
+        assert!(error.to_string().contains("unknown capsule record"));
+        assert!(sink.aborted);
         let mut overflow = header(1);
         overflow.push(3);
         overflow.extend_from_slice(&u64::MAX.to_le_bytes());
