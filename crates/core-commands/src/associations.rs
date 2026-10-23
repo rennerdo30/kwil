@@ -456,23 +456,7 @@ impl AssociationAdapter for LinuxAssociations {
     fn sync_restored(&mut self, changes: &[Change]) -> Result<(), AssociationError> {
         for change in changes {
             let path = self.path(&change.location)?;
-            // Reopening a restored file also covers retries where rollback saw
-            // Before and therefore performed no write this time.
-            match std::fs::File::open(path) {
-                Ok(file) => file.sync_all().map_err(|e| err(e.to_string()))?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(err(e.to_string())),
-            }
-            // fsync(file) does not persist rename/unlink. Sync the containing
-            // directory and its ancestors, including directories made by Apply.
-            // If Apply never reached this file, a parent can still be absent.
-            for directory in path.ancestors().skip(1) {
-                match std::fs::File::open(directory) {
-                    Ok(file) => file.sync_all().map_err(|e| err(e.to_string()))?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(err(e.to_string())),
-                }
-            }
+            linux_sync_restored_file(path, change.before.is_some()).map_err(|e| err(e.to_string()))?;
         }
         Ok(())
     }
@@ -508,6 +492,63 @@ impl AssociationAdapter for LinuxAssociations {
             Ok(())
         }
     }
+}
+// Open one component relative to an already-validated directory. O_NOFOLLOW
+// only protects the last component, so whole-path opens are insufficient.
+#[cfg(target_os = "linux")]
+fn linux_open_sync_at(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::{
+        ffi::CString,
+        os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    };
+    let name = CString::new(name.as_bytes()).map_err(|_| std::io::Error::other("invalid association component"))?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW;
+    let flags = if directory { flags | libc::O_DIRECTORY } else { flags };
+    // No create flag: no mode argument is needed. A successful descriptor is
+    // uniquely owned below, including every metadata/error path.
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if if directory { !metadata.is_dir() } else { !metadata.is_file() } {
+        return Err(std::io::Error::other("association sync descriptor has an unsafe resource type"));
+    }
+    Ok(file)
+}
+#[cfg(target_os = "linux")]
+fn linux_sync_restored_file(path: &std::path::Path, must_exist: bool) -> std::io::Result<()> {
+    use std::{os::fd::AsRawFd, path::Component};
+    let mut components = path.components().peekable();
+    if components.next() != Some(Component::RootDir) || components.peek().is_none() {
+        return Err(std::io::Error::other("association sync needs an absolute file path"));
+    }
+    let mut directories = vec![linux_open_sync_at(libc::AT_FDCWD, std::ffi::OsStr::new("/"), true)?];
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::other("association sync refuses non-normal path components"));
+        };
+        let directory = components.peek().is_some();
+        match linux_open_sync_at(directories.last().expect("root directory").as_raw_fd(), name, directory) {
+            Ok(file) if directory => directories.push(file),
+            Ok(file) => file.sync_all()?,
+            // An absent prior file may have absent parents when Apply never
+            // reached it. Still sync the existing ancestor descriptors below.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !must_exist => break,
+            Err(e) => return Err(e),
+        }
+    }
+    // Retain and sync the actual opened directories: never re-open their paths
+    // after validation. This persists rename/unlink and newly-created ancestry.
+    for directory in directories.iter().rev() {
+        directory.sync_all()?;
+    }
+    Ok(())
 }
 fn write_user_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;

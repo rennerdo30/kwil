@@ -989,6 +989,177 @@ mod tests {
         assert_eq!(Journal::open(scratch.0.clone()).unwrap().active.unwrap().receipt.pending().len(), 3);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_sync_rejects_raced_resources_in_bounded_subprocesses() {
+        use std::process::{Command, Stdio};
+        const CASE: &str = "KWIL_ASSOCIATION_SYNC_TEST_CASE";
+        const ROOT: &str = "KWIL_ASSOCIATION_SYNC_TEST_ROOT";
+        if let Some(case) = std::env::var_os(CASE) {
+            let root = PathBuf::from(std::env::var_os(ROOT).expect("explicit isolated test root"));
+            assert!(root.is_absolute());
+            assert_eq!(root.parent().unwrap(), std::env::temp_dir().canonicalize().unwrap());
+            assert!(root.file_name().unwrap().to_str().unwrap().starts_with("kwil-association-worker-"));
+            check_directory(&root).unwrap();
+            linux_sync_raced_resource_case(&root, case.to_str().unwrap());
+            return;
+        }
+        for case in [
+            "file-fifo",
+            "file-symlink",
+            "file-directory",
+            "ancestor-fifo",
+            "ancestor-symlink",
+            "regular",
+            "missing",
+            "missing-parents",
+        ] {
+            // Parent owns the fixture, so even a killed mutant child is cleaned.
+            let scratch = Scratch::new();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "associations::worker::tests::linux_sync_rejects_raced_resources_in_bounded_subprocesses",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CASE, case)
+                .env(ROOT, &scratch.0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            eprintln!("own association sync subprocess PID {}, case {case}, timeout 5s", child.id());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "association sync child {case} failed: {status}");
+                        break;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                    result => {
+                        // This exact Child is the only termination target.
+                        let _ = child.kill();
+                        child.wait().unwrap();
+                        panic!("association sync child {case} blocked or failed to wait: {result:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_sync_raced_resource_case(root: &Path, case: &str) {
+        use super::super::{Change, LinuxAssociations};
+        use std::{
+            ffi::{CString, OsStr},
+            os::{
+                fd::AsRawFd,
+                unix::{
+                    ffi::OsStrExt,
+                    fs::{DirBuilderExt, symlink},
+                },
+            },
+        };
+        struct Raced {
+            fake: Fake,
+            native: LinuxAssociations,
+            root: PathBuf,
+            case: String,
+        }
+        impl AssociationAdapter for Raced {
+            fn owner(&self) -> String {
+                self.fake.owner()
+            }
+            fn read(&mut self, l: &Location) -> Result<Option<StoredValue>, AssociationError> {
+                self.fake.read(l)
+            }
+            fn write(&mut self, l: &Location, v: Option<&StoredValue>) -> Result<(), AssociationError> {
+                self.fake.write(l, v)
+            }
+            fn sync_restored(&mut self, changes: &[Change]) -> Result<(), AssociationError> {
+                // The adversary replacement occurs AFTER rollback's last read
+                // and restoration. No live registry/desktop data is involved.
+                let config = self.root.join("config");
+                let file = config.join("mimeapps.list");
+                let fifo = |path: &Path| {
+                    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                };
+                match self.case.as_str() {
+                    "ancestor-fifo" => fifo(&config),
+                    "ancestor-symlink" => symlink(self.root.join("target-dir"), &config).unwrap(),
+                    "missing-parents" => {}
+                    case => {
+                        fs::create_dir(&config).unwrap();
+                        match case {
+                            "file-fifo" => fifo(&file),
+                            "file-symlink" => symlink(self.root.join("target"), &file).unwrap(),
+                            "file-directory" => fs::create_dir(&file).unwrap(),
+                            "regular" => fs::write(&file, b"previous bytes").unwrap(),
+                            "missing" => {}
+                            _ => panic!("unknown isolated sync case"),
+                        }
+                    }
+                }
+                self.native.sync_restored(changes)
+            }
+        }
+        let journal_path = root.join("journal");
+        fs::DirBuilder::new().mode(0o700).create(&journal_path).unwrap();
+        fs::write(root.join("target"), b"foreign target untouched").unwrap();
+        fs::create_dir(root.join("target-dir")).unwrap();
+        let location = Location::UserFile(root.join("config/mimeapps.list"));
+        let after = StoredValue::text("applied fake value");
+        let before = (case == "regular").then(|| StoredValue::text("previous bytes"));
+        let fake = Fake::default();
+        fake.0.lock().unwrap().values.push((location.clone(), after.clone()));
+        let receipt = AssociationReceipt {
+            owner: fake.owner(),
+            remaining: vec![Change { location, before, after: Some(after) }],
+        };
+        let mut journal = Journal::open(journal_path.clone()).unwrap();
+        journal.begin(receipt).unwrap();
+        let intent = fs::read(journal.path(1, "intent")).unwrap();
+        drop(journal);
+        let native = LinuxAssociations::new(root.join("data"), root.join("config")).unwrap();
+        let adapter = Raced { fake, native, root: root.to_owned(), case: case.into() };
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let (worker, events) = AssociationWorker::spawn(
+            journal_path.clone(),
+            move || Ok(adapter),
+            move || {
+                let _ = wake_tx.send(());
+            },
+        )
+        .unwrap();
+        worker.try_submit(Request::Undo { journal_id: 1 }).unwrap();
+        let result = receive(&events, &wake_rx).result;
+        let should_succeed = matches!(case, "regular" | "missing" | "missing-parents");
+        if should_succeed {
+            assert!(matches!(result.unwrap(), Response::Undone { journal_id: 1 }));
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.recovery, Some(1));
+            assert!(!error.message.contains("panicked"), "must reject the resource, not panic");
+        }
+        worker.shutdown().unwrap();
+        let journal = Journal::open(journal_path).unwrap();
+        assert_eq!(journal.active.is_none(), should_succeed);
+        assert_eq!(fs::read(journal.path(1, "intent")).unwrap(), intent);
+        assert_eq!(journal.path(1, "retired").exists(), should_succeed);
+        assert_eq!(fs::read(root.join("target")).unwrap(), b"foreign target untouched");
+        // Directory-only open is an admission contract: a FIFO must be refused
+        // by openat itself, before acquiring a non-directory descriptor.
+        if case == "ancestor-fifo" {
+            let parent = File::open(root).unwrap();
+            let error = super::super::linux_open_sync_at(parent.as_raw_fd(), OsStr::new("config"), true).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+        }
+    }
+
     #[test]
     fn plan_is_read_only_and_apply_requires_current_reviewed_generation() {
         let scratch = Scratch::new();
