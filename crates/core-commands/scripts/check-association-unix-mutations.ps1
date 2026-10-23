@@ -123,6 +123,100 @@ public static class AssociationBoundedProcessV2 {
 }
 '@
 }
+$identityCode = @'
+using System;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+public sealed class AssociationKernelIdentity {
+    public int Pid;
+    public string Mode, Boot, Birth;
+}
+public sealed class AssociationIdentityStop {
+    public bool Accepted, Stopped, KillSent;
+    public string Detail = "";
+}
+public static class AssociationNativeIdentity {
+    // Raw starttime field 22 is ticks since boot, not a wall-clock estimate:
+    // man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+    // docs.kernel.org/admin-guide/sysctl/kernel.html (random/boot_id)
+    public static AssociationKernelIdentity ParseLinux(int pid, string stat, string boot) {
+        int first = stat.IndexOf(' '), close = stat.LastIndexOf(')');
+        if (pid <= 0 || first < 1 || close <= first || stat[first + 1] != '(' ||
+            !int.TryParse(stat.Substring(0, first), out int actual) || actual != pid)
+            throw new InvalidDataException("Malformed proc identity/PID");
+        string[] fields = stat.Substring(close + 1).Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+        if (fields.Length < 20 || !ulong.TryParse(fields[19], NumberStyles.None, CultureInfo.InvariantCulture, out ulong ticks) || ticks == 0 ||
+            !Guid.TryParse(boot.Trim(), out Guid bootId) || bootId == Guid.Empty)
+            throw new InvalidDataException("Malformed proc starttime/boot identity");
+        return new AssociationKernelIdentity { Pid=pid, Mode="linux-proc", Boot=bootId.ToString("D"), Birth=ticks.ToString(CultureInfo.InvariantCulture) };
+    }
+    public static AssociationKernelIdentity Read(int pid) {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            return ParseLinux(pid, File.ReadAllText("/proc/" + pid + "/stat"), File.ReadAllText("/proc/sys/kernel/random/boot_id"));
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) throw new PlatformNotSupportedException("Fixture native identity supports Linux/Windows only");
+        using (var p = Process.GetProcessById(pid))
+            return new AssociationKernelIdentity { Pid=pid, Mode="windows-start", Boot="", Birth=p.StartTime.ToUniversalTime().Ticks.ToString(CultureInfo.InvariantCulture) };
+    }
+    public static bool Match(AssociationKernelIdentity a, AssociationKernelIdentity b) {
+        return a != null && b != null && a.Pid > 0 && a.Pid == b.Pid && a.Mode == b.Mode &&
+            !string.IsNullOrEmpty(a.Birth) && a.Birth == b.Birth && a.Boot == b.Boot &&
+            ((a.Mode == "linux-proc" && Guid.TryParse(a.Boot, out Guid boot) && boot != Guid.Empty) ||
+             (a.Mode == "windows-start" && a.Boot == ""));
+    }
+    [StructLayout(LayoutKind.Sequential)] struct PollFd { public int fd; public short events, revents; }
+    [DllImport("libc", EntryPoint="syscall", SetLastError=true)] static extern long OpenPidFd(long nr, int pid, uint flags);
+    [DllImport("libc", EntryPoint="syscall", SetLastError=true)] static extern long SignalPidFd(long nr, int fd, int signal, IntPtr info, uint flags);
+    [DllImport("libc", SetLastError=true)] static extern int poll(ref PollFd fd, UIntPtr count, int timeout);
+    [DllImport("libc")] static extern int close(int fd);
+    public static AssociationIdentityStop Stop(AssociationKernelIdentity expected, int timeoutMs) {
+        var r = new AssociationIdentityStop();
+        if (timeoutMs < 1 || timeoutMs > 1500) { r.Detail="invalid cleanup bound"; return r; }
+        var task = Task.Run(() => {
+            try {
+                if (expected == null || expected.Pid <= 0) { r.Detail="invalid expected identity"; return; }
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) {
+                    // Kernel syscall tables agree for these explicit 64-bit ABIs:
+                    // arch/x86/entry/syscalls/syscall_64.tbl and asm-generic/unistd.h.
+                    // Unsupported ABIs/kernels fail closed; never fall back to kill(PID).
+                    if (RuntimeInformation.ProcessArchitecture != Architecture.X64 && RuntimeInformation.ProcessArchitecture != Architecture.Arm64)
+                        throw new PlatformNotSupportedException("No audited pidfd ABI mapping");
+                    int fd = checked((int)OpenPidFd(434, expected.Pid, 0));
+                    if (fd < 0) throw new InvalidOperationException("pidfd_open failed: " + Marshal.GetLastPInvokeError());
+                    try {
+                        // Bind first, then compare. If PID reuse races this check,
+                        // signalling the fd can still only reach the bound lifetime.
+                        if (!Match(expected, Read(expected.Pid))) { r.Detail="PID identity changed; refusing termination"; return; }
+                        r.Accepted=true;
+                        var ready = new PollFd { fd=fd, events=1 };
+                        if (poll(ref ready, (UIntPtr)1, 0) > 0 && (ready.revents & 17) != 0) { r.Stopped=true; return; }
+                        if (SignalPidFd(424, fd, 9, IntPtr.Zero, 0) != 0) throw new InvalidOperationException("pidfd_send_signal failed: " + Marshal.GetLastPInvokeError());
+                        r.KillSent=true;
+                        ready.revents=0;
+                        r.Stopped=poll(ref ready, (UIntPtr)1, timeoutMs) > 0 && (ready.revents & 17) != 0;
+                    } finally { close(fd); }
+                } else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+                    using (var p = Process.GetProcessById(expected.Pid)) {
+                        // Keep the native handle pinned across identity check/kill.
+                        var handle=p.SafeHandle;
+                        var current=new AssociationKernelIdentity { Pid=p.Id, Mode="windows-start", Boot="", Birth=p.StartTime.ToUniversalTime().Ticks.ToString(CultureInfo.InvariantCulture) };
+                        if (!Match(expected, current)) { r.Detail="PID identity changed; refusing termination"; return; }
+                        r.Accepted=true;
+                        if (!p.HasExited) { p.Kill(); r.KillSent=true; }
+                        r.Stopped=p.WaitForExit(timeoutMs);
+                        GC.KeepAlive(handle);
+                    }
+                } else throw new PlatformNotSupportedException("No audited native identity cleanup");
+            } catch (Exception e) { r.Detail=e.GetType().Name + ": " + e.Message; }
+        });
+        if (!task.Wait(timeoutMs)) return new AssociationIdentityStop { Detail="native identity cleanup deadline; cleanup UNVERIFIED", KillSent=r.KillSent };
+        return r;
+    }
+}
+'@
+if (-not ('AssociationNativeIdentity' -as [type])) { Add-Type -TypeDefinition $identityCode }
 $script:cleanupUnverified = $false
 function Invoke-RecordedProcess([string]$Executable, [string[]]$Arguments, [string]$Label,
     [int]$ProcessMs = 170000, [int]$CaptureMs = 3000, [int]$CleanupMs = 5000, [switch]$InspectFailure) {
@@ -226,6 +320,20 @@ if ($ProcessFixture) {
     # Portable process-only fixture. The REAL phase finally is exercised against
     # a disposable marker; neither Rust file is ever changed and Cargo is not run.
     $pwsh = (Get-Process -Id $PID).Path
+    # Deterministic Linux parser/witness tests run on Windows too. A comm value
+    # may contain spaces and ')'; starttime must remain exact unsigned text.
+    $statTail = (@('S') + (1..18 | ForEach-Object { $_.ToString() }) + @('9876543210123456', '0')) -join ' '
+    $parsed = [AssociationNativeIdentity]::ParseLinux(77, "77 (worker ) with spaces) $statTail", '01234567-89ab-cdef-0123-456789abcdef')
+    if ($parsed.Birth -cne '9876543210123456') { throw 'Raw Linux starttime field ordinal/precision failure' }
+    foreach ($replacement in @(
+        [AssociationKernelIdentity]@{ Pid=77; Mode='linux-proc'; Boot=$parsed.Boot; Birth='9876543210123457' },
+        [AssociationKernelIdentity]@{ Pid=77; Mode='linux-proc'; Boot='11234567-89ab-cdef-0123-456789abcdef'; Birth=$parsed.Birth },
+        [AssociationKernelIdentity]@{ Pid=78; Mode='linux-proc'; Boot=$parsed.Boot; Birth=$parsed.Birth }
+    )) { if ([AssociationNativeIdentity]::Match($parsed, $replacement)) { throw 'Replaced PID/boot/birth identity was accepted' } }
+    $malformedRejected = $false
+    try { $null = [AssociationNativeIdentity]::ParseLinux(78, "77 (worker) $statTail", $parsed.Boot) } catch { $malformedRejected = $true }
+    if (-not $malformedRejected) { throw 'Mismatched proc PID was accepted' }
+    Write-Host 'PASS portable raw proc parsing and deterministic PID/birth/boot replacement rejection'
     $normal = Invoke-RecordedProcess $pwsh @('-NoProfile', '-Command', '[Console]::Write("captured"); [Console]::Error.Write("stderr"); exit 0') 'fixture-normal' 5000 500 1500
     if ($normal.Out -ne 'captured' -or $normal.Err -ne 'stderr' -or -not $normal.Complete) { throw 'Normal process capture fixture failed' }
     $slow = Invoke-RecordedProcess $pwsh @('-NoProfile', '-Command', 'Start-Sleep -Seconds 20') 'fixture-process-timeout' 800 300 1500 -InspectFailure
@@ -236,16 +344,19 @@ if ($ProcessFixture) {
     [IO.File]::WriteAllBytes($sourcePath, $original)
     $originalHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
     $holderReceipt = Join-Path $proof 'known-holder.json'
+    $identitySource = Join-Path $proof 'native-identity.cs'
+    [IO.File]::WriteAllText($identitySource, $identityCode)
     $parent = Join-Path $proof 'pipe-parent.ps1'
     @'
-param([string]$Receipt)
+param([string]$Receipt, [string]$IdentitySource)
+Add-Type -TypeDefinition ([IO.File]::ReadAllText($IdentitySource))
 $info = [Diagnostics.ProcessStartInfo]::new()
 $info.FileName = (Get-Process -Id $PID).Path
 $info.UseShellExecute = $false
 foreach ($arg in @('-NoProfile', '-Command', 'Start-Sleep -Seconds 20')) { $info.ArgumentList.Add($arg) }
 # Inherit BOTH redirected output handles, then let this root exit first.
 $holder = [Diagnostics.Process]::Start($info)
-@{ pid=$holder.Id; startTicks=$holder.StartTime.ToUniversalTime().Ticks.ToString() } | ConvertTo-Json | Set-Content -LiteralPath $Receipt
+[AssociationNativeIdentity]::Read($holder.Id) | ConvertTo-Json | Set-Content -LiteralPath $Receipt
 exit 0
 '@ | Set-Content -LiteralPath $parent
     $caught = $null
@@ -253,7 +364,7 @@ exit 0
         try {
             $null = Invoke-Phase 'fixture-inherited-pipe' ([Text.Encoding]::UTF8.GetBytes('temporary fixture mutation')) '' {
                 param($label)
-                Invoke-RecordedProcess $pwsh @('-NoProfile', '-File', $parent, '-Receipt', $holderReceipt) $label 5000 300 1500
+                Invoke-RecordedProcess $pwsh @('-NoProfile', '-File', $parent, '-Receipt', $holderReceipt, '-IdentitySource', $identitySource) $label 5000 300 1500
             }
         } catch { $caught = $_ }
         if ($null -eq $caught -or $caught.ToString() -notmatch 'failed closed.*inherited output holder cleanup UNVERIFIED') { throw 'Inherited-pipe fixture did not fail closed at bounded capture' }
@@ -266,12 +377,28 @@ exit 0
         # fixture separately owns its explicit child receipt and verifies identity
         # before bounded cleanup; never claim the runner itself cleaned it.
         if (Test-Path -LiteralPath $holderReceipt) {
-            $known = Get-Content -LiteralPath $holderReceipt -Raw | ConvertFrom-Json
-            $holder = [Diagnostics.Process]::GetProcessById($known.pid)
-            if ($holder.StartTime.ToUniversalTime().Ticks.ToString() -cne $known.startTicks) { throw 'Fixture holder PID identity changed; refusing termination' }
-            $stopped = [AssociationBoundedProcessV2]::StopKnown($holder, 1500)
-            "fixture-known-holder pid=$($known.pid) bounded_cleanup=$stopped runner_cleanup_claim=UNVERIFIED" | Add-Content -LiteralPath (Join-Path $proof 'pids.log')
-            if (-not $stopped) { throw 'Fixture known-holder cleanup unverified' }
+            $record = Get-Content -LiteralPath $holderReceipt -Raw | ConvertFrom-Json
+            $known = [AssociationKernelIdentity]@{ Pid=$record.Pid; Mode=$record.Mode; Boot=$record.Boot; Birth=$record.Birth }
+            $current = [AssociationNativeIdentity]::Read($known.Pid)
+            if (-not [AssociationNativeIdentity]::Match($known, $current)) { throw 'Fixture holder PID identity changed; refusing termination' }
+            # This receipt was made by another process using the same raw kernel
+            # identity implementation, not a cached .NET boot-time estimate.
+            Write-Host "PASS cross-process native identity match for owned holder PID $($known.Pid)"
+            try {
+                $forged = [AssociationKernelIdentity]@{ Pid=$known.Pid; Mode=$known.Mode; Boot=$known.Boot; Birth=([UInt64]::Parse($known.Birth) + [UInt64]1).ToString() }
+                $rejected = [AssociationNativeIdentity]::Stop($forged, 1500)
+                $rejected | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $proof 'replacement-rejected.json')
+                if ($rejected.Accepted -or $rejected.KillSent -or $rejected.Stopped -or $rejected.Detail -notmatch 'identity changed') { throw 'Forged PID lifetime did not reject before signalling' }
+                if (-not [AssociationNativeIdentity]::Match($known, [AssociationNativeIdentity]::Read($known.Pid))) { throw 'Rejected identity altered the live owned holder' }
+                Write-Host 'PASS forged PID lifetime rejected without signalling; owned holder remains alive'
+            } finally {
+                # Linux binds a pidfd before rechecking identity, then signals
+                # that lifetime only. Windows pins its native process handle.
+                $stop = [AssociationNativeIdentity]::Stop($known, 1500)
+                $stop | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $proof 'known-holder-cleanup.json')
+                "fixture-known-holder pid=$($known.Pid) bounded_cleanup=$($stop.Stopped) accepted=$($stop.Accepted) kill_sent=$($stop.KillSent) detail=$($stop.Detail) runner_cleanup_claim=UNVERIFIED" | Add-Content -LiteralPath (Join-Path $proof 'pids.log')
+                if (-not $stop.Accepted -or -not $stop.Stopped -or $stop.Detail) { throw 'Fixture known-holder cleanup unverified' }
+            }
         } else { throw 'Fixture holder receipt missing; no unknown process was terminated' }
         Assert-Pins
         Write-Host "Process-only fixture evidence: $proof"
