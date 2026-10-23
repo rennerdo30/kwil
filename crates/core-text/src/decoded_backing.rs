@@ -567,6 +567,93 @@ impl DecodedSnapshot {
         Ok(exact(self.resolve_logical(logical.start)?)?..exact(self.resolve_logical(logical.end)?)?)
     }
 
+    /// Worker endpoint resolution charged to the caller's aggregate budget.
+    /// Admission runs BEFORE each checkpoint record or raw byte visit, including
+    /// repeated decoder reads. An admission error stops all subsequent visits
+    /// and is preserved as BackingError::Io. Cancellation also stops between
+    /// admission and the visit. Existing unmetered APIs retain their fast path.
+    pub fn raw_range_admitted(
+        &self,
+        logical: Range<u64>,
+        cancel: &AtomicBool,
+        mut admit: impl FnMut(usize) -> io::Result<()>,
+    ) -> Result<Range<u64>, BackingError> {
+        if logical.start > logical.end {
+            return Err(BackingError::InvalidRange);
+        }
+        let exact = |boundary| match boundary {
+            Boundary::Exact { raw, .. } => Ok(raw),
+            other => Err(BackingError::SplitAtom(other)),
+        };
+        let start = exact(self.resolve_logical_admitted(logical.start, cancel, &mut admit)?)?;
+        let end = if logical.start == logical.end {
+            start
+        } else {
+            exact(self.resolve_logical_admitted(logical.end, cancel, &mut admit)?)?
+        };
+        Ok(start..end)
+    }
+
+    fn checkpoint_admitted(
+        &self,
+        index: usize,
+        cancel: &AtomicBool,
+        admit: &mut impl FnMut(usize) -> io::Result<()>,
+    ) -> Result<(u64, u64), BackingError> {
+        read_admitted(RECORD, cancel, admit, || self.checkpoint(index))
+    }
+
+    fn resolve_logical_admitted(
+        &self,
+        position: u64,
+        cancel: &AtomicBool,
+        admit: &mut impl FnMut(usize) -> io::Result<()>,
+    ) -> Result<Boundary, BackingError> {
+        cancelled(cancel)?;
+        if position > self.logical_bytes().len() as u64 {
+            return Err(BackingError::InvalidRange);
+        }
+        let mut low = 0;
+        let mut high = self.checkpoint_count();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let (_, logical) = self.checkpoint_admitted(mid, cancel, admit)?;
+            if logical <= position {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let index = low.saturating_sub(1);
+        let (mut raw, mut logical) = self.checkpoint_admitted(index, cancel, admit)?;
+        let end = if index + 1 < self.checkpoint_count() {
+            self.checkpoint_admitted(index + 1, cancel, admit)?.0
+        } else {
+            raw
+        };
+        loop {
+            if position == logical {
+                return Ok(Boundary::Exact { logical, raw });
+            }
+            if raw >= end {
+                return Err(BackingError::DecoderContract);
+            }
+            let atom = next_atom_admitted(
+                self.interpretation().encoding,
+                &self.raw_bytes()[raw as usize..end as usize],
+                cancel,
+                admit,
+            )?;
+            let next_raw = raw + atom.raw as u64;
+            let next_logical = logical + atom.logical as u64;
+            if position < next_logical {
+                return Ok(Boundary::Interior { logical: logical..next_logical, raw: raw..next_raw, kind: atom.kind });
+            }
+            raw = next_raw;
+            logical = next_logical;
+        }
+    }
+
     /// Pin provenance alongside a future piece/undo root. Multiple generations
     /// have distinct Arc identities even when they share the same source path.
     pub fn pin_range(&self, logical: Range<u64>) -> Result<OriginRange, BackingError> {
@@ -858,9 +945,268 @@ fn next_atom(encoding: Encoding, raw: &[u8]) -> Result<AtomSize, BackingError> {
     }
 }
 
+// Keep the byte-at-a-time decoder protocol identical to next_atom; the
+// unmetered preparation/viewport paths keep their existing implementation.
+fn read_admitted<T>(
+    bytes: usize,
+    cancel: &AtomicBool,
+    admit: &mut impl FnMut(usize) -> io::Result<()>,
+    read: impl FnOnce() -> T,
+) -> Result<T, BackingError> {
+    cancelled(cancel)?;
+    admit(bytes).map_err(BackingError::Io)?;
+    cancelled(cancel)?;
+    let value = read();
+    cancelled(cancel)?;
+    Ok(value)
+}
+fn next_atom_admitted(
+    encoding: Encoding,
+    raw: &[u8],
+    cancel: &AtomicBool,
+    admit: &mut impl FnMut(usize) -> io::Result<()>,
+) -> Result<AtomSize, BackingError> {
+    if raw.is_empty() {
+        return Err(BackingError::InvalidRange);
+    }
+    if encoding != Encoding::UTF16_LE
+        && encoding != Encoding::UTF16_BE
+        && read_admitted(1, cancel, admit, || raw[0])? < 0x80
+    {
+        return Ok(AtomSize { raw: 1, logical: 1, kind: AtomKind::Text });
+    }
+    let mut decoder = codec(encoding).new_decoder_without_bom_handling();
+    let mut scratch = [0; 16];
+    let mut consumed = 0;
+    loop {
+        if consumed == 4 {
+            return Err(BackingError::DecoderContract);
+        }
+        let (result, read, written) = read_admitted(1, cancel, admit, || {
+            decoder.decode_to_utf8_without_replacement(
+                &raw[consumed..consumed + 1],
+                &mut scratch,
+                consumed + 1 == raw.len(),
+            )
+        })?;
+        consumed += read;
+        match result {
+            DecoderResult::Malformed(length, after) => {
+                let length = length as usize;
+                if written != 0 || consumed != length + after as usize {
+                    return Err(BackingError::DecoderContract);
+                }
+                return Ok(AtomSize { raw: length, logical: 1, kind: AtomKind::Opaque });
+            }
+            _ if written != 0 => {
+                return Ok(AtomSize { raw: consumed, logical: written, kind: AtomKind::Text });
+            }
+            DecoderResult::InputEmpty if consumed < raw.len() => {}
+            _ => return Err(BackingError::DecoderContract),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_visit_order_and_error_identity_stop_before_read() {
+        use std::cell::RefCell;
+        let cancel = AtomicBool::new(false);
+        let events = RefCell::new(Vec::new());
+        let mut left = 1;
+        let mut calls = 0;
+        let mut admit = |bytes| {
+            calls += 1;
+            events.borrow_mut().push("admit");
+            if bytes > left {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "quota marker"));
+            }
+            left -= bytes;
+            Ok(())
+        };
+        let first = read_admitted(1, &cancel, &mut admit, || events.borrow_mut().push("read"));
+        let second =
+            first.and_then(|_| read_admitted(1, &cancel, &mut admit, || events.borrow_mut().push("forbidden")));
+        let result =
+            second.and_then(|_| read_admitted(1, &cancel, &mut admit, || events.borrow_mut().push("forbidden")));
+        let error = result.unwrap_err().into_io_error();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "quota marker");
+        assert_eq!(calls, 2);
+        assert_eq!(*events.borrow(), ["admit", "read", "admit"]);
+
+        #[derive(Debug)]
+        struct Marker(Arc<()>);
+        impl std::fmt::Display for Marker {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("identity marker")
+            }
+        }
+        impl std::error::Error for Marker {}
+        let identity = Arc::new(());
+        let mut read = false;
+        let error = read_admitted(
+            16,
+            &cancel,
+            &mut |_| {
+                cancel.store(true, Ordering::Relaxed);
+                Err(io::Error::new(io::ErrorKind::StorageFull, Marker(identity.clone())))
+            },
+            || read = true,
+        )
+        .unwrap_err()
+        .into_io_error();
+        assert!(!read);
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(Arc::ptr_eq(&error.get_ref().unwrap().downcast_ref::<Marker>().unwrap().0, &identity));
+    }
+
+    #[test]
+    fn admitted_endpoint_budget_counts_repeated_reads_and_exact_eof() {
+        let fixture = Fixture::new(b"abc");
+        let owner = fixture.prepare(Encoding::UTF8, 0);
+        let snapshot = owner.snapshot();
+        let cancel = AtomicBool::new(false);
+        let mut visits = Vec::new();
+        assert_eq!(
+            snapshot
+                .raw_range_admitted(1..2, &cancel, |n| {
+                    visits.push(n);
+                    Ok(())
+                })
+                .unwrap(),
+            1..2
+        );
+        assert_eq!(visits.iter().filter(|n| **n == 1).count(), 3, "both endpoints replay their actual raw prefix");
+        assert!(visits.iter().all(|n| *n == 1 || *n == RECORD));
+        let required = visits.iter().sum::<usize>();
+        let mut exact = required;
+        assert_eq!(
+            snapshot
+                .raw_range_admitted(1..2, &cancel, |n| {
+                    exact -= n;
+                    Ok(())
+                })
+                .unwrap(),
+            1..2
+        );
+        assert_eq!(exact, 0);
+        let mut small = required - 1;
+        let mut failed = false;
+        let error = snapshot
+            .raw_range_admitted(1..2, &cancel, |n| {
+                assert!(!failed, "no admission callback after a sticky quota failure");
+                if n > small {
+                    failed = true;
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "small quota"));
+                }
+                small -= n;
+                Ok(())
+            })
+            .unwrap_err()
+            .into_io_error();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let mut point_visits = Vec::new();
+        assert_eq!(
+            snapshot
+                .raw_range_admitted(1..1, &cancel, |n| {
+                    point_visits.push(n);
+                    Ok(())
+                })
+                .unwrap(),
+            1..1
+        );
+        assert_eq!(point_visits.iter().filter(|n| **n == 1).count(), 1, "equal endpoints genuinely reuse one result");
+        let mut eof_raw = 0;
+        assert_eq!(
+            snapshot
+                .raw_range_admitted(3..3, &cancel, |n| {
+                    if n == 1 {
+                        eof_raw += 1;
+                    }
+                    Ok(())
+                })
+                .unwrap(),
+            3..3
+        );
+        assert_eq!(eof_raw, 0);
+        let mut zero_calls = 0;
+        let error = snapshot
+            .raw_range_admitted(0..3, &cancel, |_| {
+                zero_calls += 1;
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "zero quota"))
+            })
+            .unwrap_err()
+            .into_io_error();
+        assert_eq!((zero_calls, error.kind()), (1, io::ErrorKind::WouldBlock));
+        drop(snapshot);
+        fixture.retire(owner);
+    }
+
+    #[test]
+    fn admitted_alias_malformed_bom_and_eof_match_unmetered_endpoints() {
+        for (raw, label, bom_len) in [
+            (b"a\xffb".as_slice(), "utf-8", 0),
+            (b"\x88\x66\x88\x62!".as_slice(), "big5", 0),
+            (b"\xff\xfe\xe9\0\0\xd8b\0".as_slice(), "utf-16le", 2),
+        ] {
+            let fixture = Fixture::new(raw);
+            let owner = fixture.prepare(Encoding::for_label(label).unwrap(), bom_len);
+            let snapshot = owner.snapshot();
+            let cancel = AtomicBool::new(false);
+            for start in 0..=snapshot.logical_bytes().len() as u64 {
+                for end in start..=snapshot.logical_bytes().len() as u64 {
+                    let expected = snapshot.raw_range(start..end);
+                    let actual = snapshot.raw_range_admitted(start..end, &cancel, |_| Ok(()));
+                    match (expected, actual) {
+                        (Ok(expected), Ok(actual)) => {
+                            assert_eq!(expected, actual, "{label}:{start}..{end}")
+                        }
+                        (Err(BackingError::SplitAtom(expected)), Err(BackingError::SplitAtom(actual))) => {
+                            assert_eq!(expected, actual)
+                        }
+                        (expected, actual) => {
+                            panic!("endpoint behavior changed: {label}:{start}..{end} {expected:?} {actual:?}")
+                        }
+                    }
+                }
+            }
+            drop(snapshot);
+            fixture.retire(owner);
+        }
+    }
+
+    #[test]
+    fn admitted_cancel_before_admission_before_read_and_after_read() {
+        let cancel = AtomicBool::new(true);
+        let mut reads = 0;
+        let result =
+            read_admitted(1, &cancel, &mut |_| panic!("cancelled work cannot request admission"), || reads += 1);
+        assert!(matches!(result, Err(BackingError::Cancelled)));
+        assert_eq!(reads, 0);
+        cancel.store(false, Ordering::Relaxed);
+        let result = read_admitted(
+            1,
+            &cancel,
+            &mut |_| {
+                cancel.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+            || reads += 1,
+        );
+        assert!(matches!(result, Err(BackingError::Cancelled)));
+        assert_eq!(reads, 0);
+        cancel.store(false, Ordering::Relaxed);
+        let result = read_admitted(1, &cancel, &mut |_| Ok(()), || {
+            reads += 1;
+            cancel.store(true, Ordering::Relaxed);
+        });
+        assert!(matches!(result, Err(BackingError::Cancelled)));
+        assert_eq!(reads, 1);
+    }
 
     #[test]
     fn pending_retirement_preparation_failure_preserves_retry_paths_and_cause() {

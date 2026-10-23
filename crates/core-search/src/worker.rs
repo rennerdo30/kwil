@@ -11,7 +11,7 @@ use std::{
     io,
     ops::Range,
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -89,8 +89,30 @@ pub struct DocumentSearch {
     pub navigation: Option<Navigation>,
     pub replacement: Option<Replacement>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeedCursor {
+    pub anchor: u64,
+    pub head: u64,
+}
+pub struct SeedRequest {
+    pub snapshot: Snapshot,
+    pub cursors: Vec<SeedCursor>,
+    pub primary: usize,
+    /// Explicit raw-view interpretation, never inferred from a save encoding.
+    /// Typed decoded origins and added UTF-8 do not require this permission.
+    pub allow_raw_utf8: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedResult {
+    pub text: String,
+    pub range: Range<u64>,
+    pub cursors: Vec<SeedCursor>,
+    pub primary: usize,
+    pub from_selection: bool,
+}
 pub enum SearchTask {
     Document(DocumentSearch),
+    SeedSelectionOrWord(SeedRequest),
     Files(FileSearch),
     FilePage { results: FileResults, page: Page },
 }
@@ -220,6 +242,7 @@ pub struct DocumentMatches {
 }
 #[derive(Debug)]
 pub enum SearchUpdate {
+    Seed(Option<SeedResult>),
     Progress(Progress),
     Hits {
         first: u64,
@@ -252,21 +275,58 @@ struct State {
     retired: [Option<Job>; RETIRED],
     events: VecDeque<SearchEvent>,
     active: Option<Cancellation>,
-    closing: Option<SearchRequest>,
+    closing: [Option<SearchRequest>; 2],
     live_spools: usize,
     retirement_errors: Vec<SpoolDiagnostic>,
     results_session: Option<SearchKey>,
 }
 struct Shared {
     state: Mutex<State>,
-    space: Condvar,
+    space: PublisherWake,
     stopped: AtomicBool,
     retirement_due: AtomicBool,
     coordinator: OnceLock<thread::Thread>,
     retry_wake: AtomicBool,
 }
+/// One publisher can block on result backpressure. An unpark token survives
+/// notification before sleep, including a retry armed while its mailbox is held.
+#[derive(Default)]
+struct PublisherWake(OnceLock<thread::Thread>);
+impl PublisherWake {
+    fn register(&self) {
+        let _ = self.0.set(thread::current());
+    }
+    fn notify_one(&self) {
+        if let Some(publisher) = self.0.get() {
+            publisher.unpark();
+        }
+    }
+    fn notify_all(&self) {
+        self.notify_one();
+    }
+}
 impl Shared {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(State {
+                pending: None,
+                retired: [const { None }; RETIRED],
+                events: VecDeque::with_capacity(EVENTS),
+                active: None,
+                closing: [None, None],
+                live_spools: 0,
+                retirement_errors: Vec::new(),
+                results_session: None,
+            }),
+            space: PublisherWake::default(),
+            stopped: AtomicBool::new(false),
+            retirement_due: AtomicBool::new(false),
+            coordinator: OnceLock::new(),
+            retry_wake: AtomicBool::new(false),
+        }
+    }
     fn notify(&self) {
+        self.space.notify_one();
         if let Some(thread) = self.coordinator.get() {
             thread.unpark();
         }
@@ -286,23 +346,7 @@ impl SearchWorker {
         if spool_bytes < 32 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "spool cap too small"));
         }
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                pending: None,
-                retired: [const { None }; RETIRED],
-                events: VecDeque::with_capacity(EVENTS),
-                active: None,
-                closing: None,
-                live_spools: 0,
-                retirement_errors: Vec::new(),
-                results_session: None,
-            }),
-            space: Condvar::new(),
-            stopped: AtomicBool::new(false),
-            retirement_due: AtomicBool::new(false),
-            coordinator: OnceLock::new(),
-            retry_wake: AtomicBool::new(false),
-        });
+        let shared = Arc::new(Shared::new());
         let worker = shared.clone();
         let thread = thread::Builder::new().name("kwil-search".into()).spawn(move || {
             let _ = worker.coordinator.set(thread::current());
@@ -329,7 +373,7 @@ impl SearchWorker {
                     let mut state = worker.state.lock().unwrap();
                     if state.pending.is_none()
                         && state.retired.iter().all(Option::is_none)
-                        && state.closing.is_none()
+                        && state.closing.iter().all(Option::is_none)
                         && !worker.stopped.load(Ordering::Acquire)
                     {
                         drop(state);
@@ -345,7 +389,7 @@ impl SearchWorker {
                     (
                         job,
                         std::mem::replace(&mut state.retired, [const { None }; RETIRED]),
-                        state.closing.take(),
+                        std::mem::take(&mut state.closing),
                         stopped,
                     )
                 };
@@ -360,6 +404,7 @@ impl SearchWorker {
                         state.live_spools = spools.live();
                         state.retirement_errors = spools.diagnostics().to_vec();
                     }
+                    wake();
                     if spools.live() == 0 {
                         break;
                     }
@@ -379,6 +424,9 @@ impl SearchWorker {
                 } else {
                     match &job.request.task {
                         SearchTask::Document(request) => run_document(key, request, &job.cancel, &emit, &mut spools),
+                        SearchTask::SeedSelectionOrWord(request) => run_seed(request, &job.cancel).map(|seed| {
+                            emit(SearchUpdate::Seed(seed));
+                        }),
                         SearchTask::Files(request) => run_files(key, request, &job.cancel, &emit, &mut spools),
                         SearchTask::FilePage { results, page } => results.read_page(*page, &job.cancel).map(|rows| {
                             emit(SearchUpdate::Files { first: page.first, rows, results: Some(results.clone()) });
@@ -436,7 +484,7 @@ impl SearchWorker {
         state.events.clear();
         match &request.task {
             SearchTask::Files(_) => state.results_session = Some(request.key),
-            SearchTask::Document(_) => state.results_session = None,
+            SearchTask::Document(_) | SearchTask::SeedSelectionOrWord(_) => state.results_session = None,
             SearchTask::FilePage { .. } => {}
         }
         state.pending = Some(Job { request, cancel: Arc::new(AtomicBool::new(false)) });
@@ -460,7 +508,13 @@ impl SearchWorker {
         self.shared.notify();
     }
     pub fn take_event(&self) -> Option<SearchEvent> {
-        let event = self.shared.state.try_lock().ok()?.events.pop_front();
+        let Ok(mut state) = self.shared.state.try_lock() else {
+            self.shared.retry_wake.store(true, Ordering::Release);
+            self.shared.notify();
+            return None;
+        };
+        let event = state.events.pop_front();
+        drop(state);
         self.shared.space.notify_one();
         event
     }
@@ -489,10 +543,17 @@ impl SearchWorker {
     /// Reserved shutdown slot for the host's one rejected request. Call once
     /// while the worker is live; shutdown never disposes that source on input.
     pub fn close_with(&self, rejected: Option<SearchRequest>) {
+        self.close_with_requests(rejected, None);
+    }
+    /// The host's internal retry and ONE panel-owned request have independent
+    /// reserved slots. No rejected source is destroyed on the input thread.
+    pub fn close_with_requests(&self, internal: Option<SearchRequest>, external: Option<SearchRequest>) {
         let mut state = self.shared.state.lock().unwrap();
-        assert!(state.closing.is_none() || rejected.is_none(), "duplicate search close request");
-        if rejected.is_some() {
-            state.closing = rejected;
+        for (slot, request) in state.closing.iter_mut().zip([internal, external]) {
+            assert!(slot.is_none() || request.is_none(), "duplicate search close request");
+            if request.is_some() {
+                *slot = request;
+            }
         }
         self.shared.stopped.store(true, Ordering::Release);
         if let Some(cancel) = &state.active {
@@ -528,6 +589,18 @@ impl Drop for SearchWorker {
 
 fn validate(request: &SearchRequest) -> Result<(), &'static str> {
     match &request.task {
+        SearchTask::SeedSelectionOrWord(seed) => {
+            if seed.cursors.is_empty() || seed.cursors.len() > REPLACE_EDITS || seed.primary >= seed.cursors.len() {
+                return Err("seed cursor metadata exceeds cap or has no primary");
+            }
+            if seed
+                .cursors
+                .iter()
+                .any(|cursor| cursor.anchor > seed.snapshot.len() || cursor.head > seed.snapshot.len())
+            {
+                return Err("seed cursor outside snapshot");
+            }
+        }
         SearchTask::Document(doc) => {
             if doc.query.expression.len() > INPUT_BYTES
                 || doc.page.len == 0
@@ -567,20 +640,377 @@ fn validate(request: &SearchRequest) -> Result<(), &'static str> {
     Ok(())
 }
 fn publish(shared: &Shared, cancel: &Cancellation, event: SearchEvent, wake: &impl Fn()) -> bool {
-    let mut state = shared.state.lock().unwrap();
-    while state.events.len() == EVENTS && !cancel.load(Ordering::Acquire) && !shared.stopped.load(Ordering::Acquire) {
-        state = shared.space.wait(state).unwrap();
+    publish_with_gate(shared, cancel, event, wake, &|| {})
+}
+fn publish_with_gate(
+    shared: &Shared,
+    cancel: &Cancellation,
+    event: SearchEvent,
+    wake: &impl Fn(),
+    before_full_wait: &impl Fn(),
+) -> bool {
+    loop {
+        let mut state = shared.state.lock().unwrap();
+        if cancel.load(Ordering::Acquire) || shared.stopped.load(Ordering::Acquire) {
+            cancel.store(true, Ordering::Release);
+            return false;
+        }
+        if state.events.len() < EVENTS {
+            state.events.push_back(event);
+            drop(state);
+            // Never invoke the host callback under the mailbox lock.
+            wake();
+            return true;
+        }
+        shared.space.register();
+        before_full_wait();
+        drop(state);
+        // A contended drain can consume the last host notification while the
+        // fifth result is pending. Service its retry HERE, before this job can
+        // return; the outer coordinator loop cannot make progress yet.
+        if shared.retry_wake.swap(false, Ordering::AcqRel) {
+            wake();
+        }
+        thread::park();
     }
-    if cancel.load(Ordering::Acquire) || shared.stopped.load(Ordering::Acquire) {
-        cancel.store(true, Ordering::Release);
-        return false;
+}
+
+fn seed_error(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+fn seed_cancel(cancel: &Cancellation) -> io::Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "search seed cancelled"))
+    } else {
+        Ok(())
     }
-    state.events.push_back(event);
-    drop(state);
-    // Always notify after unlocking: a host try_lock may have raced this push
-    // while an older notification was already being handled.
-    wake();
-    true
+}
+const SEED_WORK_BYTES: usize = 4 * INPUT_BYTES;
+struct SeedBudget {
+    bytes_left: usize,
+    steps_left: usize,
+}
+impl SeedBudget {
+    fn new() -> Self {
+        Self { bytes_left: SEED_WORK_BYTES, steps_left: 4 * INPUT_BYTES }
+    }
+    fn charge(&mut self, bytes: usize) -> io::Result<()> {
+        self.require(bytes)?;
+        self.bytes_left -= bytes;
+        Ok(())
+    }
+    fn require(&self, bytes: usize) -> io::Result<()> {
+        if bytes > self.bytes_left {
+            return Err(seed_error("seed cursors exceed aggregate source/validation/copy budget"));
+        }
+        Ok(())
+    }
+    fn step(&mut self) -> io::Result<()> {
+        if self.steps_left == 0 {
+            return Err(seed_error("seed cursors exceed bounded scalar budget"));
+        }
+        self.steps_left -= 1;
+        Ok(())
+    }
+}
+// One reusable bounded window. Growth and sliding never admit a larger word;
+// irrelevant prefetch is discarded instead of consuming the word's byte cap.
+struct SeedReader<'a, 'b> {
+    snapshot: &'a Snapshot,
+    cancel: &'a Cancellation,
+    budget: &'b mut SeedBudget,
+    bytes: Vec<u8>,
+    start: u64,
+}
+impl<'a, 'b> SeedReader<'a, 'b> {
+    fn new(snapshot: &'a Snapshot, cancel: &'a Cancellation, budget: &'b mut SeedBudget) -> Self {
+        Self { snapshot, cancel, budget, bytes: Vec::with_capacity(INPUT_BYTES + 8), start: 0 }
+    }
+    fn trim(&mut self, range: Range<u64>) {
+        let start = range.start.max(self.start);
+        let end = range.end.min(self.start + self.bytes.len() as u64).max(start);
+        let first = (start - self.start) as usize;
+        let len = (end - start) as usize;
+        self.bytes.copy_within(first..first + len, 0);
+        self.bytes.truncate(len);
+        self.start = start;
+    }
+    fn ensure(&mut self, range: Range<u64>) -> io::Result<()> {
+        seed_cancel(self.cancel)?;
+        if range.start > range.end || range.end > self.snapshot.len() {
+            return Err(seed_error("seed endpoint outside snapshot"));
+        }
+        let old_end = self.start + self.bytes.len() as u64;
+        if !self.bytes.is_empty() && self.start <= range.start && range.end <= old_end {
+            return Ok(());
+        }
+        if self.bytes.is_empty()
+            || range.start > old_end.saturating_add(256)
+            || range.end.saturating_add(256) < self.start
+        {
+            self.bytes.clear();
+            self.start = range.start;
+        }
+        let cap = (INPUT_BYTES + 8) as u64;
+        let old_end = self.start + self.bytes.len() as u64;
+        // A lookup can move in either direction (lookbehind, another cursor).
+        // Trim a useful block so scalar probes cannot slide/copy a full window
+        // once per byte. Only the actually needed range must survive this move.
+        if old_end.max(range.end) - self.start.min(range.start) > cap {
+            if range.start < self.start {
+                self.trim(self.start..(range.start + cap / 2).max(self.start));
+            } else {
+                self.trim(range.end.saturating_sub(cap / 2).max(self.start)..old_end);
+            }
+        }
+        let old_end = self.start + self.bytes.len() as u64;
+        let growth = self.bytes.len().max(256) as u64;
+        let mut start = self.start.min(range.start);
+        let mut end = old_end.max(range.end);
+        if end - start > cap {
+            return Err(seed_error("seed word exceeds bounded text window"));
+        }
+        if range.start < self.start {
+            start = self.start.saturating_sub(growth).min(range.start).max(end.saturating_sub(cap));
+        }
+        if range.end > old_end {
+            end = old_end.saturating_add(growth).max(range.end).min(self.snapshot.len()).min(start + cap);
+        }
+        let prefix = (self.start - start) as usize;
+        let suffix = (end - old_end) as usize;
+        let added = prefix + suffix;
+        self.budget.charge(added)?;
+        let old_len = self.bytes.len();
+        self.bytes.resize((end - start) as usize, 0);
+        self.bytes.copy_within(0..old_len, prefix);
+        copy_seed_bytes(self.snapshot, start..self.start, &mut self.bytes[..prefix], self.cancel)?;
+        copy_seed_bytes(self.snapshot, old_end..end, &mut self.bytes[prefix + old_len..], self.cancel)?;
+        self.start = start;
+        Ok(())
+    }
+    fn byte(&mut self, at: u64) -> io::Result<u8> {
+        self.ensure(at..at + 1)?;
+        Ok(self.bytes[(at - self.start) as usize])
+    }
+    fn character(&mut self, at: u64) -> io::Result<(char, u64)> {
+        seed_cancel(self.cancel)?;
+        self.budget.step()?;
+        let width = match self.byte(at)? {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return Err(seed_error("seed touches opaque or invalid UTF-8")),
+        };
+        self.ensure(at..at + width)?;
+        let first = (at - self.start) as usize;
+        let text = std::str::from_utf8(&self.bytes[first..first + width as usize])
+            .map_err(|_| seed_error("seed touches opaque or invalid UTF-8"))?;
+        Ok((text.chars().next().unwrap(), at + width))
+    }
+    fn previous(&mut self, at: u64) -> io::Result<u64> {
+        let mut start = at.checked_sub(1).ok_or_else(|| seed_error("seed has no previous scalar"))?;
+        for _ in 0..3 {
+            if self.byte(start)? & 0xc0 != 0x80 {
+                break;
+            }
+            start = start.checked_sub(1).ok_or_else(|| seed_error("seed splits UTF-8 scalar"))?;
+        }
+        let (c, end) = self.character(start)?;
+        if end != at {
+            return Err(seed_error("seed splits UTF-8 scalar"));
+        }
+        if c == '\n' && start > 0 && self.byte(start - 1)? == b'\r' {
+            start -= 1;
+        }
+        Ok(start)
+    }
+    fn word(&mut self, at: u64, capture: bool) -> io::Result<(Range<u64>, Option<String>)> {
+        let at = if at == self.snapshot.len() { self.previous(at)? } else { at };
+        let initial = seed_class(self.character(at)?.0);
+        let mut start = at;
+        while start > 0 {
+            let previous = self.previous(start)?;
+            if seed_class(self.character(previous)?.0) != initial {
+                break;
+            }
+            start = previous;
+            if at - start > INPUT_BYTES as u64 {
+                return Err(seed_error("seed word exceeds input cap"));
+            }
+        }
+        // Lookbehind may have prefetched an unrelated delimiter prefix. It
+        // must not reduce the admissible complete-word window.
+        self.trim(start..self.start + self.bytes.len() as u64);
+        let mut text = capture.then(|| String::with_capacity(INPUT_BYTES));
+        let mut end = start;
+        while end < self.snapshot.len() {
+            let (c, next) = self.character(end)?;
+            if seed_class(c) != initial {
+                break;
+            }
+            let crlf = c == '\r' && next < self.snapshot.len() && self.byte(next)? == b'\n';
+            end = if crlf { next + 1 } else { next };
+            if end - start > INPUT_BYTES as u64 {
+                return Err(seed_error("seed word exceeds input cap"));
+            }
+            if let Some(text) = &mut text {
+                self.budget.charge(c.len_utf8() + usize::from(crlf))?;
+                text.push(c);
+                if crlf {
+                    text.push('\n');
+                }
+            }
+        }
+        Ok((start..end, text))
+    }
+}
+fn copy_seed_bytes(snapshot: &Snapshot, range: Range<u64>, into: &mut [u8], cancel: &Cancellation) -> io::Result<()> {
+    let mut offset = 0;
+    for chunk in snapshot.chunks(range)? {
+        seed_cancel(cancel)?;
+        let chunk = chunk.map_err(io::Error::other)?;
+        into[offset..offset + chunk.len()].copy_from_slice(chunk);
+        offset += chunk.len();
+    }
+    Ok(())
+}
+// Kept in step with Editor's word classes; this worker version is strict about
+// invalid text and refuses incomplete capped words instead of truncating them.
+fn seed_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if c.is_alphanumeric()
+        || c == '_'
+        || matches!(c as u32, 0x300..=0x36f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0xfe20..=0xfe2f)
+    {
+        1
+    } else {
+        2
+    }
+}
+fn visit_seed_sources(
+    request: &SeedRequest,
+    range: Range<u64>,
+    cancel: &Cancellation,
+    budget: &mut SeedBudget,
+    mut output: Option<&mut Vec<u8>>,
+) -> io::Result<()> {
+    use kwil_core_text::SourceChunk;
+    if range.start > range.end || range.end > request.snapshot.len() || range.end - range.start > INPUT_BYTES as u64 {
+        return Err(seed_error("seed selection outside snapshot or exceeds input cap"));
+    }
+    // SourceChunks can classify a detached run before yielding it: one initial
+    // peek, one delimiter lookahead and two u32 raw-offset table entries. Admit
+    // the remaining clipped extent + that bounded overhead BEFORE next(), then
+    // debit the returned run. The source copy and UTF-8 validation are separate
+    // visits, never hidden inside that classification reservation.
+    const CLASSIFY_OVERHEAD: usize = 2 + 2 * std::mem::size_of::<u32>();
+    let mut remaining = (range.end - range.start) as usize;
+    let mut chunks = request.snapshot.source_chunks(range)?;
+    while remaining != 0 {
+        seed_cancel(cancel)?;
+        budget.require(remaining + CLASSIFY_OVERHEAD)?;
+        let chunk = chunks
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "seed source range ended early"))?
+            .map_err(io::Error::other)?;
+        let len = match &chunk {
+            SourceChunk::Added(bytes)
+            | SourceChunk::Original { bytes, .. }
+            | SourceChunk::Decoded { bytes, .. }
+            | SourceChunk::Opaque { bytes, .. } => bytes.len(),
+        };
+        if len == 0 || len > remaining {
+            return Err(seed_error("seed source range contract violated"));
+        }
+        budget.charge(len + CLASSIFY_OVERHEAD)?;
+        remaining -= len;
+        let text = match chunk {
+            SourceChunk::Added(bytes) => bytes,
+            SourceChunk::Original { bytes, .. } if request.allow_raw_utf8 => bytes,
+            SourceChunk::Original { .. } => {
+                return Err(seed_error("seed raw origin has no verified UTF-8 interpretation"));
+            }
+            SourceChunk::Opaque { .. } => return Err(seed_error("seed contains an opaque atom")),
+            SourceChunk::Decoded { origin, range, bytes } => {
+                origin
+                    .raw_range_admitted(range, cancel, |bytes| budget.charge(bytes))
+                    .map_err(kwil_core_text::decoded_backing::BackingError::into_io_error)?;
+                bytes
+            }
+        };
+        if let Some(output) = &mut output {
+            budget.charge(text.len())?;
+            output.extend_from_slice(text);
+        }
+    }
+    Ok(())
+}
+fn seed_text(
+    request: &SeedRequest,
+    range: Range<u64>,
+    cancel: &Cancellation,
+    budget: &mut SeedBudget,
+) -> io::Result<String> {
+    let len = range
+        .end
+        .checked_sub(range.start)
+        .filter(|len| *len <= INPUT_BYTES as u64)
+        .ok_or_else(|| seed_error("seed selection outside snapshot or exceeds input cap"))? as usize;
+    let mut bytes = Vec::with_capacity(len);
+    visit_seed_sources(request, range, cancel, budget, Some(&mut bytes))?;
+    budget.charge(len)?; // full validation of explicit selections, not just words
+    String::from_utf8(bytes).map_err(|_| seed_error("seed selection splits or contains invalid UTF-8"))
+}
+fn run_seed(request: &SeedRequest, cancel: &Cancellation) -> io::Result<Option<SeedResult>> {
+    run_seed_with_budget(request, cancel, &mut SeedBudget::new())
+}
+fn run_seed_with_budget(
+    request: &SeedRequest,
+    cancel: &Cancellation,
+    budget: &mut SeedBudget,
+) -> io::Result<Option<SeedResult>> {
+    seed_cancel(cancel)?;
+    let primary = request.cursors.get(request.primary).ok_or_else(|| seed_error("seed has no primary cursor"))?;
+    if request.snapshot.is_empty() {
+        return Ok(None);
+    }
+    let from_selection = primary.anchor != primary.head;
+    let mut cursors = request.cursors.clone();
+    let text = if from_selection {
+        seed_text(request, primary.anchor.min(primary.head)..primary.anchor.max(primary.head), cancel, budget)?
+    } else {
+        let mut reader = SeedReader::new(&request.snapshot, cancel, budget);
+        // Capture primary first, once. Other cursors need validated endpoints,
+        // not independent copies of the same seed text.
+        let (range, text) = reader.word(primary.head, true)?;
+        visit_seed_sources(request, range.clone(), cancel, reader.budget, None)?;
+        cursors[request.primary] = SeedCursor { anchor: range.start, head: range.end };
+        let mut validated = vec![range]; // <= cursor cap, no per-character index
+        for (index, cursor) in cursors.iter_mut().enumerate() {
+            if index == request.primary {
+                continue;
+            }
+            let at = if cursor.head == request.snapshot.len() { reader.previous(cursor.head)? } else { cursor.head };
+            let range = if let Some(range) = validated.iter().find(|range| range.contains(&at)) {
+                // A cursor within a known word may still split a UTF-8 scalar.
+                reader.character(at)?;
+                range.clone()
+            } else {
+                let (range, _) = reader.word(cursor.head, false)?;
+                visit_seed_sources(request, range.clone(), cancel, reader.budget, None)?;
+                validated.push(range.clone());
+                range
+            };
+            *cursor = SeedCursor { anchor: range.start, head: range.end };
+        }
+        text.unwrap()
+    };
+    let primary = cursors[request.primary];
+    let range = primary.anchor.min(primary.head)..primary.anchor.max(primary.head);
+    seed_cancel(cancel)?;
+    Ok(Some(SeedResult { text, range, cursors, primary: request.primary, from_selection }))
 }
 
 fn normalize_ranges(ranges: &[Range<u64>], len: u64) -> io::Result<Vec<Range<u64>>> {
@@ -626,12 +1056,12 @@ fn run_document(
     let mut plan_error = None;
     let mut scan_error = None;
     let mut page_sent = false;
-    for range in ranges {
+    for range in &ranges {
         let prior_count = count;
         let summary = search_default(
             &request.snapshot,
             &pattern,
-            range,
+            range.clone(),
             SearchMode::Hits,
             cancel,
             |hit| {
@@ -723,10 +1153,7 @@ fn run_document(
     } else if let Some(replacement) = &request.replacement {
         let ReplaceTarget::Matches(matches) = &replacement.target else { unreachable!() };
         if matches.iter().any(|m| {
-            !request
-                .ranges
-                .iter()
-                .any(|r| m.offset >= r.start && m.offset.checked_add(m.len).is_some_and(|end| end <= r.end))
+            !ranges.iter().any(|r| m.offset >= r.start && m.offset.checked_add(m.len).is_some_and(|end| end <= r.end))
         }) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "replacement match outside search selection"));
         }
@@ -839,6 +1266,407 @@ fn run_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn seed_request(text: &[u8], cursors: Vec<SeedCursor>, primary: usize) -> SeedRequest {
+        let mut buffer = kwil_core_text::Buffer::empty();
+        buffer.insert(0, text).unwrap();
+        SeedRequest { snapshot: buffer.snapshot(), cursors, primary, allow_raw_utf8: false }
+    }
+    fn caret(at: u64) -> SeedCursor {
+        SeedCursor { anchor: at, head: at }
+    }
+    #[test]
+    fn seed_selection_is_literal_and_preserves_other_cursors() {
+        let cursors = vec![SeedCursor { anchor: 6, head: 0 }, caret(7)];
+        let request = seed_request("Ä.*\n x".as_bytes(), cursors.clone(), 0);
+        let seed = run_seed(&request, &Arc::new(AtomicBool::new(false))).unwrap().unwrap();
+        assert_eq!(seed.text, "Ä.*\n ");
+        assert_eq!(seed.range, 0..6);
+        assert_eq!(seed.cursors, cursors);
+        assert!(seed.from_selection);
+    }
+    #[test]
+    fn seed_words_preserve_classes_multicursors_and_previous_word_at_eof() {
+        let request = seed_request("e\u{301} foo_bar !!".as_bytes(), vec![caret(0), caret(8), caret(14)], 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seed = run_seed(&request, &cancel).unwrap().unwrap();
+        assert_eq!(seed.text, "foo_bar");
+        assert_eq!(
+            seed.cursors,
+            [
+                SeedCursor { anchor: 0, head: 3 },
+                SeedCursor { anchor: 4, head: 11 },
+                SeedCursor { anchor: 12, head: 14 }
+            ]
+        );
+        assert_eq!(seed.primary, 1);
+        assert!(!seed.from_selection);
+        let eof = run_seed(&seed_request(b"word", vec![caret(4)], 0), &cancel).unwrap().unwrap();
+        assert_eq!((eof.text.as_str(), eof.range), ("word", 0..4));
+        assert!(run_seed(&seed_request(b"", vec![caret(0)], 0), &cancel).unwrap().is_none());
+        let nul = run_seed(&seed_request(b"word\0", vec![caret(5)], 0), &cancel).unwrap().unwrap();
+        assert_eq!((nul.text.as_bytes(), nul.range), (b"\0".as_slice(), 4..5));
+        let whitespace = run_seed(&seed_request(b"word\r\n ", vec![caret(7)], 0), &cancel).unwrap().unwrap();
+        assert_eq!((whitespace.text.as_str(), whitespace.range), ("\r\n ", 4..7));
+    }
+    #[test]
+    fn seed_caps_invalid_endpoints_and_cancel_refuse_partial_output() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let exact = vec![b'x'; INPUT_BYTES];
+        let seed = run_seed(&seed_request(&exact, vec![caret(INPUT_BYTES as u64)], 0), &cancel).unwrap().unwrap();
+        assert_eq!(seed.text.len(), INPUT_BYTES);
+        assert_eq!(seed.range, 0..INPUT_BYTES as u64);
+        let oversized = vec![b'x'; INPUT_BYTES + 1];
+        assert!(run_seed(&seed_request(&oversized, vec![caret(0)], 0), &cancel).is_err());
+        assert!(run_seed(&seed_request(b"a\xffb", vec![SeedCursor { anchor: 0, head: 3 }], 0), &cancel).is_err());
+        assert!(run_seed(&seed_request("é".as_bytes(), vec![SeedCursor { anchor: 0, head: 1 }], 0), &cancel).is_err());
+        assert!(run_seed(&seed_request("é".as_bytes(), vec![caret(1)], 0), &cancel).is_err());
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            run_seed(&seed_request(b"word", vec![caret(0)], 0), &cancel).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+    #[test]
+    fn seed_exact_64k_word_slides_past_lookbehind_and_multibyte_delimiters() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ascii = format!("{}{} ", " ".repeat(256), "x".repeat(INPUT_BYTES));
+        for at in [256, 256 + (INPUT_BYTES / 2) as u64, 256 + INPUT_BYTES as u64 - 1] {
+            let seed = run_seed(&seed_request(ascii.as_bytes(), vec![caret(at)], 0), &cancel).unwrap().unwrap();
+            assert_eq!(seed.range, 256..256 + INPUT_BYTES as u64);
+            assert_eq!(seed.text, "x".repeat(INPUT_BYTES));
+        }
+        let prefix = "\u{2003}".repeat(86); //258 bytes, multibyte lookbehind
+        let word = "\u{10400}".repeat(INPUT_BYTES / 4);
+        let text = format!("{prefix}{word}\u{2003}");
+        let start = prefix.len() as u64;
+        for at in [start, start + (INPUT_BYTES / 2) as u64] {
+            let seed = run_seed(&seed_request(text.as_bytes(), vec![caret(at)], 0), &cancel).unwrap().unwrap();
+            assert_eq!(seed.range, start..start + INPUT_BYTES as u64);
+            assert_eq!(seed.text, word);
+        }
+        let eof = format!("{prefix}{word}");
+        let seed = run_seed(&seed_request(eof.as_bytes(), vec![caret(eof.len() as u64)], 0), &cancel).unwrap().unwrap();
+        assert_eq!((seed.range, seed.text), (start..eof.len() as u64, word));
+    }
+    #[test]
+    fn seed_fifteen_astral_carets_share_one_word_without_primary_recopy() {
+        let text = "\u{10400}".repeat(16384);
+        assert_eq!(text.len(), INPUT_BYTES);
+        let request = seed_request(text.as_bytes(), (0..15).map(|i| caret(i * 4)).collect(), 14);
+        let mut budget = SeedBudget::new();
+        let seed = run_seed_with_budget(&request, &Arc::new(AtomicBool::new(false)), &mut budget).unwrap().unwrap();
+        assert_eq!(seed.text, text);
+        assert_eq!(seed.primary, 14);
+        assert_eq!(seed.cursors, vec![SeedCursor { anchor: 0, head: INPUT_BYTES as u64 }; 15]);
+        assert!(budget.bytes_left > 0, "all visits and primary copy must fit the shared256KiB budget");
+        // Reusing a word must never bless a cursor in a scalar's interior.
+        let invalid = seed_request(text.as_bytes(), vec![caret(0), caret(1)], 0);
+        assert!(run_seed(&invalid, &Arc::new(AtomicBool::new(false))).is_err());
+    }
+    #[test]
+    fn seed_selection_and_distinct_words_charge_the_same_admission_budget() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let text = "\u{10400}".repeat(INPUT_BYTES / 4);
+        let request = seed_request(text.as_bytes(), vec![SeedCursor { anchor: 0, head: INPUT_BYTES as u64 }], 0);
+        let mut insufficient = SeedBudget { bytes_left: 3 * INPUT_BYTES + 9, steps_left: 4 * INPUT_BYTES };
+        let error = run_seed_with_budget(&request, &cancel, &mut insufficient).unwrap_err();
+        assert!(error.to_string().contains("aggregate source/validation/copy budget"));
+        let mut exact = SeedBudget { bytes_left: 3 * INPUT_BYTES + 10, steps_left: 4 * INPUT_BYTES };
+        assert_eq!(run_seed_with_budget(&request, &cancel, &mut exact).unwrap().unwrap().text, text);
+        assert_eq!(exact.bytes_left, 0);
+        let word = "x".repeat(INPUT_BYTES);
+        let text = format!("{word} {word} {word}");
+        let request = seed_request(
+            text.as_bytes(),
+            vec![caret(0), caret((INPUT_BYTES + 1) as u64), caret((2 * INPUT_BYTES + 2) as u64)],
+            0,
+        );
+        let error = run_seed(&request, &cancel).unwrap_err();
+        assert!(error.to_string().contains("aggregate source/validation/copy budget"));
+    }
+    #[test]
+    fn seed_decoded_alias_and_opaque_provenance_are_not_reinterpreted() {
+        use kwil_core_text::{
+            Buffer, TextFile,
+            decoded_backing::{DecodedBacking, Interpretation},
+            encoding::Encoding,
+        };
+        let parent = std::env::temp_dir().join(format!(
+            "kwil-search-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let owner = DecodedBacking::prepare_from_reader(
+            &mut b"\x88\x62!".as_slice(),
+            3,
+            Interpretation::new(Encoding::for_label("big5").unwrap(), 0).unwrap(),
+            &parent,
+            &cancel,
+        )
+        .unwrap();
+        let buffer = Buffer::from_decoded(owner.snapshot());
+        let mut request =
+            SeedRequest { snapshot: buffer.snapshot(), cursors: vec![caret(0)], primary: 0, allow_raw_utf8: false };
+        let alias = run_seed(&request, &cancel).unwrap().unwrap();
+        request.cursors = vec![SeedCursor { anchor: 0, head: 2 }];
+        let split_refused = run_seed(&request, &cancel).is_err();
+        drop(request);
+        drop(buffer);
+        owner.try_retire().map_err(|error| error.with_cause(io::Error::other("seed fixture retirement"))).unwrap();
+        let owner = DecodedBacking::prepare_from_reader(
+            &mut b"a\xffb".as_slice(),
+            3,
+            Interpretation::new(Encoding::UTF8, 0).unwrap(),
+            &parent,
+            &cancel,
+        )
+        .unwrap();
+        let buffer = Buffer::from_decoded(owner.snapshot());
+        let request = SeedRequest {
+            snapshot: buffer.snapshot(),
+            cursors: vec![SeedCursor { anchor: 0, head: 3 }],
+            primary: 0,
+            allow_raw_utf8: false,
+        };
+        let opaque_refused = run_seed(&request, &cancel).is_err();
+        drop(request);
+        drop(buffer);
+        owner.try_retire().map_err(|error| error.with_cause(io::Error::other("seed fixture retirement"))).unwrap();
+        let raw_path = parent.join("raw.txt");
+        std::fs::write(&raw_path, b"word").unwrap();
+        let file = TextFile::open(&raw_path).unwrap();
+        file.build_index(1).unwrap();
+        let buffer = Buffer::from_file(file.clone()).unwrap();
+        let mut request =
+            SeedRequest { snapshot: buffer.snapshot(), cursors: vec![caret(0)], primary: 0, allow_raw_utf8: false };
+        let untyped_refused = run_seed(&request, &cancel).is_err();
+        request.allow_raw_utf8 = true;
+        let verified = run_seed(&request, &cancel).unwrap().unwrap();
+        drop(request);
+        drop(buffer);
+        assert!(file.try_close().is_ok());
+        std::fs::remove_file(&raw_path).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        assert_eq!((alias.text.as_str(), alias.range), ("Ê\u{304}", 0..4));
+        assert!(split_refused && opaque_refused && untyped_refused);
+        assert_eq!(verified.text, "word");
+    }
+    #[test]
+    fn full_retirement_and_dual_shutdown_keep_sources_until_worker_last_drop() {
+        let parent = std::env::temp_dir().join(format!(
+            "kwil-search-close-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let paths = [parent.join("internal.txt"), parent.join("external.txt")];
+        let mut sources = Vec::new();
+        let mut requests = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            std::fs::write(path, b"source").unwrap();
+            let file = kwil_core_text::TextFile::open(path).unwrap();
+            file.build_index(1).unwrap();
+            let buffer = kwil_core_text::Buffer::from_file(file.clone()).unwrap();
+            let mut item = request(index as u64 + 2, b"source", "s");
+            let SearchTask::Document(doc) = &mut item.task else { unreachable!() };
+            doc.snapshot = buffer.snapshot();
+            drop(buffer);
+            requests.push(item);
+            sources.push(Some(file));
+        }
+        let sources = Arc::new(Mutex::new(sources));
+        fn try_close_sources(sources: &Mutex<Vec<Option<kwil_core_text::TextFile>>>) -> Vec<bool> {
+            sources
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .map(|slot| {
+                    let Some(file) = slot.take() else { return true };
+                    match file.try_close() {
+                        Ok(()) => true,
+                        Err(file) => {
+                            *slot = Some(file);
+                            false
+                        }
+                    }
+                })
+                .collect()
+        }
+        let observed = sources.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+        let first = AtomicBool::new(true);
+        let worker = SearchWorker::new(move || {
+            if first.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if try_close_sources(&observed).iter().all(|closed| *closed) {
+                let _ = retired_tx.send(thread::current().name().unwrap_or("").to_owned());
+            }
+        })
+        .unwrap();
+        worker.shared.state.lock().unwrap().pending =
+            Some(Job { request: request(1, b"seed", "s"), cancel: Arc::new(AtomicBool::new(false)) });
+        worker.shared.notify();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        {
+            let mut state = worker.shared.state.lock().unwrap();
+            for (index, slot) in state.retired.iter_mut().enumerate() {
+                *slot = Some(Job {
+                    request: request(index as u64 + 10, b"queued", "q"),
+                    cancel: Arc::new(AtomicBool::new(true)),
+                });
+            }
+        }
+        let external = worker.retire(requests.pop().unwrap()).unwrap_err();
+        let internal = requests.pop().unwrap();
+        worker.close_with_requests(Some(internal), Some(*external));
+        let retained_before_release = try_close_sources(&sources);
+        release_tx.send(()).unwrap();
+        let retired_on = retired_rx.recv_timeout(Duration::from_secs(5));
+        worker.shutdown().unwrap();
+        for path in &paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir(&parent).unwrap();
+        assert_eq!(retained_before_release, [false, false], "neither accepted closing source may drop on input");
+        assert_eq!(retired_on.unwrap(), "kwil-search", "last source pins and file handles retire on coordinator");
+    }
+    #[test]
+    fn contended_result_drain_rearms_one_explicit_worker_wake() {
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let first = AtomicBool::new(true);
+        let worker = SearchWorker::new(move || {
+            if first.swap(false, Ordering::AcqRel) {
+                wake_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        })
+        .unwrap();
+        let key = SearchKey { document_id: 7, revision: 2, generation: 9 };
+        let mut state = worker.shared.state.lock().unwrap();
+        state.events.push_back(SearchEvent { key, update: SearchUpdate::Failed("queued completion".into()) });
+        let contended = worker.take_event();
+        drop(state);
+        let woke = wake_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let event = worker.take_event(); // callback gate keeps coordinator outside mailbox.
+        let _ = release_tx.send(());
+        worker.shutdown().unwrap();
+        assert!(contended.is_none());
+        assert!(woke, "contended final completion must rearm the worker notification");
+        let event = event.expect("queued result remains drainable without a UI timer");
+        assert_eq!(event.key, key);
+        assert!(matches!(event.update, SearchUpdate::Failed(message) if message == "queued completion"));
+    }
+    #[test]
+    fn full_four_file_pages_fifth_publish_contention_retries_before_job_returns() {
+        // The sole producer IS the coordinator: no idle outer loop is allowed
+        // to service retry_wake on its behalf while the fifth publish blocks.
+        let shared = Arc::new(Shared::new());
+        let worker = SearchWorker { shared: shared.clone(), thread: None };
+        let key = SearchKey { document_id: 0, revision: 0, generation: 21 };
+        let page = |first| SearchEvent { key, update: SearchUpdate::Files { first, rows: Vec::new(), results: None } };
+        {
+            let mut state = shared.state.lock().unwrap();
+            for first in 0..EVENTS {
+                state.events.push_back(page(first as u64));
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let first_wait = AtomicBool::new(true);
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let producer_cancel = cancel.clone();
+        let producer_shared = shared.clone();
+        let producer = thread::spawn(move || {
+            let _ = producer_shared.coordinator.set(thread::current());
+            let accepted = publish_with_gate(
+                &producer_shared,
+                &producer_cancel,
+                SearchEvent { key, update: SearchUpdate::Files { first: 4, rows: Vec::new(), results: None } },
+                &|| {
+                    let _ = wake_tx.send(());
+                },
+                &|| {
+                    if first_wait.swap(false, Ordering::AcqRel) {
+                        entered_tx.send(()).unwrap();
+                        release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                },
+            );
+            done_tx.send(accepted).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let contended = worker.take_event(); // producer still owns the mailbox
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let retried = wake_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok();
+        let mut pages = Vec::new();
+        if retried {
+            while pages.len() < 5 {
+                if let Some(event) = worker.take_event() {
+                    if let SearchUpdate::Files { first, .. } = event.update {
+                        pages.push(first);
+                    }
+                } else if wake_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_err() {
+                    break;
+                }
+            }
+        }
+        // Always release the producer before asserting the negative control.
+        cancel.store(true, Ordering::Release);
+        shared.notify();
+        let completed = done_rx.recv_timeout(Duration::from_secs(5));
+        producer.join().unwrap();
+        assert!(contended.is_none());
+        assert!(retried, "full result queue must retry the lost drain before active job returns");
+        assert_eq!(pages, [0, 1, 2, 3, 4]);
+        assert!(completed.unwrap(), "fifth page must complete after the retried drain");
+    }
+    #[test]
+    fn explicit_replace_uses_the_same_overlap_union_as_matching() {
+        let mut request = request(1, b"abcdef", "bcde");
+        let SearchTask::Document(doc) = &mut request.task else { unreachable!() };
+        doc.ranges = vec![0..4, 2..6];
+        doc.replacement = Some(Replacement {
+            template: b"X".to_vec(),
+            target: ReplaceTarget::Matches(vec![Match { offset: 1, len: 4 }]),
+        });
+        let output = Mutex::new(Vec::new());
+        let emit = |event| {
+            output.lock().unwrap().push(event);
+            true
+        };
+        let mut spools = SpoolOwner::new(4096).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_document(request.key, doc, &cancel, &emit, &mut spools).unwrap();
+        let result = output
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event {
+                SearchUpdate::Document(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((result.count, result.hits), (1, vec![Match { offset: 1, len: 4 }]));
+        let recipe = result.replacement.unwrap();
+        assert_eq!(recipe.edits.iter().next().unwrap().unwrap(), Edit { offset: 1, len: 4, new_bytes: b"X".to_vec() });
+        // Touching selection boundaries are independent, never a combined region.
+        doc.ranges = vec![0..3, 3..6];
+        let error = run_document(request.key, doc, &cancel, &|_| true, &mut spools).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
     #[test]
     fn file_spool_revisits_first_native_page_after_ninety_rows() {
         #[cfg(windows)]
