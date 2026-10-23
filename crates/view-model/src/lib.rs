@@ -57,6 +57,8 @@ pub struct View {
     pending_goto: Option<(u64, u64, bool)>,
     first_byte_column: u64,
     line_byte_limit: usize,
+    // Worker-decoded read-only first block; never interpreted as edit bytes.
+    preview: Option<Vec<u8>>,
 }
 
 impl View {
@@ -79,10 +81,22 @@ impl View {
             pending_goto: None,
             first_byte_column: 0,
             line_byte_limit: 16 << 10,
+            preview: None,
         };
         if view.file.as_ref().is_some_and(|file| file.index().is_some()) {
             view.index_ready();
         }
+        view
+    }
+
+    /// Install a worker-rendered first block before full preparation/indexing.
+    /// Resizes and horizontal windows only touch this immutable bounded cache.
+    pub fn from_preview(path: PathBuf, file: TextFile, text: Vec<u8>) -> Self {
+        let mut view = Self::new(None);
+        view.editor = None;
+        view.path = Some(path);
+        view.file = Some(file);
+        view.preview = Some(text);
         view
     }
 
@@ -102,6 +116,9 @@ impl View {
     pub fn line_count(&self) -> Option<u64> {
         if let Some(editor) = &self.editor {
             return Some(editor.document().buffer().line_count());
+        }
+        if self.preview.is_some() {
+            return None;
         }
         self.file.as_ref()?.index().map(|i| i.line_count())
     }
@@ -142,6 +159,7 @@ impl View {
     pub fn index_ready(&mut self) -> Damage {
         let installing = self.editor.is_none();
         if self.editor.is_none()
+            && self.preview.is_none()
             && let (Some(path), Some(file)) = (&self.path, &self.file)
             && file.index().is_some()
         {
@@ -221,6 +239,7 @@ impl View {
 
     fn reload(&mut self) {
         if let Some(editor) = &self.editor {
+            self.preview = None;
             let snapshot = editor.document().snapshot();
             let result = (0..self.rows)
                 .take_while(|row| self.top + (*row as u64) < snapshot.line_count())
@@ -255,6 +274,25 @@ impl View {
             return;
         }
         self.line_sources.clear();
+        if let Some(preview) = &self.preview {
+            self.lines.clear();
+            self.line_offsets.clear();
+            let mut remaining = preview.as_slice();
+            for _ in 0..self.rows {
+                let end = remaining.iter().position(|b| matches!(b, b'\r' | b'\n')).unwrap_or(remaining.len());
+                let line = &remaining[..end];
+                let start = grid::boundary(line, self.first_byte_column.min(line.len() as u64) as usize);
+                let stop = grid::boundary(line, start.saturating_add(self.line_byte_limit).min(line.len()));
+                self.lines.push(line[start..stop].to_vec());
+                self.line_offsets.push(start as u64);
+                if end == remaining.len() {
+                    break;
+                }
+                let width = if remaining[end..].starts_with(b"\r\n") { 2 } else { 1 };
+                remaining = &remaining[end + width..];
+            }
+            return;
+        }
         let Some(file) = &self.file else {
             self.lines = vec![b"No file open. Usage: kwil <file>".to_vec()];
             return;
@@ -355,6 +393,30 @@ impl View {
 #[cfg(test)]
 mod viewer_tests {
     use super::*;
+
+    #[test]
+    fn decoded_preview_remains_read_only_and_resize_uses_cached_text() {
+        let original = view_with_lines("decoded-preview", 3);
+        let path = original.path.clone().unwrap();
+        let mut view = View::from_preview(path.clone(), original.file.clone().unwrap(), b"A\r\nB\rC\n\\xD8".to_vec());
+        drop(original);
+        view.index_ready();
+        assert!(view.editor().is_none(), "a ready raw index must not make the preview editable");
+        std::fs::remove_file(&path).unwrap();
+        view.set_rows(5);
+        assert_eq!(view.line(0), Some(&b"A"[..]));
+        assert_eq!(view.line(1), Some(&b"B"[..]));
+        assert_eq!(view.line(2), Some(&b"C"[..]));
+        assert_eq!(view.line(3), Some(&b"\\xD8"[..]));
+        assert!(view.line_source(0).is_none(), "presentation escapes have no logical editing coordinates");
+        assert!(view.line_count().is_none(), "raw file index must not supply decoded line metrics");
+        view.index_ready();
+        assert!(view.editor().is_none(), "raw index completion must never attach a UTF-8 editor to encoded bytes");
+        assert_eq!(view.line(0), Some(&b"A"[..]));
+        let parent = path.parent().unwrap().to_path_buf();
+        drop(view);
+        std::fs::remove_dir(parent).unwrap();
+    }
 
     fn view_with_lines(name: &str, n: usize) -> View {
         // One file per test: tests run in parallel and must not share it.

@@ -23,7 +23,10 @@
 use crate::encoding::{Encoding, EncodingError};
 use crate::{FileState, ReadError, TextFile};
 use encoding_rs::DecoderResult;
+#[path = "decoded_preview.rs"]
+mod preview;
 use memmap2::Mmap;
+pub use preview::{DecodedPreview, decode_preview};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;

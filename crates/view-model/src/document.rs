@@ -2,13 +2,27 @@
 //! belong on workers; the editor only mutates an already indexed buffer.
 
 use kwil_core_text::{Buffer, Snapshot, TextFile};
+use kwil_core_text::{
+    decoded_backing::DecodedSnapshot,
+    encoding::{Encoding, SavePlan},
+};
 use std::{io, path::PathBuf};
 
-/// Encoding integration seam for KW-10. No implicit decoding or lossy save.
+/// Output encoding is independent of the immutable origins held by pieces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DocumentEncoding {
     #[default]
     Utf8,
+    Encoded(Encoding),
+}
+
+impl DocumentEncoding {
+    pub fn encoding(self) -> Encoding {
+        match self {
+            Self::Utf8 => Encoding::UTF8,
+            Self::Encoded(encoding) => encoding,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -32,6 +46,7 @@ pub struct Document {
     pub(crate) original: Option<TextFile>,
     pub(crate) path: Option<PathBuf>,
     pub encoding: DocumentEncoding,
+    pub bom: bool,
     pub line_ending: DocumentLineEnding,
     pub(crate) revision: u64,
     pub(crate) saved_revision: u64,
@@ -51,6 +66,7 @@ impl Document {
             original: None,
             path: None,
             encoding: DocumentEncoding::Utf8,
+            bom: false,
             line_ending: DocumentLineEnding::Lf,
             revision: 0,
             saved_revision: 0,
@@ -68,6 +84,31 @@ impl Document {
 
     pub(crate) fn from_indexed_file(path: PathBuf, file: TextFile) -> io::Result<Self> {
         let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
+        Self::attach(path, file, buffer)
+    }
+
+    /// Worker entry point for a prepared lossless logical backing. The worker
+    /// retains its DecodedBacking owner until all snapshots have retired.
+    /// `file` remains the external raw destination identity, never edit bytes.
+    pub fn from_decoded_file(path: PathBuf, file: TextFile, origin: DecodedSnapshot) -> io::Result<Self> {
+        let interpretation = origin.interpretation();
+        let mut document = Self::attach(path, file, Buffer::from_decoded(origin))?;
+        document.encoding = if interpretation.encoding == Encoding::UTF8 {
+            DocumentEncoding::Utf8
+        } else {
+            DocumentEncoding::Encoded(interpretation.encoding)
+        };
+        document.bom = interpretation.bom_len != 0;
+        Ok(document)
+    }
+
+    /// Capture with the immutable save request. None preserves mixed endings;
+    /// the preferred Enter key ending is separate from a conversion request.
+    pub fn save_plan(&self) -> SavePlan {
+        SavePlan { encoding: self.encoding.encoding(), bom: self.bom, line_ending: None }
+    }
+
+    fn attach(path: PathBuf, file: TextFile, buffer: Buffer) -> io::Result<Self> {
         let mut ending = DocumentLineEnding::Lf;
         let snapshot = buffer.snapshot();
         let mut previous = 0;
@@ -120,5 +161,52 @@ impl Document {
     pub(crate) fn changed(&mut self) {
         self.revision = self.next_revision;
         self.next_revision += 1;
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use kwil_core_text::decoded_backing::{DecodedBacking, Interpretation};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[test]
+    fn decoded_document_edits_logical_utf8_and_preserves_utf16_output_policy() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "kwil-document-codec-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("source.txt");
+        let raw = b"\xff\xfeA\0\r\0\n\0";
+        std::fs::write(&path, raw).unwrap();
+        let file = TextFile::open(&path).unwrap();
+        let backing = DecodedBacking::prepare(
+            &file,
+            Interpretation::new(Encoding::UTF16_LE, 2).unwrap(),
+            &directory,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut document = Document::from_decoded_file(path.clone(), file, backing.snapshot()).unwrap();
+        assert_eq!(document.line_ending, DocumentLineEnding::CrLf);
+        assert_eq!(document.snapshot().len(), 3);
+        assert_eq!(document.encoding, DocumentEncoding::Encoded(Encoding::UTF16_LE));
+        assert!(document.bom);
+        assert_eq!(document.original.as_ref().unwrap().path(), path);
+        let plan = document.save_plan();
+        document.buffer.insert(1, b"x").unwrap();
+        let mut saved = Vec::new();
+        kwil_core_text::encoding::write_snapshot(&document.snapshot(), plan, &mut saved).unwrap();
+        assert_eq!(saved, b"\xff\xfeA\0x\0\r\0\n\0");
+        document.encoding = DocumentEncoding::Utf8;
+        document.bom = false;
+        assert_eq!(plan.encoding, Encoding::UTF16_LE, "captured request policy must not change");
+        assert_eq!(document.save_plan().line_ending, None, "preferred Enter ending must not normalize mixed text");
+        drop(document);
+        assert!(backing.try_retire().is_ok());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
