@@ -810,8 +810,16 @@ pub(super) fn draw(
             let target = Target::Category(category);
             let selected = source.category() == category && !hosted_open;
             desktop::nav_row(pixels, stride, rect, selected, hover == Some(target) && !editing, &c, &s);
-            let text = Rect { x: rect.x + s.pad, w: rect.w.saturating_sub(s.pad + s.gap), ..rect };
-            let title = category.map_or("All settings", Category::title);
+            let glyph=match category {
+                Some(Category::Editor|Category::Keymap)=>icons::Icon::Text,
+                Some(Category::Appearance)=>if theme.scheme()==kwil_core_commands::theme::Scheme::Dark {icons::Icon::Moon}else{icons::Icon::Sun},
+                Some(Category::Files)=>icons::Icon::File,Some(Category::Search)=>icons::Icon::Search,
+                Some(Category::Updates)=>icons::Icon::Down,Some(Category::Remote)=>icons::Icon::GoTo,
+                _=>icons::Icon::Settings,
+            };
+            icons::draw(pixels,stride,glyph,((rect.x+s.pad+m.dip(8.0)) as f32,(rect.y+rect.h/2) as f32),m.dip(16.0),if selected {c.fg}else{c.muted});
+            let text = Rect { x: rect.x + s.pad+m.dip(24.0), w: rect.w.saturating_sub(s.pad+s.gap+m.dip(24.0)), ..rect };
+            let title = if category==Some(Category::Appearance) {"Appearance"}else{category.map_or("All settings", Category::title)};
             desktop::label(pixels, stride, font, text, title, if selected { c.fg } else { c.muted });
             view.hits.push(rect, target);
             y += s.nav;

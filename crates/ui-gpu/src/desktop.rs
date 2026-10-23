@@ -453,38 +453,17 @@ pub(super) fn icon(
     bg: u32,
     s: &Sizes,
 ) {
-    let stroke = (s.focus as f32 * 0.65).max(1.0);
-    let (cx, cy) = center;
-    let h = size as f32 / 2.0;
-    let q = size as f32 / 4.0;
-    match kind {
-        Icon::Close => {
-            chrome::line(buf, stride, (cx - h, cy - h), (cx + h, cy + h), stroke, color);
-            chrome::line(buf, stride, (cx - h, cy + h), (cx + h, cy - h), stroke, color);
-        }
-        Icon::Back | Icon::Forward => {
-            let (tip, tail) = if kind == Icon::Back { (cx - q, cx + q) } else { (cx + q, cx - q) };
-            chrome::line(buf, stride, (tail, cy - h), (tip, cy), stroke, color);
-            chrome::line(buf, stride, (tip, cy), (tail, cy + h), stroke, color);
-        }
-        Icon::Up | Icon::Down => {
-            let (tip, tail) = if kind == Icon::Up { (cy - q, cy + q) } else { (cy + q, cy - q) };
-            chrome::line(buf, stride, (cx - h, tail), (cx, tip), stroke, color);
-            chrome::line(buf, stride, (cx, tip), (cx + h, tail), stroke, color);
-        }
-        Icon::Search => {
-            let r = h * 0.72;
-            let (ox, oy) = (cx - h * 0.18, cy - h * 0.18);
-            chrome::disc(buf, stride, (ox, oy), r, color);
-            chrome::disc(buf, stride, (ox, oy), (r - stroke).max(0.5), bg);
-            let d = r * std::f32::consts::FRAC_1_SQRT_2;
-            chrome::line(buf, stride, (ox + d, oy + d), (cx + h, cy + h), stroke, color);
-        }
-        Icon::Check => {
-            chrome::line(buf, stride, (cx - h, cy), (cx - q * 0.5, cy + h * 0.7), stroke * 1.2, color);
-            chrome::line(buf, stride, (cx - q * 0.5, cy + h * 0.7), (cx + h, cy - h * 0.7), stroke * 1.2, color);
-        }
-    }
+    let kind = match kind {
+        Icon::Close => icons::Icon::Close,
+        Icon::Back => icons::Icon::Back,
+        Icon::Forward => icons::Icon::Forward,
+        Icon::Up => icons::Icon::Up,
+        Icon::Down => icons::Icon::Down,
+        Icon::Search => icons::Icon::Search,
+        Icon::Check => icons::Icon::Check,
+    };
+    let _ = (bg, s); // SVG masks blend against the actual destination surface.
+    icons::draw(buf, stride, kind, center, size.saturating_mul(3)/2, color);
 }
 
 /// Square icon button (close, back, page arrows).

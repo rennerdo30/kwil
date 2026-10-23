@@ -66,6 +66,7 @@ pub(super) fn frame(
             Some(font) => font.measure(name, m.tab_max),
             None => name.chars().count() * m.dip(7.0),
         })
+        .map(|width| width + m.dip(22.0))
         .collect();
     let ids: Vec<_> = tabs.iter().map(|tab| tab.id).collect();
     let active = ids.iter().position(|id| *id == view.active_id());
@@ -123,7 +124,6 @@ pub(super) fn draw(
     };
     chrome::fill_clipped(pixels, stride, edge, chrome::mix(strip_bg, border, 0xa0));
     let mut font = font;
-    let stroke = (1.25 * m.scale as f32).max(1.0);
     for (index, (slot, title)) in g.slots.iter().zip(&frame.titles).enumerate() {
         let area = rect(slot.area);
         let hovered = matches!(frame.hover, Hover::Tab(i) | Hover::Close(i) if i == index);
@@ -193,7 +193,17 @@ pub(super) fn draw(
         }
         let close = slot.close;
         if let Some(font) = font.as_deref_mut() {
-            let left = area.x + m.pad;
+            let icon =
+                if title.to_ascii_lowercase().ends_with(".md") { icons::Icon::Markdown } else { icons::Icon::File };
+            icons::draw(
+                pixels,
+                stride,
+                icon,
+                ((area.x + m.pad + m.dip(8.0)) as f32, (area.y + area.h / 2) as f32),
+                m.dip(16.0),
+                text_fg,
+            );
+            let left = area.x + m.pad + m.dip(22.0);
             let room = close.x.saturating_sub(left + m.dip(4.0));
             let label = font.fit(title, room);
             let baseline = font.baseline(area.y, area.h);
@@ -208,7 +218,14 @@ pub(super) fn draw(
                 chrome::round_rect(pixels, stride, rect(close), m.radius, chrome::mix(bg, fg, 0x34));
             }
             let mark = if slot.active || hovered { text_fg } else { chrome::mix(strip_bg, fg, 0x78) };
-            chrome::cross(pixels, stride, close, m.glyph, stroke, mark);
+            icons::draw(
+                pixels,
+                stride,
+                icons::Icon::Close,
+                ((close.x + close.width / 2) as f32, (close.y + close.height / 2) as f32),
+                m.dip(16.0),
+                mark,
+            );
         }
     }
     for (area, enabled, left, hover) in
@@ -235,7 +252,14 @@ pub(super) fn draw(
             );
         }
         let mark = if enabled { fg } else { chrome::mix(strip_bg, fg, 0x50) };
-        chrome::chevron(pixels, stride, area, m.glyph, left, stroke, mark);
+        icons::draw(
+            pixels,
+            stride,
+            if left { icons::Icon::Back } else { icons::Icon::Forward },
+            ((area.x + area.width / 2) as f32, (area.y + area.height / 2) as f32),
+            m.dip(16.0),
+            mark,
+        );
     }
 }
 

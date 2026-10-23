@@ -39,6 +39,7 @@ pub(crate) struct Native {
     target: *mut Target,
     session: bool,
     subclass: bool,
+    tips: super::tooltips_windows::Tips,
 }
 struct State {
     send: SendEvent,
@@ -76,7 +77,14 @@ impl Native {
             "kwil-native subclass={subclass} session_notifications={session} ole={ole} drop_target={}",
             !target.is_null()
         );
-        Self { hwnd, state, ole, target, session, subclass }
+        Self { hwnd, state, ole, target, session, subclass, tips: Default::default() }
+    }
+    pub fn toolbar_tooltips(
+        &mut self,
+        tools: &[super::super::menu::Tool],
+        labels: &std::collections::HashMap<&'static str, String>,
+    ) {
+        self.tips.update(self.hwnd, tools, labels);
     }
     pub fn user_placed(&self) -> bool {
         self.state.user_placed.load(Ordering::Acquire)

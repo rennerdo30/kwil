@@ -3,6 +3,8 @@
 #[cfg(windows)]
 pub(crate) mod file_dialog_windows;
 #[cfg(windows)]
+mod tooltips_windows;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub(crate) use windows::*;
@@ -16,6 +18,12 @@ pub(crate) struct Native;
 impl Native {
     pub fn register(_hwnd: isize, _send: impl Fn(super::UserEvent) + Send + Sync + 'static) -> Self {
         Self
+    }
+    pub fn toolbar_tooltips(
+        &mut self,
+        _tools: &[super::menu::Tool],
+        _labels: &std::collections::HashMap<&'static str, String>,
+    ) {
     }
     pub fn user_placed(&self) -> bool {
         false

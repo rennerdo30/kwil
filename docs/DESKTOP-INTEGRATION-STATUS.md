@@ -28,7 +28,7 @@ Actual Shell dialog appearance, overwrite UI, and native dirty-close button inte
 - Verified placement: three focused geometry/parser/file-replacement tests, strict GUI lib/tests Clippy, a two-process hidden native exact-bounds save/restart check, and a native owned-Welcome work-area assertion. Real OS maximize/restore and display hot-plug remain owner/platform checks.
 - Actual onscreen GPU presentation. The existing GPU path maintains a backing texture; CPU still presents. Renderer CLI/settings selection is preparation, not GPU completion.
 - Markdown Text/Preview/Split host integration.
-- Repository SVG icon system throughout the editor.
+- SVG icons are now integrated: repository-owned vector assets compile to cached DPI masks, with real command buttons, tab/file icons, settings-category icons and field/navigation controls. Windows command buttons have native tooltip labels with effective keymap shortcuts. SVG parsing performs no runtime file I/O.
 - Search replacement transaction execution, complete viewport hit pages, and regex completeness beyond the backend's bounded match contract. Find navigation is working; these gaps are not full search/replace acceptance.
 - Native dialog implementations on macOS/Linux; those retain their explicit inline workflow.
 - General compression/log/highlighting and other retained worker packages require their own integration checks.

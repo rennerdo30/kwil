@@ -368,6 +368,9 @@ pub(super) fn pretty(keys: &str) -> String {
 /// match the pixels on screen.
 #[derive(Default)]
 pub(super) struct MenuBar {
+    pub toolbar: Vec<Tool>,
+    pub toolbar_surface: Option<(usize, usize, u64)>,
+    pub toolbar_hover: Option<&'static str>,
     pub state: State,
     /// Mnemonic underlines, shown while navigating with the keyboard.
     pub cues: bool,
@@ -380,6 +383,41 @@ pub(super) struct MenuBar {
     pub scroll: usize,
     /// Keyboard moved the highlight; the next paint scrolls it into view.
     pub reveal: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Tool {
+    pub rect: Rect,
+    pub icon: icons::Icon,
+    pub command: &'static str,
+    pub enabled: bool,
+}
+pub(super) fn toolbar(area: TabArea, titles: &[TabArea], m: &Metrics, available: &Available) -> Vec<Tool> {
+    let first = titles.last().map_or(area.x, |r| r.x + r.width).saturating_add(m.gap);
+    let width = m.dip(30.0);
+    let mut end = area.x + area.width;
+    let mut tools = Vec::with_capacity(7);
+    for (icon, command) in [
+        (icons::Icon::Settings, "view.settings"),
+        (icons::Icon::Search, "search.find"),
+        (icons::Icon::GoTo, "navigation.goToLine"),
+        (icons::Icon::Redo, "edit.redo"),
+        (icons::Icon::Undo, "edit.undo"),
+        (icons::Icon::Save, "file.save"),
+        (icons::Icon::Open, "file.open"),
+    ] {
+        if end.saturating_sub(first) < width {
+            break;
+        }
+        end -= width;
+        tools.push(Tool {
+            rect: Rect { x: end, y: area.y, w: width, h: area.height },
+            icon,
+            command,
+            enabled: enabled(available, command),
+        });
+    }
+    tools
 }
 
 impl MenuBar {
@@ -607,6 +645,26 @@ pub(super) fn draw_bar(
         if bar.cues {
             underline(pixels, stride, font, rect, x, baseline, menu.title, fg, m);
         }
+    }
+    for tool in &bar.toolbar {
+        let r = tool.rect;
+        if bar.toolbar_hover == Some(tool.command) && tool.enabled {
+            chrome::round_rect(
+                pixels,
+                stride,
+                Rect { x: r.x, y: r.y + inset, w: r.w, h: r.h.saturating_sub(2 * inset) },
+                m.radius,
+                chrome::mix(bg, fg, 0x26),
+            );
+        }
+        icons::draw(
+            pixels,
+            stride,
+            tool.icon,
+            ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32),
+            m.dip(18.0),
+            if tool.enabled { fg } else { chrome::mix(bg, fg, 0x55) },
+        );
     }
 }
 
@@ -922,6 +980,16 @@ impl App {
             return false;
         }
         let pointer = self.pointer;
+        let size = self.pending_resize.unwrap_or(self.size);
+        if self.menu.toolbar_surface == Some((size.0, size.1, self.ui.scale.to_bits()))
+            && let Some(tool) = self.menu.toolbar.iter().find(|t| t.rect.contains(pointer)).copied()
+        {
+            if tool.enabled && enabled(&self.menu_available(), tool.command) {
+                self.menu_set(State::Closed, false);
+                self.run_menu_command(Some(el), tool.command);
+            }
+            return true;
+        }
         if let Some(dropdown) = self.current_dropdown()
             && dropdown.area.contains(pointer)
         {
@@ -995,6 +1063,15 @@ impl App {
             }
         }
         true
+    }
+
+    pub(super) fn toolbar_track(&mut self) {
+        let hovered = self.menu.toolbar.iter().find(|tool| tool.rect.contains(self.pointer)).map(|tool| tool.command);
+        if hovered != self.menu.toolbar_hover {
+            self.menu.toolbar_hover = hovered;
+            self.chrome_dirty = true;
+            self.request_frame();
+        }
     }
 
     /// Runs a menu command through the same path as the palette and bindings.
@@ -1267,5 +1344,26 @@ mod tests {
         assert!(keys.owns(Preset::VsCode, &[], Mode::Insert, chord("alt+z")), "VS Code binds Alt+Z");
         let unbound = [Binding { keys: "alt+f".into(), command: String::new(), context: None, mode: None }];
         assert!(keys.owns(Preset::VsCode, &unbound, Mode::Insert, chord("alt+f")));
+    }
+    #[test]
+    fn svg_command_buttons_fit_without_overlapping_menu_titles_and_keep_disabled_actions() {
+        for scale in [1.0, 1.5, 2.0] {
+            let m = Metrics::new(scale);
+            let titles = [TabArea { x: 0, y: 0, width: m.dip(360.0), height: m.menu }];
+            for width in [7, 320, 800, 1600] {
+                let area = TabArea { x: 0, y: 0, width, height: m.menu };
+                let tools = toolbar(area, &titles, &m, &Available::default());
+                for tool in &tools {
+                    assert!(tool.rect.x >= titles[0].width + m.gap);
+                    assert!(tool.rect.x + tool.rect.w <= width);
+                }
+                for pair in tools.windows(2) {
+                    assert!(pair[1].rect.x + pair[1].rect.w <= pair[0].rect.x);
+                }
+                if let Some(search) = tools.iter().find(|t| t.command == "search.find") {
+                    assert!(!search.enabled);
+                }
+            }
+        }
     }
 }

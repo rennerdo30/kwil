@@ -313,6 +313,11 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::FindCheck => {
             let cursor = app.view.editor().unwrap().primary_cursor().clone();
             assert_eq!(cursor.head.abs_diff(cursor.anchor), 5, "Enter selects the actual match");
+            app.close_search();
+            let button = app.menu.toolbar.iter().find(|t| t.command == "search.find").unwrap().rect;
+            app.pointer = (button.x + button.w / 2, button.y + button.h / 2);
+            app.menu_mouse(el);
+            assert!(app.search_panel.is_open(), "SVG Find button dispatches the real command");
             assert!(app.render());
             if let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from) {
                 std::fs::write(

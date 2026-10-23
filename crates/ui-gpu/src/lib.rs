@@ -19,6 +19,7 @@ mod window_placement;
 mod filetypes_ui;
 mod font;
 mod hit;
+mod icons;
 mod ime;
 mod input;
 mod menu;
@@ -1276,6 +1277,11 @@ impl App {
             self.menu.scroll = dropdown.scroll;
         }
         let available = self.menu_available();
+        self.menu.toolbar = menu::toolbar(lay.menu, &self.menu.titles, &self.ui, &available);
+        self.menu.toolbar_surface = Some((self.size.0, self.size.1, self.ui.scale.to_bits()));
+        if let Some(native) = self.gfx.as_mut().and_then(|gfx| gfx.native.as_mut()) {
+            native.toolbar_tooltips(&self.menu.toolbar, &self.menu.labels);
+        }
         let (notice, segments) = chrome::status(&self.view, self.zoom.percent());
         let title = chrome::window_title(&self.view);
         let dragging = self.drag.map(|drag| drag.vertical);
@@ -2645,6 +2651,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
+                self.toolbar_track();
                 if self.menu.state.is_open() {
                     self.menu_track();
                 }
