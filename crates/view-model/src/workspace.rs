@@ -139,6 +139,8 @@ struct FileFlow {
 pub struct Workspace {
     input_epoch: u64,
     editor_settings: Option<kwil_core_commands::Settings>,
+    // Tab.path tracks named destinations; recovery_path is display-only context.
+    // Only View/Document paths can supply an implicit save destination.
     session: Session,
     views: HashMap<DocumentId, View>,
     closed_views: HashMap<DocumentId, View>,
@@ -200,6 +202,7 @@ impl Workspace {
         let name = tab
             .path
             .as_ref()
+            .or(tab.recovery_path.as_ref())
             .and_then(|path| path.file_name())
             .map_or_else(|| format!("Untitled {}", id.0), |name| name.to_string_lossy().into_owned());
         let dirty = self
@@ -466,22 +469,29 @@ impl Workspace {
             if cached.is_none_or(|view| view.editor().is_none()) && self.files.queue.len() >= 256 {
                 return Err(io::Error::other("File worker queue is full; retry reopening"));
             }
-            if cached.is_some_and(|view| view.editor().is_none() && view.path.is_none()) && tab.revision == 0 {
+            if cached.is_some_and(|view| view.editor().is_none() && view.path.is_none())
+                && tab.revision == 0
+                && tab.saved_revision == 0
+                && tab.recovery_path.is_none()
+            {
                 return Err(io::Error::other("Closed document requires recovery"));
             }
         }
         if let Some(id) = self.session.reopen_closed()? {
             if !keep_path {
-                self.session.tab_mut(id).unwrap().path = None;
-                if let Some(view) = self.closed_views.get_mut(&id) {
-                    view.path = None;
-                    if let Some(editor) = view.editor_mut() {
-                        editor.document.path = None;
-                        editor.document.original = None;
-                        editor.document.mark_unsaved();
-                    }
-                    view.set_notice("Closed backing cannot be verified; use Save As".into());
+                let tab = self.session.tab_mut(id).unwrap();
+                if let Some(path) = tab.path.take() {
+                    tab.recovery_path = Some(path);
                 }
+            }
+            if !keep_path && let Some(view) = self.closed_views.get_mut(&id) {
+                view.path = None;
+                if let Some(editor) = view.editor_mut() {
+                    editor.document.path = None;
+                    editor.document.original = None;
+                    editor.document.mark_unsaved();
+                }
+                view.set_notice("Closed backing cannot be verified; use Save As".into());
             }
             // Publish before recovery/index requests can pump more saves. The
             // worker also retains its provisional reservation until release.
@@ -491,7 +501,7 @@ impl Workspace {
                 if self.views[&id].editor().is_none() {
                     let tab = self.session.tabs().iter().find(|tab| tab.id == id).unwrap().clone();
                     self.files.queue.retain(|request|!matches!(request,DocumentRequest::Open {document,..}|DocumentRequest::Index {document,..} if *document==id));
-                    let request = if tab.revision != 0 {
+                    let request = if tab.revision != 0 || tab.saved_revision != 0 || tab.recovery_path.is_some() {
                         DocumentRequest::Recover { tab }
                     } else if let (Some(path), Some(file)) = (&self.views[&id].path, self.views[&id].file()) {
                         DocumentRequest::Index { document: id, revision: 0, path: path.clone(), file: file.clone() }
@@ -523,9 +533,7 @@ impl Workspace {
         let id = self.active_id();
         let Some(view) = self.views.get(&id) else { return };
         if let Some(tab) = self.session.tab_mut(id) {
-            if tab.path != view.path {
-                tab.path.clone_from(&view.path);
-            }
+            sync_tab_path(tab, &view.path);
             tab.first_visible_line = view.top();
             tab.first_byte_column = view.first_byte_column;
             if let Some(editor) = view.editor() {
@@ -540,9 +548,7 @@ impl Workspace {
     pub fn sync_all(&mut self) {
         for tab in self.session.tabs().iter().map(|t| t.id).collect::<Vec<_>>() {
             if let (Some(view), Some(metadata)) = (self.views.get(&tab), self.session.tab_mut(tab)) {
-                if metadata.path != view.path {
-                    metadata.path.clone_from(&view.path);
-                }
+                sync_tab_path(metadata, &view.path);
                 metadata.first_visible_line = view.top();
                 metadata.first_byte_column = view.first_byte_column;
                 if let Some(editor) = view.editor() {
@@ -1262,12 +1268,10 @@ impl Workspace {
                 {
                     match result {
                         Ok(document) => {
-                            if document.path != tab.path {
+                            if document.path != tab.path || (document.path.is_none() && tab.recovery_path.is_some()) {
                                 view.path.clone_from(&document.path);
-                                self.session.tab_mut(tab.id).unwrap().path.clone_from(&document.path);
-                                view.set_notice(
-                                    "Recovered file changed on disk; original recovery retained. Use Save As".into(),
-                                );
+                                sync_tab_path(self.session.tab_mut(tab.id).unwrap(), &document.path);
+                                view.set_notice(recovery_notice(&tab));
                             }
                             let mut editor = Editor::new(*document);
                             if let Some(settings) = &self.editor_settings {
@@ -1457,7 +1461,11 @@ impl Workspace {
                     // metadata result must still fail visibly and never close.
                     may_close = false;
                     warning = true;
-                    view.path = None;
+                    let recovery_path = view.path.take();
+                    if let Some(tab) = self.session.tab_mut(document) {
+                        tab.path = None;
+                        tab.recovery_path = recovery_path;
+                    }
                     if let Some(editor) = view.editor_mut() {
                         editor.document.path = None;
                         editor.document.original = None;
@@ -1575,12 +1583,10 @@ impl Workspace {
             view.path = tab.path.clone();
             match document {
                 Ok(document) => {
-                    if document.path != tab.path {
+                    if document.path != tab.path || (document.path.is_none() && tab.recovery_path.is_some()) {
                         view.path.clone_from(&document.path);
-                        self.session.tab_mut(id).unwrap().path.clone_from(&document.path);
-                        view.set_notice(
-                            "Recovered file changed on disk; original recovery retained. Use Save As".into(),
-                        );
+                        sync_tab_path(self.session.tab_mut(id).unwrap(), &document.path);
+                        view.set_notice(recovery_notice(&tab));
                     }
                     let mut editor = Editor::new(document);
                     if let Some(settings) = &self.editor_settings {
@@ -1651,9 +1657,15 @@ impl Workspace {
                     recovered.path = None;
                     if let Some(editor) = recovered.editor_mut() {
                         editor.document.path = None;
+                        editor.document.original = None;
+                        editor.document.mark_unsaved();
                     }
                 }
-                self.session.tab_mut(existing).unwrap().path = None;
+                let metadata = self.session.tab_mut(existing).unwrap();
+                sync_tab_path(metadata, &None);
+                if let Some(view) = self.views.get_mut(&existing) {
+                    view.set_notice(recovery_notice(metadata));
+                }
             }
             let id = self.session.open(view.path.clone()).expect("validated paths and reserved recovery capacity");
             mapping.insert(tab.id, id);
@@ -1727,6 +1739,25 @@ impl Workspace {
             && needed
             && self.files.durable.get(&id) != Some(&(editor.document().revision(), next.saturating_sub(1)))
     }
+}
+
+fn sync_tab_path(tab: &mut kwil_core_workspace::session::Tab, path: &Option<PathBuf>) {
+    if let Some(path) = path {
+        tab.path = Some(path.clone());
+        tab.recovery_path = None;
+    } else if let Some(previous) = tab.path.take() {
+        tab.recovery_path = Some(previous);
+    }
+}
+
+fn recovery_notice(tab: &kwil_core_workspace::session::Tab) -> String {
+    format!(
+        "Recovered backing cannot be verified for {}; original recovery retained. Use Save As",
+        tab.path
+            .as_ref()
+            .or(tab.recovery_path.as_ref())
+            .map_or_else(|| "this tab".into(), |path| path.display().to_string()),
+    )
 }
 
 impl Deref for Workspace {
@@ -1810,12 +1841,123 @@ mod tests {
     }
 
     #[test]
+    fn recovered_context_survives_sync_dedup_reservation_and_cached_reopen_without_becoming_writable() {
+        let path = std::env::temp_dir().join("kwil-virtual-last-named-context.txt");
+        let mut session = Session::default();
+        let id = session.open(Some(path.clone())).unwrap();
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, b"retained").unwrap();
+        document.mark_unsaved();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.install_prepared(crate::document_worker::PreparedWorkspace {
+            session,
+            documents: vec![(id, Ok(document))],
+        });
+        workspace.sync_active();
+        workspace.sync_all();
+        assert!(workspace.session().tabs()[0].path.is_none());
+        assert_eq!(
+            workspace.session().tabs()[0].recovery_path.as_ref(),
+            Some(&path),
+            "sync must retain last named context"
+        );
+        assert!(workspace.path.is_none());
+        assert!(workspace.editor_mut().unwrap().save_request(None).is_err());
+        let candidate = workspace.open(View::new(None)).unwrap();
+        edit(&mut workspace, "explicit destination");
+        workspace.save_document(candidate, Some(path.clone())).expect("context alone must not reserve a destination");
+        let (owner, request) = take_save(&mut workspace);
+        assert_eq!(owner, candidate);
+        assert_eq!(request.path, path);
+        workspace.document_result(DocumentResult::Saved {
+            document: candidate,
+            revision: request.revision,
+            result: Err(io::Error::new(io::ErrorKind::PermissionDenied, "fake save boundary")),
+        });
+        workspace.close(candidate, true).unwrap();
+        workspace.activate(id);
+        let named = workspace.open_path(path.clone()).unwrap();
+        assert_ne!(named, id, "context must not masquerade as an open-path identity");
+        assert_eq!(workspace.open_path(path.clone()).unwrap(), named, "actual open paths still deduplicate");
+        assert!(workspace.view(id).unwrap().path.is_none(), "opening the name must not attach recovered bytes");
+        assert!(workspace.views.get_mut(&id).unwrap().editor_mut().unwrap().save_request(None).is_err());
+        let other = workspace.open(View::new(None)).unwrap();
+        edit(&mut workspace, "other");
+        assert!(
+            workspace.save_document(other, Some(path.clone())).is_err(),
+            "actual open destination remains reserved"
+        );
+        workspace.close(other, true).unwrap();
+        workspace.close(named, true).unwrap();
+        workspace.activate(id);
+        workspace.close(id, true).unwrap();
+        workspace.files.reopen = Some((id, 1));
+        workspace.document_result(DocumentResult::ReopenValidated { document: id, generation: 1, result: Ok(false) });
+        assert_eq!(workspace.active_id(), id);
+        let restored = workspace.session().tabs().iter().find(|t| t.id == id).unwrap();
+        assert!(restored.path.is_none());
+        assert_eq!(restored.recovery_path.as_ref(), Some(&path));
+        assert!(workspace.path.is_none());
+        let editor = workspace.editor_mut().unwrap();
+        assert!(editor.save_request(None).is_err());
+        assert!(editor.document().is_dirty());
+        let mut bytes = Vec::new();
+        editor.document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"retained");
+        assert!(workspace.status_text().contains("Save As"));
+        workspace.file_command("file.saveAll").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().kind, FilePromptKind::SaveAs);
+        assert_eq!(workspace.file_prompt().unwrap().document, id);
+        workspace.cancel_file_prompt();
+        assert!(workspace.close(id, false).is_err());
+    }
+
+    #[test]
+    fn duplicate_live_named_tab_keeps_recovered_name_context_and_both_unsaved_contents() {
+        let path = std::env::temp_dir().join("kwil-virtual-duplicate-recovery-name.txt");
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.path = Some(path.clone());
+        workspace.editor_mut().unwrap().document.path = Some(path.clone());
+        edit(&mut workspace, "live edits");
+        let mut session = Session::default();
+        let recovered = session.open(Some(path.clone())).unwrap();
+        let mut document = crate::Document::new();
+        document.path = Some(path.clone());
+        document.buffer.insert(0, b"recovered bytes").unwrap();
+        workspace.install_prepared(crate::document_worker::PreparedWorkspace {
+            session,
+            documents: vec![(recovered, Ok(document))],
+        });
+        workspace.sync_all();
+        assert_eq!(workspace.session.tabs().len(), 2);
+        let metadata = workspace.session.tabs().iter().find(|t| t.id == recovered).unwrap();
+        assert!(metadata.path.is_none());
+        assert_eq!(metadata.recovery_path.as_ref(), Some(&path), "duplicate live name must not erase recovery context");
+        let recovered_view = workspace.view(recovered).unwrap();
+        assert!(recovered_view.path.is_none());
+        assert!(recovered_view.editor().unwrap().document().is_dirty());
+        assert!(recovered_view.status_text().contains("Use Save As"));
+        let mut bytes = Vec::new();
+        recovered_view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"recovered bytes");
+        let live = workspace.session.tabs().iter().find(|t| t.path.as_ref() == Some(&path)).unwrap().id;
+        assert_ne!(live, recovered);
+        bytes.clear();
+        workspace.view(live).unwrap().editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"live edits");
+        workspace.activate(recovered);
+        assert!(workspace.editor_mut().unwrap().save_request(None).is_err());
+        assert!(workspace.close(recovered, false).is_err());
+        assert!(workspace.session.validate().is_ok());
+    }
+
+    #[test]
     fn recovered_closed_attachment_restores_per_row_windows_and_safe_conflict_path() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         let first = workspace.active_id();
         let path = std::env::temp_dir().join("kwil-virtual-recovered-conflict.txt");
         workspace.session.set_path(first, path.clone()).unwrap();
-        workspace.views.get_mut(&first).unwrap().path = Some(path);
+        workspace.views.get_mut(&first).unwrap().path = Some(path.clone());
         workspace.set_horizontal_window(2, 64 << 10);
         workspace.close(first, true).unwrap();
         workspace.closed_views.remove(&first);
@@ -1831,6 +1973,7 @@ mod tests {
         });
         assert!(workspace.view(first).unwrap().path.is_none());
         assert!(workspace.session.tab_mut(first).unwrap().path.is_none());
+        assert_eq!(workspace.session.tab_mut(first).unwrap().recovery_path.as_ref(), Some(&path));
         assert_eq!(workspace.horizontal_origin(), 2);
         assert_eq!(workspace.line_offset(0), 0);
         assert_eq!(workspace.line_offset(1), 2);
@@ -2242,7 +2385,7 @@ mod tests {
         let reopening = workspace.active_id();
         let path = std::env::temp_dir().join("kwil-virtual-unverified-closed.txt");
         workspace.views.get_mut(&reopening).unwrap().path = Some(path.clone());
-        workspace.editor_mut().unwrap().document.path = Some(path);
+        workspace.editor_mut().unwrap().document.path = Some(path.clone());
         edit(&mut workspace, "recovered bytes");
         workspace.close(reopening, true).unwrap();
         workspace.files.reopen = Some((reopening, 1));
@@ -2253,7 +2396,9 @@ mod tests {
         });
         assert_eq!(workspace.active_id(), reopening);
         assert!(workspace.path.is_none());
-        assert!(workspace.session.tabs().iter().find(|tab| tab.id == reopening).unwrap().path.is_none());
+        let metadata = workspace.session.tabs().iter().find(|tab| tab.id == reopening).unwrap();
+        assert!(metadata.path.is_none());
+        assert_eq!(metadata.recovery_path.as_ref(), Some(&path));
         assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 15);
         assert!(workspace.editor().unwrap().document().is_dirty());
         assert!(workspace.status_text().contains("Save As"));

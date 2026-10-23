@@ -332,7 +332,7 @@ impl DocumentWorker {
                                 } else if let Some(path) = &tab.path {
                                     kwil_core_workspace::open_for_editing(path)
                                         .and_then(|file| index(path.clone(), file))
-                                } else if tab.revision == tab.saved_revision {
+                                } else if tab.revision == tab.saved_revision && tab.recovery_path.is_none() {
                                     Ok(Document::new())
                                 } else {
                                     Err(io::Error::other("Closed document has no complete recovery journal"))
@@ -619,6 +619,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
         let metadata = Tab {
             id: *id,
             path: None,
+            recovery_path: None,
             revision: 0,
             saved_revision: 0,
             cursor: 0,
@@ -626,16 +627,20 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             first_visible_line: 0,
             first_byte_column: 0,
         };
-        let (document, recovered, base) = recover_document(path.clone(), &metadata)?;
-        let summary = recovered.summary();
-        let path = base.original_path.filter(|path| !session.tabs().iter().any(|t| t.path.as_ref() == Some(path)));
+        let (mut document, recovered, base) = recover_document(path.clone(), &metadata)?;
+        // Orphan metadata never proves a saved state, including revision zero.
+        // Reserve an unreachable saved marker on the Document itself: sync
+        // must not turn the Session dirty flag back into a clean document.
+        mark_recovered_unsaved(&mut document)?;
+        let recovery_path = base.original_path;
         // Keep the old name as recovery context, never as an unverified
         // writable backing on the recovered orphan document.
         session.restore_tab(Tab {
             id: *id,
-            path,
-            revision: summary.revision,
-            saved_revision: summary.revision.wrapping_add(1),
+            path: None,
+            recovery_path,
+            revision: document.revision(),
+            saved_revision: document.saved_revision(),
             cursor: 0,
             anchor: 0,
             first_visible_line: 0,
@@ -657,12 +662,20 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             })
         } else if let Some(path) = &tab.path {
             kwil_core_workspace::open_for_editing(path).and_then(|file| index(path.clone(), file))
-        } else if tab.revision != tab.saved_revision {
+        } else if tab.revision != tab.saved_revision || tab.recovery_path.is_some() {
             Err(io::Error::other("Unsaved document has no complete recovery journal"))
         } else {
             Ok(Document::new())
         };
         documents.push((tab.id, result));
+    }
+    for (id, document) in &documents {
+        if document.as_ref().is_ok_and(|document| document.path().is_none())
+            && let Some(tab) = session.tab_mut(*id)
+            && let Some(path) = tab.path.take()
+        {
+            tab.recovery_path = Some(path);
+        }
     }
     let durable_session = session::load_session(&root.join("session.kws"))?;
     Ok((
@@ -1035,11 +1048,20 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
             }
             _ => {
                 document.path = None;
-                document.mark_unsaved();
+                mark_recovered_unsaved(&mut document)?;
             }
         }
     }
+    if document.path.is_none() && tab.recovery_path.is_some() && !document.is_dirty() {
+        mark_recovered_unsaved(&mut document)?;
+    }
     Ok((document, recovered, base.ok_or_else(|| io::Error::other("Missing recovery base"))?))
+}
+
+fn mark_recovered_unsaved(document: &mut Document) -> io::Result<()> {
+    document.next_revision.checked_add(1).ok_or_else(|| io::Error::other("Recovery revision overflow"))?;
+    document.mark_unsaved();
+    Ok(())
 }
 
 fn snapshots_equal(a: &kwil_core_text::Snapshot, b: &kwil_core_text::Snapshot) -> io::Result<bool> {
@@ -1363,6 +1385,162 @@ mod tests {
     }
 
     #[test]
+    fn missing_context_journal_never_adopts_the_current_named_disk_as_a_baseline() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("last-named.txt");
+        std::fs::write(&path, b"foreign current bytes").unwrap();
+        let mut session = Session::default();
+        let id = session.open(None).unwrap();
+        session.tab_mut(id).unwrap().recovery_path = Some(path.clone());
+        session::store_session(&scratch.0.join("session.kws"), &session).unwrap();
+        let (prepared, storage) = prepare_root(scratch.0.clone()).unwrap();
+        assert!(prepared.documents[0].1.is_err(), "missing context journal must not become a clean empty document");
+        assert_eq!(prepared.session.tabs()[0].recovery_path.as_ref(), Some(&path));
+        assert!(prepared.session.tabs()[0].path.is_none());
+        assert_eq!(std::fs::read(path).unwrap(), b"foreign current bytes");
+        stop_storage(storage);
+    }
+
+    #[test]
+    fn revision_zero_orphan_stays_dirty_through_install_save_all_and_close() {
+        let scratch = Scratch::new();
+        let mut tab = recovery_tab(None);
+        tab.revision = 0;
+        tab.saved_revision = 0;
+        fixture_journal(&scratch.0, &tab, b"orphan\r\n\xff");
+        let (prepared, storage) = prepare_root(scratch.0.clone()).unwrap();
+        stop_storage(storage);
+        let mut workspace = crate::Workspace::new(crate::View::new(None)).unwrap();
+        workspace.document_result(DocumentResult::Prepared(Ok(prepared)));
+        workspace.sync_active();
+        workspace.sync_all();
+        let document = workspace.editor().unwrap().document();
+        assert!(document.is_dirty(), "revision-zero orphan must remain unsaved after installation");
+        assert_eq!(document.revision(), 0);
+        assert!(document.next_revision > document.saved_revision());
+        assert_eq!(document.line_ending, crate::DocumentLineEnding::CrLf);
+        assert_eq!(document.buffer().add_memory_bytes(), 0);
+        let mut bytes = Vec::new();
+        document.snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"orphan\r\n\xff");
+        let metadata = &workspace.session().tabs()[0];
+        assert_ne!(metadata.revision, metadata.saved_revision);
+        assert!(workspace.status_text().contains('*'), "orphan dirty marker must be visible");
+        workspace.file_command("file.saveAll").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().kind, crate::FilePromptKind::SaveAs);
+        workspace.cancel_file_prompt();
+        assert!(workspace.close(tab.id, false).is_err());
+        workspace.request_window_close(false).unwrap();
+        assert!(!workspace.wants_exit(), "guarded close must retain the orphan");
+        workspace.cancel_file_prompt();
+        workspace
+            .execute("edit.insert", &crate::CommandArgs { text: Some("!".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.execute("edit.undo", &Default::default(), 1).unwrap();
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        workspace.execute("edit.redo", &Default::default(), 1).unwrap();
+        assert!(workspace.editor().unwrap().document().is_dirty());
+    }
+
+    #[test]
+    fn latest_save_as_context_survives_two_restarts_without_becoming_a_writable_backing() {
+        use crate::{CommandArgs, View, Workspace};
+        for originally_named in [false, true] {
+            let scratch = Scratch::new();
+            let original = scratch.0.join("original.txt");
+            let latest = scratch.0.join("latest.txt");
+            let initial = if originally_named {
+                std::fs::write(&original, b"original\r\n\xff").unwrap();
+                let file = kwil_core_workspace::open_for_editing(&original).unwrap();
+                file.build_index(1).unwrap();
+                View::new(Some((original.clone(), file)))
+            } else {
+                View::new(None)
+            };
+            let mut workspace = Workspace::new(initial).unwrap();
+            workspace.set_session_restore(true);
+            let (sender, receiver) = mpsc::channel();
+            workspace
+                .start_document_worker_at(Some(scratch.0.clone()), move |result| {
+                    let _ = sender.send(result);
+                })
+                .unwrap();
+            drive(&mut workspace, &receiver, Workspace::recovery_ready);
+            let id = workspace.active_id();
+            workspace
+                .execute("edit.insert", &CommandArgs { text: Some("seed\r\n".into()), ..Default::default() }, 1)
+                .unwrap();
+            workspace.save_document(id, Some(latest.clone())).unwrap();
+            drive(&mut workspace, &receiver, |w| w.editor().is_some_and(|e| !e.document().is_dirty()));
+            workspace
+                .execute("edit.insert", &CommandArgs { text: Some("unsaved".into()), ..Default::default() }, 1)
+                .unwrap();
+            let mut expected = Vec::new();
+            workspace.editor().unwrap().document().snapshot().write_to(&mut expected).unwrap();
+            workspace.request_window_close(false).unwrap();
+            drive(&mut workspace, &receiver, Workspace::wants_exit);
+            drop(workspace);
+            wait_stopped(&receiver);
+            let disk_before = std::fs::read(&latest).unwrap();
+            let journal_path = scratch.0.join(format!("{}.kwj", id.0));
+            let mut base_path = None;
+            let journal = RecoveredJournal::open(journal_path, id, &AtomicBool::new(false), |event| {
+                if let RecoveryEvent::Base(base) = event {
+                    base_path = base.original_path.clone();
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(base_path, originally_named.then_some(original.clone()));
+            drop(journal);
+            for _ in 0..2 {
+                let (sender, receiver) = mpsc::channel();
+                let mut restored = Workspace::new(View::new(None)).unwrap();
+                restored.set_session_restore(true);
+                restored
+                    .start_document_worker_at(Some(scratch.0.clone()), move |result| {
+                        let _ = sender.send(result);
+                    })
+                    .unwrap();
+                drive(&mut restored, &receiver, Workspace::recovery_ready);
+                restored.sync_active();
+                restored.sync_all();
+                assert!(restored.session().tabs()[0].path.is_none());
+                assert_eq!(
+                    restored.session().tabs()[0].recovery_path.as_deref(),
+                    Some(latest.as_path()),
+                    "last Save As context must survive recovery and metadata sync"
+                );
+                assert!(restored.path.is_none());
+                let document = restored.editor().unwrap().document();
+                assert!(document.path().is_none());
+                assert!(document.original.is_none());
+                assert!(document.is_dirty());
+                let mut bytes = Vec::new();
+                document.snapshot().write_to(&mut bytes).unwrap();
+                assert_eq!(bytes, expected);
+                assert!(restored.status_text().contains("Use Save As"));
+                assert!(restored.tab_title(id).contains("latest.txt"));
+                restored.file_command("file.saveAll").unwrap();
+                assert_eq!(restored.file_prompt().unwrap().kind, crate::FilePromptKind::SaveAs);
+                restored.cancel_file_prompt();
+                assert!(restored.close(id, false).is_err());
+                restored.request_window_close(false).unwrap();
+                drive(&mut restored, &receiver, Workspace::wants_exit);
+                drop(restored);
+                wait_stopped(&receiver);
+                let persisted = session::load_session(&scratch.0.join("session.kws")).unwrap();
+                assert!(persisted.tabs()[0].path.is_none());
+                assert_eq!(persisted.tabs()[0].recovery_path.as_deref(), Some(latest.as_path()));
+                assert_eq!(std::fs::read(&latest).unwrap(), disk_before);
+                if originally_named {
+                    assert_eq!(std::fs::read(&original).unwrap(), b"original\r\n\xff");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn orphan_named_recovery_retains_path_context_but_requires_save_as() {
         let scratch = Scratch::new();
         let path = scratch.0.join("named.txt");
@@ -1370,7 +1548,8 @@ mod tests {
         fixture_journal(&scratch.0, &tab, b"recovered\r\n\xff");
         std::fs::write(&path, b"external bytes").unwrap();
         let (prepared, storage) = prepare_root(scratch.0.clone()).unwrap();
-        assert_eq!(prepared.session.tabs()[0].path.as_deref(), Some(path.as_path()));
+        assert!(prepared.session.tabs()[0].path.is_none());
+        assert_eq!(prepared.session.tabs()[0].recovery_path.as_deref(), Some(path.as_path()));
         let document = prepared.documents.into_iter().next().unwrap().1.unwrap();
         assert!(document.is_dirty());
         let mut editor = crate::Editor::new(document);
@@ -1791,7 +1970,7 @@ mod tests {
         assert_eq!(persisted.tabs(), expected.tabs(), "persisted metadata keeps the original path context");
         let mut recovered_tabs = expected.tabs().to_vec();
         for tab in &mut recovered_tabs {
-            tab.path = None;
+            tab.recovery_path = tab.path.take();
         }
 
         let (sender, receiver) = mpsc::channel();
@@ -1807,8 +1986,9 @@ mod tests {
         drive(&mut restarted, &receiver, crate::Workspace::recovery_ready);
         restarted.sync_all();
         assert_eq!(restarted.session().active(), expected.active());
-        assert_eq!(restarted.session().tabs(), recovered_tabs, "unverified dirty backings require Save As");
+        assert_eq!(restarted.session().tabs(), recovered_tabs, "last named recovery context must survive sync");
         assert!(restarted.view(second).unwrap().status_text().contains("Use Save As"));
+        assert!(restarted.view(second).unwrap().path.is_none(), "context must not become a writable backing");
         for tab in expected.tabs() {
             assert_eq!(
                 restarted.view(tab.id).unwrap().first_byte_column,

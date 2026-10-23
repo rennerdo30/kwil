@@ -24,6 +24,10 @@ pub struct DocumentId(pub u64);
 pub struct Tab {
     pub id: DocumentId,
     pub path: Option<PathBuf>,
+    /// Last named destination for an unverified recovered buffer. Context only:
+    /// never a writable backing, open-path identity or destination reservation.
+    /// Mutually exclusive with `path`, keeping per-tab path storage bounded.
+    pub recovery_path: Option<PathBuf>,
     pub revision: u64,
     pub saved_revision: u64,
     /// Byte offsets in the original encoding, including BOM.
@@ -71,6 +75,7 @@ impl Session {
         }
         let tab = self.tab_mut(id).ok_or_else(|| invalid("unknown document ID"))?;
         tab.path = Some(path.clone());
+        tab.recovery_path = None;
         self.touch_recent(path);
         Ok(())
     }
@@ -105,6 +110,7 @@ impl Session {
         self.tabs.push(Tab {
             id,
             path,
+            recovery_path: None,
             revision: 0,
             saved_revision: 0,
             cursor: 0,
@@ -130,6 +136,7 @@ impl Session {
                 return Err(invalid("restored tab path"));
             }
         }
+        validate_recovery_path(&tab)?;
         let next = tab.id.0.checked_add(1).ok_or_else(|| invalid("document ID exhausted"))?;
         self.next_id = self.next_id.max(next);
         self.active = Some(tab.id);
@@ -209,6 +216,7 @@ impl Session {
                     return Err(invalid("relative session path"));
                 }
             }
+            validate_recovery_path(tab)?;
         }
         for tab in &self.tabs {
             if let Some(path) = &tab.path
@@ -231,7 +239,7 @@ impl Session {
     fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
         let mut b = Vec::new();
-        b.extend_from_slice(b"KWS2");
+        b.extend_from_slice(b"KWS3");
         put64(&mut b, self.next_id);
         put64(&mut b, self.active.map_or(0, |id| id.0));
         let closed: Vec<_> = self.closed.iter().collect();
@@ -243,6 +251,7 @@ impl Session {
                     put64(&mut b, v);
                 }
                 put_path(&mut b, t.path.as_deref())?;
+                put_path(&mut b, t.recovery_path.as_deref())?;
             }
         }
         put32(&mut b, self.recent.len() as u32);
@@ -262,9 +271,10 @@ impl Session {
             return Err(invalid("metadata checksum"));
         }
         let mut r = Decoder::new(body);
-        let horizontal = match r.take(4)? {
-            b"KWS1" => false,
-            b"KWS2" => true,
+        let (horizontal, recovery_context) = match r.take(4)? {
+            b"KWS1" => (false, false),
+            b"KWS2" => (true, false),
+            b"KWS3" => (true, true),
             _ => return Err(invalid("metadata version")),
         };
         let next_id = r.u64()?;
@@ -286,6 +296,7 @@ impl Session {
                     first_visible_line: r.u64()?,
                     first_byte_column: if horizontal { r.u64()? } else { 0 },
                     path: r.path()?,
+                    recovery_path: if recovery_context { r.path()? } else { None },
                 });
             }
             groups.push(group);
@@ -302,6 +313,16 @@ impl Session {
         session.validate()?;
         Ok(session)
     }
+}
+
+fn validate_recovery_path(tab: &Tab) -> io::Result<()> {
+    if let Some(path) = &tab.recovery_path {
+        validate_path(path)?;
+        if !path.is_absolute() || tab.path.is_some() {
+            return Err(invalid("recovery context requires an absolute path without a named backing"));
+        }
+    }
+    Ok(())
 }
 
 /// Worker-only load. Missing means a new session; corruption is never silently reset.
@@ -567,11 +588,45 @@ mod horizontal_codec_tests {
         let second = session.open(None).unwrap();
         session.tab_mut(second).unwrap().first_byte_column = u64::MAX;
         let bytes = session.encode().unwrap();
-        assert_eq!(&bytes[..4], b"KWS2");
+        assert_eq!(&bytes[..4], b"KWS3");
         let decoded = Session::decode(&bytes).unwrap();
         assert_eq!(decoded, session);
         assert_eq!(decoded.closed()[0].first_byte_column, 123_456);
         assert_eq!(decoded.tabs()[0].first_byte_column, u64::MAX);
+    }
+
+    #[test]
+    fn prior_named_metadata_versions_migrate_without_granting_recovery_context_a_backing() {
+        for horizontal in [false, true] {
+            let name = std::env::temp_dir().join("kwil-legacy-native-name.txt");
+            let mut bytes = if horizontal { b"KWS2".to_vec() } else { b"KWS1".to_vec() };
+            put64(&mut bytes, 2);
+            put64(&mut bytes, 1);
+            put32(&mut bytes, 1);
+            for value in [1, 9, 8, 6, 5, 4] {
+                put64(&mut bytes, value);
+            }
+            if horizontal {
+                put64(&mut bytes, 23);
+            }
+            put_path(&mut bytes, Some(&name)).unwrap();
+            put32(&mut bytes, 0);
+            put32(&mut bytes, 0);
+            let crc = checksum(&bytes);
+            put32(&mut bytes, crc);
+            let migrated = Session::decode(&bytes).unwrap();
+            let tab = &migrated.tabs()[0];
+            assert_eq!(tab.path.as_ref(), Some(&name));
+            assert!(tab.recovery_path.is_none());
+            assert_eq!(
+                (tab.revision, tab.saved_revision, tab.cursor, tab.anchor, tab.first_visible_line),
+                (9, 8, 6, 5, 4)
+            );
+            assert_eq!(tab.first_byte_column, if horizontal { 23 } else { 0 });
+            let current = migrated.encode().unwrap();
+            assert_eq!(&current[..4], b"KWS3");
+            assert_eq!(Session::decode(&current).unwrap(), migrated);
+        }
     }
 
     #[test]

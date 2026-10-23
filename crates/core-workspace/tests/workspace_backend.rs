@@ -105,6 +105,54 @@ fn kw20_session_bounds_stable_ids_reopen_and_atomic_snapshot() {
 }
 
 #[test]
+fn kw20_recovery_context_roundtrips_without_claiming_a_named_destination() {
+    let temp = Temp::new();
+    let name = temp.path("last-save-as.txt");
+    let mut session = Session::default();
+    let recovered = session.open(Some(name.clone())).unwrap();
+    let tab = session.tab_mut(recovered).unwrap();
+    tab.recovery_path = tab.path.take();
+    tab.saved_revision = 2;
+    tab.first_byte_column = 31;
+    let live = session.open(Some(name.clone())).unwrap();
+    assert_ne!(live, recovered, "recovery context is not an open-path identity");
+    assert_eq!(session.open(Some(name.clone())).unwrap(), live);
+    assert!(session.close(recovered));
+    let path = temp.path("session.kws");
+    store_session(&path, &session).unwrap();
+    assert_eq!(&fs::read(&path).unwrap()[..4], b"KWS3");
+    let mut restored = load_session(&path).unwrap();
+    assert_eq!(restored, session);
+    assert!(restored.closed()[0].path.is_none());
+    assert_eq!(restored.closed()[0].recovery_path.as_ref(), Some(&name));
+    assert_eq!(restored.reopen_closed().unwrap(), Some(recovered));
+    assert!(restored.set_path(recovered, name).is_err(), "actual destinations still reject duplicates");
+    let next = temp.path("new-save-as.txt");
+    restored.set_path(recovered, next.clone()).unwrap();
+    let tab = restored.tab_mut(recovered).unwrap();
+    assert_eq!(tab.path.as_ref(), Some(&next));
+    assert!(tab.recovery_path.is_none(), "explicit Save As replaces previous recovery context");
+    store_session(&path, &restored).unwrap();
+    assert_eq!(load_session(&path).unwrap(), restored);
+}
+
+#[test]
+fn kw20_recovery_context_validation_preserves_native_path_bounds_and_exclusive_storage() {
+    let temp = Temp::new();
+    let mut session = Session::default();
+    let id = session.open(None).unwrap();
+    session.tab_mut(id).unwrap().recovery_path = Some("relative.txt".into());
+    assert!(session.validate().is_err());
+    session.tab_mut(id).unwrap().recovery_path = Some(temp.path("x"));
+    assert!(session.validate().is_ok());
+    session.tab_mut(id).unwrap().path = Some(temp.path("other"));
+    assert!(session.validate().is_err(), "one native path per tab preserves the existing metadata cap");
+    session.tab_mut(id).unwrap().path = None;
+    session.tab_mut(id).unwrap().recovery_path = Some(temp.path(&"x".repeat(MAX_PATH_BYTES + 1)));
+    assert!(session.validate().is_err());
+}
+
+#[test]
 fn kw20_closed_history_never_silently_evicts_dirty_document() {
     let mut session = Session::default();
     let dirty = session.open(None).unwrap();
@@ -127,6 +175,7 @@ fn kw20_orphan_journal_tab_retains_identity_and_advances_allocator() {
     let tab = Tab {
         id: DocumentId(900),
         path: None,
+        recovery_path: None,
         revision: 17,
         saved_revision: 1,
         cursor: 9,
