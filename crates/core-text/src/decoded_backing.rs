@@ -31,8 +31,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Maximum raw distance between complete-atom checkpoints, including alignment.
 pub const CHECKPOINT_RAW_BYTES: usize = 64 << 10;
@@ -77,7 +77,35 @@ impl std::fmt::Display for BackingError {
         }
     }
 }
-impl std::error::Error for BackingError {}
+impl std::error::Error for BackingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Read(error) => Some(error),
+            Self::Encoding(error) => Some(error),
+            Self::Cleanup { cause, .. } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
+impl BackingError {
+    /// Transport failed preparation to an I/O API without losing retry paths
+    /// or the original failure kind. The worker must extract pending retirement.
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Io(error) => error,
+            Self::Read(ReadError::Io(ref error)) | Self::Encoding(EncodingError::Io(ref error)) => {
+                io::Error::new(error.kind(), self)
+            }
+            Self::Cancelled => io::Error::new(io::ErrorKind::Interrupted, self),
+            Self::Cleanup { cause, directory, error } => {
+                let paths = Box::new(BackingPaths::in_directory(directory));
+                RetirementError::Cleanup { paths, error }.with_cause(cause.into_io_error())
+            }
+            other => io::Error::other(other),
+        }
+    }
+}
 impl From<io::Error> for BackingError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
@@ -150,6 +178,14 @@ pub struct BackingPaths {
     pub checkpoints: PathBuf,
 }
 impl BackingPaths {
+    fn in_directory(directory: PathBuf) -> Self {
+        Self {
+            raw: directory.join("raw"),
+            logical: directory.join("logical"),
+            checkpoints: directory.join("checkpoints"),
+            directory,
+        }
+    }
     fn create(parent: &Path) -> io::Result<Self> {
         loop {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -213,6 +249,58 @@ pub struct DecodedSnapshot {
 pub enum RetirementError {
     LiveSnapshots(DecodedBacking),
     Cleanup { paths: Box<BackingPaths>, error: io::Error },
+}
+
+/// One resource per failed preparation, carried through typed error contexts.
+/// Taking it transfers ownership to the already-admitted worker registry slot.
+/// Dropping this payload never performs filesystem work.
+struct PendingRetirement {
+    cause: io::Error,
+    resource: Mutex<Option<RetirementError>>,
+}
+impl std::fmt::Debug for PendingRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRetirement").field("cause", &self.cause).finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for PendingRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)?;
+        let resource = self.resource.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match resource.as_ref() {
+            Some(RetirementError::Cleanup { paths, error }) => {
+                write!(f, "; private decoded cleanup failed at {}: {error}", paths.directory.display())
+            }
+            Some(RetirementError::LiveSnapshots(owner)) => {
+                write!(f, "; private decoded backing still pinned at {}", owner.storage.paths.directory.display())
+            }
+            None => f.write_str("; private decoded retirement retained by worker"),
+        }
+    }
+}
+impl std::error::Error for PendingRetirement {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+impl RetirementError {
+    /// Preserve the actual owner or exact cleanup paths alongside the cause.
+    pub fn with_cause(self, cause: io::Error) -> io::Error {
+        io::Error::new(cause.kind(), PendingRetirement { cause, resource: Mutex::new(Some(self)) })
+    }
+
+    /// Transfer a helper failure's resource exactly once, including through
+    /// atomic-save contexts. Never infer resources from diagnostic text.
+    pub fn take_from(error: &io::Error) -> Option<Self> {
+        let mut current: &(dyn std::error::Error + 'static) = error;
+        loop {
+            if let Some(pending) = current.downcast_ref::<PendingRetirement>() {
+                return pending.resource.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+            }
+            current =
+                if let Some(io) = current.downcast_ref::<io::Error>() { io.get_ref()? } else { current.source()? };
+        }
+    }
 }
 
 impl DecodedBacking {
@@ -774,6 +862,50 @@ fn next_atom(encoding: Encoding, raw: &[u8]) -> Result<AtomSize, BackingError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pending_retirement_preparation_failure_preserves_retry_paths_and_cause() {
+        let fixture = Fixture::new(b"untouched");
+        #[derive(Debug)]
+        struct ReadFailure;
+        impl std::fmt::Display for ReadFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("injected private copy failure")
+            }
+        }
+        impl std::error::Error for ReadFailure {}
+        struct Fails<'a>(&'a Path);
+        impl Read for Fails<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                let directory =
+                    fs::read_dir(self.0)?.map(Result::unwrap).find(|e| e.file_type().unwrap().is_dir()).unwrap().path();
+                fs::write(directory.join("blocker"), b"test blocker")?;
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, ReadFailure))
+            }
+        }
+        let error = DecodedBacking::prepare_from_reader(
+            &mut Fails(&fixture.directory),
+            1,
+            Interpretation::new(Encoding::UTF8, 0).unwrap(),
+            &fixture.directory,
+            &AtomicBool::new(false),
+        )
+        .err()
+        .unwrap()
+        .into_io_error();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let pending = error.get_ref().unwrap().downcast_ref::<PendingRetirement>().unwrap();
+        assert!(pending.cause.get_ref().unwrap().is::<ReadFailure>(), "retain the actual I/O cause");
+        let Some(RetirementError::Cleanup { paths, .. }) = RetirementError::take_from(&error) else {
+            panic!("preparation cleanup failure must carry retry paths");
+        };
+        assert!(RetirementError::take_from(&error).is_none(), "ownership transfers exactly once");
+        assert!(paths.cleanup().is_err());
+        fs::remove_file(paths.directory.join("blocker")).unwrap();
+        paths.cleanup().unwrap();
+        assert!(!paths.directory.exists());
+        assert_eq!(fs::read(&fixture.source).unwrap(), b"untouched");
+    }
+
     struct Fixture {
         directory: PathBuf,
         source: PathBuf,
@@ -815,6 +947,9 @@ mod tests {
                         && entry.file_type().is_ok_and(|kind| kind.is_dir())
                     {
                         let directory = entry.path();
+                        // Exact blocker used by failed-preparation regression
+                        // tests, including when a deliberate mutant panics.
+                        let _ = fs::remove_file(directory.join("blocker"));
                         let _ = BackingPaths {
                             raw: directory.join("raw"),
                             logical: directory.join("logical"),

@@ -126,9 +126,19 @@ impl WorkerBackings {
         let slot = self.slots.iter_mut().find(|slot| slot.is_none()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "decoded backing capacity retained by snapshots or cleanup")
         })?;
-        let (value, owner) = make(&self.parent)?;
-        *slot = Some(Resource::Owner(owner));
-        Ok(value)
+        match make(&self.parent) {
+            Ok((value, owner)) => {
+                *slot = Some(Resource::Owner(owner));
+                Ok(value)
+            }
+            Err(error) => {
+                *slot = RetirementError::take_from(&error).map(|retirement| match retirement {
+                    RetirementError::LiveSnapshots(owner) => Resource::Owner(owner),
+                    RetirementError::Cleanup { paths, .. } => Resource::Cleanup(paths),
+                });
+                Err(error)
+            }
+        }
     }
 
     pub fn open(
@@ -210,6 +220,131 @@ mod tests {
         cell::Cell,
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    #[test]
+    fn pending_retirement_failed_preparation_occupies_slot_until_cleanup_retry() {
+        let fixture = Fixture::new();
+        let mut registry = fixture.registry(1);
+        let cancel = AtomicBool::new(false);
+        struct Cancels<'a> {
+            parent: &'a Path,
+            cancel: &'a AtomicBool,
+        }
+        impl std::io::Read for Cancels<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                let directory = std::fs::read_dir(self.parent)?
+                    .map(Result::unwrap)
+                    .find(|entry| entry.file_type().unwrap().is_dir())
+                    .unwrap()
+                    .path();
+                std::fs::write(directory.join("blocker"), b"test blocker")?;
+                self.cancel.store(true, Ordering::Relaxed);
+                Err(io::Error::new(io::ErrorKind::Interrupted, "injected copy cancellation"))
+            }
+        }
+        let error = registry
+            .prepare(|parent| {
+                let owner = DecodedBacking::prepare_from_reader(
+                    &mut Cancels { parent, cancel: &cancel },
+                    1,
+                    Interpretation::new(Encoding::UTF8, 0).unwrap(),
+                    parent,
+                    &cancel,
+                )
+                .map_err(kwil_core_text::decoded_backing::BackingError::into_io_error)?;
+                Ok(((), owner))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(RetirementError::take_from(&error).is_none(), "registry must own the failed helper resource");
+        assert_eq!(registry.retained(), 1);
+        let called = Cell::new(false);
+        let error = registry
+            .prepare(|_| {
+                called.set(true);
+                Ok(((), fixture.owner()))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!called.get(), "pending cleanup must refuse before another private preparation");
+        assert_eq!(registry.retire().cleanup_pending, 1);
+        assert_eq!(registry.retained(), 1);
+        let Some(Resource::Cleanup(paths)) = &registry.slots[0] else { panic!("retain exact cleanup paths") };
+        let directory = paths.directory.clone();
+        std::fs::remove_file(directory.join("blocker")).unwrap();
+        assert_eq!(registry.retire().retired, 1);
+        assert!(!directory.exists());
+        assert_eq!(registry.retained(), 0);
+        registry.prepare::<()>(|_| Err(io::Error::new(io::ErrorKind::NotFound, "ordinary failure"))).unwrap_err();
+        assert_eq!(registry.retained(), 0, "ordinary failures without resources free the slot");
+        registry.prepare(|_| Ok(((), fixture.owner()))).unwrap();
+        assert_eq!(registry.retire().retired, 1);
+    }
+
+    #[test]
+    fn pending_retirement_failed_index_callback_is_owned_before_error_returns() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("source");
+        std::fs::write(&path, b"abc").unwrap();
+        let file = TextFile::open(&path).unwrap();
+        let mut registry = fixture.registry(1);
+        let error = registry
+            .prepare(|parent| {
+                let prepared = crate::document_worker::decoded::prepare_with_index_check(
+                    path,
+                    file,
+                    None,
+                    parent,
+                    &AtomicBool::new(false),
+                    |_| {
+                        assert_eq!(std::fs::read_dir(parent)?.count(), 1, "preview precedes private files");
+                        Ok(())
+                    },
+                    || {
+                        let directory = std::fs::read_dir(parent)
+                            .unwrap()
+                            .map(Result::unwrap)
+                            .find(|entry| entry.file_type().unwrap().is_dir())
+                            .unwrap()
+                            .path();
+                        std::fs::write(directory.join("blocker"), b"test blocker").unwrap();
+                        true
+                    },
+                )?;
+                Ok(((), prepared.backing))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let Some(Resource::Cleanup(paths)) = &registry.slots[0] else { panic!("failed callback must retain paths") };
+        std::fs::remove_file(paths.directory.join("blocker")).unwrap();
+        assert_eq!(registry.retire().retired, 1);
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pending_retirement_failed_callback_retains_actual_live_owner() {
+        let fixture = Fixture::new();
+        let mut registry = fixture.registry(1);
+        let mut pin = None;
+        let error = registry
+            .prepare::<()>(|_| {
+                let owner = fixture.owner();
+                pin = Some(owner.snapshot());
+                let retirement = owner.try_retire().err().unwrap();
+                Err(retirement.with_cause(io::Error::new(io::ErrorKind::Interrupted, "failed callback")))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(matches!(registry.slots[0], Some(Resource::Owner(_))), "retain the actual owner while pins exist");
+        assert_eq!(registry.retained(), 1);
+        assert_eq!(registry.retire().live, 1);
+        assert_eq!(pin.as_ref().unwrap().logical_bytes(), b"abc");
+        let directory = pin.as_ref().unwrap().paths().directory.clone();
+        drop(pin);
+        assert!(directory.exists());
+        assert_eq!(registry.retire().retired, 1);
+        assert!(!directory.exists());
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {

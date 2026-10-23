@@ -217,14 +217,38 @@ fn commit_with_operations(
 /// A post-replacement error must never look like a failed, uncommitted write.
 /// Keep the underlying kind for diagnostics, and explicitly identify the saved
 /// pathname so frontends can report the committed/durability-uncertain state.
-fn committed_error(path: &Path, operation: &str, error: io::Error) -> io::Error {
-    io::Error::new(
-        error.kind(),
-        format!(
-            "file committed at {}, but {operation} failed: {error}; do not retry as an uncommitted save",
-            path.display()
-        ),
-    )
+fn committed_error(path: &Path, operation: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), SaveErrorContext { path: path.to_owned(), operation: Some(operation), cause: error })
+}
+
+#[derive(Debug)]
+struct SaveErrorContext {
+    path: PathBuf,
+    operation: Option<&'static str>,
+    cause: io::Error,
+}
+impl std::fmt::Display for SaveErrorContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(operation) = self.operation {
+            write!(
+                f,
+                "file committed at {}, but {operation} failed: {}; do not retry as an uncommitted save",
+                self.path.display(),
+                self.cause
+            )
+        } else {
+            write!(f, "cannot save {}: {}", self.path.display(), self.cause)?;
+            if self.cause.kind() == io::ErrorKind::PermissionDenied {
+                f.write_str("; path needs write permission or elevation; choose another path")?;
+            }
+            Ok(())
+        }
+    }
+}
+impl std::error::Error for SaveErrorContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
 }
 
 fn sync_parent(destination: &Path, parent: &Path) -> io::Result<()> {
@@ -330,12 +354,7 @@ fn visit_trimmed(
 }
 
 fn save_error(path: &Path, error: io::Error) -> io::Error {
-    let hint = if error.kind() == io::ErrorKind::PermissionDenied {
-        "; path needs write permission or elevation; choose another path"
-    } else {
-        ""
-    };
-    io::Error::new(error.kind(), format!("cannot save {}: {error}{hint}", path.display()))
+    io::Error::new(error.kind(), SaveErrorContext { path: path.to_owned(), operation: None, cause: error })
 }
 
 #[cfg(unix)]
@@ -428,6 +447,74 @@ fn replace(temp: &Path, destination: &Path, backup: Option<&Path>) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_retirement_atomic_prepare_and_committed_wrappers_preserve_resource_and_cause() {
+        use kwil_core_text::decoded_backing::{DecodedBacking, Interpretation, RetirementError};
+        use kwil_core_text::encoding::Encoding;
+        use std::sync::atomic::AtomicBool;
+        #[derive(Debug)]
+        struct PreparationFailure;
+        impl std::fmt::Display for PreparationFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("injected preparation failure")
+            }
+        }
+        impl std::error::Error for PreparationFailure {}
+        let f = Fixture::new();
+        fs::write(f.path(), b"keep destination").unwrap();
+        let original = open_for_editing(&f.path()).unwrap();
+        let buffer = Buffer::from_file(original.clone()).unwrap();
+        let error = commit_with_operations(
+            f.request(original, &buffer),
+            |snapshot, file| snapshot.write_to(file).map(|_| None),
+            |_| {
+                let owner = DecodedBacking::prepare_from_reader(
+                    &mut &b"a"[..],
+                    1,
+                    Interpretation::new(Encoding::UTF8, 0).unwrap(),
+                    &f.0,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                let directory = owner.snapshot().paths().directory.clone();
+                fs::write(directory.join("blocker"), b"test blocker").unwrap();
+                Err(owner
+                    .try_retire()
+                    .err()
+                    .unwrap()
+                    .with_cause(io::Error::new(io::ErrorKind::Interrupted, PreparationFailure)))
+            },
+            |_, _, _| panic!("preparation failure must precede replacement"),
+            sync_parent,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("cannot save"));
+        assert_eq!(fs::read(f.path()).unwrap(), b"keep destination");
+        // Deliberately place the pending token inside both atomic contexts.
+        let error = committed_error(&f.path(), "test durability operation", error);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("file committed at"));
+        let Some(RetirementError::Cleanup { paths, .. }) = RetirementError::take_from(&error) else {
+            panic!("typed pending cleanup must survive both save context wrappers");
+        };
+        let mut cause: &(dyn std::error::Error + 'static) = &error;
+        loop {
+            if cause.is::<PreparationFailure>() {
+                break;
+            }
+            cause = if let Some(io) = cause.downcast_ref::<io::Error>() {
+                io.get_ref().expect("I/O cause payload")
+            } else {
+                cause.source().expect("typed original preparation cause")
+            };
+        }
+        fs::remove_file(paths.directory.join("blocker")).unwrap();
+        paths.cleanup().unwrap();
+        assert!(!paths.directory.exists());
+    }
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     struct CountingAllocator;

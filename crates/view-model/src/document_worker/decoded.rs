@@ -16,14 +16,6 @@ pub struct PreparedDecodedDocument {
     pub backing: DecodedBacking,
 }
 
-fn backing_error(error: BackingError) -> io::Error {
-    match error {
-        BackingError::Io(error) => error,
-        BackingError::Cancelled => io::Error::new(io::ErrorKind::Interrupted, error),
-        other => io::Error::other(other),
-    }
-}
-
 /// `publish` admits a bounded, read-only preview to the existing completion
 /// queue. An admission error stops preparation; it never enables raw editing.
 /// The caller owns the worker lane, cancellation flag and retirement registry.
@@ -38,7 +30,7 @@ pub fn prepare_decoded_document(
     prepare_with_index_check(path, file, interpretation, private_parent, cancel, publish, || false)
 }
 
-fn prepare_with_index_check(
+pub(super) fn prepare_with_index_check(
     path: PathBuf,
     file: TextFile,
     interpretation: Option<Encoding>,
@@ -54,29 +46,17 @@ fn prepare_with_index_check(
     .map_err(io::Error::other)?;
     let detection = encoded.detection();
     let interpretation = Interpretation::new(detection.encoding, detection.bom_len).map_err(io::Error::other)?;
-    let preview = decode_preview(&file, interpretation, cancel).map_err(backing_error)?;
+    let preview = decode_preview(&file, interpretation, cancel).map_err(BackingError::into_io_error)?;
     publish(preview)?;
-    let backing = DecodedBacking::prepare(&file, interpretation, private_parent, cancel).map_err(backing_error)?;
+    let backing =
+        DecodedBacking::prepare(&file, interpretation, private_parent, cancel).map_err(BackingError::into_io_error)?;
     match Document::from_decoded_file_cancellable(path, file, backing.snapshot(), || {
         cancel.load(std::sync::atomic::Ordering::Relaxed) || index_cancelled()
     }) {
         Ok(document) => Ok(PreparedDecodedDocument { document, backing }),
         Err(error) => match backing.try_retire() {
             Ok(()) => Err(error),
-            Err(retirement) => {
-                // Keep the original failure and identify private recovery data.
-                // No unlink or source access is deferred to a UI-thread Drop.
-                let directory = match retirement {
-                    kwil_core_text::decoded_backing::RetirementError::LiveSnapshots(backing) => {
-                        backing.snapshot().paths().directory.clone()
-                    }
-                    kwil_core_text::decoded_backing::RetirementError::Cleanup { paths, .. } => paths.directory,
-                };
-                Err(io::Error::new(
-                    error.kind(),
-                    format!("{error}; decoded cleanup pending at {}", directory.display()),
-                ))
-            }
+            Err(retirement) => Err(retirement.with_cause(error)),
         },
     }
 }
@@ -85,6 +65,42 @@ fn prepare_with_index_check(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn pending_retirement_decoded_index_cancellation_keeps_cleanup_resource() {
+        let fixture = Fixture::new();
+        let (path, file) = fixture.file(b"text");
+        let error = prepare_with_index_check(
+            path,
+            file,
+            None,
+            &fixture.0,
+            &AtomicBool::new(false),
+            |_| Ok(()),
+            || {
+                let directory = std::fs::read_dir(&fixture.0)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .find(|entry| entry.file_type().unwrap().is_dir())
+                    .unwrap()
+                    .path();
+                std::fs::write(directory.join("blocker"), b"test blocker").unwrap();
+                true
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let Some(kwil_core_text::decoded_backing::RetirementError::Cleanup { paths, .. }) =
+            kwil_core_text::decoded_backing::RetirementError::take_from(&error)
+        else {
+            panic!("cancelled logical indexing must retain failed cleanup");
+        };
+        assert!(paths.cleanup().is_err());
+        std::fs::remove_file(paths.directory.join("blocker")).unwrap();
+        paths.cleanup().unwrap();
+        assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {

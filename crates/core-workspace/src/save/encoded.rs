@@ -1,7 +1,7 @@
 //! Worker-only encoded save: logical text and immutable raw provenance stay
 //! separate from the actual destination file. No file-sized payload or edit list.
 use super::*;
-use kwil_core_text::decoded_backing::{DecodedBacking, Interpretation, RetirementError};
+use kwil_core_text::decoded_backing::{BackingError, DecodedBacking, Interpretation};
 use kwil_core_text::encoding::{
     Encoding, EncodingError, SavePlan, validate_snapshot_save_cancellable, write_snapshot_cancellable,
 };
@@ -165,17 +165,7 @@ fn discard_prepared(prepared: Option<PreparedCheckpoint>, cause: io::Error) -> i
     drop(snapshot);
     match backing.try_retire() {
         Ok(()) => cause,
-        Err(RetirementError::Cleanup { paths, error }) => io::Error::new(
-            cause.kind(),
-            format!("{cause}; private decoded cleanup failed at {}: {error}", paths.directory.display()),
-        ),
-        Err(RetirementError::LiveSnapshots(backing)) => {
-            let pin = backing.snapshot();
-            io::Error::new(
-                cause.kind(),
-                format!("{cause}; private decoded backing still pinned at {}", pin.paths().directory.display()),
-            )
-        }
+        Err(retirement) => retirement.with_cause(cause),
     }
 }
 
@@ -232,7 +222,7 @@ fn save_encoded_with_index_cancellation(
                 private_parent,
                 cancel,
             )
-            .map_err(io::Error::other)?;
+            .map_err(BackingError::into_io_error)?;
             let origin = backing.snapshot();
             // Store the owner before any subsequent fallible work, so all
             // aborted precommit paths can explicitly retire it on this worker.
@@ -348,8 +338,115 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kwil_core_text::decoded_backing::RetirementError;
     use kwil_core_text::encoding::LineEnding;
     use std::cell::{Cell, RefCell};
+
+    fn block_checkpoint(root: &Path) -> PathBuf {
+        let directory = fs::read_dir(root)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.file_type().unwrap().is_dir())
+            .unwrap()
+            .path();
+        fs::write(directory.join("blocker"), b"test blocker").unwrap();
+        directory
+    }
+
+    #[test]
+    fn pending_retirement_encoded_precommit_cleanup_survives_atomic_context() {
+        let f = Fixture::new();
+        fs::write(f.path(), b"keep destination").unwrap();
+        let mut buffer = Buffer::empty();
+        buffer.insert(0, b"new").unwrap();
+        let error = save_encoded_with_index_cancellation(
+            f.request(&buffer, false),
+            plan(Encoding::UTF8, false),
+            &f.root,
+            &AtomicBool::new(false),
+            |_, _, _| panic!("cancelled index must not replace destination"),
+            || {
+                block_checkpoint(&f.root);
+                true
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("cannot save"));
+        assert_eq!(fs::read(f.path()).unwrap(), b"keep destination");
+        let Some(RetirementError::Cleanup { paths, .. }) = RetirementError::take_from(&error) else {
+            panic!("atomic save context must preserve typed cleanup");
+        };
+        fs::remove_file(paths.directory.join("blocker")).unwrap();
+        paths.cleanup().unwrap();
+        assert_eq!(f.private_directories(), 0);
+        assert_eq!(fs::read_dir(&f.root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pending_retirement_encoded_postcommit_cleanup_keeps_committed_context() {
+        let f = Fixture::new();
+        let mut buffer = Buffer::empty();
+        buffer.insert(0, b"saved bytes").unwrap();
+        let retained = f.root.join("committed-copy");
+        let error = save_encoded_with_operations(
+            f.request(&buffer, false),
+            plan(Encoding::UTF8, false),
+            &f.root,
+            &AtomicBool::new(false),
+            |temp, destination, backup| {
+                replace(temp, destination, backup)?;
+                fs::rename(destination, &retained)?;
+                block_checkpoint(&f.root);
+                Ok(())
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("file committed at"));
+        assert!(error.to_string().contains("destination reopen"));
+        let Some(RetirementError::Cleanup { paths, .. }) = RetirementError::take_from(&error) else {
+            panic!("postcommit cleanup must retain its resource");
+        };
+        // Extracting the resource must not erase committed diagnostics.
+        assert!(error.to_string().contains("do not retry as an uncommitted save"));
+        assert_eq!(fs::read(retained).unwrap(), b"saved bytes");
+        fs::remove_file(paths.directory.join("blocker")).unwrap();
+        paths.cleanup().unwrap();
+    }
+
+    #[test]
+    fn pending_retirement_encoded_discard_preserves_live_owner() {
+        let f = Fixture::new();
+        let owner = DecodedBacking::prepare_from_reader(
+            &mut &b"pinned"[..],
+            6,
+            Interpretation::new(Encoding::UTF8, 0).unwrap(),
+            &f.root,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let pin = owner.snapshot();
+        let directory = pin.paths().directory.clone();
+        let prepared = PreparedCheckpoint {
+            snapshot: Some(Buffer::from_decoded(owner.snapshot()).snapshot()),
+            backing: owner,
+            logical_coordinates_changed: false,
+            normalized: false,
+        };
+        let error = discard_prepared(Some(prepared), io::Error::new(io::ErrorKind::Interrupted, "failed save"));
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let Some(RetirementError::LiveSnapshots(owner)) = RetirementError::take_from(&error) else {
+            panic!("encoded discard must preserve the actual pinned owner");
+        };
+        assert_eq!(pin.raw_bytes(), b"pinned");
+        assert!(directory.exists());
+        drop(pin);
+        assert!(owner.try_retire().is_ok());
+        assert!(!directory.exists());
+    }
 
     struct Fixture {
         root: PathBuf,
