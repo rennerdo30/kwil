@@ -1379,7 +1379,29 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
     if !document.is_dirty()
         && let Some(path) = &tab.path
     {
-        let disk = kwil_core_workspace::open_for_editing(path).and_then(|file| index(path.clone(), file));
+        let disk = match kwil_core_workspace::open_for_editing(path) {
+            Ok(file) => {
+                // A raw-v1 journal has no decoded-coordinate policy. Never
+                // attach its raw index under the default UTF-8 save policy
+                // when the actual disk interpretation is different or unclear.
+                let encoded = kwil_core_text::encoding::EncodedFile::new(file.clone()).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("Legacy raw-v1 clean recovery cannot verify the encoding: {error}; journal retained"),
+                    )
+                })?;
+                if encoded.detection().encoding != kwil_core_text::encoding::Encoding::UTF8
+                    || file.bytes().map_err(io::Error::other)?.contains(&0)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Legacy raw-v1 clean recovery requires unambiguous UTF-8 without NUL bytes; journal retained",
+                    ));
+                }
+                index(path.clone(), file)
+            }
+            Err(error) => Err(error),
+        };
         match disk {
             Ok(mut disk) if snapshots_equal(&snapshot, &disk.snapshot())? => {
                 disk.revision = document.revision;
@@ -2255,6 +2277,70 @@ mod tests {
         document.snapshot().write_to(&mut actual).unwrap();
         assert_eq!(actual, b"old bytes");
         assert_eq!(std::fs::read(&path).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn legacy_clean_recovery_refuses_unsafe_encoding_before_editor_exposure_and_retains_journal() {
+        for (label, original) in [
+            ("bomless-utf16le", b"A\0B\0C\0D\0".as_slice()),
+            ("bomless-utf16be", b"\0A\0B\0C\0D".as_slice()),
+            ("bom-utf16le", b"\xff\xfeA\0B\0".as_slice()),
+            ("bom-utf16be", b"\xfe\xff\0A\0B".as_slice()),
+            ("unsupported-utf32", b"\xff\xfe\0\0A\0\0\0".as_slice()),
+            ("ambiguous-nul", b"a\0b".as_slice()),
+        ] {
+            let scratch = Scratch::new();
+            let path = scratch.0.join(format!("{label}.txt"));
+            let mut tab = recovery_tab(Some(path.clone()));
+            tab.saved_revision = tab.revision;
+            fixture_journal(&scratch.0, &tab, original);
+            std::fs::write(&path, original).unwrap();
+            let journal_path = scratch.0.join("1.kwj");
+            let journal_before = std::fs::read(&journal_path).unwrap();
+            let error = match recover_document(journal_path.clone(), &tab) {
+                Err(error) => error,
+                Ok(_) => panic!("legacy clean {label} must be refused before exposing an editor/save request"),
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{label}: {error}");
+            assert!(error.to_string().contains("journal retained"));
+            assert_eq!(std::fs::read(&path).unwrap(), original, "{label}: original bytes must not change");
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before, "{label}: journal must not change");
+            let mut replayed = Vec::new();
+            let recovered = RecoveredJournal::open(journal_path, tab.id, &AtomicBool::new(false), |event| {
+                if let RecoveryEvent::BaseBytes(bytes) = event {
+                    replayed.extend_from_slice(bytes);
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(recovered.summary().revision, tab.revision);
+            assert_eq!(replayed, original, "{label}: refused journal must remain recoverable");
+        }
+    }
+
+    #[test]
+    fn legacy_clean_recovery_keeps_verified_utf8_edit_save_and_journal_bytes() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("utf8.txt");
+        let mut tab = recovery_tab(Some(path.clone()));
+        tab.saved_revision = tab.revision;
+        let original = "plain 🌿\r\n".as_bytes();
+        fixture_journal(&scratch.0, &tab, original);
+        std::fs::write(&path, original).unwrap();
+        let journal_path = scratch.0.join("1.kwj");
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let (document, recovered, _) = recover_document(journal_path.clone(), &tab).unwrap();
+        assert!(!document.is_dirty());
+        assert_eq!(document.path(), Some(path.as_path()));
+        assert!(document.original.is_some());
+        let mut editor = crate::Editor::new(document);
+        editor.execute("edit.insert", &crate::CommandArgs { text: Some("x".into()), ..Default::default() }, 1).unwrap();
+        let saved = kwil_core_workspace::save_snapshot(editor.save_request(None).unwrap()).unwrap();
+        editor.finish_save(Ok(saved)).unwrap();
+        assert!(!editor.document().is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), [b"x".as_slice(), original].concat());
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        drop((editor, recovered));
     }
 
     #[test]
