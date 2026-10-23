@@ -1,6 +1,9 @@
 //! Persistent AVL rope. Leaves reference immutable original/add storage;
 //! branches cache extensible subtree metrics. No document bytes are copied.
 
+use crate::decoded_backing::DecodedSnapshot;
+use crate::decoded_piece::IndexedDecoded;
+use crate::encoding::Encoding;
 use crate::{ReadError, TextFile};
 use memchr::memchr_iter;
 use std::collections::BTreeMap;
@@ -14,18 +17,46 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(crate) const ADD_BLOCK: usize = 64 * 1024;
 const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
 pub(crate) type Tree = Option<Arc<Node>>;
-pub(crate) type OriginalUses = BTreeMap<usize, (crate::file::OriginalRef, u64)>;
+pub(crate) type OriginalUses = BTreeMap<(u8, usize), (SourceRef, u64)>;
+
+#[derive(Clone)]
+pub(crate) enum SourceRef {
+    Raw(crate::file::OriginalRef),
+    Decoded { source: std::sync::Weak<IndexedDecoded>, cost: usize },
+}
+
+impl SourceRef {
+    fn id(&self) -> (u8, usize) {
+        match self {
+            Self::Raw(source) => (0, source.id()),
+            Self::Decoded { source, .. } => (1, source.as_ptr() as usize),
+        }
+    }
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Raw(source) => source.retained_bytes(),
+            Self::Decoded { source, cost } => {
+                if source.strong_count() == 0 {
+                    0
+                } else {
+                    *cost
+                }
+            }
+        }
+    }
+}
 
 /// Shared across all versions, so keeping worker snapshots cannot bypass
 /// the resident add-byte cap. The OS page cache of spilled blocks is separate.
 pub(crate) struct AddBudget {
     pub limit: usize,
     pub used: AtomicUsize,
+    owner: Arc<()>,
 }
 
 impl AddBudget {
-    pub fn new(limit: usize) -> Arc<Self> {
-        Arc::new(Self { limit, used: AtomicUsize::new(0) })
+    pub fn new(limit: usize, owner: Arc<()>) -> Arc<Self> {
+        Arc::new(Self { limit, used: AtomicUsize::new(0), owner })
     }
 }
 
@@ -105,8 +136,20 @@ impl Drop for DiskBlock {
 
 enum Storage {
     Original(TextFile),
-    Memory { bytes: Box<[u8]>, budget: Arc<AddBudget> },
+    Decoded(Arc<IndexedDecoded>),
+    Memory {
+        bytes: Box<[u8]>,
+        budget: Arc<AddBudget>,
+    },
     Disk(DiskBlock),
+    /// Bounded detached opaque run. Each payload/table block is <= ADD_BLOCK
+    /// and uses the destination budget (or its existing immutable spill path).
+    Opaque {
+        encoding: Encoding,
+        logical: Arc<Storage>,
+        raw: Arc<Storage>,
+        offsets: Arc<Storage>,
+    },
 }
 
 impl Drop for Storage {
@@ -121,8 +164,10 @@ impl Storage {
     fn bytes(&self) -> Result<&[u8], ReadError> {
         Ok(match self {
             Self::Original(file) => file.bytes()?,
+            Self::Decoded(source) => source.origin.logical_bytes(),
             Self::Memory { bytes, .. } => bytes,
             Self::Disk(block) => block.map.as_ref().expect("mapped add block"),
+            Self::Opaque { logical, .. } => logical.bytes()?,
         })
     }
 
@@ -131,6 +176,8 @@ impl Storage {
             Self::Original(file) => {
                 file.index().expect("indexed original").line_of_offset(file.bytes()?, offset).unwrap()
             }
+            Self::Decoded(source) => source.index.line_of_offset(source.origin.logical_bytes(), offset).unwrap(),
+            Self::Opaque { .. } => 0,
             // Added pieces never scan more than ADD_BLOCK bytes.
             _ => memchr_iter(b'\n', &self.bytes()?[..offset as usize]).count() as u64,
         })
@@ -139,6 +186,11 @@ impl Storage {
     fn line_start(&self, line: u64) -> Result<u64, ReadError> {
         Ok(match self {
             Self::Original(file) => file.index().unwrap().line_start(file.bytes()?, line).unwrap(),
+            Self::Decoded(source) => source.index.line_start(source.origin.logical_bytes(), line).unwrap(),
+            Self::Opaque { .. } => {
+                assert_eq!(line, 0);
+                0
+            }
             _ if line == 0 => 0,
             _ => memchr_iter(b'\n', self.bytes()?).nth((line - 1) as usize).unwrap() as u64 + 1,
         })
@@ -148,6 +200,9 @@ impl Storage {
         let bytes = match self {
             Self::Memory { bytes, .. } => bytes.len(),
             Self::Disk(block) => block.path.capacity(),
+            Self::Opaque { logical, raw, offsets, .. } => {
+                logical.retained_bytes() + raw.retained_bytes() + offsets.retained_bytes()
+            }
             _ => 0, // Original storage is baseline; mapped add bytes are page cache.
         };
         bytes + std::mem::size_of::<Self>() + ARC_HEADER
@@ -187,6 +242,30 @@ pub(crate) struct Node {
     pub metrics: Metrics,
     height: u32,
     kind: Kind,
+    affinity: Affinity,
+}
+
+enum Affinity {
+    Free,
+    Owned(Arc<()>),
+    Mixed,
+}
+impl Affinity {
+    fn accepts(&self, owner: &Arc<()>) -> bool {
+        match self {
+            Self::Free => true,
+            Self::Owned(source) => Arc::ptr_eq(source, owner),
+            Self::Mixed => false,
+        }
+    }
+    fn joined(a: &Self, b: &Self) -> Self {
+        match (a, b) {
+            (Self::Free, Self::Free) => Self::Free,
+            (Self::Owned(a), Self::Free) | (Self::Free, Self::Owned(a)) => Self::Owned(a.clone()),
+            (Self::Owned(a), Self::Owned(b)) if Arc::ptr_eq(a, b) => Self::Owned(a.clone()),
+            _ => Self::Mixed,
+        }
+    }
 }
 
 enum Kind {
@@ -202,6 +281,7 @@ fn leaf(piece: Piece) -> Arc<Node> {
             retained: std::mem::size_of::<Node>() + ARC_HEADER + piece.storage.retained_bytes(),
         },
         height: 1,
+        affinity: piece.owner.as_ref().map_or(Affinity::Free, |owner| Affinity::Owned(owner.clone())),
         kind: Kind::Leaf(piece),
     })
 }
@@ -218,6 +298,7 @@ fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
                 .saturating_add(std::mem::size_of::<Node>() + ARC_HEADER),
         },
         height: 1 + left.height.max(right.height),
+        affinity: Affinity::joined(&left.affinity, &right.affinity),
         kind: Kind::Branch(left, right),
     })
 }
@@ -312,43 +393,142 @@ pub(crate) fn original(file: TextFile, owner: Arc<()>) -> Result<Tree, ReadError
 pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
     let mut tree = None;
     for chunk in bytes.chunks(ADD_BLOCK) {
-        let reserved = budget
-            .used
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(chunk.len()).filter(|&next| next <= budget.limit)
-            })
-            .is_ok();
-        let storage = if reserved {
-            Storage::Memory { bytes: chunk.into(), budget: budget.clone() }
-        } else {
-            Storage::Disk(DiskBlock::new(chunk)?)
-        };
+        let storage = capped_block(chunk, budget)?;
+        let owner = matches!(&*storage, Storage::Memory { .. }).then(|| budget.owner.clone());
         let breaks = memchr_iter(b'\n', chunk).count() as u64;
-        tree = join(
-            tree,
-            Some(leaf(Piece {
-                storage: Arc::new(storage),
-                owner: None,
-                start: 0,
-                end: chunk.len() as u64,
-                first_line: 0,
-                breaks,
-            })),
-        );
+        tree =
+            join(tree, Some(leaf(Piece { storage, owner, start: 0, end: chunk.len() as u64, first_line: 0, breaks })));
     }
     Ok(tree)
+}
+
+fn capped_block(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Arc<Storage>> {
+    assert!(bytes.len() <= ADD_BLOCK);
+    let reserved = budget
+        .used
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes.len()).filter(|&next| next <= budget.limit)
+        })
+        .is_ok();
+    Ok(Arc::new(if reserved {
+        Storage::Memory { bytes: bytes.into(), budget: budget.clone() }
+    } else {
+        Storage::Disk(DiskBlock::new(bytes)?)
+    }))
+}
+
+fn opaque_run(encoding: Encoding, raw: &[u8], offsets: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
+    // The offset table includes both endpoints. It is itself budgeted payload,
+    // never an uncharged Vec retained by a snapshot.
+    assert!(offsets.len().is_multiple_of(4) && offsets.len() >= 8 && offsets.len() <= ADD_BLOCK);
+    let count = offsets.len() / 4 - 1;
+    let logical = capped_block(&vec![0xff; count], budget)?;
+    let raw = capped_block(raw, budget)?;
+    let offsets = capped_block(offsets, budget)?;
+    let resident = [&logical, &raw, &offsets].iter().any(|storage| matches!(&***storage, Storage::Memory { .. }));
+    Ok(Some(leaf(Piece {
+        storage: Arc::new(Storage::Opaque { encoding, logical, raw, offsets }),
+        owner: resident.then(|| budget.owner.clone()),
+        start: 0,
+        end: count as u64,
+        first_line: 0,
+        breaks: 0,
+    })))
+}
+
+fn offset_at(offsets: &[u8], at: u64) -> usize {
+    let at = usize::try_from(at).expect("bounded opaque logical offset");
+    let bytes = offsets.get(at * 4..at * 4 + 4).expect("opaque endpoint table");
+    u32::from_le_bytes(bytes.try_into().unwrap()) as usize
+}
+
+fn import_decoded(origin: &DecodedSnapshot, range: Range<u64>, budget: &Arc<AddBudget>) -> io::Result<Tree> {
+    crate::decoded_piece::validate_range(origin, range.clone())?;
+    let bytes = &origin.logical_bytes()[range.start as usize..range.end as usize];
+    let mut tree = None;
+    let mut position = 0;
+    while position < bytes.len() {
+        if bytes[position] != 0xff {
+            let end = memchr::memchr(0xff, &bytes[position..]).map_or(bytes.len(), |at| position + at);
+            tree = join(tree, added(&bytes[position..end], budget)?);
+            position = end;
+        } else {
+            let end = bytes[position..].iter().position(|&byte| byte != 0xff).map_or(bytes.len(), |at| position + at);
+            let mut raw = Vec::with_capacity(ADD_BLOCK);
+            let mut offsets = Vec::with_capacity(ADD_BLOCK);
+            offsets.extend_from_slice(&0_u32.to_le_bytes());
+            for atom in
+                origin.atoms(range.start + position as u64..range.start + end as u64).map_err(io::Error::other)?
+            {
+                let atom = atom.map_err(io::Error::other)?;
+                if offsets.len() + 4 > ADD_BLOCK || raw.len() + atom.raw_bytes.len() > ADD_BLOCK {
+                    tree = join(tree, opaque_run(origin.interpretation().encoding, &raw, &offsets, budget)?);
+                    raw.clear();
+                    offsets.clear();
+                    offsets.extend_from_slice(&0_u32.to_le_bytes());
+                }
+                raw.extend_from_slice(atom.raw_bytes);
+                offsets.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            }
+            tree = join(tree, opaque_run(origin.interpretation().encoding, &raw, &offsets, budget)?);
+            position = end;
+        }
+    }
+    Ok(tree)
+}
+
+pub(crate) fn decoded(origin: DecodedSnapshot, owner: Arc<()>) -> Tree {
+    if origin.logical_bytes().is_empty() {
+        return None;
+    }
+    let source = Arc::new(IndexedDecoded::new(origin));
+    let end = source.origin.logical_bytes().len() as u64;
+    let breaks = source.index.line_count() - 1;
+    Some(leaf(Piece {
+        storage: Arc::new(Storage::Decoded(source)),
+        owner: Some(owner),
+        start: 0,
+        end,
+        first_line: 0,
+        breaks,
+    }))
 }
 
 /// Import foreign original ranges and resident add blocks into the destination
 /// cap. Its own originals/add blocks and immutable spill blocks remain shared.
 pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>) -> io::Result<Tree> {
+    import_observed(tree, budget, owner, &mut || {})
+}
+
+fn import_observed(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>, visit: &mut impl FnMut()) -> io::Result<Tree> {
     let Some(node) = tree else { return Ok(None) };
+    visit();
+    // Cached lineage and capped storage ownership make an own-document move
+    // O(1), including a composite root or a root retained before checkpoint.
+    if node.affinity.accepts(owner) {
+        return Ok(Some(node));
+    }
     match &node.kind {
         Kind::Leaf(piece) => {
+            if let Storage::Decoded(source) = &*piece.storage {
+                return import_decoded(&source.origin, piece.start..piece.end, budget);
+            }
+            if let Storage::Opaque { encoding, raw, offsets, .. } = &*piece.storage {
+                let offsets = offsets.bytes().map_err(io::Error::other)?;
+                let begin = offset_at(offsets, piece.start);
+                let end = offset_at(offsets, piece.end);
+                let mut rebased = Vec::with_capacity((piece.end - piece.start + 1) as usize * 4);
+                for at in piece.start..=piece.end {
+                    rebased.extend_from_slice(&((offset_at(offsets, at) - begin) as u32).to_le_bytes());
+                }
+                return opaque_run(*encoding, &raw.bytes().map_err(io::Error::other)?[begin..end], &rebased, budget);
+            }
             let foreign = match piece.storage.as_ref() {
                 Storage::Memory { budget: source, .. } => !Arc::ptr_eq(source, budget),
                 Storage::Original(_) => !piece.owner.as_ref().is_some_and(|source| Arc::ptr_eq(source, owner)),
+                Storage::Decoded(_) => !piece.owner.as_ref().is_some_and(|source| Arc::ptr_eq(source, owner)),
                 Storage::Disk(_) => false,
+                Storage::Opaque { .. } => unreachable!(),
             };
             if foreign {
                 let bytes = piece.storage.bytes().map_err(io::Error::other)?;
@@ -358,8 +538,8 @@ pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>)
             }
         }
         Kind::Branch(left, right) => {
-            let a = import_added(Some(left.clone()), budget, owner)?;
-            let b = import_added(Some(right.clone()), budget, owner)?;
+            let a = import_observed(Some(left.clone()), budget, owner, visit)?;
+            let b = import_observed(Some(right.clone()), budget, owner, visit)?;
             if a.as_ref().is_some_and(|a| Arc::ptr_eq(a, left)) && b.as_ref().is_some_and(|b| Arc::ptr_eq(b, right)) {
                 Ok(Some(node))
             } else {
@@ -367,6 +547,13 @@ pub(crate) fn import_added(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>)
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn import_visit_count(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>) -> usize {
+    let mut count = 0;
+    import_observed(tree, budget, owner, &mut || count += 1).unwrap();
+    count
 }
 
 /// Exact source byte ownership from cached metrics, with no file reads.
@@ -383,8 +570,14 @@ pub(crate) fn original_uses(tree: &Tree, range: Range<u64>) -> OriginalUses {
                 stack.push((left, offset));
             }
             Kind::Leaf(piece) => {
-                if let Storage::Original(file) = &*piece.storage {
-                    let source = file.history_backing_ref();
+                let source = match &*piece.storage {
+                    Storage::Original(file) => Some(SourceRef::Raw(file.history_backing_ref())),
+                    Storage::Decoded(source) => {
+                        Some(SourceRef::Decoded { source: Arc::downgrade(source), cost: source.retained_bytes() })
+                    }
+                    _ => None,
+                };
+                if let Some(source) = source {
                     let bytes = (range.end - offset).min(node.metrics.bytes) - range.start.saturating_sub(offset);
                     result.entry(source.id()).or_insert((source, 0)).1 += bytes;
                 }
@@ -403,6 +596,7 @@ pub(crate) fn saved_original(tree: &Tree) -> bool {
             Storage::Original(file) => {
                 piece.start == 0 && piece.end == file.len() && file.resident_original_bytes() == 0
             }
+            Storage::Decoded(source) => piece.start == 0 && piece.end == source.origin.logical_bytes().len() as u64,
             _ => false,
         },
         _ => false,
@@ -415,7 +609,9 @@ pub(crate) fn own_saved_original(tree: Tree, owner: &Arc<()>) -> Tree {
     let node = tree?;
     match &node.kind {
         Kind::Leaf(piece) => match &*piece.storage {
-            Storage::Original(_) => Some(leaf(Piece { owner: Some(owner.clone()), ..piece.clone() })),
+            Storage::Original(_) | Storage::Decoded(_) => {
+                Some(leaf(Piece { owner: Some(owner.clone()), ..piece.clone() }))
+            }
             _ => Some(node),
         },
         _ => Some(node),
@@ -468,6 +664,23 @@ pub enum SourceChunk<'a> {
         range: Range<u64>,
         bytes: &'a [u8],
     },
+    /// Logical UTF-8 coordinates in this immutable decoded generation. Its
+    /// typed opaque atoms retain their original bytes, independently of BOMs.
+    Decoded {
+        origin: &'a DecodedSnapshot,
+        range: Range<u64>,
+        bytes: &'a [u8],
+    },
+    /// Detached foreign opaque atoms. `raw_offsets` has one LE u32 per atom
+    /// boundary, including the end, relative to the block's original raw start.
+    /// Subtract its first entry to index into this chunk's `raw_bytes`.
+    /// Each atom corresponds to one FF in `bytes`, NOT to a literal FF byte.
+    Opaque {
+        encoding: Encoding,
+        bytes: &'a [u8],
+        raw_bytes: &'a [u8],
+        raw_offsets: &'a [u8],
+    },
     /// Added bytes are UTF-8 for an encoding-aware editor.
     Added(&'a [u8]),
 }
@@ -497,12 +710,26 @@ impl<'a> Iterator for SourceChunks<'a> {
                 Kind::Leaf(piece) => {
                     let start = piece.start + self.0.range.start.saturating_sub(offset);
                     let end = piece.start + (self.0.range.end - offset).min(node.metrics.bytes);
-                    let result = piece.storage.bytes().map(|bytes| {
+                    let result = piece.storage.bytes().and_then(|bytes| {
                         let bytes = &bytes[start as usize..end as usize];
-                        match piece.storage.as_ref() {
+                        Ok(match piece.storage.as_ref() {
                             Storage::Original(file) => SourceChunk::Original { file, range: start..end, bytes },
+                            Storage::Decoded(source) => {
+                                SourceChunk::Decoded { origin: &source.origin, range: start..end, bytes }
+                            }
+                            Storage::Opaque { encoding, raw, offsets, .. } => {
+                                let table = offsets.bytes()?;
+                                let begin = offset_at(table, start);
+                                let finish = offset_at(table, end);
+                                SourceChunk::Opaque {
+                                    encoding: *encoding,
+                                    bytes,
+                                    raw_bytes: &raw.bytes()?[begin..finish],
+                                    raw_offsets: &table[start as usize * 4..(end as usize + 1) * 4],
+                                }
+                            }
                             _ => SourceChunk::Added(bytes),
-                        }
+                        })
                     });
                     if result.is_err() {
                         self.0.stack.clear();

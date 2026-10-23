@@ -23,6 +23,41 @@ pub struct Snapshot {
     originals: Arc<OriginalUses>,
 }
 
+/// Send this handle and an immutable source snapshot to an import worker.
+/// Foreign raw/decoded originals and opaque provenance are copied in bounded
+/// blocks under this document's resident/spill cap. Private spill creation and
+/// last-drop file removal must run off the UI thread, as for all add blocks.
+#[derive(Clone)]
+pub struct SnapshotImporter {
+    added: Arc<AddBudget>,
+    owner: Arc<()>,
+}
+
+impl SnapshotImporter {
+    pub fn prepare(&self, source: &Snapshot, range: Range<u64>) -> io::Result<Snapshot> {
+        source.check_range(&range)?;
+        let full = range.start == 0 && range.end == source.len();
+        let selected = if full {
+            source.root.clone()
+        } else {
+            let (_, tail) = piece_tree::split(source.root.clone(), range.start).map_err(io::Error::other)?;
+            piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?.0
+        };
+        let root = piece_tree::import_added(selected, &self.added, &self.owner)?;
+        let shared = match (&root, &source.root) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let originals = if full && shared {
+            source.originals.clone()
+        } else {
+            Arc::new(piece_tree::original_uses(&root, 0..range.end - range.start))
+        };
+        Ok(Snapshot { root, originals })
+    }
+}
+
 impl Snapshot {
     pub fn len(&self) -> u64 {
         self.root.as_ref().map_or(0, |node| node.metrics.bytes)
@@ -205,13 +240,14 @@ impl Buffer {
 
     /// Choose the resident add-byte cap before any edits (zero always spills).
     pub fn with_add_memory_limit(bytes: usize) -> Self {
+        let owner = Arc::new(());
         Self {
             snapshot: Snapshot::default(),
-            added: AddBudget::new(bytes),
+            added: AddBudget::new(bytes, owner.clone()),
             history: History::new(UNDO_MEMORY),
             transaction: None,
             typing: None,
-            owner: Arc::new(()),
+            owner,
         }
     }
 
@@ -228,8 +264,27 @@ impl Buffer {
         Ok(buffer)
     }
 
+    /// Attach an immutable worker-prepared decoded generation. Builds sparse
+    /// logical UTF-8 line metrics on the calling worker, without copying text.
+    /// Keep its DecodedBacking owner on the worker retirement queue.
+    pub fn from_decoded(origin: crate::decoded_backing::DecodedSnapshot) -> Self {
+        let mut buffer = Self::empty();
+        let root = piece_tree::decoded(origin, buffer.owner.clone());
+        let len = root.as_ref().map_or(0, |node| node.metrics.bytes);
+        let originals = Arc::new(piece_tree::original_uses(&root, 0..len));
+        buffer.snapshot = Snapshot { root, originals };
+        buffer
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.clone()
+    }
+
+    /// Capture before dispatching foreign clipboard/register imports to a
+    /// worker. Insert the returned snapshot through insert_snapshot_range;
+    /// its already admitted blocks then share in O(1), without spill writes.
+    pub fn snapshot_importer(&self) -> SnapshotImporter {
+        SnapshotImporter { added: self.added.clone(), owner: self.owner.clone() }
     }
 
     pub fn len(&self) -> u64 {
@@ -269,8 +324,9 @@ impl Buffer {
         self.insert_inner(offset, bytes, false)
     }
 
-    /// Insert an immutable range by sharing pieces, without copying its bytes.
-    /// Useful for huge-line moves, duplication, clipboard and Vim registers.
+    /// Own-document ranges share pieces. Foreign imports can create spill files
+    /// and must be prepared on a worker via snapshot_importer first. Last-drop
+    /// spill cleanup also belongs on the worker retirement path.
     pub fn insert_snapshot_range(&mut self, offset: u64, source: &Snapshot, range: Range<u64>) -> io::Result<()> {
         self.snapshot.check_range(&(offset..offset))?;
         source.check_range(&range)?;
@@ -280,17 +336,16 @@ impl Buffer {
         self.len()
             .checked_add(range.end - range.start)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
-        let (_, tail) = piece_tree::split(source.root.clone(), range.start).map_err(io::Error::other)?;
-        let (inserted, _) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
-        let inserted = piece_tree::import_added(inserted, &self.added, &self.owner)?;
-        let uses = piece_tree::original_uses(&inserted, 0..range.end - range.start);
+        let prepared = self.snapshot_importer().prepare(source, range)?;
+        let inserted = prepared.root;
+        let uses = prepared.originals;
         let before = self.snapshot();
         let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(piece_tree::join(left, inserted), right);
         if !uses.is_empty() {
             let mut originals = self.snapshot.originals.as_ref().clone();
-            for (id, (source, bytes)) in uses {
-                originals.entry(id).or_insert((source, 0)).1 += bytes;
+            for (&id, (source, bytes)) in uses.iter() {
+                originals.entry(id).or_insert((source.clone(), 0)).1 += bytes;
             }
             self.snapshot.originals = Arc::new(originals);
         }
@@ -506,6 +561,69 @@ impl Buffer {
 #[cfg(test)]
 mod editing_contract_tests {
     use super::*;
+
+    #[test]
+    fn decoded_source_bookkeeping_charges_index_once_and_prunes_empty_roots() {
+        use crate::decoded_backing::{DecodedBacking, Interpretation};
+        use crate::encoding::Encoding;
+        use std::sync::atomic::AtomicBool;
+        let fixture = OriginalsFixture::new();
+        let path = fixture.0.join("decoded-history.txt");
+        std::fs::write(&path, b"z\n".repeat(100_000)).unwrap();
+        let file = TextFile::open(&path).unwrap();
+        let owner = DecodedBacking::prepare(
+            &file,
+            Interpretation::new(Encoding::UTF8, 0).unwrap(),
+            &fixture.0,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut buffer = Buffer::from_decoded(owner.snapshot());
+        let initial = buffer.snapshot();
+        let cost = initial.originals.values().next().unwrap().0.retained_bytes();
+        assert!(cost > 1000, "logical sparse index must be accounted");
+        buffer.begin();
+        for line in (0..100).rev() {
+            buffer.insert(line * 2, b"x").unwrap();
+        }
+        buffer.commit();
+        assert_eq!(buffer.snapshot.originals.len(), 1);
+        assert_eq!(buffer.snapshot.originals.values().next().unwrap().1, 200_000);
+        assert!(buffer.snapshot.retained_bytes() < cost + 200_000, "100 pieces must not charge 100 full indexes");
+        let clipped = initial.slice(1..2).unwrap();
+        assert_eq!(clipped.originals.len(), 1);
+        assert_eq!(clipped.originals.values().next().unwrap().1, 1);
+        let doubled = clipped.concat(&clipped).unwrap();
+        assert_eq!(doubled.originals.len(), 1);
+        assert_eq!(doubled.originals.values().next().unwrap().1, 2);
+        buffer.set_undo_memory_limit(0);
+        buffer.delete(0..buffer.len()).unwrap();
+        assert!(buffer.snapshot.originals.is_empty());
+        assert_eq!(buffer.undo_memory_bytes(), 0);
+        drop((buffer, initial, clipped, doubled));
+        assert!(owner.try_retire().is_ok(), "bookkeeping must not retain the decoded origin");
+    }
+
+    #[test]
+    fn own_composite_import_uses_cached_lineage_without_visiting_leaves() {
+        let mut buffer = Buffer::empty();
+        for _ in 0..32 {
+            buffer.insert(buffer.len(), b"abc\n").unwrap();
+        }
+        let source = buffer.snapshot();
+        assert_eq!(
+            piece_tree::import_visit_count(source.root.clone(), &buffer.added, &buffer.owner),
+            1,
+            "own composite import must not traverse its leaves"
+        );
+        let prepared = buffer.snapshot_importer().prepare(&source, 0..source.len()).unwrap();
+        assert!(Arc::ptr_eq(source.root.as_ref().unwrap(), prepared.root.as_ref().unwrap()));
+        buffer.set_undo_memory_limit(0);
+        buffer.delete(0..buffer.len()).unwrap();
+        buffer.insert_snapshot_range(0, &prepared, 0..prepared.len()).unwrap();
+        assert!(Arc::ptr_eq(source.root.as_ref().unwrap(), buffer.snapshot.root.as_ref().unwrap()));
+        assert_eq!(buffer.add_memory_bytes(), 128);
+    }
 
     #[test]
     fn model_metadata_charge_is_idempotent_and_obeys_history_cap() {

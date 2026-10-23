@@ -28,6 +28,10 @@ use std::sync::{Arc, OnceLock};
 #[path = "encoding_tests.rs"]
 mod tests;
 
+#[path = "encoded_snapshot.rs"]
+mod snapshot_save;
+pub use snapshot_save::{validate_snapshot_save, write_snapshot};
+
 const SAMPLE: usize = 64 << 10;
 const STRIDE: usize = 64 << 10;
 const SCRATCH: usize = 16 << 10;
@@ -766,6 +770,7 @@ impl EncodedFile {
                     (bytes, self.detection.encoding)
                 }
                 SourceChunk::Added(bytes) => (bytes, Encoding::UTF8),
+                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } => return Err(EncodingError::WrongSource),
             };
             if encoding.utf16() {
                 for at in (0..bytes.len().saturating_sub(1)).step_by(2) {
@@ -852,6 +857,7 @@ impl EncodedFile {
                     finish_source(&mut source_decoder, &mut output)?;
                     added.feed(bytes, |text| output.feed(text))?;
                 }
+                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } => return Err(EncodingError::WrongSource),
             }
         }
         added.finish()?;
