@@ -6,6 +6,7 @@ use crate::associations::{
 
 #[test]
 fn file_types_catalog_is_broad_unique_and_contains_owner_named_extensions() {
+    let _admission_case = crate::associations::test_admission_guard();
     let all = Selection::new(Preset::AllTextTypes);
     assert!((150..=250).contains(&catalog().len()));
     assert_eq!(catalog().len(), all.extensions().len());
@@ -25,6 +26,7 @@ fn file_types_catalog_is_broad_unique_and_contains_owner_named_extensions() {
 }
 #[test]
 fn file_types_presets_and_custom_are_explicit_and_deduplicate_case() {
+    let _admission_case = crate::associations::test_admission_guard();
     let plain = Selection::new(Preset::PlainTextOnly);
     assert_eq!(plain.extensions().iter().map(Extension::as_str).collect::<Vec<_>>(), ["log", "text", "txt"]);
     let common = Selection::new(Preset::CommonTextConfig);
@@ -43,6 +45,7 @@ fn file_types_presets_and_custom_are_explicit_and_deduplicate_case() {
 }
 #[test]
 fn file_types_capacity_256_and_257_refusal_preserves_selection() {
+    let _admission_case = crate::associations::test_admission_guard();
     let mut selected = Selection::default();
     for index in 0..256 {
         selected.add_custom(&format!("type{index}")).unwrap();
@@ -55,6 +58,7 @@ fn file_types_capacity_256_and_257_refusal_preserves_selection() {
 }
 #[test]
 fn file_types_actual_path_suffix_and_extensionless_build_hints() {
+    let _admission_case = crate::associations::test_admission_guard();
     assert_eq!(current_extension(Path::new("folder/real.File.JSON")).unwrap().as_str(), "json");
     assert_eq!(current_extension(Path::new("folder/Makefile")), Err(ExtensionError::NoExtension));
     assert_eq!(current_extension(Path::new("folder/.env")), Err(ExtensionError::NoExtension));
@@ -95,6 +99,7 @@ impl AssociationAdapter for Fake {
 }
 #[test]
 fn file_types_named_presets_use_real_plan_without_any_write() {
+    let _admission_case = crate::associations::test_admission_guard();
     let mut fake = Fake::default();
     for preset in [Preset::PlainTextOnly, Preset::CommonTextConfig] {
         let selected = Selection::new(preset);

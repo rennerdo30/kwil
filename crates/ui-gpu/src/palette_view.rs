@@ -322,6 +322,7 @@ mod tests {
 
     /// Installs `rows` as fresh results for `request`, exactly as the
     /// worker's `PaletteReady` path does (`apply_results`).
+    #[cfg(windows)]
     fn install(palette: &mut Palette, request: &kwil_core_commands::palette::PaletteQuery, rows: Vec<PaletteRow>) {
         let total = rows.len();
         let results = kwil_core_commands::palette::PaletteResults {
@@ -335,6 +336,7 @@ mod tests {
     }
 
     /// An open command palette holding `rows` as fresh results.
+    #[cfg(windows)]
     fn palette_with(rows: Vec<PaletteRow>) -> Palette {
         let mut palette = Palette::new(64);
         let request = palette.open(">").unwrap().expect("command mode asks the worker");

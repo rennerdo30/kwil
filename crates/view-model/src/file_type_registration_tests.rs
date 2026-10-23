@@ -176,6 +176,7 @@ impl Drop for Harness {
 }
 #[test]
 fn registration_preview_skip_and_default_do_not_mutate() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     assert_eq!(h.session().registration_status(), &RegistrationStatus::Idle);
     h.preview_plain();
@@ -188,6 +189,7 @@ fn registration_preview_skip_and_default_do_not_mutate() {
 
 #[test]
 fn registration_adopted_all240_is_one_reviewed_transaction_and_restores_exact_original() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     h.session().state_mut().context.limits = RegistrationLimits::RootAdopted256;
     let (location, _) = h.required_windows_values("txt").remove(0);
@@ -221,6 +223,7 @@ fn registration_adopted_all240_is_one_reviewed_transaction_and_restores_exact_or
 }
 #[test]
 fn registration_explicit_accept_repeat_and_unregister_use_actual_durable_worker() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let review = h.preview_plain();
     h.session().register_selected(review.clone(), None).unwrap();
@@ -247,6 +250,7 @@ fn registration_explicit_accept_repeat_and_unregister_use_actual_durable_worker(
 }
 #[test]
 fn registration_partial_failure_retains_receipt_and_exact_extension_inspection() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let review = h.preview_plain();
     // Apply first three values (log), then one text value; fail the next and rollback.
@@ -276,6 +280,7 @@ fn registration_partial_failure_retains_receipt_and_exact_extension_inspection()
 }
 #[test]
 fn registration_failure_cancellation_and_protected_defaults_are_distinct() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     h.session().state_mut().context.default_choice = DefaultChoice::MakeDefault;
     *h.session().selection_mut() = Selection::new(Preset::PlainTextOnly);
@@ -290,6 +295,7 @@ fn registration_failure_cancellation_and_protected_defaults_are_distinct() {
 }
 #[test]
 fn registration_stale_selection_and_native_current_file_capture_are_rejected() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let review = h.preview_plain();
     h.session().selection_mut().add_custom("rs").unwrap();
@@ -313,6 +319,7 @@ fn registration_stale_selection_and_native_current_file_capture_are_rejected() {
 }
 #[test]
 fn registration_pending_preserves_whole_current_file_action_ownership() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     h.session().status().unwrap();
     let current = CurrentFile::capture(DocumentIdentity { tab: 3, incarnation: 9 }, &h.journal.join("a.ts")).unwrap();
@@ -326,6 +333,7 @@ fn registration_pending_preserves_whole_current_file_action_ownership() {
 }
 #[test]
 fn registration_base_capacity_and_unknown_mime_are_explicit_gates() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     *h.session().selection_mut() = Selection::new(Preset::AllTextTypes);
     assert!(matches!(
@@ -342,6 +350,7 @@ fn registration_base_capacity_and_unknown_mime_are_explicit_gates() {
 }
 #[test]
 fn registration_retirement_does_not_wait_for_pending_adapter_on_ui() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let (entered, ready) = mpsc::sync_channel(1);
     let (release, resume) = mpsc::sync_channel(1);
@@ -358,6 +367,7 @@ fn registration_retirement_does_not_wait_for_pending_adapter_on_ui() {
 }
 #[test]
 fn registration_restart_retains_unknown_membership_receipt_and_additional_type_gate() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let review = h.preview_plain();
     h.session().register_selected(review.clone(), None).unwrap();
@@ -397,6 +407,7 @@ fn registration_restart_retains_unknown_membership_receipt_and_additional_type_g
 #[cfg(unix)]
 #[test]
 fn registration_non_unicode_native_suffix_is_never_lossily_registered() {
+    let _admission_case = registration_admission_case();
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
     let path = PathBuf::from(OsString::from_vec(b"/tmp/native.\xff".to_vec()));
     assert_eq!(
@@ -412,6 +423,7 @@ fn registration_non_unicode_native_suffix_is_never_lossily_registered() {
 #[cfg(windows)]
 #[test]
 fn registration_windows_native_surrogate_path_preserved_but_suffix_rejected() {
+    let _admission_case = registration_admission_case();
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
     let mut units: Vec<u16> = "E:\\source-only\\native-".encode_utf16().collect();
     units.push(0xd800);
@@ -430,6 +442,7 @@ fn registration_windows_native_surrogate_path_preserved_but_suffix_rejected() {
 
 #[test]
 fn registration_full_and_closed_return_entire_action_without_consuming_review() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let review = h.preview_plain();
     for queue in [SubmitError::Full, SubmitError::Closed] {
@@ -456,6 +469,7 @@ fn registration_full_and_closed_return_entire_action_without_consuming_review() 
 
 #[test]
 fn registration_replaced_controller_rejects_retained_review_with_same_generation_and_whole_action() {
+    let _admission_case = registration_admission_case();
     let mut first = Harness::new();
     let retained = first.preview_one("txt");
     let action = RegistrationAction::RegisterSelected { review: retained.clone(), current: None };
@@ -479,6 +493,7 @@ fn registration_replaced_controller_rejects_retained_review_with_same_generation
 
 #[test]
 fn registration_review_generation_exhaustion_refuses_without_wrapping_or_consuming_action() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     h.session().state_mut().next_review = u64::MAX - 1;
     let last = h.preview_one("txt");
@@ -495,6 +510,7 @@ fn registration_review_generation_exhaustion_refuses_without_wrapping_or_consumi
 
 #[test]
 fn registration_missing_unchanged_command_never_becomes_available_from_receipt_inspection() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let required = h.required_windows_values("txt");
     assert_eq!(required.len(), 3);
@@ -542,6 +558,7 @@ fn registration_missing_unchanged_command_never_becomes_available_from_receipt_i
 
 #[test]
 fn registration_full_changed_receipt_control_reports_only_verified_receipt_and_detects_owned_command_loss() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let required = h.required_windows_values("txt");
     let command = required
@@ -573,6 +590,7 @@ fn registration_full_changed_receipt_control_reports_only_verified_receipt_and_d
 
 #[test]
 fn registration_already_matching_preview_is_time_scoped_and_empty_receipt_cannot_refresh_it() {
+    let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     let required = h.required_windows_values("txt");
     h.fake.lock().unwrap().values = required;
@@ -595,4 +613,9 @@ fn registration_already_matching_preview_is_time_scoped_and_empty_receipt_cannot
         "historical Plan observation remains visibly separate from current receipt inspection"
     );
     assert_eq!(h.fake.lock().unwrap().writes, 0);
+}
+
+static REGISTRATION_ADMISSION_CASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn registration_admission_case() -> std::sync::MutexGuard<'static, ()> {
+    REGISTRATION_ADMISSION_CASE.lock().unwrap_or_else(|poison| poison.into_inner())
 }

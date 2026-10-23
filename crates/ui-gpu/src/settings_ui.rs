@@ -2279,7 +2279,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kwil_core_commands::settings_ui::{SettingsDocument, SettingsMenu};
+    use kwil_core_commands::settings_ui::SettingsDocument;
+    #[cfg(windows)]
+    use kwil_core_commands::settings_ui::SettingsMenu;
     use kwil_view_model::settings_panels::SettingsPanelController;
 
     fn mode(compound: bool, editing: bool, capturing: bool) -> KeyMode {
@@ -2292,6 +2294,7 @@ mod tests {
 
     /// Worker-free settings source over the same core menu and panel
     /// controller the session wraps.
+    #[cfg(windows)]
     struct Fake {
         menu: SettingsMenu,
         panel: Option<SettingsPanelController>,
@@ -2299,6 +2302,7 @@ mod tests {
         searching: bool,
         draft: Option<String>,
     }
+    #[cfg(windows)]
     impl Fake {
         fn new(source: &str) -> Self {
             Self {
@@ -2314,6 +2318,7 @@ mod tests {
             self
         }
     }
+    #[cfg(windows)]
     impl Source for Fake {
         fn loaded(&self) -> bool {
             true

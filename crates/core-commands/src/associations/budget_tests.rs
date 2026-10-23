@@ -68,6 +68,7 @@ impl AssociationAdapter for Fake {
 
 #[test]
 fn budget_all240_and_256_roundtrip_exact_typed_originals() {
+    let _admission_case = crate::associations::test_admission_guard();
     for request in [all240_request(), counted_request(256)] {
         let expected = request.types.len() * 3;
         assert!(matches!(request.types.len(), 240 | 256));
@@ -103,6 +104,7 @@ fn budget_all240_and_256_roundtrip_exact_typed_originals() {
 
 #[test]
 fn budget_257_refuses_before_any_native_read() {
+    let _admission_case = crate::associations::test_admission_guard();
     let mut fake = Fake::default();
     assert!(plan(&mut fake, &counted_request(257)).is_err());
     assert_eq!((fake.reads, fake.copies, fake.writes), (0, 0, 0));
@@ -110,6 +112,7 @@ fn budget_257_refuses_before_any_native_read() {
 
 #[test]
 fn budget_native_value_denial_precedes_allocation_and_fake_clone() {
+    let _admission_case = crate::associations::test_admission_guard();
     let location = Location::WindowsValue { subkey: "Kwil.txt".into(), name: String::new() };
     let mut fake =
         Fake { values: vec![(location.clone(), StoredValue { kind: 91, bytes: vec![255; 9] })], ..Fake::default() };
@@ -132,6 +135,7 @@ fn budget_native_value_denial_precedes_allocation_and_fake_clone() {
 
 #[test]
 fn budget_one_mib_original_roundtrips_with_256_types() {
+    let _admission_case = crate::associations::test_admission_guard();
     let request = counted_request(256);
     let mut fake = Fake::default();
     let seed = plan(&mut fake, &request).unwrap();
@@ -149,6 +153,7 @@ fn budget_one_mib_original_roundtrips_with_256_types() {
 
 #[test]
 fn budget_aggregate_read_denial_precedes_next_clone() {
+    let _admission_case = crate::associations::test_admission_guard();
     let mut request = counted_request(1);
     let mut fake = Fake::default();
     let seed = plan(&mut fake, &request).unwrap();
@@ -166,6 +171,7 @@ fn budget_aggregate_read_denial_precedes_next_clone() {
 
 #[test]
 fn budget_snapshots_share_admission_and_overlap_refuses_before_copy() {
+    let _admission_case = crate::associations::test_admission_guard();
     let mut fake = Fake::default();
     let original = plan(&mut fake, &counted_request(1)).unwrap();
     let snapshot = original.clone();
@@ -184,6 +190,7 @@ fn budget_snapshots_share_admission_and_overlap_refuses_before_copy() {
 
 #[test]
 fn budget_failed_cleanup_retains_only_successful_original_ownership() {
+    let _admission_case = crate::associations::test_admission_guard();
     let mut fake = Fake::default();
     let reviewed = plan(&mut fake, &counted_request(1)).unwrap();
     fake.fail_from = Some(2);
@@ -204,6 +211,7 @@ fn budget_failed_cleanup_retains_only_successful_original_ownership() {
 
 #[test]
 fn budget_legacy_adapter_fails_closed_before_unbounded_read() {
+    let _admission_case = crate::associations::test_admission_guard();
     struct Legacy;
     impl AssociationAdapter for Legacy {
         fn owner(&self) -> String {

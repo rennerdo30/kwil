@@ -1000,6 +1000,7 @@ mod tests {
 
     #[test]
     fn budget_all240_and_256_use_one_original_durable_intent_and_exact_undo() {
+        let _admission_case = crate::associations::test_admission_guard();
         for count in [240, 256] {
             let scratch = Scratch::new();
             let fake = Fake::default();
@@ -1060,6 +1061,7 @@ mod tests {
 
     #[test]
     fn budget_all240_failed_apply_and_cleanup_keep_full_durable_recovery() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1090,6 +1092,7 @@ mod tests {
 
     #[test]
     fn budget_worker_257_refuses_before_reads_or_intent() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1105,6 +1108,7 @@ mod tests {
 
     #[test]
     fn budget_serializer_16mib_preflight_denies_before_output_allocation() {
+        let _admission_case = crate::associations::test_admission_guard();
         // JSON byte-array digits expand 4 MiB + 1 bytes beyond a 16 MiB
         // serialized record. The input is generated at runtime, never checked in.
         let value = vec![255u8; MAX_RECORD_BYTES / 4 + 1];
@@ -1124,6 +1128,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn budget_directory_steps_canonical_windows_prefix_waits_for_root() {
+        let _admission_case = crate::associations::test_admission_guard();
         let path = Path::new(r"\\?\C:\Users\example\AppData\Roaming\kwil\kwil-associations-v1");
         let mut steps = Vec::new();
         directory_steps(path, |part| {
@@ -1143,6 +1148,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn budget_directory_steps_drive_and_unc_keep_every_actual_ancestor() {
+        let _admission_case = crate::associations::test_admission_guard();
         for (path, root) in [
             (r"C:\kwil\journal", r"C:\"),
             (r"\\server\share\kwil\journal", r"\\server\share\"),
@@ -1164,6 +1170,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn budget_directory_steps_relative_and_parent_refusals_are_preserved() {
+        let _admission_case = crate::associations::test_admission_guard();
         for path in [r"journal", r"C:journal", r"\journal"] {
             let mut probes = 0;
             assert!(
@@ -1180,6 +1187,7 @@ mod tests {
 
     #[test]
     fn undo_makes_restored_values_and_removals_durable_before_retirement() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let (mut e, plan) = applied_durability_fixture(&scratch, &fake);
@@ -1203,6 +1211,7 @@ mod tests {
 
     #[test]
     fn failed_backend_barrier_keeps_full_recovery_and_retries_already_visible_before() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let (mut e, _) = applied_durability_fixture(&scratch, &fake);
@@ -1230,6 +1239,7 @@ mod tests {
 
     #[test]
     fn crash_before_backend_barrier_preserves_receipt_for_applied_state_on_restart() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let (mut e, _) = applied_durability_fixture(&scratch, &fake);
@@ -1250,6 +1260,7 @@ mod tests {
 
     #[test]
     fn unsupported_backend_durability_never_retires_recovery() {
+        let _admission_case = crate::associations::test_admission_guard();
         // Intentionally inherit the safe default instead of a fake success.
         struct Unverified(Fake);
         impl AssociationAdapter for Unverified {
@@ -1286,6 +1297,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_sync_rejects_raced_resources_in_bounded_subprocesses() {
+        let _admission_case = crate::associations::test_admission_guard();
         use std::process::{Command, Stdio};
         const CASE: &str = "KWIL_ASSOCIATION_SYNC_TEST_CASE";
         const ROOT: &str = "KWIL_ASSOCIATION_SYNC_TEST_ROOT";
@@ -1466,6 +1478,7 @@ mod tests {
 
     #[test]
     fn plan_is_read_only_and_apply_requires_current_reviewed_generation() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1487,6 +1500,7 @@ mod tests {
 
     #[test]
     fn cancellation_failed_replan_and_fresh_preconditions_invalidate_review() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1508,6 +1522,7 @@ mod tests {
 
     #[test]
     fn persistence_failure_precedes_all_native_writes_and_preserves_obstruction() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1526,6 +1541,7 @@ mod tests {
 
     #[test]
     fn journal_owner_drop_releases_lock_while_inherited_descriptor_lives() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let owner = engine(&scratch, &fake);
@@ -1543,6 +1559,7 @@ mod tests {
 
     #[test]
     fn journal_sync_failure_blocks_apply_and_undo_until_restart() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1564,6 +1581,7 @@ mod tests {
 
     #[test]
     fn mid_apply_failure_retains_full_durable_receipt_for_restart_undo() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1595,6 +1613,7 @@ mod tests {
 
     #[test]
     fn interrupted_undo_restores_old_values_on_retry_and_refuses_foreign_edits() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1641,6 +1660,7 @@ mod tests {
 
     #[test]
     fn restart_invalidates_review_and_exclusive_lock_prevents_parallel_workers() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1656,6 +1676,7 @@ mod tests {
 
     #[test]
     fn worker_constructs_adapter_off_caller_and_bounds_undrained_event_credit() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let caller = thread::current().id();
         let fake = Fake::default();
@@ -1715,6 +1736,7 @@ mod tests {
 
     #[test]
     fn receiver_close_inside_wake_cannot_deadlock_or_abandon_accepted_apply() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let (wake_tx, wake_rx) = mpsc::channel();
@@ -1756,6 +1778,7 @@ mod tests {
 
     #[test]
     fn adapter_interruption_is_reported_and_restart_undo_uses_prejournaled_receipt() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         fake.0.lock().unwrap().panic_at = Some(2);
@@ -1787,6 +1810,7 @@ mod tests {
 
     #[test]
     fn drop_is_nonblocking_and_still_drains_accepted_work() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1815,6 +1839,7 @@ mod tests {
 
     #[test]
     fn bounded_request_records_paths_and_history_fail_closed() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut e = engine(&scratch, &fake);
@@ -1834,6 +1859,7 @@ mod tests {
 
     #[test]
     fn foreign_receipt_owner_cannot_recover_or_write() {
+        let _admission_case = crate::associations::test_admission_guard();
         let scratch = Scratch::new();
         let fake = Fake::default();
         let mut journal = Journal::open(scratch.0.clone()).unwrap();
@@ -1848,6 +1874,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_special_symlink_hardlink_and_public_paths_are_rejected_before_open() {
+        let _admission_case = crate::associations::test_admission_guard();
         use std::{
             ffi::CString,
             os::unix::{

@@ -22,6 +22,15 @@ use std::{
 
 pub mod worker;
 
+// Quota-exhaustion cases intentionally reserve the complete process-wide pool.
+// Serialize fixture lifetimes only; production workers retain their real bound.
+#[cfg(test)]
+static TEST_ADMISSION_CASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub(crate) fn test_admission_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ADMISSION_CASE.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 pub const MAX_TYPES: usize = 256;
 pub const MAX_CHANGES: usize = 768;
 pub const MAX_VALUE_BYTES: usize = 1024 * 1024;
@@ -1139,6 +1148,7 @@ mod tests {
     }
     #[test]
     fn association_failure_rolls_back_and_receipt_never_overwrites_foreign_edits() {
+        let _admission_case = crate::associations::test_admission_guard();
         let mut adapter = Fake::default();
         let plan = plan(&mut adapter, &request()).unwrap();
         assert_eq!(adapter.writes, 0);
@@ -1160,6 +1170,7 @@ mod tests {
     }
     #[test]
     fn associations_require_explicit_default_choice_and_restore_linux_bytes() {
+        let _admission_case = crate::associations::test_admission_guard();
         let mut adapter = Fake::default();
         let mut req = request();
         req.default_choice = DefaultChoice::MakeDefault;
@@ -1183,6 +1194,7 @@ mod tests {
     }
     #[test]
     fn stale_plan_and_foreign_owner_are_rejected_before_writing() {
+        let _admission_case = crate::associations::test_admission_guard();
         let mut adapter = Fake::default();
         let mut p = plan(&mut adapter, &request()).unwrap();
         p.owner = "someone else".into();
@@ -1196,6 +1208,7 @@ mod tests {
     }
     #[test]
     fn mac_roles_restore_distinct_handlers_and_refuse_missing_prior_default() {
+        let _admission_case = crate::associations::test_admission_guard();
         let mut adapter = Fake::default();
         let mut req = request();
         req.platform = AssociationPlatform::MacOS { bundle_id: "dev.renner.kwil".into() };
@@ -1219,6 +1232,7 @@ mod tests {
     }
     #[test]
     fn linux_registration_removes_only_chosen_removed_entry_and_rolls_back_exact_bytes() {
+        let _admission_case = crate::associations::test_admission_guard();
         let mut adapter = Fake::default();
         let mut req = request();
         let root = std::env::current_dir().unwrap();
