@@ -11,6 +11,7 @@ mod line_index;
 mod piece_tree;
 mod recovery;
 mod undo;
+pub mod worker_edit;
 
 pub use buffer::{Buffer, Lines, Snapshot, SnapshotImporter};
 pub use file::with_checked_read_batch;

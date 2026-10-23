@@ -16,6 +16,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) const ADD_BLOCK: usize = 64 * 1024;
 const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+/// Worker disk admission charges EACH physical file, including an empty file,
+/// by whole64KiB units. Never round a logical sum across distinct allocations.
+pub(crate) fn worker_disk_charge(bytes: u64) -> io::Result<u64> {
+    bytes
+        .max(1)
+        .checked_add(ADD_BLOCK as u64 - 1)
+        .map(|n| n / ADD_BLOCK as u64 * ADD_BLOCK as u64)
+        .ok_or_else(crate::worker_edit::overflow)
+}
 pub(crate) type Tree = Option<Arc<Node>>;
 pub(crate) type OriginalUses = BTreeMap<(u8, usize), (SourceRef, u64)>;
 
@@ -136,10 +145,13 @@ impl AddBudget {
     }
 }
 
-struct DiskBlock {
+pub(crate) struct DiskBlock {
     map: Option<memmap2::Mmap>,
     file: Option<File>,
     path: PathBuf,
+    worker_file_owned: bool,
+    worker_directory_owned: bool,
+    payload_len: usize,
     // Once leased, only an explicit worker retirement may unlink this block.
     // Worker shutdown must not hand deletion back to a surviving UI snapshot.
     explicit_retirement: std::sync::atomic::AtomicBool,
@@ -177,6 +189,9 @@ impl DiskBlock {
                 map: None,
                 file: None,
                 path,
+                worker_file_owned: false,
+                worker_directory_owned: cfg!(unix),
+                payload_len: bytes.len(),
                 explicit_retirement: std::sync::atomic::AtomicBool::new(false),
                 retirement_leased: std::sync::atomic::AtomicBool::new(false),
             };
@@ -190,6 +205,7 @@ impl DiskBlock {
             match options.open(&block.path) {
                 Ok(file) => {
                     block.file = Some(file);
+                    block.worker_file_owned = true;
                     break block;
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -223,7 +239,7 @@ impl Drop for DiskBlock {
     }
 }
 
-enum Storage {
+pub(crate) enum Storage {
     Original(TextFile),
     Decoded(Arc<IndexedDecoded>),
     Memory {
@@ -702,6 +718,8 @@ struct ImportBuilder<'a> {
     offsets: Vec<u8>,
     opaque_atoms: usize,
     tree: Tree,
+    allocation: Option<&'a mut WorkerAllocation>,
+    worker_cancel: Option<&'a std::sync::atomic::AtomicBool>,
     admission: Option<ImportAdmission<'a>>,
 }
 impl<'a> ImportBuilder<'a> {
@@ -715,6 +733,8 @@ impl<'a> ImportBuilder<'a> {
             opaque_atoms: 0,
             tree: None,
             admission: None,
+            allocation: None,
+            worker_cancel: None,
         }
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -726,7 +746,17 @@ impl<'a> ImportBuilder<'a> {
         if let Some(admit) = &mut self.admission {
             admit(if self.raw.is_empty() { 1 } else { 3 }, &self.tree)?;
         }
-        let block = if self.raw.is_empty() {
+        let block = if let Some(allocation) = self.allocation.as_deref_mut() {
+            worker_detached(
+                self.encoding,
+                &self.logical,
+                &self.raw,
+                &self.offsets,
+                self.budget,
+                allocation,
+                self.worker_cancel.expect("worker allocation cancellation"),
+            )?
+        } else if self.raw.is_empty() {
             added(&self.logical, self.budget)?
         } else if self.opaque_atoms == self.logical.len() {
             opaque_run(self.encoding, &self.raw, &self.offsets, self.budget)?
@@ -951,6 +981,916 @@ pub(crate) fn import_visit_count(tree: Tree, budget: &Arc<AddBudget>, owner: &Ar
     let mut count = 0;
     import_observed(tree, budget, owner, &mut || count += 1).unwrap();
     count
+}
+
+/// One operation's physical allocation ledger. It is registered in a stable
+/// worker depot slot before payload creation. Baseline certificates retain actual
+/// storage identities; neither affinity nor a leased boolean grants coverage.
+pub(crate) struct WorkerAllocation {
+    plan: crate::worker_edit::WorkerEditPlan,
+    blocks: Vec<Arc<Storage>>,
+    baseline: Vec<Arc<Storage>>,
+    decoded: Vec<WorkerDecodedCopy>,
+    metadata: usize,
+    external_metadata: usize,
+    tree_work: usize,
+    disk: u64,
+    claimed: bool,
+    #[cfg(test)]
+    pub(crate) fault: WorkerFault,
+    #[cfg(test)]
+    pub(crate) creates: usize,
+    #[cfg(test)]
+    pub(crate) collision_path: Option<PathBuf>,
+}
+
+/// Actual ownership is registered before each creation. The weak source key
+/// avoids duplicate copies without retaining any foreign decoded owner.
+struct WorkerDecodedCopy {
+    source: crate::decoded_backing::DecodedOriginKey,
+    paths: crate::decoded_backing::BackingPaths,
+    directory_owned: bool,
+    files: [Option<File>; 3],
+    owned: [bool; 3],
+    owner: Option<crate::decoded_backing::DecodedBacking>,
+    storage: Option<Arc<Storage>>,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerFault {
+    None,
+    Write,
+    Map,
+    AfterOpenPanic,
+    Cleanup,
+    CancelAfterWrite,
+    CancelAfterClaim,
+    DecodedCopyCancel,
+    DecodedCopyPanic,
+    ClaimPrefixCancel,
+    ClaimPrefixPanic,
+    ResidentPanic,
+}
+impl WorkerAllocation {
+    pub(crate) fn new(plan: crate::worker_edit::WorkerEditPlan) -> io::Result<Self> {
+        use crate::worker_edit::{capacity, overflow};
+        let paths = plan.max_path_bytes.checked_mul(2).ok_or_else(overflow)?;
+        let descriptor = (std::mem::size_of::<Storage>() + ARC_HEADER + std::mem::size_of::<Arc<Storage>>())
+            .checked_add(paths)
+            .ok_or_else(overflow)?;
+        let descriptors = plan.max_new_blocks.checked_mul(descriptor).ok_or_else(overflow)?;
+        let certificates =
+            plan.max_certificates.checked_mul(std::mem::size_of::<Arc<Storage>>()).ok_or_else(overflow)?;
+        // Three files per decoded copy. Paths/index are charged per actual copy
+        // before allocation; this vector's bounded capacity is charged up front.
+        let copies =
+            (plan.max_new_blocks / 3).checked_mul(std::mem::size_of::<WorkerDecodedCopy>()).ok_or_else(overflow)?;
+        let metadata = descriptors
+            .checked_add(certificates)
+            .and_then(|n| n.checked_add(copies))
+            .and_then(|n| {
+                n.checked_add(4 * ADD_BLOCK + std::mem::size_of::<Self>() + 1024 + crate::worker_edit::slot_metadata())
+            })
+            .ok_or_else(overflow)?;
+        let recipe_disk = if plan.recipe_bytes == 0 { 0 } else { worker_disk_charge(plan.recipe_bytes)? };
+        if metadata > plan.metadata_bytes || recipe_disk > plan.disk_bytes {
+            return Err(capacity());
+        }
+        let mut blocks = Vec::new();
+        let mut baseline = Vec::new();
+        let mut decoded = Vec::new();
+        blocks.try_reserve_exact(plan.max_new_blocks).map_err(io::Error::other)?;
+        baseline.try_reserve_exact(plan.max_certificates).map_err(io::Error::other)?;
+        decoded.try_reserve_exact(plan.max_new_blocks / 3).map_err(io::Error::other)?;
+        Ok(Self {
+            plan,
+            blocks,
+            baseline,
+            decoded,
+            metadata,
+            external_metadata: 0,
+            tree_work: 0,
+            disk: recipe_disk,
+            claimed: false,
+            #[cfg(test)]
+            fault: WorkerFault::None,
+            #[cfg(test)]
+            creates: 0,
+            #[cfg(test)]
+            collision_path: None,
+        })
+    }
+    fn charge(&mut self, bytes: usize) -> io::Result<()> {
+        self.metadata = self
+            .metadata
+            .checked_add(bytes)
+            .filter(|n| *n <= self.plan.metadata_bytes)
+            .ok_or_else(crate::worker_edit::capacity)?;
+        Ok(())
+    }
+    pub(crate) fn reserve_external(&mut self, bytes: usize) -> io::Result<()> {
+        if bytes > self.external_metadata {
+            self.charge(bytes - self.external_metadata)?;
+            self.external_metadata = bytes;
+        }
+        Ok(())
+    }
+    pub(crate) fn charge_tree(&mut self, tree: &Tree) -> io::Result<()> {
+        let nodes = tree.as_ref().map_or(0, |n| n.metrics.resources.tree_nodes);
+        if nodes > self.plan.max_tree_nodes {
+            return Err(crate::worker_edit::capacity());
+        }
+        let work = recovery_tree_work(tree)
+            .and_then(|n| nodes.checked_mul(512).and_then(|d| n.checked_add(d)))
+            .ok_or_else(crate::worker_edit::overflow)?;
+        // One active core import/split/join working set. Returned/composed roots
+        // and source expansion are covered by the separately reserved VM peak.
+        // Charge its HIGH WATER, not every transient allocation ever performed:
+        // cumulative full-tree charges would falsely make streaming quadratic.
+        if work > self.tree_work {
+            self.charge(work - self.tree_work)?;
+            self.tree_work = work;
+        }
+        Ok(())
+    }
+    pub(crate) fn owns_storage(&self, storage: &Arc<Storage>) -> bool {
+        self.blocks.iter().any(|known| Arc::ptr_eq(known, storage))
+            || self.decoded.iter().any(|entry| entry.storage.as_ref().is_some_and(|known| Arc::ptr_eq(known, storage)))
+    }
+    fn certified(&self, storage: &Arc<Storage>) -> bool {
+        self.owns_storage(storage)
+            || self
+                .baseline
+                .binary_search_by_key(&(Arc::as_ptr(storage) as usize), |known| Arc::as_ptr(known) as usize)
+                .is_ok()
+    }
+    fn certificate(
+        &mut self,
+        storage: &Arc<Storage>,
+        covers: &mut impl FnMut(&Arc<Storage>) -> bool,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<()> {
+        crate::worker_edit::poll(cancelled)?;
+        if self.baseline.len() >= self.plan.max_certificates {
+            return Err(crate::worker_edit::capacity());
+        }
+        if matches!(storage.as_ref(), Storage::Disk(_)) && !covers(storage) {
+            return Err(crate::worker_edit::invalid("baseline spill has no retained worker owner"));
+        }
+        self.baseline.push(storage.clone());
+        if let Storage::Opaque { logical, raw, offsets, .. } = storage.as_ref() {
+            for child in [logical, raw, offsets] {
+                self.certificate(child, covers, cancelled)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn certify_baseline(
+        &mut self,
+        tree: &Tree,
+        covers: &mut impl FnMut(&Arc<Storage>) -> bool,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<()> {
+        fn visit(
+            a: &mut WorkerAllocation,
+            node: &Node,
+            covers: &mut impl FnMut(&Arc<Storage>) -> bool,
+            cancelled: &std::sync::atomic::AtomicBool,
+        ) -> io::Result<()> {
+            crate::worker_edit::poll(cancelled)?;
+            match &node.kind {
+                Kind::Leaf(piece) => a.certificate(&piece.storage, covers, cancelled),
+                Kind::Branch(left, right) => {
+                    visit(a, left, covers, cancelled)?;
+                    visit(a, right, covers, cancelled)
+                }
+            }
+        }
+        self.charge_tree(tree)?;
+        if let Some(root) = tree {
+            visit(self, root, covers, cancelled)?;
+        }
+        self.baseline.sort_unstable_by_key(|s| Arc::as_ptr(s) as usize);
+        self.baseline.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        Ok(())
+    }
+    fn block(
+        &mut self,
+        bytes: &[u8],
+        budget: &Arc<AddBudget>,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<Arc<Storage>> {
+        use crate::worker_edit::{capacity, overflow};
+        crate::worker_edit::poll(cancelled)?;
+        if bytes.is_empty()
+            || bytes.len() > ADD_BLOCK
+            || self
+                .blocks
+                .len()
+                .checked_add(self.decoded.len().checked_mul(3).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?
+                >= self.plan.max_new_blocks
+        {
+            return Err(capacity());
+        }
+        // Reserve worst-case spill BEFORE the resident CAS. A concurrent importer
+        // can consume all resident headroom; no file creation depends on a guess.
+        let spilled_disk = self
+            .disk
+            .checked_add(worker_disk_charge(bytes.len() as u64)?)
+            .filter(|n| *n <= self.plan.disk_bytes)
+            .ok_or_else(capacity)?;
+        struct DiskReservation<'a> {
+            used: &'a mut u64,
+            previous: u64,
+            keep: bool,
+        }
+        impl Drop for DiskReservation<'_> {
+            fn drop(&mut self) {
+                if !self.keep {
+                    *self.used = self.previous;
+                }
+            }
+        }
+        let previous = self.disk;
+        self.disk = spilled_disk;
+        let mut spill = DiskReservation { used: &mut self.disk, previous, keep: false };
+        let reserved = budget
+            .used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes.len()).filter(|&next| next <= budget.limit.load(Ordering::Acquire))
+            })
+            .is_ok();
+        if reserved {
+            struct Reservation<'a> {
+                budget: &'a AddBudget,
+                len: usize,
+            }
+            impl Drop for Reservation<'_> {
+                fn drop(&mut self) {
+                    self.budget.used.fetch_sub(self.len, Ordering::Relaxed);
+                }
+            }
+            let mut guard = Reservation { budget, len: bytes.len() };
+            #[cfg(test)]
+            if self.fault == WorkerFault::ResidentPanic {
+                panic!("controlled resident allocation unwind");
+            }
+            let storage = Arc::new(Storage::Memory { bytes: bytes.into(), budget: budget.clone() });
+            guard.len = 0; // Storage now owns the exact shared resident charge.
+            self.blocks.push(storage.clone());
+            return Ok(storage);
+        }
+        // From here the spill descriptor/partial file keeps the reservation
+        // until explicit retirement. Resident success/error/unwind restores it.
+        spill.keep = true;
+        drop(spill);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).map_err(|_| overflow())?;
+        let name = format!("kwil-worker-{}-{id}", std::process::id());
+        let private = std::env::temp_dir().join(name);
+        #[cfg(unix)]
+        let path = private.join("block");
+        #[cfg(not(unix))]
+        let path = private;
+        #[cfg(test)]
+        let path = self.collision_path.clone().unwrap_or(path);
+        if path.as_os_str().as_encoded_bytes().len() > self.plan.max_path_bytes
+            || path.capacity() > self.plan.max_path_bytes * 2
+        {
+            return Err(capacity());
+        }
+        // The exact physical Arc is registered BEFORE mkdir/open/write/map.
+        // Partial descriptors never escape; explicit Drop cannot unlink them.
+        self.blocks.push(Arc::new(Storage::Disk(DiskBlock {
+            map: None,
+            file: None,
+            path,
+            worker_file_owned: false,
+            worker_directory_owned: false,
+            payload_len: bytes.len(),
+            explicit_retirement: std::sync::atomic::AtomicBool::new(true),
+            retirement_leased: std::sync::atomic::AtomicBool::new(false),
+        })));
+        let index = self.blocks.len() - 1;
+        let Storage::Disk(block) = Arc::get_mut(&mut self.blocks[index]).unwrap() else { unreachable!() };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(block.path.parent().unwrap())?;
+            block.worker_directory_owned = true;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        block.file = Some(options.open(&block.path)?);
+        block.worker_file_owned = true; // BEFORE the next fallible operation.
+        #[cfg(test)]
+        eprintln!("owned worker allocation created: {}", block.path.display());
+        crate::worker_edit::poll(cancelled)?;
+        #[cfg(test)]
+        {
+            self.creates += 1;
+            if self.fault == WorkerFault::AfterOpenPanic {
+                panic!("controlled worker write unwind");
+            }
+            if self.fault == WorkerFault::Write {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+        }
+        block.file.as_mut().unwrap().write_all(bytes)?;
+        #[cfg(test)]
+        if self.fault == WorkerFault::CancelAfterWrite {
+            cancelled.store(true, Ordering::Release);
+        }
+        crate::worker_edit::poll(cancelled)?;
+        #[cfg(test)]
+        if self.fault == WorkerFault::Map {
+            return Err(io::ErrorKind::Other.into());
+        }
+        // SAFETY: private create_new ownership; immutable after mapping; both
+        // file and map remain registered until the unique worker cleanup pass.
+        block.map = Some(unsafe { memmap2::Mmap::map(block.file.as_ref().unwrap())? });
+        crate::worker_edit::poll(cancelled)?;
+        Ok(self.blocks[index].clone())
+    }
+    fn decoded_copy(
+        &mut self,
+        source: &Arc<IndexedDecoded>,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<Arc<Storage>> {
+        use crate::decoded_backing::{BackingPaths, DecodedBacking};
+        use crate::worker_edit::{capacity, overflow};
+        crate::worker_edit::poll(cancelled)?;
+        if let Some(storage) = self
+            .decoded
+            .iter()
+            .find_map(|entry| entry.source.matches(&source.origin).then_some(entry.storage.as_ref()).flatten())
+        {
+            return Ok(storage.clone());
+        }
+        let count = self
+            .blocks
+            .len()
+            .checked_add(self.decoded.len().checked_mul(3).ok_or_else(overflow)?)
+            .and_then(|n| n.checked_add(3))
+            .ok_or_else(overflow)?;
+        if count > self.plan.max_new_blocks {
+            return Err(capacity());
+        }
+        let lengths = [
+            source.origin.raw_bytes().len(),
+            source.origin.logical_bytes().len(),
+            source.origin.checkpoint_count().checked_mul(16).ok_or_else(overflow)?,
+        ];
+        for length in lengths {
+            self.disk = self
+                .disk
+                .checked_add(worker_disk_charge(length as u64)?)
+                .filter(|n| *n <= self.plan.disk_bytes)
+                .ok_or_else(capacity)?;
+        }
+        // Sequential LineIndex has two doubling Vecs: one per1024 newlines,
+        // one per64KiB. Four times their maximum record count covers min-growth
+        // capacity too. Charge before index construction or touching cold bytes.
+        let len = lengths[1];
+        let records = (len / crate::line_index::DEFAULT_EVERY as usize)
+            .checked_add(1)
+            .and_then(|n| n.checked_add(len.div_ceil(ADD_BLOCK)))
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(overflow)?;
+        let index_bytes = records
+            .checked_mul(4 * std::mem::size_of::<(u64, u64)>())
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<IndexedDecoded>() + std::mem::size_of::<Storage>() + 2 * ARC_HEADER)
+            })
+            .and_then(|n| n.checked_add(DecodedBacking::registered_copy_metadata()))
+            .ok_or_else(overflow)?;
+        let path_bytes =
+            self.plan.max_path_bytes.checked_mul(2).and_then(|n| n.checked_mul(12)).ok_or_else(overflow)?;
+        self.charge(index_bytes.checked_add(path_bytes).ok_or_else(overflow)?)?;
+        static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
+        let id =
+            NEXT_COPY.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).map_err(|_| overflow())?;
+        let directory = std::env::temp_dir().join(format!("kwil-worker-decoded-{}-{id}", std::process::id()));
+        let paths = BackingPaths {
+            raw: directory.join("raw"),
+            logical: directory.join("logical"),
+            checkpoints: directory.join("checkpoints"),
+            directory,
+        };
+        let path_capacity = self.plan.max_path_bytes.checked_mul(2).ok_or_else(overflow)?;
+        for path in [&paths.directory, &paths.raw, &paths.logical, &paths.checkpoints] {
+            if path.as_os_str().as_encoded_bytes().len() > self.plan.max_path_bytes || path.capacity() > path_capacity {
+                return Err(capacity());
+            }
+        }
+        // Registration precedes even mkdir. Failed create never conveys ownership.
+        self.decoded.push(WorkerDecodedCopy {
+            source: source.origin.weak_identity(),
+            paths,
+            directory_owned: false,
+            files: [None, None, None],
+            owned: [false; 3],
+            owner: None,
+            storage: None,
+        });
+        let at = self.decoded.len() - 1;
+        let entry = &mut self.decoded[at];
+        let directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut directory = directory;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(&entry.paths.directory)?;
+        entry.directory_owned = true;
+        #[cfg(test)]
+        eprintln!("owned decoded directory created: {}", entry.paths.directory.display());
+        let paths = [&entry.paths.raw, &entry.paths.logical, &entry.paths.checkpoints];
+        for (i, path) in paths.into_iter().enumerate() {
+            crate::worker_edit::poll(cancelled)?;
+            let mut options = OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            entry.files[i] = Some(options.open(path)?);
+            entry.owned[i] = true;
+            #[cfg(test)]
+            eprintln!("owned decoded allocation created: {}", path.display());
+            #[cfg(test)]
+            {
+                self.creates += 1;
+                if self.fault == WorkerFault::AfterOpenPanic {
+                    panic!("controlled decoded open unwind");
+                }
+                if self.fault == WorkerFault::Write {
+                    return Err(io::ErrorKind::StorageFull.into());
+                }
+            }
+        }
+        let [raw, logical, checkpoints] = &mut entry.files;
+        #[cfg(test)]
+        let mut polls = 0;
+        let owner = DecodedBacking::copy_registered(
+            &source.origin,
+            entry.paths.clone(),
+            [raw.as_mut().unwrap(), logical.as_mut().unwrap(), checkpoints.as_mut().unwrap()],
+            &mut || {
+                #[cfg(test)]
+                {
+                    polls += 1;
+                    if polls == 3 {
+                        if self.fault == WorkerFault::DecodedCopyCancel {
+                            cancelled.store(true, Ordering::Release);
+                        }
+                        if self.fault == WorkerFault::DecodedCopyPanic {
+                            panic!("controlled decoded copy unwind");
+                        }
+                    }
+                }
+                crate::worker_edit::poll(cancelled)
+            },
+        )?;
+        entry.owner = Some(owner); // rescue owns maps BEFORE next fallible step
+        #[cfg(test)]
+        if self.fault == WorkerFault::Map {
+            return Err(io::ErrorKind::Other.into());
+        }
+        let indexed = IndexedDecoded::new_checked(entry.owner.as_ref().unwrap().snapshot(), &mut || {
+            crate::worker_edit::poll(cancelled)
+        })?;
+        let storage = Arc::new(Storage::Decoded(Arc::new(indexed)));
+        entry.storage = Some(storage.clone());
+        Ok(storage)
+    }
+
+    fn allowed(&self, storage: &Arc<Storage>, budget: &Arc<AddBudget>) -> bool {
+        match storage.as_ref() {
+            Storage::Opaque { logical, raw, offsets, .. } => {
+                [logical, raw, offsets].iter().all(|s| self.allowed(s, budget))
+            }
+            Storage::Memory { budget: source, .. } => Arc::ptr_eq(source, budget) && self.certified(storage),
+            _ => self.certified(storage),
+        }
+    }
+    pub(crate) fn snapshot(
+        &mut self,
+        root: Tree,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<crate::Snapshot> {
+        crate::worker_edit::poll(cancelled)?;
+        self.charge_tree(&root)?; // bounds OriginalUses BTreeMap and traversal.
+        Ok(crate::buffer::Buffer::recovery_snapshot(root))
+    }
+    pub(crate) fn validate(
+        &mut self,
+        snapshot: &crate::Snapshot,
+        budget: &Arc<AddBudget>,
+        owner: &Arc<()>,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<()> {
+        fn storage_check(storage: &Storage) -> io::Result<()> {
+            if let Storage::Opaque { logical, raw, offsets, .. } = storage {
+                let logical = logical.bytes().map_err(io::Error::other)?;
+                let raw = raw.bytes().map_err(io::Error::other)?;
+                let offsets = offsets.bytes().map_err(io::Error::other)?;
+                if logical.len() >= ADD_BLOCK / 4
+                    || offsets.len() != (logical.len() + 1) * 4
+                    || offsets.len() > ADD_BLOCK
+                    || raw.len() > ADD_BLOCK
+                    || offset_at(offsets, 0) != 0
+                    || offset_at(offsets, logical.len() as u64) != raw.len()
+                {
+                    return Err(crate::worker_edit::invalid("opaque table shape"));
+                }
+                for (i, byte) in logical.iter().enumerate() {
+                    let a = offset_at(offsets, i as u64);
+                    let b = offset_at(offsets, i as u64 + 1);
+                    if a > b || b > raw.len() || (*byte == 0xff && a == b) || (*byte != 0xff && a != b) {
+                        return Err(crate::worker_edit::invalid("opaque provenance offsets"));
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn visit(
+            a: &WorkerAllocation,
+            node: &Node,
+            budget: &Arc<AddBudget>,
+            owner: &Arc<()>,
+            cancelled: &std::sync::atomic::AtomicBool,
+        ) -> io::Result<(u64, u64, StorageResources)> {
+            crate::worker_edit::poll(cancelled)?;
+            let (bytes, breaks, resources) = match &node.kind {
+                Kind::Leaf(piece) => {
+                    if !a.allowed(&piece.storage, budget) {
+                        return Err(crate::worker_edit::invalid("untracked candidate graft"));
+                    }
+                    if matches!(piece.storage.as_ref(), Storage::Original(_) | Storage::Decoded(_))
+                        && !piece.owner.as_ref().is_some_and(|p| Arc::ptr_eq(p, owner))
+                    {
+                        return Err(crate::worker_edit::invalid("foreign source owner"));
+                    }
+                    storage_check(&piece.storage)?;
+                    let data = piece.storage.bytes().map_err(io::Error::other)?;
+                    if piece.start > piece.end || piece.end > data.len() as u64 {
+                        return Err(crate::worker_edit::invalid("candidate piece range"));
+                    }
+                    if let Storage::Decoded(source) = piece.storage.as_ref() {
+                        crate::decoded_piece::validate_range(&source.origin, piece.start..piece.end)?;
+                    }
+                    for _ in data[piece.start as usize..piece.end as usize].chunks(ADD_BLOCK) {
+                        crate::worker_edit::poll(cancelled)?;
+                    }
+                    let breaks = piece
+                        .storage
+                        .rank(piece.end)
+                        .map_err(io::Error::other)?
+                        .checked_sub(piece.storage.rank(piece.start).map_err(io::Error::other)?)
+                        .ok_or_else(crate::worker_edit::overflow)?;
+                    if breaks != piece.breaks {
+                        return Err(crate::worker_edit::invalid("candidate line metrics"));
+                    }
+                    (
+                        piece.end - piece.start,
+                        breaks,
+                        piece.storage.resources().plus(StorageResources { tree_nodes: 1, ..Default::default() }),
+                    )
+                }
+                Kind::Branch(left, right) => {
+                    let (lb, ll, lr) = visit(a, left, budget, owner, cancelled)?;
+                    let (rb, rl, rr) = visit(a, right, budget, owner, cancelled)?;
+                    (
+                        lb.checked_add(rb).ok_or_else(crate::worker_edit::overflow)?,
+                        ll.checked_add(rl).ok_or_else(crate::worker_edit::overflow)?,
+                        lr.plus(rr).plus(StorageResources { tree_nodes: 1, ..Default::default() }),
+                    )
+                }
+            };
+            if node.metrics.bytes != bytes || node.metrics.breaks != breaks || node.metrics.resources != resources {
+                return Err(crate::worker_edit::invalid("candidate cached metrics"));
+            }
+            Ok((bytes, breaks, resources))
+        }
+        self.charge_tree(&snapshot.root)?;
+        if let Some(root) = &snapshot.root {
+            visit(self, root, budget, owner, cancelled)?;
+        }
+        let actual = original_uses(&snapshot.root, 0..snapshot.len());
+        if actual.len() != snapshot.originals.len()
+            || actual
+                .iter()
+                .any(|(key, (_, count))| snapshot.originals.get(key).is_none_or(|(_, other)| count != other))
+        {
+            return Err(crate::worker_edit::invalid("candidate original directory"));
+        }
+        crate::worker_edit::poll(cancelled)
+    }
+    pub(crate) fn claim(&mut self, cancelled: &std::sync::atomic::AtomicBool) -> io::Result<()> {
+        #[cfg(test)]
+        let mut polls = 0;
+        spill_retirement::claim_worker_allocations(&self.blocks, &mut || {
+            #[cfg(test)]
+            {
+                polls += 1;
+                if polls == 2 {
+                    if self.fault == WorkerFault::ClaimPrefixPanic {
+                        panic!("controlled prefix claim unwind");
+                    }
+                    if self.fault == WorkerFault::ClaimPrefixCancel {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                }
+            }
+            cancelled.load(Ordering::Acquire)
+        })?;
+        self.claimed = true;
+        #[cfg(test)]
+        if self.fault == WorkerFault::CancelAfterClaim {
+            cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.decoded.is_empty()
+    }
+    pub(crate) fn visit_owned_paths(&self, visit: &mut impl FnMut(&std::path::Path)) {
+        for entry in &self.decoded {
+            if entry.directory_owned {
+                visit(&entry.paths.directory);
+            }
+            for (owned, path) in
+                entry.owned.iter().zip([&entry.paths.raw, &entry.paths.logical, &entry.paths.checkpoints])
+            {
+                if *owned {
+                    visit(path);
+                }
+            }
+        }
+        for storage in &self.blocks {
+            if let Storage::Disk(block) = storage.as_ref()
+                && (block.worker_file_owned || block.worker_directory_owned)
+            {
+                visit(&block.path);
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn worker_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = self
+            .blocks
+            .iter()
+            .filter_map(|s| if let Storage::Disk(b) = s.as_ref() { Some(b.path.clone()) } else { None })
+            .collect();
+        for entry in &self.decoded {
+            paths.extend([entry.paths.raw.clone(), entry.paths.logical.clone(), entry.paths.checkpoints.clone()]);
+        }
+        paths
+    }
+    #[cfg(test)]
+    pub(crate) fn worker_reserved_disk(&self) -> u64 {
+        self.disk
+    }
+    pub(crate) fn retire(&mut self) -> SpillRetirementReport {
+        self.baseline.clear(); // release source pins only on the worker.
+        let mut report = SpillRetirementReport::default();
+        let mut at = 0;
+        while at < self.decoded.len() {
+            let entry = &mut self.decoded[at];
+            if entry.storage.as_ref().is_some_and(|storage| Arc::strong_count(storage) != 1) {
+                report.live += 1;
+                at += 1;
+                continue;
+            }
+            entry.storage.take();
+            if let Some(owner) = entry.owner.take()
+                && let Err(owner) = owner.close_registered()
+            {
+                entry.owner = Some(owner);
+                report.live += 1;
+                at += 1;
+                continue;
+            }
+            for file in &mut entry.files {
+                file.take();
+            }
+            let result = (|| {
+                #[cfg(test)]
+                if self.fault == WorkerFault::Cleanup {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                for (owned, path) in
+                    entry.owned.iter_mut().zip([&entry.paths.raw, &entry.paths.logical, &entry.paths.checkpoints])
+                {
+                    if *owned {
+                        match std::fs::remove_file(path) {
+                            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                            _ => {}
+                        }
+                        *owned = false;
+                    }
+                }
+                if entry.directory_owned {
+                    match std::fs::remove_dir(&entry.paths.directory) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                        _ => {}
+                    }
+                    entry.directory_owned = false;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    self.decoded.swap_remove(at);
+                    report.retired += 3;
+                }
+                Err(error) => {
+                    report.cleanup_pending += 1;
+                    if report.first_error.is_none() {
+                        report.first_error = Some(error);
+                    }
+                    at += 1;
+                }
+            }
+        }
+        let mut index = 0;
+        while index < self.blocks.len() {
+            let Some(storage) = Arc::get_mut(&mut self.blocks[index]) else {
+                report.live += 1;
+                index += 1;
+                continue;
+            };
+            let result = if let Storage::Disk(block) = storage {
+                block.map.take();
+                block.file.take();
+                #[cfg(test)]
+                let blocked = self.fault == WorkerFault::Cleanup;
+                #[cfg(not(test))]
+                let blocked = false;
+                (|| {
+                    if blocked {
+                        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                    }
+                    if block.worker_file_owned {
+                        match std::fs::remove_file(&block.path) {
+                            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                            _ => {}
+                        }
+                        block.worker_file_owned = false;
+                    }
+                    if block.worker_directory_owned {
+                        match std::fs::remove_dir(block.path.parent().unwrap()) {
+                            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                            _ => {}
+                        }
+                        block.worker_directory_owned = false;
+                    }
+                    if self.claimed {
+                        block.retirement_leased.store(false, Ordering::Release);
+                    }
+                    Ok(())
+                })()
+            } else {
+                Ok(())
+            };
+            match result {
+                Ok(()) => {
+                    self.blocks.swap_remove(index);
+                    report.retired += 1;
+                }
+                Err(error) => {
+                    report.cleanup_pending += 1;
+                    if report.first_error.is_none() {
+                        report.first_error = Some(error);
+                    }
+                    index += 1;
+                }
+            }
+        }
+        report
+    }
+}
+
+fn worker_added(
+    bytes: &[u8],
+    budget: &Arc<AddBudget>,
+    allocation: &mut WorkerAllocation,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> io::Result<Tree> {
+    let mut tree = None;
+    for chunk in bytes.chunks(ADD_BLOCK) {
+        allocation.charge_tree(&tree)?;
+        let storage = allocation.block(chunk, budget, cancelled)?;
+        tree = join(
+            tree,
+            Some(leaf(Piece {
+                storage,
+                owner: Some(budget.owner.clone()),
+                start: 0,
+                end: chunk.len() as u64,
+                first_line: 0,
+                breaks: memchr_iter(b'\n', chunk).count() as u64,
+            })),
+        );
+    }
+    Ok(tree)
+}
+fn worker_detached(
+    encoding: Encoding,
+    bytes: &[u8],
+    raw: &[u8],
+    offsets: &[u8],
+    budget: &Arc<AddBudget>,
+    allocation: &mut WorkerAllocation,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> io::Result<Tree> {
+    if raw.is_empty() {
+        return worker_added(bytes, budget, allocation, cancelled);
+    }
+    allocation.charge_tree(&None)?;
+    let logical = allocation.block(bytes, budget, cancelled)?;
+    let raw = allocation.block(raw, budget, cancelled)?;
+    let offsets = allocation.block(offsets, budget, cancelled)?;
+    Ok(Some(leaf(Piece {
+        storage: Arc::new(Storage::Opaque { encoding, logical, raw, offsets }),
+        owner: Some(budget.owner.clone()),
+        start: 0,
+        end: bytes.len() as u64,
+        first_line: 0,
+        breaks: memchr_iter(b'\n', bytes).count() as u64,
+    })))
+}
+pub(crate) fn worker_import(
+    tree: Tree,
+    budget: &Arc<AddBudget>,
+    allocation: &mut WorkerAllocation,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> io::Result<Tree> {
+    crate::worker_edit::poll(cancelled)?;
+    let Some(node) = tree else { return Ok(None) };
+    match &node.kind {
+        Kind::Branch(left, right) => {
+            allocation.charge_tree(&Some(node.clone()))?;
+            let a = worker_import(Some(left.clone()), budget, allocation, cancelled)?;
+            let b = worker_import(Some(right.clone()), budget, allocation, cancelled)?;
+            Ok(join(a, b))
+        }
+        Kind::Leaf(piece) => {
+            if allocation.allowed(&piece.storage, budget) {
+                return Ok(Some(node));
+            }
+            match piece.storage.as_ref() {
+                Storage::Decoded(source) => {
+                    crate::decoded_piece::validate_range(&source.origin, piece.start..piece.end)?;
+                    let storage = allocation.decoded_copy(source, cancelled)?;
+                    let first_line = storage.rank(piece.start).map_err(io::Error::other)?;
+                    let breaks = storage.rank(piece.end).map_err(io::Error::other)? - first_line;
+                    Ok(Some(leaf(Piece {
+                        storage,
+                        owner: Some(budget.owner.clone()),
+                        start: piece.start,
+                        end: piece.end,
+                        first_line,
+                        breaks,
+                    })))
+                }
+                Storage::Opaque { encoding, raw, offsets, .. } => {
+                    let offsets = offsets.bytes().map_err(io::Error::other)?;
+                    let first = offset_at(offsets, piece.start);
+                    let last = offset_at(offsets, piece.end);
+                    let mut rebased = Vec::with_capacity((piece.end - piece.start + 1) as usize * 4);
+                    for at in piece.start..=piece.end {
+                        rebased.extend_from_slice(&((offset_at(offsets, at) - first) as u32).to_le_bytes());
+                    }
+                    let bytes = piece.storage.bytes().map_err(io::Error::other)?;
+                    worker_detached(
+                        *encoding,
+                        &bytes[piece.start as usize..piece.end as usize],
+                        &raw.bytes().map_err(io::Error::other)?[first..last],
+                        &rebased,
+                        budget,
+                        allocation,
+                        cancelled,
+                    )
+                }
+                _ => {
+                    // COPY foreign spills too, even Free/all-spilled leaves.
+                    let bytes = piece.storage.bytes().map_err(io::Error::other)?;
+                    worker_added(&bytes[piece.start as usize..piece.end as usize], budget, allocation, cancelled)
+                }
+            }
+        }
+    }
 }
 
 /// Exact source byte ownership from cached metrics, with no file reads.
