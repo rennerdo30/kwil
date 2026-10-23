@@ -53,7 +53,9 @@ pub(super) fn owns_input(event: &WindowEvent) -> bool {
 
 impl App {
     pub(super) fn sync_desktop_window(&mut self, el: &ActiveEventLoop) {
-        let wanted = if self.welcome.visible() {
+        let wanted = if self.file_dialogs.exiting() {
+            None
+        } else if self.welcome.visible() {
             Some(Kind::Welcome)
         } else if self.settings_open() {
             Some(Kind::Settings)
@@ -152,7 +154,9 @@ impl App {
             }
             Err(error) => {
                 self.error = Some(GuiError::Unavailable(format!("Desktop dialog: {error}")));
-                el.exit();
+                if self.force_exit() {
+                    el.exit();
+                }
             }
         }
     }
@@ -160,7 +164,7 @@ impl App {
     pub(super) fn desktop_window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::RedrawRequested => {
-                if !self.render_desktop_window() {
+                if !self.render_desktop_window() && self.force_exit() {
                     el.exit();
                 }
             }

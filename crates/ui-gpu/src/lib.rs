@@ -2601,6 +2601,20 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        // Native file/close dialogs and teardown own input ahead of every GUI
+        // overlay, including the separate settings window. Worker receipts still drain.
+        if self.file_modal() && desktop_window::owns_input(&ev) {
+            if !self.file_dialogs.exiting()
+                && self.close_dialog.is_none()
+                && matches!(&ev,WindowEvent::KeyboardInput{event,..} if event.state==ElementState::Pressed && matches!(event.logical_key,Key::Named(NamedKey::Escape)))
+            {
+                self.view.cancel_file_prompt();
+                self.sync_file_ui();
+                self.apply(Damage { status: true, ..Default::default() });
+            }
+            return;
+        }
+
         if !self.desktop_dispatch {
             if self.desktop_window.as_ref().is_some_and(|dialog| dialog.gfx.window.id() == _id) {
                 self.desktop_window_event(el, _id, ev);
