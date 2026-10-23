@@ -119,10 +119,19 @@ fn same_logical(snapshot: &Snapshot, bytes: &[u8], cancel: &AtomicBool) -> io::R
     Ok(true)
 }
 
-/// Failure cleanup occurs here on the saving worker, never in an owner Drop.
+/// Worker-owned preparation can fail before a logical snapshot exists.
+struct PreparedCheckpoint {
+    // Retain the owner even before the fallible logical index has produced a
+    // snapshot. Owner Drop alone deliberately does not unlink private files.
+    snapshot: Option<Snapshot>,
+    backing: DecodedBacking,
+    logical_coordinates_changed: bool,
+}
+
+/// Failure cleanup occurs on the saving worker, never in an owner Drop.
 /// Surface cleanup paths rather than silently losing a failed retirement.
-fn discard_prepared(prepared: Option<(Snapshot, DecodedBacking, bool)>, cause: io::Error) -> io::Error {
-    let Some((snapshot, backing, _)) = prepared else { return cause };
+fn discard_prepared(prepared: Option<PreparedCheckpoint>, cause: io::Error) -> io::Error {
+    let Some(PreparedCheckpoint { snapshot, backing, .. }) = prepared else { return cause };
     drop(snapshot);
     match backing.try_retire() {
         Ok(()) => cause,
@@ -146,6 +155,19 @@ fn save_encoded_with_operations(
     private_parent: &Path,
     cancel: &AtomicBool,
     replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
+) -> io::Result<EncodedSavedSnapshot> {
+    save_encoded_with_index_cancellation(request, plan, private_parent, cancel, replace, || {
+        cancel.load(Ordering::Relaxed)
+    })
+}
+
+fn save_encoded_with_index_cancellation(
+    request: SaveRequest,
+    plan: SavePlan,
+    private_parent: &Path,
+    cancel: &AtomicBool,
+    replace: impl FnOnce(&Path, &Path, Option<&Path>) -> io::Result<()>,
+    mut index_cancel: impl FnMut() -> bool,
 ) -> io::Result<EncodedSavedSnapshot> {
     cancelled(cancel)?;
     validate_encoded_snapshot(&request.snapshot, plan, || cancel.load(Ordering::Relaxed))?;
@@ -184,10 +206,11 @@ fn save_encoded_with_operations(
             let origin = backing.snapshot();
             // Store the owner before any subsequent fallible work, so all
             // aborted precommit paths can explicitly retire it on this worker.
-            let snapshot = Buffer::from_decoded(origin.clone()).snapshot();
-            prepared = Some((snapshot, backing, false));
+            prepared = Some(PreparedCheckpoint { snapshot: None, backing, logical_coordinates_changed: false });
+            let snapshot = Buffer::from_decoded_cancellable(origin.clone(), &mut index_cancel)?.snapshot();
+            prepared.as_mut().unwrap().snapshot = Some(snapshot);
             let changed = !same_logical(&submitted, origin.logical_bytes(), cancel)?;
-            prepared.as_mut().unwrap().2 = changed;
+            prepared.as_mut().unwrap().logical_coordinates_changed = changed;
             cancelled(cancel)
         },
         replace,
@@ -206,8 +229,8 @@ fn save_encoded_with_operations(
             ));
         }
     };
-    let (snapshot, backing, logical_coordinates_changed) = prepared.unwrap();
-    let mut saved = committed.finish(file, snapshot);
+    let PreparedCheckpoint { snapshot, backing, logical_coordinates_changed } = prepared.unwrap();
+    let mut saved = committed.finish(file, snapshot.expect("successful preparation must finish logical indexing"));
     saved.trim_deletions = spool.filter(|spool| !spool.is_empty());
     Ok(EncodedSavedSnapshot { saved, backing, logical_coordinates_changed })
 }
@@ -499,6 +522,61 @@ mod tests {
         assert!(err.to_string().contains("injected encoded replace failure"), "{err}");
         assert_eq!(fs::read(f.path()).unwrap(), b"unchanged");
         assert_eq!(fs::read_dir(&f.root).unwrap().count(), 1, "no temporary/private backing leak");
+    }
+
+    #[test]
+    fn encoded_checkpoint_index_cancellation_retires_backing_before_any_replacement() {
+        let f = Fixture::new();
+        fs::write(f.path(), b"unchanged original").unwrap();
+        let mut bytes = vec![b'x'; 128 << 10];
+        bytes[(64 << 10) - 1] = b'\n';
+        bytes[(128 << 10) - 1] = b'\n';
+        let mut b = Buffer::empty();
+        b.insert(0, &bytes).unwrap();
+        let cancel = AtomicBool::new(false);
+        let replaced = Cell::new(false);
+        let mut polls = 0;
+        let error = save_encoded_with_index_cancellation(
+            f.request(&b, false),
+            plan(Encoding::UTF8, false),
+            &f.root,
+            &cancel,
+            |temp, destination, backup| {
+                replaced.set(true);
+                replace(temp, destination, backup)
+            },
+            || {
+                // This probe is passed only to logical indexing, after backing
+                // preparation, never to encoding or the raw/logical file copy.
+                assert_eq!(f.private_directories(), 1, "backing must exist before index cancellation");
+                let directory = fs::read_dir(&f.root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| path.is_dir())
+                    .unwrap();
+                for name in ["raw", "logical", "checkpoints"] {
+                    assert!(directory.join(name).is_file(), "prepared backing lacks {name}");
+                }
+                assert_eq!(fs::metadata(directory.join("logical")).unwrap().len(), 128 << 10);
+                assert_eq!(fs::read(f.path()).unwrap(), b"unchanged original");
+                assert!(!replaced.get());
+                polls += 1;
+                // Current bounded builder checks entry, before the first block,
+                // then after its <=64KiB scan. Cancel inside that index build.
+                if polls == 3 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                cancel.load(Ordering::Relaxed)
+            },
+        )
+        .err()
+        .expect("cooperative index cancellation must abort the precommit save");
+        assert_eq!(polls, 3, "cancelled logical indexing must stop polling immediately");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(!replaced.get(), "index cancellation must never enter the replacement operation");
+        assert_eq!(fs::read(f.path()).unwrap(), b"unchanged original");
+        assert_eq!(f.private_directories(), 0, "index-error backing needs explicit worker retirement");
+        assert_eq!(fs::read_dir(&f.root).unwrap().count(), 1, "retire all private files and the save temp");
     }
 
     #[test]
