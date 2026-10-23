@@ -1508,7 +1508,62 @@ mod tests {
     fn stop_storage(mut storage: Storage) {
         storage.service.finish();
         storage.service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        storage.journals.clear();
+        let _ = storage.encoding.retire();
         drop(storage);
+    }
+
+    #[test]
+    fn production_save_normalization_is_an_undoable_receipted_edit() {
+        let root = Scratch::new();
+        let path = root.0.join("joined-opaque.txt");
+        std::fs::write(&path, b"\xef\xbb\xbf\xc2X\xa2").unwrap();
+        let (_, mut storage) = prepare_root(root.0.clone()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let document =
+            storage.encoding.open(path.clone(), TextFile::open(&path).unwrap(), None, &cancel, |_| Ok(())).unwrap();
+        let mut editor = crate::Editor::new(document);
+        let receipts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = receipts.clone();
+        editor
+            .set_edit_observer(Some(Box::new(move |receipt| {
+                recorded.lock().unwrap().push(receipt);
+                Ok(())
+            })))
+            .unwrap();
+        editor.set_cursors(vec![crate::Cursor { anchor: 1, head: 1, desired_column: None }], 0).unwrap();
+        editor.execute("edit.delete", &crate::CommandArgs::default(), 1).unwrap();
+        let before_revision = editor.document().revision();
+        let request = editor.save_request(None).unwrap();
+        let saved = storage.encoding.save(request, editor.document().save_plan(), &cancel).unwrap();
+        editor.finish_save(Ok(saved)).unwrap();
+        let after_revision = editor.document().revision();
+        let recorded = receipts.lock().unwrap();
+        let receipt_count = recorded.len();
+        let save_transition = recorded.last().cloned();
+        drop(recorded);
+        let mut saved_text = Vec::new();
+        editor.document().snapshot().write_to(&mut saved_text).unwrap();
+        editor.execute("edit.undo", &crate::CommandArgs::default(), 2).unwrap();
+        let mut undone = Vec::new();
+        editor.document().snapshot().write_to(&mut undone).unwrap();
+        editor.execute("edit.redo", &crate::CommandArgs::default(), 3).unwrap();
+        let mut redone = Vec::new();
+        editor.document().snapshot().write_to(&mut redone).unwrap();
+        drop(editor);
+        drop(receipts);
+        let disk = std::fs::read(&path).unwrap();
+        // Release captured snapshot pins before explicit worker retirement.
+        let transition = save_transition
+            .map(|receipt| (receipt.before_revision, receipt.after_revision, receipt.replacement_count()));
+        stop_storage(storage);
+        assert_ne!(after_revision, before_revision, "normalization requires a real model revision");
+        assert_eq!(receipt_count, 2, "normalization requires its own exact journal receipt");
+        assert_eq!(transition, Some((before_revision, after_revision, 1)));
+        assert_eq!(disk, b"\xef\xbb\xbf\xc2\xa2");
+        assert_eq!(saved_text, "¢".as_bytes());
+        assert_eq!(undone, b"\xff\xff", "undo must restore both original opaque atoms");
+        assert_eq!(redone, "¢".as_bytes());
     }
 
     fn prepare_test_worker(worker: &DocumentWorker, receiver: &mpsc::Receiver<DocumentResult>, root: &std::path::Path) {
@@ -1517,6 +1572,96 @@ mod tests {
             if let DocumentResult::Prepared(result) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
                 drop(result.unwrap());
                 break;
+            }
+        }
+    }
+
+    #[test]
+    fn production_normalized_save_backpressure_stale_and_trim_remain_ordered() {
+        use std::sync::{Arc, Mutex, atomic::Ordering};
+        for mode in ["pending", "stale", "trim"] {
+            let root = Scratch::new();
+            let path = root.0.join("normalized.txt");
+            let raw = if mode == "trim" {
+                b"\xef\xbb\xbf\xc2X\xa2  \n".as_slice()
+            } else {
+                b"\xef\xbb\xbf\xc2X\xa2".as_slice()
+            };
+            std::fs::write(&path, raw).unwrap();
+            let (_, mut storage) = prepare_root(root.0.clone()).unwrap();
+            let cancel = AtomicBool::new(false);
+            let document =
+                storage.encoding.open(path.clone(), TextFile::open(&path).unwrap(), None, &cancel, |_| Ok(())).unwrap();
+            let mut editor = crate::Editor::new(document);
+            editor.settings.editor.trim_trailing_whitespace_on_save = mode == "trim";
+            let accepting = Arc::new(AtomicBool::new(mode == "stale"));
+            let gate = accepting.clone();
+            let receipts = Arc::new(Mutex::new(Vec::new()));
+            let recorded = receipts.clone();
+            editor
+                .set_edit_observer(Some(Box::new(move |receipt| {
+                    if !gate.load(Ordering::Relaxed) {
+                        return Err(receipt);
+                    }
+                    recorded.lock().unwrap().push(receipt);
+                    Ok(())
+                })))
+                .unwrap();
+            editor.set_cursors(vec![crate::Cursor { anchor: 1, head: 1, desired_column: None }], 0).unwrap();
+            editor.execute("edit.delete", &Default::default(), 1).unwrap();
+            let source_revision = editor.document().revision();
+            let request = editor.save_request(None).unwrap();
+            let saved = storage.encoding.save(request, editor.document().save_plan(), &cancel).unwrap();
+            assert!(saved.normalized, "the worker must distinguish normalization from trim: {mode}");
+            assert!(saved.trim_deletions.is_none(), "unused trim spool must retire on worker");
+            if mode == "stale" {
+                accepting.store(false, Ordering::Relaxed);
+                editor
+                    .execute("edit.insert", &crate::CommandArgs { text: Some("!".into()), ..Default::default() }, 2)
+                    .unwrap();
+                let live_revision = editor.document().revision();
+                editor.finish_save(Ok(saved)).unwrap();
+                assert!(!editor.has_pending_save_completion());
+                assert!(editor.has_pending_edit_receipt());
+                assert!(editor.document().is_dirty());
+                assert_eq!(editor.document().revision(), live_revision);
+            } else {
+                let error = editor.finish_save(Ok(saved)).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(editor.has_pending_save_completion());
+                assert_eq!(editor.document().revision(), source_revision);
+                assert!(
+                    editor
+                        .execute(
+                            "edit.insert",
+                            &crate::CommandArgs { text: Some("must not retry".into()), ..Default::default() },
+                            2
+                        )
+                        .is_err()
+                );
+            }
+            accepting.store(true, Ordering::Relaxed);
+            editor.flush_edit_receipt().unwrap();
+            if mode != "stale" {
+                assert!(editor.finish_pending_save().unwrap().is_some());
+            }
+            let mut live = Vec::new();
+            editor.document().snapshot().write_to(&mut live).unwrap();
+            let recorded = receipts.lock().unwrap();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!((recorded[0].sequence, recorded[1].sequence), (1, 2));
+            let normalized_receipts =
+                recorded.iter().filter(|receipt| receipt.kind == crate::EditKind::WorkerSave).count();
+            drop(recorded);
+            drop(editor);
+            drop(receipts);
+            stop_storage(storage);
+            if mode == "stale" {
+                assert_eq!(live, b"\xff!\xff");
+                assert_eq!(normalized_receipts, 0, "stale completion emits no phantom edit");
+            } else {
+                assert_eq!(live, if mode == "trim" { "¢\n".as_bytes() } else { "¢".as_bytes() });
+                assert_eq!(normalized_receipts, 1, "retry publishes exactly one normalization");
             }
         }
     }

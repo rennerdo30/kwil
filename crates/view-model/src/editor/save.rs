@@ -1,3 +1,4 @@
+use super::receipts::Shape;
 use super::*;
 use kwil_core_workspace::{SaveRequest, SavedSnapshot};
 use std::path::PathBuf;
@@ -41,13 +42,60 @@ impl Editor {
             }
         };
         let current = self.document.revision == saved.revision;
-        if current && saved.trimmed_rows.is_some() && self.flush_edit_receipt().is_err() {
+        if current && (saved.normalized || saved.trimmed_rows.is_some()) && self.flush_edit_receipt().is_err() {
             self.receipts.deferred_save = Some(saved);
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "save completion awaits journal admission"));
         }
         self.saving = false;
         let mut damage = Damage { status: true, ..Damage::default() };
-        if let Some(rows) = saved.trimmed_rows {
+        if saved.normalized {
+            if current {
+                let before = self.state();
+                let source = self.document.snapshot();
+                let rows = 0..source.line_count().max(saved.snapshot.line_count());
+                for cursor in &mut self.cursors {
+                    for position in [&mut cursor.anchor, &mut cursor.head] {
+                        *position = (*position).min(saved.snapshot.len());
+                        // A formerly separate opaque atom can now lie inside
+                        // one UTF8 scalar. Round forward to its valid boundary.
+                        for _ in 0..3 {
+                            if text::byte(&saved.snapshot, *position)?.is_some_and(|byte| byte & 0xc0 == 0x80) {
+                                *position += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    cursor.desired_column = None;
+                }
+                let transition = Transition {
+                    before: source.clone(),
+                    after: saved.snapshot.clone(),
+                    recipe: Recipe::Explicit(Arc::new(vec![Shape {
+                        range: 0..source.len(),
+                        inserted: saved.snapshot.len(),
+                    }])),
+                };
+                self.document.buffer.install_worker_edit(saved.snapshot)?;
+                self.document.changed();
+                self.box_column = None;
+                self.normalize();
+                self.redo.clear();
+                self.undo.push_back(HistoryEntry {
+                    before: before.clone(),
+                    after: self.state(),
+                    edited: rows,
+                    structural: true,
+                    transition: transition.clone(),
+                });
+                self.charge_model_history();
+                self.publish(transition, before.revision, self.document.revision, EditKind::WorkerSave);
+                self.document.saved_revision = self.document.revision;
+                damage = Damage { full: true, status: true, ..Damage::default() };
+            } else {
+                self.document.mark_unsaved();
+            }
+        } else if let Some(rows) = saved.trimmed_rows {
             if current {
                 let old = self.cursor_rows()?;
                 let before = self.state();

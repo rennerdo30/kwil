@@ -33,6 +33,9 @@ pub struct SavedSnapshot {
     pub warnings: Vec<String>,
     pub trimmed_rows: Option<Range<u64>>,
     pub trim_deletions: Option<TrimSpool>,
+    /// Encoding changed logical text beyond the submitted-coordinate trim
+    /// recipe. Install as a model edit, never as an equivalent checkpoint.
+    pub normalized: bool,
 }
 
 /// Opening worker entry point, also conservatively cleans recognized orphan
@@ -135,6 +138,7 @@ impl CommittedSave {
             warnings: self.warnings,
             trimmed_rows: self.trimmed_rows,
             trim_deletions: None,
+            normalized: false,
         }
     }
 }

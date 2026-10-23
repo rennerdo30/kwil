@@ -9,6 +9,7 @@ pub enum EditKind {
     Undo,
     Redo,
     WorkerTrim,
+    WorkerSave,
 }
 
 #[derive(Clone)]

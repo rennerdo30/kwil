@@ -65,10 +65,14 @@ impl EncodingRuntime {
                 "line-ending conversion requires a logical completion transaction",
             ));
         }
-        let completed = self.backings.save(request, plan, cancel)?;
-        // With ending preservation, logical changes are the submitted-coordinate
-        // trim recipe already carried by SavedSnapshot. The raw file is never
-        // installed as the editor's logical checkpoint.
+        let mut completed = self.backings.save(request, plan, cancel)?;
+        if completed.saved.normalized {
+            // The model records a complete logical replacement in this case;
+            // its trim-only spool is unnecessary and must retire on the worker.
+            completed.saved.trim_deletions.take();
+        }
+        // Logical normalization is explicitly flagged in SavedSnapshot, even
+        // when lengths agree. The model installs it as an undoable transaction.
         Ok(completed.saved)
     }
 

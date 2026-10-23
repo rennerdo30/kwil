@@ -119,6 +119,35 @@ fn same_logical(snapshot: &Snapshot, bytes: &[u8], cancel: &AtomicBool) -> io::R
     Ok(true)
 }
 
+fn same_after_trim(snapshot: &Snapshot, spool: &TrimSpool, bytes: &[u8], cancel: &AtomicBool) -> io::Result<bool> {
+    let mut at = 0usize;
+    let mut compare = |range| -> io::Result<bool> {
+        for chunk in snapshot.chunks(range)? {
+            for block in chunk.map_err(io::Error::other)?.chunks(64 << 10) {
+                cancelled(cancel)?;
+                let end = at.checked_add(block.len()).ok_or_else(|| io::Error::other("logical comparison overflow"))?;
+                if bytes.get(at..end) != Some(block) {
+                    return Ok(false);
+                }
+                at = end;
+            }
+        }
+        Ok(true)
+    };
+    let mut source = 0;
+    for deletion in spool.ranges()? {
+        let deletion = deletion?;
+        if !compare(source..deletion.start)? {
+            return Ok(false);
+        }
+        source = deletion.end;
+    }
+    if !compare(source..snapshot.len())? {
+        return Ok(false);
+    }
+    Ok(at == bytes.len())
+}
+
 /// Worker-owned preparation can fail before a logical snapshot exists.
 struct PreparedCheckpoint {
     // Retain the owner even before the fallible logical index has produced a
@@ -126,6 +155,7 @@ struct PreparedCheckpoint {
     snapshot: Option<Snapshot>,
     backing: DecodedBacking,
     logical_coordinates_changed: bool,
+    normalized: bool,
 }
 
 /// Failure cleanup occurs on the saving worker, never in an owner Drop.
@@ -206,11 +236,22 @@ fn save_encoded_with_index_cancellation(
             let origin = backing.snapshot();
             // Store the owner before any subsequent fallible work, so all
             // aborted precommit paths can explicitly retire it on this worker.
-            prepared = Some(PreparedCheckpoint { snapshot: None, backing, logical_coordinates_changed: false });
+            prepared = Some(PreparedCheckpoint {
+                snapshot: None,
+                backing,
+                logical_coordinates_changed: false,
+                normalized: false,
+            });
             let snapshot = Buffer::from_decoded_cancellable(origin.clone(), &mut index_cancel)?.snapshot();
             prepared.as_mut().unwrap().snapshot = Some(snapshot);
             let changed = !same_logical(&submitted, origin.logical_bytes(), cancel)?;
             prepared.as_mut().unwrap().logical_coordinates_changed = changed;
+            let normalized = if let Some(spool) = spool.as_ref().filter(|spool| !spool.is_empty()) {
+                !same_after_trim(&submitted, spool, origin.logical_bytes(), cancel)?
+            } else {
+                changed
+            };
+            prepared.as_mut().unwrap().normalized = normalized;
             cancelled(cancel)
         },
         replace,
@@ -229,9 +270,10 @@ fn save_encoded_with_index_cancellation(
             ));
         }
     };
-    let PreparedCheckpoint { snapshot, backing, logical_coordinates_changed } = prepared.unwrap();
+    let PreparedCheckpoint { snapshot, backing, logical_coordinates_changed, normalized } = prepared.unwrap();
     let mut saved = committed.finish(file, snapshot.expect("successful preparation must finish logical indexing"));
     saved.trim_deletions = spool.filter(|spool| !spool.is_empty());
+    saved.normalized = normalized;
     Ok(EncodedSavedSnapshot { saved, backing, logical_coordinates_changed })
 }
 
