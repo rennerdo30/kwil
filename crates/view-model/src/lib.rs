@@ -174,7 +174,8 @@ impl View {
                 }
             }
         }
-        if let Some((line, column, extend)) = self.pending_goto.take()
+        if self.editor.is_some()
+            && let Some((line, column, extend)) = self.pending_goto.take()
             && let Some(editor) = &mut self.editor
         {
             match editor.go_to_line(line, column, extend) {
@@ -393,6 +394,33 @@ impl View {
 #[cfg(test)]
 mod viewer_tests {
     use super::*;
+
+    #[test]
+    fn decoded_preview_preserves_deferred_navigation_until_prepared_editor() {
+        let original = view_with_lines("decoded-preview-goto", 6);
+        let mut view = View::from_preview(
+            original.path.clone().unwrap(),
+            original.file.clone().unwrap(),
+            b"preview only".to_vec(),
+        );
+        view.set_rows(2);
+        view.execute(
+            "navigation.goToLine",
+            &CommandArgs { line: Some(4), column: Some(3), extend: true, ..Default::default() },
+            1,
+        )
+        .unwrap();
+        view.index_ready();
+        assert_eq!(view.pending_goto, Some((4, 3, true)));
+        view.editor = original.editor;
+        view.editor.as_mut().unwrap().set_viewport(view.top, view.rows);
+        view.index_ready();
+        assert!(view.pending_goto.is_none());
+        let cursor = view.editor().unwrap().primary_cursor();
+        assert_eq!(cursor.anchor, 0);
+        assert_eq!(view.editor().unwrap().position_at(cursor.head).unwrap(), (3, 2));
+        assert_eq!(view.line((3 - view.top()) as usize), Some(&b"line 3"[..]));
+    }
 
     #[test]
     fn decoded_preview_remains_read_only_and_resize_uses_cached_text() {
