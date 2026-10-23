@@ -10,7 +10,11 @@ use std::{
 };
 mod trim_spool;
 pub use trim_spool::{TrimRanges, TrimSpool};
+mod compressed;
 mod encoded;
+pub use compressed::{
+    CompressedCheckpointOwners, CompressedSaveRetirement, CompressedSavedSnapshot, save_compressed_snapshot,
+};
 pub use encoded::{EncodedSavedSnapshot, save_encoded_snapshot};
 
 pub struct SaveRequest {
@@ -63,7 +67,9 @@ impl Temporary {
                 options.mode(0o600);
             }
             match options.open(&path) {
-                Ok(file) => return Ok(Self { path, file: Some(file) }),
+                Ok(file) => {
+                    return Ok(Self { path, file: Some(file) });
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }

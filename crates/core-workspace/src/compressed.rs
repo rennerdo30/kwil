@@ -21,7 +21,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 pub const STREAM_CHUNK: usize = 64 * 1024;
@@ -169,12 +172,41 @@ impl From<io::Error> for CompressionError {
 pub struct PreparedFile {
     source: PathBuf,
     format: CompressionFormat,
+    mode: CompressionMode,
     file: Option<TextFile>,
     backing: Option<Backing>,
     cleanup_error: Option<io::Error>,
 }
 
+/// Metadata distinguishes automatic gzip detection from a manual override.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompressionNotice {
+    pub mode: CompressionMode,
+    pub format: CompressionFormat,
+}
+
 impl PreparedFile {
+    pub fn mode(&self) -> CompressionMode {
+        self.mode
+    }
+
+    pub fn notice(&self) -> Option<CompressionNotice> {
+        (self.mode != CompressionMode::Auto || self.format == CompressionFormat::Gzip)
+            .then_some(CompressionNotice { mode: self.mode, format: self.format })
+    }
+
+    /// Extract a failed preparation's retained owner exactly once through typed
+    /// save contexts. The worker registry must retain the returned owner.
+    pub fn take_from(error: &io::Error) -> Option<Self> {
+        let mut current: &(dyn std::error::Error + 'static) = error;
+        loop {
+            if let Some(pending) = current.downcast_ref::<PendingPreparedRetirement>() {
+                return pending.owner.lock().unwrap_or_else(|p| p.into_inner()).take();
+            }
+            current =
+                if let Some(io) = current.downcast_ref::<io::Error>() { io.get_ref()? } else { current.source()? };
+        }
+    }
     pub fn source_path(&self) -> &Path {
         &self.source
     }
@@ -468,10 +500,11 @@ pub fn prepare_file(
         check_cancel(cancel)?;
         let file = TextFile::open_saved_version(&source).map_err(io::Error::from)?;
         check_cancel(cancel)?;
-        return Ok(PreparedFile { source, format, file: Some(file), backing: None, cleanup_error: None });
+        return Ok(PreparedFile { source, format, mode, file: Some(file), backing: None, cleanup_error: None });
     }
     input.seek(SeekFrom::Start(0))?;
     let mut prepared = prepare_gzip(&source, &mut input, scratch_parent, cancel)?;
+    prepared.mode = mode;
     // Catch ordinary concurrent edits before publishing decoded bytes. The
     // parent still owns original-path identity/watch/journal/save conflict checks.
     let unchanged = (|| -> io::Result<bool> {
@@ -517,6 +550,7 @@ fn prepare_gzip(
         Ok(file) => Ok(PreparedFile {
             source: source.to_path_buf(),
             format: CompressionFormat::Gzip,
+            mode: CompressionMode::Gzip,
             file: Some(file),
             backing: scratch.backing.take(),
             cleanup_error: None,
@@ -645,6 +679,86 @@ pub fn recompress_reader(
     })
 }
 
+impl CompressionError {
+    /// Keep cleanup ownership and cancellation kind intact at I/O API edges.
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Cancelled => io::Error::new(io::ErrorKind::Interrupted, self),
+            Self::Io(error) => error,
+            Self::Cleanup { path, cause, error } => {
+                let owner = PreparedFile {
+                    source: path.clone(),
+                    format: CompressionFormat::Gzip,
+                    mode: CompressionMode::Gzip,
+                    file: None,
+                    backing: Some(Backing { path: path.join("payload"), directory: path }),
+                    cleanup_error: Some(error),
+                };
+                let cause = cause.into_io_error();
+                io::Error::new(cause.kind(), PendingPreparedRetirement { cause, owner: Mutex::new(Some(owner)) })
+            }
+            other => io::Error::new(io::ErrorKind::InvalidData, other),
+        }
+    }
+}
+struct PendingPreparedRetirement {
+    cause: io::Error,
+    owner: Mutex<Option<PreparedFile>>,
+}
+impl std::fmt::Debug for PendingPreparedRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingGzipRetirement").field("cause", &self.cause).finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for PendingPreparedRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)?;
+        let owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(owner) = owner.as_ref() {
+            if let Some(path) = owner.backing_path() {
+                write!(f, "; gzip cleanup pending at {}", path.display())?;
+            }
+            if let Some(error) = owner.cleanup_error() {
+                write!(f, ": {error}")?;
+            }
+        } else {
+            f.write_str("; gzip cleanup retained by worker")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for PendingPreparedRetirement {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// Worker-only preparation of a completed immutable gzip payload. Identity is
+/// the compressed destination, independent of the temporary reader. Close the
+/// reader before attempting replacement on Windows.
+pub fn prepare_gzip_payload(
+    identity: &Path,
+    input: &mut impl Read,
+    scratch_parent: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedFile, CompressionError> {
+    let identity = std::path::absolute(identity)?;
+    prepare_gzip(&identity, input, scratch_parent, cancel)
+}
+
+/// Streams encoded output through the guarded gzip encoder. Finishes CRC/trailer
+/// on success; suppresses Drop writes after failure. Preserves typed I/O causes.
+pub fn recompress_payload(
+    writer: &mut impl Write,
+    cancel: &AtomicBool,
+    feed: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> Result<(), CompressionError> {
+    recompress_with(writer, cancel, |encoder| {
+        feed(encoder)?;
+        Ok(0)
+    })
+    .map(|_| ())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,5 +1231,147 @@ mod tests {
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         assert!(prepared.try_finish().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "kwil-gzip-payload-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        recompress_payload(&mut output, &AtomicBool::new(false), |writer| writer.write_all(bytes)).unwrap();
+        output
+    }
+
+    #[test]
+    fn notices_distinguish_automatic_detection_and_explicit_overrides() {
+        let f = Fixture::new();
+        let path = f.0.join("input");
+        fs::write(&path, gzip(b"plain")).unwrap();
+        for mode in [CompressionMode::Auto, CompressionMode::Gzip, CompressionMode::Raw] {
+            let owner = prepare_file(&path, mode, &f.0, &AtomicBool::new(false)).unwrap();
+            assert_eq!(owner.mode(), mode);
+            assert_eq!(owner.notice(), Some(CompressionNotice { mode, format: owner.format() }));
+            assert!(owner.try_finish().is_ok());
+        }
+        fs::write(&path, b"plain").unwrap();
+        let owner = prepare_file(&path, CompressionMode::Auto, &f.0, &AtomicBool::new(false)).unwrap();
+        assert_eq!(owner.mode(), CompressionMode::Auto);
+        assert_eq!(owner.notice(), None);
+        assert!(owner.try_finish().is_ok());
+    }
+
+    #[test]
+    fn payload_preparation_uses_destination_identity_and_validates_all_members() {
+        let f = Fixture::new();
+        let payload = [gzip(b"first"), gzip(b""), gzip(b"\xfflast")].concat();
+        let identity = f.0.join("original.gz");
+        let owner = prepare_gzip_payload(&identity, &mut &payload[..], &f.0, &AtomicBool::new(false)).unwrap();
+        assert_eq!(owner.source_path(), identity);
+        assert_eq!(owner.text_file().unwrap().bytes().unwrap(), b"first\xfflast");
+        assert_eq!(owner.text_file().unwrap().resident_original_bytes(), 0);
+        assert!(owner.try_finish().is_ok());
+        assert!(!identity.exists(), "decompression must never create or overwrite the original");
+    }
+
+    #[test]
+    fn payload_callback_failure_keeps_typed_cause_and_never_seals_truncated_input() {
+        #[derive(Debug)]
+        struct FeedFailure;
+        impl std::fmt::Display for FeedFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("typed feed failure")
+            }
+        }
+        impl std::error::Error for FeedFailure {}
+        let mut output = Vec::new();
+        let error = recompress_payload(&mut output, &AtomicBool::new(false), |writer| {
+            writer.write_all(b"partial")?;
+            Err(io::Error::other(FeedFailure))
+        })
+        .unwrap_err()
+        .into_io_error();
+        assert!(error.get_ref().unwrap().is::<FeedFailure>());
+        assert!(MultiGzDecoder::new(&output[..]).read_to_end(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn payload_cancellation_and_footer_failure_never_retry_output_in_drop() {
+        let cancel = AtomicBool::new(false);
+        let mut output = Vec::new();
+        let error = recompress_payload(&mut output, &cancel, |writer| {
+            writer.write_all(b"partial")?;
+            cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap_err()
+        .into_io_error();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(MultiGzDecoder::new(&output[..]).read_to_end(&mut Vec::new()).is_err());
+        struct FooterFailure {
+            left: usize,
+            failed: bool,
+        }
+        impl Write for FooterFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(!self.failed, "Drop retried failed output");
+                if self.left == 0 {
+                    self.failed = true;
+                    return Err(io::Error::other("payload footer failure"));
+                }
+                let count = bytes.len().min(self.left);
+                self.left -= count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = FooterFailure { left: gzip(b"trailer").len() - 8, failed: false };
+        let error = recompress_payload(&mut writer, &AtomicBool::new(false), |writer| writer.write_all(b"trailer"))
+            .unwrap_err();
+        assert!(writer.failed);
+        assert!(error.to_string().contains("payload footer failure"));
+    }
+
+    #[test]
+    fn payload_cleanup_error_retains_typed_owner_and_original_cancellation() {
+        let f = Fixture::new();
+        let scratch = WorkerScratch::create(&f.0).unwrap();
+        let directory = scratch.backing.as_ref().unwrap().directory.clone();
+        let blocker = directory.join("keep");
+        fs::write(&blocker, b"keep").unwrap();
+        let error = scratch.abort(CompressionError::Cancelled).into_io_error();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        let owner = PreparedFile::take_from(&error).expect("cleanup owner must survive I/O context");
+        assert!(PreparedFile::take_from(&error).is_none());
+        assert!(owner.text_file().is_none());
+        assert!(owner.cleanup_error().is_some());
+        let owner = match owner.try_finish() {
+            Err(owner) => owner,
+            Ok(()) => panic!("blocker must retain cleanup owner"),
+        };
+        fs::remove_file(&blocker).unwrap();
+        assert!(owner.try_finish().is_ok());
+        assert!(!directory.exists());
     }
 }

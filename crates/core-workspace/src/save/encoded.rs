@@ -53,7 +53,11 @@ fn encoding_error(error: EncodingError) -> io::Error {
     }
 }
 
-fn validate_encoded_snapshot(snapshot: &Snapshot, plan: SavePlan, cancelled: impl FnMut() -> bool) -> io::Result<()> {
+pub(super) fn validate_encoded_snapshot(
+    snapshot: &Snapshot,
+    plan: SavePlan,
+    cancelled: impl FnMut() -> bool,
+) -> io::Result<()> {
     validate_snapshot_save_cancellable(snapshot, plan, cancelled).map_err(encoding_error)
 }
 
@@ -92,7 +96,7 @@ impl<W: Write> Write for Cancellable<'_, W> {
     }
 }
 
-fn bom_len(plan: SavePlan) -> usize {
+pub(super) fn bom_len(plan: SavePlan) -> usize {
     if !plan.bom {
         0
     } else if plan.encoding == Encoding::UTF8 {
@@ -102,7 +106,7 @@ fn bom_len(plan: SavePlan) -> usize {
     }
 }
 
-fn same_logical(snapshot: &Snapshot, bytes: &[u8], cancel: &AtomicBool) -> io::Result<bool> {
+pub(super) fn same_logical(snapshot: &Snapshot, bytes: &[u8], cancel: &AtomicBool) -> io::Result<bool> {
     if snapshot.len() != bytes.len() as u64 {
         return Ok(false);
     }
@@ -119,7 +123,12 @@ fn same_logical(snapshot: &Snapshot, bytes: &[u8], cancel: &AtomicBool) -> io::R
     Ok(true)
 }
 
-fn same_after_trim(snapshot: &Snapshot, spool: &TrimSpool, bytes: &[u8], cancel: &AtomicBool) -> io::Result<bool> {
+pub(super) fn same_after_trim(
+    snapshot: &Snapshot,
+    spool: &TrimSpool,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> io::Result<bool> {
     let mut at = 0usize;
     let mut compare = |range| -> io::Result<bool> {
         for chunk in snapshot.chunks(range)? {
@@ -161,7 +170,9 @@ struct PreparedCheckpoint {
 /// Failure cleanup occurs on the saving worker, never in an owner Drop.
 /// Surface cleanup paths rather than silently losing a failed retirement.
 fn discard_prepared(prepared: Option<PreparedCheckpoint>, cause: io::Error) -> io::Error {
-    let Some(PreparedCheckpoint { snapshot, backing, .. }) = prepared else { return cause };
+    let Some(PreparedCheckpoint { snapshot, backing, .. }) = prepared else {
+        return cause;
+    };
     drop(snapshot);
     match backing.try_retire() {
         Ok(()) => cause,
@@ -271,7 +282,7 @@ fn save_encoded_with_index_cancellation(
 /// edited piece tree proportional to the number of trimmed lines. A trailing
 /// CR is held across range boundaries when converting endings: deleting spaces
 /// can join CR and LF, which must be converted as one ending, not two.
-fn stream(
+pub(super) fn stream(
     snapshot: &Snapshot,
     spool: Option<&TrimSpool>,
     plan: SavePlan,
