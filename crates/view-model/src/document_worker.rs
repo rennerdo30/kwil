@@ -3,6 +3,7 @@
 use crate::Document;
 mod decoded;
 pub mod provenance;
+pub mod retirement;
 pub use decoded::{PreparedDecodedDocument, prepare_decoded_document};
 use kwil_core_text::{Buffer, TextFile};
 use kwil_core_workspace::{SaveRequest, SavedSnapshot, session::DocumentId};
