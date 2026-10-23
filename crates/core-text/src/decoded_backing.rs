@@ -583,7 +583,14 @@ fn copy_exact(
     while len != 0 {
         cancelled(cancel)?;
         let n = len.min(SCRATCH as u64) as usize;
-        input.read_exact(&mut scratch[..n])?;
+        // read_exact retries Interrupted internally, hiding cancellation from
+        // a journal reader. Poll after every call and propagate other errors.
+        let read = input.read(&mut scratch[..n]);
+        cancelled(cancel)?;
+        let n = read?;
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+        }
         output.write_all(&scratch[..n])?;
         len -= n as u64;
     }
@@ -1383,6 +1390,41 @@ mod tests {
     }
 
     #[test]
+    fn reader_recovery_interrupted_read_polls_cancel_and_preserves_errors() {
+        let fixture = Fixture::new(b"original");
+        let cancel = AtomicBool::new(false);
+        struct Interrupts<'a> {
+            cancel: Option<&'a AtomicBool>,
+            calls: usize,
+        }
+        impl Read for Interrupts<'_> {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                assert_eq!(self.calls, 1, "interrupted input must not be retried invisibly");
+                if let Some(cancel) = self.cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            }
+        }
+        let interpretation = Interpretation::new(Encoding::UTF8, 0).unwrap();
+        let mut input = Interrupts { cancel: Some(&cancel), calls: 0 };
+        assert!(matches!(
+            DecodedBacking::prepare_from_reader(&mut input, 1, interpretation, &fixture.directory, &cancel),
+            Err(BackingError::Cancelled)
+        ));
+        assert_eq!(input.calls, 1);
+        cancel.store(false, Ordering::Relaxed);
+        let mut input = Interrupts { cancel: None, calls: 0 };
+        assert!(matches!(
+            DecodedBacking::prepare_from_reader(&mut input, 1, interpretation, &fixture.directory, &cancel),
+            Err(BackingError::Io(error)) if error.kind() == io::ErrorKind::Interrupted
+        ));
+        assert_eq!(input.calls, 1);
+        assert_eq!(fs::read_dir(&fixture.directory).unwrap().count(), 1);
+    }
+
+    #[test]
     fn injected_disk_full_and_mid_copy_cancel_stop_bounded_work() {
         let raw = vec![0xff; SCRATCH * 2 + 1];
         let cancel = AtomicBool::new(false);
@@ -1415,7 +1457,7 @@ mod tests {
             Err(BackingError::Cancelled)
         ));
         assert_eq!(input.reads, 1);
-        assert_eq!(output.len(), SCRATCH);
+        assert!(output.is_empty(), "cancellation after read must stop before writing");
         let fixture = Fixture::new(b"unchanged");
         let source = TextFile::open(&fixture.source).unwrap();
         assert!(matches!(
