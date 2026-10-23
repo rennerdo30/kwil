@@ -125,6 +125,7 @@ struct DiskBlock {
     // Once leased, only an explicit worker retirement may unlink this block.
     // Worker shutdown must not hand deletion back to a surviving UI snapshot.
     explicit_retirement: std::sync::atomic::AtomicBool,
+    retirement_leased: std::sync::atomic::AtomicBool,
 }
 
 impl DiskBlock {
@@ -154,8 +155,13 @@ impl DiskBlock {
             #[cfg(not(unix))]
             let path = std::env::temp_dir().join(format!("kwil-add-{}-{id}.tmp", std::process::id()));
             // Own the private directory before any fallible file operation.
-            let mut block =
-                Self { map: None, file: None, path, explicit_retirement: std::sync::atomic::AtomicBool::new(false) };
+            let mut block = Self {
+                map: None,
+                file: None,
+                path,
+                explicit_retirement: std::sync::atomic::AtomicBool::new(false),
+                retirement_leased: std::sync::atomic::AtomicBool::new(false),
+            };
             let mut options = OpenOptions::new();
             options.read(true).write(true).create_new(true);
             #[cfg(unix)]

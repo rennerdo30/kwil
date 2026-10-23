@@ -32,6 +32,29 @@ pub struct SpillRetirement {
     _worker: PhantomData<Rc<()>>,
 }
 
+struct PendingClaims<'a> {
+    blocks: &'a [Arc<Storage>],
+    claimed: usize,
+}
+impl Drop for PendingClaims<'_> {
+    fn drop(&mut self) {
+        for storage in &self.blocks[..self.claimed] {
+            let Storage::Disk(block) = storage.as_ref() else { unreachable!() };
+            block.retirement_leased.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for SpillRetirement {
+    fn drop(&mut self) {
+        for storage in &self.blocks {
+            let Storage::Disk(block) = storage.as_ref() else { unreachable!() };
+            block.retirement_leased.store(false, Ordering::Release);
+        }
+        // The permanent explicit-retirement flag still prevents UI unlink.
+    }
+}
+
 fn check(cancelled: &mut impl FnMut() -> bool) -> io::Result<()> {
     if cancelled() {
         Err(io::Error::new(io::ErrorKind::Interrupted, "spill lease collection cancelled"))
@@ -127,12 +150,25 @@ impl SpillRetirement {
         blocks.sort_unstable_by_key(|storage| Arc::as_ptr(storage) as usize);
         blocks.dedup_by(|a, b| Arc::ptr_eq(a, b));
         check(&mut cancelled)?;
+        let mut claims = PendingClaims { blocks: &blocks, claimed: 0 };
+        for storage in &blocks {
+            check(&mut cancelled)?;
+            let Storage::Disk(block) = storage.as_ref() else { unreachable!() };
+            let already_leased =
+                block.retirement_leased.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err();
+            if already_leased {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "spill block already has a retirement lease"));
+            }
+            claims.claimed += 1;
+        }
         // From this point onward, even an unexpected lease/worker drop must
         // leave unlinking to an explicit worker cleanup, never a UI last-drop.
         for storage in &blocks {
             let Storage::Disk(block) = storage.as_ref() else { unreachable!() };
             block.explicit_retirement.store(true, Ordering::Relaxed);
         }
+        claims.claimed = 0;
+        drop(claims);
         Ok(Self { blocks, metadata_reserved: metadata, _worker: PhantomData })
     }
 
@@ -254,6 +290,26 @@ mod tests {
         drop(combined);
         assert_eq!(lease.retire().retired, 1);
         assert_eq!(lease.retained(), 0);
+    }
+
+    #[test]
+    fn spill_lease_rejects_overlap_and_rolls_back_partial_registration() {
+        let mut buffer = Buffer::with_add_memory_limit(0);
+        buffer.insert(0, b"a").unwrap();
+        buffer.insert(1, b"b").unwrap();
+        let snapshot = buffer.snapshot();
+        let first = snapshot.slice(0..1).unwrap();
+        let second = snapshot.slice(1..2).unwrap();
+        let first_lease = SpillRetirement::collect(&first.root, limits(), || false).unwrap();
+        let overlap = SpillRetirement::collect(&snapshot.root, limits(), || false).err().unwrap();
+        assert_eq!(overlap.kind(), io::ErrorKind::InvalidInput);
+        let second_lease = SpillRetirement::collect(&second.root, limits(), || false).unwrap();
+        drop((first_lease, second_lease));
+        let mut complete = SpillRetirement::collect(&snapshot.root, limits(), || false).unwrap();
+        assert_eq!(complete.retained(), 2);
+        drop((buffer, snapshot, first, second));
+        assert_eq!(complete.retire().retired, 2);
+        assert_eq!(complete.retained(), 0);
     }
 
     #[test]
