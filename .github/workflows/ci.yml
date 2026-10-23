@@ -62,6 +62,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Prove Linux association safe-open mutations
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        shell: pwsh
+        run: ./crates/core-commands/scripts/check-association-unix-mutations.ps1
       - name: Prove Unix save permissions reject broken preservation
         if: runner.os != 'Windows'
         shell: pwsh
