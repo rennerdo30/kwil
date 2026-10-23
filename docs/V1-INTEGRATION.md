@@ -2,6 +2,44 @@
 
 This is intermediate evidence, not v1 acceptance or a release.
 
+## Current safety checkpoint
+
+The partial editor merge remains blocked. Review at `aff7cd9` found dirty
+recovery adopting an unverified disk baseline, inactive Save All retaining old
+trim settings, and legacy bytes entering the UTF-8 editing path. `94daff1`
+requires Save As for unverified recovery; further review requires revision-zero
+orphan coverage and separate persistent last-name context. `83789a9` applies
+accepted settings to all editors and each addressed save. Independent review
+approved that settings scope after inspecting 32 workspace tests, 26 settings
+session tests and five compiling mutant failures. Encoding integration needs
+lossless logical/raw provenance, not just a different output writer.
+
+Association worker restoration now passes a backend durability barrier before
+retiring recovery (`a2f2a60`). Windows uses the Classes hive flush; Linux syncs
+restored files and parent directories. Unsupported barriers retain recovery.
+Fake verification passed 22 tests and rejected four compiling omissions;
+native/platform and independent review remain separate gates.
+
+Hidden native repeat probe on the immutable `aff7cd9` executable passed with
+scan-code-correct window messages: runner 73504 and GUI 60064 exited zero.
+`function-capture.png` visibly retains a single F11 capture for Save;
+`keymap-conflict.png` visibly retains the Save-to-Enter proposal and affected
+command after held Enter. No binding was persisted by autorepeat. The isolated
+file-type mapping was saved, while the source fixture hash stayed unchanged.
+Executable SHA256:
+`F8E16752D8ABE056620A9CDA9FA89B8FB769D982DE0DC7D40312F054131936E6`.
+Evidence: `E:/Development/_cache/kwil-settings-pages-native-aff7cd9/`,
+`repeat-probe2.*` and `repeat-capture2/`. The first probe omitted scan codes and
+targeted the wrong capture row; it is rejected as function-key evidence.
+This does not validate later raw-shortcut normalization or compact paging.
+
+Settings conflict review remains under correction: `96db6d6` renders parsed
+canonical chords, preserving raw TOML. The 5,000-space and zero-padded-function
+regression failed before the change and passed afterward. Review additionally
+requires safe handling of over-limit existing sequences and TUI repeated
+stage-changing keys. Neither this checkpoint nor green focused tests establish
+full settings or v1 acceptance.
+
 ## Verified source
 
 Production source tested at `34dbdcf3edf9076e1aa1a96f55636e71e6c8964c`.
