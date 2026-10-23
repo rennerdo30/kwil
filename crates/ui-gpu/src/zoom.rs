@@ -29,6 +29,17 @@ impl Zoom {
     }
 }
 
+/// One nonblocking handoff after the native window reveals its actual scale.
+/// The font worker parses in parallel, then rasterizes before first presentation.
+pub(crate) fn start_font_rasterization(
+    sender: std::sync::mpsc::SyncSender<f32>,
+    configured_logical_px: f32,
+    monitor_scale: f64,
+    zoom: Zoom,
+) -> Result<(), std::sync::mpsc::TrySendError<f32>> {
+    sender.try_send(zoom.physical_px(configured_logical_px, monitor_scale))
+}
+
 impl super::App {
     pub(super) fn font_physical_px(&self) -> f32 {
         self.zoom.physical_px(self.settings.font.size, self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()))

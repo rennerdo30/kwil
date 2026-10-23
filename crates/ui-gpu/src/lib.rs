@@ -250,6 +250,7 @@ struct App {
     external_open: Option<ExternalOpen>,
     external_inbox: kwil_view_model::document_worker::ExternalOpenInbox,
     font_thread: Option<std::thread::JoinHandle<Option<Font>>>,
+    font_size: Option<std::sync::mpsc::SyncSender<f32>>,
     font: Option<Font>,
     gfx: Option<Gfx>,
     size: (usize, usize),
@@ -313,7 +314,8 @@ pub fn run_with_external_open(
 ) -> Result<(), GuiError> {
     trace::mark("gui entry");
     // Font loading runs while the event loop and window are created.
-    let font_thread = Some(std::thread::spawn(|| Font::load(14.0)));
+    let (font_size, font_size_rx) = std::sync::mpsc::sync_channel(1);
+    let font_thread = Some(std::thread::spawn(move || Font::startup(font_size_rx)));
     let event_loop =
         EventLoop::<UserEvent>::with_user_event().build().map_err(|e| GuiError::Unavailable(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -346,6 +348,7 @@ pub fn run_with_external_open(
         external_open: Some(external_open),
         external_inbox,
         font_thread,
+        font_size: Some(font_size),
         font: None,
         gfx: None,
         size: (0, 0),
@@ -1431,6 +1434,10 @@ impl ApplicationHandler<UserEvent> for App {
         #[cfg(windows)]
         if self.opts.hidden {
             cloak_and_show(hwnd);
+        }
+        if let Some(font_size) = self.font_size.take() {
+            let _ =
+                zoom::start_font_rasterization(font_size, self.settings.font.size, window.scale_factor(), self.zoom);
         }
         match self.font_thread.take().and_then(|t| t.join().ok()).flatten() {
             Some(f) => self.font = Some(f),
