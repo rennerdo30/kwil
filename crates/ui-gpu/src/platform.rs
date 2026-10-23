@@ -17,6 +17,9 @@ impl Native {
     pub fn register(_hwnd: isize, _send: impl Fn(super::UserEvent) + Send + Sync + 'static) -> Self {
         Self
     }
+    pub fn user_placed(&self) -> bool {
+        false
+    }
     pub fn theme(&self, _dark: bool, _remote: bool) {}
 }
 

@@ -76,22 +76,27 @@ impl App {
         let Some(owner) = self.gfx.as_ref() else { return };
         let logical = if kind == Kind::Settings { (1080.0, 780.0) } else { (880.0, 660.0) };
         let scale = owner.window.scale_factor();
-        let outer = owner.window.outer_size();
-        let origin = owner.window.outer_position().unwrap_or_default();
-        let position = PhysicalPosition::new(
-            origin.x + (i64::from(outer.width) - (logical.0 * scale) as i64) as i32 / 2,
-            origin.y + (i64::from(outer.height) - (logical.1 * scale) as i64) as i32 / 2,
-        );
+        let monitor = owner.window.current_monitor().or_else(|| el.primary_monitor());
+        let work = monitor.as_ref().map(window_placement::work).unwrap_or(window_placement::Work {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+            scale,
+        });
+        let placement = window_placement::Placement::centered(work, window_placement::capture(&owner.window), logical);
+        let position = PhysicalPosition::new(placement.x, placement.y);
+        let inner = (placement.width as f64 / scale - 16.0, placement.height as f64 / scale - 48.0);
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title(if kind == Kind::Settings { "Settings — Kwil" } else { "Welcome to Kwil" })
-            .with_inner_size(LogicalSize::new(logical.0, logical.1))
-            .with_min_inner_size(LogicalSize::new(560.0, 440.0))
+            .with_inner_size(LogicalSize::new(inner.0.max(1.0), inner.1.max(1.0)))
+            .with_min_inner_size(LogicalSize::new(560.0f64.min(inner.0).max(1.0), 440.0f64.min(inner.1).max(1.0)))
             .with_position(position)
             .with_resizable(true)
             .with_enabled_buttons(WindowButtons::CLOSE)
             .with_window_icon(winit::window::Icon::from_rgba(include_bytes!("icon.rgba").to_vec(), 32, 32).ok())
-            .with_visible(!self.opts.hidden);
+            .with_visible(false);
         #[cfg(windows)]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
@@ -103,6 +108,10 @@ impl App {
         }
         let result = (|| {
             let window = Rc::new(el.create_window(attrs).map_err(|e| e.to_string())?);
+            window_placement::fit_window(&window, placement);
+            if !self.opts.hidden {
+                window.set_visible(true);
+            }
             window.set_ime_allowed(true);
             let context = Context::new(window.clone()).map_err(|e| e.to_string())?;
             let surface = Surface::new(&context, window.clone()).map_err(|e| e.to_string())?;

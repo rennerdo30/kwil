@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 use windows_sys::{
@@ -42,11 +42,12 @@ pub(crate) struct Native {
 }
 struct State {
     send: SendEvent,
+    user_placed: AtomicBool,
 }
 impl Native {
     pub fn register(hwnd: isize, send: impl Fn(UserEvent) + Send + Sync + 'static) -> Self {
         let hwnd = hwnd as HWND;
-        let state = Arc::new(State { send: Box::new(send) });
+        let state = Arc::new(State { send: Box::new(send), user_placed: AtomicBool::new(false) });
         let ptr = Arc::as_ptr(&state) as usize;
         let subclass = unsafe { SetWindowSubclass(hwnd, Some(window_proc), SUBCLASS_ID, ptr) != 0 };
         let session = subclass && unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != 0 };
@@ -76,6 +77,9 @@ impl Native {
             !target.is_null()
         );
         Self { hwnd, state, ole, target, session, subclass }
+    }
+    pub fn user_placed(&self) -> bool {
+        self.state.user_placed.load(Ordering::Acquire)
     }
     pub fn theme(&self, dark: bool, remote: bool) {
         decorate_window(self.hwnd as isize, dark, remote, false);
@@ -136,6 +140,18 @@ impl Drop for Native {
     }
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _id: usize, data: usize) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, WM_ENTERSIZEMOVE, WM_SYSCOMMAND,
+    };
+    if msg == WM_ENTERSIZEMOVE
+        || (msg == WM_SYSCOMMAND
+            && [SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SC_MOVE, SC_SIZE].contains(&((w as u32) & 0xfff0)))
+    {
+        unsafe {
+            (&*(data as *const State)).user_placed.store(true, Ordering::Release);
+            ((&*(data as *const State)).send)(UserEvent::WindowPlacementTouched);
+        }
+    }
     if msg == WM_WTSSESSION_CHANGE {
         let remote = match w as u32 {
             WTS_REMOTE_CONNECT | WTS_REMOTE_DISCONNECT => true,

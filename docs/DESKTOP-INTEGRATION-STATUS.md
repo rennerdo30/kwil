@@ -24,7 +24,8 @@ Actual Shell dialog appearance, overwrite UI, and native dirty-close button inte
 
 ## Still unfinished
 
-- Centering/clamping to monitor work areas and persisted normal/maximized geometry.
+- Window placement is now integrated: editor and owned dialogs are centered and clamped to usable monitor areas. Editor normal outer bounds, DPI and maximized state use one bounded debounced background persistence lane. Late loading cannot override a window the user has already manipulated.
+- Verified placement: three focused geometry/parser/file-replacement tests, strict GUI lib/tests Clippy, a two-process hidden native exact-bounds save/restart check, and a native owned-Welcome work-area assertion. Real OS maximize/restore and display hot-plug remain owner/platform checks.
 - Actual onscreen GPU presentation. The existing GPU path maintains a backing texture; CPU still presents. Renderer CLI/settings selection is preparation, not GPU completion.
 - Markdown Text/Preview/Split host integration.
 - Repository SVG icon system throughout the editor.

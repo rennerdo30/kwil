@@ -14,6 +14,7 @@ mod desktop;
 mod desktop_window;
 mod file_dialog;
 mod file_prompt;
+mod window_placement;
 // Until ROOT adopts the file-type registration backend; then `mod filetypes_ui;`.
 mod filetypes_ui;
 mod font;
@@ -121,6 +122,9 @@ enum UserEvent {
     CloseDialog(close_dialog::Reply),
     HighlightsReady,
     SearchReady,
+    WindowPlacementLoaded(Result<Option<window_placement::Placement>, String>),
+    WindowPlacementProgress,
+    WindowPlacementTouched,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
     SettingsPath(Result<std::path::PathBuf, String>),
@@ -355,6 +359,11 @@ struct App {
     desktop_window: Option<desktop_window::Dialog>,
     desktop_dispatch: bool,
     pending_resize: Option<(usize, usize)>,
+    window_placement: Option<window_placement::Service>,
+    window_normal: Option<window_placement::Placement>,
+    window_latest: Option<window_placement::Placement>,
+    window_placement_loaded: bool,
+    window_touched: bool,
     size: (usize, usize),
     mods: ModifiersState,
     pending: Damage,
@@ -454,6 +463,13 @@ pub fn run_with_external_open(
     let frontend_document = view.active_id();
     let frontend_epoch = view.input_epoch();
     let horizontal = view.horizontal_origin();
+    let window_placement = match window_placement::Service::start(opts.hidden, proxy.clone()) {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            let _ = proxy.send_event(UserEvent::Notice(format!("Window placement worker unavailable: {error}")));
+            None
+        }
+    };
     let mut app = App {
         search: None,
         search_panel: Default::default(),
@@ -498,6 +514,11 @@ pub fn run_with_external_open(
         desktop_window: None,
         desktop_dispatch: false,
         pending_resize: None,
+        window_placement,
+        window_normal: None,
+        window_latest: None,
+        window_placement_loaded: false,
+        window_touched: false,
         size: (0, 0),
         mods: ModifiersState::empty(),
         pending: Damage::default(),
@@ -598,7 +619,16 @@ pub fn run_with_external_open(
             .map_err(|_| "search shutdown lane panicked".to_owned())?
         }) as shutdown::Job
     });
-    let shutdown_result = shutdown::drain([prep_job, welcome_job, registration_job, settings_job, search_job]);
+    let placement_latest = app.window_latest;
+    let placement_job = app.window_placement.take().map(|service| {
+        Box::new(move || {
+            std::thread::spawn(move || service.stop(placement_latest))
+                .join()
+                .map_err(|_| "Window placement shutdown panicked".to_owned())?
+        }) as shutdown::Job
+    });
+    let shutdown_result =
+        shutdown::drain([prep_job, welcome_job, registration_job, settings_job, search_job, placement_job]);
     if let Some(palette) = &mut app.palette {
         let handles = palette.stop();
         std::thread::spawn(move || {
@@ -1999,11 +2029,11 @@ impl ApplicationHandler<UserEvent> for App {
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title("Kwil")
-            .with_inner_size(PhysicalSize::new(1280, 800))
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 840.0))
             .with_decorations(true)
             .with_transparent(false)
             .with_window_icon(icon.clone())
-            .with_visible(!self.opts.hidden);
+            .with_visible(false);
         #[cfg(windows)]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
@@ -2020,6 +2050,15 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        if let Some(monitor) = window.current_monitor().or_else(|| el.primary_monitor()) {
+            let placement =
+                window_placement::Placement::centered(window_placement::work(&monitor), None, (1280.0, 840.0));
+            window_placement::fit_window(&window, placement);
+            self.window_normal = Some(placement);
+        }
+        if !self.opts.hidden {
+            window.set_visible(true);
+        }
         window.set_ime_allowed(true);
         let surface = Context::new(window.clone()).and_then(|c| Surface::new(&c, window.clone()));
         let surface = match surface {
@@ -2136,6 +2175,18 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
+            UserEvent::WindowPlacementLoaded(result) => {
+                self.placement_loaded(result);
+                Damage::default()
+            }
+            UserEvent::WindowPlacementProgress => {
+                self.placement_progress();
+                Damage::default()
+            }
+            UserEvent::WindowPlacementTouched => {
+                self.window_touched = true;
+                Damage::default()
+            }
             UserEvent::SearchReady => {
                 self.search_ready();
                 Damage::default()
@@ -2552,12 +2603,21 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
+        if matches!(&ev,WindowEvent::KeyboardInput{event,..} if event.state==ElementState::Pressed)
+            || matches!(&ev, WindowEvent::MouseInput { state: ElementState::Pressed, .. })
+        {
+            self.window_touched = true;
+        }
         if self.welcome_input(&ev) {
             return;
         }
         match ev {
             WindowEvent::CloseRequested => self.request_close(el, false),
+            WindowEvent::Moved(_) => {
+                self.remember_placement();
+            }
             WindowEvent::Resized(sz) => {
+                self.remember_placement();
                 // The first Resized repeats the creation size.
                 let latest = (sz.width as usize, sz.height as usize);
                 if latest == self.pending_resize.unwrap_or(self.size) {

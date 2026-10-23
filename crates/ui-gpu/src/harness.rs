@@ -44,6 +44,8 @@ pub(crate) enum Step {
     FindOpen,
     FindNext,
     FindCheck,
+    PlacementSet,
+    PlacementCheck,
     End,
 }
 #[derive(Default, Clone, Copy)]
@@ -156,7 +158,14 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (100, Step::UsabilityCapture("find.bmp")),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_FIND_PROBE").is_some() {
+        let placement =
+            [(1800, Step::DismissSetup), (200, Step::PlacementSet), (350, Step::PlacementCheck), (100, Step::End)];
+        let replay = [(1800, Step::DismissSetup), (250, Step::PlacementCheck), (100, Step::End)];
+        let steps = if std::env::var_os("KWIL_PLACEMENT_REPLAY").is_some() {
+            replay.as_slice()
+        } else if std::env::var_os("KWIL_PLACEMENT_PROBE").is_some() {
+            placement.as_slice()
+        } else if std::env::var_os("KWIL_FIND_PROBE").is_some() {
             find.as_slice()
         } else if std::env::var_os("KWIL_DESKTOP_WINDOW_PROBE").is_some() {
             desktop.as_slice()
@@ -199,6 +208,15 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             let dialog = app.desktop_window.as_ref().expect("welcome is a separate desktop window");
             assert_ne!(dialog.gfx.window.id(), main);
             assert_eq!(dialog.kind, super::desktop_window::Kind::Welcome);
+            let p = super::window_placement::capture(&dialog.gfx.window).unwrap();
+            let work = super::window_placement::work(&dialog.gfx.window.current_monitor().unwrap());
+            assert!(
+                p.x >= work.x
+                    && p.y >= work.y
+                    && i64::from(p.x) + i64::from(p.width) <= i64::from(work.x) + i64::from(work.width)
+                    && i64::from(p.y) + i64::from(p.height) <= i64::from(work.y) + i64::from(work.height),
+                "welcome outer bounds remain inside the work area"
+            );
             assert!(app.render_desktop_window());
             if let Some(dir) = &dir {
                 std::fs::write(
@@ -225,6 +243,48 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                     "PASS: separate owned Settings window; theme dropdown painted\n",
                 )
                 .unwrap();
+            }
+        }
+        Step::PlacementSet => {
+            assert!(app.window_placement_loaded);
+            app.window_touched = true;
+            let window = &app.gfx.as_ref().unwrap().window;
+            let monitor = window.current_monitor().unwrap();
+            let work = super::window_placement::work(&monitor);
+            let p = super::window_placement::Placement {
+                x: work.x + 40,
+                y: work.y + 60,
+                width: (700.0 * work.scale) as u32,
+                height: (480.0 * work.scale) as u32,
+                scale: work.scale,
+                maximized: false,
+            }
+            .clamp(work);
+            super::window_placement::fit_window(window, p);
+            app.remember_placement();
+        }
+        Step::PlacementCheck => {
+            assert!(app.window_placement_loaded);
+            let window = &app.gfx.as_ref().unwrap().window;
+            let p = super::window_placement::capture(window).unwrap();
+            let work = super::window_placement::work(&window.current_monitor().unwrap());
+            assert!(
+                p.x >= work.x
+                    && p.y >= work.y
+                    && i64::from(p.x) + i64::from(p.width) <= i64::from(work.x) + i64::from(work.width)
+                    && i64::from(p.y) + i64::from(p.height) <= i64::from(work.y) + i64::from(work.height)
+            );
+            if let Some(expected) = std::env::var_os("KWIL_EXPECT_PLACEMENT") {
+                let values: Vec<i64> = expected.to_str().unwrap().split(',').map(|v| v.parse().unwrap()).collect();
+                assert_eq!(
+                    values,
+                    vec![i64::from(p.x), i64::from(p.y), i64::from(p.width), i64::from(p.height)],
+                    "fresh process restored actual native outer bounds"
+                );
+            }
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join("placement-result.txt"), format!("{},{},{},{}", p.x, p.y, p.width, p.height))
+                    .unwrap();
             }
         }
         Step::FindOpen => {
