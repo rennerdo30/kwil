@@ -8,13 +8,62 @@ pub struct Bar {
     pub maximum: u64,
 }
 
+/// Preserve the exact document position at pointer capture. The thumb's pixel
+/// position is quantized; inverting it would jump even on a stationary move.
+#[derive(Clone, Copy, Debug)]
+pub struct Drag {
+    pub vertical: bool,
+    bar: Bar,
+    pointer: usize,
+    offset: u64,
+    grab: usize,
+}
+
+impl Drag {
+    pub fn new(vertical: bool, bar: Bar, pointer: usize, offset: u64) -> Self {
+        Self { vertical, bar, pointer, offset: offset.min(bar.maximum), grab: pointer.saturating_sub(bar.thumb_start) }
+    }
+
+    pub fn position(self, pointer: usize) -> u64 {
+        if pointer == self.pointer {
+            return self.offset;
+        }
+        let travel = self.bar.length - self.bar.thumb_length;
+        if travel == 0 {
+            return self.offset;
+        }
+        let thumb = pointer.saturating_sub(self.bar.start).saturating_sub(self.grab);
+        if pointer < self.pointer && thumb == 0 {
+            return 0;
+        }
+        if pointer > self.pointer && thumb >= travel {
+            return self.bar.maximum;
+        }
+        let distance = pointer.abs_diff(self.pointer) as u128;
+        let delta = (distance * self.bar.maximum as u128 / travel as u128).min(u64::MAX as u128) as u64;
+        if pointer < self.pointer {
+            self.offset.saturating_sub(delta)
+        } else {
+            self.offset.saturating_add(delta).min(self.bar.maximum)
+        }
+    }
+}
+
 impl Bar {
+    /// Fixed 18 px minimum thumb; production passes a DPI size to `sized`.
+    #[cfg(test)]
     pub fn new(start: usize, length: usize, visible: u64, total: u64, offset: u64) -> Self {
+        Self::sized(start, length, visible, total, offset, 18)
+    }
+
+    /// `min_thumb` is in physical pixels (the GUI passes a DPI-scaled grab size),
+    /// so a multi-GB document still has a thumb a pointer can hit.
+    pub fn sized(start: usize, length: usize, visible: u64, total: u64, offset: u64, min_thumb: usize) -> Self {
         let maximum = total.saturating_sub(visible);
         let thumb_length = if total == 0 || maximum == 0 {
             length
         } else {
-            ((length as u128 * visible as u128 / total as u128) as usize).max(18).min(length)
+            ((length as u128 * visible as u128 / total as u128) as usize).max(min_thumb).min(length)
         };
         let travel = length - thumb_length;
         let thumb_start = start
@@ -26,6 +75,7 @@ impl Bar {
         (self.thumb_start..self.thumb_start + self.thumb_length).contains(&pixel)
     }
 
+    #[cfg(test)]
     pub fn drag(self, pixel: usize, grab: usize) -> u64 {
         let travel = self.length - self.thumb_length;
         if travel == 0 {
@@ -166,12 +216,63 @@ mod tests {
     }
 
     #[test]
+    fn capture_preserves_exact_offset_despite_thumb_quantization() {
+        let offset = 12_345_678;
+        let bar = Bar::sized(0, 700, 40, 20_000_000, offset, 48);
+        let pointer = bar.thumb_start + 24;
+        assert_ne!(bar.drag(pointer, 24), offset, "reproduce the old round-trip jump");
+        let drag = Drag::new(true, bar, pointer, offset);
+        assert_eq!(drag.position(pointer), offset, "horizontal movement must not scroll vertically");
+        assert!(drag.position(pointer + 1) > offset);
+        assert!(drag.position(pointer - 1) < offset);
+        assert_eq!(drag.position(pointer), offset, "returning the pointer restores the precise captured position");
+        assert_eq!(drag.position(0), 0);
+        assert_eq!(drag.position(usize::MAX), bar.maximum);
+    }
+
+    #[test]
+    fn drag_retains_original_mapping_when_document_extent_changes() {
+        let old = Bar::sized(0, 700, 40, 1_000_000, 412_345, 48);
+        let pointer = old.thumb_start + 10;
+        let drag = Drag::new(true, old, pointer, 412_345);
+        let new = Bar::sized(0, 700, 40, 20_000_000, 412_345, 48);
+        assert_ne!(new.thumb_start, old.thumb_start);
+        assert_eq!(drag.position(pointer), 412_345);
+        assert_eq!(drag.position(pointer + 1), 412_345 + old.maximum / (old.length - old.thumb_length) as u64);
+    }
+
+    #[test]
     fn drag_reaches_both_ends_of_huge_documents() {
         let bar = Bar::new(4, 700, 40, u64::MAX, u64::MAX);
         assert_eq!(bar.thumb_start + bar.thumb_length, 704);
         assert_eq!(bar.drag(0, 5), 0);
         assert_eq!(bar.drag(usize::MAX, 5), bar.maximum);
         assert!(bar.contains_thumb(703));
+    }
+
+    #[test]
+    fn huge_document_thumb_is_a_grabbable_dpi_target_with_exact_endpoints() {
+        // 20M lines in a 40-row view: a proportional thumb would be 0 px.
+        for scale in [1.0, 1.5, 2.0] {
+            let metrics = crate::chrome::Metrics::new(scale);
+            let track = (600.0 * scale) as usize;
+            let bar = Bar::sized(0, track, 40, 20_000_000, 0, metrics.min_thumb);
+            assert!(bar.thumb_length as f64 >= 32.0 * scale - 0.5, "thumb {} at {scale}", bar.thumb_length);
+            assert!(metrics.bar as f64 >= 14.0 * scale - 0.5, "track {} at {scale}", metrics.bar);
+            // The whole thumb is a hit target, from its first to its last pixel.
+            assert!(bar.contains_thumb(bar.thumb_start) && bar.contains_thumb(bar.thumb_start + bar.thumb_length - 1));
+            // A grab in the middle of the large thumb still maps both track ends exactly.
+            let grab = bar.thumb_length / 2;
+            assert_eq!(bar.drag(0, grab), 0);
+            assert_eq!(bar.drag(usize::MAX, grab), bar.maximum);
+            let end = Bar::sized(0, track, 40, 20_000_000, bar.maximum, metrics.min_thumb);
+            assert_eq!(end.thumb_start + end.thumb_length, track);
+            assert_eq!(end.thumb_length, bar.thumb_length, "thumb size must not change while scrolling");
+        }
+        // Integer mapping survives u64 extremes with the larger thumb.
+        let extreme = Bar::sized(0, 700, 40, u64::MAX, u64::MAX / 2, 48);
+        assert_eq!(extreme.thumb_length, 48);
+        assert!(extreme.thumb_start > 0 && extreme.thumb_start + extreme.thumb_length < 700);
     }
 
     #[test]

@@ -366,6 +366,29 @@ impl View {
         Ok(result)
     }
 
+    /// Transient notice, exactly as set; frontends must not parse `status_text`.
+    pub fn notice(&self) -> &str {
+        &self.notice
+    }
+
+    /// Zero-based caret coordinates.
+    pub fn status_position(&self) -> Option<(u64, u64)> {
+        self.editor
+            .as_ref()
+            .and_then(|editor| editor.position_at(editor.primary_cursor().head).ok())
+            .or_else(|| self.file.as_ref().map(|_| (self.top, 0)))
+    }
+
+    /// Background line-index progress while the line count is still unknown.
+    pub fn indexing_percent(&self) -> Option<u64> {
+        let file = self.file.as_ref()?;
+        if self.line_count().is_some() {
+            return None;
+        }
+        let progress = file.progress();
+        Some(((u128::from(progress.scanned) * 100) / u128::from(progress.total.max(1))).min(100) as u64)
+    }
+
     pub fn status_text(&self) -> String {
         let mut name = self.path.as_ref().map_or_else(|| "kwil".to_string(), |p| p.display().to_string());
         if self.editor.as_ref().is_some_and(|editor| editor.document().is_dirty()) {

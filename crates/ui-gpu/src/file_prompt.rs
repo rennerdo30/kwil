@@ -1,13 +1,13 @@
 //! File/tab actions stay outside editor command dispatch and renderer geometry.
 use super::*;
 
-pub(super) fn sync_active_document(
+pub(super) fn sync_active_document<T>(
     workspace: &Workspace,
     previous: &mut kwil_view_model::SessionDocumentId,
     previous_epoch: &mut u64,
     horizontal: &mut u64,
     selecting: &mut bool,
-    drag: &mut Option<(bool, usize)>,
+    drag: &mut Option<T>,
     keys: Option<&mut kwil_core_commands::keymap::KeymapEngine>,
 ) {
     if *previous != workspace.active_id() || *previous_epoch != workspace.input_epoch() {
@@ -131,7 +131,7 @@ mod tests {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         let mut previous = workspace.active_id();
         let mut epoch = workspace.input_epoch();
-        let (mut horizontal, mut selecting, mut drag) = (0, false, None);
+        let (mut horizontal, mut selecting, mut drag) = (0, false, None::<(bool, usize)>);
         let mut keys = KeymapEngine::new(Preset::Vim, &[]).unwrap();
         assert_eq!(keys.feed_with_selection("d".parse().unwrap()), VimResult::Pending);
         workspace.file_command("file.new").unwrap();

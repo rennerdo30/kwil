@@ -1,73 +1,221 @@
-//! Thin, virtualized chrome. Editor drawing and glyph row coordinates remain
-//! relative to the body framebuffer; only composition/copy uses window origins.
+//! Tab strip over the shared tab model. Slot geometry comes from DPI chrome
+//! metrics and UI text widths; the workspace still owns every tab action.
+//! Editor drawing and glyph row coordinates remain relative to the body
+//! framebuffer; only composition/copy uses window origins.
 use super::*;
-use kwil_view_model::{TabArea, TabGeometry, TabMetrics};
+use chrome::{Hover, Metrics};
+use kwil_core_commands::settings::TabLayout;
+use kwil_view_model::{TabArea, TabGeometry};
 
+/// Card row backgrounds still used by the palette and settings overlays.
 pub(super) const ACTIVE: u32 = 0x192a43;
 pub(super) const INACTIVE: u32 = 0x101d31;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Frame {
     pub geometry: TabGeometry,
+    /// Labels of the visible slots, without the workspace's dirty prefix.
     pub titles: Vec<String>,
+    pub dirty: Vec<bool>,
+    pub layout: chrome::Layout,
+    pub hover: Hover,
+    pub kind: TabLayout,
 }
 
-pub(super) fn body(
-    size: (usize, usize),
-    cw: usize,
-    ch: usize,
-    layout: kwil_core_commands::settings::TabLayout,
-) -> TabArea {
-    use kwil_core_commands::settings::TabLayout;
-    let (w, h) = size;
-    let content = h.saturating_sub(ch);
-    match layout {
-        TabLayout::Horizontal => {
-            let top = ch.min(content);
-            TabArea { x: 0, y: top, width: w, height: content - top }
-        }
-        TabLayout::Vertical => {
-            let left = cw.saturating_mul(26).min(w / 3);
-            TabArea { x: left, y: 0, width: w - left, height: content }
-        }
-    }
+/// Session tab ids in strip order.
+pub(super) fn ids(view: &Workspace) -> Vec<kwil_view_model::SessionDocumentId> {
+    view.session().tabs().iter().map(|tab| tab.id).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn frame(
     view: &Workspace,
     size: (usize, usize),
-    cw: usize,
+    m: &Metrics,
     ch: usize,
-    layout: kwil_core_commands::settings::TabLayout,
+    kind: TabLayout,
+    mut font: Option<&mut font::UiFont>,
+    hover: Hover,
 ) -> Frame {
-    let geometry = view.tab_geometry(
-        TabMetrics { width: size.0, height: size.1, cell_width: cw, cell_height: ch, scrollbar: BAR },
-        layout,
-    );
-    let titles = geometry.slots.iter().map(|slot| view.tab_title(slot.document)).collect();
-    Frame { geometry, titles }
+    let layout = chrome::layout(size, m, kind);
+    let tabs = view.session().tabs();
+    // Same dirty rule as the workspace title, so the dot never disagrees with it.
+    let dirty: Vec<bool> = tabs
+        .iter()
+        .map(|tab| {
+            view.view(tab.id)
+                .and_then(View::editor)
+                .map_or(tab.revision != tab.saved_revision, |editor| editor.document().is_dirty())
+        })
+        .collect();
+    let names: Vec<String> = tabs
+        .iter()
+        .zip(&dirty)
+        .map(|(tab, dirty)| {
+            let title = view.tab_title(tab.id);
+            match title.strip_prefix("* ") {
+                Some(name) if *dirty => name.to_owned(),
+                _ => title,
+            }
+        })
+        .collect();
+    let labels: Vec<usize> = names
+        .iter()
+        .map(|name| match font.as_deref_mut() {
+            // Only up to the widest tab matters; long names are never measured in full.
+            Some(font) => font.measure(name, m.tab_max),
+            None => name.chars().count() * m.dip(7.0),
+        })
+        .collect();
+    let ids: Vec<_> = tabs.iter().map(|tab| tab.id).collect();
+    let active = ids.iter().position(|id| *id == view.active_id());
+    let geometry = chrome::tab_geometry(&layout, m, kind, &ids, active, &labels, ch);
+    let visible = geometry.first..geometry.first + geometry.slots.len();
+    Frame { titles: names[visible.clone()].to_vec(), dirty: dirty[visible].to_vec(), geometry, layout, hover, kind }
 }
 
 pub(super) fn rect(area: TabArea) -> Rect {
     Rect { x: area.x, y: area.y, w: area.width, h: area.height }
 }
 
-pub(super) fn draw(frame: &Frame, pixels: &mut [u32], stride: usize, font: &mut Font) {
-    fill(pixels, stride, rect(frame.geometry.chrome), INACTIVE);
-    for (slot, title) in frame.geometry.slots.iter().zip(&frame.titles) {
-        let bg = if slot.active { ACTIVE } else { INACTIVE };
-        fill(pixels, stride, rect(slot.area), bg);
-        let columns = slot.close.x.saturating_sub(slot.area.x) / font.cw;
-        draw_text(pixels, stride, font, slot.area.x, slot.area.y, title.as_bytes(), columns, FG, bg);
-        draw_text(pixels, stride, font, slot.close.x, slot.close.y, b"[x]", slot.close.width / font.cw, GUTTER_FG, bg);
+/// Which tab element is under the pointer.
+pub(super) fn hover(frame: &Frame, x: usize, y: usize) -> Hover {
+    let g = &frame.geometry;
+    if g.first > 0 && g.previous.contains(x, y) {
+        return Hover::Previous;
     }
-    for (area, enabled, text) in [
-        (frame.geometry.previous, frame.geometry.first > 0, b"<".as_slice()),
-        (frame.geometry.next, frame.geometry.first + frame.geometry.capacity < frame.geometry.total, b">".as_slice()),
-    ] {
-        if enabled && area.height >= font.ch {
-            draw_text(pixels, stride, font, area.x, area.y, text, area.width / font.cw, STATUS_FG, INACTIVE);
+    if g.first + g.capacity < g.total && g.next.contains(x, y) {
+        return Hover::Next;
+    }
+    for (index, slot) in g.slots.iter().enumerate() {
+        if slot.close.contains(x, y) {
+            return Hover::Close(index);
         }
+        if slot.area.contains(x, y) {
+            return Hover::Tab(index);
+        }
+    }
+    Hover::None
+}
+
+pub(super) fn draw(
+    frame: &Frame,
+    pixels: &mut [u32],
+    stride: usize,
+    font: Option<&mut font::UiFont>,
+    theme: &kwil_core_commands::theme::Theme,
+    m: &Metrics,
+) {
+    use kwil_core_commands::theme::UiRole;
+    let color = |role| theme_ui::rgb(theme, role);
+    let (strip_bg, active_bg) = (color(UiRole::TabBackground), color(UiRole::ActiveTabBackground));
+    let (fg, active_fg) = (color(UiRole::TabForeground), color(UiRole::ActiveTabForeground));
+    let (accent, border) = (color(UiRole::Accent), color(UiRole::Border));
+    let g = &frame.geometry;
+    let strip = rect(g.chrome);
+    let horizontal = frame.kind == TabLayout::Horizontal;
+    chrome::fill_clipped(pixels, stride, strip, strip_bg);
+    // Hairline between the strip and the editor; the active tab covers it.
+    let edge = if horizontal {
+        Rect { x: strip.x, y: (strip.y + strip.h).saturating_sub(m.line), w: strip.w, h: m.line.min(strip.h) }
+    } else {
+        Rect { x: (strip.x + strip.w).saturating_sub(m.line), y: strip.y, w: m.line.min(strip.w), h: strip.h }
+    };
+    chrome::fill_clipped(pixels, stride, edge, chrome::mix(strip_bg, border, 0xa0));
+    let mut font = font;
+    let stroke = (1.25 * m.scale as f32).max(1.0);
+    for (index, (slot, title)) in g.slots.iter().zip(&frame.titles).enumerate() {
+        let area = rect(slot.area);
+        let hovered = matches!(frame.hover, Hover::Tab(i) | Hover::Close(i) if i == index);
+        let bg = if slot.active {
+            active_bg
+        } else if hovered {
+            chrome::mix(strip_bg, fg, 0x16)
+        } else {
+            strip_bg
+        };
+        let text_fg = if slot.active {
+            active_fg
+        } else if hovered {
+            fg
+        } else {
+            chrome::mix(strip_bg, fg, 0xb4)
+        };
+        if slot.active || hovered {
+            let cover = if horizontal { area } else { Rect { w: area.w.saturating_sub(m.line), ..area } };
+            chrome::fill_clipped(pixels, stride, cover, bg);
+        }
+        if slot.active {
+            let indicator = if horizontal {
+                Rect { x: area.x, y: area.y, w: area.w, h: m.indicator }
+            } else {
+                Rect { x: area.x, y: area.y, w: m.indicator, h: area.h }
+            };
+            chrome::fill_clipped(pixels, stride, indicator, accent);
+        } else if horizontal && !hovered {
+            // Quiet separators between inactive neighbours only.
+            let next_active = g.slots.get(index + 1).is_some_and(|next| next.active);
+            let next_hovered = matches!(frame.hover, Hover::Tab(i) | Hover::Close(i) if i == index + 1);
+            if !next_active && !next_hovered {
+                let inset = area.h / 4;
+                chrome::fill_clipped(
+                    pixels,
+                    stride,
+                    Rect {
+                        x: (area.x + area.w).saturating_sub(m.line),
+                        y: area.y + inset,
+                        w: m.line,
+                        h: area.h - 2 * inset,
+                    },
+                    chrome::mix(strip_bg, border, 0x90),
+                );
+            }
+        }
+        let close = slot.close;
+        if let Some(font) = font.as_deref_mut() {
+            let left = area.x + m.pad;
+            let room = close.x.saturating_sub(left + m.dip(4.0));
+            let label = font.fit(title, room);
+            let baseline = font.baseline(area.y, area.h);
+            font.draw(pixels, stride, area, left, baseline, &label, text_fg);
+        }
+        let close_hovered = frame.hover == Hover::Close(index);
+        if frame.dirty.get(index).copied().unwrap_or(false) && !close_hovered {
+            let center = (close.x as f32 + close.width as f32 / 2.0, close.y as f32 + close.height as f32 / 2.0);
+            chrome::disc(pixels, stride, center, m.dip(4.0) as f32, text_fg);
+        } else {
+            if close_hovered {
+                chrome::round_rect(pixels, stride, rect(close), m.radius, chrome::mix(bg, fg, 0x34));
+            }
+            let mark = if slot.active || hovered { text_fg } else { chrome::mix(strip_bg, fg, 0x78) };
+            chrome::cross(pixels, stride, close, m.glyph, stroke, mark);
+        }
+    }
+    for (area, enabled, left, hover) in
+        [(g.previous, g.first > 0, true, Hover::Previous), (g.next, g.first + g.capacity < g.total, false, Hover::Next)]
+    {
+        if area.width == 0 || area.height == 0 {
+            continue;
+        }
+        let r = rect(area);
+        chrome::fill_clipped(pixels, stride, r, strip_bg);
+        if enabled && frame.hover == hover {
+            let inset = m.dip(4.0).min(r.h / 4);
+            chrome::round_rect(
+                pixels,
+                stride,
+                Rect {
+                    x: r.x + inset / 2,
+                    y: r.y + inset,
+                    w: r.w.saturating_sub(inset),
+                    h: r.h.saturating_sub(2 * inset),
+                },
+                m.radius,
+                chrome::mix(strip_bg, fg, 0x2c),
+            );
+        }
+        let mark = if enabled { fg } else { chrome::mix(strip_bg, fg, 0x50) };
+        chrome::chevron(pixels, stride, area, m.glyph, left, stroke, mark);
     }
 }
 
@@ -113,5 +261,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hover_targets_match_the_hit_test_and_dirty_tabs_keep_their_name() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.file_command("file.new").unwrap();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("x".into()), ..Default::default() }, 1).unwrap();
+        let m = Metrics::new(1.0);
+        let frame = frame(&workspace, (1000, 700), &m, 18, TabLayout::Horizontal, None, Hover::None);
+        assert_eq!(frame.titles.len(), 2);
+        assert!(frame.dirty[1] && !frame.titles[1].starts_with('*'), "dirty state is a dot, not a '* ' prefix");
+        assert!(frame.titles.iter().all(|title| !title.contains("[x]")));
+        for (index, slot) in frame.geometry.slots.iter().enumerate() {
+            let (cx, cy) = (slot.close.x + slot.close.width / 2, slot.close.y + slot.close.height / 2);
+            assert_eq!(hover(&frame, cx, cy), Hover::Close(index));
+            assert_eq!(frame.geometry.hit(cx, cy), Some(kwil_view_model::TabAction::Close(slot.document)));
+            assert_eq!(hover(&frame, slot.area.x + 3, cy), Hover::Tab(index));
+        }
+        assert_eq!(hover(&frame, 500, 400), Hover::None, "the editor body is not a tab target");
     }
 }

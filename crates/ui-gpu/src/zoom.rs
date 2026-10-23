@@ -21,6 +21,17 @@ impl Zoom {
         changed
     }
 
+    /// Whether `id` would change zoom; menus disable commands at their bounds.
+    pub(crate) fn would_change(self, id: &str) -> bool {
+        let mut next = self;
+        next.command(id)
+    }
+
+    /// Editor text scale shown in the status bar; chrome never scales with it.
+    pub(crate) fn percent(self) -> u32 {
+        (1.1_f64.powi(self.steps as i32) * 100.0).round() as u32
+    }
+
     pub(crate) fn physical_px(self, configured_logical_px: f32, monitor_scale: f64) -> f32 {
         let base =
             if configured_logical_px.is_finite() && configured_logical_px > 0.0 { configured_logical_px } else { 14.0 };
@@ -86,6 +97,34 @@ mod tests {
         let mut zoom = Zoom::default();
         assert!(!zoom.command("view.zoomReset"));
         assert!(Zoom::recognizes("view.zoomReset"), "a no-op reset must still be consumed");
+    }
+
+    #[test]
+    fn winit_equals_plus_minus_and_zero_keys_reach_zoom_on_every_preset() {
+        use kwil_core_commands::{Preset, keymap::KeymapEngine, vim::VimResult};
+        use winit::keyboard::{Key, ModifiersState};
+        let ctrl = ModifiersState::CONTROL;
+        for preset in [Preset::VsCode, Preset::Vim, Preset::NotepadPlusPlus] {
+            let mut keys = KeymapEngine::new(preset, &[]).unwrap();
+            for (text, mods, command) in [
+                ("=", ctrl, "view.zoomIn"),
+                ("+", ctrl | ModifiersState::SHIFT, "view.zoomIn"),
+                ("-", ctrl, "view.zoomOut"),
+                ("0", ctrl, "view.zoomReset"),
+            ] {
+                let chord = crate::input::chord(&Key::Character(text.into()), mods).unwrap();
+                assert!(
+                    matches!(keys.feed_with_selection(chord), VimResult::Command(call) if call.id == command),
+                    "{preset:?}: ctrl {text} must run {command}"
+                );
+            }
+        }
+        let mut zoom = Zoom::default();
+        assert!(zoom.would_change("view.zoomIn") && !zoom.would_change("view.zoomReset"));
+        assert_eq!(zoom, Zoom::default(), "probing must not change zoom");
+        zoom.command("view.zoomIn");
+        assert_eq!(zoom.percent(), 110);
+        assert!(zoom.would_change("view.zoomReset"));
     }
 
     #[test]
