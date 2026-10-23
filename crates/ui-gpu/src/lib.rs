@@ -1558,9 +1558,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Document(result) => {
                 let damage = self.view.document_result(result);
-                if let Some(editor) = self.view.editor_mut() {
-                    editor.settings = self.settings.clone();
-                }
                 self.sync_file_ui();
                 if self.view.wants_exit() {
                     el.exit();
@@ -1672,6 +1669,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let keymap_changed =
                     settings.keymap != self.settings.keymap || settings.bindings != self.settings.bindings;
                 self.settings = *settings;
+                self.view.set_editor_settings(&self.settings);
                 self.view.set_session_restore(self.settings.files.restore_session);
                 if layout_changed {
                     self.chrome_dirty = true;
@@ -1684,9 +1682,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.keys =
                         kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings)
                             .ok();
-                }
-                if let Some(editor) = self.view.editor_mut() {
-                    editor.settings = self.settings.clone();
                 }
                 self.policy = RenderPolicy::new(self.settings.render.clone(), self.policy.detected());
                 self.apply_native_theme();

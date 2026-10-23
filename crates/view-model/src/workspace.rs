@@ -138,6 +138,7 @@ struct FileFlow {
 
 pub struct Workspace {
     input_epoch: u64,
+    editor_settings: Option<kwil_core_commands::Settings>,
     session: Session,
     views: HashMap<DocumentId, View>,
     closed_views: HashMap<DocumentId, View>,
@@ -148,6 +149,7 @@ impl Workspace {
     pub fn new(view: View) -> io::Result<Self> {
         let mut workspace = Self {
             input_epoch: 0,
+            editor_settings: None,
             session: Session::default(),
             views: HashMap::new(),
             closed_views: HashMap::new(),
@@ -179,6 +181,18 @@ impl Workspace {
     }
     pub fn view_mut(&mut self, id: DocumentId) -> Option<&mut View> {
         self.views.get_mut(&id)
+    }
+
+    /// Apply accepted settings in memory, including inactive and cached tabs.
+    /// Keep the policy for editors installed by later open/recovery results.
+    /// Frontends retain responsibility for settings receipts and visual damage.
+    pub fn set_editor_settings(&mut self, settings: &kwil_core_commands::Settings) {
+        self.editor_settings = Some(settings.clone());
+        for view in self.views.values_mut().chain(self.closed_views.values_mut()) {
+            if let Some(editor) = view.editor_mut() {
+                editor.settings = settings.clone();
+            }
+        }
     }
 
     pub fn tab_title(&self, id: DocumentId) -> String {
@@ -318,6 +332,11 @@ impl Workspace {
         {
             self.session.activate(id);
             return Ok(id);
+        }
+        if let Some(settings) = &self.editor_settings
+            && let Some(editor) = view.editor_mut()
+        {
+            editor.settings = settings.clone();
         }
         let id = self.session.open(view.path.clone())?;
         // Reopening an already-open path activates its existing unsaved view.
@@ -863,6 +882,9 @@ impl Workspace {
             .get_mut(&id)
             .and_then(View::editor_mut)
             .ok_or_else(|| io::Error::other("Indexing: editing will be available when ready"))?;
+        if let Some(settings) = &self.editor_settings {
+            editor.settings = settings.clone();
+        }
         if path.is_none() && editor.document().path().is_none() {
             self.files.next_prompt = self.files.next_prompt.wrapping_add(1);
             self.files.prompt = Some(FilePrompt {
@@ -1248,6 +1270,9 @@ impl Workspace {
                                 );
                             }
                             let mut editor = Editor::new(*document);
+                            if let Some(settings) = &self.editor_settings {
+                                editor.settings = settings.clone();
+                            }
                             let len = editor.document().snapshot().len();
                             let _ = editor.set_cursors(
                                 vec![crate::Cursor {
@@ -1293,6 +1318,9 @@ impl Workspace {
                     match result {
                         Ok(document) => {
                             let mut editor = Editor::new(*document);
+                            if let Some(settings) = &self.editor_settings {
+                                editor.settings = settings.clone();
+                            }
                             editor.set_viewport(view.top, view.rows);
                             view.editor = Some(editor);
                             view.index_ready();
@@ -1555,6 +1583,9 @@ impl Workspace {
                         );
                     }
                     let mut editor = Editor::new(document);
+                    if let Some(settings) = &self.editor_settings {
+                        editor.settings = settings.clone();
+                    }
                     let len = editor.document().snapshot().len();
                     let _ = editor.set_cursors(
                         vec![crate::Cursor {
@@ -1832,6 +1863,160 @@ mod tests {
             panic!("expected worker save")
         };
         (document, request)
+    }
+
+    fn settings_with_trim(trim: bool) -> kwil_core_commands::Settings {
+        let mut settings = kwil_core_commands::Settings::default();
+        settings.editor.trim_trailing_whitespace_on_save = trim;
+        settings
+    }
+
+    fn inactive_save_all_after_settings_reload(trim: bool) {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-save-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.set_editor_settings(&settings_with_trim(!trim));
+        let first = workspace.active_id();
+        edit(&mut workspace, "first \t\n");
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        edit(&mut workspace, "second \t\n");
+        for (id, name) in [(first, "first.txt"), (second, "second.txt")] {
+            let path = root.join(name);
+            workspace.session.set_path(id, path.clone()).unwrap();
+            let view = workspace.views.get_mut(&id).unwrap();
+            view.path = Some(path.clone());
+            view.editor_mut().unwrap().document.path = Some(path);
+        }
+        let revision = workspace.view(first).unwrap().editor().unwrap().document().revision();
+        workspace.set_editor_settings(&settings_with_trim(trim));
+        assert_eq!(workspace.active_id(), second);
+        assert_eq!(workspace.view(first).unwrap().editor().unwrap().document().revision(), revision);
+        workspace.file_command("file.saveAll").unwrap();
+        for (expected, bytes) in [(first, b"first \t\n".as_slice()), (second, b"second \t\n".as_slice())] {
+            let (document, request) = take_save(&mut workspace);
+            assert_eq!(document, expected);
+            assert_eq!(request.trim_trailing_whitespace, trim, "addressed save must use the accepted policy");
+            let path = request.path.clone();
+            let revision = request.revision;
+            let result = kwil_core_workspace::save_snapshot(request);
+            let damage = workspace.document_result(DocumentResult::Saved { document, revision, result });
+            if document == first {
+                assert!(!damage.full, "inactive save must not repaint the active text");
+                assert_eq!(workspace.active_id(), second);
+                assert_eq!(workspace.editor().unwrap().document().snapshot().len(), b"second \t\n".len() as u64);
+            }
+            let expected = if trim {
+                if document == first { b"first\n".as_slice() } else { b"second\n".as_slice() }
+            } else {
+                bytes
+            };
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+            assert!(!workspace.view(document).unwrap().editor().unwrap().document().is_dirty());
+        }
+        assert!(workspace.files.saves.is_empty());
+        assert!(workspace.files.save_all.is_empty());
+        drop(workspace);
+        for name in ["first.txt", "second.txt"] {
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn live_settings_disable_trim_for_inactive_save_all() {
+        inactive_save_all_after_settings_reload(false);
+    }
+
+    #[test]
+    fn live_settings_enable_trim_for_inactive_save_all() {
+        inactive_save_all_after_settings_reload(true);
+    }
+
+    #[test]
+    fn live_settings_reach_new_opened_indexed_and_reopened_editors() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        workspace.set_editor_settings(&settings_with_trim(true));
+        workspace.close(first, true).unwrap();
+        workspace.set_editor_settings(&settings_with_trim(false));
+        workspace.file_command("file.reopenClosed").unwrap();
+        assert_eq!(workspace.active_id(), first);
+        assert!(!workspace.editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
+        workspace.set_editor_settings(&settings_with_trim(true));
+        workspace.file_command("file.new").unwrap();
+        assert!(workspace.editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
+        let opened = workspace.open(View::new(None)).unwrap();
+        assert!(workspace.view(opened).unwrap().editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
+        let indexed = workspace.open_path(std::env::temp_dir().join("kwil-virtual-settings-index.txt")).unwrap();
+        workspace.activate(first);
+        let damage = workspace.document_result(DocumentResult::Indexed {
+            document: indexed,
+            revision: 0,
+            result: Ok(Box::new(crate::Document::new())),
+        });
+        assert!(workspace.view(indexed).unwrap().editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
+        assert!(!damage.full);
+        assert_eq!(workspace.active_id(), first);
+    }
+
+    #[test]
+    fn live_settings_reach_restored_and_late_recovered_editors() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.set_editor_settings(&settings_with_trim(true));
+        let mut session = Session::default();
+        let recovered = session.open(None).unwrap();
+        workspace.install_prepared(crate::document_worker::PreparedWorkspace {
+            session,
+            documents: vec![(recovered, Ok(crate::Document::new()))],
+        });
+        assert!(workspace.view(recovered).unwrap().editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
+        workspace.views.get_mut(&recovered).unwrap().editor = None;
+        workspace.file_command("file.new").unwrap();
+        let active = workspace.active_id();
+        workspace.set_editor_settings(&settings_with_trim(false));
+        workspace.document_result(DocumentResult::Recovered {
+            document: recovered,
+            revision: 0,
+            result: Ok(Box::new(crate::Document::new())),
+        });
+        assert!(!workspace.view(recovered).unwrap().editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
+        workspace.views.get_mut(&recovered).unwrap().editor = None;
+        workspace.set_editor_settings(&settings_with_trim(true));
+        let damage = workspace.document_result(DocumentResult::Recovered {
+            document: recovered,
+            revision: 0,
+            result: Ok(Box::new(crate::Document::new())),
+        });
+        assert!(workspace.view(recovered).unwrap().editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
+        assert!(!damage.full);
+        assert_eq!(workspace.active_id(), active);
+    }
+
+    #[test]
+    fn live_settings_refresh_each_addressed_save_without_changing_inflight_policy() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "keep \t\n");
+        let first = workspace.active_id();
+        workspace.set_editor_settings(&settings_with_trim(true));
+        workspace.save_document(first, Some(std::env::temp_dir().join("kwil-virtual-policy-first.txt"))).unwrap();
+        let (_, first_request) = take_save(&mut workspace);
+        assert!(first_request.trim_trailing_whitespace);
+        workspace.file_command("file.new").unwrap();
+        let second = workspace.active_id();
+        workspace.set_editor_settings(&settings_with_trim(false));
+        // An accepted request remains immutable, but later addressed saves use
+        // the current policy even if a caller supplied an older editor config.
+        assert!(first_request.trim_trailing_whitespace);
+        workspace.editor_mut().unwrap().settings = settings_with_trim(true);
+        workspace.save_document(second, Some(std::env::temp_dir().join("kwil-virtual-policy-second.txt"))).unwrap();
+        let (document, request) = take_save(&mut workspace);
+        assert_eq!(document, second);
+        assert!(!request.trim_trailing_whitespace);
     }
 
     #[test]

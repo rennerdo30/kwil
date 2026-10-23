@@ -217,16 +217,11 @@ pub fn run_with_external_open(
                         settings = *next;
                     }
                     view.set_session_restore(settings.files.restore_session);
-                    if let Some(editor) = view.editor_mut() {
-                        editor.settings = settings.clone();
-                    }
+                    view.set_editor_settings(&settings);
                     true
                 }
                 Msg::Document(result) => {
                     view.document_result(result);
-                    if let Some(editor) = view.editor_mut() {
-                        editor.settings = settings.clone();
-                    }
                     if view.wants_exit() {
                         break;
                     }
@@ -436,9 +431,6 @@ pub fn run_with_external_open(
                 }
                 // ratatui diffs against the previous frame and writes only
                 // the changed cells.
-                if let Some(editor) = view.editor_mut() {
-                    editor.settings = settings.clone();
-                }
                 if let Some(host) = &mut highlighting {
                     prepare_highlighting_for_draw(host, &view);
                 }
