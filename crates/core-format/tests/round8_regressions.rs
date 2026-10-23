@@ -34,6 +34,11 @@ fn sql_nested_boundaries_are_refused_without_disabling_proven_atoms() {
         "$tag$/* outer /* from */ */$tag$",
     ] {
         let input = format!("select {atom} from t;");
+        if atom.starts_with(['$', '[']) {
+            let error = format(input.as_bytes(), Language::Sql, "sql", None, &Settings::default()).unwrap_err();
+            assert!(error.message.contains("dialect") && error.message.contains("external formatter"), "{error}");
+            continue;
+        }
         let result = format(input.as_bytes(), Language::Sql, "sql", None, &Settings::default()).unwrap();
         assert_eq!(result.bytes, format!("SELECT {atom}\nFROM t;\n").as_bytes(), "{atom}");
     }

@@ -1,6 +1,6 @@
-# Formatter preservation audit after eight review rounds
+# Formatter preservation audit after ten review rounds
 
-Base audited: `de1ef1486b94cc7c379041caa88214760d5ccfae` plus the R8 source
+Base audited: exact validated R9 candidate at HEAD `05edc5f8df69b4fa02b5ae9b5fb48f68b920a4df`, plus the R10 source
 candidate. Every prior failure class below retains its safety contracts.
 R6 corrects two unsafe legacy selection output assertions with explicit parent
 approval; JSON and root/document XML positive selection checks remain. No test
@@ -33,7 +33,7 @@ that local tests replace macOS/Linux CI or prove every language grammar.
 | R5 SQL parameter/variable names expose reserved words | Refuse ambiguous `:`, `@`, `?` introducers outside literal/comment spans before they can bind a keyword-looking name | `round5_regressions::sql_parameter_names_are_not_keyword_tokens` |
 | R5 Oracle alternative quoting mistaken for ordinary quotes | Refuse atoms adjoining quote delimiters (optionally via `&`) without inferring a dialect; no formatted replacement is returned | `round5_regressions::sql_prefixed_literals_are_preserved_or_refused` |
 | R5 C++ spliced block-comment terminator hides a later raw string opener | Backslash/trigraph syntax in a C/C++ block comment protects the entire uncertain suffix through EOF; raw-byte comment termination is no longer guessed | `round5_regressions::cpp_spliced_block_comments_cannot_hide_raw_string_openers` |
-| R6 SQL backslash quote boundaries depend on standard-conforming vs escape-enabled dialect | Refuse backslashes inside quoted tokens without returning an edit; retain known dollar-quote support | `round6_regressions::sql_backslash_quote_ambiguity_is_preserved_or_refused` |
+| R6 SQL backslash quote boundaries depend on standard-conforming vs escape-enabled dialect | Refuse backslashes inside quoted tokens without returning an edit; R9 also refuses unproven dollar boundaries | `round6_regressions::sql_backslash_quote_ambiguity_is_preserved_or_refused` |
 | R6 generic selection ends before a physical line ending and joins tokens | Preserve trailing selected separator bytes at that boundary; use actual following bytes to permit physical-EOL trim; preserve clipped CRLF components too | `round6_regressions::generic_selection_does_not_trim_token_separator_at_partial_line_end`; `selection_boundaries::{selected_crlf_prefix_does_not_normalize_into_an_extra_line_break,selection_uses_actual_following_bytes_to_allow_physical_line_end_trim}`; corrected selection contract |
 | R6 nested XML selection loses inherited xml:space | Nonzero-offset/rootless fragment selections preserve bytes with a context notice; complete root/document selections retain positive formatting coverage | `round6_regressions::xml_selection_does_not_lose_inherited_space_context`; corrected root XML/JSON selection positives |
 | R6 Java Unicode preprocessing changes comment/literal delimiters before raw-source scanning | A Java Unicode escape introducer preserves the entire compilation unit when preprocessing context is unproven | `round6_regressions::java_unicode_preprocessing_cannot_hide_text_block_openers` |
@@ -41,6 +41,10 @@ that local tests replace macOS/Linux CI or prove every language grammar.
 | R7 PHP mixed-case halt keyword exposes opaque trailing data to tidy | Match the halt introducer ASCII-case-insensitively outside already-proven comments/literals; preserve the suffix through EOF, with all tidy settings | `round7_regressions::{php_mixed_case_halt_compiler_preserves_payload_eof,php_halt_case_variants_protect_data_without_disabling_code_tidy}` |
 | R8 SQL universal comment nesting hides a literal opener under SQLite-style first-close rules | Refuse a nested opener inside a SQL block comment without choosing either grammar; nonnested comments and marker text inside proven literals remain supported | `round8_regressions::{sql_sqlite_comment_closure_cannot_hide_a_literal_opener,sql_nested_boundaries_are_refused_without_disabling_proven_atoms}`; corrected R1/R7 cases |
 | R8 PHP prefix without an opening-tag boundary exposes inline output | Require case-insensitive long tag followed by proven space/tab/CR/LF, or the existing short echo tag; otherwise protect all inline bytes and EOF | `round8_regressions::{php_prefix_without_a_tag_boundary_is_inline_output,php_requires_proven_opening_whitespace_and_retains_benign_code_tidy}` |
+| R9 SQL dollar parameters/quotes and bracket identifiers/array expressions hide literal openers | Refuse code-level dollar/bracket syntax and dollar-bearing complete atoms before keyword rewriting; marker bytes inside proven quotes/comments remain supported | `round9_regressions::{sql_sqlite_dollar_parameters_cannot_hide_literal_openers,sql_boundary_proof_retains_common_quotes_comments_and_complete_atoms}`; retained/corrected contracts, R1, R7, R8 cases |
+| R9 PHP physical heredoc label occurs inside interpolated script string/comment/braces | Track nowdoc vs heredoc; unescaped dollar syntax refuses the entire edit before trusting a later label; escaped dollar/plain heredoc and noninterpolating nowdoc remain positive | `round9_regressions::{php_heredoc_terminators_require_outer_literal_context,php_heredoc_interpolation_uncertainty_is_bounded_and_nowdoc_stays_literal}` |
+| R10 SQL CR versus LF-only line-comment termination hides literal context | Refuse a CR encountered before LF/EOF in an admitted line comment; LF-only/ordinary EOF and quoted/block CR forms remain positive | `round10_regressions::{sql_cr_comment_terminator_cannot_hide_literal_context,sql_comment_boundaries_preserve_common_lf_eof_and_quoted_cr}` |
+| R10 shell physical marker is continued body data, or joined fragments synthesize a logical marker | Stream logical delimiter comparison in constant space, with escape parity, quote mode, logical leading-tab stripping and per-heredoc FIFO state; raw bytes stay protected | `round10_regressions::{shell_continued_physical_delimiter_is_body_data,shell_logical_delimiters_keep_parity_tabs_queue_cr_and_eof_contracts}` |
 
 The existing malformed-input, UTF-8, input/output cap, nesting, selection offset,
 external timeout/error and one-replacement contracts remain part of the focused
@@ -64,3 +68,59 @@ counterexamples, dialect-boundary/tag variants and positive safe formatting.
 Historical de1ef148 plus independent universal-nesting/prefix faults must compile
 and fail behaviorally before this source-only candidate is accepted. No Cargo
 execution has run yet; ROOT retains the finite grant and independent review.
+
+R9 retains all 70 earlier named tests and their original inputs. ROOT approved
+only these additional unsafe SQL expectation corrections (2026-10-23 R9 brief,
+plus bracket extension message `0e71f0d8-503e-4311-bd6d-4e82a859aeaf`):
+
+- `contracts::sql_preserves_dialect_literals_identifiers_and_comments`: original
+  combined dollar/bracket input now refuses; independent bracket refusal and
+  common quote/comment formatting positives are added. Malformed-input line
+  assertion is unchanged.
+- `review_regressions::protected_literals_idempotent`: only its SQL dollar case
+  now refuses; original input stays and common SQL idempotence is added. All
+  other languages keep their original assertions.
+- R7/R8 atom matrices: only original `$$`, `$tag$` and bracket atoms change to
+  explicit dialect refusal. The original arrays, nested/comment/quote cases and
+  named-test counts stay intact. No other prior expectations change.
+
+ROOT additionally approved the exact retained R1 historical harness accounting
+correction (message `b63d0312-2d0a-4613-99f6-56b5bff6bb60`): 13 behavioral
+failures / 0 passes, formerly 12 / 1. The original SQL-dollar idempotence input
+now detects that historical defect, while independent common-SQL idempotence
+remains positive in the same named test. This changes no input/name or assertion
+beyond the approved R9 SQL expectation; the harness has not been re-executed in
+this source-only round and is outside the proposed six-process R9 grant.
+
+Four new tests put exact dollar/ARRAY literal and PHP raw-body byte assertions
+before broad variants. Historical 9dcc8e0 and independent universal SQL quotation
+and PHP interpolation-admission faults must compile and fail those assertions.
+Positive formatting/selection cases include ordinary SQL atoms/quotes/comments,
+plain heredoc, nowdoc, escaped dollars and all 16 combinations of tidy switches.
+Nested interpolation, script quotes/comments/braces, escaped/open headers and
+EOF are covered by explicit uncertainty refusal or the retained suffix guard.
+
+Remaining work is explicit: no SQL dialect is selected/proven by this scanner;
+it does not validate every vendor grammar. PHP interpolation needs a proper
+bounded script/interpolation lexer to format those constructs rather than refuse.
+Refusals establish interim preservation safety only, not complete any-file
+formatting, worker adoption, production integration, native or v1 acceptance.
+
+R10 retains all 74 earlier named tests AND their exact source bytes: no earlier
+expectations, names, inputs or harness counts change in this round. Four new
+tests require actual significant-byte preservation before broader refusal/positive
+matrices, plus full-context/contextless shell selections and all16 tidy masks.
+The shell audit covers odd/even escape parity, multi-fragment logical markers,
+quoted markers, tabs/<<-, multiple queued heredocs, CR/backslash-CRLF, open
+headers, unknown delimiter syntax and incomplete logical EOF. Unknown headers
+continue protecting the suffix; a backtick command substitution cannot prove a
+literal delimiter. Complete proven logical delimiters expose positive code tidy.
+
+Historical proof uses exact pre-edit R9 source bytes, SHA-pinned outside the
+repository (R9 was uncommitted on HEAD05edc5f8). Independent SQL CR and shell
+logical-boundary bypasses must compile and fail two byte assertions each. The
+finite proposal is freshfour, historicalfour fails, SQLtwo fails, Shelltwo fails,
+restored fresh78 integration tests, strict all-target Clippy; own fmt separate.
+No Cargo execution has run for R10. Earlier source/runtime receipts remain
+separate; PHP interpolation, full any-file formatting and parent adoption gates
+remain open. No dialect setting, dependency, API or manifest change is added.
