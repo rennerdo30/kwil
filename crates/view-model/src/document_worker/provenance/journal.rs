@@ -15,10 +15,14 @@ use super::{
 };
 use kwil_core_text::{
     Buffer,
+    decoded_backing::DecodedSnapshot,
     encoding::{Encoding, LineEnding},
 };
-use kwil_core_workspace::journal::{
-    JournalBase, JournalBatch, JournalReader, JournalReplacement, RecoveryEvent, RecoverySummary,
+use kwil_core_workspace::{
+    journal::{
+        JournalBase, JournalBatch, JournalReader, JournalReplacement, RecoveredJournal, RecoveryEvent, RecoverySummary,
+    },
+    session::DocumentId,
 };
 use std::{
     io,
@@ -186,12 +190,47 @@ impl JournalRecovery {
     pub fn recover(&mut self, reader: &mut JournalReader, cancel: &AtomicBool) -> io::Result<&JournalRecoverySummary> {
         self.recover_observed(reader, cancel, |_| Ok(()))
     }
+
+    /// Recover through the backend's ownership-pinned authenticated callback,
+    /// then return THAT validated handle for JournalService::try_resume. No
+    /// independent reader scan or path reopen can split model/file identity.
+    /// Backend pending merge and interrupted-tail truncation remain its contract;
+    /// unlike recover(reader), this operation is not a read-only journal scan.
+    pub fn recover_owned(
+        &mut self,
+        path: PathBuf,
+        expected: DocumentId,
+        cancel: &AtomicBool,
+    ) -> io::Result<RecoveredJournal> {
+        self.recover_owned_observed(path, expected, cancel, |_| Ok(()))
+    }
+    fn recover_owned_observed(
+        &mut self,
+        path: PathBuf,
+        expected: DocumentId,
+        cancel: &AtomicBool,
+        observe: impl FnMut(Point) -> io::Result<()>,
+    ) -> io::Result<RecoveredJournal> {
+        self.drive(cancel, observe, |emit| {
+            let recovered = RecoveredJournal::open(path, expected, cancel, emit)?;
+            Ok((recovered.summary(), recovered))
+        })
+    }
     fn recover_observed(
         &mut self,
         reader: &mut JournalReader,
         cancel: &AtomicBool,
-        mut observe: impl FnMut(Point) -> io::Result<()>,
+        observe: impl FnMut(Point) -> io::Result<()>,
     ) -> io::Result<&JournalRecoverySummary> {
+        self.drive(cancel, observe, |emit| reader.recover(cancel, emit).map(|summary| (summary, ())))?;
+        Ok(self.summary.as_ref().unwrap())
+    }
+    fn drive<T>(
+        &mut self,
+        cancel: &AtomicBool,
+        mut observe: impl FnMut(Point) -> io::Result<()>,
+        run: impl FnOnce(&mut dyn FnMut(RecoveryEvent<'_>) -> io::Result<()>) -> io::Result<(RecoverySummary, T)>,
+    ) -> io::Result<T> {
         if self.phase != Phase::Fresh {
             return Err(invalid("journal recovery is one-shot; retire and create a new worker state"));
         }
@@ -215,15 +254,17 @@ impl JournalRecovery {
                 batches: 0,
                 replacements: 0,
             };
-            let journal = reader.recover(cancel, |event| events.event(event))?;
-            events.finish(journal)
+            let (journal, value) = run(&mut |event| events.event(event))?;
+            Ok((events.finish(journal)?, value))
         })();
         match outcome {
-            Ok(summary) => {
+            Ok((summary, value)) => {
+                // value retains owned backend locking across the final core
+                // commit. Any error drops that handle without returning it.
                 revision.commit()?;
                 self.summary = Some(summary);
                 self.phase = Phase::Ready;
-                Ok(self.summary.as_ref().unwrap())
+                Ok(value)
             }
             Err(error) => {
                 // Drop all staged root/registry pins before retiring origins.
@@ -234,6 +275,20 @@ impl JournalRecovery {
     }
     pub fn summary(&self) -> Option<&JournalRecoverySummary> {
         self.summary.as_ref()
+    }
+
+    /// Supply committed origin IDs for bounded writer directory adoption before
+    /// extracting Buffer. No pending IDs are visible. Failure leaves Ready and
+    /// every owner intact, so caller-staged adoption may retry or be abandoned.
+    pub fn for_each_origin(
+        &self,
+        cancel: &AtomicBool,
+        visit: &mut impl FnMut(u64, DecodedSnapshot) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.phase != Phase::Ready {
+            return Err(invalid("journal origin descriptors require Ready recovery before Buffer extraction"));
+        }
+        self.replay.for_each_origin(cancel, visit)
     }
     /// Buffer extraction is terminal on error (including cancelled finish).
     /// Owners remain here, never in a UI-drop cleanup guard.
@@ -444,10 +499,13 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
                 }
                 self.revision_id = batch.header.to_revision;
             }
-            RecoveryEvent::Base(_)
-            | RecoveryEvent::BeginEdit(_)
-            | RecoveryEvent::CommitEdit
-            | RecoveryEvent::BeginReplacement(_) => {
+            RecoveryEvent::Base(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "raw journal base requires the legacy recovery consumer",
+                ));
+            }
+            RecoveryEvent::BeginEdit(_) | RecoveryEvent::CommitEdit | RecoveryEvent::BeginReplacement(_) => {
                 return Err(invalid("raw/mixed journal frames require the legacy recovery consumer"));
             }
         }
@@ -495,7 +553,7 @@ mod tests {
         encoding::{self, SavePlan},
     };
     use kwil_core_workspace::{
-        journal::{JOURNAL_CHUNK, JournalCommand, JournalWorker, RecoveryTail},
+        journal::{JOURNAL_CHUNK, JournalCommand, JournalService, JournalWorker, RecoveryTail},
         session::DocumentId,
     };
     use std::{
@@ -739,6 +797,381 @@ mod tests {
         assert_eq!(state.retained_origin_resources(), 0);
         assert!(!state.has_pending_payload());
         assert_eq!(fixture.count(), 0, "all staged files explicitly retired");
+    }
+
+    fn base_boundary(bytes: &[u8]) -> usize {
+        let mut at = 0;
+        loop {
+            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let end = at + 12 + len;
+            if bytes[at + 12] == 3 {
+                return end;
+            }
+            at = end;
+        }
+    }
+    fn pending_path(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".pending");
+        PathBuf::from(name)
+    }
+    fn relabel_seed(mut capsule: Capsule, encoding: Encoding, raw_len: usize, id: u64) -> Capsule {
+        // Real serializer's single-definition seed. Change ONLY the persisted
+        // numeric ID and its reference, leaving exact raw provenance untouched.
+        assert_eq!(capsule.bytes[16], 1);
+        let reference = 16 + 20 + encoding.name().len() + raw_len;
+        assert_eq!(capsule.bytes[reference], 2);
+        capsule.bytes[17..25].copy_from_slice(&id.to_le_bytes());
+        capsule.bytes[reference + 1..reference + 9].copy_from_slice(&id.to_le_bytes());
+        capsule
+    }
+
+    #[test]
+    fn journal_owned_lock_precedes_model_callbacks_and_same_handle_resumes() {
+        let fixture = Fixture::new();
+        let mut registry = registry();
+        let base = text(&mut registry, b"abc");
+        fixture.write(&base, policy(), &[]);
+        let path = fixture.root.join("journal");
+        let cancel = AtomicBool::new(false);
+        let mut state = fixture.state();
+        let mut applied = 0;
+        let recovered = state
+            .recover_owned_observed(path.clone(), DocumentId(17), &cancel, |point| {
+                if matches!(point, Point::CapsuleApplied) {
+                    applied += 1;
+                    assert!(
+                        RecoveredJournal::open(path.clone(), DocumentId(17), &cancel, |_| Ok(())).is_err(),
+                        "ownership must already be pinned during model replay, not acquired in a second scan"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(applied, 1, "one authenticated base application");
+        assert_eq!(recovered.summary(), state.summary().unwrap().journal);
+        assert!(
+            RecoveredJournal::open(path.clone(), DocumentId(17), &cancel, |_| Ok(())).is_err(),
+            "returned handle keeps exclusion"
+        );
+        let buffer = state.take_buffer(&cancel).unwrap();
+        assert_eq!(logical(&buffer), b"abc");
+        let delta = text(&mut registry, b"!");
+        let mut service = JournalService::spawn(Duration::from_secs(60)).unwrap();
+        let mut session = service.try_resume(recovered).unwrap();
+        assert_eq!(session.ready.recv_timeout(WAIT).unwrap().unwrap(), 9);
+        for command in [
+            JournalCommand::BeginBatch(JournalBatch { from_revision: 9, to_revision: 2, replacements: 1 }),
+            JournalCommand::BeginEncodedReplacement {
+                replacement: JournalReplacement { offset: 3, removed: 0, inserted: 1 },
+                payload_len: delta.bytes.len() as u64,
+            },
+            JournalCommand::Bytes(delta.bytes),
+            JournalCommand::EndReplacement,
+            JournalCommand::CommitBatch,
+        ] {
+            session.try_submit(command).unwrap();
+        }
+        session.try_finish().unwrap();
+        assert_eq!(session.finished.recv_timeout(WAIT).unwrap().unwrap(), 2);
+        service.finish();
+        service.finished.recv_timeout(WAIT).unwrap().unwrap();
+        drop(buffer);
+        state.abandon().unwrap();
+        let mut again = fixture.state();
+        let pinned = again.recover_owned(path, DocumentId(17), &cancel).unwrap();
+        assert_eq!((pinned.summary().revision, pinned.summary().byte_len), (2, 4));
+        let buffer = again.take_buffer(&cancel).unwrap();
+        assert_eq!(logical(&buffer), b"abc!");
+        drop(buffer);
+        drop(pinned);
+        again.abandon().unwrap();
+    }
+
+    #[test]
+    fn journal_owned_pending_complete_or_interrupted_agrees_with_model_and_handle() {
+        for complete in [false, true] {
+            let fixture = Fixture::new();
+            let mut registry = registry();
+            let raw = b"\xff\xfeA\0\0\xd8";
+            let base = seed(&mut registry, fixture.original(raw, Encoding::UTF16_LE, 2));
+            fixture.write(
+                &base,
+                RecoveryPolicy { encoding: Encoding::UTF16_LE, bom: true, preferred_ending: LineEnding::CrLf },
+                &[EditBatch { from: 9, to: 2, parts: vec![part(base.logical, 0, text(&mut registry, b"!"))] }],
+            );
+            let path = fixture.root.join("journal");
+            let full = fs::read(&path).unwrap();
+            let base_end = base_boundary(&full);
+            let end = if complete { full.len() } else { full.len() - 13 };
+            fs::write(&path, &full[..base_end + 5]).unwrap();
+            fs::write(pending_path(&path), &full[base_end..end]).unwrap();
+            let mut state = fixture.state();
+            let handle = state.recover_owned(path.clone(), DocumentId(17), &AtomicBool::new(false)).unwrap();
+            let expected = if complete { (2, 3, RecoveryTail::Complete) } else { (9, 2, RecoveryTail::Interrupted) };
+            let summary = state.summary().unwrap().journal;
+            assert_eq!((summary.revision, summary.byte_len, summary.tail), expected);
+            assert_eq!(
+                handle.summary(),
+                summary,
+                "owned backend and staged logical model must use the same validated stream"
+            );
+            assert_eq!(fs::metadata(&path).unwrap().len(), summary.committed_end);
+            assert!(!pending_path(&path).exists(), "backend pending retirement contract retained");
+            let buffer = state.take_buffer(&AtomicBool::new(false)).unwrap();
+            let mut expected_raw = raw.to_vec();
+            if complete {
+                expected_raw.extend_from_slice(b"!\0");
+            }
+            assert_eq!(save(&buffer.snapshot(), Encoding::UTF16_LE, true), expected_raw);
+            drop(buffer);
+            drop(handle);
+            state.abandon().unwrap();
+            assert_eq!(fixture.count(), 0);
+        }
+    }
+
+    #[test]
+    fn journal_owned_failures_keep_error_kinds_no_handle_and_release_lock() {
+        for case in 0..8 {
+            let fixture = Fixture::new();
+            let mut registry = registry();
+            let base = seed(&mut registry, fixture.original(b"\xff\xfeA\0", Encoding::UTF16_LE, 2));
+            let mut codec = policy().to_codec().unwrap();
+            if case == 2 {
+                codec[4] = 99;
+            }
+            let batches = if case == 6 {
+                let mut bad = text(&mut registry, b"bad");
+                *bad.bytes.last_mut().unwrap() = 255;
+                vec![EditBatch { from: 9, to: 2, parts: vec![part(base.logical, 0, bad)] }]
+            } else {
+                Vec::new()
+            };
+            fixture.write_codec(&base, codec, case != 1, &batches);
+            let path = fixture.root.join("journal");
+            let mut bytes = fs::read(&path).unwrap();
+            if case == 3 {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                fs::write(&path, &bytes).unwrap();
+            }
+            let mut limits = limits();
+            if case == 4 {
+                limits.max_payload_bytes = 1;
+            }
+            let mut state = JournalRecovery::new(fixture.private.clone(), limits).unwrap();
+            let cancel = AtomicBool::new(case == 5);
+            let mut reached = false;
+            let error = state
+                .recover_owned_observed(path.clone(), DocumentId(if case == 0 { 18 } else { 17 }), &cancel, |point| {
+                    if case == 7 && matches!(point, Point::CapsuleApplied) {
+                        reached = true;
+                        assert_eq!(fixture.count(), 1, "decoded owner prepared before cancellation");
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    Ok(())
+                })
+                .unwrap_err();
+            if case == 7 {
+                assert!(reached);
+            }
+            assert_eq!(
+                error.kind(),
+                match case {
+                    1 => io::ErrorKind::Unsupported,
+                    5 | 7 => io::ErrorKind::Interrupted,
+                    _ => io::ErrorKind::InvalidData,
+                }
+            );
+            assert_rolled_back(&state, &fixture);
+            assert_eq!(fs::read(&path).unwrap(), bytes, "failure must not silently discard journal evidence");
+            let mut lock_name = path.as_os_str().to_os_string();
+            lock_name.push(".lock");
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(PathBuf::from(lock_name))
+                .unwrap();
+            lock.try_lock().expect("failed recovery returned no ownership handle and released exclusion");
+            drop(lock);
+            let mut callbacks = 0;
+            assert!(
+                state
+                    .for_each_origin(&AtomicBool::new(false), &mut |_, _| {
+                        callbacks += 1;
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert_eq!(callbacks, 0, "failed recovery never exposes descriptors");
+            assert!(
+                state
+                    .recover_owned(path, DocumentId(17), &AtomicBool::new(false))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("one-shot")
+            );
+        }
+    }
+
+    #[test]
+    fn journal_owned_cleanup_failure_returns_no_handle_and_retains_payload_retry() {
+        let fixture = Fixture::new();
+        let mut registry = registry();
+        let base = text(&mut registry, &vec![b'a'; 80 << 10]);
+        fixture.write(&base, policy(), &[]);
+        let path = fixture.root.join("journal");
+        let bytes = fs::read(&path).unwrap();
+        let mut state = fixture.state();
+        let mut blocker = None;
+        let error = state
+            .recover_owned_observed(path.clone(), DocumentId(17), &AtomicBool::new(false), |point| {
+                if matches!(point, Point::CapsuleApplied) {
+                    let directory = fs::read_dir(&fixture.private).unwrap().next().unwrap().unwrap().path();
+                    let path = directory.join("owned-blocker");
+                    fs::write(&path, b"x").unwrap();
+                    blocker = Some(path);
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("cleanup retained for retry"));
+        assert!(state.has_pending_payload());
+        assert!(state.summary().is_none());
+        assert_eq!(state.replay.snapshot().unwrap().len(), 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let handle = RecoveredJournal::open(path, DocumentId(17), &AtomicBool::new(false), |_| Ok(())).unwrap();
+        drop(handle);
+        assert!(state.retry_retirement().is_err());
+        fs::remove_file(blocker.unwrap()).unwrap();
+        assert_eq!(state.retry_retirement().unwrap(), JournalRetirementStatus::default());
+        assert_eq!(fixture.count(), 0);
+    }
+
+    #[test]
+    fn journal_owned_descriptors_sparse_ids_adopt_without_redefinition_and_allow_retry() {
+        let fixture = Fixture::new();
+        let mut first_registry = registry();
+        let mut second_registry = registry();
+        let first_raw = b"\xff\xfeA\0\0\xd8";
+        let base = relabel_seed(
+            seed(&mut first_registry, fixture.original(first_raw, Encoding::UTF16_LE, 2)),
+            Encoding::UTF16_LE,
+            first_raw.len(),
+            7,
+        );
+        let big5 = Encoding::for_label("big5").unwrap();
+        let other = relabel_seed(seed(&mut second_registry, fixture.original(b"\x88\x62", big5, 0)), big5, 2, 42);
+        fixture.write(&base, policy(), &[EditBatch { from: 9, to: 2, parts: vec![part(base.logical, 0, other)] }]);
+        let mut state = fixture.state();
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0;
+        assert!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    calls += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 0);
+        let handle = state.recover_owned(fixture.root.join("journal"), DocumentId(17), &cancel).unwrap();
+        let before = state.retained_origin_resources();
+        let error = state
+            .for_each_origin(&cancel, &mut |_, _| {
+                calls += 1;
+                cancel.store(true, Ordering::Relaxed);
+                Err(io::Error::new(io::ErrorKind::StorageFull, "adoption callback"))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull, "concrete callback failure wins coincident cancellation");
+        let mut cancelled_calls = 0;
+        assert_eq!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    cancelled_calls += 1;
+                    Ok(())
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(cancelled_calls, 0);
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    cancelled_calls += 1;
+                    cancel.store(true, Ordering::Relaxed);
+                    Ok(())
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(cancelled_calls, 1, "cancel polled immediately after each descriptor");
+        cancel.store(false, Ordering::Relaxed);
+        let mut final_calls = 0;
+        assert_eq!(
+            state
+                .for_each_origin(&cancel, &mut |id, _| {
+                    final_calls += 1;
+                    if id == 42 {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    Ok(())
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+            "last callback cancellation must not disappear at end of directory"
+        );
+        assert_eq!(final_calls, 2);
+        cancel.store(false, Ordering::Relaxed);
+        let mut origins = Vec::new();
+        state
+            .for_each_origin(&cancel, &mut |id, origin| {
+                origins.push((id, origin));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(origins.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [7, 42]);
+        assert_eq!(origins[0].1.raw_bytes(), first_raw);
+        assert_eq!(origins[1].1.raw_bytes(), b"\x88\x62");
+        assert_eq!(state.retained_origin_resources(), before);
+        assert_eq!(state.accepted_origin_count(), 2);
+        let snapshot = Buffer::from_decoded(origins[1].1.clone()).snapshot();
+        let mut adopted = OriginRegistry::from_recovered(8, 8192, origins, &cancel).unwrap();
+        let plan = adopted.plan(snapshot, 0..4, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(plan.new_origin_count(), 0, "resumed writer reuses recovered exact ID without raw re-embedding");
+        let reference = pack(&mut adopted, plan);
+        assert_eq!(reference.bytes[16], 2);
+        assert_eq!(u64::from_le_bytes(reference.bytes[17..25].try_into().unwrap()), 42);
+        let third = seed(&mut adopted, fixture.original(b"new", Encoding::UTF8, 0));
+        assert_eq!(
+            u64::from_le_bytes(third.bytes[17..25].try_into().unwrap()),
+            43,
+            "new persisted ID exceeds exact adopted maximum"
+        );
+        let buffer = state.take_buffer(&cancel).unwrap();
+        let mut late = 0;
+        assert!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    late += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(late, 0);
+        drop(adopted);
+        drop(buffer);
+        drop(handle);
+        state.abandon().unwrap();
+        assert_eq!(fixture.count(), 0);
     }
 
     #[test]
@@ -1030,7 +1463,7 @@ mod tests {
             let bytes = fs::read(fixture.root.join("journal")).unwrap();
             let mut state = fixture.state();
             let error = state.recover(&mut fixture.reader(), &AtomicBool::new(false)).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.kind(), if case == 0 { io::ErrorKind::Unsupported } else { io::ErrorKind::InvalidData });
             assert!(error.to_string().contains(if case == 1 { "codec/version" } else { "legacy recovery" }));
             assert_rolled_back(&state, &fixture);
             assert_eq!(fs::read(fixture.root.join("journal")).unwrap(), bytes);

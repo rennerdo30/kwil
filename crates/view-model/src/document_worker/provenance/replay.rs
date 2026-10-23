@@ -17,7 +17,8 @@ use super::decode::{self, CapsuleSink, DecodeLimits};
 use kwil_core_text::{
     Buffer, RecoveryAssembler, RecoveryLimits, RecoveryRevision, RecoveryUsage, Snapshot,
     decoded_backing::{
-        BackingError, BackingPaths, CHECKPOINT_RAW_BYTES, DecodedBacking, Interpretation, RetirementError,
+        BackingError, BackingPaths, CHECKPOINT_RAW_BYTES, DecodedBacking, DecodedSnapshot, Interpretation,
+        RetirementError,
     },
     encoding::Encoding,
 };
@@ -181,6 +182,48 @@ impl ReplayState {
     }
     pub fn has_pending_cleanup(&self) -> bool {
         self.owners.slots.iter().any(|s| !s.accepted)
+    }
+
+    /// Visit committed persisted IDs with O(1) snapshot descriptors, without
+    /// reading raw bytes, touching the filesystem or building another registry.
+    /// Available before Buffer extraction while the assembler pins every origin.
+    /// Callback errors/cancellation leave this state unchanged and retryable;
+    /// callbacks must stage their own external effects if they need atomicity.
+    pub fn for_each_origin(
+        &self,
+        cancel: &AtomicBool,
+        visit: &mut impl FnMut(u64, DecodedSnapshot) -> io::Result<()>,
+    ) -> io::Result<()> {
+        poll(cancel)?;
+        let expected =
+            self.assembler.as_ref().ok_or_else(|| invalid("replay origin directory already consumed"))?.origin_count();
+        let mut accepted = 0;
+        // Validate the complete directory BEFORE the first callback. Missing
+        // owners, including a removed slot or cleanup-only accepted slot, must
+        // never silently produce an incomplete writer adoption directory.
+        for slot in &self.owners.slots {
+            poll(cancel)?;
+            if slot.accepted {
+                if !matches!(&slot.resource, Some(Resource::Owner(_))) {
+                    return Err(invalid("committed replay origin owner missing or retired"));
+                }
+                accepted += 1;
+            }
+        }
+        if accepted != expected {
+            return Err(invalid("committed replay origin directory incomplete"));
+        }
+        for slot in &self.owners.slots {
+            poll(cancel)?;
+            if slot.accepted {
+                let Some(Resource::Owner(owner)) = &slot.resource else {
+                    return Err(invalid("committed replay origin owner missing or retired"));
+                };
+                visit(slot.id, owner.snapshot())?;
+                poll(cancel)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn begin_revision<'a>(&'a mut self, cancel: &'a AtomicBool) -> io::Result<ReplayRevision<'a>> {
@@ -1257,6 +1300,153 @@ mod tests {
         CapsuleSink::end_fragment(&mut revision, 3).unwrap();
         assert!(revision.commit().is_err(), "completed but unreplaced fragment cannot be silently discarded");
         assert!(raw(&state.snapshot().unwrap()).is_empty());
+        state.abandon().unwrap();
+        fixture.assert_empty();
+    }
+
+    #[test]
+    fn replay_origin_descriptors_exclude_pending_and_preserve_retryable_callbacks() {
+        let fixture = Fixture::new();
+        let mut registry = registry();
+        let first = seed(&mut registry, fixture.origin(b"ABC", Encoding::UTF8, 0));
+        let second = seed(&mut registry, fixture.origin(b"\xff\xfeA\0\0\xd8", Encoding::UTF16_LE, 2));
+        let mut state = fixture.state();
+        accepted(&mut state, &first, 0..0);
+        accepted(&mut state, &second, 3..3);
+        // A retained uncommitted owner can coexist with accepted origins after
+        // rollback/cleanup. It must never leak into the adopted writer directory.
+        let pending = DecodedBacking::prepare_from_reader(
+            &mut Cursor::new(b"pending"),
+            7,
+            Interpretation::new(Encoding::UTF8, 0).unwrap(),
+            &fixture.recovered,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        state.owners.slots.push(Slot { id: 99, resource: Some(Resource::Owner(pending)), storage: 0, accepted: false });
+        let usage = state.usage();
+        let storage = state.origin_storage_reserved();
+        let cancel = AtomicBool::new(false);
+        let mut ids = Vec::new();
+        state
+            .for_each_origin(&cancel, &mut |id, origin| {
+                ids.push(id);
+                assert_eq!(origin.raw_bytes(), if id == 1 { &b"ABC"[..] } else { &b"\xff\xfeA\0\0\xd8"[..] });
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ids, [1, 2], "never expose uncommitted99");
+        let error = state
+            .for_each_origin(&cancel, &mut |_, _| Err(io::Error::new(io::ErrorKind::StorageFull, "callback admission")))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        let mut called = 0;
+        assert_eq!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    called += 1;
+                    cancel.store(true, Ordering::Relaxed);
+                    Ok(())
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(called, 1);
+        assert_eq!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    called += 1;
+                    Ok(())
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(called, 1);
+        cancel.store(false, Ordering::Relaxed);
+        ids.clear();
+        state
+            .for_each_origin(&cancel, &mut |id, _| {
+                ids.push(id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(state.usage(), usage);
+        assert_eq!(state.origin_storage_reserved(), storage);
+        assert_eq!(state.accepted_origin_count(), 2);
+        assert_eq!(state.retained_resource_count(), 3);
+        assert_eq!(state.retry_retirement().unwrap().retired, 1);
+        state.abandon().unwrap();
+        fixture.assert_empty();
+    }
+
+    #[test]
+    fn replay_origin_descriptors_fail_before_callback_for_missing_or_cleanup_only_owners() {
+        let fixture = Fixture::new();
+        let mut registry = registry();
+        let first = seed(&mut registry, fixture.origin(b"A", Encoding::UTF8, 0));
+        let second = seed(&mut registry, fixture.origin(b"B", Encoding::UTF8, 0));
+        let mut state = fixture.state();
+        accepted(&mut state, &first, 0..0);
+        accepted(&mut state, &second, 1..1);
+        let cancel = AtomicBool::new(false);
+        let mut called = 0;
+        let resource = state.owners.slots[1].resource.take().unwrap();
+        assert!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    called += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(called, 0);
+        let paths = match &resource {
+            Resource::Owner(owner) => owner.snapshot().paths().clone(),
+            _ => unreachable!(),
+        };
+        state.owners.slots[1].resource = Some(Resource::Paths(Box::new(paths)));
+        assert!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    called += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(called, 0);
+        state.owners.slots[1].resource = Some(resource);
+        let removed = state.owners.slots.pop().unwrap();
+        assert!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    called += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(called, 0, "missing slot must not silently shorten the committed directory");
+        state.owners.slots.push(removed);
+        state
+            .for_each_origin(&cancel, &mut |_, _| {
+                called += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(called, 2);
+        let buffer = state.take_buffer(&cancel).unwrap();
+        assert!(
+            state
+                .for_each_origin(&cancel, &mut |_, _| {
+                    called += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(called, 2, "assembler extraction ends descriptor admission");
+        drop(buffer);
         state.abandon().unwrap();
         fixture.assert_empty();
     }
