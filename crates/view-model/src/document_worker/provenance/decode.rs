@@ -53,8 +53,9 @@ fn exact(input: &mut impl Read, mut bytes: &mut [u8], cancel: &AtomicBool) -> io
     while !bytes.is_empty() {
         poll(cancel)?;
         let result = input.read(bytes);
-        poll(cancel)?;
         let n = result?;
+        // A concrete I/O failure wins over a coincident cancellation signal.
+        poll(cancel)?;
         if n == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
@@ -120,14 +121,16 @@ impl<R: Read> Read for OriginInput<'_, R> {
             return self.fail(error);
         }
         let len = bytes.len().min(MAX_READ_BYTES);
-        let result = self.input.read(&mut bytes[..len]);
+        let n = match self.input.read(&mut bytes[..len]) {
+            Ok(n) => n,
+            Err(error) => return self.fail(error),
+        };
         if let Err(error) = poll(self.cancel) {
             return self.fail(error);
         }
-        match result {
-            Ok(0) if len != 0 && self.input.limit() != 0 => self.fail(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            Ok(n) => Ok(n),
-            Err(error) => self.fail(error),
+        match n {
+            0 if len != 0 && self.input.limit() != 0 => self.fail(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            n => Ok(n),
         }
     }
 }
@@ -648,6 +651,37 @@ mod tests {
                 io::ErrorKind::Interrupted
             );
             assert_eq!(input.raw_calls, 1, "failed origin reader must remain poisoned");
+            assert!(sink.aborted);
+            assert!(sink.origins.is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_io_error_wins_over_simultaneous_cancellation_in_header_and_origin() {
+        struct Fails<'a> {
+            input: io::Cursor<Vec<u8>>,
+            fail_at: u64,
+            cancel: &'a AtomicBool,
+        }
+        impl Read for Fails<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.input.position() >= self.fail_at {
+                    self.cancel.store(true, Ordering::Relaxed);
+                    return Err(io::Error::new(io::ErrorKind::StorageFull, "injected read failure"));
+                }
+                self.input.read(bytes)
+            }
+        }
+        for header in [true, false] {
+            let cancel = AtomicBool::new(false);
+            let input = origin_input(b"payload", None, false);
+            let len = input.input.get_ref().len() as u64;
+            let fail_at = if header { 0 } else { input.raw_start };
+            let mut input = Fails { input: input.input, fail_at, cancel: &cancel };
+            let mut sink = Sink::default();
+            let error = decode_capsule(&mut input, len, 0, &limits(), &cancel, &mut sink).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::StorageFull, "original failure must survive cancellation");
+            assert!(error.to_string().contains("injected read failure"));
             assert!(sink.aborted);
             assert!(sink.origins.is_empty());
         }
