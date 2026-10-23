@@ -2362,7 +2362,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Middle, .. } => {
                 // Middle click closes a tab, as in browsers and other editors.
-                if self.settings_open() || self.palette_open() || self.menu.state.is_open() {
+                if self.settings_open() || self.palette_open() || self.menu.state.is_open() || self.save_path.is_some()
+                {
                     return;
                 }
                 let frame = self.tab_frame();

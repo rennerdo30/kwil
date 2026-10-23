@@ -707,8 +707,18 @@ impl App {
     pub(super) fn settings_hosted_wheel(&mut self, up: bool) {
         if let Some(page) = &mut self.file_types {
             let (visible, total) = page.ui.rows;
-            page.ui.scroll = desktop::wheel(page.ui.scroll, up, visible, total);
-            self.apply(Damage { full: true, status: true, ..Default::default() });
+            let next = desktop::wheel(page.ui.scroll, up, visible, total);
+            if next != page.ui.scroll {
+                page.ui.scroll = next;
+                if self.welcome.visible() {
+                    self.welcome_view.hits = desktop::Hits::default();
+                    self.welcome_view.paint.request();
+                } else {
+                    self.settings_view.hover = None;
+                    self.settings_view.paint.request();
+                }
+                self.request_frame();
+            }
         }
     }
 }

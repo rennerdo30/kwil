@@ -13,6 +13,8 @@ pub(super) enum Action {
 
 #[derive(Default)]
 pub(super) struct WelcomeView {
+    pub paint: desktop::Paint,
+    pub rows: (usize, usize),
     pub hits: Hits<Action>,
     pub area: Option<Rect>,
     pub scroll: usize,
@@ -60,6 +62,7 @@ pub(super) fn draw(
             lines.push(String::new());
         }
         let visible = content.h / s.text.max(1);
+        view.rows = (visible, lines.len());
         view.scroll = view.scroll.min(lines.len().saturating_sub(visible));
         for (i, line) in lines.iter().skip(view.scroll).take(visible).enumerate() {
             desktop::label(pixels, w, font, Rect { y: content.y + i * s.text, h: s.text, ..content }, line, c.fg);
@@ -205,16 +208,17 @@ impl App {
                     MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
                 };
                 if self.welcome.stage() == welcome::Stage::About {
-                    self.welcome_view.scroll = if up {
-                        self.welcome_view.scroll.saturating_sub(2)
-                    } else {
-                        self.welcome_view.scroll.saturating_add(2)
-                    };
+                    let (visible, total) = self.welcome_view.rows;
+                    let next = desktop::wheel(self.welcome_view.scroll, up, visible, total);
+                    if next != self.welcome_view.scroll {
+                        self.welcome_view.scroll = next;
+                        self.welcome_view.hits = Hits::default();
+                        self.welcome_view.paint.request();
+                        self.request_frame();
+                    }
                 } else {
                     self.settings_hosted_wheel(up);
                 }
-                self.welcome_view.hits = Hits::default();
-                self.apply(Damage { full: true, ..Default::default() });
                 true
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -289,7 +293,8 @@ impl App {
             _ => {}
         }
 
-        self.apply(Damage { full: true, ..Default::default() });
+        self.welcome_view.paint.request();
+        self.request_frame();
     }
 
     pub(super) fn welcome_action(&mut self, action: Action) {

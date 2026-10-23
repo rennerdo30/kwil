@@ -794,7 +794,10 @@ impl App {
     /// Render admission for card-only repaints (LIB-HOOKS-R1 hunk 2). True
     /// while any overlay asked for a frame through its `Paint`.
     pub(super) fn overlay_paint_pending(&self) -> bool {
-        self.settings_view.paint.pending() || self.palette_view.paint.pending() || self.prompt_view.paint.pending()
+        self.settings_view.paint.pending()
+            || self.palette_view.paint.pending()
+            || self.prompt_view.paint.pending()
+            || self.welcome_view.paint.pending()
     }
 
     /// Consumed once per admitted render; the open cards then repaint in place.
@@ -802,6 +805,7 @@ impl App {
         self.settings_view.paint.take();
         self.palette_view.paint.take();
         self.prompt_view.paint.take();
+        self.welcome_view.paint.take();
     }
 
     /// The surface overlays are painted for right now.

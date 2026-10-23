@@ -29,10 +29,12 @@ pub(crate) enum Step {
     WelcomeProbe,
     WelcomeNext,
     WelcomeKeyboard,
+    WelcomeScrollDamage,
     WelcomeSkip,
     WelcomeSmall,
     WelcomeSmallCheck,
     WelcomeLateInput,
+    RecentMiddleClick,
     DismissSetup,
     End,
 }
@@ -107,12 +109,14 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (100, Step::UsabilityCapture("welcome.bmp")),
             (100, Step::WelcomeNext),
             (100, Step::WelcomeKeyboard),
+            (100, Step::WelcomeScrollDamage),
             (300, Step::UsabilityCapture("welcome-file-types.bmp")),
             (100, Step::WelcomeSmall),
             (200, Step::WelcomeSmallCheck),
             (100, Step::UsabilityCapture("welcome-small.bmp")),
             (100, Step::WelcomeSkip),
             (100, Step::WelcomeLateInput),
+            (100, Step::RecentMiddleClick),
             (200, Step::UsabilityCapture("welcome-complete.bmp")),
             (100, Step::End),
         ];
@@ -147,6 +151,48 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::WelcomeScrollDamage => {
+            assert!(app.render());
+            let phase = app.metrics.phase;
+            let full = app.metrics.per[phase].full;
+            app.settings_hosted_wheel(false);
+            assert!(!app.pending.full, "file types scroll must not request a full frame");
+            assert!(app.welcome_view.paint.pending());
+            assert!(app.render());
+            assert_eq!(app.metrics.per[phase].full, full, "file types scroll presents only its card");
+            app.settings_hosted_wheel(true);
+            assert!(app.render());
+            let presents = app.metrics.per[phase].presents;
+            app.settings_hosted_wheel(true);
+            assert!(!app.overlay_paint_pending(), "wheel at top bound must not request a repaint");
+            assert!(app.render());
+            assert_eq!(app.metrics.per[phase].presents, presents);
+        }
+        Step::RecentMiddleClick => {
+            use winit::application::ApplicationHandler;
+            use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+            assert!(app.dispatch_file("file.recent"));
+            let generation = app.view.file_prompt().unwrap().generation;
+            let ids = super::tabs::ids(&app.view);
+            let frame = app.tab_frame();
+            let slot = &frame.geometry.slots[0];
+            app.pointer = (slot.area.x + 1, slot.area.y + 1);
+            let id = app.gfx.as_ref().unwrap().window.id();
+            app.window_event(
+                el,
+                id,
+                WindowEvent::MouseInput {
+                    device_id: DeviceId::dummy(),
+                    state: ElementState::Pressed,
+                    button: MouseButton::Middle,
+                },
+            );
+            assert_eq!(super::tabs::ids(&app.view), ids, "Recent must retain every tab");
+            assert_eq!(app.view.file_prompt().unwrap().generation, generation, "middle click cannot cancel Recent");
+            assert_eq!(app.view.file_prompt().unwrap().kind, kwil_view_model::FilePromptKind::Recent);
+            super::file_prompt::cancel(&mut app.view);
+            app.sync_file_ui();
+        }
         Step::DismissSetup => {
             if app.welcome.stage() == super::welcome::Stage::About {
                 app.welcome_action(super::welcome_ui::Action::Next);
