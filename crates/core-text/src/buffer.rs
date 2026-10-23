@@ -339,6 +339,15 @@ impl Buffer {
         piece_tree::added(bytes, &self.added)
     }
 
+    pub(crate) fn recovery_promote_raw_v1(
+        &self,
+        root: &Tree,
+        admission: &mut dyn FnMut(usize, &Tree) -> io::Result<()>,
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Tree> {
+        piece_tree::recovery_promote_raw_v1(root, &self.added, admission, check)
+    }
+
     pub(crate) fn recovery_opaque(
         &self,
         encoding: crate::encoding::Encoding,

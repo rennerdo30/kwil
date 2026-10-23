@@ -238,9 +238,93 @@ impl SpillRetirement {
 mod tests {
     use super::*;
     use crate::Buffer;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
     fn limits() -> SpillRetirementLimits {
         SpillRetirementLimits { max_block_references: 64, max_metadata_bytes: 1 << 20, max_path_bytes: 4096 }
+    }
+
+    struct PhysicalPair {
+        _buffer: Buffer,
+        full: crate::Snapshot,
+        low: crate::Snapshot,
+        high: crate::Snapshot,
+        low_storage: Arc<Storage>,
+        high_storage: Arc<Storage>,
+    }
+    impl PhysicalPair {
+        fn new() -> Self {
+            fn physical(snapshot: &crate::Snapshot) -> Arc<Storage> {
+                let Kind::Leaf(piece) = &snapshot.root.as_ref().unwrap().kind else { panic!("one physical block") };
+                assert!(matches!(piece.storage.as_ref(), Storage::Disk(_)));
+                piece.storage.clone()
+            }
+            let mut buffer = Buffer::with_add_memory_limit(0);
+            buffer.insert(0, b"a").unwrap();
+            buffer.insert(1, b"b").unwrap();
+            let full = buffer.snapshot();
+            let first = full.slice(0..1).unwrap();
+            let second = full.slice(1..2).unwrap();
+            let mut blocks = [(first.clone(), physical(&first)), (second.clone(), physical(&second))];
+            // Collection claims in physical address order, independent of the
+            // logical order or allocation order of these two Added blocks.
+            blocks.sort_unstable_by_key(|(_, storage)| Arc::as_ptr(storage) as usize);
+            let [(low, low_storage), (high, high_storage)] = blocks;
+            assert!((Arc::as_ptr(&low_storage) as usize) < Arc::as_ptr(&high_storage) as usize);
+            Self { _buffer: buffer, full, low, high, low_storage, high_storage }
+        }
+        fn leased(storage: &Arc<Storage>) -> bool {
+            let Storage::Disk(block) = storage.as_ref() else { unreachable!() };
+            block.retirement_leased.load(Ordering::Acquire)
+        }
+        fn low_leased(&self) -> bool {
+            Self::leased(&self.low_storage)
+        }
+        fn high_leased(&self) -> bool {
+            Self::leased(&self.high_storage)
+        }
+        fn reacquire_prefix(&self) {
+            let prefix = SpillRetirement::collect(&self.low.root, limits(), || false).unwrap();
+            assert_eq!(prefix.retained(), 1, "the successfully claimed fresh prefix must be reacquirable");
+            drop(prefix);
+            assert!(!self.low_leased());
+        }
+    }
+
+    fn with_physical_pair(assertions: impl FnOnce(&PhysicalPair) -> SpillRetirement) {
+        let pair = PhysicalPair::new();
+        let paths = spill_paths(&pair.full.root);
+        let outcome = catch_unwind(AssertUnwindSafe(|| assertions(&pair)));
+        // Release every source/history/inspection pin before worker cleanup,
+        // including after a deliberately broken rollback assertion unwinds.
+        drop(pair);
+        let outcome = outcome.and_then(|mut complete| {
+            catch_unwind(AssertUnwindSafe(|| {
+                assert_eq!(complete.retained(), 2);
+                assert_eq!(complete.retire().retired, 2);
+                assert_eq!(complete.retained(), 0);
+                assert!(paths.iter().all(|path| !path.exists()));
+            }))
+        });
+        let cleanup = paths.iter().try_for_each(|path| -> io::Result<()> {
+            match std::fs::remove_file(path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+            #[cfg(unix)]
+            match std::fs::remove_dir(path.parent().unwrap()) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+            Ok(())
+        });
+        if let Err(payload) = outcome {
+            if let Err(error) = cleanup {
+                eprintln!("test-owned spill cleanup failed: {error}");
+            }
+            resume_unwind(payload);
+        }
+        cleanup.unwrap();
     }
 
     #[test]
@@ -294,22 +378,71 @@ mod tests {
 
     #[test]
     fn spill_lease_rejects_overlap_and_rolls_back_partial_registration() {
-        let mut buffer = Buffer::with_add_memory_limit(0);
-        buffer.insert(0, b"a").unwrap();
-        buffer.insert(1, b"b").unwrap();
-        let snapshot = buffer.snapshot();
-        let first = snapshot.slice(0..1).unwrap();
-        let second = snapshot.slice(1..2).unwrap();
-        let first_lease = SpillRetirement::collect(&first.root, limits(), || false).unwrap();
-        let overlap = SpillRetirement::collect(&snapshot.root, limits(), || false).err().unwrap();
-        assert_eq!(overlap.kind(), io::ErrorKind::InvalidInput);
-        let second_lease = SpillRetirement::collect(&second.root, limits(), || false).unwrap();
-        drop((first_lease, second_lease));
-        let mut complete = SpillRetirement::collect(&snapshot.root, limits(), || false).unwrap();
-        assert_eq!(complete.retained(), 2);
-        drop((buffer, snapshot, first, second));
-        assert_eq!(complete.retire().retired, 2);
-        assert_eq!(complete.retained(), 0);
+        with_physical_pair(|pair| {
+            let high_lease = SpillRetirement::collect(&pair.high.root, limits(), || false).unwrap();
+            let mut observed_fresh_claim = false;
+            let overlap = SpillRetirement::collect(&pair.full.root, limits(), || {
+                observed_fresh_claim |= pair.low_leased() && pair.high_leased();
+                false
+            })
+            .err()
+            .unwrap();
+            assert!(observed_fresh_claim, "overlap must occur after claiming the lower-address fresh block");
+            assert_eq!(overlap.kind(), io::ErrorKind::InvalidInput);
+            assert!(!pair.low_leased(), "failed overlap must roll back its successful fresh claim");
+            assert!(pair.high_leased(), "failed overlap must preserve the existing higher-address lease");
+            pair.reacquire_prefix();
+            assert!(pair.high_leased());
+            drop(high_lease);
+            SpillRetirement::collect(&pair.full.root, limits(), || false).unwrap()
+        });
+    }
+
+    #[test]
+    fn spill_lease_cancellation_after_fresh_claim_rolls_back_partial_registration() {
+        with_physical_pair(|pair| {
+            let mut observed_fresh_claim = false;
+            let error = SpillRetirement::collect(&pair.full.root, limits(), || {
+                if pair.low_leased() {
+                    assert!(!pair.high_leased(), "cancel before the second physical claim");
+                    observed_fresh_claim = true;
+                    true
+                } else {
+                    false
+                }
+            })
+            .err()
+            .unwrap();
+            assert!(observed_fresh_claim, "cancellation must follow a successful fresh claim");
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(!pair.low_leased());
+            assert!(!pair.high_leased());
+            pair.reacquire_prefix();
+            SpillRetirement::collect(&pair.full.root, limits(), || false).unwrap()
+        });
+    }
+
+    #[test]
+    fn spill_lease_unwind_after_fresh_claim_rolls_back_partial_registration() {
+        with_physical_pair(|pair| {
+            let mut observed_fresh_claim = false;
+            let unwind = catch_unwind(AssertUnwindSafe(|| {
+                let _result = SpillRetirement::collect(&pair.full.root, limits(), || {
+                    if pair.low_leased() {
+                        assert!(!pair.high_leased(), "unwind before the second physical claim");
+                        observed_fresh_claim = true;
+                        panic!("test unwind after a successful physical spill claim");
+                    }
+                    false
+                });
+            }));
+            assert!(unwind.is_err());
+            assert!(observed_fresh_claim, "unwind must follow a successful fresh claim");
+            assert!(!pair.low_leased());
+            assert!(!pair.high_leased());
+            pair.reacquire_prefix();
+            SpillRetirement::collect(&pair.full.root, limits(), || false).unwrap()
+        });
     }
 
     #[test]

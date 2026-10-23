@@ -138,6 +138,52 @@ pub struct RecoveryRevision<'a> {
     committed: bool,
 }
 impl RecoveryRevision<'_> {
+    /// Interpret the complete historical raw-v1 prefix, after all raw edits.
+    /// Valid UTF-8 (including a leading BOM) stays ordinary text; each invalid
+    /// source BYTE becomes one UTF8-labelled opaque atom. Logical byte length
+    /// and all historical coordinates stay unchanged. No root is published
+    /// until commit. Typed/decoded input refuses rather than losing provenance.
+    /// Invoke before registering the first typed capsule's origins.
+    pub fn promote_raw_v1(&mut self, mut cancelled: impl FnMut() -> bool) -> io::Result<()> {
+        let result = (|| {
+            self.ready()?;
+            poll(&mut cancelled)?;
+            if self.fragment.is_some() {
+                return Err(invalid("raw-v1 promotion requires a complete prefix"));
+            }
+            if !self.assembler.origins.is_empty() {
+                return Err(invalid("raw-v1 promotion refuses decoded origins"));
+            }
+            // Three fixed packing Vecs, the bounded opaque-only flush scratch,
+            // decoder/iterator state and source traversal coexist with source
+            // and target. Source construction remains charged in self.usage.
+            let scratch = 4 * piece_tree::ADD_BLOCK + 1024;
+            let mut usage = self.reserve(0, 0, sum(&[scratch, tree_work(&self.root)?])?)?;
+            let limits = self.assembler.limits;
+            let root = self.assembler.buffer.recovery_promote_raw_v1(
+                &self.root,
+                &mut |blocks, target| {
+                    usage = usage.admit(
+                        limits,
+                        RecoveryUsage {
+                            records: 1,
+                            pieces: 1,
+                            blocks,
+                            metadata_bytes: sum(&[block_work(blocks)?, tree_work(target)?])?,
+                        },
+                    )?;
+                    Ok(())
+                },
+                &mut || poll(&mut cancelled),
+            )?;
+            poll(&mut cancelled)?;
+            self.root = root;
+            self.usage = usage;
+            Ok(())
+        })();
+        self.checked(result)
+    }
+
     /// Check a fresh origin's conservative index/path charge BEFORE its raw
     /// input is read or private files are created. This allocates nothing and
     /// does not publish an ID or charge twice. The worker must register the
@@ -919,5 +965,223 @@ mod tests {
             matches!(assembler.finish(|| { polls += 1; polls == 2 }), Err(error) if error.kind() == io::ErrorKind::Interrupted)
         );
         drop(empty);
+    }
+    fn opaque_bytes(snapshot: &Snapshot) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for chunk in snapshot.source_chunks(0..snapshot.len()).unwrap() {
+            match chunk.unwrap() {
+                SourceChunk::Opaque { encoding, bytes, raw_bytes, raw_offsets } => {
+                    assert_eq!(encoding, Encoding::UTF8);
+                    assert_eq!(bytes.len(), raw_bytes.len(), "one opaque atom per source byte");
+                    assert_eq!(raw_offsets.len(), (bytes.len() + 1) * 4);
+                    for adjacent in raw_offsets.as_chunks::<4>().0.windows(2) {
+                        assert_eq!(u32::from_le_bytes(adjacent[1]) - u32::from_le_bytes(adjacent[0]), 1);
+                    }
+                    raw.extend_from_slice(raw_bytes);
+                }
+                SourceChunk::Added(_) => {}
+                _ => panic!("promotion must produce detached text/opaque blocks"),
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn recovery_raw_v1_malformed_bytes_bom_and_zero_add_cap_are_exact() {
+        for raw in [b"\xff".as_slice(), b"\xc2\xc2", b"\xf0\x90", b"\xef\xbb\xbftext"] {
+            let mut config = limits();
+            config.add_memory_bytes = 0;
+            let mut assembler = RecoveryAssembler::new(config).unwrap();
+            literal(&mut assembler, 0..0, raw);
+            let before = assembler.snapshot();
+            let mut revision = assembler.begin_revision();
+            revision.promote_raw_v1(|| false).unwrap();
+            assert_eq!(bytes(&revision.assembler.snapshot()), raw, "uncommitted source stays published");
+            let staged = Buffer::recovery_snapshot(revision.root.clone());
+            assert_eq!(staged.len(), raw.len() as u64);
+            assert_eq!(save(&staged, Encoding::UTF8, false), raw);
+            if raw == b"\xef\xbb\xbftext" {
+                assert!(opaque_bytes(&staged).is_empty());
+                assert_eq!(bytes(&staged), raw, "BOM is ordinary data");
+            } else {
+                assert_eq!(opaque_bytes(&staged), raw);
+            }
+            revision.commit(|| false).unwrap();
+            assert_eq!(bytes(&before), raw);
+            let mut buffer = assembler.finish(|| false).unwrap();
+            assert_eq!(buffer.add_memory_bytes(), 0);
+            assert_eq!(buffer.history_depth(), (0, 0));
+            buffer.insert(buffer.len(), b"!").unwrap();
+            assert!(buffer.undo());
+            assert_eq!(save(&buffer.snapshot(), Encoding::UTF8, false), raw);
+            assert!(buffer.redo());
+            let mut edited = raw.to_vec();
+            edited.push(b'!');
+            assert_eq!(save(&buffer.snapshot(), Encoding::UTF8, false), edited);
+        }
+    }
+
+    #[test]
+    fn recovery_raw_v1_alternating_atoms_pack_before_block_creation() {
+        let raw = [b'A', 0xff].repeat(8192);
+        let mut config = limits();
+        config.add_memory_bytes = 0;
+        let mut assembler = RecoveryAssembler::new(config).unwrap();
+        literal(&mut assembler, 0..0, &raw);
+        let before = assembler.usage();
+        let mut revision = assembler.begin_revision();
+        revision.promote_raw_v1(|| false).unwrap();
+        revision.commit(|| false).unwrap();
+        let promoted = assembler.snapshot();
+        assert_eq!(promoted.len(), raw.len() as u64);
+        assert_eq!(save(&promoted, Encoding::UTF8, false), raw);
+        assert_eq!(opaque_bytes(&promoted), vec![0xff; 8192]);
+        assert!(promoted.storage_resources().blocks <= 6, "bounded mixed packing");
+        assert_eq!(promoted.storage_resources().spilled_blocks, promoted.storage_resources().blocks);
+        assert!(assembler.usage().blocks - before.blocks <= 6);
+    }
+
+    #[test]
+    fn recovery_raw_v1_final_prefix_can_split_and_join_utf8_before_promotion() {
+        let mut assembler = RecoveryAssembler::new(limits()).unwrap();
+        literal(&mut assembler, 0..0, b"\xe2\xac"); // Historical incomplete scalar.
+        literal(&mut assembler, 1..1, b"\x82"); // Join through another Added piece.
+        literal(&mut assembler, 3..3, b"\xc2\xa2");
+        literal(&mut assembler, 4..5, b""); // Split the final scalar through a raw edit.
+        let mut revision = assembler.begin_revision();
+        revision.promote_raw_v1(|| false).unwrap();
+        revision.commit(|| false).unwrap();
+        assert_eq!(bytes(&assembler.snapshot()), b"\xe2\x82\xac\xff");
+        assert_eq!(opaque_bytes(&assembler.snapshot()), b"\xc2");
+        assert_eq!(save(&assembler.snapshot(), Encoding::UTF8, false), b"\xe2\x82\xac\xc2");
+    }
+
+    #[test]
+    fn recovery_raw_v1_utf8_survives_all_streamblock_scalar_splits() {
+        for scalar in ["¢", "€", "𐀀"] {
+            for tail in 1..scalar.len() {
+                let mut raw = vec![b'a'; piece_tree::ADD_BLOCK - tail];
+                raw.extend_from_slice(scalar.as_bytes());
+                raw.extend_from_slice(b"z");
+                let mut assembler = RecoveryAssembler::new(limits()).unwrap();
+                let mut revision = assembler.begin_revision();
+                revision.begin_fragment().unwrap();
+                for chunk in raw.chunks(piece_tree::ADD_BLOCK) {
+                    revision.append_bytes(chunk, || false).unwrap();
+                }
+                revision.replace(0..0, || false).unwrap();
+                revision.promote_raw_v1(|| false).unwrap();
+                revision.commit(|| false).unwrap();
+                assert_eq!(bytes(&assembler.snapshot()), raw, "{scalar}, tail {tail}");
+                assert_eq!(save(&assembler.snapshot(), Encoding::UTF8, false), raw);
+                assert!(opaque_bytes(&assembler.snapshot()).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_raw_v1_caps_and_cancellation_poison_without_publication() {
+        let raw = [b'A', 0xff].repeat(8192);
+        for cap in ["records", "pieces", "blocks", "metadata"] {
+            let mut config = limits();
+            config.add_memory_bytes = 0;
+            let mut assembler = RecoveryAssembler::new(config).unwrap();
+            literal(&mut assembler, 0..0, &raw);
+            let accepted = assembler.usage();
+            match cap {
+                "records" => assembler.limits.max_records = accepted.records,
+                "pieces" => assembler.limits.max_pieces = accepted.pieces,
+                "blocks" => assembler.limits.max_blocks = accepted.blocks + 2,
+                "metadata" => assembler.limits.max_metadata_bytes = accepted.metadata_bytes,
+                _ => unreachable!(),
+            }
+            let mut revision = assembler.begin_revision();
+            let error = revision.promote_raw_v1(|| false).unwrap_err();
+            assert!(error.to_string().contains(cap), "{cap}: {error}");
+            assert!(revision.commit(|| false).is_err());
+            assert_eq!(assembler.usage(), accepted);
+            assert_eq!(bytes(&assembler.snapshot()), raw);
+        }
+        let mut assembler = RecoveryAssembler::new(limits()).unwrap();
+        literal(&mut assembler, 0..0, &raw);
+        let accepted = assembler.usage();
+        let mut polls = 0;
+        {
+            let mut revision = assembler.begin_revision();
+            revision
+                .promote_raw_v1(|| {
+                    polls += 1;
+                    false
+                })
+                .unwrap();
+            // Drop deliberately: the complete promoted target is still staged.
+        }
+        for stop in [1, polls / 2, polls] {
+            let mut seen = 0;
+            let mut revision = assembler.begin_revision();
+            assert_eq!(
+                revision
+                    .promote_raw_v1(|| {
+                        seen += 1;
+                        seen == stop
+                    })
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert!(revision.commit(|| false).is_err());
+            assert_eq!(assembler.usage(), accepted);
+            assert_eq!(bytes(&assembler.snapshot()), raw);
+        }
+        let mut revision = assembler.begin_revision();
+        revision.promote_raw_v1(|| false).unwrap();
+        assert_eq!(revision.commit(|| true).unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(assembler.usage(), accepted);
+        assert_eq!(bytes(&assembler.snapshot()), raw);
+        let mut revision = assembler.begin_revision();
+        revision.begin_fragment().unwrap();
+        revision.append_bytes(b"pending", || false).unwrap();
+        assert!(revision.promote_raw_v1(|| false).is_err());
+        assert!(revision.commit(|| false).is_err());
+        assert_eq!(assembler.usage(), accepted);
+        assert_eq!(bytes(&assembler.snapshot()), raw);
+    }
+
+    #[test]
+    fn recovery_raw_v1_rejects_typed_origins_and_rolls_back_pending_ids() {
+        let fixture = Fixture::new();
+        let empty = fixture.origin(b"\xef\xbb\xbf", Encoding::UTF8, 3);
+        let mut assembler = RecoveryAssembler::new(limits()).unwrap();
+        literal(&mut assembler, 0..0, b"\xff");
+        let accepted = assembler.usage();
+        {
+            let mut revision = assembler.begin_revision();
+            revision.register_origin(17, empty.clone(), || false).unwrap();
+            assert!(revision.promote_raw_v1(|| false).is_err(), "even empty decoded identities reject");
+            assert_eq!(revision.assembler.origin_count(), 0, "failure removes pending IDs immediately");
+            assert!(revision.commit(|| false).is_err());
+        }
+        assert_eq!(assembler.usage(), accepted);
+        assert_eq!(bytes(&assembler.snapshot()), b"\xff");
+        {
+            let mut revision = assembler.begin_revision();
+            revision.register_origin(17, empty.clone(), || false).unwrap();
+            revision.commit(|| false).unwrap(); // Rolled-back numeric ID is reusable.
+        }
+        drop(assembler);
+        drop(empty);
+
+        let mut assembler = RecoveryAssembler::new(limits()).unwrap();
+        let mut revision = assembler.begin_revision();
+        revision.begin_fragment().unwrap();
+        revision.append_opaque(Encoding::UTF8, b"\xff", &[0, 0, 0, 0, 1, 0, 0, 0], 1, || false).unwrap();
+        revision.replace(0..0, || false).unwrap();
+        revision.commit(|| false).unwrap();
+        let accepted = assembler.usage();
+        let mut revision = assembler.begin_revision();
+        assert!(revision.promote_raw_v1(|| false).is_err(), "typed opaque storage is never flattened");
+        assert!(revision.commit(|| false).is_err());
+        assert_eq!(assembler.usage(), accepted);
+        assert_eq!(save(&assembler.snapshot(), Encoding::UTF8, false), b"\xff");
     }
 }

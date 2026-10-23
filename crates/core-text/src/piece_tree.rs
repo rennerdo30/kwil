@@ -23,6 +23,9 @@ pub(crate) type OriginalUses = BTreeMap<(u8, usize), (SourceRef, u64)>;
 mod spill_retirement;
 pub use spill_retirement::{SpillRetirement, SpillRetirementLimits, SpillRetirementReport};
 
+#[path = "legacy_raw.rs"]
+mod legacy_raw;
+
 #[derive(Clone)]
 pub(crate) enum SourceRef {
     Raw(crate::file::OriginalRef),
@@ -674,6 +677,8 @@ fn offset_at(offsets: &[u8], at: u64) -> usize {
 /// One bounded packing buffer across all short valid/opaque runs. Valid-only
 /// blocks can fill ADD_BLOCK; mixed blocks leave room for a u32 per logical
 /// byte plus the final endpoint. The table stays flat over valid UTF-8 bytes.
+type ImportAdmission<'a> = &'a mut dyn FnMut(usize, &Tree) -> io::Result<()>;
+
 struct ImportBuilder<'a> {
     encoding: Encoding,
     budget: &'a Arc<AddBudget>,
@@ -682,6 +687,7 @@ struct ImportBuilder<'a> {
     offsets: Vec<u8>,
     opaque_atoms: usize,
     tree: Tree,
+    admission: Option<ImportAdmission<'a>>,
 }
 impl<'a> ImportBuilder<'a> {
     fn new(encoding: Encoding, budget: &'a Arc<AddBudget>) -> Self {
@@ -693,11 +699,17 @@ impl<'a> ImportBuilder<'a> {
             offsets: Vec::with_capacity(ADD_BLOCK),
             opaque_atoms: 0,
             tree: None,
+            admission: None,
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         if self.logical.is_empty() {
             return Ok(());
+        }
+        // Recovery admits storage/path metadata and transient join paths
+        // before any payload allocation or private spill file is created.
+        if let Some(admit) = &mut self.admission {
+            admit(if self.raw.is_empty() { 1 } else { 3 }, &self.tree)?;
         }
         let block = if self.raw.is_empty() {
             added(&self.logical, self.budget)?
@@ -747,6 +759,61 @@ impl<'a> ImportBuilder<'a> {
         self.flush()?;
         Ok(self.tree)
     }
+}
+
+/// Ordinary raw-v1 storage only. Inspect provenance without allocating a
+/// descriptor vector or reading a source byte; empty decoded identities are
+/// checked separately by the recovery registry.
+fn validate_raw_v1(tree: &Tree, check: &mut impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    let Some(node) = tree else { return Ok(()) };
+    check()?;
+    match &node.kind {
+        Kind::Branch(left, right) => {
+            validate_raw_v1(&Some(left.clone()), check)?;
+            validate_raw_v1(&Some(right.clone()), check)
+        }
+        Kind::Leaf(piece) => match &*piece.storage {
+            Storage::Original(_) | Storage::Memory { .. } | Storage::Disk(_) => Ok(()),
+            Storage::Decoded(_) | Storage::Opaque { .. } => {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "raw-v1 promotion refuses typed or decoded storage"))
+            }
+        },
+    }
+}
+
+/// Caller has admitted fixed packing/traversal scratch while retaining the
+/// entire source. Each target flush is admitted before growth/file creation.
+pub(crate) fn recovery_promote_raw_v1(
+    source: &Tree,
+    budget: &Arc<AddBudget>,
+    admission: &mut dyn FnMut(usize, &Tree) -> io::Result<()>,
+    check: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<Tree> {
+    validate_raw_v1(source, check)?;
+    check()?;
+    let mut builder = ImportBuilder::new(Encoding::UTF8, budget);
+    builder.admission = Some(admission);
+    let mut decoder = legacy_raw::RawUtf8::default();
+    let len = source.as_ref().map_or(0, |node| node.metrics.bytes);
+    for chunk in Chunks::new(source, 0..len) {
+        let chunk = chunk.map_err(io::Error::other)?;
+        for bytes in chunk.chunks(ADD_BLOCK) {
+            check()?;
+            decoder.feed(bytes, &mut |span| match span {
+                legacy_raw::Span::Text(bytes) => builder.text(bytes),
+                legacy_raw::Span::Opaque(byte) => builder.opaque(&[byte]),
+            })?;
+        }
+    }
+    check()?;
+    decoder.finish(&mut |span| match span {
+        legacy_raw::Span::Text(bytes) => builder.text(bytes),
+        legacy_raw::Span::Opaque(byte) => builder.opaque(&[byte]),
+    })?;
+    check()?;
+    let result = builder.finish()?;
+    check()?;
+    Ok(result)
 }
 
 fn import_atoms<'a>(
