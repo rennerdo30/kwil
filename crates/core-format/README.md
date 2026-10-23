@@ -82,6 +82,11 @@ input ceiling; a lower output limit is checked after its serialization.
   literal delimiters/escapes require an explicit dialect. This includes Oracle
   alternative quoting; an ordinary quoted-string scanner must not guess its end.
   A configured external formatter can handle that dialect explicitly.
+  A code-level `--` also requires a following ASCII whitespace/control byte;
+  otherwise MySQL can parse minus operators where another dialect hides the
+  rest of the line. The whole request is refused before any quote can be hidden.
+  `--` inside an already-proven string, identifier, dollar quote or block comment
+  stays literal data. Without a following byte, the boundary is unproven too.
   Backslashes inside SQL quoted tokens are refused too: standard-conforming and
   escape-enabled dialects disagree on which quote ends the token. Dollar-quoted
   spans retain their known delimiters and are not subject to this ambiguity.
@@ -109,6 +114,9 @@ input ceiling; a lower output limit is checked after its serialization.
   delimiter. Code before that suffix can still be tidied. PHP inline HTML and
   attributes and Ruby trailing data are protected. PHP heredoc spans stop at the
   closing label, so following expression literals are tokenized normally.
+  PHP's `__halt_compiler` introducer is ASCII-case-insensitive; every case
+  protects its trailing data through EOF. Text inside an already-proven string
+  or comment does not activate that halt boundary, and ordinary code still tidies.
   Heredoc body scanning requires a proven simple header made only of heredoc
   operators, simple delimiter words (optionally quoted) and spaces/tabs. Any
   other header token protects the suffix through EOF: a physical LF inside a
@@ -210,6 +218,12 @@ SQL literal/comment control must pass. It restores sources in `finally` too.
 comment-splice regressions to fail on unchanged `4540af2`, then restores sources.
 `verify-round6-fail-first.ps1` requires all four exact source-derived R6 review
 fixtures to fail on unchanged `72f87e0`, then restores all three source files.
+`verify-round7-fail-first.ps1 -Case Base` requires all four R7 tests to fail on
+unchanged `c8a173e`; `-Case Sql` and `-Case Php` select independent compiling
+guard faults and require the corresponding two tests to fail. Each invocation
+must fit the parent's finite grant. It restores exact source bytes/SHA/mtime,
+then logs an explicit timestamp advance for only those restored source files so
+the next positive run rebuilds repaired source without reusing a mutant binary.
 
 All harnesses require a direct parent Cargo grant and no concurrent reader of
 this package. `verify-support.ps1` uses the configured shared cache without

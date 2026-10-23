@@ -664,6 +664,18 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
         }
         let comment = text[i..].starts_with("/*");
         let line_comment = sql && text[i..].starts_with("--");
+        // MySQL requires whitespace/control after --; otherwise these can be
+        // minus operators, exposing quotes that other dialects hide in a comment.
+        // Admit only the shared lexical boundary without a selected SQL dialect.
+        let ambiguous_line_comment =
+            line_comment && b.get(i + 2).is_none_or(|c| !c.is_ascii_whitespace() && !c.is_ascii_control());
+        if ambiguous_line_comment {
+            return Err(FormatError::new(
+                "SQL",
+                "ambiguous '--' comment boundary requires an explicit dialect; configure an external formatter",
+                line_at(b, i),
+            ));
+        }
         let bracket = sql && b[i] == b'[';
         let dollar = if sql && b[i] == b'$' {
             text[i + 1..]

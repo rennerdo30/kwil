@@ -412,7 +412,14 @@ impl Iterator for Scanner<'_> {
             } else if k == Kind::Ruby && line_start && (rest.starts_with("=begin") || rest.starts_with("__END__")) {
                 // Embedded documentation and Ruby's trailing data section.
                 self.uncertain()
-            } else if k == Kind::Php && (rest.starts_with("?>") || rest.starts_with("__halt_compiler")) {
+            } else if k == Kind::Php
+                && (rest.starts_with("?>")
+                    || rest
+                        .get(.."__halt_compiler".len())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("__halt_compiler")))
+            {
+                // PHP keywords are ASCII case-insensitive. Any halt spelling
+                // ends proven code context; its following data is opaque to tidy.
                 self.uncertain() // Inline HTML/data is literal output.
             } else if k == Kind::Rust && (rest.starts_with("r\"") || rest.starts_with("r#")) {
                 let hashes = b[start + 1..].iter().take_while(|&&c| c == b'#').count();

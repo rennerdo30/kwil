@@ -296,3 +296,29 @@ cannot count as proof. Native/platform/performance acceptance stays with ROOT.
 
 Evidence root: `E:/AgentData/scratch/kwil-v1-wave-formatter-cb48f62`.
 Cargo/test/Clippy validation remains on HOLD until a separate direct ROOT grant.
+
+## R7 source candidate after independent review (2026-10-23)
+
+Pinned review/source baseline: `c8a173e0cbdaea5c87aed18c898c23e3bb8edb49`.
+The independent review found two inherited P1 violations in the cumulative
+backend: unconditional SQL `--` comment recognition can hide a real string
+opener under MySQL rules, and PHP mixed-case `__HALT_COMPILER` can expose opaque
+data to trimming and final-newline insertion. Both block production integration.
+
+The R7 candidate fixes the lexical admission contract. Code-level SQL `--`
+requires a following ASCII whitespace/control byte or refuses the entire request
+with a dialect/external-formatter error. Already-proven quoted/comment spans
+remain atomic. PHP halt introducers match ASCII-case-insensitively and protect
+their opaque suffix through EOF. No public API, dependency, manifest or ceiling
+changes. The complete R0-R7 protection matrix is in FAILURE-MATRIX.md; earlier
+62 tests, including four exact R6 fixtures and both selection guards, are unchanged.
+
+Four new tests include both exact counterexamples, comment/literal/line-ending
+and PHP-case variants, plus benign SQL/CSS/PHP controls that must still format.
+`verify-round7-fail-first.ps1` prepares one historical c8a173e source-copy witness
+and separate compiling SQL/PHP guard faults, with exact restoration and an
+explicit restored-source timestamp advance to prevent stale mutant reuse.
+
+Evidence: `E:/AgentData/scratch/kwil-v1-wave-formatter-r7-c8a173e`.
+Source preparation only; Cargo/tests/Clippy and behavioral fail-first execution
+have NOT RUN for this R7 candidate. A finite ROOT grant is required first.
