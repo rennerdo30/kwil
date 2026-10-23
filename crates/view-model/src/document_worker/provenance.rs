@@ -50,6 +50,7 @@
 //! fails after enqueue, stop and clear/reload just as for a journal failure.
 
 use kwil_core_text::{Snapshot, SourceChunk, decoded_backing::DecodedSnapshot, encoding::Encoding};
+pub mod decode;
 use std::{
     io::{self, Read},
     mem::size_of,
