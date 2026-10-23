@@ -188,7 +188,7 @@ fn registration_preview_skip_and_default_do_not_mutate() {
 }
 
 #[test]
-fn registration_adopted_all240_is_one_reviewed_transaction_and_restores_exact_original() {
+fn registration_adopted_all_offered_is_one_reviewed_transaction_and_restores_exact_original() {
     let _admission_case = registration_admission_case();
     let mut h = Harness::new();
     h.session().state_mut().context.limits = RegistrationLimits::RootAdopted256;
@@ -196,11 +196,13 @@ fn registration_adopted_all240_is_one_reviewed_transaction_and_restores_exact_or
     let original = StoredValue { kind: 42, bytes: vec![255, 0, 17, 0] };
     h.fake.lock().unwrap().values.push((location.clone(), original.clone()));
     *h.session().selection_mut() = Selection::new(Preset::AllTextTypes);
-    assert_eq!(h.session().selection().extensions().len(), 240);
+    let offered = kwil_core_commands::file_types::catalog().len();
+    assert!(offered > 128);
+    assert_eq!(h.session().selection().extensions().len(), offered);
     h.session().preview().unwrap();
     h.event();
     let review = h.session().reviewed_preview().unwrap();
-    assert_eq!(review.extensions.len(), 240);
+    assert_eq!(review.extensions.len(), offered);
     let token = review.review.clone();
     assert_eq!(h.fake.lock().unwrap().writes, 0);
     h.session().register_selected(token, None).unwrap();
@@ -209,7 +211,7 @@ fn registration_adopted_all240_is_one_reviewed_transaction_and_restores_exact_or
         RegistrationStatus::Applied { journal_id } => *journal_id,
         other => panic!("{other:?}"),
     };
-    assert_eq!(h.fake.lock().unwrap().values.len(), 720);
+    assert_eq!(h.fake.lock().unwrap().values.len(), offered * 3);
     assert_eq!(
         fs::read_dir(&h.journal)
             .unwrap()
@@ -338,7 +340,8 @@ fn registration_base_capacity_and_unknown_mime_are_explicit_gates() {
     *h.session().selection_mut() = Selection::new(Preset::AllTextTypes);
     assert!(matches!(
         h.session().preview().unwrap_err().kind,
-        ActionErrorKind::UnadoptedCapacity { selected: 240, limit: 128 }
+        ActionErrorKind::UnadoptedCapacity { selected, limit: 128 }
+            if selected == kwil_core_commands::file_types::catalog().len()
     ));
     *h.session().selection_mut() = Selection::new(Preset::PlainTextOnly);
     h.session().state_mut().context.platform =

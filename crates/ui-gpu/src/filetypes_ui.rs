@@ -84,6 +84,8 @@ fn error_text(error: &ActionError) -> String {
         ActionErrorKind::StaleReview => "The selection changed after the review; review again.".into(),
         ActionErrorKind::StaleCurrentFile => "The current file changed; review again.".into(),
         ActionErrorKind::InvalidNativePath => "Kwil's own path cannot be registered.".into(),
+        ActionErrorKind::Extension(kwil_core_commands::file_types::ExtensionError::UnsafeAssociation) =>
+            "Executable scripts, system-managed types and non-text formats cannot be registered. You can still edit them in Kwil.".into(),
         ActionErrorKind::Extension(_) => "Use letters, digits, _, - or + (up to 64), like “log” or “.cfg”.".into(),
         ActionErrorKind::Exhausted => "The registration journal is full; see the settings documentation.".into(),
     }

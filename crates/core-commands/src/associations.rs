@@ -326,6 +326,17 @@ pub fn plan(
     if !worker::bounded_request(request) {
         return Err(err("association request exceeds bounds"));
     }
+    // Validate the whole batch before acquiring native state or constructing a plan.
+    // Existing receipts still remain readable/undoable for recovery.
+    for file_type in &request.types {
+        let extension =
+            crate::settings_ui::normalize_extension(&file_type.extension).map_err(|e| err(e.to_string()))?;
+        if !crate::file_types::registration_allowed(&extension) {
+            return Err(err(format!(
+                ".{extension} has executable, system-managed or non-text semantics; registration refused"
+            )));
+        }
+    }
     let admission = Admission::acquire(WORKSPACE_BYTES)?;
     let mut values = ValueBudget::new(worker::MAX_RECORD_BYTES);
     let executable = request.executable.to_str().ok_or_else(|| err("executable must be Unicode"))?;

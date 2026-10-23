@@ -4,7 +4,141 @@ use std::path::Path;
 
 pub const MAX_SELECTED_EXTENSIONS: usize = 256;
 pub const MAX_EXTENSION_BYTES: usize = 64;
-pub const ALL_SCOPE: &str = "All text types means every extension in Kwil's offered catalog. Custom extensions can be added individually. It does not mean every possible text extension.";
+/// Text editing support does not imply safe shell-association registration.
+/// These retain execution, package, OS-integration or non-text semantics.
+pub const UNSAFE_REGISTRATION_EXTENSIONS: &[&str] = &[
+    "bat",
+    "cmd",
+    "com",
+    "exe",
+    "scr",
+    "pif",
+    "lnk",
+    "url",
+    "scf",
+    "cpl",
+    "dll",
+    "sys",
+    "msi",
+    "msp",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "app",
+    "pkg",
+    "dmg",
+    "deb",
+    "rpm",
+    "run",
+    "reg",
+    "inf",
+    "ins",
+    "isp",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "mjs",
+    "cjs",
+    "jsx",
+    "wsf",
+    "wsh",
+    "hta",
+    "ps1",
+    "psm1",
+    "psd1",
+    "ps1xml",
+    "psc1",
+    "pssc",
+    "psrc",
+    "workflow",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ksh",
+    "csh",
+    "tcsh",
+    "command",
+    "applescript",
+    "scpt",
+    "scptd",
+    "action",
+    "py",
+    "pyw",
+    "rb",
+    "rake",
+    "gemspec",
+    "pl",
+    "pm",
+    "lua",
+    "awk",
+    "sed",
+    "tcl",
+    "r",
+    "jl",
+    "m",
+    "php",
+    "groovy",
+    "kts",
+    "exs",
+    "fsx",
+    "csx",
+    "fsi",
+    "clj",
+    "cljs",
+    "lisp",
+    "cl",
+    "scm",
+    "rkt",
+    "desktop",
+    "service",
+    "socket",
+    "timer",
+    "target",
+    "mount",
+    "rules",
+    "ics",
+    "svg",
+    "plist",
+    "nsi",
+    "iss",
+    "zip",
+    "gz",
+    "bz2",
+    "xz",
+    "zst",
+    "7z",
+    "rar",
+    "tar",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "ico",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+    "class",
+    "jar",
+    "wasm",
+    "mp3",
+    "mp4",
+    "wav",
+    "avi",
+];
+
+pub fn registration_allowed(extension: &str) -> bool {
+    let extension = extension.strip_prefix('.').unwrap_or(extension);
+    !UNSAFE_REGISTRATION_EXTENSIONS.iter().any(|denied| extension.eq_ignore_ascii_case(denied))
+}
+pub const ALL_SCOPE: &str = "All text types means the safe text/source/data catalog. Executable scripts, system-managed types and non-text formats are excluded from registration, including custom entries. They can still be opened for editing.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -51,16 +185,16 @@ entries! {
     Markup, true => ["md", "markdown", "rst"];
     Markup, false => ["mdown", "mkd", "mdx", "rmd", "qmd", "adoc", "asciidoc", "org", "tex", "bib", "sty", "cls", "pod"];
     Data, true => ["json", "jsonl", "ndjson", "xml", "csv", "tsv"];
-    Data, false => ["jsonc", "json5", "geojson", "graphql", "gql", "xsd", "xsl", "xslt", "dtd", "rss", "atom", "svg", "plist", "srt", "vtt", "ics", "ttl", "proto", "thrift", "avsc"];
+    Data, false => ["jsonc", "json5", "geojson", "graphql", "gql", "xsd", "xsl", "xslt", "dtd", "rss", "atom", "srt", "vtt", "ttl", "proto", "thrift", "avsc"];
     Configuration, true => ["toml", "yaml", "yml", "ini", "cfg", "conf", "properties", "env", "editorconfig"];
-    Configuration, false => ["config", "reg", "desktop", "service", "socket", "timer", "target", "mount", "rules", "gitignore", "gitattributes", "gitmodules", "npmrc", "dockerignore", "hcl", "tf", "tfvars", "nix", "ron", "kdl"];
+    Configuration, false => ["config", "gitignore", "gitattributes", "gitmodules", "npmrc", "dockerignore", "hcl", "tf", "tfvars", "nix", "ron", "kdl"];
     Systems, false => ["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "inl", "ipp", "tpp", "c++", "h++", "rs", "go", "zig", "d", "asm", "s", "inc", "f", "for", "f90", "f95", "f03", "f08", "ada", "adb", "ads", "pas", "pp", "vala"];
-    Managed, false => ["java", "cs", "csx", "fs", "fsi", "fsx", "vb", "vbs", "kt", "kts", "scala", "groovy", "swift", "dart", "clj", "cljs", "cljc", "edn", "ex", "exs", "erl", "hrl", "hs", "ml", "mli", "lisp", "cl", "scm", "rkt", "elm", "purs"];
-    Scripts, true => ["py", "sh", "ps1", "sql"];
-    Scripts, false => ["pyi", "pyw", "rb", "rake", "gemspec", "pl", "pm", "lua", "bash", "zsh", "fish", "ksh", "csh", "tcsh", "psm1", "psd1", "bat", "cmd", "awk", "sed", "tcl", "r", "jl", "m", "php"];
-    Web, true => ["html", "css", "js", "ts"];
-    Web, false => ["htm", "xhtml", "scss", "sass", "less", "jsx", "tsx", "mjs", "cjs", "vue", "svelte", "astro", "ejs", "erb", "hbs", "handlebars", "mustache", "pug", "liquid", "jinja", "jinja2", "j2", "twig", "jsp", "aspx", "razor", "cshtml"];
-    Build, false => ["mk", "mak", "cmake", "ninja", "gradle", "sbt", "bazel", "bzl", "gyp", "pro", "props", "targets", "csproj", "fsproj", "vbproj", "vcxproj", "sln", "slnx", "nuspec", "wxs", "wxi", "iss", "nsi", "dockerfile", "just"];
+    Managed, false => ["java", "cs", "fs", "vb", "kt", "scala", "swift", "dart", "cljc", "edn", "ex", "erl", "hrl", "hs", "ml", "mli", "elm", "purs"];
+    Scripts, true => ["sql"];
+    Scripts, false => ["pyi"];
+    Web, true => ["html", "css", "ts"];
+    Web, false => ["htm", "xhtml", "scss", "sass", "less", "tsx", "vue", "svelte", "astro", "ejs", "erb", "hbs", "handlebars", "mustache", "pug", "liquid", "jinja", "jinja2", "j2", "twig", "jsp", "aspx", "razor", "cshtml"];
+    Build, false => ["mk", "mak", "cmake", "ninja", "gradle", "sbt", "bazel", "bzl", "gyp", "pro", "props", "targets", "csproj", "fsproj", "vbproj", "vcxproj", "sln", "slnx", "nuspec", "wxs", "wxi", "dockerfile", "just"];
     Scientific, false => ["ipynb", "stan", "typ", "lean", "agda", "coq", "vhdl", "vhd", "sv", "svh", "glsl", "vert", "frag", "hlsl", "wgsl"];
 }
 
@@ -93,6 +227,7 @@ pub struct Extension(String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtensionError {
     Invalid,
+    UnsafeAssociation,
     TooMany,
     NonUnicode,
     NoExtension,
@@ -164,6 +299,9 @@ impl Selection {
         self.extensions.binary_search(extension).is_ok()
     }
     pub fn toggle(&mut self, extension: Extension, selected: bool) -> Result<(), ExtensionError> {
+        if selected && !registration_allowed(extension.as_str()) {
+            return Err(ExtensionError::UnsafeAssociation);
+        }
         match (self.extensions.binary_search(&extension), selected) {
             (Err(index), true) => {
                 if self.extensions.len() == MAX_SELECTED_EXTENSIONS {

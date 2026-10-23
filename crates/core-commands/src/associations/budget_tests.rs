@@ -2,18 +2,12 @@
 //! integration/review; no registry or desktop databases are accessed.
 use super::*;
 
-// Exact offered catalog from frozen R1 file_types.rs, SHA256
-// 5556F8D159B99F9F52BBD42CA6577BC1287560605C6F51738F77B80DA8B08C8F.
-const ALL240: &str = "txt text log asc nfo todo md markdown rst mdown mkd mdx rmd qmd adoc asciidoc org tex bib sty cls pod json jsonl ndjson xml csv tsv jsonc json5 geojson graphql gql xsd xsl xslt dtd rss atom svg plist srt vtt ics ttl proto thrift avsc toml yaml yml ini cfg conf properties env editorconfig config reg desktop service socket timer target mount rules gitignore gitattributes gitmodules npmrc dockerignore hcl tf tfvars nix ron kdl c cc cpp cxx h hh hpp hxx inl ipp tpp c++ h++ rs go zig d asm s inc f for f90 f95 f03 f08 ada adb ads pas pp vala java cs csx fs fsi fsx vb vbs kt kts scala groovy swift dart clj cljs cljc edn ex exs erl hrl hs ml mli lisp cl scm rkt elm purs py sh ps1 sql pyi pyw rb rake gemspec pl pm lua bash zsh fish ksh csh tcsh psm1 psd1 bat cmd awk sed tcl r jl m php html css js ts htm xhtml scss sass less jsx tsx mjs cjs vue svelte astro ejs erb hbs handlebars mustache pug liquid jinja jinja2 j2 twig jsp aspx razor cshtml mk mak cmake ninja gradle sbt bazel bzl gyp pro props targets csproj fsproj vbproj vcxproj sln slnx nuspec wxs wxi iss nsi dockerfile just ipynb stan typ lean agda coq vhdl vhd sv svh glsl vert frag hlsl wgsl";
-
+// Synthetic safe extensions retain the exact 240/256 capacity and restoration witnesses.
 pub(super) fn all240_request() -> AssociationRequest {
     AssociationRequest {
         platform: AssociationPlatform::Windows,
         executable: std::env::temp_dir().join("kwil-budget-fixture.exe"),
-        types: ALL240
-            .split_ascii_whitespace()
-            .map(|ext| FileType { extension: ext.into(), content_type: None })
-            .collect(),
+        types: (0..240).map(|n| FileType { extension: format!("safe_fixture{n}"), content_type: None }).collect(),
         default_choice: DefaultChoice::KeepCurrent,
     }
 }

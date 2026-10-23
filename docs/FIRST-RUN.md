@@ -2,7 +2,7 @@
 
 Kwil shows a short welcome explaining its editing benefits first, then the implementation behind them. Release builds remember completed setup in the selected settings profile. Debug builds show setup on every launch and never read or write that completion marker.
 
-The next screen offers 240 common text extensions, grouped by purpose. Choose Common, All text types, Plain text, or Custom; individual choices and additional extension text are editable. Selecting a preset does not change the operating system. Review changes, then choose Register selected, or Skip for now.
+The next screen offers a safe text/source/data extension catalog, grouped by purpose. Choose Common, All text types, Plain text, or Custom; individual choices and additional extension text are editable. Executable scripts, operating-system integration types, installers and known non-text formats are excluded, including custom entries. Editing those files remains supported without registering their associations. Selecting a preset does not change the operating system. Review changes, then choose Register selected, or Skip for now.
 
 On Windows this adds per-user Open with entries. It does not replace protected default-app choices; use Windows Default apps to change those. Registration is one bounded, journaled transaction, with an explicit Unregister operation that restores previous values when they have not been changed by another application. Existing conflicts or incomplete verification are reported without claiming that Kwil is the current default.
 

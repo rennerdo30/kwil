@@ -12,8 +12,8 @@ fn file_types_catalog_is_broad_unique_and_contains_owner_named_extensions() {
     assert_eq!(catalog().len(), all.extensions().len());
     for name in [
         "txt", "text", "log", "md", "markdown", "rst", "java", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx",
-        "json", "jsonl", "ndjson", "toml", "yaml", "yml", "xml", "html", "css", "js", "ts", "rs", "cs", "py", "sh",
-        "ps1", "sql", "ini", "cfg", "conf", "cmake", "mk", "gradle",
+        "json", "jsonl", "ndjson", "toml", "yaml", "yml", "xml", "html", "css", "ts", "rs", "cs", "pyi", "sql", "ini",
+        "cfg", "conf", "cmake", "mk", "gradle",
     ] {
         assert!(all.contains(&Extension::parse(name).unwrap()), "missing {name}");
     }
@@ -22,6 +22,50 @@ fn file_types_catalog_is_broad_unique_and_contains_owner_named_extensions() {
     }
     for group in groups() {
         assert!(catalog().iter().any(|entry| entry.group == *group));
+    }
+}
+#[test]
+fn file_types_scripts_system_types_and_binary_types_cannot_be_selected_or_planned() {
+    let _admission_case = crate::associations::test_admission_guard();
+    struct NoNativeAccess;
+    impl AssociationAdapter for NoNativeAccess {
+        fn owner(&self) -> String {
+            panic!("unsafe batch reached adapter ownership")
+        }
+        fn read(&mut self, _: &Location) -> Result<Option<StoredValue>, AssociationError> {
+            panic!("unsafe batch read native state")
+        }
+        fn read_bounded(
+            &mut self,
+            _: &Location,
+            _: &mut crate::associations::ValueBudget,
+        ) -> Result<Option<StoredValue>, AssociationError> {
+            panic!("unsafe batch read bounded native state")
+        }
+        fn write(&mut self, _: &Location, _: Option<&StoredValue>) -> Result<(), AssociationError> {
+            panic!("unsafe batch wrote native state")
+        }
+    }
+    for denied in UNSAFE_REGISTRATION_EXTENSIONS {
+        assert!(!catalog().iter().any(|entry| entry.extension.eq_ignore_ascii_case(denied)), "offered {denied}");
+        assert!(!registration_allowed(&denied.to_ascii_uppercase()));
+        let mut selection = Selection::new(Preset::PlainTextOnly);
+        let before = selection.clone();
+        assert_eq!(
+            selection.add_custom(&format!(".{}", denied.to_ascii_uppercase())),
+            Err(ExtensionError::UnsafeAssociation)
+        );
+        assert_eq!(selection, before);
+        let request = AssociationRequest {
+            platform: AssociationPlatform::Windows,
+            executable: std::env::temp_dir().join("kwil-refusal.exe"),
+            default_choice: DefaultChoice::KeepCurrent,
+            types: vec![
+                FileType { extension: "txt".into(), content_type: None },
+                FileType { extension: denied.to_ascii_uppercase(), content_type: None },
+            ],
+        };
+        assert!(associations::plan(&mut NoNativeAccess, &request).is_err(), "planned {denied}");
     }
 }
 #[test]
