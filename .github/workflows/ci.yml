@@ -66,7 +66,9 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 15
         shell: pwsh
-        run: ./crates/core-commands/scripts/check-association-unix-mutations.ps1
+        run: |
+          ./crates/core-commands/scripts/check-association-unix-mutations.ps1 -ProcessFixture
+          ./crates/core-commands/scripts/check-association-unix-mutations.ps1
       - name: Prove Unix save permissions reject broken preservation
         if: runner.os != 'Windows'
         shell: pwsh

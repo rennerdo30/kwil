@@ -1,9 +1,9 @@
 # Hosted Linux only. Never run against live association data: the selected Rust
 # test uses private fixtures and bounds/kills/reaps only its own subprocesses.
-param([string]$EvidenceRoot = [IO.Path]::GetTempPath())
+param([string]$EvidenceRoot = [IO.Path]::GetTempPath(), [switch]$ProcessFixture)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if (-not $IsLinux) { throw 'Association Unix mutation proof requires Linux; no Windows runtime inference.' }
+if (-not $IsLinux -and -not $ProcessFixture) { throw 'Association Unix mutation proof requires Linux; no Windows runtime inference.' }
 
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
 $sourcePath = Join-Path $repo 'crates/core-commands/src/associations.rs'
@@ -39,7 +39,93 @@ function Assert-Pins {
     }
 }
 
-function Invoke-RecordedProcess([string]$Executable, [string[]]$Arguments, [string]$Label) {
+if (-not ('AssociationBoundedProcessV2' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+public sealed class AssociationProcessReceipt {
+    public int Pid, Exit = -1;
+    public string Out = "", Err = "", Detail = "";
+    public bool ProcessTimeout, CaptureTimeout, RootReaped, CaptureComplete;
+    public bool CleanupComplete, ReadersDisposed, KillReturned, Complete;
+}
+public static class AssociationBoundedProcessV2 {
+    public static AssociationProcessReceipt Run(ProcessStartInfo info, int processMs, int captureMs, int cleanupMs) {
+        var r = new AssociationProcessReceipt();
+        var p = new Process { StartInfo = info };
+        var cancellation = new CancellationTokenSource();
+        Task<string[]> capture = null;
+        bool started = false;
+        try {
+            if (!p.Start()) throw new InvalidOperationException("Process start refused");
+            started = true;
+            r.Pid = p.Id;
+            capture = Task.WhenAll(p.StandardOutput.ReadToEndAsync(cancellation.Token), p.StandardError.ReadToEndAsync(cancellation.Token));
+            r.RootReaped = p.WaitForExit(processMs);
+            r.ProcessTimeout = !r.RootReaped;
+            if (r.RootReaped) {
+                r.Exit = p.ExitCode;
+                r.CaptureComplete = capture.Wait(captureMs);
+                r.CaptureTimeout = !r.CaptureComplete;
+                if (r.CaptureComplete) {
+                    // Result access only after bounded, successful completion.
+                    r.Out = capture.Result[0];
+                    r.Err = capture.Result[1];
+                }
+            }
+        } catch (Exception e) {
+            r.Detail = "process/capture failure: " + e.GetType().Name + ": " + e.Message;
+        } finally {
+            // Kill, reap, cancellation and reader disposal can themselves block.
+            // Isolate ALL of them in a background task; never synchronously
+            // dispose these readers/process on the restoration thread.
+            var cleanup = Task.Run(() => {
+                try {
+                    if (started && !r.RootReaped) {
+                        if (!p.HasExited) { p.Kill(true); r.KillReturned = true; }
+                        r.RootReaped = p.WaitForExit(Math.Min(1000, cleanupMs));
+                    }
+                    cancellation.Cancel();
+                    if (capture != null) {
+                        try { capture.Wait(Math.Min(1000, cleanupMs)); } catch (AggregateException) { }
+                    }
+                    if (started) {
+                        p.StandardOutput.Dispose();
+                        p.StandardError.Dispose();
+                        r.ReadersDisposed = true;
+                    }
+                    p.Dispose();
+                    cancellation.Dispose();
+                } catch (Exception e) {
+                    r.Detail += "; cleanup failure: " + e.GetType().Name + ": " + e.Message;
+                }
+            });
+            r.CleanupComplete = cleanup.Wait(cleanupMs);
+        }
+        // Root reaping never proves that an exited root's inherited-pipe holder
+        // was stopped. Do not discover/kill an unrelated process by name or PID.
+        if (r.CaptureTimeout) r.Detail += "; inherited output holder cleanup UNVERIFIED";
+        if (r.ProcessTimeout) r.Detail += "; process deadline exceeded; descendant cleanup UNVERIFIED";
+        if (!r.CleanupComplete) r.Detail += "; bounded cleanup expired; kill/reap/reader disposal UNVERIFIED";
+        r.Complete = r.RootReaped && r.CaptureComplete && r.CleanupComplete && r.ReadersDisposed &&
+            !r.ProcessTimeout && !r.CaptureTimeout && r.Detail.Length == 0;
+        return r;
+    }
+    public static bool StopKnown(Process p, int timeoutMs) {
+        var cleanup = Task.Run(() => {
+            try { if (!p.HasExited) p.Kill(true); return p.WaitForExit(timeoutMs); }
+            catch { return false; }
+        });
+        return cleanup.Wait(timeoutMs) && cleanup.Status == TaskStatus.RanToCompletion && cleanup.Result;
+    }
+}
+'@
+}
+$script:cleanupUnverified = $false
+function Invoke-RecordedProcess([string]$Executable, [string[]]$Arguments, [string]$Label,
+    [int]$ProcessMs = 170000, [int]$CaptureMs = 3000, [int]$CleanupMs = 5000, [switch]$InspectFailure) {
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $Executable
     $info.WorkingDirectory = $repo
@@ -48,34 +134,17 @@ function Invoke-RecordedProcess([string]$Executable, [string[]]$Arguments, [stri
     $info.RedirectStandardError = $true
     foreach ($argument in $Arguments) { $info.ArgumentList.Add($argument) }
     # Inherit target directory, RUSTC_WRAPPER/sccache and all existing CI env.
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $info
-    $started = $false
-    try {
-        if (-not $process.Start()) { throw "Cannot start $Executable" }
-        $started = $true
-        $ownPid = $process.Id
-        "label=$Label pid=$ownPid timeout=180s" | Add-Content -LiteralPath (Join-Path $proof 'pids.log')
-        if ($Label -ne 'git-head') { Write-Host "START $Label PID=$ownPid timeout=180s" }
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(180000)) {
-            $process.Kill($true)
-            $process.WaitForExit()
-            throw "$Label exceeded 180s; only its own process tree was stopped"
-        }
-        $result = [pscustomobject]@{ Exit=$process.ExitCode; Out=$stdout.GetAwaiter().GetResult(); Err=$stderr.GetAwaiter().GetResult(); Pid=$ownPid }
-        "label=$Label pid=$ownPid exit=$($result.Exit)" | Add-Content -LiteralPath (Join-Path $proof 'pids.log')
-        return $result
-    } finally {
-        # Also reap on an exception during capture/validation. Never select by name.
-        if ($started -and -not $process.HasExited) {
-            $process.Kill($true)
-            $process.WaitForExit()
-            "label=$Label pid=$($process.Id) stopped-and-reaped" | Add-Content -LiteralPath (Join-Path $proof 'pids.log')
-        }
-        $process.Dispose()
+    # Default stages total <=178s. In particular there is no parameterless
+    # WaitForExit or unbounded GetResult after the root exits or is killed.
+    $result = [AssociationBoundedProcessV2]::Run($info, $ProcessMs, $CaptureMs, $CleanupMs)
+    "label=$Label pid=$($result.Pid) exit=$($result.Exit) process_ms=$ProcessMs capture_ms=$CaptureMs cleanup_ms=$CleanupMs root_reaped=$($result.RootReaped) capture_complete=$($result.CaptureComplete) cleanup_complete=$($result.CleanupComplete) readers_disposed=$($result.ReadersDisposed) detail=$($result.Detail)" |
+        Add-Content -LiteralPath (Join-Path $proof 'pids.log')
+    $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $proof "$Label.process.json")
+    if (-not $result.Complete) {
+        $script:cleanupUnverified = $true
+        if (-not $InspectFailure) { throw "$Label failed closed: $($result.Detail); PID=$($result.Pid); see $Label.process.json" }
     }
+    return $result
 }
 
 $git = Invoke-RecordedProcess 'git' @('rev-parse', 'HEAD') 'git-head'
@@ -91,7 +160,7 @@ Write-Host $header
 [ordered]@{ commit=$head; source=$originalHash; worker=$workerHash; manifests=$pins; excluded=$excluded } |
     ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $proof 'inputs.json')
 
-function Invoke-Phase([string]$Label, [byte[]]$Bytes, [string]$ExpectedChild = '') {
+function Invoke-Phase([string]$Label, [byte[]]$Bytes, [string]$ExpectedChild = '', [scriptblock]$ProcessAction = $null) {
     Assert-Pins
     if ((Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash -ne $originalHash) { throw 'Source is not the original before phase' }
     # A unique comment changes compiler inputs without changing original behavior,
@@ -106,7 +175,9 @@ function Invoke-Phase([string]$Label, [byte[]]$Bytes, [string]$ExpectedChild = '
     try {
         [IO.File]::WriteAllBytes($sourcePath, $phaseBytes)
         $start = [DateTime]::UtcNow
-        $result = Invoke-RecordedProcess 'cargo' @('test', '--offline', '--locked', '-j', '4', '-p', 'kwil-core-commands', '--lib', $test, '--message-format=json', '-v', '--', '--exact', '--nocapture', '--test-threads=1') $Label
+        $result = if ($ProcessAction) { & $ProcessAction $Label } else {
+            Invoke-RecordedProcess 'cargo' @('test', '--offline', '--locked', '-j', '4', '-p', 'kwil-core-commands', '--lib', $test, '--message-format=json', '-v', '--', '--exact', '--nocapture', '--test-threads=1') $Label
+        }
         $result.Err, $result.Out | Add-Content -LiteralPath $log
         # Strip only ANSI escapes for matching; retain the original log bytes/text.
         $text = [regex]::Replace(($result.Err + "`n" + $result.Out), "`e\[[0-9;]*m", '')
@@ -151,6 +222,63 @@ function Invoke-Phase([string]$Label, [byte[]]$Bytes, [string]$ExpectedChild = '
     }
 }
 
+if ($ProcessFixture) {
+    # Portable process-only fixture. The REAL phase finally is exercised against
+    # a disposable marker; neither Rust file is ever changed and Cargo is not run.
+    $pwsh = (Get-Process -Id $PID).Path
+    $normal = Invoke-RecordedProcess $pwsh @('-NoProfile', '-Command', '[Console]::Write("captured"); [Console]::Error.Write("stderr"); exit 0') 'fixture-normal' 5000 500 1500
+    if ($normal.Out -ne 'captured' -or $normal.Err -ne 'stderr' -or -not $normal.Complete) { throw 'Normal process capture fixture failed' }
+    $slow = Invoke-RecordedProcess $pwsh @('-NoProfile', '-Command', 'Start-Sleep -Seconds 20') 'fixture-process-timeout' 800 300 1500 -InspectFailure
+    if (-not $slow.ProcessTimeout -or -not $slow.RootReaped -or -not $slow.CleanupComplete) { throw 'Bounded kill/reap fixture failed' }
+    $script:cleanupUnverified = $false
+    $sourcePath = Join-Path $proof 'restore-marker.bin'
+    $original = [Text.Encoding]::UTF8.GetBytes("original fixture marker`n")
+    [IO.File]::WriteAllBytes($sourcePath, $original)
+    $originalHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
+    $holderReceipt = Join-Path $proof 'known-holder.json'
+    $parent = Join-Path $proof 'pipe-parent.ps1'
+    @'
+param([string]$Receipt)
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = (Get-Process -Id $PID).Path
+$info.UseShellExecute = $false
+foreach ($arg in @('-NoProfile', '-Command', 'Start-Sleep -Seconds 20')) { $info.ArgumentList.Add($arg) }
+# Inherit BOTH redirected output handles, then let this root exit first.
+$holder = [Diagnostics.Process]::Start($info)
+@{ pid=$holder.Id; startTicks=$holder.StartTime.ToUniversalTime().Ticks.ToString() } | ConvertTo-Json | Set-Content -LiteralPath $Receipt
+exit 0
+'@ | Set-Content -LiteralPath $parent
+    $caught = $null
+    try {
+        try {
+            $null = Invoke-Phase 'fixture-inherited-pipe' ([Text.Encoding]::UTF8.GetBytes('temporary fixture mutation')) '' {
+                param($label)
+                Invoke-RecordedProcess $pwsh @('-NoProfile', '-File', $parent, '-Receipt', $holderReceipt) $label 5000 300 1500
+            }
+        } catch { $caught = $_ }
+        if ($null -eq $caught -or $caught.ToString() -notmatch 'failed closed.*inherited output holder cleanup UNVERIFIED') { throw 'Inherited-pipe fixture did not fail closed at bounded capture' }
+        $receipt = Get-Content -LiteralPath (Join-Path $proof 'fixture-inherited-pipe.process.json') -Raw | ConvertFrom-Json
+        if (-not $receipt.CaptureTimeout -or -not $receipt.RootReaped -or -not $script:cleanupUnverified) { throw 'Inherited-pipe cleanup uncertainty was concealed' }
+        if ((Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash -ne $originalHash) { throw 'Real phase finally failed marker byte/SHA restoration' }
+        Write-Host 'PASS normal capture, bounded process kill/reap, inherited-pipe timeout, and real phase finally marker restoration'
+    } finally {
+        # The runner cannot identify a pipe holder after its root exited. This
+        # fixture separately owns its explicit child receipt and verifies identity
+        # before bounded cleanup; never claim the runner itself cleaned it.
+        if (Test-Path -LiteralPath $holderReceipt) {
+            $known = Get-Content -LiteralPath $holderReceipt -Raw | ConvertFrom-Json
+            $holder = [Diagnostics.Process]::GetProcessById($known.pid)
+            if ($holder.StartTime.ToUniversalTime().Ticks.ToString() -cne $known.startTicks) { throw 'Fixture holder PID identity changed; refusing termination' }
+            $stopped = [AssociationBoundedProcessV2]::StopKnown($holder, 1500)
+            "fixture-known-holder pid=$($known.pid) bounded_cleanup=$stopped runner_cleanup_claim=UNVERIFIED" | Add-Content -LiteralPath (Join-Path $proof 'pids.log')
+            if (-not $stopped) { throw 'Fixture known-holder cleanup unverified' }
+        } else { throw 'Fixture holder receipt missing; no unknown process was terminated' }
+        Assert-Pins
+        Write-Host "Process-only fixture evidence: $proof"
+    }
+    return
+}
+
 $failure = $null
 try {
     # Validate all exact anchors before touching source or spending a compile.
@@ -165,8 +293,15 @@ try {
 } catch {
     $failure = $_
 } finally {
-    # Re-run original behavior after restoration even if a mutant was rejected.
-    try { $null = Invoke-Phase 'restored-original' $original } catch { if ($null -eq $failure) { $failure = $_ } else { Write-Error $_ -ErrorAction Continue } }
+    # Re-run after ordinary mutant rejection, but never start more Cargo while
+    # prior process/descendant/capture cleanup remains unverified. Phase finally
+    # has already restored source; record this exception to the rerun gate.
+    if ($script:cleanupUnverified) {
+        'SKIPPED restored-original: process/capture/descendant cleanup UNVERIFIED; source restoration required' |
+            Tee-Object -FilePath (Join-Path $proof 'summary.log') -Append | Write-Host
+    } else {
+        try { $null = Invoke-Phase 'restored-original' $original } catch { if ($null -eq $failure) { $failure = $_ } else { Write-Error $_ -ErrorAction Continue } }
+    }
     Assert-Pins
     Write-Host "Evidence: $proof; excluded: $excluded"
 }
