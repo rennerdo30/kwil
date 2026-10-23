@@ -56,7 +56,7 @@ impl SourceRef {
 /// Shared across all versions, so keeping worker snapshots cannot bypass
 /// the resident add-byte cap. The OS page cache of spilled blocks is separate.
 pub(crate) struct AddBudget {
-    pub limit: usize,
+    pub limit: AtomicUsize,
     pub used: AtomicUsize,
     owner: Arc<()>,
     #[cfg(test)]
@@ -83,7 +83,7 @@ pub(crate) struct ImportWork {
 impl AddBudget {
     pub fn new(limit: usize, owner: Arc<()>) -> Arc<Self> {
         Arc::new(Self {
-            limit,
+            limit: AtomicUsize::new(limit),
             used: AtomicUsize::new(0),
             owner,
             #[cfg(test)]
@@ -97,6 +97,21 @@ impl AddBudget {
             #[cfg(test)]
             import_raw_repeated: AtomicU64::new(0),
         })
+    }
+
+    /// One-way activation after spill-only replay. Keep the original shared
+    /// accounting object: snapshots/importers cannot acquire independent caps.
+    pub fn enable_resident_additions(&self, limit: usize) -> io::Result<()> {
+        if limit == 0 || self.used.load(Ordering::Acquire) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resident additions require zero-cap unused budget",
+            ));
+        }
+        self.limit
+            .compare_exchange(0, limit, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "resident add budget was already configured"))
     }
 
     fn observe_import_atom(&self, _raw: &Range<u64>) {
@@ -516,7 +531,7 @@ fn capped_block(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Arc<Storage
     let reserved = budget
         .used
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            used.checked_add(bytes.len()).filter(|&next| next <= budget.limit)
+            used.checked_add(bytes.len()).filter(|&next| next <= budget.limit.load(Ordering::Acquire))
         })
         .is_ok();
     Ok(Arc::new(if reserved {

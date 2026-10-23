@@ -658,11 +658,143 @@ impl Buffer {
     pub fn add_memory_bytes(&self) -> usize {
         self.added.used.load(Ordering::Relaxed)
     }
+
+    /// Enable future resident additions exactly once after zero-cap replay.
+    /// This never imports/rebases the current snapshot, changes its owner,
+    /// records history, or resets shared accounting. Existing importers see the
+    /// same monotonic zero-to-positive cap. Zero/repeated/nonzero reconfiguration
+    /// is refused; callers retaining an explicitly configured zero skip this.
+    pub fn enable_resident_additions(&mut self, limit: usize) -> io::Result<()> {
+        self.added.enable_resident_additions(limit)
+    }
 }
 
 #[cfg(test)]
 mod editing_contract_tests {
     use super::*;
+
+    #[test]
+    fn resident_activation_preserves_spill_only_replay_provenance_and_undo() {
+        use crate::encoding::{self, Encoding, SavePlan};
+        use crate::{RecoveryAssembler, RecoveryLimits};
+        let raw = b"A\xff\xc2\xc2";
+        let mut replay = RecoveryAssembler::new(RecoveryLimits {
+            add_memory_bytes: 0,
+            undo_memory_bytes: 1 << 20,
+            max_origins: 0,
+            max_records: 128,
+            max_pieces: 128,
+            max_blocks: 128,
+            max_metadata_bytes: 8 << 20,
+        })
+        .unwrap();
+        let mut revision = replay.begin_revision();
+        revision.begin_fragment().unwrap();
+        revision.append_bytes(raw, || false).unwrap();
+        revision.replace(0..0, || false).unwrap();
+        revision.promote_raw_v1(|| false).unwrap();
+        revision.commit(|| false).unwrap();
+        let mut buffer = replay.finish(|| false).unwrap();
+        let before = buffer.snapshot();
+        let budget = buffer.added.clone();
+        let owner = buffer.owner.clone();
+        let importer = buffer.snapshot_importer();
+        assert_eq!(buffer.add_memory_bytes(), 0);
+        let spills = before.storage_resources().spilled_blocks;
+        assert!(spills >= 3);
+        buffer.enable_resident_additions(2).unwrap();
+        assert!(Arc::ptr_eq(&budget, &buffer.added));
+        assert!(Arc::ptr_eq(&owner, &buffer.owner));
+        assert_eq!(buffer.history_depth(), (0, 0));
+        assert_eq!(buffer.snapshot().storage_resources().spilled_blocks, spills);
+        buffer.insert(buffer.len(), b"x").unwrap();
+        assert_eq!(buffer.add_memory_bytes(), 1, "future typing uses the activated original budget");
+        assert_eq!(buffer.snapshot().storage_resources().spilled_blocks, spills);
+        let plan = SavePlan { encoding: Encoding::UTF8, bom: false, line_ending: None };
+        let write = |snapshot: &Snapshot| {
+            let mut bytes = Vec::new();
+            encoding::write_snapshot(snapshot, plan, &mut bytes).unwrap();
+            bytes
+        };
+        let mut edited = raw.to_vec();
+        edited.push(b'x');
+        assert_eq!(write(&buffer.snapshot()), edited);
+        assert!(buffer.undo());
+        assert_eq!(write(&buffer.snapshot()), raw);
+        assert!(buffer.redo());
+        assert_eq!(write(&buffer.snapshot()), edited);
+        assert_eq!(write(&before), raw);
+        let mut foreign = Buffer::empty();
+        foreign.insert(0, b"Y").unwrap();
+        let imported = importer.prepare(&foreign.snapshot(), 0..1).unwrap();
+        assert_eq!(buffer.add_memory_bytes(), 2);
+        buffer.insert(buffer.len(), b"Z").unwrap();
+        assert_eq!(buffer.add_memory_bytes(), 2, "pre-activation importer and typing share one cap");
+        assert!(buffer.snapshot().storage_resources().spilled_blocks > spills);
+        drop(imported);
+        assert_eq!(buffer.add_memory_bytes(), 1);
+    }
+
+    #[test]
+    fn resident_activation_refuses_zero_repeat_and_preconfigured_budget_without_reset() {
+        let mut disabled = Buffer::with_add_memory_limit(0);
+        assert_eq!(disabled.enable_resident_additions(0).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        disabled.insert(0, b"x").unwrap();
+        assert_eq!(disabled.add_memory_bytes(), 0);
+        assert_eq!(disabled.snapshot().storage_resources().spilled_blocks, 1);
+        disabled.enable_resident_additions(4).unwrap();
+        for cap in [0, 4, 8] {
+            assert_eq!(disabled.enable_resident_additions(cap).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(disabled.history_depth(), (1, 0));
+        let mut configured = Buffer::with_add_memory_limit(4);
+        assert!(configured.enable_resident_additions(8).is_err());
+        configured.insert(0, b"ab").unwrap();
+        let budget = configured.added.clone();
+        assert!(configured.enable_resident_additions(8).is_err());
+        assert!(Arc::ptr_eq(&budget, &configured.added));
+        assert_eq!(configured.add_memory_bytes(), 2, "failed activation never resets live accounting");
+    }
+
+    #[test]
+    fn resident_activation_precaptured_concurrent_importers_share_one_cap() {
+        let mut destination = Buffer::with_add_memory_limit(0);
+        let first_importer = destination.snapshot_importer();
+        let second_importer = destination.snapshot_importer();
+        let mut foreign = Buffer::empty();
+        foreign.insert(0, b"XY").unwrap();
+        let source = foreign.snapshot();
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let spawn = |importer: SnapshotImporter| {
+            let gate = gate.clone();
+            let source = source.clone();
+            std::thread::spawn(move || {
+                gate.wait();
+                importer.prepare(&source, 0..source.len()).unwrap()
+            })
+        };
+        let first = spawn(first_importer.clone());
+        let second = spawn(second_importer.clone());
+        destination.enable_resident_additions(4).unwrap();
+        gate.wait();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(destination.add_memory_bytes(), 4);
+        assert_eq!(first.storage_resources().spilled_blocks + second.storage_resources().spilled_blocks, 0);
+        let third = first_importer.prepare(&source, 0..source.len()).unwrap();
+        assert_eq!(third.storage_resources().spilled_blocks, 1);
+        assert_eq!(destination.add_memory_bytes(), 4);
+        let shared = first.clone();
+        drop(first);
+        assert_eq!(destination.add_memory_bytes(), 4, "snapshot clones do not change physical-byte accounting");
+        drop(shared);
+        assert_eq!(destination.add_memory_bytes(), 2);
+        let fourth = second_importer.prepare(&source, 0..source.len()).unwrap();
+        assert_eq!(fourth.storage_resources().spilled_blocks, 0);
+        assert_eq!(destination.add_memory_bytes(), 4);
+        drop((second, third, fourth));
+        assert_eq!(destination.add_memory_bytes(), 0);
+    }
 
     #[test]
     fn decoded_cancellable_attach_interrupts_index_and_releases_partial_origin() {
