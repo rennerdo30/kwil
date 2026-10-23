@@ -19,7 +19,11 @@ fn value_text(value: &SettingValue) -> String {
 }
 
 pub(super) fn key(host: &mut SettingsSession, event: KeyEvent, size: (u16, u16)) -> bool {
-    if event.kind == KeyEventKind::Repeat && (host.panel_is_capturing() || host.panel_is_confirming()) {
+    if event.kind == KeyEventKind::Repeat
+        && (host.panel_is_capturing()
+            || host.panel_is_confirming()
+            || matches!(event.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab))
+    {
         return true;
     }
     if host.panel().is_some() {
@@ -288,9 +292,16 @@ mod tests {
         key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!host.panel_is_capturing());
         assert!(host.panel().is_some(), "first Escape cancels the capture only");
+        let mut held_escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        held_escape.kind = KeyEventKind::Repeat;
+        key(&mut host, held_escape);
+        assert!(host.panel().is_some(), "held Escape must not advance after cancelling capture");
+        assert!(host.is_open());
         key(&mut host, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(host.panel().is_none());
         assert!(host.is_open(), "second Escape returns to settings, not the document");
+        key(&mut host, held_escape);
+        assert!(host.is_open(), "held Escape must not close the settings screen");
         host.input(SettingsInput::Accept).unwrap();
         host.panel_input(PanelInput::Text("file.save")).unwrap();
         key(&mut host, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

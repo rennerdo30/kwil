@@ -99,7 +99,18 @@ fn error(message: impl Into<String>) -> SettingsError {
     SettingsError(message.into())
 }
 fn check_confirmation(actual: &[KeyConflict], confirmed: &[KeyConflict]) -> Result<(), SettingsError> {
+    check_reviewable_conflicts(actual)?;
     if actual == confirmed { Ok(()) } else { Err(error("shortcut conflicts changed; review and confirm again")) }
+}
+fn check_reviewable_conflicts(conflicts: &[KeyConflict]) -> Result<(), SettingsError> {
+    use kwil_core_commands::settings_ui::MAX_REBIND_CHORDS;
+    if conflicts
+        .iter()
+        .any(|conflict| conflict.keys.split_whitespace().take(MAX_REBIND_CHORDS + 1).count() > MAX_REBIND_CHORDS)
+    {
+        return Err(error("shortcut conflict exceeds eight-chord review limit; use Open settings file"));
+    }
+    Ok(())
 }
 fn reset_conflicts(doc: &SettingsDocument, command: &str) -> Result<Vec<KeyConflict>, SettingsError> {
     check_keymap_bound(doc)?;
@@ -454,6 +465,7 @@ impl SettingsPanelController {
                 }
                 if matches!(input, PanelInput::Accept) {
                     let actual = edit.conflicts(doc)?;
+                    check_reviewable_conflicts(&actual)?;
                     if actual != *approved {
                         *approved = actual;
                         self.confirmation_index = 0;
@@ -585,6 +597,7 @@ impl SettingsPanelController {
                 if conflicts.is_empty() {
                     return Err(failure);
                 }
+                check_reviewable_conflicts(&conflicts)?;
                 self.confirmation_index = 0;
                 self.confirmation_page = 0;
                 self.state = State::Confirm(edit, conflicts);
@@ -903,6 +916,23 @@ mod tests {
         press(&mut panel, &doc, key("alt+f9"));
         assert!(press(&mut panel, &doc, key("escape")).is_none());
         assert!(!panel.is_editing());
+    }
+
+    #[test]
+    fn settings_confirmation_refuses_sequences_beyond_backend_edit_limit() {
+        let raw_keys = format!("ctrl+shift+f11 {} ctrl+shift+f10", "alt+f9 ".repeat(600));
+        let source = format!("[[bindings]]\nkeys='{raw_keys}'\ncommand='file.open'\n");
+        let doc = SettingsDocument::parse(&source).unwrap();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.save").unwrap();
+        press(&mut panel, &doc, PanelInput::Accept);
+        press(&mut panel, &doc, key("ctrl+shift+f11"));
+        let result = panel.input(&doc, PanelInput::Accept);
+        assert!(result.is_err(), "an over-limit conflict must not enter a truncated confirmation");
+        assert!(!panel.is_confirming());
+        assert_eq!(doc.source(), source, "refusal must preserve the original binding");
+        press(&mut panel, &doc, PanelInput::Cancel);
+        assert!(!panel.is_capturing());
     }
 
     #[test]

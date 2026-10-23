@@ -17,6 +17,9 @@ use crate::{Binding, Context, Key, KeyChord, KeySequence, Mode, NamedKey, Resolu
 use std::collections::BTreeMap;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
+/// Existing capture and conflict-preview limit; raw settings remain lossless.
+pub const MAX_REBIND_CHORDS: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
     Editor,
@@ -644,7 +647,7 @@ impl SettingsDocument {
         if !candidate.command.is_empty() && crate::command(&candidate.command).is_none() {
             return Err(error("unknown command"));
         }
-        if candidate.keys.split_whitespace().take(9).count() > 8 {
+        if candidate.keys.split_whitespace().take(MAX_REBIND_CHORDS + 1).count() > MAX_REBIND_CHORDS {
             return Err(error("Vim conflict preview supports at most eight chords"));
         }
         let sequence = candidate.keys.parse::<KeySequence>().map_err(|e| error(e.to_string()))?;
