@@ -19,6 +19,21 @@ pub(crate) enum Step {
     ZoomIn,
     InputOwnership,
     UsabilityCapture(&'static str),
+    /// Desktop overlays (settings, palette) captured in the hidden window.
+    SettingsOpen,
+    SettingsKeymap,
+    SettingsCapture,
+    SettingsClose,
+    PaletteOpen,
+    PaletteClose,
+    WelcomeProbe,
+    WelcomeNext,
+    WelcomeKeyboard,
+    WelcomeSkip,
+    WelcomeSmall,
+    WelcomeSmallCheck,
+    WelcomeLateInput,
+    DismissSetup,
     End,
 }
 #[derive(Default, Clone, Copy)]
@@ -54,7 +69,8 @@ impl Metrics {
 pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
         let usual = [
-            (2000, Step::Idle),
+            (1800, Step::DismissSetup),
+            (200, Step::Idle),
             (250, Step::Scroll),
             (200, Step::Repaint),
             (150, Step::Status),
@@ -63,7 +79,8 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (100, Step::End),
         ];
         let usability = [
-            (2000, Step::Idle),
+            (1800, Step::DismissSetup),
+            (200, Step::Idle),
             (100, Step::InputOwnership),
             (100, Step::MenuOpen),
             (150, Step::UsabilityCapture("menu.bmp")),
@@ -72,9 +89,36 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (200, Step::ZoomIn),
             (200, Step::ZoomIn),
             (400, Step::UsabilityCapture("zoom.bmp")),
+            // Zoom stays at its raised level: overlay text and sizes must not follow it.
+            (100, Step::SettingsOpen),
+            (300, Step::UsabilityCapture("settings.bmp")),
+            (100, Step::SettingsKeymap),
+            (300, Step::UsabilityCapture("settings-keymap.bmp")),
+            (100, Step::SettingsCapture),
+            (300, Step::UsabilityCapture("settings-capture.bmp")),
+            (100, Step::SettingsClose),
+            (100, Step::PaletteOpen),
+            (300, Step::UsabilityCapture("palette.bmp")),
+            (100, Step::PaletteClose),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_UI_USABILITY_CAPTURE").is_some() {
+        let welcome = [
+            (2000, Step::WelcomeProbe),
+            (100, Step::UsabilityCapture("welcome.bmp")),
+            (100, Step::WelcomeNext),
+            (100, Step::WelcomeKeyboard),
+            (300, Step::UsabilityCapture("welcome-file-types.bmp")),
+            (100, Step::WelcomeSmall),
+            (200, Step::WelcomeSmallCheck),
+            (100, Step::UsabilityCapture("welcome-small.bmp")),
+            (100, Step::WelcomeSkip),
+            (100, Step::WelcomeLateInput),
+            (200, Step::UsabilityCapture("welcome-complete.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_WELCOME_PROBE").is_some() {
+            welcome.as_slice()
+        } else if std::env::var_os("KWIL_UI_USABILITY_CAPTURE").is_some() {
             usability.as_slice()
         } else {
             usual.as_slice()
@@ -88,8 +132,122 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
     });
 }
 pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step_inner(app, el, step))) {
+        if let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR") {
+            let text = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            let _ = std::fs::write(PathBuf::from(dir).join("harness-failure.txt"), format!("{step:?}: {text}"));
+        }
+        std::panic::resume_unwind(payload);
+    }
+}
+fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::DismissSetup => {
+            if app.welcome.stage() == super::welcome::Stage::About {
+                app.welcome_action(super::welcome_ui::Action::Next);
+            }
+            if app.welcome.stage() == super::welcome::Stage::FileTypes {
+                app.welcome_action(super::welcome_ui::Action::Skip);
+            }
+        }
+        Step::WelcomeSmall => {
+            let _ = app.gfx.as_ref().unwrap().window.request_inner_size(winit::dpi::PhysicalSize::new(520u32, 300u32));
+        }
+        Step::WelcomeSmallCheck => {
+            assert!(app.render());
+            let hits: Vec<_> = app.welcome_view.hits.iter().copied().collect();
+            assert!(
+                hits.iter().any(|(_, action)| *action == super::welcome_ui::Action::FileType(1)),
+                "small window retains registration action"
+            );
+            for (i, (a, _)) in hits.iter().enumerate() {
+                for (b, _) in &hits[i + 1..] {
+                    assert!(
+                        a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y,
+                        "setup controls must not overlap: {a:?}, {b:?}"
+                    );
+                }
+            }
+        }
+        Step::WelcomeLateInput => {
+            use winit::application::ApplicationHandler;
+            use winit::event::{Ime, WindowEvent};
+            let id = app.gfx.as_ref().unwrap().window.id();
+            let revision = app.view.editor().unwrap().document().revision();
+            app.window_event(el, id, WindowEvent::Ime(Ime::Commit("old setup commit".into())));
+            assert_eq!(app.view.editor().unwrap().document().revision(), revision);
+            app.window_event(el, id, WindowEvent::Ime(Ime::Preedit("new".into(), None)));
+            assert!(app.composing);
+            app.user_event(el, UserEvent::WelcomeReady);
+            assert!(app.composing, "late setup acknowledgment must preserve new editor composition");
+            app.window_event(el, id, WindowEvent::Ime(Ime::Commit("new".into())));
+            assert!(app.view.editor().unwrap().document().revision() > revision);
+        }
+        Step::WelcomeProbe => welcome_probe(app, el),
+        Step::WelcomeNext => {
+            app.welcome_action(super::welcome_ui::Action::Next);
+            assert_eq!(app.welcome.stage(), super::welcome::Stage::FileTypes);
+        }
+        Step::WelcomeKeyboard => {
+            use winit::keyboard::{Key, NamedKey};
+            assert!(app.render());
+            app.welcome_key(&Key::Character("zzzkwil".into()), Some("zzzkwil"));
+            app.welcome_key(&Key::Named(NamedKey::Enter), None);
+            if let Some(page) = &mut app.file_types {
+                page.key(&Key::Named(NamedKey::End), None, app.mods);
+            }
+            assert!(app.render());
+            app.welcome_key(&Key::Character("aaakwil".into()), Some("aaakwil"));
+            assert!(app.render());
+            let old=app.welcome_view.hits.iter().find(|(_,action)|matches!(action,super::welcome_ui::Action::FileType(code) if code&0xf000_0000==0x3000_0000)).map(|(rect,_)|*rect).expect("painted custom row");
+            app.welcome_key(&Key::Named(NamedKey::Enter), None);
+            assert_eq!(app.welcome_view.hits.iter().count(), 0, "custom Enter invalidates old sorted indices");
+            app.pointer = (old.x + 1, old.y + 1);
+            use winit::application::ApplicationHandler;
+            app.window_event(
+                el,
+                app.gfx.as_ref().unwrap().window.id(),
+                winit::event::WindowEvent::MouseInput {
+                    device_id: winit::event::DeviceId::dummy(),
+                    state: winit::event::ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                },
+            );
+            for name in ["aaakwil", "zzzkwil"] {
+                assert!(
+                    app.file_types
+                        .as_ref()
+                        .unwrap()
+                        .service
+                        .selection()
+                        .contains(&kwil_core_commands::file_types::Extension::parse(name).unwrap())
+                );
+            }
+            app.welcome_action(super::welcome_ui::Action::Back);
+            assert_eq!(app.welcome.stage(), super::welcome::Stage::About);
+            assert!(app.render());
+            app.welcome_key(&Key::Named(NamedKey::Enter), None);
+            assert_eq!(
+                app.welcome.stage(),
+                super::welcome::Stage::FileTypes,
+                "hidden custom focus cannot intercept Next"
+            );
+            *app.file_types.as_mut().unwrap().service.selection_mut() = kwil_core_commands::file_types::Selection::new(
+                kwil_core_commands::file_types::Preset::CommonTextConfig,
+            );
+            app.file_types.as_mut().unwrap().key(&Key::Named(NamedKey::Home), None, app.mods);
+            app.apply(Damage { full: true, ..Default::default() });
+        }
+        Step::WelcomeSkip => {
+            app.welcome_action(super::welcome_ui::Action::Skip);
+            assert!(!app.welcome.visible());
+            assert_eq!(app.welcome.stage(), super::welcome::Stage::Complete);
+        }
         Step::Idle => {
             // Prime the retained GPU image without an onscreen present, so the
             // following scroll/readback exercises GPU copies, not a fresh upload.
@@ -182,6 +340,42 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
             }
         }
         Step::MenuClose => app.menu_set(super::menu::State::Closed, false),
+        Step::SettingsOpen => {
+            app.dispatch_settings("view.settings");
+        }
+        Step::SettingsKeymap => {
+            // The same host calls a click on Keymap -> Custom bindings -> Edit makes.
+            if let Some(host) = app.settings_panel.as_mut() {
+                host.set_category(Some(kwil_core_commands::settings_ui::Category::Keymap));
+                if let Some(index) = host.rows().iter().position(|row| row.spec.id == "bindings") {
+                    host.select(index);
+                    let _ = host.input(kwil_view_model::settings_session::SettingsInput::Accept);
+                }
+            }
+            app.settings_epoch = app.settings_epoch.wrapping_add(1);
+            app.palette_redraw();
+        }
+        Step::SettingsCapture => {
+            if let Some(host) = app.settings_panel.as_mut() {
+                let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Accept);
+            }
+            app.settings_epoch = app.settings_epoch.wrapping_add(1);
+            app.palette_redraw();
+        }
+        Step::SettingsClose => {
+            if let Some(host) = app.settings_panel.as_mut() {
+                // Cancel the capture, leave the page, then close: no edit is applied.
+                let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
+                let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
+                host.close();
+            }
+            app.settings_epoch = app.settings_epoch.wrapping_add(1);
+            app.palette_redraw();
+        }
+        Step::PaletteOpen => {
+            app.dispatch_palette("view.commandPalette");
+        }
+        Step::PaletteClose => app.palette_input(kwil_view_model::palette_session::PaletteInput::Cancel),
         Step::ZoomIn => {
             app.dispatch_zoom("view.zoomIn");
         }
@@ -215,6 +409,77 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
     }
 }
+fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
+    use kwil_core_commands::associations::{
+        AssociationAdapter, AssociationError, AssociationPlatform, DefaultChoice, Location, StoredValue,
+    };
+    use kwil_view_model::file_type_registration::{FileTypeRegistration, RegistrationContext, RegistrationLimits};
+    use winit::application::ApplicationHandler;
+    use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
+    assert!(app.opts.hidden);
+    assert_eq!(app.welcome.stage(), super::welcome::Stage::About, "debug launch must show setup");
+    let before = app.view.editor().map(|e| (e.document().revision(), e.cursors().to_vec()));
+    let id = app.gfx.as_ref().unwrap().window.id();
+    app.window_event(el, id, WindowEvent::Ime(Ime::Preedit("日本語".into(), None)));
+    app.window_event(el, id, WindowEvent::Ime(Ime::Commit("must not edit".into())));
+    app.pointer = (1, 1);
+    app.window_event(
+        el,
+        id,
+        WindowEvent::MouseInput {
+            device_id: winit::event::DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+        },
+    );
+    assert_eq!(app.view.editor().map(|e| (e.document().revision(), e.cursors().to_vec())), before);
+    struct NoNative;
+    impl AssociationAdapter for NoNative {
+        fn read_bounded(
+            &mut self,
+            _: &Location,
+            _: &mut kwil_core_commands::associations::ValueBudget,
+        ) -> Result<Option<StoredValue>, AssociationError> {
+            Ok(None)
+        }
+        fn owner(&self) -> String {
+            "isolated-welcome-probe".into()
+        }
+        fn read(&mut self, _: &Location) -> Result<Option<StoredValue>, AssociationError> {
+            Ok(None)
+        }
+        fn write(&mut self, _: &Location, _: Option<&StoredValue>) -> Result<(), AssociationError> {
+            panic!("welcome display/skip must not register")
+        }
+    }
+    let root = PathBuf::from(std::env::var_os("KWIL_WORKSPACE_ROOT").expect("isolated fixture"));
+    assert!(root.is_absolute());
+    let context = RegistrationContext {
+        platform: AssociationPlatform::Windows,
+        executable: root.join("kwil.exe"),
+        content_types: Default::default(),
+        default_choice: DefaultChoice::KeepCurrent,
+        limits: RegistrationLimits::Base128,
+    };
+    let proxy = app.proxy.clone();
+    let mut service = FileTypeRegistration::start(
+        root.join("fake-association-journal"),
+        context,
+        || Ok(NoNative),
+        std::sync::Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::RegistrationReady);
+        }),
+    )
+    .unwrap();
+    *service.selection_mut() =
+        kwil_core_commands::file_types::Selection::new(kwil_core_commands::file_types::Preset::CommonTextConfig);
+    app.file_types = Some(super::filetypes_ui::Page { service, ui: Default::default() });
+    app.apply(Damage { full: true, ..Default::default() });
+    println!(
+        "kwil-welcome PASS debug visibility, modal IME/click ownership; explicit fake adapter, no native association writes"
+    );
+}
+
 fn input_ownership(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
     use winit::application::ApplicationHandler;
     use winit::event::{ElementState, Ime, MouseButton, WindowEvent};

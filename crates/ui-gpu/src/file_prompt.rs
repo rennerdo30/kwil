@@ -63,6 +63,10 @@ impl App {
             }
         }
         self.save_path = self.view.file_prompt().map(|p| p.text.clone());
+        // The prompt card repaints while open and restores the body once it leaves.
+        if self.save_path.is_some() || self.prompt_view.area.take().is_some() {
+            self.palette_dirty = true;
+        }
         self.close_pending = self.view.close_pending();
         sync_active_document(
             &self.view,
@@ -87,6 +91,7 @@ impl App {
             prompt.text = text.clone();
         }
         let damage = self.view.prompt_notice();
+        self.palette_dirty = true;
         self.apply(damage);
     }
 }

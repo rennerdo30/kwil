@@ -35,7 +35,7 @@ use std::{
 pub const QUEUE_CAPACITY: usize = 8;
 pub const MAX_JOURNAL_TRANSACTIONS: u64 = 32;
 pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PATH: usize = 4096;
+pub(super) const MAX_PATH: usize = 4096;
 
 /// Opaque review identity. Only the worker's current plan can be applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,10 +303,11 @@ impl Drop for Events {
 fn bounded_path(path: &Path) -> bool {
     path.as_os_str().len() <= MAX_PATH
 }
-fn bounded_request(request: &AssociationRequest) -> bool {
+pub(super) fn bounded_request(request: &AssociationRequest) -> bool {
     use super::AssociationPlatform;
     bounded_path(&request.executable)
-        && request.types.len() <= 128
+        && !request.types.is_empty()
+        && request.types.len() <= super::MAX_TYPES
         && request
             .types
             .iter()
@@ -341,7 +342,11 @@ impl<A: AssociationAdapter> Engine<A> {
         Ok(Self { adapter, journal, pending: None, identity })
     }
     fn execute(&mut self, request: Request) -> Result<Response, WorkerError> {
-        let result = self.run(request);
+        // Includes temporary native reads, bounded request/response metadata and
+        // rollback/serialization overlap. Retained payloads have separate leases.
+        let result = super::Admission::acquire(super::WORKSPACE_BYTES)
+            .map_err(WorkerError::from)
+            .and_then(|_work| self.run(request));
         result.map_err(|mut e| {
             e.recovery = self.journal.active.as_ref().map(|r| r.id);
             e
@@ -360,9 +365,7 @@ impl<A: AssociationAdapter> Engine<A> {
                 self.identity.generation =
                     self.identity.generation.checked_add(1).ok_or_else(|| failure("plan generation exhausted"))?;
                 let plan = super::plan(&mut self.adapter, &request)?;
-                validate_receipt(&AssociationReceipt { owner: plan.owner.clone(), remaining: plan.changes.clone() })?;
-                // Bound the complete snapshot before delivering it to a frontend.
-                bounded_json(&plan)?;
+                validate_plan(&plan)?;
                 let token = self.identity;
                 self.pending = Some((token, plan.clone()));
                 Ok(Response::Planned { token, plan })
@@ -384,7 +387,7 @@ impl<A: AssociationAdapter> Engine<A> {
                 // Fresh whole-plan preconditions before journaling; backend checks
                 // again globally and immediately before each native write.
                 for change in &plan.changes {
-                    if self.adapter.read(&change.location)? != change.before {
+                    if super::read_one(&mut self.adapter, &change.location)? != change.before {
                         return Err(failure("association state changed; review a new plan"));
                     }
                 }
@@ -428,7 +431,7 @@ impl<A: AssociationAdapter> Engine<A> {
                         .receipt
                         .pending()
                         .iter()
-                        .map(|c| match self.adapter.read(&c.location) {
+                        .map(|c| match super::read_one(&mut self.adapter, &c.location) {
                             Ok(v) if v == c.before => CurrentState::Before,
                             Ok(v) if v == c.after => CurrentState::Applied,
                             Ok(_) => CurrentState::Conflict,
@@ -478,6 +481,7 @@ impl Drop for Journal {
 }
 impl Journal {
     fn open(directory: PathBuf) -> Result<Self, WorkerError> {
+        let _workspace = super::Admission::acquire(super::WORKSPACE_BYTES)?;
         check_directory(&directory)?;
         let lock_path = directory.join("worker.lock");
         let lock = match open_regular(&lock_path, true) {
@@ -606,9 +610,27 @@ impl Journal {
     }
 }
 
-fn validate_receipt(receipt: &AssociationReceipt) -> Result<(), WorkerError> {
+pub(super) fn validate_plan(plan: &AssociationPlan) -> Result<(), WorkerError> {
+    if plan.owner.is_empty() || plan.owner.len() > MAX_PATH {
+        return Err(failure("plan owner exceeds bounds"));
+    }
+    let receipt = AssociationReceipt { owner: plan.owner.clone(), remaining: plan.changes.clone() };
+    validate_receipt(&receipt)?;
+    json_size(plan)?;
+    // The complete durable envelope, not just the change list, must fit before
+    // planning returns or any byte copies/native writes are attempted.
+    #[derive(Serialize)]
+    struct Envelope<'a> {
+        version: u32,
+        id: u64,
+        receipt: &'a AssociationReceipt,
+    }
+    json_size(&Envelope { version: 1, id: MAX_JOURNAL_TRANSACTIONS, receipt: &receipt })?;
+    Ok(())
+}
+pub(super) fn validate_receipt(receipt: &AssociationReceipt) -> Result<(), WorkerError> {
     use super::Location;
-    if receipt.owner.is_empty() || receipt.owner.len() > MAX_PATH || receipt.remaining.len() > 384 {
+    if receipt.owner.is_empty() || receipt.owner.len() > MAX_PATH || receipt.remaining.len() > super::MAX_CHANGES {
         return Err(failure("receipt exceeds bounds"));
     }
     for (index, c) in receipt.remaining.iter().enumerate() {
@@ -620,35 +642,82 @@ fn validate_receipt(receipt: &AssociationReceipt) -> Result<(), WorkerError> {
             Location::UserFile(path) => path.is_absolute() && bounded_path(path),
             Location::MacRole { uti, .. } => uti.len() <= 255,
         };
-        if !location_ok || c.before.iter().chain(c.after.iter()).any(|v| v.bytes.len() > 1024 * 1024) {
+        if !location_ok || c.before.iter().chain(c.after.iter()).any(|v| v.bytes.len() > super::MAX_VALUE_BYTES) {
             return Err(failure("receipt location/value exceeds bounds"));
         }
     }
+    json_size(receipt)?;
     Ok(())
 }
-fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, WorkerError> {
-    struct Bounded(Vec<u8>);
-    impl Write for Bounded {
+/// Count escaped strings, byte-array digits, separators and envelope exactly,
+/// with no output buffer. Denial happens before reserve/serialization growth.
+fn json_size(value: &impl Serialize) -> Result<usize, WorkerError> {
+    struct Counter(usize);
+    impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > MAX_RECORD_BYTES.saturating_sub(self.0.len()) {
+            if bytes.len() > MAX_RECORD_BYTES.saturating_sub(self.0) {
                 return Err(io::Error::other("association record exceeds size limit"));
             }
-            self.0.extend_from_slice(bytes);
+            self.0 += bytes.len();
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-    let mut out = Bounded(Vec::new());
+    let mut count = Counter(0);
+    serde_json::to_writer(&mut count, value).map_err(|e| failure(e.to_string()))?;
+    Ok(count.0)
+}
+#[derive(Debug)]
+struct RecordBytes {
+    bytes: Vec<u8>,
+    _admission: super::Admission,
+}
+#[cfg(test)]
+static RECORD_ALLOCATION_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+impl std::ops::Deref for RecordBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+fn bounded_json(value: &impl Serialize) -> Result<RecordBytes, WorkerError> {
+    let length = json_size(value)?;
+    let admission = super::Admission::acquire(length)?;
+    struct Bounded {
+        bytes: Vec<u8>,
+        length: usize,
+    }
+    impl Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.length.saturating_sub(self.bytes.len()) {
+                return Err(io::Error::other("association serialization changed after preflight"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Bounded { bytes: Vec::new(), length };
+    #[cfg(test)]
+    RECORD_ALLOCATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    out.bytes.try_reserve_exact(length).map_err(|_| failure("record allocation failed"))?;
     serde_json::to_writer(&mut out, value).map_err(|e| failure(e.to_string()))?;
-    Ok(out.0)
+    if out.bytes.len() != length {
+        return Err(failure("association serialization changed after preflight"));
+    }
+    Ok(RecordBytes { bytes: out.bytes, _admission: admission })
 }
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
-fn check_directory(directory: &Path) -> io::Result<()> {
+/// Pure traversal shared with path fixtures: accumulate a Windows volume/UNC
+/// prefix, but do not probe it until RootDir makes it a rooted directory.
+fn directory_steps(directory: &Path, mut inspect: impl FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
     if !directory.is_absolute() || !bounded_path(directory) {
         return Err(invalid("journal requires a bounded absolute private directory"));
     }
@@ -658,11 +727,21 @@ fn check_directory(directory: &Path) -> io::Result<()> {
             return Err(invalid("journal path must be normalized"));
         }
         part.push(component);
-        let m = fs::symlink_metadata(&part)?;
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        inspect(&part)?;
+    }
+    Ok(())
+}
+fn check_directory(directory: &Path) -> io::Result<()> {
+    directory_steps(directory, |part| {
+        let m = fs::symlink_metadata(part)?;
         if !m.is_dir() || is_link(&m) {
             return Err(invalid("journal ancestors must be real directories"));
         }
-    }
+        Ok(())
+    })?;
     let m = fs::symlink_metadata(directory)?;
     private_metadata(&m, true)
 }
@@ -719,17 +798,23 @@ fn private_new(path: &Path) -> io::Result<File> {
     private_metadata(&file.metadata()?, false)?;
     Ok(file)
 }
-fn read_record(path: &Path, limit: usize) -> Result<Vec<u8>, WorkerError> {
-    let file = open_regular(path, false)?;
-    if file.metadata()?.len() > limit as u64 {
+fn read_record(path: &Path, limit: usize) -> Result<RecordBytes, WorkerError> {
+    let mut file = open_regular(path, false)?;
+    let length = file.metadata()?.len();
+    if length > limit as u64 || length > MAX_RECORD_BYTES as u64 {
         return Err(failure("journal record exceeds size limit"));
     }
+    let length = length as usize;
+    let admission = super::Admission::acquire(length)?;
     let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
+    bytes.try_reserve_exact(length).map_err(|_| failure("record allocation failed"))?;
+    bytes.resize(length, 0);
+    file.read_exact(&mut bytes)?;
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? != 0 {
         return Err(failure("journal record grew beyond size limit"));
     }
-    Ok(bytes)
+    Ok(RecordBytes { bytes, _admission: admission })
 }
 fn sync_directory(directory: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -783,6 +868,8 @@ mod tests {
     struct FakeState {
         values: Vec<(Location, StoredValue)>,
         writes: usize,
+        reads: usize,
+        expected_changes: Option<usize>,
         fail_from: Option<usize>,
         panic_at: Option<usize>,
         durable: Option<PathBuf>,
@@ -800,6 +887,15 @@ mod tests {
         fn read(&mut self, location: &Location) -> Result<Option<StoredValue>, AssociationError> {
             Ok(self.0.lock().unwrap().values.iter().find(|(k, _)| k == location).map(|(_, v)| v.clone()))
         }
+        fn read_bounded(
+            &mut self,
+            location: &Location,
+            budget: &mut super::super::ValueBudget,
+        ) -> Result<Option<StoredValue>, AssociationError> {
+            let mut state = self.0.lock().unwrap();
+            state.reads += 1;
+            state.values.iter().find(|(k, _)| k == location).map(|(_, v)| budget.copy(v.kind, &v.bytes)).transpose()
+        }
         fn write(&mut self, location: &Location, value: Option<&StoredValue>) -> Result<(), AssociationError> {
             let mut s = self.0.lock().unwrap();
             if let Some(path) = &s.durable {
@@ -807,7 +903,11 @@ mod tests {
                     read_record(path, MAX_RECORD_BYTES).expect("intent must be readable before EVERY native write");
                 let intent: Intent = serde_json::from_slice(&bytes).unwrap();
                 assert!(intent.receipt.pending().iter().any(|c| c.location == *location));
-                assert_eq!(intent.receipt.pending().len(), 3, "full planned receipt, not a partial result");
+                assert_eq!(
+                    intent.receipt.pending().len(),
+                    s.expected_changes.unwrap_or(3),
+                    "full planned receipt, not a partial result"
+                );
             }
             s.writes += 1;
             if s.panic_at == Some(s.writes) {
@@ -826,7 +926,7 @@ mod tests {
         fn sync_restored(&mut self, changes: &[super::super::Change]) -> Result<(), AssociationError> {
             let mut s = self.0.lock().unwrap();
             s.barriers += 1;
-            assert_eq!(changes.len(), 3, "barrier must cover the original full receipt");
+            assert_eq!(changes.len(), s.expected_changes.unwrap_or(3), "barrier must cover the original full receipt");
             for change in changes {
                 assert_eq!(
                     s.values.iter().find(|(l, _)| *l == change.location).map(|(_, v)| v),
@@ -896,6 +996,186 @@ mod tests {
         let mut s = fake.0.lock().unwrap();
         s.durable_values = s.values.clone();
         (e, plan)
+    }
+
+    #[test]
+    fn budget_all240_and_256_use_one_original_durable_intent_and_exact_undo() {
+        for count in [240, 256] {
+            let scratch = Scratch::new();
+            let fake = Fake::default();
+            let mut e = engine(&scratch, &fake);
+            let mut request = super::super::budget_tests::all240_request();
+            for n in 240..count {
+                request.types.push(FileType { extension: format!("extra{n}"), content_type: None });
+            }
+            let expected = count * 3;
+            let seed = match e.execute(Request::Plan(request.clone())).unwrap() {
+                Response::Planned { plan, .. } => plan,
+                other => panic!("unexpected {other:?}"),
+            };
+            let originals: Vec<_> = seed
+                .changes()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 3 != 2)
+                .map(|(i, c)| {
+                    (c.location.clone(), StoredValue { kind: 60 + i as u32, bytes: vec![0, 255, i as u8, 0, 128] })
+                })
+                .collect();
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.expected_changes = Some(expected);
+                state.values = originals.clone();
+                state.durable = Some(e.journal.path(1, "intent"));
+            }
+            drop(seed);
+            let (token, reviewed) = match e.execute(Request::Plan(request)).unwrap() {
+                Response::Planned { token, plan } => (token, plan),
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(reviewed.changes().len(), expected);
+            assert!(matches!(e.execute(Request::Apply { token }).unwrap(), Response::Applied { journal_id: 1 }));
+            assert_eq!(fake.0.lock().unwrap().writes, expected);
+            assert_eq!(e.journal.last, 1, "one transaction, never split batches");
+            assert_eq!(e.journal.active.as_ref().unwrap().receipt.pending(), reviewed.changes());
+            let intent_bytes = fs::read(e.journal.path(1, "intent")).unwrap();
+            let intent: Intent = serde_json::from_slice(&intent_bytes).unwrap();
+            assert_eq!(intent.receipt.pending(), reviewed.changes());
+            drop(intent);
+            drop(e);
+            let mut e = engine(&scratch, &fake);
+            assert_eq!(status(&mut e).recovery.unwrap().receipt.pending().len(), expected);
+            assert!(matches!(e.execute(Request::Undo { journal_id: 1 }).unwrap(), Response::Undone { journal_id: 1 }));
+            assert_eq!(fake.0.lock().unwrap().barriers, 1);
+            assert!(e.journal.active.is_none());
+            assert_eq!(fs::read(e.journal.path(1, "intent")).unwrap(), intent_bytes, "original receipt is immutable");
+            assert!(e.journal.path(1, "retired").exists());
+            let state = fake.0.lock().unwrap();
+            assert_eq!(state.values.len(), originals.len());
+            for (location, original) in originals {
+                assert_eq!(state.values.iter().find(|(p, _)| *p == location).map(|(_, v)| v), Some(&original));
+            }
+        }
+    }
+
+    #[test]
+    fn budget_all240_failed_apply_and_cleanup_keep_full_durable_recovery() {
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut e = engine(&scratch, &fake);
+        let (token, plan) = match e.execute(Request::Plan(super::super::budget_tests::all240_request())).unwrap() {
+            Response::Planned { token, plan } => (token, plan),
+            other => panic!("unexpected {other:?}"),
+        };
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.expected_changes = Some(720);
+            state.durable = Some(e.journal.path(1, "intent"));
+            state.fail_from = Some(2);
+        }
+        let failure = e.execute(Request::Apply { token }).unwrap_err();
+        assert_eq!(failure.recovery, Some(1));
+        assert_eq!(fake.0.lock().unwrap().values.len(), 1);
+        assert_eq!(e.journal.active.as_ref().unwrap().receipt.pending(), plan.changes());
+        assert!(!e.journal.path(1, "retired").exists());
+        let bytes = fs::read(e.journal.path(1, "intent")).unwrap();
+        drop(e);
+        fake.0.lock().unwrap().fail_from = None;
+        let mut e = engine(&scratch, &fake);
+        e.execute(Request::Undo { journal_id: 1 }).unwrap();
+        assert!(fake.0.lock().unwrap().values.is_empty());
+        assert_eq!(fs::read(e.journal.path(1, "intent")).unwrap(), bytes);
+        assert_eq!(e.journal.last, 1);
+    }
+
+    #[test]
+    fn budget_worker_257_refuses_before_reads_or_intent() {
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut e = engine(&scratch, &fake);
+        let mut request = super::super::budget_tests::all240_request();
+        for n in 240..257 {
+            request.types.push(FileType { extension: format!("extra{n}"), content_type: None });
+        }
+        assert!(!bounded_request(&request));
+        assert!(e.execute(Request::Plan(request)).is_err());
+        assert_eq!((fake.0.lock().unwrap().reads, e.journal.last), (0, 0));
+        assert!(!e.journal.path(1, "intent").exists());
+    }
+
+    #[test]
+    fn budget_serializer_16mib_preflight_denies_before_output_allocation() {
+        // JSON byte-array digits expand 4 MiB + 1 bytes beyond a 16 MiB
+        // serialized record. The input is generated at runtime, never checked in.
+        let value = vec![255u8; MAX_RECORD_BYTES / 4 + 1];
+        let before = RECORD_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed);
+        assert!(bounded_json(&value).is_err());
+        assert_eq!(RECORD_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed), before);
+        let at_limit = "x".repeat(MAX_RECORD_BYTES - 2); // quotes are part of the cap
+        let encoded = bounded_json(&at_limit).unwrap();
+        assert_eq!(encoded.len(), MAX_RECORD_BYTES);
+        assert_eq!(RECORD_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed), before + 1);
+        drop(encoded);
+        let too_large = "x".repeat(MAX_RECORD_BYTES - 1);
+        assert!(bounded_json(&too_large).is_err());
+        assert_eq!(RECORD_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn budget_directory_steps_canonical_windows_prefix_waits_for_root() {
+        let path = Path::new(r"\\?\C:\Users\example\AppData\Roaming\kwil\kwil-associations-v1");
+        let mut steps = Vec::new();
+        directory_steps(path, |part| {
+            steps.push(part.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(steps.len(), 7);
+        assert_eq!(steps[0].as_os_str(), std::ffi::OsStr::new(r"\\?\C:\"));
+        assert_eq!(steps.last().unwrap(), path);
+        assert!(!steps.iter().any(|part| part.as_os_str() == std::ffi::OsStr::new(r"\\?\C:")));
+        for part in &steps {
+            assert!(part.is_absolute());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn budget_directory_steps_drive_and_unc_keep_every_actual_ancestor() {
+        for (path, root) in [
+            (r"C:\kwil\journal", r"C:\"),
+            (r"\\server\share\kwil\journal", r"\\server\share\"),
+            (r"\\?\UNC\server\share\kwil\journal", r"\\?\UNC\server\share\"),
+        ] {
+            let mut steps = Vec::new();
+            directory_steps(Path::new(path), |part| {
+                steps.push(part.to_owned());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(steps.len(), 3);
+            assert_eq!(steps[0].as_os_str(), std::ffi::OsStr::new(root));
+            assert_eq!(steps[1], Path::new(root).join("kwil"));
+            assert_eq!(steps[2], Path::new(path));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn budget_directory_steps_relative_and_parent_refusals_are_preserved() {
+        for path in [r"journal", r"C:journal", r"\journal"] {
+            let mut probes = 0;
+            assert!(
+                directory_steps(Path::new(path), |_| {
+                    probes += 1;
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert_eq!(probes, 0);
+        }
+        assert!(directory_steps(Path::new(r"\\?\C:\kwil\..\journal"), |_| Ok(())).is_err());
     }
 
     #[test]
@@ -978,6 +1258,13 @@ mod tests {
             }
             fn read(&mut self, l: &Location) -> Result<Option<StoredValue>, AssociationError> {
                 self.0.read(l)
+            }
+            fn read_bounded(
+                &mut self,
+                l: &Location,
+                b: &mut super::super::ValueBudget,
+            ) -> Result<Option<StoredValue>, AssociationError> {
+                self.0.read_bounded(l, b)
             }
             fn write(&mut self, l: &Location, v: Option<&StoredValue>) -> Result<(), AssociationError> {
                 self.0.write(l, v)
@@ -1083,6 +1370,13 @@ mod tests {
             fn read(&mut self, l: &Location) -> Result<Option<StoredValue>, AssociationError> {
                 self.fake.read(l)
             }
+            fn read_bounded(
+                &mut self,
+                l: &Location,
+                b: &mut super::super::ValueBudget,
+            ) -> Result<Option<StoredValue>, AssociationError> {
+                self.fake.read_bounded(l, b)
+            }
             fn write(&mut self, l: &Location, v: Option<&StoredValue>) -> Result<(), AssociationError> {
                 self.fake.write(l, v)
             }
@@ -1125,7 +1419,10 @@ mod tests {
         fake.0.lock().unwrap().values.push((location.clone(), after.clone()));
         let receipt = AssociationReceipt {
             owner: fake.owner(),
-            remaining: vec![Change { location, before, after: Some(after) }],
+            remaining: super::super::SharedChanges::admitted(
+                vec![Change { location, before, after: Some(after) }],
+                super::super::Admission::acquire(super::super::WORKSPACE_BYTES).unwrap(),
+            ),
         };
         let mut journal = Journal::open(journal_path.clone()).unwrap();
         journal.begin(receipt).unwrap();
@@ -1179,7 +1476,9 @@ mod tests {
         assert_eq!(fake.0.lock().unwrap().writes, 0);
         assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 1, "planning only creates worker lock");
         // The frontend snapshot is never the authority passed back to Apply.
-        visible_plan.changes[0].after = Some(StoredValue::text("tampered frontend copy"));
+        let (mut tampered, admission) = visible_plan.changes.copied().unwrap();
+        tampered[0].after = Some(StoredValue::text("tampered frontend copy"));
+        visible_plan.changes = super::super::SharedChanges::admitted(tampered, admission);
         e.execute(Request::Apply { token: second }).unwrap();
         assert_ne!(fake.0.lock().unwrap().values[0].1, StoredValue::text("tampered frontend copy"));
         assert!(e.execute(Request::Apply { token: second }).is_err(), "review is consumed");
@@ -1377,6 +1676,13 @@ mod tests {
                     }
                     fn read(&mut self, l: &Location) -> Result<Option<StoredValue>, AssociationError> {
                         self.0.read(l)
+                    }
+                    fn read_bounded(
+                        &mut self,
+                        l: &Location,
+                        b: &mut super::super::ValueBudget,
+                    ) -> Result<Option<StoredValue>, AssociationError> {
+                        self.0.read_bounded(l, b)
                     }
                     fn write(&mut self, l: &Location, v: Option<&StoredValue>) -> Result<(), AssociationError> {
                         self.0.write(l, v)
