@@ -65,6 +65,14 @@ impl Editor {
                                 break;
                             }
                         }
+                        // CRLF is one editing boundary, even when byte-length
+                        // normalization moves the old position onto its LF.
+                        if *position > 0
+                            && text::byte(&saved.snapshot, *position)? == Some(b'\n')
+                            && text::byte(&saved.snapshot, *position - 1)? == Some(b'\r')
+                        {
+                            *position -= 1;
+                        }
                     }
                     cursor.desired_column = None;
                 }

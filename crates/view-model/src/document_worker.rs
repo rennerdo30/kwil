@@ -759,11 +759,26 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             first_visible_line: 0,
             first_byte_column: 0,
         };
-        let (mut document, recovered, base, origins) = recover_prepared(&root, &mut encoding, path.clone(), &metadata)?;
+        let recovered = recover_prepared(&root, &mut encoding, path.clone(), &metadata).and_then(
+            |(mut document, recovered, base, origins)| {
+                mark_recovered_unsaved(&mut document)?;
+                Ok((document, recovered, base, origins))
+            },
+        );
+        let (document, recovered, base, origins) = match recovered {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                // Keep its identity reserved and show an addressed failure.
+                // A bad orphan must not discard the initialized I/O lane or
+                // prevent unrelated documents from opening and saving.
+                session.restore_tab(Tab { saved_revision: 1, ..metadata })?;
+                orphans.insert(*id, Err(error));
+                continue;
+            }
+        };
         // Orphan metadata never proves a saved state, including revision zero.
         // Reserve an unreachable saved marker on the Document itself: sync
         // must not turn the Session dirty flag back into a clean document.
-        mark_recovered_unsaved(&mut document)?;
         let recovery_path = base.original_path;
         // Keep the old name as recovery context, never as an unverified
         // writable backing on the recovered orphan document.
@@ -778,12 +793,12 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             first_visible_line: 0,
             first_byte_column: 0,
         })?;
-        orphans.insert(*id, (document, recovered, origins));
+        orphans.insert(*id, Ok((document, recovered, origins)));
     }
     for tab in session.tabs() {
         let result = if paths.contains_key(&tab.id) {
             let recovered = match orphans.remove(&tab.id) {
-                Some(recovered) => Ok(recovered),
+                Some(recovered) => recovered,
                 None => recover_prepared(&root, &mut encoding, paths[&tab.id].clone(), tab)
                     .map(|(d, r, _, origins)| (d, r, origins)),
             };
@@ -1514,6 +1529,64 @@ mod tests {
     }
 
     #[test]
+    fn malformed_orphan_does_not_disable_unrelated_decoded_open_and_save() {
+        let root = Scratch::new();
+        let corrupt = root.0.join("91.kwj");
+        let corrupt_bytes = b"malformed recovery journal";
+        std::fs::write(&corrupt, corrupt_bytes).unwrap();
+        let source = root.0.join("unrelated.txt");
+        std::fs::write(&source, b"unrelated").unwrap();
+        let output = root.0.join("new-work.txt");
+        let (tx, rx) = mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = tx.send(result);
+        })
+        .unwrap();
+        worker.try_submit(DocumentRequest::Prepare { root: Some(root.0.clone()) }).unwrap();
+        let failed_recoveries = loop {
+            if let DocumentResult::Prepared(result) = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                break result
+                    .ok()
+                    .map(|prepared| prepared.documents.iter().filter(|(_, result)| result.is_err()).count());
+            }
+        };
+        worker
+            .try_submit(DocumentRequest::Open { document: DocumentId(92), revision: 0, path: source.clone() })
+            .unwrap();
+        let opened = loop {
+            if let DocumentResult::Indexed { result, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                break result.is_ok();
+            }
+        };
+        let mut editor = crate::Editor::new(Document::new());
+        editor
+            .execute("edit.insert", &crate::CommandArgs { text: Some("new work".into()), ..Default::default() }, 1)
+            .unwrap();
+        let request = editor.save_request(Some(output.clone())).unwrap();
+        worker
+            .try_submit(DocumentRequest::Save {
+                document: DocumentId(93),
+                request,
+                plan: editor.document().save_plan(),
+            })
+            .unwrap();
+        let saved = loop {
+            if let DocumentResult::Saved { result, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                break result.is_ok();
+            }
+        };
+        drop(editor);
+        drop(worker);
+        wait_stopped(&rx);
+        assert_eq!(failed_recoveries, Some(1), "retain the failed orphan as an addressed recovery item");
+        assert!(opened, "bad recovery must not block unrelated decoded opening");
+        assert!(saved, "bad recovery must not block new-document Save As");
+        assert_eq!(std::fs::read(output).unwrap(), b"new work");
+        assert_eq!(std::fs::read(source).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read(corrupt).unwrap(), corrupt_bytes);
+    }
+
+    #[test]
     fn production_save_normalization_is_an_undoable_receipted_edit() {
         let root = Scratch::new();
         let path = root.0.join("joined-opaque.txt");
@@ -1564,6 +1637,39 @@ mod tests {
         assert_eq!(saved_text, "¢".as_bytes());
         assert_eq!(undone, b"\xff\xff", "undo must restore both original opaque atoms");
         assert_eq!(redone, "¢".as_bytes());
+    }
+
+    #[test]
+    fn normalized_save_caret_preserves_crlf_boundary_through_undo_redo_and_delete() {
+        let root = Scratch::new();
+        let path = root.0.join("normalized-crlf.txt");
+        std::fs::write(&path, b"\xef\xbb\xbf\xc2X\xa2 \r\n").unwrap();
+        let (_, mut storage) = prepare_root(root.0.clone()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let document =
+            storage.encoding.open(path.clone(), TextFile::open(&path).unwrap(), None, &cancel, |_| Ok(())).unwrap();
+        let mut editor = crate::Editor::new(document);
+        editor.settings.editor.trim_trailing_whitespace_on_save = true;
+        editor.set_cursors(vec![crate::Cursor { anchor: 1, head: 1, desired_column: None }], 0).unwrap();
+        editor.execute("edit.delete", &Default::default(), 1).unwrap();
+        editor.set_cursors(vec![crate::Cursor { anchor: 3, head: 3, desired_column: None }], 0).unwrap();
+        let request = editor.save_request(None).unwrap();
+        let saved = storage.encoding.save(request, editor.document().save_plan(), &cancel).unwrap();
+        editor.finish_save(Ok(saved)).unwrap();
+        let saved_caret = editor.cursors()[0].head;
+        editor.execute("edit.undo", &Default::default(), 2).unwrap();
+        let undone_caret = editor.cursors()[0].head;
+        editor.execute("edit.redo", &Default::default(), 3).unwrap();
+        let redone_caret = editor.cursors()[0].head;
+        editor.execute("edit.delete", &Default::default(), 4).unwrap();
+        let mut deleted = Vec::new();
+        editor.document().snapshot().write_to(&mut deleted).unwrap();
+        drop(editor);
+        stop_storage(storage);
+        assert_eq!(saved_caret, 2, "normalized caret must precede the entire CRLF pair");
+        assert_eq!(undone_caret, 3);
+        assert_eq!(redone_caret, 2);
+        assert_eq!(deleted, "¢".as_bytes(), "Delete consumes both newline bytes");
     }
 
     fn prepare_test_worker(worker: &DocumentWorker, receiver: &mpsc::Receiver<DocumentResult>, root: &std::path::Path) {
@@ -2300,7 +2406,12 @@ mod tests {
         drop(service);
         drop(handle);
         let before = std::fs::read(&path).unwrap();
-        assert!(prepare(Some(scratch.0.clone())).is_err());
+        let (prepared, storage) = prepare(Some(scratch.0.clone())).unwrap();
+        assert_eq!(prepared.documents.len(), 1);
+        assert_eq!(prepared.documents[0].0, DocumentId(9));
+        assert!(prepared.documents[0].1.is_err(), "an incomplete seed remains an addressed recovery error");
+        drop(prepared);
+        stop_storage(storage);
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
