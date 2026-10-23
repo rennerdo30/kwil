@@ -350,3 +350,73 @@ No compilation, fault execution or native/platform acceptance is claimed here.
 
 Evidence: `E:/AgentData/scratch/kwil-v1-wave-formatter-r8-de1ef14`.
 Source-only pending a fresh direct ROOT Cargo grant.
+
+## R9 source candidate after independent review (2026-10-23)
+
+Pinned review/source baseline: `9dcc8e0e5194a7f995efecb209cb03e7ae34d813`.
+Two inherited contracts failed: SQL inferred universal dollar quotation from a
+matching spelling; PHP inferred outer heredoc context from its physical label.
+The wider SQL audit found the same unproven assumption for bracket identifiers
+versus PostgreSQL array/subscript expressions. ROOT approved refusal and the
+named expectation changes recorded in FAILURE-MATRIX.md; original inputs and
+all 70 prior test names/counts remain. No unrelated assertion changes are allowed.
+ROOT also approved the consequent R1 historical count correction to 13 failures
+and 0 passes, retaining the original idempotence input and independent positive.
+That retained script's runtime is not included in the proposed six R9 processes.
+
+SQL now refuses ambiguous dollar/bracket introducers and dollar-bearing ASCII
+atoms, after preserving the earlier Unicode-name guard. Proven common quoted
+tokens, nonnested comments, complete ordinary atoms and literal marker bytes
+still format. PHP distinguishes nowdoc from interpolating heredoc and handles
+escaped dollars/backslashes in constant state; an unescaped dollar refuses the
+request before any edit is returned. This interim safety guard deliberately
+leaves proper interpolation lexer support as required feature work.
+
+Four R9 tests cover exact significant-byte witnesses, SQL parameter/quote/ARRAY
+boundaries, nested PHP interpolation/script strings/comments/braces, escaped
+syntax, open headers, EOF, full-context selections, contextless preservation and
+all 16 tidy-switch combinations with positive plain/nowdoc/code controls.
+The retained matrix and older fail-first scripts remain meaningful.
+
+Prepared finite proposal: six pinned Cargo processes, each offline/locked/-j4,
+hidden and bounded to 180 seconds: new four tests; historical 9dcc8e0 four intended
+behavior failures; independent SQL two failures; independent PHP two failures;
+exact restored fresh 74 retained integration tests; strict all-target Clippy.
+Owned rustfmt is separate, bounded, and limited to changed formatter Rust files.
+No Cargo, fault execution, native/platform/performance or adoption is claimed.
+Public API, manifests, versions and dependencies are unchanged.
+
+Evidence: `E:/AgentData/scratch/kwil-v1-wave-formatter-r9-9dcc8e0`.
+Cargo remains on HOLD until a fresh direct finite ROOT grant.
+
+## R10 source candidate after independent review (2026-10-23)
+
+R10 audits exact validated R9 source at HEAD05edc5f8. SQL line-comment CR was
+mistaken for a universal end; shell physical heredoc lines were mistaken for
+logical delimiter lines. Both can hide the real literal context and rewrite
+significant bytes. SQL now refuses CR before returning any edit. Shell uses a
+bounded streaming logical matcher: odd unquoted backslash-LF joins, even parity
+does not, quoted markers remain physical, <<- strips logical leading tabs for
+recognition, and each queued heredoc retains its own quote/tab policy. CR remains
+data; incomplete logical EOF and unparsed/command-substituted headers retain the
+uncertain suffix. No raw heredoc bytes are normalized by delimiter recognition.
+
+All74 prior tests remain byte-identical. Four new tests add exact wrong-byte
+witnesses, full-context/contextless selections, all16 tidy masks and ordinary
+LF/quoted/nowdoc/header/tab/queue/CR/EOF and code-formatting positive controls.
+No prior test expectation or historical harness count changes in this round.
+
+R9 historical source is a SHA-pinned pre-edit snapshot, not the bare9dcc8e0 Git
+object (which predates R9). Exact copies/provenance are stored outside the repo.
+Independent SQL CR and shell logical-boundary faults retain other guards and must
+freshly compile, normally exit101 and fail exact byte assertions. Exact restoration
+then logged mtime refresh occurs per fault; restored timestamps stay fresh after
+the final positive compile. Zero-case/compiler/stale/abnormal results are excluded.
+
+Finite proposal: six pinned/offline/locked/-j4 Cargo processes, hidden owned
+PIDs180s each: fresh R10four, historicalfour intended byte failures, SQLtwo and
+Shelltwo independent failures, restored fresh78 retained integration tests,
+strict all-target Clippy-Dwarnings; separate bounded own fmt. No Cargo run yet.
+Public API, dependencies/manifests, worker defaults and limits remain unchanged.
+Proper PHP interpolation/full any-file work and production/native/adoption gates
+remain with ROOT. Evidence: `E:/AgentData/scratch/kwil-v1-wave-formatter-r10-05edc5f`.

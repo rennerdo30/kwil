@@ -1,7 +1,7 @@
 //! Small, conservative literal tokenizers, not parsers or keyword tables.
 //! One span is retained at a time. Ambiguous syntax protects the remaining bytes
-//! (including EOF), rather than guessing where a literal ends. Comments are
-//! identified and retained too. Interpolation expressions are never reformatted.
+//! (including EOF), or refuses the edit, rather than guessing where a literal
+//! ends. Comments are retained too. Interpolation expressions are never reformatted.
 use crate::{FormatError, Indent, Output, Settings};
 use std::ops::Range;
 
@@ -63,7 +63,7 @@ pub fn tidy(
         out.push(&text[range])?;
         return Ok(out.text);
     }
-    let mut scanner = Scanner { text, kind, pos: 0 };
+    let mut scanner = Scanner { text, kind, pos: 0, refusal: None };
     let mut span = scanner.next();
     let b = text.as_bytes();
     let mut start = range.start;
@@ -145,6 +145,15 @@ pub fn tidy(
         }
         start = next;
     }
+    if let Some(at) = scanner.refusal {
+        // No replacement escapes this function when lexical proof failed, even
+        // if the selected lines preceded the uncertain interpolation boundary.
+        return Err(FormatError::new(
+            "PHP",
+            "heredoc interpolation boundary is unproven; configure an external formatter",
+            crate::line_at(b, at).saturating_sub(crate::line_at(b, range.start) - 1).max(1),
+        ));
+    }
     let final_ending = text.ends_with('\n') || kind != Kind::Shell && text.ends_with('\r');
     if !selected && settings.final_newline && !eof_protected && !final_ending {
         out.push(eol.unwrap_or("\n"))?;
@@ -156,6 +165,7 @@ struct Scanner<'a> {
     text: &'a str,
     kind: Kind,
     pos: usize,
+    refusal: Option<usize>,
 }
 impl Scanner<'_> {
     fn uncertain(&self) -> usize {
@@ -272,7 +282,43 @@ impl Scanner<'_> {
         Some(self.uncertain())
     }
 
-    fn heredoc(&self, start: usize) -> usize {
+    fn shell_heredoc_line(&self, start: usize, delimiter: &str, strip: bool, quoted: bool) -> Option<(usize, bool)> {
+        // Match the logical line without materializing it. Unquoted backslash-LF
+        // removal precedes delimiter matching (and leading-tab stripping). Paired
+        // backslashes quote each other, so only odd parity removes a following LF.
+        // CR is ordinary shell data, including the CR in backslash-CRLF.
+        let b = self.text.as_bytes();
+        let mut at = start;
+        let mut matched = Some(0);
+        let mut leading = true;
+        while at < b.len() {
+            if !quoted && b[at] == b'\\' {
+                if b.get(at + 1) == Some(&b'\n') {
+                    at += 2;
+                    continue;
+                }
+                if b.get(at + 1) == Some(&b'\\') {
+                    matched = None;
+                    leading = false;
+                    at += 2;
+                    continue;
+                }
+            }
+            if b[at] == b'\n' {
+                return Some((at + 1, matched == Some(delimiter.len())));
+            }
+            if !(strip && leading && b[at] == b'\t') {
+                leading = false;
+                matched = matched.filter(|&n| delimiter.as_bytes().get(n) == Some(&b[at])).map(|n| n + 1);
+            }
+            at += 1;
+        }
+        // A missing logical newline leaves EOF unproven; retain it exactly,
+        // including a final escaped newline or a delimiter-looking EOF fragment.
+        None
+    }
+
+    fn heredoc(&mut self, start: usize) -> usize {
         let b = self.text.as_bytes();
         let header_end = self.line_end(start);
         let mut i = start;
@@ -310,6 +356,10 @@ impl Scanner<'_> {
                 i += 1;
             }
             let quote = b.get(i).copied().filter(|c| matches!(c, b'\'' | b'"' | b'`'));
+            if self.kind == Kind::Shell && quote == Some(b'`') {
+                // Command substitution does not prove a literal delimiter word.
+                return self.uncertain();
+            }
             if quote.is_some() {
                 i += 1;
             }
@@ -329,13 +379,23 @@ impl Scanner<'_> {
             } else if i < header_end && !matches!(b[i], b' ' | b'\t' | b';' | b'<' | b')') {
                 return self.uncertain();
             }
-            delimiters.push((delimiter, strip));
+            delimiters.push((delimiter, strip, quote == Some(b'\''), quote.is_some()));
         }
         let mut body = self.after_line(start);
-        for (delimiter, strip) in delimiters {
+        for (delimiter, strip, nowdoc, quoted) in delimiters {
             loop {
                 if body >= b.len() {
                     return self.uncertain();
+                }
+                if self.kind == Kind::Shell {
+                    let Some((next, closes)) = self.shell_heredoc_line(body, delimiter, strip, quoted) else {
+                        return self.uncertain();
+                    };
+                    body = next;
+                    if closes {
+                        break;
+                    }
+                    continue;
                 }
                 let end = self.line_end(body);
                 let original = &self.text[body..end];
@@ -362,6 +422,27 @@ impl Scanner<'_> {
                     }
                     body = self.after_line(body);
                     break;
+                }
+                if self.kind == Kind::Php && !nowdoc {
+                    // A physical label is a terminator only in OUTER literal
+                    // context. PHP interpolation can enter nested script strings,
+                    // comments and braces containing that same physical label.
+                    // Rather than invent a partial PHP expression parser, refuse
+                    // unescaped dollar syntax before trusting any later label.
+                    // Nowdocs have no interpolation. Heredoc \$ and \\ escapes
+                    // are resolved in constant state; other escapes cannot hide
+                    // a later interpolation introducer (including \{$...}).
+                    let mut at = body;
+                    while at < end {
+                        if b[at] == b'\\' && b.get(at + 1).is_some_and(|c| matches!(c, b'$' | b'\\')) {
+                            at += 2;
+                        } else if b[at] == b'$' {
+                            self.refusal = Some(at);
+                            return self.uncertain();
+                        } else {
+                            at += 1;
+                        }
+                    }
                 }
                 body = self.after_line(body);
             }

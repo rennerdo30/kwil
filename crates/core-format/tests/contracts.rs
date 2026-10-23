@@ -266,9 +266,14 @@ fn markup_preserves_whitespace_text_and_xml_space() {
 
 #[test]
 fn sql_preserves_dialect_literals_identifiers_and_comments() {
+    let input = "select [from], $tag$where  x$tag$, $$select\n x$$ from t -- keep where\nwhere x='it''s  x';";
+    let error = format(input.as_bytes(), Language::Sql, "", None, &Settings::default()).unwrap_err();
+    assert!(error.message.contains("dialect") && error.message.contains("external formatter"), "{error}");
+    let error = format(b"select [from] from t;", Language::Sql, "", None, &Settings::default()).unwrap_err();
+    assert!(error.message.contains("dialect") && error.message.contains("external formatter"), "{error}");
     golden(
-        "select [from], $tag$where  x$tag$, $$select\n x$$ from t -- keep where\nwhere x='it''s  x';",
-        "SELECT [from], $tag$where  x$tag$, $$select\n x$$\nFROM t -- keep where\nWHERE x='it''s  x';\n",
+        "select 'where  x', \"from\" from t /* keep where */ where x='it''s  x';",
+        "SELECT 'where  x', \"from\"\nFROM t /* keep where */\nWHERE x='it''s  x';\n",
         Language::Sql,
     );
     assert!(

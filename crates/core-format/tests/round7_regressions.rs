@@ -45,6 +45,11 @@ fn sql_comment_boundaries_are_proven_without_entering_literals_or_comments() {
             sql_refuses_unproven_boundary(&input);
             continue;
         }
+        if atom.starts_with(['$', '[']) {
+            let error = format(input.as_bytes(), Language::Sql, "sql", None, &Settings::default()).unwrap_err();
+            assert!(error.message.contains("dialect") && error.message.contains("external formatter"), "{error}");
+            continue;
+        }
         let result = format(input.as_bytes(), Language::Sql, "sql", None, &Settings::default()).unwrap();
         assert_eq!(result.bytes, format!("SELECT {atom}\nFROM t;\n").as_bytes(), "{atom}");
     }

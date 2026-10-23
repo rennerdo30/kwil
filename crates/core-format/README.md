@@ -72,7 +72,10 @@ input ceiling; a lower output limit is checked after its serialization.
   are emitted. Other function spans remain verbatim too.
   SQL uppercases a small reserved-keyword set and separates top-level clauses.
   Both preserve quoted text/comments and validate balanced delimiters, not the
-  full language grammar. SQL also preserves bracket and dollar-quoted content.
+  full language grammar. Code-level dollar and bracket syntax requires a selected
+  dialect and is refused: SQLite parameters and PostgreSQL dollar quotes share
+  spellings, while bracket identifiers conflict with array/subscript expressions.
+  A matching delimiter alone cannot prove which grammar owns the intervening bytes.
   SQL retains original whitespace separators so newline-concatenated literals
   remain concatenated. A nested opener inside a SQL block comment is refused:
   nested and first-close dialects disagree on where ordinary code resumes.
@@ -88,11 +91,17 @@ input ceiling; a lower output limit is checked after its serialization.
   A code-level `--` also requires a following ASCII whitespace/control byte;
   otherwise MySQL can parse minus operators where another dialect hides the
   rest of the line. The whole request is refused before any quote can be hidden.
-  `--` inside an already-proven string, identifier, dollar quote or block comment
+  `--` inside an already-proven quoted token or block comment
   stays literal data. Without a following byte, the boundary is unproven too.
+  A CR inside an admitted line comment refuses the whole edit: SQLite ends it
+  only at LF, while another dialect may resume code at CR. LF-only and ordinary
+  EOF comments still format; quoted/block-comment CR bytes stay atomic. See
+  [SQLite comment syntax](https://www.sqlite.org/lang_comment.html).
   Backslashes inside SQL quoted tokens are refused too: standard-conforming and
-  escape-enabled dialects disagree on which quote ends the token. Dollar-quoted
-  spans retain their known delimiters and are not subject to this ambiguity.
+  escape-enabled dialects disagree on which quote ends the token. Dollar-bearing
+  unquoted atoms are refused too; a name/number must never expose a parameter or
+  keyword-looking suffix. Dollar/bracket marker bytes in common quoted tokens
+  and comments remain byte-exact.
   SQL keyword classification operates on complete identifier/number atoms. An
   unquoted non-ASCII atom is refused before keyword classification because this
   formatter has no selected dialect's Unicode identifier rules. Unicode quoted
@@ -116,7 +125,13 @@ input ceiling; a lower output limit is checked after its serialization.
   unproven constructs protect the remaining suffix, rather than guessing a closing
   delimiter. Code before that suffix can still be tidied. PHP inline HTML and
   attributes and Ruby trailing data are protected. PHP heredoc spans stop at the
-  closing label, so following expression literals are tokenized normally.
+  closing label, so following expression literals are tokenized normally when
+  that label is proven to occur in the outer literal context. Nowdocs do not
+  interpolate. Plain heredocs and escaped dollars remain supported; an unescaped
+  dollar in an interpolating heredoc refuses the request before any replacement
+  is returned. Nested PHP script strings/comments/braces can otherwise hide a
+  physical label. This bounded uncertainty guard is interim preservation safety,
+  not complete interpolation support or acceptance of the PHP formatting feature.
   PHP's `__halt_compiler` introducer is ASCII-case-insensitive; every case
   protects its trailing data through EOF. Text inside an already-proven string
   or comment does not activate that halt boundary, and ordinary code still tidies.
@@ -137,6 +152,14 @@ input ceiling; a lower output limit is checked after its serialization.
   Unicode escapes are translated before comments and literal delimiters, so a
   raw-source tokenizer cannot establish their lexical context safely.
   Comments are preserved too (trimming them is allowed by policy, but not needed).
+  Shell heredoc terminators are matched against bounded logical lines: unquoted
+  odd-parity backslash-LF pairs join physical lines before delimiter comparison,
+  so a physical marker can remain body data and joined fragments can form the
+  real marker. Quoted delimiters disable joining; `<<-` strips leading logical
+  tabs only for recognition. Original body bytes are emitted unchanged. CR and
+  backslash-CRLF remain data, incomplete logical EOF stays protected, and queued
+  heredocs retain their own quoting/tab policy. Command-substituted/mixed/escaped
+  delimiter headers remain uncertain. See [Bash heredocs](https://www.gnu.org/s/bash/manual/html_node/Redirections.html).
   Boundary references: [PHP heredoc expressions](https://www.php.net/manual/en/language.types.string.php#language.types.string.syntax.heredoc),
   [PHP attributes](https://www.php.net/manual/en/language.attributes.syntax.php),
   [ECMAScript comments](https://tc39.es/ecma262/multipage/ecmascript-language-lexical-grammar.html#sec-comments),
@@ -207,8 +230,10 @@ a fresh helper process and uses independent anonymous temporary files.
 admission guard, proves all contracts fail, and restores the implementation in
 `finally`. Run it only with no other reader of this worktree.
 `verify-review-fail-first.ps1` copies the broken PR base's implementation into
-this owned worktree, runs the review regressions (12 failures and one idempotence
-control), and restores sources in `finally`. The wrapper/grandchild fixture has
+this owned worktree, runs the review regressions (13 behavioral failures after
+R9's approved SQL dollar-refusal correction), and restores sources in `finally`.
+The original idempotence case/input remains, with a new common-SQL positive;
+its historical dollar acceptance must now fail too. The wrapper/grandchild fixture has
 a six-second natural lifetime, so even the broken-copy run leaves no live fixture.
 `verify-round2-fail-first.ps1` restores broken CSS recognition, disables literal
 protection, makes explicit trim an identity and disables descendant containment.
@@ -235,6 +260,18 @@ the next positive run rebuilds repaired source without reusing a mutant binary.
 Sql (universal nesting, two failures) or Php (unbounded tag prefix, two failures).
 Use the approved pinned-toolchain/child-RUSTC runner; all invocations must fit
 the finite parent grant. Exact restoration and explicit freshness logs are kept.
+`verify-round9-fail-first.ps1` selects Base (9dcc8e0, four failures), Sql
+(independent universal dollar/bracket quotation, two failures) or Php
+(independent outer-context admission bypass, two failures). Exact counterexample
+literal/body assertions precede the wider admission matrix, so historical runs
+must expose changed significant bytes rather than merely a missing error.
+All modes require a fresh finite parent Cargo grant; none run during source hold.
+`verify-round10-fail-first.ps1` selects an exact SHA-pinned snapshot of the
+previously validated R9 implementation (Base, four byte-assertion failures), or
+independent CR-comment/logical-heredoc bypasses (Sql/Shell, two failures each).
+The snapshot is retained outside the repository because R9 was an uncommitted
+candidate at HEAD05edc5f8. Fresh compilation, normal101, exact significant-byte
+assertions, byte/SHA restoration and logged source-mtime refresh are required.
 
 All harnesses require a direct parent Cargo grant and no concurrent reader of
 this package. `verify-support.ps1` uses the configured shared cache without

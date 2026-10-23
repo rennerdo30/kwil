@@ -651,10 +651,14 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
             continue;
         }
         let start = i;
-        if sql && matches!(b[i], b'#' | b':' | b'@' | b'?') {
+        if sql && matches!(b[i], b'#' | b':' | b'@' | b'?' | b'$' | b'[') {
             // MySQL starts a line comment here; other dialects use # in
             // operators or temporary identifiers. Parameter/variable prefixes
             // likewise bind names that must never be classified as keywords.
+            // In particular $tag$ is a SQLite parameter as well as a PostgreSQL
+            // quote delimiter. Finding a matching spelling proves neither role.
+            // Likewise [ can open an identifier or a PostgreSQL array/subscript
+            // expression, whose strings may themselves contain closing brackets.
             // Abort the entire edit when their dialect grammar is unproven.
             return Err(FormatError::new(
                 "SQL",
@@ -676,16 +680,7 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
                 line_at(b, i),
             ));
         }
-        let bracket = sql && b[i] == b'[';
-        let dollar = if sql && b[i] == b'$' {
-            text[i + 1..]
-                .find('$')
-                .filter(|&end| text[i + 1..i + 1 + end].bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
-                .map(|end| &text[i..i + end + 2])
-        } else {
-            None
-        };
-        let mut quoted = matches!(b[i], b'\'' | b'"' | b'`') || bracket || dollar.is_some();
+        let mut quoted = matches!(b[i], b'\'' | b'"' | b'`');
         if comment {
             let mut nesting = 1;
             i += 2;
@@ -710,14 +705,18 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
             }
         } else if line_comment {
             i = text[i..].find(['\r', '\n']).map_or(text.len(), |n| i + n);
-        } else if let Some(delimiter) = dollar {
-            let after = i + delimiter.len();
-            i = text[after..]
-                .find(delimiter)
-                .map(|n| after + n + delimiter.len())
-                .ok_or_else(|| FormatError::new(kind, "unterminated dollar-quoted string", line_at(b, start)))?;
+            if b.get(i) == Some(&b'\r') {
+                // SQLite continues through CR until LF, while other dialects
+                // can resume code at CR. Neither side's quote context is proven,
+                // even at EOF or before CRLF; never return a partial edit.
+                return Err(FormatError::new(
+                    "SQL",
+                    "CR line-comment boundary requires an explicit dialect; configure an external formatter",
+                    line_at(b, i),
+                ));
+            }
         } else if quoted {
-            i = quoted_end(text, i, if bracket { b']' } else { b[i] }, sql, kind)?;
+            i = quoted_end(text, i, b[i], sql, kind)?;
         } else if !sql && (b[i] == b'\\' || b[i] == b'-' || b[i] >= 128 || b[i].is_ascii_alphanumeric() || b[i] == b'_')
         {
             while i < b.len() {
@@ -746,6 +745,15 @@ fn lexical(text: &str, settings: &Settings, sql: bool) -> Result<String, FormatE
                 return Err(FormatError::new(
                     "SQL",
                     "Unicode identifier requires an explicit dialect; configure an external formatter",
+                    line_at(b, start),
+                ));
+            }
+            if text[start..i].contains('$') {
+                // Dialects also disagree about dollars embedded in identifiers
+                // and number/parameter adjacency; do not expose a suffix token.
+                return Err(FormatError::new(
+                    "SQL",
+                    "dollar-bearing atom requires an explicit dialect; configure an external formatter",
                     line_at(b, start),
                 ));
             }

@@ -120,6 +120,13 @@ fn protected_literals_idempotent() {
         (Language::Css, "a{content:';}';background:url('a;b}');/* c;} */color:red}"),
         (Language::Sql, "select 'where', \"from\", $tag$select WHERE$tag$, $$from$$ from t;"),
     ] {
+        if language == Language::Sql {
+            let error = format(s.as_bytes(), language, "", None, &Settings::default()).unwrap_err();
+            assert!(error.message.contains("dialect") && error.message.contains("external formatter"), "{error}");
+            let a = out("select 'where', \"from\" from t /* literal $tag$ */;", language, "");
+            assert_eq!(out(&a, language, ""), a, "{language:?}");
+            continue;
+        }
         let a = out(s, language, "");
         assert_eq!(out(&a, language, ""), a, "{language:?}");
     }
