@@ -51,6 +51,7 @@
 
 use kwil_core_text::{Snapshot, SourceChunk, decoded_backing::DecodedSnapshot, encoding::Encoding};
 pub mod decode;
+pub mod journal;
 pub mod payload;
 pub mod replay;
 use std::{
