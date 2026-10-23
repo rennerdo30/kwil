@@ -69,6 +69,14 @@ pub trait AssociationAdapter {
     fn owner(&self) -> String;
     fn read(&mut self, location: &Location) -> Result<Option<StoredValue>, AssociationError>;
     fn write(&mut self, location: &Location, value: Option<&StoredValue>) -> Result<(), AssociationError>;
+    /// Persist restored state (including removals and already-visible old values)
+    /// before its durable recovery receipt may be retired. Called on the worker
+    /// after complete rollback with the ORIGINAL full change list. Visibility or
+    /// platform notification alone is insufficient. Unsupported backends must
+    /// keep recovery rather than promise durability they cannot establish.
+    fn sync_restored(&mut self, _changes: &[Change]) -> Result<(), AssociationError> {
+        Err(err("backend cannot verify durable association restoration; retain recovery receipt"))
+    }
     /// Notify the platform after owned mutations; never runs during planning.
     fn notify_changes(&mut self) {}
 }
@@ -444,6 +452,30 @@ impl AssociationAdapter for LinuxAssociations {
     fn owner(&self) -> String {
         format!("xdg:{}:{}", self.data_home.display(), self.config_home.display())
     }
+    #[cfg(target_os = "linux")]
+    fn sync_restored(&mut self, changes: &[Change]) -> Result<(), AssociationError> {
+        for change in changes {
+            let path = self.path(&change.location)?;
+            // Reopening a restored file also covers retries where rollback saw
+            // Before and therefore performed no write this time.
+            match std::fs::File::open(path) {
+                Ok(file) => file.sync_all().map_err(|e| err(e.to_string()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(err(e.to_string())),
+            }
+            // fsync(file) does not persist rename/unlink. Sync the containing
+            // directory and its ancestors, including directories made by Apply.
+            // If Apply never reached this file, a parent can still be absent.
+            for directory in path.ancestors().skip(1) {
+                match std::fs::File::open(directory) {
+                    Ok(file) => file.sync_all().map_err(|e| err(e.to_string()))?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(err(e.to_string())),
+                }
+            }
+        }
+        Ok(())
+    }
     fn read(&mut self, location: &Location) -> Result<Option<StoredValue>, AssociationError> {
         let path = self.path(location)?;
         match std::fs::symlink_metadata(path) {
@@ -532,6 +564,34 @@ impl AssociationAdapter for WindowsAssociations {
     }
     fn write(&mut self, location: &Location, value: Option<&StoredValue>) -> Result<(), AssociationError> {
         windows_registry(location, value, true).map(|_| ())
+    }
+    fn sync_restored(&mut self, changes: &[Change]) -> Result<(), AssociationError> {
+        // Validate receipt resources through the same per-user restriction as
+        // reads/writes. A missing value/key still requires the hive barrier.
+        for change in changes {
+            self.read(&change.location)?;
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        // Flush the Classes key's containing hive (Classes can be mounted in a
+        // separate hive from HKCU itself). One barrier, not one per value.
+        use windows_sys::Win32::{Foundation::ERROR_SUCCESS, System::Registry::*};
+        let key: Vec<u16> = "Software\\Classes".encode_utf16().chain(Some(0)).collect();
+        let mut handle = std::ptr::null_mut();
+        let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_QUERY_VALUE, &mut handle) };
+        if status != ERROR_SUCCESS {
+            return Err(err(std::io::Error::from_raw_os_error(status as i32).to_string()));
+        }
+        let status = unsafe { RegFlushKey(handle) };
+        unsafe {
+            RegCloseKey(handle);
+        }
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(err(std::io::Error::from_raw_os_error(status as i32).to_string()))
+        }
     }
     fn notify_changes(&mut self) {
         use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};

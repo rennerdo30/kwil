@@ -7,6 +7,8 @@
 //! An immutable, synced full receipt precedes every backend write. Until Undo
 //! retires it, even a failed/interrupted Apply prevents another transaction.
 //! Undo always replays the original receipt, so an interrupted Undo is retryable.
+//! Native restoration must pass the backend durability barrier before retirement;
+//! a failed/unsupported barrier retains that full receipt even if reads show Before.
 //! Records are never replaced, renamed or deleted. History has a finite limit;
 //! reaching it requires explicit host maintenance while the service is stopped.
 //!
@@ -413,6 +415,7 @@ impl<A: AssociationAdapter> Engine<A> {
                         errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
                     )));
                 }
+                self.adapter.sync_restored(record.receipt.pending())?;
                 self.journal.retire()?;
                 self.pending = None;
                 Ok(Response::Undone { journal_id })
@@ -585,7 +588,8 @@ impl Journal {
             }
             Err(e) => return Err(e.into()),
         };
-        // An empty immutable marker can only be created AFTER complete Undo.
+        // An empty immutable marker can only be created AFTER complete Undo
+        // and successful backend durability verification of restored state.
         // A crash before/during sync either retains the original receipt for
         // idempotent retry, or observes this safe retirement. Never rename away.
         marker.sync_all()?;
@@ -775,6 +779,10 @@ mod tests {
         fail_from: Option<usize>,
         panic_at: Option<usize>,
         durable: Option<PathBuf>,
+        durable_values: Vec<(Location, StoredValue)>,
+        fail_barrier: bool,
+        crash_at_barrier: bool,
+        barriers: usize,
     }
     #[derive(Clone, Default)]
     struct Fake(Arc<Mutex<FakeState>>);
@@ -806,6 +814,27 @@ mod tests {
             if let Some(v) = value {
                 s.values.push((location.clone(), v.clone()));
             }
+            Ok(())
+        }
+        fn sync_restored(&mut self, changes: &[super::super::Change]) -> Result<(), AssociationError> {
+            let mut s = self.0.lock().unwrap();
+            s.barriers += 1;
+            assert_eq!(changes.len(), 3, "barrier must cover the original full receipt");
+            for change in changes {
+                assert_eq!(
+                    s.values.iter().find(|(l, _)| *l == change.location).map(|(_, v)| v),
+                    change.before.as_ref()
+                );
+            }
+            if s.crash_at_barrier {
+                s.values = s.durable_values.clone();
+                drop(s);
+                panic!("simulated crash before backend durability barrier");
+            }
+            if s.fail_barrier {
+                return Err(super::super::err("injected backend durability barrier failure"));
+            }
+            s.durable_values = s.values.clone();
             Ok(())
         }
     }
@@ -843,6 +872,121 @@ mod tests {
             wake.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                 .expect("bounded worker completion");
         }
+    }
+
+    fn applied_durability_fixture(scratch: &Scratch, fake: &Fake) -> (Engine<Fake>, AssociationPlan) {
+        let mut e = engine(scratch, fake);
+        let (_, baseline) = planned(&mut e);
+        // Two prior typed values plus one absent value exercise both replacement
+        // and removal. Simulate the OS independently flushing the applied state.
+        fake.0.lock().unwrap().values = baseline.changes[..2]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.location.clone(), StoredValue { kind: 20 + i as u32, bytes: vec![0, 255, i as u8] }))
+            .collect();
+        let (token, plan) = planned(&mut e);
+        e.execute(Request::Apply { token }).unwrap();
+        let mut s = fake.0.lock().unwrap();
+        s.durable_values = s.values.clone();
+        (e, plan)
+    }
+
+    #[test]
+    fn undo_makes_restored_values_and_removals_durable_before_retirement() {
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let (mut e, plan) = applied_durability_fixture(&scratch, &fake);
+        e.execute(Request::Undo { journal_id: 1 }).unwrap();
+        {
+            let mut s = fake.0.lock().unwrap();
+            // Crash discards visible, unflushed state; only durable state survives.
+            s.values = s.durable_values.clone();
+            for change in plan.changes() {
+                assert_eq!(
+                    s.values.iter().find(|(l, _)| *l == change.location).map(|(_, v)| v),
+                    change.before.as_ref(),
+                    "retirement must never outlive durable restoration"
+                );
+            }
+            assert_eq!(s.barriers, 1);
+        }
+        drop(e);
+        assert!(status(&mut engine(&scratch, &fake)).recovery.is_none());
+    }
+
+    #[test]
+    fn failed_backend_barrier_keeps_full_recovery_and_retries_already_visible_before() {
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let (mut e, _) = applied_durability_fixture(&scratch, &fake);
+        let intent = fs::read(e.journal.path(1, "intent")).unwrap();
+        fake.0.lock().unwrap().fail_barrier = true;
+        let error = e.execute(Request::Undo { journal_id: 1 }).unwrap_err();
+        assert_eq!(error.recovery, Some(1));
+        assert!(error.message.contains("durability barrier failure"));
+        assert!(!e.journal.path(1, "retired").exists(), "failed barrier must precede marker creation");
+        assert_eq!(fs::read(e.journal.path(1, "intent")).unwrap(), intent);
+        let recovery = status(&mut e).recovery.unwrap();
+        assert_eq!(recovery.receipt.pending().len(), 3);
+        assert!(recovery.current.iter().all(|c| *c == CurrentState::Before));
+        assert!(e.execute(Request::Plan(request())).is_err());
+        drop(e);
+        fake.0.lock().unwrap().fail_barrier = false;
+        let writes = fake.0.lock().unwrap().writes;
+        let mut e = engine(&scratch, &fake);
+        e.execute(Request::Undo { journal_id: 1 }).unwrap();
+        let s = fake.0.lock().unwrap();
+        assert_eq!(s.writes, writes, "already-visible Before needs a barrier, not another write");
+        assert_eq!(s.barriers, 2);
+        assert_eq!(s.durable_values, s.values);
+    }
+
+    #[test]
+    fn crash_before_backend_barrier_preserves_receipt_for_applied_state_on_restart() {
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let (mut e, _) = applied_durability_fixture(&scratch, &fake);
+        fake.0.lock().unwrap().crash_at_barrier = true;
+        let crashed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.execute(Request::Undo { journal_id: 1 })));
+        assert!(crashed.is_err(), "fault must reach the barrier before retirement");
+        assert!(!e.journal.path(1, "retired").exists());
+        drop(e);
+        fake.0.lock().unwrap().crash_at_barrier = false;
+        let mut e = engine(&scratch, &fake);
+        let recovery = status(&mut e).recovery.unwrap();
+        assert_eq!(recovery.receipt.pending().len(), 3);
+        assert!(recovery.current.iter().all(|c| *c == CurrentState::Applied));
+        e.execute(Request::Undo { journal_id: 1 }).unwrap();
+        assert!(status(&mut e).recovery.is_none());
+    }
+
+    #[test]
+    fn unsupported_backend_durability_never_retires_recovery() {
+        // Intentionally inherit the safe default instead of a fake success.
+        struct Unverified(Fake);
+        impl AssociationAdapter for Unverified {
+            fn owner(&self) -> String {
+                self.0.owner()
+            }
+            fn read(&mut self, l: &Location) -> Result<Option<StoredValue>, AssociationError> {
+                self.0.read(l)
+            }
+            fn write(&mut self, l: &Location, v: Option<&StoredValue>) -> Result<(), AssociationError> {
+                self.0.write(l, v)
+            }
+        }
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let (e, _) = applied_durability_fixture(&scratch, &fake);
+        drop(e);
+        let mut e = Engine::new(Unverified(fake), Journal::open(scratch.0.clone()).unwrap()).unwrap();
+        let error = e.execute(Request::Undo { journal_id: 1 }).unwrap_err();
+        assert_eq!(error.recovery, Some(1));
+        assert!(error.message.contains("cannot verify durable"));
+        assert!(!e.journal.path(1, "retired").exists());
+        drop(e);
+        assert_eq!(Journal::open(scratch.0.clone()).unwrap().active.unwrap().receipt.pending().len(), 3);
     }
 
     #[test]
