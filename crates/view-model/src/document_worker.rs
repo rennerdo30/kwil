@@ -626,10 +626,11 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             first_visible_line: 0,
             first_byte_column: 0,
         };
-        let (mut document, recovered, base) = recover_document(path.clone(), &metadata)?;
+        let (document, recovered, base) = recover_document(path.clone(), &metadata)?;
         let summary = recovered.summary();
         let path = base.original_path.filter(|path| !session.tabs().iter().any(|t| t.path.as_ref() == Some(path)));
-        document.path = path.clone();
+        // Keep the old name as recovery context, never as an unverified
+        // writable backing on the recovered orphan document.
         session.restore_tab(Tab {
             id: *id,
             path,
@@ -991,7 +992,10 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
             .unwrap_or(usize::MAX),
     );
     document.buffer = interactive;
-    document.path = tab.path.clone();
+    // A dirty journal has no verified pre-crash original. Keep its bytes
+    // unnamed so Save requires an explicit destination instead of adopting
+    // the current disk contents as a fresh baseline. Clean recovery below
+    // restores the name only after byte equality supplies a valid original.
     // Recovery is dirty even when metadata lagged behind the journal.
     document.revision = revision;
     document.saved_revision = if tab.revision == tab.saved_revision && tab.revision == revision {
@@ -1316,6 +1320,66 @@ mod tests {
         }
         drop(worker);
         wait_stopped(&receiver);
+    }
+
+    #[test]
+    fn dirty_named_recovery_requires_save_as_without_a_verified_original() {
+        for disk_bytes in [b"external\r\n\xff".as_slice(), b"recovered\r\n\xff".as_slice()] {
+            let scratch = Scratch::new();
+            let path = scratch.0.join("named.txt");
+            let tab = recovery_tab(Some(path.clone()));
+            let recovered_bytes = b"recovered\r\n\xff";
+            fixture_journal(&scratch.0, &tab, recovered_bytes);
+            // Even matching current bytes do not prove the pre-crash saved baseline.
+            std::fs::write(&path, disk_bytes).unwrap();
+            let journal_path = scratch.0.join("1.kwj");
+            let journal_bytes = std::fs::read(&journal_path).unwrap();
+            let (document, _, base) = recover_document(journal_path.clone(), &tab).unwrap();
+            assert_eq!(base.original_path.as_deref(), Some(path.as_path()), "keep original recovery context");
+            assert!(document.is_dirty(), "recovery must preserve the unsaved marker");
+            assert_eq!(document.revision(), tab.revision);
+            assert_eq!(document.saved_revision(), tab.saved_revision);
+            assert!(document.original.is_none(), "current disk is not a verified original");
+            assert_eq!(document.line_ending, crate::DocumentLineEnding::CrLf);
+            assert_eq!(document.buffer().add_memory_bytes(), 0, "recovery must remain spill-only");
+            let mut actual = Vec::new();
+            document.snapshot().write_to(&mut actual).unwrap();
+            assert_eq!(actual, recovered_bytes);
+            let mut editor = crate::Editor::new(document);
+            assert!(editor.save_request(None).is_err(), "unverified named recovery must require Save As");
+            assert!(editor.document().path().is_none());
+            assert!(editor.document().is_dirty());
+            assert_eq!(std::fs::read(&path).unwrap(), disk_bytes);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal_bytes);
+            let destination = scratch.0.join("recovered.txt");
+            let request = editor.save_request(Some(destination.clone())).unwrap();
+            let saved = kwil_core_workspace::save_snapshot(request).unwrap();
+            editor.finish_save(Ok(saved)).unwrap();
+            assert!(!editor.document().is_dirty());
+            assert_eq!(std::fs::read(destination).unwrap(), recovered_bytes);
+            assert_eq!(std::fs::read(&path).unwrap(), disk_bytes);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal_bytes);
+        }
+    }
+
+    #[test]
+    fn orphan_named_recovery_retains_path_context_but_requires_save_as() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("named.txt");
+        let tab = recovery_tab(Some(path.clone()));
+        fixture_journal(&scratch.0, &tab, b"recovered\r\n\xff");
+        std::fs::write(&path, b"external bytes").unwrap();
+        let (prepared, storage) = prepare_root(scratch.0.clone()).unwrap();
+        assert_eq!(prepared.session.tabs()[0].path.as_deref(), Some(path.as_path()));
+        let document = prepared.documents.into_iter().next().unwrap().1.unwrap();
+        assert!(document.is_dirty());
+        let mut editor = crate::Editor::new(document);
+        assert!(editor.save_request(None).is_err(), "orphan recovery must also require Save As");
+        let mut bytes = Vec::new();
+        editor.document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"recovered\r\n\xff");
+        assert_eq!(std::fs::read(&path).unwrap(), b"external bytes");
+        stop_storage(storage);
     }
 
     #[test]
@@ -1723,6 +1787,12 @@ mod tests {
         assert_eq!(workspace.session().tabs(), expected.tabs());
         drop(workspace);
         wait_stopped(&receiver);
+        let persisted = session::load_session(&scratch.0.join("session.kws")).unwrap();
+        assert_eq!(persisted.tabs(), expected.tabs(), "persisted metadata keeps the original path context");
+        let mut recovered_tabs = expected.tabs().to_vec();
+        for tab in &mut recovered_tabs {
+            tab.path = None;
+        }
 
         let (sender, receiver) = mpsc::channel();
         let mut restarted = Workspace::new(View::new(None)).unwrap();
@@ -1737,7 +1807,8 @@ mod tests {
         drive(&mut restarted, &receiver, crate::Workspace::recovery_ready);
         restarted.sync_all();
         assert_eq!(restarted.session().active(), expected.active());
-        assert_eq!(restarted.session().tabs(), expected.tabs());
+        assert_eq!(restarted.session().tabs(), recovered_tabs, "unverified dirty backings require Save As");
+        assert!(restarted.view(second).unwrap().status_text().contains("Use Save As"));
         for tab in expected.tabs() {
             assert_eq!(
                 restarted.view(tab.id).unwrap().first_byte_column,
