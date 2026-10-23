@@ -48,6 +48,14 @@
 //! outer-batch admission and `admit` must still form ONE non-interleaved FIFO
 //! worker critical section; two started readers cannot safely compete. If admit
 //! fails after enqueue, stop and clear/reload just as for a journal failure.
+//!
+//! For multiple capsules in ONE outer batch, use `begin_batch`. Its exclusive
+//! guard owns a private staged directory; scoped plans/readers cannot escape or
+//! expose unchecked tokens. Reader `admit` stages IDs for later capsules only.
+//! Guard commit publishes the directory AFTER CommitBatch queue admission, not
+//! durability. Any observed error or unfinished plan/reader poisons the guard;
+//! drop/abort preserves the exact live baseline. Keep this entire sequence on
+//! the same FIFO worker and retain/retire backing owners there. Drops do no I/O.
 
 use kwil_core_text::{Snapshot, SourceChunk, decoded_backing::DecodedSnapshot, encoding::Encoding};
 pub mod decode;
@@ -94,6 +102,9 @@ pub struct OriginRegistry {
     baseline: Arc<Baseline>,
     max_origins: usize,
     max_metadata_bytes: usize,
+    // Nonzero only in a batch's private shadow: retained live directory and
+    // guard/wrapper/control headers, charged in addition to staged two-copy work.
+    metadata_retained: usize,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -135,7 +146,55 @@ impl OriginRegistry {
             baseline: Arc::new(Baseline { epoch: 0, next_id: 1, origins: Vec::new() }),
             max_origins,
             max_metadata_bytes,
+            metadata_retained: 0,
         }
+    }
+
+    /// Worker-only adoption of an ALREADY authenticated/admitted recovered
+    /// directory. Preserve persisted IDs exactly; the next definition is above
+    /// their exact maximum. This validates metadata, not journal authenticity.
+    /// Caller retains DecodedBacking owners on the worker retirement queue.
+    /// No raw read/copy/indexing: only bounded handles, with O(k^2) sorted moves
+    /// and duplicate-ID comparisons for k <= max_origins. Failure drops all
+    /// temporary pins and never publishes a partially adopted registry.
+    pub fn from_recovered(
+        max_origins: usize,
+        max_metadata_bytes: usize,
+        origins: impl IntoIterator<Item = (u64, DecodedSnapshot)>,
+        cancel: &AtomicBool,
+    ) -> io::Result<Self> {
+        poll(cancel)?;
+        if metadata_cost(0)? > max_metadata_bytes {
+            return Err(invalid("origin metadata budget exceeded"));
+        }
+        let mut registry = Self::new(max_origins, max_metadata_bytes);
+        let mut entries: Vec<Origin> = Vec::new();
+        let mut next_id = 1;
+        for (id, snapshot) in origins {
+            poll(cancel)?;
+            if id == 0 || entries.iter().any(|entry| entry.id == id) {
+                return Err(invalid("duplicate or zero recovered origin ID"));
+            }
+            let at = match entries
+                .binary_search_by(|entry| entry.snapshot.paths().directory.cmp(&snapshot.paths().directory))
+            {
+                Ok(_) => return Err(invalid("duplicate recovered origin identity")),
+                Err(at) => at,
+            };
+            let needed = entries.len().checked_add(1).ok_or_else(|| invalid("origin count overflow"))?;
+            if needed > max_origins {
+                return Err(invalid("origin count cap exceeded"));
+            }
+            next_id = next_id.max(add(id, 1)?);
+            registry.check_capacity(entries.capacity().max(needed))?;
+            reserve(&mut entries, 1)?;
+            registry.check_capacity(entries.capacity())?;
+            entries.insert(at, Origin { id, snapshot });
+            poll(cancel)?;
+        }
+        poll(cancel)?;
+        registry.baseline = Arc::new(Baseline { epoch: 0, next_id, origins: entries });
+        Ok(registry)
     }
 
     pub fn origin_count(&self) -> usize {
@@ -143,6 +202,36 @@ impl OriginRegistry {
     }
     pub fn epoch(&self) -> u64 {
         self.baseline.epoch
+    }
+
+    /// Exclusive worker transaction for one outer journal batch. Conservatively
+    /// admit the retained ACTUAL committed capacity plus two max-sized staged
+    /// directories before allocating the shadow. No raw bytes are read/copied.
+    /// IDs/epoch/pins stay live only on explicit successful guard commit.
+    pub fn begin_batch(&mut self) -> io::Result<OriginBatch<'_>> {
+        let epoch = add(self.baseline.epoch, 1)?;
+        let metadata_retained = batch_retained_cost(self.baseline.origins.capacity())?
+            .checked_add(self.metadata_retained)
+            .ok_or_else(|| invalid("batch metadata overflow"))?;
+        let peak = metadata_retained
+            .checked_add(metadata_cost(self.max_origins)?)
+            .ok_or_else(|| invalid("batch metadata overflow"))?;
+        if peak > self.max_metadata_bytes {
+            return Err(invalid("batch origin metadata budget exceeded"));
+        }
+        let mut origins = Vec::new();
+        reserve(&mut origins, self.baseline.origins.len())?;
+        if origins.capacity() > self.max_origins {
+            return Err(invalid("batch origin capacity exceeds admitted bound"));
+        }
+        origins.extend(self.baseline.origins.iter().cloned());
+        let staged = OriginRegistry {
+            baseline: Arc::new(Baseline { epoch, next_id: self.baseline.next_id, origins }),
+            max_origins: self.max_origins,
+            max_metadata_bytes: self.max_metadata_bytes,
+            metadata_retained,
+        };
+        Ok(OriginBatch { live: self, staged, failed: false, pending: false, cancel: None, metadata_peak: peak })
     }
 
     /// Invalidates all outstanding tokens, retaining monotonically increasing
@@ -289,7 +378,14 @@ impl OriginRegistry {
         if total > self.max_origins {
             return Err(invalid("origin count cap exceeded"));
         }
-        self.check_capacity(total)?;
+        let needed = definitions.len().checked_add(1).ok_or_else(|| invalid("origin capacity overflow"))?;
+        self.check_capacity(
+            self.baseline
+                .origins
+                .capacity()
+                .checked_add(definitions.capacity().max(needed))
+                .ok_or_else(|| invalid("origin capacity overflow"))?,
+        )?;
         let id = *next_id;
         *next_id = add(*next_id, 1)?;
         *physical_len = add(*physical_len, definition_len(origin)?)?;
@@ -309,11 +405,13 @@ impl OriginRegistry {
     }
 
     fn check_capacity(&self, slots: usize) -> io::Result<()> {
-        if metadata_cost(slots)? > self.max_metadata_bytes {
-            Err(invalid("origin metadata budget exceeded"))
-        } else {
-            Ok(())
+        let cost = metadata_cost(slots)?
+            .checked_add(self.metadata_retained)
+            .ok_or_else(|| invalid("origin metadata overflow"))?;
+        if self.metadata_retained != 0 && slots > self.max_origins {
+            return Err(invalid("batch origin capacity exceeds admitted bound"));
         }
+        if cost > self.max_metadata_bytes { Err(invalid("origin metadata budget exceeded")) } else { Ok(()) }
     }
 
     /// Reject stale/foreign planning before touching a writer. Keep the entire
@@ -342,7 +440,15 @@ impl OriginRegistry {
         if total > self.max_origins {
             return Err(invalid("origin count cap exceeded"));
         }
-        self.check_capacity(total)?;
+        self.check_capacity(
+            total.max(
+                self.baseline
+                    .origins
+                    .capacity()
+                    .checked_add(token.definitions.capacity())
+                    .ok_or_else(|| invalid("origin capacity overflow"))?,
+            ),
+        )?;
         let mut origins = Vec::new();
         reserve(&mut origins, total)?;
         self.check_capacity(
@@ -369,6 +475,200 @@ impl OriginRegistry {
         poll(&token.cancel)?;
         self.baseline = Arc::new(Baseline { epoch: token.next_epoch, next_id: token.next_id, origins });
         Ok(())
+    }
+}
+
+fn batch_retained_cost(committed_capacity: usize) -> io::Result<usize> {
+    // Existing metadata_cost accounts for TWO staged Baseline headers and
+    // directory slots. Retain the ACTUAL committed directory as a third one,
+    // plus all live/shadow/guard/scoped-wrapper headers and all three Arc control
+    // blocks (two native atomic reference counts each). Plans/readers exclusively
+    // borrow the guard, so only ONE capsule's definition Vec can be retained.
+    // During merge old-staged + definitions + new-staged <=2*max_origins slots;
+    // during definition reallocation old/new definitions fit the same bound.
+    committed_capacity
+        .checked_mul(size_of::<Origin>())
+        .and_then(|n| n.checked_add(size_of::<Baseline>()))
+        .and_then(|n| n.checked_add(size_of::<OriginRegistry>()))
+        .and_then(|n| n.checked_add(size_of::<OriginBatch<'_>>()))
+        .and_then(|n| n.checked_add(size_of::<OriginBatchPlan<'_, '_>>()))
+        .and_then(|n| n.checked_add(size_of::<OriginBatchReader<'_, '_>>()))
+        .and_then(|n| n.checked_add(6 * size_of::<usize>()))
+        .ok_or_else(|| invalid("batch metadata overflow"))
+}
+
+/// One exclusive FIFO-worker scope for an outer journal batch. Staged reader
+/// admission is NOT live publication. Call commit only after the caller's
+/// JournalCommand::CommitBatch queue admission succeeds; later flush establishes
+/// durability. Queue/write failure must drop/abort this guard, never commit it.
+/// Every capsule binds the SAME cancellation Arc; no per-capsule flag list.
+/// No filesystem work occurs on guard/wrapper drop. Backing owners and pins must
+/// still be retained/retired on the worker by the caller.
+#[must_use = "commit only after complete outer batch admission, otherwise abort/drop"]
+pub struct OriginBatch<'registry> {
+    live: &'registry mut OriginRegistry,
+    staged: OriginRegistry,
+    failed: bool,
+    pending: bool,
+    cancel: Option<Arc<AtomicBool>>,
+    metadata_peak: usize,
+}
+
+impl<'registry> OriginBatch<'registry> {
+    pub fn origin_count(&self) -> usize {
+        self.staged.origin_count()
+    }
+    pub fn epoch(&self) -> u64 {
+        self.staged.epoch()
+    }
+    pub fn metadata_reserved_bytes(&self) -> usize {
+        self.metadata_peak
+    }
+    pub fn is_poisoned(&self) -> bool {
+        self.failed
+    }
+
+    fn ready(&self) -> io::Result<()> {
+        if self.failed {
+            return Err(invalid("origin batch is poisoned"));
+        }
+        if self.pending {
+            return Err(invalid("origin batch has an unfinished capsule"));
+        }
+        if let Some(cancel) = &self.cancel {
+            poll(cancel)?;
+        }
+        Ok(())
+    }
+    fn bind(&mut self, cancel: &Arc<AtomicBool>) -> io::Result<()> {
+        self.ready()?;
+        poll(cancel)?;
+        if let Some(bound) = &self.cancel {
+            if !Arc::ptr_eq(bound, cancel) {
+                return Err(invalid("origin batch cancellation flag changed"));
+            }
+        } else {
+            self.cancel = Some(cancel.clone());
+        }
+        Ok(())
+    }
+    fn checked<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    pub fn plan<'batch>(
+        &'batch mut self,
+        snapshot: Snapshot,
+        range: Range<u64>,
+        cancel: Arc<AtomicBool>,
+    ) -> io::Result<OriginBatchPlan<'batch, 'registry>> {
+        let result = self.bind(&cancel).and_then(|()| self.staged.plan(snapshot, range, cancel));
+        let plan = self.checked(result)?;
+        self.pending = true;
+        Ok(OriginBatchPlan { batch: Some(self), plan: Some(plan) })
+    }
+
+    pub fn plan_seed<'batch>(
+        &'batch mut self,
+        snapshot: Snapshot,
+        origin: DecodedSnapshot,
+        cancel: Arc<AtomicBool>,
+    ) -> io::Result<OriginBatchPlan<'batch, 'registry>> {
+        let result = self.bind(&cancel).and_then(|()| self.staged.plan_seed(snapshot, origin, cancel));
+        let plan = self.checked(result)?;
+        self.pending = true;
+        Ok(OriginBatchPlan { batch: Some(self), plan: Some(plan) })
+    }
+
+    /// Infallible publication after readiness/cancellation validation; no new
+    /// directory allocation or callbacks after live publication. Even an empty
+    /// successful batch changes baseline identity/epoch, staling old plans.
+    pub fn commit(mut self) -> io::Result<()> {
+        let result = self.ready();
+        self.checked(result)?;
+        self.live.baseline = self.staged.baseline.clone();
+        Ok(())
+    }
+    pub fn abort(self) {}
+}
+
+/// The underlying CapsulePlan is deliberately private: it cannot escape into
+/// the standalone start/admit API or outlive the exclusive batch borrow.
+#[must_use = "start/read/admit this capsule, or the batch is poisoned"]
+pub struct OriginBatchPlan<'batch, 'registry> {
+    batch: Option<&'batch mut OriginBatch<'registry>>,
+    plan: Option<CapsulePlan>,
+}
+impl<'batch, 'registry> OriginBatchPlan<'batch, 'registry> {
+    pub fn physical_len(&self) -> u64 {
+        self.plan.as_ref().expect("owned batch plan").physical_len()
+    }
+    pub fn logical_len(&self) -> u64 {
+        self.plan.as_ref().expect("owned batch plan").logical_len()
+    }
+    pub fn new_origin_count(&self) -> usize {
+        self.plan.as_ref().expect("owned batch plan").new_origin_count()
+    }
+
+    pub fn start(mut self) -> io::Result<OriginBatchReader<'batch, 'registry>> {
+        let batch = self.batch.take().expect("owned batch borrow");
+        let plan = self.plan.take().expect("owned batch plan");
+        let result = if batch.failed { Err(invalid("origin batch is poisoned")) } else { batch.staged.start(plan) };
+        let reader = batch.checked(result)?;
+        Ok(OriginBatchReader { batch: Some(batch), reader: Some(reader) })
+    }
+}
+impl Drop for OriginBatchPlan<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(batch) = &mut self.batch {
+            batch.failed = true;
+        }
+    }
+}
+
+/// Owns one bounded serializer reader and exclusively borrows its batch. A read
+/// error, drop without admission, or failed completion poisons the whole guard.
+/// No public unchecked reader/token extraction or mutable registry seam exists.
+#[must_use = "complete serialization and admit only after capsule bytes are queued"]
+pub struct OriginBatchReader<'batch, 'registry> {
+    batch: Option<&'batch mut OriginBatch<'registry>>,
+    reader: Option<CapsuleReader>,
+}
+impl OriginBatchReader<'_, '_> {
+    /// Complete-reader validation plus STAGED admission. No IDs become live.
+    /// The caller must have accepted this capsule's bytes before invoking it;
+    /// outer CommitBatch admission still precedes OriginBatch::commit.
+    pub fn admit(mut self) -> io::Result<()> {
+        let batch = self.batch.take().expect("owned batch borrow");
+        let reader = self.reader.take().expect("owned batch reader");
+        if batch.failed {
+            return Err(invalid("origin batch is poisoned"));
+        }
+        let token = batch.checked(reader.finish())?;
+        let result = batch.staged.admit(token);
+        batch.checked(result)?;
+        batch.pending = false;
+        Ok(())
+    }
+}
+impl Read for OriginBatchReader<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let batch = self.batch.as_mut().expect("owned batch borrow");
+        if batch.failed {
+            return Err(invalid("origin batch is poisoned"));
+        }
+        let result = self.reader.as_mut().expect("owned batch reader").read(output);
+        batch.checked(result)
+    }
+}
+impl Drop for OriginBatchReader<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(batch) = &mut self.batch {
+            batch.failed = true;
+        }
     }
 }
 
@@ -1243,5 +1543,452 @@ mod tests {
         drop(token);
         assert_eq!(registry.origin_count(), 0);
         assert_eq!(registry.epoch(), 0);
+    }
+
+    fn batch_bytes(plan: OriginBatchPlan<'_, '_>) -> Vec<u8> {
+        let expected = plan.physical_len();
+        let mut reader = plan.start().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len() as u64, expected);
+        reader.admit().unwrap(); // in-memory fixture admission; not durability
+        bytes
+    }
+
+    #[test]
+    fn capsule_batch_distinct_definitions_and_staged_refs_round_trip_real_journal() {
+        use super::journal::{JournalRecovery, JournalReplayLimits, RecoveryPolicy};
+        use super::replay::ReplayLimits;
+        use kwil_core_text::{
+            RecoveryLimits,
+            encoding::{self, LineEnding, SavePlan},
+        };
+        use kwil_core_workspace::{
+            journal::{JournalBase, JournalBatch, JournalCommand, JournalReader, JournalReplacement, JournalWorker},
+            session::DocumentId,
+        };
+        use std::{io::Cursor, time::Duration};
+        let fixture = Fixture::new();
+        let old = fixture.decoded(b"\xff\xfeO\0", Encoding::UTF16_LE, 2);
+        let a = fixture.decoded(b"A\0", Encoding::UTF16_LE, 0);
+        let b = fixture.decoded(b"B\0", Encoding::UTF16_LE, 0);
+        let mut registry = registry();
+        let p = plan(&registry, &old.snapshot());
+        let (base_bytes, base_token) = serialize(&registry, p, 3);
+        let policy = RecoveryPolicy { encoding: Encoding::UTF16_LE, bom: true, preferred_ending: LineEnding::CrLf };
+        let path = fixture.directory.join("staged-journal");
+        let metadata = JournalBase {
+            document: DocumentId(41),
+            revision: 0,
+            original_path: None,
+            original_identity: [0; 4],
+            codec: policy.to_codec().unwrap(),
+            byte_len: base_bytes.len() as u64,
+        };
+        let wait = Duration::from_secs(5);
+        let mut worker = JournalWorker::create_encoded_from_reader(
+            path.clone(),
+            metadata.with_logical_len(1).unwrap(),
+            Box::new(Cursor::new(base_bytes)),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        worker.ready.recv_timeout(wait).unwrap().unwrap();
+        registry.admit(base_token).unwrap();
+        let before = registry.baseline.clone();
+        let flag = cancel();
+        let mut batch = registry.begin_batch().unwrap();
+        worker
+            .try_submit(JournalCommand::BeginBatch(JournalBatch { from_revision: 0, to_revision: 1, replacements: 3 }))
+            .unwrap();
+        for (snapshot, id, offset, removed, definitions) in
+            [(a.snapshot(), 2, 0, 1, 1), (b.snapshot(), 3, 1, 0, 1), (a.snapshot(), 2, 2, 0, 0)]
+        {
+            let p = batch.plan(snapshot, 0..1, flag.clone()).unwrap();
+            assert_eq!(
+                p.new_origin_count(),
+                definitions,
+                "later capsule must reuse earlier staged IDs without raw rewrite"
+            );
+            if definitions != 0 {
+                assert_eq!(
+                    p.plan.as_ref().unwrap().definitions[0].id,
+                    id,
+                    "staged origin IDs must remain collision-free"
+                );
+            } else {
+                assert_eq!(p.physical_len(), HEADER_LEN + REFERENCE_LEN + 1);
+            }
+            let physical = p.physical_len();
+            let mut reader = p.start().unwrap();
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes.len() as u64, physical);
+            let known = [(1, 1), (2, 1), (3, 1)];
+            let records = if definitions == 0 {
+                inspect(&bytes, &known).1
+            } else {
+                inspect(&bytes, &known[..(id - 1) as usize]).1
+            };
+            assert_eq!(records.last(), Some(&Record::Reference { id, range: 0..1 }));
+            worker
+                .try_submit(JournalCommand::BeginEncodedReplacement {
+                    replacement: JournalReplacement { offset, removed, inserted: 1 },
+                    payload_len: physical,
+                })
+                .unwrap();
+            worker.try_submit(JournalCommand::Bytes(bytes)).unwrap();
+            worker.try_submit(JournalCommand::EndReplacement).unwrap();
+            reader.admit().unwrap();
+            assert!(Arc::ptr_eq(&batch.live.baseline, &before), "staged admission must not publish the live directory");
+            assert_eq!(batch.live.origin_count(), 1);
+        }
+        assert_eq!(batch.origin_count(), 3);
+        worker.try_submit(JournalCommand::CommitBatch).unwrap();
+        batch.commit().unwrap(); // only AFTER actual outer queue acceptance
+        assert_eq!(registry.origin_count(), 3);
+        assert!(!Arc::ptr_eq(&registry.baseline, &before));
+        worker.finish();
+        assert_eq!(worker.finished.recv_timeout(wait).unwrap().unwrap(), 1);
+        let private = fixture.directory.join("recovered");
+        std::fs::create_dir(&private).unwrap();
+        let limits = JournalReplayLimits {
+            replay: ReplayLimits {
+                core: RecoveryLimits {
+                    add_memory_bytes: 4096,
+                    undo_memory_bytes: 1 << 20,
+                    max_origins: 8,
+                    max_records: 1024,
+                    max_pieces: 4096,
+                    max_blocks: 512,
+                    max_metadata_bytes: 16 << 20,
+                },
+                decode: decode::DecodeLimits {
+                    max_physical_bytes: 128 << 10,
+                    max_logical_bytes: 128 << 10,
+                    max_records: 128,
+                },
+                max_origin_storage_bytes: 4 << 20,
+                max_private_path_bytes: 1024,
+            },
+            max_payload_bytes: 128 << 10,
+            max_base_metadata_bytes: 4096,
+            max_document_bytes: 128 << 10,
+            max_batches: 8,
+            max_replacements: 16,
+        };
+        let mut recovered = JournalRecovery::new(private.clone(), limits).unwrap();
+        let mut journal = JournalReader::open(&path).unwrap();
+        let summary = recovered.recover(&mut journal, &flag).unwrap();
+        assert_eq!(summary.journal.byte_len, 3);
+        assert_eq!(summary.journal.revision, 1);
+        let buffer = recovered.take_buffer(&flag).unwrap();
+        let mut raw = Vec::new();
+        encoding::write_snapshot(
+            &buffer.snapshot(),
+            SavePlan { encoding: Encoding::UTF16_LE, bom: true, line_ending: None },
+            &mut raw,
+        )
+        .unwrap();
+        assert_eq!(raw, b"\xff\xfeA\0B\0A\0");
+        assert_eq!(recovered.accepted_origin_count(), 3);
+        drop(buffer);
+        recovered.abandon().unwrap();
+        assert_eq!(std::fs::read_dir(&private).unwrap().count(), 0);
+        std::fs::remove_dir(private).unwrap();
+        drop((journal, worker));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn capsule_batch_drop_abort_errors_and_cancellation_preserve_exact_live_state() {
+        let fixture = Fixture::new();
+        let old = fixture.decoded(b"A", Encoding::UTF8, 0);
+        let new = fixture.decoded(b"B", Encoding::UTF8, 0);
+        let mut registry = registry();
+        let (_, token) = serialize(&registry, plan(&registry, &old.snapshot()), 3);
+        registry.admit(token).unwrap();
+        for mode in [
+            "drop",
+            "abort",
+            "plan",
+            "plan_drop",
+            "reader_drop",
+            "incomplete",
+            "start_cancel",
+            "read_cancel",
+            "admit_cancel",
+            "commit_cancel",
+            "flag_changed",
+        ] {
+            let before = registry.baseline.clone();
+            let old_epoch = registry.epoch();
+            let old_next = registry.baseline.next_id;
+            let prior_plan = plan(&registry, &old.snapshot());
+            let flag = cancel();
+            let mut batch = registry.begin_batch().unwrap();
+            batch_bytes(batch.plan(new.snapshot(), 0..1, flag.clone()).unwrap());
+            assert_eq!(batch.origin_count(), 2);
+            assert!(Arc::ptr_eq(&batch.live.baseline, &before), "staging must preserve live baseline before {mode}");
+            match mode {
+                "drop" => drop(batch),
+                "abort" => batch.abort(),
+                _ => {
+                    match mode {
+                        "plan" => assert!(batch.plan(new.snapshot(), 0..2, flag.clone()).is_err()),
+                        "plan_drop" => drop(batch.plan(new.snapshot(), 0..1, flag.clone()).unwrap()),
+                        "reader_drop" => drop(batch.plan(new.snapshot(), 0..1, flag.clone()).unwrap().start().unwrap()),
+                        "incomplete" => {
+                            let mut reader = batch.plan(new.snapshot(), 0..1, flag.clone()).unwrap().start().unwrap();
+                            assert_eq!(reader.read(&mut [0; 3]).unwrap(), 3);
+                            assert!(reader.admit().is_err());
+                        }
+                        "start_cancel" => {
+                            let p = batch.plan(new.snapshot(), 0..1, flag.clone()).unwrap();
+                            flag.store(true, Ordering::Relaxed);
+                            assert!(p.start().is_err());
+                            flag.store(false, Ordering::Relaxed);
+                        }
+                        "read_cancel" => {
+                            let mut r = batch.plan(new.snapshot(), 0..1, flag.clone()).unwrap().start().unwrap();
+                            flag.store(true, Ordering::Relaxed);
+                            assert!(r.read(&mut [0; 3]).is_err());
+                            flag.store(false, Ordering::Relaxed);
+                            drop(r);
+                        }
+                        "admit_cancel" => {
+                            let mut r = batch.plan(new.snapshot(), 0..1, flag.clone()).unwrap().start().unwrap();
+                            r.read_to_end(&mut Vec::new()).unwrap();
+                            flag.store(true, Ordering::Relaxed);
+                            assert!(r.admit().is_err());
+                            flag.store(false, Ordering::Relaxed);
+                        }
+                        "commit_cancel" => flag.store(true, Ordering::Relaxed),
+                        "flag_changed" => assert!(batch.plan(new.snapshot(), 0..1, cancel()).is_err()),
+                        _ => unreachable!(),
+                    }
+                    assert!(batch.commit().is_err(), "poisoned/cancelled batch must refuse partial commit: {mode}");
+                }
+            }
+            assert!(Arc::ptr_eq(&registry.baseline, &before), "abort must preserve EXACT baseline: {mode}");
+            assert_eq!(registry.origin_count(), 1);
+            assert_eq!(registry.epoch(), old_epoch);
+            assert_eq!(registry.baseline.next_id, old_next);
+            let mut reader =
+                registry.start(prior_plan).expect("pre-existing plan must remain usable after batch abort");
+            reader.read_to_end(&mut Vec::new()).unwrap();
+            drop(reader.finish().unwrap());
+            assert_eq!(
+                plan(&registry, &new.snapshot()).definitions[0].id,
+                old_next,
+                "failed batch must not consume live ID sequence"
+            );
+        }
+    }
+
+    #[test]
+    fn capsule_batch_success_stales_preexisting_plans_including_empty_batch() {
+        let fixture = Fixture::new();
+        let source = fixture.decoded(b"A", Encoding::UTF8, 0);
+        let mut registry = registry();
+        let old = plan(&registry, &source.snapshot());
+        let flag = cancel();
+        let mut batch = registry.begin_batch().unwrap();
+        batch_bytes(batch.plan(source.snapshot(), 0..1, flag).unwrap());
+        batch.commit().unwrap();
+        assert!(registry.start(old).is_err(), "successful batch must stale old standalone plans");
+        let old = plan(&registry, &source.snapshot());
+        let before = registry.baseline.clone();
+        let epoch = registry.epoch();
+        registry.begin_batch().unwrap().commit().unwrap();
+        assert!(!Arc::ptr_eq(&registry.baseline, &before));
+        assert!(registry.epoch() > epoch);
+        assert!(registry.start(old).is_err());
+        assert_eq!(registry.origin_count(), 1);
+    }
+
+    #[test]
+    fn capsule_batch_exact_metadata_peak_accounts_retained_actual_capacity_before_growth() {
+        let fixture = Fixture::new();
+        let a = fixture.decoded(b"A", Encoding::UTF8, 0);
+        let b = fixture.decoded(b"B", Encoding::UTF8, 0);
+        let mut registry = OriginRegistry::new(2, 8192);
+        let (_, token) = serialize(&registry, plan(&registry, &a.snapshot()), 3);
+        registry.admit(token).unwrap();
+        reserve(&mut Arc::get_mut(&mut registry.baseline).unwrap().origins, 4).unwrap();
+        let actual = registry.baseline.origins.capacity();
+        assert!(actual > registry.max_origins, "witness requires committed spare capacity");
+        let required = batch_retained_cost(actual).unwrap() + metadata_cost(2).unwrap();
+        let before = registry.baseline.clone();
+        let pins = Arc::strong_count(&registry.baseline);
+        registry.max_metadata_bytes = required - 1;
+        assert!(
+            registry.begin_batch().is_err(),
+            "missing retained committed capacity accounting must refuse BEFORE shadow allocation"
+        );
+        assert_eq!(Arc::strong_count(&registry.baseline), pins);
+        assert!(Arc::ptr_eq(&registry.baseline, &before));
+        assert_eq!(registry.baseline.origins.capacity(), actual);
+        registry.max_metadata_bytes = required;
+        let flag = cancel();
+        let mut batch = registry.begin_batch().unwrap();
+        assert_eq!(batch.metadata_reserved_bytes(), required);
+        batch_bytes(batch.plan(b.snapshot(), 0..1, flag.clone()).unwrap());
+        batch_bytes(batch.plan(a.snapshot(), 0..1, flag).unwrap());
+        batch.commit().unwrap();
+        assert_eq!(registry.origin_count(), 2);
+        assert!(batch_retained_cost(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn capsule_batch_empty_seed_dedup_and_definition_metadata_do_not_retain_payloads() {
+        let fixture = Fixture::new();
+        let empty = fixture.decoded(b"\xff\xfe", Encoding::UTF16_LE, 2);
+        let empty_origin = fixture.owners.borrow().last().unwrap().snapshot();
+        let large = fixture.decoded(&vec![b'A'; 96 << 10], Encoding::UTF8, 0);
+        let mut registry = registry();
+        let flag = cancel();
+        let mut batch = registry.begin_batch().unwrap();
+        let p = batch.plan_seed(empty.snapshot(), empty_origin.clone(), flag.clone()).unwrap();
+        assert_eq!(p.new_origin_count(), 1);
+        batch_bytes(p);
+        let p = batch.plan_seed(empty.snapshot(), empty_origin, flag.clone()).unwrap();
+        assert_eq!(p.new_origin_count(), 0);
+        assert_eq!(p.physical_len(), HEADER_LEN + REFERENCE_LEN + 1);
+        let bytes = batch_bytes(p);
+        assert_eq!(inspect(&bytes, &[(1, 0)]), (0, vec![Record::Reference { id: 1, range: 0..0 }]));
+        let p = batch.plan(large.snapshot(), 0..large.len(), flag.clone()).unwrap();
+        assert_eq!(p.plan.as_ref().unwrap().definitions.len(), 1);
+        let physical = p.physical_len();
+        let mut reader = p.start().unwrap();
+        let mut scratch = [0; MAX_READ_BYTES];
+        let mut total = 0;
+        loop {
+            let n = reader.read(&mut scratch).unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            let inner = reader.reader.as_ref().unwrap();
+            assert!(inner.pending.len() < 128);
+            assert!(matches!(inner.payload, Payload::None | Payload::Definition { .. }));
+        }
+        assert_eq!(total, physical);
+        reader.admit().unwrap();
+        assert!(
+            batch.metadata_reserved_bytes() < large.len() as usize,
+            "registry stores bounded handles, never raw payload copies"
+        );
+        let p = batch.plan(large.snapshot(), 0..1, flag).unwrap();
+        assert_eq!(p.new_origin_count(), 0);
+        assert_eq!(p.physical_len(), HEADER_LEN + REFERENCE_LEN + 1);
+        batch_bytes(p);
+        batch.commit().unwrap();
+        assert_eq!(registry.origin_count(), 2);
+    }
+
+    #[test]
+    fn capsule_batch_reader_io_failure_poison_and_dropped_batch_release_new_origin_pins() {
+        let fixture = Fixture::new();
+        let source = fixture.decoded(b"A", Encoding::UTF8, 0);
+        let path = fixture.directory.join("mutable-original");
+        std::fs::write(&path, b"original").unwrap();
+        let original = Buffer::from_file(TextFile::open(&path).unwrap()).unwrap();
+        let mut registry = registry();
+        let before = registry.baseline.clone();
+        let flag = cancel();
+        let mut batch = registry.begin_batch().unwrap();
+        batch_bytes(batch.plan(source.snapshot(), 0..1, flag.clone()).unwrap());
+        let mut reader = batch.plan(original.snapshot(), 0..original.len(), flag).unwrap().start().unwrap();
+        std::fs::write(&path, b"modified and longer").unwrap();
+        assert!(reader.read_to_end(&mut Vec::new()).is_err());
+        assert!(reader.admit().is_err());
+        assert!(batch.is_poisoned());
+        assert!(batch.commit().is_err());
+        assert!(Arc::ptr_eq(&registry.baseline, &before));
+        assert_eq!(registry.origin_count(), 0);
+        drop(source);
+        let owner = fixture.owners.borrow_mut().pop().unwrap();
+        assert!(owner.try_retire().is_ok(), "aborted staged directory must release new origin pins on the worker");
+    }
+
+    #[test]
+    fn capsule_batch_forgotten_scoped_plan_cannot_commit_an_unfinished_capsule() {
+        let mut registry = registry();
+        let before = registry.baseline.clone();
+        let mut batch = registry.begin_batch().unwrap();
+        // Safe code may deliberately forget an RAII wrapper. The separate
+        // pending flag must still refuse publication. Empty fixture pins no
+        // origin, payload or file; only bounded metadata is leaked to process exit.
+        std::mem::forget(batch.plan(Snapshot::default(), 0..0, cancel()).unwrap());
+        assert!(batch.commit().is_err(), "in-flight marker must survive a forgotten wrapper");
+        assert!(Arc::ptr_eq(&registry.baseline, &before));
+    }
+
+    #[test]
+    fn capsule_batch_recovered_sparse_ids_reuse_origins_and_allocate_above_exact_maximum() {
+        let fixture = Fixture::new();
+        let a = fixture.decoded(b"A\0", Encoding::UTF16_LE, 0);
+        let a_origin = fixture.owners.borrow().last().unwrap().snapshot();
+        let b = fixture.decoded(b"B\0", Encoding::UTF16_LE, 0);
+        let b_origin = fixture.owners.borrow().last().unwrap().snapshot();
+        let c = fixture.decoded(b"C\0", Encoding::UTF16_LE, 0);
+        let flag = cancel();
+        let mut registry = OriginRegistry::from_recovered(8, 8192, [(23, b_origin), (7, a_origin)], &flag).unwrap();
+        assert_eq!(registry.origin_count(), 2);
+        assert_eq!(registry.baseline.next_id, 24);
+        let p = plan(&registry, &a.snapshot());
+        assert_eq!(p.new_origin_count(), 0, "adoption must not recopy recovered raw origins");
+        let (bytes, token) = serialize(&registry, p, 3);
+        assert_eq!(inspect(&bytes, &[(7, 1), (23, 1)]), (1, vec![Record::Reference { id: 7, range: 0..1 }]));
+        registry.admit(token).unwrap();
+        let mut batch = registry.begin_batch().unwrap();
+        let p = batch.plan(c.snapshot(), 0..1, flag.clone()).unwrap();
+        assert_eq!(p.plan.as_ref().unwrap().definitions[0].id, 24);
+        batch_bytes(p);
+        let p = batch.plan(b.snapshot(), 0..1, flag).unwrap();
+        assert_eq!(p.new_origin_count(), 0);
+        let bytes = batch_bytes(p);
+        assert_eq!(inspect(&bytes, &[(7, 1), (23, 1), (24, 1)]), (1, vec![Record::Reference { id: 23, range: 0..1 }]));
+        batch.commit().unwrap();
+        assert_eq!(registry.origin_count(), 3);
+        assert_eq!(registry.baseline.next_id, 25);
+    }
+
+    #[test]
+    fn capsule_batch_recovered_directory_rejects_invalid_ids_identity_caps_and_cancellation() {
+        let fixture = Fixture::new();
+        let a = fixture.decoded(b"A", Encoding::UTF8, 0);
+        let a_origin = fixture.owners.borrow().last().unwrap().snapshot();
+        let b = fixture.decoded(b"B", Encoding::UTF8, 0);
+        let b_origin = fixture.owners.borrow().last().unwrap().snapshot();
+        let flag = cancel();
+        for entries in [
+            vec![(0, a_origin.clone())],
+            vec![(3, a_origin.clone()), (3, b_origin.clone())],
+            vec![(3, a_origin.clone()), (4, a_origin.clone())],
+            vec![(u64::MAX, a_origin.clone())],
+        ] {
+            assert!(OriginRegistry::from_recovered(8, 8192, entries, &flag).is_err());
+        }
+        assert!(
+            OriginRegistry::from_recovered(1, 8192, [(3, a_origin.clone()), (4, b_origin.clone())], &flag).is_err()
+        );
+        assert!(OriginRegistry::from_recovered(8, 0, [(3, a_origin.clone())], &flag).is_err());
+        flag.store(true, Ordering::Relaxed);
+        assert!(OriginRegistry::from_recovered(8, 8192, [(3, a_origin.clone())], &flag).is_err());
+        flag.store(false, Ordering::Relaxed);
+        let entries = [(3, a_origin.clone()), (4, b_origin.clone())].into_iter().inspect(|(id, _)| {
+            if *id == 4 {
+                flag.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(OriginRegistry::from_recovered(8, 8192, entries, &flag).is_err());
+        drop((a, b, a_origin, b_origin));
+        // Constructor failures retain no origin pins, even after a partially
+        // built private directory. Source owners remain explicitly worker-owned.
+        for owner in fixture.owners.borrow_mut().drain(..) {
+            assert!(owner.try_retire().is_ok());
+        }
     }
 }
