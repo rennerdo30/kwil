@@ -138,6 +138,11 @@ pub struct RecoveryRevision<'a> {
     committed: bool,
 }
 impl RecoveryRevision<'_> {
+    /// Cumulative admitted work staged by this revision, before publication.
+    pub fn usage(&self) -> RecoveryUsage {
+        self.usage
+    }
+
     /// Interpret the complete historical raw-v1 prefix, after all raw edits.
     /// Valid UTF-8 (including a leading BOM) stays ordinary text; each invalid
     /// source BYTE becomes one UTF8-labelled opaque atom. Logical byte length

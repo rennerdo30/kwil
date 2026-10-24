@@ -1,5 +1,7 @@
-//! Linear root history. Accounting deliberately overestimates shared nodes
-//! and resident add blocks, so the cap never depends on a full tree walk.
+//! Linear root history. Each snapshot caches a persistent directory charging
+//! each physical storage allocation once, including a fully pinned tiny slice.
+//! Sharing between history entries remains conservatively charged per entry;
+//! ordinary history accounting never walks the document's unchanged pieces.
 
 use crate::buffer::Snapshot;
 use std::collections::VecDeque;

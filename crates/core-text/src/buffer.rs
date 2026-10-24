@@ -1,7 +1,7 @@
 //! Byte-exact editing over immutable, shared pieces. Offsets, columns and
 //! line numbers are zero-based; columns count bytes, not Unicode scalars.
 
-use crate::piece_tree::{self, AddBudget, Chunks, OriginalUses, Tree};
+use crate::piece_tree::{self, AddBudget, Chunks, OriginalUses, RetainedStorage, Tree};
 use crate::undo::History;
 use crate::{ReadError, TextFile};
 use std::io::{self, Write};
@@ -21,6 +21,7 @@ const TYPING_GAP: Duration = Duration::from_millis(500);
 pub struct Snapshot {
     pub(crate) root: Tree,
     pub(crate) originals: Arc<OriginalUses>,
+    retained_storage: RetainedStorage,
 }
 
 /// Send this handle and an immutable source snapshot to an import worker.
@@ -54,7 +55,9 @@ impl SnapshotImporter {
         } else {
             Arc::new(piece_tree::original_uses(&root, 0..range.end - range.start))
         };
-        Ok(Snapshot { root, originals })
+        let retained_storage =
+            if full && shared { source.retained_storage.clone() } else { RetainedStorage::from_tree(&root) };
+        Ok(Snapshot { root, originals, retained_storage })
     }
 }
 
@@ -146,21 +149,29 @@ impl Snapshot {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.root.as_ref().map_or(0, |node| node.metrics.retained).saturating_add(
-            self.originals
-                .values()
-                .fold(0_usize, |cost, (source, _)| cost.saturating_add(source.retained_bytes()).saturating_add(512)),
-        )
+        self.root
+            .as_ref()
+            .map_or(0, |node| node.metrics.retained)
+            .saturating_add(self.retained_storage.bytes())
+            .saturating_add(
+                self.originals.values().fold(0_usize, |cost, (source, _)| {
+                    cost.saturating_add(source.retained_bytes()).saturating_add(512)
+                }),
+            )
     }
 
     /// Compose immutable ranges without importing storage. The final mutable
     /// destination enforces its own resident/spill cap when inserting them.
     pub fn slice(&self, range: Range<u64>) -> io::Result<Self> {
         self.check_range(&range)?;
+        if range.start == 0 && range.end == self.len() {
+            return Ok(self.clone());
+        }
         let (_, tail) = piece_tree::split(self.root.clone(), range.start).map_err(io::Error::other)?;
         let (root, _) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
         let originals = Arc::new(piece_tree::original_uses(&root, 0..range.end - range.start));
-        Ok(Self { root, originals })
+        let retained_storage = RetainedStorage::from_tree(&root);
+        Ok(Self { root, originals, retained_storage })
     }
 
     pub fn concat(&self, other: &Self) -> io::Result<Self> {
@@ -171,7 +182,13 @@ impl Snapshot {
         for (&id, (source, bytes)) in other.originals.iter() {
             originals.entry(id).or_insert((source.clone(), 0)).1 += bytes;
         }
-        Ok(Self { root: piece_tree::join(self.root.clone(), other.root.clone()), originals: Arc::new(originals) })
+        let mut retained_storage = self.retained_storage.clone();
+        retained_storage.extend(&other.retained_storage);
+        Ok(Self {
+            root: piece_tree::join(self.root.clone(), other.root.clone()),
+            originals: Arc::new(originals),
+            retained_storage,
+        })
     }
 
     fn check_range(&self, range: &Range<u64>) -> io::Result<()> {
@@ -301,7 +318,8 @@ impl Buffer {
         let mut buffer = Self::empty();
         let root = piece_tree::original(file.clone(), buffer.owner.clone())?;
         let originals = Arc::new(piece_tree::original_uses(&root, 0..file.len()));
-        buffer.snapshot = Snapshot { root, originals };
+        let retained_storage = RetainedStorage::from_tree(&root);
+        buffer.snapshot = Snapshot { root, originals, retained_storage };
         Ok(buffer)
     }
 
@@ -334,7 +352,8 @@ impl Buffer {
         let root = piece_tree::decoded_checked(origin, buffer.owner.clone(), check)?;
         let len = root.as_ref().map_or(0, |node| node.metrics.bytes);
         let originals = Arc::new(piece_tree::original_uses(&root, 0..len));
-        buffer.snapshot = Snapshot { root, originals };
+        let retained_storage = RetainedStorage::from_tree(&root);
+        buffer.snapshot = Snapshot { root, originals, retained_storage };
         Ok(buffer)
     }
 
@@ -351,7 +370,8 @@ impl Buffer {
     ) -> io::Result<Snapshot> {
         let root = piece_tree::decoded_checked(origin, self.owner.clone(), check)?;
         let len = root.as_ref().map_or(0, |node| node.metrics.bytes);
-        Ok(Snapshot { originals: Arc::new(piece_tree::original_uses(&root, 0..len)), root })
+        let retained_storage = RetainedStorage::from_tree(&root);
+        Ok(Snapshot { originals: Arc::new(piece_tree::original_uses(&root, 0..len)), root, retained_storage })
     }
 
     pub(crate) fn recovery_bytes(&self, bytes: &[u8]) -> io::Result<Tree> {
@@ -379,7 +399,8 @@ impl Buffer {
 
     pub(crate) fn recovery_snapshot(root: Tree) -> Snapshot {
         let len = root.as_ref().map_or(0, |node| node.metrics.bytes);
-        Snapshot { originals: Arc::new(piece_tree::original_uses(&root, 0..len)), root }
+        let retained_storage = RetainedStorage::from_tree(&root);
+        Snapshot { originals: Arc::new(piece_tree::original_uses(&root, 0..len)), root, retained_storage }
     }
 
     pub(crate) fn recovery_install(&mut self, snapshot: Snapshot) {
@@ -463,9 +484,12 @@ impl Buffer {
         let prepared = self.snapshot_importer().prepare(source, range)?;
         let inserted = prepared.root;
         let uses = prepared.originals;
+        let mut retained_storage = self.snapshot.retained_storage.clone();
+        retained_storage.extend(&prepared.retained_storage);
         let before = self.snapshot();
         let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(piece_tree::join(left, inserted), right);
+        self.snapshot.retained_storage = retained_storage;
         if !uses.is_empty() {
             let mut originals = self.snapshot.originals.as_ref().clone();
             for (&id, (source, bytes)) in uses.iter() {
@@ -488,9 +512,12 @@ impl Buffer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer length overflow"))?;
         // Allocate all new storage before mutating the root: I/O errors are atomic.
         let added = piece_tree::added(bytes, &self.added)?;
+        let mut retained_storage = self.snapshot.retained_storage.clone();
+        retained_storage.change_range(&added, 0..bytes.len() as u64, false);
         let before = self.snapshot();
         let (left, right) = piece_tree::split(before.root.clone(), offset).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(piece_tree::join(left, added), right);
+        self.snapshot.retained_storage = retained_storage;
         self.record(before, coalesce);
         Ok(())
     }
@@ -503,6 +530,12 @@ impl Buffer {
             return Ok(());
         }
         let before = self.snapshot();
+        let mut retained_storage = before.retained_storage.clone();
+        if range.start == 0 && range.end == before.len() {
+            retained_storage = RetainedStorage::default();
+        } else {
+            retained_storage.change_range(&before.root, range.clone(), true);
+        }
         let removed = if range.start == 0 && range.end == before.len() {
             before.originals.as_ref().clone()
         } else {
@@ -511,6 +544,7 @@ impl Buffer {
         let (left, tail) = piece_tree::split(before.root.clone(), range.start).map_err(io::Error::other)?;
         let (_, right) = piece_tree::split(tail, range.end - range.start).map_err(io::Error::other)?;
         self.snapshot.root = piece_tree::join(left, right);
+        self.snapshot.retained_storage = retained_storage;
         if !removed.is_empty() {
             let mut originals = before.originals.as_ref().clone();
             for (id, (_, bytes)) in removed {
@@ -683,8 +717,10 @@ impl Buffer {
         }
     }
 
-    /// Conservative retained-root accounting; shared nodes/blocks may count
-    /// more than once. Excludes baseline original storage and OS page cache.
+    /// Conservative retained-root accounting. Each snapshot charges unique
+    /// storage allocations once (including fully pinned tiny slices), while
+    /// sharing between history entries may count more than once. Excludes
+    /// baseline original storage and OS page cache.
     /// Drops oldest undo entries, then farthest-future redo entries, keeping
     /// a contiguous history anchored at the current state.
     /// Active transactions and externally held snapshots are not undo history.
@@ -716,6 +752,111 @@ impl Buffer {
 #[cfg(test)]
 mod editing_contract_tests {
     use super::*;
+
+    #[test]
+    fn retained_storage_fragmented_replacement_keeps_one_undo_at_default_cap() {
+        let mut buffer = Buffer::empty();
+        let count = 4107;
+        let original = b"a\n".repeat(count);
+        buffer.insert(0, &original).unwrap();
+        let before = buffer.snapshot();
+        buffer.begin();
+        for index in (0..count).rev() {
+            let offset = (2 * index) as u64;
+            buffer.delete(offset..offset + 1).unwrap();
+            buffer.insert(offset, b"bc").unwrap();
+        }
+        buffer.commit();
+        buffer.snapshot.retained_storage.assert_matches_tree(&buffer.snapshot.root);
+        before.retained_storage.assert_matches_tree(&before.root);
+        assert_eq!(buffer.history_depth(), (2, 0), "a small fragmented edit must not evict its own undo");
+        assert!(buffer.undo_memory_bytes() < UNDO_MEMORY);
+        assert!(buffer.undo());
+        let mut bytes = Vec::new();
+        buffer.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, original);
+        buffer.snapshot.retained_storage.assert_matches_tree(&buffer.snapshot.root);
+        assert!(buffer.redo());
+        bytes.clear();
+        buffer.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"bc\n".repeat(count));
+    }
+
+    #[test]
+    fn retained_storage_tiny_slice_pins_full_allocation_and_concat_counts_it_once() {
+        let mut buffer = Buffer::empty();
+        let original = vec![b'x'; 64 << 10];
+        buffer.insert(0, &original).unwrap();
+        let source = buffer.snapshot();
+        let tiny = source.slice(17..18).unwrap();
+        assert_eq!(
+            tiny.retained_storage.bytes(),
+            source.retained_storage.bytes(),
+            "one byte pins the full added allocation"
+        );
+        assert!(tiny.retained_bytes() >= original.len());
+        let repeated = tiny.concat(&tiny).unwrap().concat(&tiny).unwrap();
+        assert_eq!(repeated.retained_storage.bytes(), tiny.retained_storage.bytes());
+        repeated.retained_storage.assert_matches_tree(&repeated.root);
+        let mut target = Buffer::empty();
+        let prepared = target.snapshot_importer().prepare(&repeated, 0..3).unwrap();
+        target.insert_snapshot_range(0, &prepared, 0..3).unwrap();
+        target.snapshot.retained_storage.assert_matches_tree(&target.snapshot.root);
+        target.begin();
+        target.delete(0..2).unwrap();
+        target.snapshot.retained_storage.assert_matches_tree(&target.snapshot.root);
+        target.cancel();
+        target.snapshot.retained_storage.assert_matches_tree(&target.snapshot.root);
+        target.set_undo_memory_limit(0);
+        target.delete(0..target.len()).unwrap();
+        assert_eq!(target.snapshot.retained_storage.bytes(), 0);
+        // Immutable earlier versions retain their own valid directory/root.
+        source.retained_storage.assert_matches_tree(&source.root);
+        repeated.retained_storage.assert_matches_tree(&repeated.root);
+    }
+
+    #[test]
+    fn retained_storage_tracks_mixed_range_edits_without_changing_snapshots() {
+        let mut buffer = Buffer::empty();
+        buffer.set_undo_memory_limit(0);
+        let mut saved = Vec::new();
+        let mut seed = 0x51ce_2026_u64;
+        for step in 0..320 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let at = (seed >> 32) % (buffer.len() + 1);
+            if step % 4 == 0 && buffer.len() > at {
+                let end = (at + 1 + (seed % 9)).min(buffer.len());
+                buffer.delete(at..end).unwrap();
+            } else {
+                buffer.insert(at, &[step as u8; 3]).unwrap();
+            }
+            buffer.snapshot.retained_storage.assert_matches_tree(&buffer.snapshot.root);
+            if step % 41 == 0 {
+                saved.push(buffer.snapshot());
+            }
+        }
+        for snapshot in saved {
+            snapshot.retained_storage.assert_matches_tree(&snapshot.root);
+        }
+    }
+
+    #[test]
+    fn retained_storage_opaque_slice_keeps_all_physical_payloads_once() {
+        let buffer = Buffer::empty();
+        let raw = vec![0xff; 128];
+        let offsets: Vec<u8> = (0_u32..=128).flat_map(u32::to_le_bytes).collect();
+        let root = buffer.recovery_opaque(crate::encoding::Encoding::UTF8, &raw, &offsets, 128).unwrap();
+        let source = Buffer::recovery_snapshot(root);
+        let tiny = source.slice(63..64).unwrap();
+        assert_eq!(tiny.retained_storage.bytes(), source.retained_storage.bytes());
+        assert!(
+            tiny.retained_storage.bytes() >= 2 * raw.len() + offsets.len(),
+            "logical/raw/offset allocations remain fully pinned"
+        );
+        let repeated = tiny.concat(&tiny).unwrap().concat(&tiny).unwrap();
+        assert_eq!(repeated.retained_storage.bytes(), source.retained_storage.bytes());
+        repeated.retained_storage.assert_matches_tree(&repeated.root);
+    }
 
     #[test]
     fn resident_activation_preserves_spill_only_replay_provenance_and_undo() {

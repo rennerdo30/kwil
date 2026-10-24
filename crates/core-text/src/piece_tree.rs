@@ -28,6 +28,238 @@ pub(crate) fn worker_disk_charge(bytes: u64) -> io::Result<u64> {
 pub(crate) type Tree = Option<Arc<Node>>;
 pub(crate) type OriginalUses = BTreeMap<(u8, usize), (SourceRef, u64)>;
 
+/// Persistent directory of physical storage allocations used by one snapshot.
+/// A split changes logical use counts, never the full allocation charge. The
+/// directory does not pin storage independently: its snapshot's root owns it.
+#[derive(Clone, Default)]
+pub(crate) struct RetainedStorage(Option<Arc<RetainedNode>>);
+
+struct RetainedNode {
+    key: usize,
+    uses: u128,
+    cost: usize,
+    left: RetainedStorage,
+    right: RetainedStorage,
+    height: u32,
+    bytes: usize,
+}
+
+impl RetainedStorage {
+    fn height(&self) -> u32 {
+        self.0.as_ref().map_or(0, |node| node.height)
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        self.0.as_ref().map_or(0, |node| node.bytes)
+    }
+    fn node(key: usize, uses: u128, cost: usize, left: Self, right: Self) -> Self {
+        let height = 1 + left.height().max(right.height());
+        let bytes = left
+            .bytes()
+            .saturating_add(right.bytes())
+            .saturating_add(cost)
+            .saturating_add(std::mem::size_of::<RetainedNode>() + ARC_HEADER);
+        Self(Some(Arc::new(RetainedNode { key, uses, cost, left, right, height, bytes })))
+    }
+    fn balanced(key: usize, uses: u128, cost: usize, left: Self, right: Self) -> Self {
+        if left.height() > right.height() + 1 {
+            let a = left.0.as_ref().unwrap();
+            if a.left.height() >= a.right.height() {
+                return Self::node(
+                    a.key,
+                    a.uses,
+                    a.cost,
+                    a.left.clone(),
+                    Self::node(key, uses, cost, a.right.clone(), right),
+                );
+            }
+            let b = a.right.0.as_ref().unwrap();
+            return Self::node(
+                b.key,
+                b.uses,
+                b.cost,
+                Self::node(a.key, a.uses, a.cost, a.left.clone(), b.left.clone()),
+                Self::node(key, uses, cost, b.right.clone(), right),
+            );
+        }
+        if right.height() > left.height() + 1 {
+            let a = right.0.as_ref().unwrap();
+            if a.right.height() >= a.left.height() {
+                return Self::node(
+                    a.key,
+                    a.uses,
+                    a.cost,
+                    Self::node(key, uses, cost, left, a.left.clone()),
+                    a.right.clone(),
+                );
+            }
+            let b = a.left.0.as_ref().unwrap();
+            return Self::node(
+                b.key,
+                b.uses,
+                b.cost,
+                Self::node(key, uses, cost, left, b.left.clone()),
+                Self::node(a.key, a.uses, a.cost, b.right.clone(), a.right.clone()),
+            );
+        }
+        Self::node(key, uses, cost, left, right)
+    }
+    fn without_first(&self) -> ((usize, u128, usize), Self) {
+        let node = self.0.as_ref().unwrap();
+        if node.left.0.is_none() {
+            return ((node.key, node.uses, node.cost), node.right.clone());
+        }
+        let (first, left) = node.left.without_first();
+        (first, Self::balanced(node.key, node.uses, node.cost, left, node.right.clone()))
+    }
+    fn changed(&self, key: usize, uses: u128, cost: usize, remove: bool) -> Self {
+        let Some(node) = &self.0 else {
+            assert!(!remove, "retained storage must be present before removal");
+            return Self::node(key, uses, cost, Self::default(), Self::default());
+        };
+        match key.cmp(&node.key) {
+            std::cmp::Ordering::Less => Self::balanced(
+                node.key,
+                node.uses,
+                node.cost,
+                node.left.changed(key, uses, cost, remove),
+                node.right.clone(),
+            ),
+            std::cmp::Ordering::Greater => Self::balanced(
+                node.key,
+                node.uses,
+                node.cost,
+                node.left.clone(),
+                node.right.changed(key, uses, cost, remove),
+            ),
+            std::cmp::Ordering::Equal => {
+                let remaining = if remove {
+                    node.uses.checked_sub(uses).expect("retained use count")
+                } else {
+                    node.uses.checked_add(uses).expect("retained use count overflow")
+                };
+                if remaining != 0 {
+                    return Self::node(key, remaining, cost, node.left.clone(), node.right.clone());
+                }
+                if node.left.0.is_none() {
+                    return node.right.clone();
+                }
+                if node.right.0.is_none() {
+                    return node.left.clone();
+                }
+                let ((key, uses, cost), right) = node.right.without_first();
+                Self::balanced(key, uses, cost, node.left.clone(), right)
+            }
+        }
+    }
+    pub(crate) fn from_tree(tree: &Tree) -> Self {
+        let mut result = Self::default();
+        let length = tree.as_ref().map_or(0, |node| node.metrics.bytes);
+        result.change_range(tree, 0..length, false);
+        result
+    }
+    /// Traversal is clipped to the edited range. Point edits touch only the
+    /// affected leaf and O(log distinct allocations) directory nodes.
+    pub(crate) fn change_range(&mut self, tree: &Tree, range: Range<u64>, remove: bool) {
+        fn storage(directory: &mut RetainedStorage, source: &Arc<Storage>, uses: u128, remove: bool) {
+            let key = Arc::as_ptr(source) as usize;
+            *directory = directory.changed(key, uses, source.allocation_bytes(), remove);
+            if let Storage::Opaque { logical, raw, offsets, .. } = source.as_ref() {
+                for child in [logical, raw, offsets] {
+                    storage(directory, child, uses, remove);
+                }
+            }
+        }
+        fn visit(directory: &mut RetainedStorage, node: &Node, range: Range<u64>, remove: bool) {
+            if range.is_empty() {
+                return;
+            }
+            match &node.kind {
+                Kind::Leaf(piece) => storage(directory, &piece.storage, u128::from(range.end - range.start), remove),
+                Kind::Branch(left, right) => {
+                    let split = left.metrics.bytes;
+                    if range.start < split {
+                        visit(directory, left, range.start..range.end.min(split), remove);
+                    }
+                    if range.end > split {
+                        visit(directory, right, range.start.saturating_sub(split)..range.end - split, remove);
+                    }
+                }
+            }
+        }
+        if let Some(root) = tree {
+            visit(self, root, range, remove);
+        }
+    }
+    pub(crate) fn extend(&mut self, other: &Self) {
+        if self.0.is_none() {
+            *self = other.clone();
+            return;
+        }
+        fn visit(directory: &mut RetainedStorage, node: &RetainedNode) {
+            if let Some(left) = &node.left.0 {
+                visit(directory, left);
+            }
+            *directory = directory.changed(node.key, node.uses, node.cost, false);
+            if let Some(right) = &node.right.0 {
+                visit(directory, right);
+            }
+        }
+        if let Some(root) = &other.0 {
+            visit(self, root);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_matches_tree(&self, tree: &Tree) {
+        // Independent mutable-map oracle for the persistent directory. It also
+        // checks balance/cache invariants after removals, rotations and sharing.
+        fn storage(source: &Arc<Storage>, uses: u128, expected: &mut BTreeMap<usize, (u128, usize)>) {
+            expected.entry(Arc::as_ptr(source) as usize).or_insert((0, source.allocation_bytes())).0 += uses;
+            if let Storage::Opaque { logical, raw, offsets, .. } = source.as_ref() {
+                for child in [logical, raw, offsets] {
+                    storage(child, uses, expected);
+                }
+            }
+        }
+        fn tree_uses(node: &Node, expected: &mut BTreeMap<usize, (u128, usize)>) {
+            match &node.kind {
+                Kind::Leaf(piece) => storage(&piece.storage, u128::from(piece.end - piece.start), expected),
+                Kind::Branch(left, right) => {
+                    tree_uses(left, expected);
+                    tree_uses(right, expected);
+                }
+            }
+        }
+        fn directory(node: &RetainedNode, actual: &mut BTreeMap<usize, (u128, usize)>) {
+            assert!(node.uses > 0);
+            assert!(node.left.height().abs_diff(node.right.height()) <= 1);
+            assert_eq!(node.height, 1 + node.left.height().max(node.right.height()));
+            assert_eq!(
+                node.bytes,
+                node.left.bytes() + node.right.bytes() + node.cost + std::mem::size_of::<RetainedNode>() + ARC_HEADER
+            );
+            if let Some(left) = &node.left.0 {
+                assert!(left.key < node.key);
+                directory(left, actual);
+            }
+            assert!(actual.insert(node.key, (node.uses, node.cost)).is_none());
+            if let Some(right) = &node.right.0 {
+                assert!(right.key > node.key);
+                directory(right, actual);
+            }
+        }
+        let mut expected = BTreeMap::new();
+        if let Some(root) = tree {
+            tree_uses(root, &mut expected);
+        }
+        let mut actual = BTreeMap::new();
+        if let Some(root) = &self.0 {
+            directory(root, &mut actual);
+        }
+        assert_eq!(actual, expected);
+    }
+}
+
 #[path = "spill_retirement.rs"]
 mod spill_retirement;
 pub use spill_retirement::{SpillRetirement, SpillRetirementLimits, SpillRetirementReport};
@@ -308,6 +540,16 @@ impl Storage {
         bytes + std::mem::size_of::<Self>() + ARC_HEADER
     }
 
+    // Opaque children have their own identities and charges in the directory.
+    fn allocation_bytes(&self) -> usize {
+        let bytes = match self {
+            Self::Memory { bytes, .. } => bytes.len(),
+            Self::Disk(block) => block.path.capacity(),
+            _ => 0,
+        };
+        bytes.saturating_add(std::mem::size_of::<Self>() + ARC_HEADER)
+    }
+
     fn resources(&self) -> StorageResources {
         match self {
             Self::Memory { .. } => StorageResources { blocks: 1, ..StorageResources::default() },
@@ -409,7 +651,7 @@ fn leaf(piece: Piece) -> Arc<Node> {
         metrics: Metrics {
             bytes: piece.end - piece.start,
             breaks: piece.breaks,
-            retained: std::mem::size_of::<Node>() + ARC_HEADER + piece.storage.retained_bytes(),
+            retained: std::mem::size_of::<Node>() + ARC_HEADER,
             resources: piece
                 .storage
                 .resources()
@@ -1102,6 +1344,15 @@ impl WorkerAllocation {
         }
         let work = recovery_tree_work(tree)
             .and_then(|n| nodes.checked_mul(512).and_then(|d| n.checked_add(d)))
+            .and_then(|n| {
+                // One directory node per physical storage (including opaque
+                // wrapper/children), plus path-copying scratch while building.
+                let blocks = tree.as_ref().map_or(0, |root| root.metrics.resources.blocks);
+                blocks
+                    .checked_add(nodes)
+                    .and_then(|count| count.checked_mul(2 * (std::mem::size_of::<RetainedNode>() + ARC_HEADER)))
+                    .and_then(|directory| n.checked_add(directory))
+            })
             .ok_or_else(crate::worker_edit::overflow)?;
         // One active core import/split/join working set. Returned/composed roots
         // and source expansion are covered by the separately reserved VM peak.
