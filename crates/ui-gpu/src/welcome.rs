@@ -87,7 +87,7 @@ impl Model {
         }
     }
     pub fn skip_registration(&mut self) {
-        if self.stage == Stage::FileTypes {
+        if matches!(self.stage, Stage::About | Stage::FileTypes) {
             self.stage = Stage::Complete;
             self.completion_pending = true;
         }
@@ -448,5 +448,25 @@ mod tests {
         assert!(completion.retained_temporary.is_none());
         assert_eq!(fs::read(&path).unwrap(), b"foreign marker");
         assert_eq!(fs::read_dir(&case.0).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+    #[test]
+    fn not_now_skips_about_and_late_ready_does_not_reopen() {
+        let mut model = Model::default(); model.ready(true);
+        model.skip_registration();
+        assert_eq!(model.stage(), Stage::Complete);
+        assert!(!model.visible()); assert!(model.completion_pending);
+        model.ready(true); assert!(!model.visible());
+    }
+    #[test]
+    fn skip_cannot_interrupt_an_accepted_registration() {
+        let mut model = Model::default(); model.ready(true); model.next();
+        assert!(model.begin_registration()); model.skip_registration();
+        assert_eq!(model.stage(), Stage::Registering);
+        assert!(!model.completion_pending);
     }
 }
