@@ -1338,16 +1338,41 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(vec![b'n', 0xff, b'x'])
         };
+        // Synthetic native paths exercise lossy-display guards even on APFS,
+        // which cannot materialize the invalid UTF-8 filesystem component.
+        let synthetic_root = std::env::temp_dir().join(&native);
+        assert!(synthetic_root.to_str().is_none());
+        let mut panel = SearchPanel::default();
+        panel.set_root(synthetic_root).unwrap();
+        panel.open(SearchMode::Files, &Settings::default().search).unwrap();
+        panel.deferred_input(SearchInput::Focus(SearchField::Root)).unwrap();
+        let displayed = panel.text(SearchField::Root).0.to_owned();
+        for input in [SearchInput::Text("-changed"), SearchInput::Backspace, SearchInput::Delete] {
+            assert!(panel.deferred_input(input).is_err(), "display text must not partially replace a native root");
+            assert_eq!(panel.text(SearchField::Root).0, displayed);
+        }
+        panel.deferred_input(SearchInput::SelectAll).unwrap();
+        #[cfg(windows)]
+        let replacement = "C:/kwil-native-root-replacement";
+        #[cfg(unix)]
+        let replacement = "/kwil-native-root-replacement";
+        panel.deferred_input(SearchInput::Text(replacement)).unwrap();
+        assert_eq!(panel.text(SearchField::Root).0, replacement, "an explicit complete replacement remains available");
+
+        #[cfg(target_os = "macos")]
+        let filesystem_native = std::ffi::OsString::from("native-界-é");
+        #[cfg(not(target_os = "macos"))]
+        let filesystem_native = native;
         let mut h = Harness::new("original");
-        let tree = h.root.join(&native);
+        let tree = h.root.join(&filesystem_native);
         std::fs::create_dir_all(&tree).unwrap();
-        let path = tree.join(native);
+        let path = tree.join(filesystem_native);
         std::fs::write(&path, "needle\n").unwrap();
         h.files(tree, "needle");
         assert_eq!(h.host.panel.count(), (1, true));
         let action = h.host.session.as_ref().unwrap().file_action(0, 0).unwrap();
         assert!(matches!(&action, SearchAction::OpenFile { path: actual, .. } if actual == &path));
-        h.render(40, 10); // replacement characters are display only
+        h.render(40, 10); // Unicode/replacement characters are display only
         h.press(KeyCode::Enter, KeyModifiers::NONE);
         h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
         assert_eq!(h.selection(), 0..0);

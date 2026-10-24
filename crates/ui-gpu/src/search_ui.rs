@@ -1251,10 +1251,19 @@ pub(crate) mod host_dispatch_tests {
     fn actual_host_folder_utf16_and_native_root_are_not_lossy_navigation_authority() {
         let (mut app, rx, root) = worker_host("");
         let tree = folder_tree(&root);
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         let tree = {
             use std::os::unix::ffi::OsStringExt;
             let native = tree.join(std::ffi::OsString::from_vec(b"native-\xff".to_vec()));
+            std::fs::create_dir(&native).unwrap();
+            native
+        };
+        #[cfg(target_os = "macos")]
+        let tree = {
+            // APFS rejects invalid UTF-8 path components. Keep the real
+            // UTF-16/open workflow here; synthetic lossy roots are exercised
+            // without filesystem access by the separate authority control.
+            let native = tree.join("native-検索-🦊");
             std::fs::create_dir(&native).unwrap();
             native
         };
@@ -1281,18 +1290,23 @@ pub(crate) mod host_dispatch_tests {
             Some(("utf16.txt:2", "needle")),
             "native request root is stripped before display decoding"
         );
-        app.search_input(SearchInput::Focus(SearchField::Root));
-        app.search_input(SearchInput::End);
-        let native_key = app.search.as_ref().unwrap().key();
-        let root_display = app.search_panel.text(SearchField::Root).0.to_owned();
-        app.search_input(SearchInput::Text("rejected-partial-edit"));
-        assert_eq!(app.search_panel.text(SearchField::Root).0, root_display);
-        assert_eq!(app.search.as_ref().unwrap().key(), native_key);
-        assert_eq!(
-            app.search_view.row_text(0),
-            Some(("utf16.txt:2", "needle")),
-            "rejected native-root editing preserves the completed display page"
-        );
+        let page_key = app.search.as_ref().unwrap().key();
+        let page_first = app.search.as_ref().unwrap().state().file_first;
+        #[cfg(not(target_os = "macos"))]
+        {
+            app.search_input(SearchInput::Focus(SearchField::Root));
+            app.search_input(SearchInput::End);
+            let native_key = app.search.as_ref().unwrap().key();
+            let root_display = app.search_panel.text(SearchField::Root).0.to_owned();
+            app.search_input(SearchInput::Text("rejected-partial-edit"));
+            assert_eq!(app.search_panel.text(SearchField::Root).0, root_display);
+            assert_eq!(app.search.as_ref().unwrap().key(), native_key);
+            assert_eq!(
+                app.search_view.row_text(0),
+                Some(("utf16.txt:2", "needle")),
+                "rejected native-root editing preserves the completed display page"
+            );
+        }
         app.search_input(SearchInput::Focus(SearchField::Query));
         paint_folder(&mut app);
         let action = app.search.as_ref().unwrap().file_action(0, 0).unwrap();
@@ -1309,6 +1323,9 @@ pub(crate) mod host_dispatch_tests {
             "UTF-16 original offset is not a logical UTF-8 offset"
         );
         assert_eq!(app.search_panel.count(), (1, true));
+        assert_eq!(app.search.as_ref().unwrap().key(), page_key, "opening preserves the folder query generation");
+        assert_eq!(app.search.as_ref().unwrap().state().file_first, page_first);
+        assert_eq!(app.search_panel.results().len(), 1, "the result page stays available on every platform");
         // Editing the display explicitly opts into the typed replacement path.
         app.search_input(SearchInput::Focus(SearchField::Root));
         app.search_input(SearchInput::SelectAll);
@@ -1316,6 +1333,51 @@ pub(crate) mod host_dispatch_tests {
         finish(&mut app, &rx);
         assert_eq!(app.search_panel.text(SearchField::Root).0, root.to_str().unwrap());
         worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_folder_synthetic_lossy_root_edits_preserve_authority_without_filesystem() {
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"native-\xff".to_vec())
+        };
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[110, 97, 116, 105, 118, 101, 45, 0xd800])
+        };
+        // Construct native paths only: neither path is materialized or sent
+        // to a worker, including on macOS where APFS cannot store this name.
+        let native = std::env::temp_dir().join(name);
+        assert!(native.to_str().is_none());
+        let (mut app, _rx) = host("");
+        app.set_search_root(native.clone());
+        app.dispatch_search("search.findInFiles");
+        app.search_input(SearchInput::Focus(SearchField::Root));
+        app.search_input(SearchInput::End);
+        let display = app.search_panel.text(SearchField::Root).0.to_owned();
+        for input in [SearchInput::Text("partial"), SearchInput::Backspace, SearchInput::Delete] {
+            app.search_input(input);
+            assert_eq!(app.search_panel.text(SearchField::Root).0, display);
+            assert!(app.search_panel.status().contains("cannot be edited"));
+            assert!(app.search.is_none(), "synthetic native paths never reach filesystem workers");
+        }
+        // Rejected partial edits must not claim text ownership: another typed
+        // root delivery can still replace the intact native authority.
+        let next_native = native.join("next-root");
+        app.set_search_root(next_native.clone());
+        assert_eq!(app.search_panel.text(SearchField::Root).0, next_native.to_string_lossy().as_ref());
+        let explicit = std::env::temp_dir().join("explicit-root").to_string_lossy().into_owned();
+        app.search_input(SearchInput::SelectAll);
+        app.search_input(SearchInput::Text(&explicit));
+        app.set_search_root(native);
+        assert_eq!(
+            app.search_panel.text(SearchField::Root).0,
+            explicit,
+            "only an explicit full edit transfers path authority to text"
+        );
+        assert!(app.search.is_none());
     }
 
     #[test]
