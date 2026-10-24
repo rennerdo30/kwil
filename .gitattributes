@@ -1,2 +1,4 @@
 *.bat text eol=crlf
 *.sh text eol=lf
+# These bytes are the independent plaintext oracle for the gzip fixture.
+examples/smoke/example.log text eol=lf
