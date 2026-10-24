@@ -1,6 +1,76 @@
 # Install Kwil
 
-The commands below become usable after these scripts reach `main` and the owner
+## Local Windows distribution
+
+From the repository root, run:
+
+```powershell
+.\dist.bat
+# Optional: retain work/logs and set bounded build/package timeouts (seconds).
+.\dist.bat -KeepWorkDirectory -BuildTimeoutSeconds 1800 -PackageTimeoutSeconds 120
+```
+
+Prerequisites must already be installed: Windows x64 or ARM64, PowerShell 7
+(`pwsh.exe`), Git, rustup, the pinned Rust toolchain for the native MSVC target,
+Windows SDK/linker tools and `makecab.exe`. Locked Cargo dependencies must be
+cached, and `E:/Development/_cache/cargo-target` must exist. The build is offline;
+it does not download or install missing tools or dependencies.
+
+The driver archives one exact **committed HEAD**. Application, installer backend,
+guard, assets and lockfile integration must already be committed; dirty and
+untracked inputs are ignored. Only the invoked driver comes from the working
+tree. Missing committed integration is a refusal, not a fallback to dirty code.
+
+On success, `dist/kwil-<version>-<12-hex-commit>-<target>/` contains an unsigned
+MSI, `*-portable.zip`, the MSI's adjacent `<full-msi-filename>.manifest.json`
+sidecar, `INSTALL.txt`, `manifest.json` and `SHA256SUMS`. Checksums cover the MSI,
+sidecar, ZIP, instructions and outer manifest; they are not publisher signatures.
+Existing output directories are refused, never overwritten. **Building does not
+install or launch Kwil, sign artifacts or publish a release.**
+
+To try the MSI, open the generated `.msi` as your normal, non-elevated user.
+The installer contract specifies `%LOCALAPPDATA%/Programs/Kwil` (without a
+version subdirectory), an Apps & Features entry, a current-user Start Menu
+shortcut and an Explorer **Open with Kwil** static context-menu verb for files.
+On Windows 11, look under **Show more options**. This verb opens `kwil.exe`;
+it does not choose Kwil as a default application. The MSI does not change PATH.
+Uninstall through Windows Settings > Apps (Apps & Features / Installed apps).
+Settings, recovery data, edited documents and unrelated files/registry values
+are retained.
+
+Keep the exact original MSI and its sidecar. Close Kwil before maintenance.
+Explicit repair of missing owned resources uses the retained original package
+(replace the placeholder with its actual path):
+
+```powershell
+msiexec /i "<retained-original.msi>" REINSTALL=ALL REINSTALLMODE=amus
+```
+
+There is no advertised/automatic repair. A present changed installer-authored
+file, shortcut or registry value blocks repair, upgrade and uninstall; it is
+not overwritten or deleted. Preserve modifications and restore the original
+resource before retrying. A repacked MSI with a different PackageCode cannot
+substitute for the retained original. Upgrades require a strictly higher numeric
+version; equal-version different builds, downgrades and architecture switching
+in place are refused.
+
+For portable use, extract the ZIP into a new writable folder and keep `kwil.exe`
+and `kwil.com` together. Run `kwil.exe` for the GUI or `kwil.com --tui` for explicit
+terminal use. `kwil.portable` keeps settings beside the executable; the MSI
+omits it and uses the normal user settings location. Both payloads contain
+`kwil.no-update`, disabling self-update: update these copies explicitly by
+rebuilding/reinstalling or replacing the portable distribution. The ZIP adds no
+Start Menu or Explorer registration.
+
+Installer/guard integration and native lifecycle qualification remain pending.
+These instructions describe the source contract, not a passed install, repair,
+upgrade or uninstall run, nor v1 completion. See [decision 0004](decisions/0004-windows-installer.md)
+and its normative [machine-readable contract](../scripts/windows-installer-contract.json).
+Local artifacts are not a release and confer no publication authorization.
+
+## Published-release download scripts
+
+The download commands below become usable after these scripts reach `main` and the owner
 publishes a stable GitHub Release containing the platform binaries and
 `SHA256SUMS`. Draft releases are deliberately unavailable to the installer.
 

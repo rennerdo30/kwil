@@ -2,7 +2,7 @@
 
 Windows release entry points use a static C runtime and are checked for forbidden
 runtime DLL imports before upload. See [installation](INSTALL.md) for the
-one-line installers and exact platform dependency boundaries. Installer commands
+one-line installers and exact platform dependency boundaries. Release-download commands
 are not advertised as available until the scripts are on main and the owner has
 published a stable release with both Windows entry points and checksums.
 
@@ -19,7 +19,7 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 
    It then creates a **draft** GitHub Release with the binaries (`kwil-<target>` on Unix; `kwil-<target>.exe` and `kwil-<target>.com` on Windows) and `SHA256SUMS`.
 4. The owner reviews the draft and publishes it.
-5. Installed copies find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once.
+5. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once. Local MSI/portable distributions contain that marker and require explicit updates instead.
 
 ## Asset contract (do not change without updating `crates/update`)
 
@@ -34,7 +34,39 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 ## Not yet in place
 
 - Code signing (Windows Authenticode, macOS notarization) and an update signature (for example minisign). Each needs keys from the owner (KW-4, KW-5).
-- Installers and packages (MSI/winget, dmg/Homebrew, AppImage/Flatpak): KW-31.
+- Qualified installers and packages: the local Windows MSI/portable source path below still needs integration and lifecycle acceptance; winget, dmg/Homebrew and AppImage/Flatpak remain pending (KW-31).
+
+## Local Windows distribution (not a release)
+
+`dist.bat` invokes `scripts/dist.ps1` to prepare a native x64 or ARM64 MSI and
+portable ZIP offline from committed HEAD. See [local installation](INSTALL.md#local-windows-distribution)
+for prerequisites, the existing CLI options, installation/Explorer integration
+and the exact retained-original repair command. All intended backend, isolated
+guard and Cargo/lockfile integration must be committed first; dirty/untracked
+inputs are excluded, apart from the invoked driver itself.
+
+Successful output is an immutable
+`dist/kwil-<version>-<12-hex-commit>-<target>/` directory containing the MSI,
+portable ZIP, `<full-msi-filename>.manifest.json` sidecar, `INSTALL.txt`, outer
+`manifest.json` and `SHA256SUMS`. Retain the original MSI and sidecar together.
+The sidecar records package identity/inventory and inspection evidence;
+`nativeLifecycle: not-run` is not native acceptance. Checksums cover the MSI,
+sidecar, ZIP, instructions and outer manifest, not themselves. Neither manifest
+nor checksums authenticate the publisher.
+
+This build does not install, run the application, sign or publish. It does not
+change the raw GitHub Release asset/updater contract above. The MSI and ZIP both
+contain `kwil.no-update`; only the ZIP contains `kwil.portable`. Their updates
+are explicit rather than the paired self-update flow below.
+
+Decision [0004](decisions/0004-windows-installer.md) and
+[`scripts/windows-installer-contract.json`](../scripts/windows-installer-contract.json)
+are jointly normative. Integration and disposable hosted Windows x64/ARM64
+lifecycle qualification remain pending: install, original-package repair,
+higher-version upgrade, rollback, uninstall, resource/in-use refusals and data
+preservation. MSI/CAB/PE inspection alone proves none of those lifecycle results.
+Local artifact preparation does not establish v1 completion or authorize a
+release/publication; owner approval remains required.
 
 ## Windows development build
 
