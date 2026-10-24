@@ -829,7 +829,9 @@ mod tests {
             let settings = Settings::default();
             let keys = KeymapEngine::new(settings.keymap, &settings.bindings).unwrap();
             let mut harness = Self { host: SearchHost::default(), view, keys, settings, rx, stopped, root };
-            harness.until(|h| h.view.recovery_ready() && h.view.editor().is_some());
+            harness.until_stage("initial workspace recovery and editor", |h| {
+                h.view.recovery_ready() && h.view.editor().is_some()
+            });
             harness
                 .view
                 .execute("edit.insert", &CommandArgs { text: Some(text.into()), ..Default::default() }, 1)
@@ -852,24 +854,55 @@ mod tests {
             self.host.sync(&mut self.view, &mut self.keys);
         }
         fn until(&mut self, ready: impl Fn(&Self) -> bool) {
+            self.until_stage("worker condition", ready);
+        }
+        fn until_stage(&mut self, stage: &str, ready: impl Fn(&Self) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !ready(self) {
-                let message = self
-                    .rx
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .expect("bounded real TUI worker wake");
+                let message = self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap_or_else(
+                    |error| {
+                        // Failure-only, bounded cached state: no source reads,
+                        // extra worker wakes or retained document owners.
+                        let tabs: Vec<_> = self
+                            .view
+                            .session()
+                            .tabs()
+                            .iter()
+                            .take(8)
+                            .map(|tab| {
+                                let view = self.view.view(tab.id);
+                                (
+                                    tab.id,
+                                    self.view.document_busy(tab.id),
+                                    self.view.binary_offer_pending(tab.id),
+                                    view.and_then(|view| view.editor()).map(|editor| editor.primary_cursor().selection()),
+                                    view.map(|view| view.notice().chars().take(256).collect::<String>()),
+                                )
+                            })
+                            .collect();
+                        panic!(
+                            "bounded real TUI worker wake ({stage}): {error:?}; active={:?}; search_pending={} count={:?}; recovery_ready={} file_prompt={} binary_offer={}; tabs(id,busy,binary_pending,cursor,notice)={tabs:?}",
+                            self.view.active_id(),
+                            self.host.panel.is_pending(),
+                            self.host.panel.count(),
+                            self.view.recovery_ready(),
+                            self.view.file_prompt().is_some(),
+                            self.view.binary_offer().is_some(),
+                        );
+                    },
+                );
                 self.dispatch(message);
             }
         }
         fn receipts(&mut self) {
-            self.until(|h| {
+            self.until_stage("edit and recovery receipts", |h| {
                 !h.view.search_replacement_pending()
                     && h.view.recovery_notice().is_none()
                     && h.view.editor().is_some_and(|editor| !editor.has_pending_edit_receipt())
             });
         }
         fn settle(&mut self) {
-            self.until(|h| !h.host.panel.is_pending());
+            self.until_stage("search panel completion", |h| !h.host.panel.is_pending());
         }
         fn press(&mut self, code: KeyCode, modifiers: KeyModifiers) -> KeyResult {
             let intent = key(
@@ -1036,6 +1069,38 @@ mod tests {
     }
 
     #[test]
+    fn checked_open_missing_path_preserves_open_failure_and_indexed_failure_stage() {
+        use kwil_view_model::document_worker::DocumentResult;
+
+        let mut h = Harness::new("original");
+        let failed = h.view.open_path(h.root.join("missing-parent/absent.txt")).unwrap();
+        assert!(h.view.editor().is_none(), "actual checked-open placeholder has no editor");
+        assert!(h.view.binary_offer_pending(failed), "checked open owns the pending source decision");
+        h.until_stage("missing-path checked-open completion", |h| !h.view.binary_offer_pending(failed));
+        assert_eq!(h.view.active_id(), failed);
+        assert!(h.view.editor().is_none(), "failed checked open must not fabricate an editor");
+        assert!(!h.view.document_busy(failed), "the error completion releases the checked-open flight");
+        assert!(h.view.binary_offer().is_none(), "an unavailable source cannot offer a binary choice");
+        assert!(
+            h.view.notice().starts_with("Open failed:"),
+            "missing-path failure belongs to open, not indexing: {}",
+            h.view.notice()
+        );
+
+        // Keep the distinct legacy index-result branch covered through the
+        // same host dispatcher. Only this control event is synthetic; the
+        // missing-path completion above comes from the actual document worker.
+        h.dispatch(Msg::Document(DocumentResult::Indexed {
+            document: failed,
+            revision: 0,
+            result: Err(std::io::Error::other("injected index-stage failure")),
+        }));
+        assert!(h.view.editor().is_none());
+        assert_eq!(h.view.notice(), "Index failed: injected index-stage failure");
+        h.finish();
+    }
+
+    #[test]
     fn folder_r1_files_open_from_loading_and_failed_tabs_without_an_editor() {
         let mut h = Harness::new("original");
         let tree = h.root.join("editor-absent");
@@ -1048,9 +1113,13 @@ mod tests {
         h.host.sync(&mut h.view, &mut h.keys);
         h.press(KeyCode::Enter, KeyModifiers::NONE);
         assert_ne!(h.view.active_id(), failed, "Files keyboard open is independent of the absent editor");
-        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
-        h.until(|h| h.selection() == (7..7));
-        h.until(|h| h.view.view(failed).is_some_and(|view| view.notice().contains("Open failed")));
+        h.until_stage("loading-tab result editor", |h| {
+            h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path()))
+        });
+        h.until_stage("loading-tab result line cursor", |h| h.selection() == (7..7));
+        h.until_stage("missing-path open failure notice", |h| {
+            h.view.view(failed).is_some_and(|view| view.notice().contains("Open failed"))
+        });
         assert!(h.view.activate(failed));
         assert!(h.view.editor().is_none(), "a real failed-open tab still has no editor");
         h.host.sync(&mut h.view, &mut h.keys);
@@ -1058,7 +1127,7 @@ mod tests {
         let row = h.host.painted.as_ref().unwrap().rows[0].0;
         h.click(row.x + 2, row.y, 100, 20);
         assert_ne!(h.view.active_id(), failed, "painted Files mouse open also works without an editor");
-        h.until(|h| h.selection() == (7..7));
+        h.until_stage("failed-tab result line cursor", |h| h.selection() == (7..7));
         h.finish();
     }
 

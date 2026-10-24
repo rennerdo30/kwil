@@ -2502,14 +2502,21 @@ impl Workspace {
                 self.checkpoint_session();
                 Damage { full: true, status: true, ..Default::default() }
             }
-            result => {
-                let result = result.map(|document| document.expect("accepted checked source"));
-                if let Ok(document) = &result {
-                    self.views.get_mut(&id).unwrap().file = document.original.clone();
-                } else {
-                    self.hex_forget_binary_open(id);
-                }
-                self.document_result(DocumentResult::Indexed { document: id, revision: ticket.revision(), result })
+            Err(error) => {
+                self.hex_forget_binary_open(id);
+                self.document_result(DocumentResult::Opened {
+                    document: id,
+                    revision: ticket.revision(),
+                    result: Err(error),
+                })
+            }
+            Ok(Some(document)) => {
+                self.views.get_mut(&id).unwrap().file = document.original.clone();
+                self.document_result(DocumentResult::Indexed {
+                    document: id,
+                    revision: ticket.revision(),
+                    result: Ok(document),
+                })
             }
         }
     }

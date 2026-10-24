@@ -89,6 +89,22 @@ fn logical(workspace: &Workspace, id: DocumentId) -> Vec<u8> {
 }
 
 #[test]
+fn binary_offer_model_checked_open_failure_keeps_open_stage_and_releases_pending_owner() {
+    let fixture = Fixture::new();
+    let (mut workspace, rx) = start(&fixture, View::new(None));
+    let missing = fixture.0.join("missing-parent").join("absent.txt");
+    let id = workspace.open_path(missing.clone()).unwrap();
+    drive(&mut workspace, &rx, |w| !w.binary_offer_pending(id));
+    let failed = workspace.view(id).unwrap();
+    assert!(failed.editor().is_none());
+    assert_eq!(failed.path.as_deref(), Some(missing.as_path()));
+    assert!(failed.notice().starts_with("Open failed:"), "{}", failed.notice());
+    assert!(workspace.files.failed_opens.contains(&id));
+    assert!(workspace.binary_offer_for(id).is_none());
+    stop(workspace, &rx);
+}
+
+#[test]
 fn binary_offer_model_actual_hex_text_cancel_and_late_callbacks() {
     for choice in [Choice::Hex, Choice::Text, Choice::Cancel] {
         let fixture = Fixture::new();

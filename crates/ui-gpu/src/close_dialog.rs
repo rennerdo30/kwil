@@ -13,7 +13,9 @@ pub(super) enum Ticket {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Choice {
+    #[cfg_attr(not(windows), expect(dead_code, reason = "Only constructed by the Windows dirty-close dialog"))]
     Save,
+    #[cfg_attr(not(windows), expect(dead_code, reason = "Only constructed by the Windows dirty-close dialog"))]
     Discard,
     Cancel,
     Hex,
