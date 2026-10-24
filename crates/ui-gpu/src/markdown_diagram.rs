@@ -418,15 +418,27 @@ fn sequence(diagram: &Diagram, scene: &mut Layout, s: Sizes) -> Result<(), Error
     let nw = scene.nodes.iter().map(|n| n.rect.w).max().unwrap_or(1);
     let nh = scene.nodes.iter().map(|n| n.rect.h).max().unwrap_or(1);
     let ew = scene.edges.iter().map(|e| e.text.rect.w).max().unwrap_or(0);
-    let self_width = diagram.edges().iter().zip(&scene.edges)
-        .filter(|(edge, _)| edge.from == edge.to).map(|(_, draw)| draw.text.rect.w).max().unwrap_or(0);
+    let self_width = diagram
+        .edges()
+        .iter()
+        .zip(&scene.edges)
+        .filter(|(edge, _)| edge.from == edge.to)
+        .map(|(_, draw)| draw.text.rect.w)
+        .max()
+        .unwrap_or(0);
     let step = (nw + s.gap).max(ew + 2 * s.pad).max(self_width + s.gap + s.pad);
     let base = 2 * s.pad + scene.nodes.len() * step;
     // Earlier participants' self messages fit inside their existing column.
     // Only a return beyond the final column needs additional canvas width.
-    let natural = diagram.edges().iter().zip(&scene.edges).filter(|(edge, _)| edge.from == edge.to)
+    let natural = diagram
+        .edges()
+        .iter()
+        .zip(&scene.edges)
+        .filter(|(edge, _)| edge.from == edge.to)
         .map(|(edge, draw)| s.pad + edge.from * step + step / 2 + draw.text.rect.w + s.gap + s.pad)
-        .max().unwrap_or(0).max(base);
+        .max()
+        .unwrap_or(0)
+        .max(base);
     if natural > scene.width {
         return Err(Error::TooNarrow { required: natural, available: scene.width });
     }
@@ -756,8 +768,10 @@ mod tests {
         let a = layout("sequenceDiagram; participant Editor; participant Worker; Editor->>Worker: Immutable snapshot; Worker-->>Editor: Versioned render model; Editor->>Editor: Reject stale result", 600).unwrap();
         let next_lifeline = a.lifelines[1].0.x;
         let self_message = &a.edges[2];
-        assert!(self_message.points.iter().all(|point| point.x < next_lifeline),
-            "Editor self message must not look like a Worker interaction");
+        assert!(
+            self_message.points.iter().all(|point| point.x < next_lifeline),
+            "Editor self message must not look like a Worker interaction"
+        );
         assert_eq!(self_message.points.first().unwrap().x, self_message.points.last().unwrap().x);
         assert_eq!(self_message.text.lines.concat(), "Reject stale result");
         validate(&a).unwrap();

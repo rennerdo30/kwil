@@ -2,7 +2,7 @@
 //! clipboard access, IME capture and coherent SearchAction admission.
 use super::*;
 use kwil_core_commands::theme::{Theme, UiRole};
-#[cfg(all(test, windows))]
+#[cfg(test)]
 use kwil_view_model::search_panel::SearchField;
 use kwil_view_model::search_panel::{SearchInput, SearchMode, SearchOutcome, SearchPanel};
 

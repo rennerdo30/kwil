@@ -680,8 +680,13 @@ impl Flow<'_> {
                 self.fill(x + a + offset, y + (b + offset) as i64, thickness, thickness, color);
             }
             for offset in 0..side / 2 {
-                self.fill(x + a + side / 4 + offset, y + (b + side / 4) as i64 - offset as i64,
-                    thickness, thickness, color);
+                self.fill(
+                    x + a + side / 4 + offset,
+                    y + (b + side / 4) as i64 - offset as i64,
+                    thickness,
+                    thickness,
+                    color,
+                );
             }
         } else {
             self.fill(x, y, side, thickness, fg);
@@ -1054,17 +1059,27 @@ mod tests {
         let pixels = render("| Header |\n| --- |\n| `inline_code()` |\n", 250, 0);
         let theme = kwil_core_commands::theme::Theme::builtin(kwil_core_commands::theme::Scheme::Dark);
         let border = theme_ui::rgb(&theme, kwil_core_commands::theme::UiRole::Border);
-        for x in 24..516 { assert_eq!(pixels[74 * 540 + x], border, "rule at x={x}"); }
+        for x in 24..516 {
+            assert_eq!(pixels[74 * 540 + x], border, "rule at x={x}");
+        }
     }
     #[test]
     fn right_aligned_showcase_cell_uses_one_line_at_fractional_dpi() {
-        let pixels = render_scaled("| Feature | Example | Status |\n| :--- | :---: | ---: |\n| Escapes | A \\| B | Literal pipe |\n", 1898, 400, 0, 1.5);
+        let pixels = render_scaled(
+            "| Feature | Example | Status |\n| :--- | :---: | ---: |\n| Escapes | A \\| B | Literal pipe |\n",
+            1898,
+            400,
+            0,
+            1.5,
+        );
         let theme = kwil_core_commands::theme::Theme::builtin(kwil_core_commands::theme::Scheme::Dark);
         let bg = theme_ui::rgb(&theme, kwil_core_commands::theme::UiRole::PanelBackground);
         // Header starts at36px, body at112px; its second row is vertical padding.
-        for y in 151..185 { for x in 1270..1840 {
-            assert_eq!(pixels[y * 1898 + x], bg, "unnecessary wrapped text at ({x},{y})");
-        }}
+        for y in 151..185 {
+            for x in 1270..1840 {
+                assert_eq!(pixels[y * 1898 + x], bg, "unnecessary wrapped text at ({x},{y})");
+            }
+        }
     }
     #[test]
     fn scrolled_heading_and_wrapped_content_match_full_canvas_crop() {

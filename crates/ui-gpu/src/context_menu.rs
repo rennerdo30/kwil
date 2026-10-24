@@ -22,8 +22,10 @@ pub(super) struct Context {
     surface: Option<(usize, usize, u64)>,
 }
 impl Context {
-    #[cfg(feature="frame-harness")]
-    pub fn probe_labels(&self) -> impl Iterator<Item=&str> { self.items.iter().map(|item| item.label.as_str()) }
+    #[cfg(feature = "frame-harness")]
+    pub fn probe_labels(&self) -> impl Iterator<Item = &str> {
+        self.items.iter().map(|item| item.label.as_str())
+    }
     pub fn is_open(&self) -> bool {
         self.source.is_some()
     }

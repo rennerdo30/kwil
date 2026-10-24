@@ -257,9 +257,9 @@ mod input_dispatch_tests {
             assert_eq!(workspace.file_prompt().unwrap().text, value);
             assert!(workspace.close_pending());
             let mut prompt = Some(workspace.file_prompt().unwrap().text.clone());
-            assert!(input::commit("Ã¦—Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt".into(), &mut prompt, false).is_none());
+            assert!(input::commit("\u{65e5}\u{672c}\u{8a9e}.txt".into(), &mut prompt, false).is_none());
             workspace.file_prompt_mut().unwrap().text = prompt.unwrap();
-            assert!(workspace.file_prompt().unwrap().text.ends_with("Ã¦—Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt"));
+            assert!(workspace.file_prompt().unwrap().text.ends_with("\u{65e5}\u{672c}\u{8a9e}.txt"));
             assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 4);
             file_prompt::cancel(&mut workspace);
             assert!(!workspace.close_pending());
@@ -304,10 +304,10 @@ mod input_dispatch_tests {
             App::unbound_key(&keys, &Key::Character("q".into()), None, ModifiersState::CONTROL),
             UnboundKey::Ignore
         );
-        assert_eq!(keys.feed_with_selection("Ã§•Å’".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(keys.feed_with_selection("\u{754c}".parse().unwrap()), VimResult::Unbound);
         assert_eq!(
-            App::unbound_key(&keys, &Key::Character("Ã§•Å’".into()), Some("Ã§•Å’"), ModifiersState::empty()),
-            UnboundKey::Edit(input::Action::Text("Ã§•Å’".into()))
+            App::unbound_key(&keys, &Key::Character("\u{754c}".into()), Some("\u{754c}"), ModifiersState::empty()),
+            UnboundKey::Edit(input::Action::Text("\u{754c}".into()))
         );
         assert_eq!(keys.feed_with_selection("cmd+s".parse().unwrap()), VimResult::Unbound);
         assert_eq!(

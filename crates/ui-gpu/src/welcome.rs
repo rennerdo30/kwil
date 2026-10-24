@@ -32,8 +32,7 @@ pub enum Stage {
     Complete,
 }
 
-/// Completing the About card alone does not consume first-run setup: the
-/// extension list must be offered, then explicitly registered or skipped.
+/// Continue offers file types before completion; Not now explicitly skips setup.
 pub struct Model {
     stage: Stage,
     completion_pending: bool,
@@ -286,11 +285,9 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn about_requires_offering_registration_before_completion() {
+    fn continuing_about_offers_registration_before_completion() {
         let mut model = Model::default();
         model.ready(true);
-        assert_eq!(model.stage(), Stage::About);
-        model.skip_registration();
         assert_eq!(model.stage(), Stage::About);
         model.next();
         assert_eq!(model.stage(), Stage::FileTypes);
@@ -456,16 +453,22 @@ mod skip_tests {
     use super::*;
     #[test]
     fn not_now_skips_about_and_late_ready_does_not_reopen() {
-        let mut model = Model::default(); model.ready(true);
+        let mut model = Model::default();
+        model.ready(true);
         model.skip_registration();
         assert_eq!(model.stage(), Stage::Complete);
-        assert!(!model.visible()); assert!(model.completion_pending);
-        model.ready(true); assert!(!model.visible());
+        assert!(!model.visible());
+        assert!(model.completion_pending);
+        model.ready(true);
+        assert!(!model.visible());
     }
     #[test]
     fn skip_cannot_interrupt_an_accepted_registration() {
-        let mut model = Model::default(); model.ready(true); model.next();
-        assert!(model.begin_registration()); model.skip_registration();
+        let mut model = Model::default();
+        model.ready(true);
+        model.next();
+        assert!(model.begin_registration());
+        model.skip_registration();
         assert_eq!(model.stage(), Stage::Registering);
         assert!(!model.completion_pending);
     }
