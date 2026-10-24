@@ -39,6 +39,15 @@ function Assert-TestProcessEnvironment {
     Assert-True ([object]::Equals($actual, $Expected.Value)) "$Message (exact value)"
 }
 
+function Assert-TestNonInstallingRustupArguments {
+    param([string[]]$Arguments)
+    # ROOT's retained installed-CLI help lists only --install as the opt-in
+    # installer option. Assert that real grammar, not an invented opt-out flag.
+    Assert-True ($Arguments.Count -ge 3 -and $Arguments[0] -ceq 'run' -and
+        $Arguments[1] -ceq '1.99.1' -and $Arguments[2] -cin @('cargo', 'rustc')) 'supported rustup run TOOLCHAIN COMMAND grammar'
+    Assert-True ('--install' -cnotin $Arguments -and '--no-auto-install' -cnotin $Arguments) 'no installing or unsupported rustup option'
+}
+
 function New-TestPe {
     param([string]$Path, [string]$Dll = 'kernel32.dll', [switch]$Delay,
         [switch]$Unterminated, [int]$Subsystem = 2, [int]$Machine = 0x8664, [switch]$DllImage,
@@ -201,6 +210,7 @@ try {
             param($FilePath, $Arguments, $WorkingDirectory, $TimeoutSeconds, $LogDirectory, $Label)
             $script:mockCalls.Add([pscustomobject]@{ File = $FilePath; Args = @($Arguments); Cwd = $WorkingDirectory; Timeout = $TimeoutSeconds; Label = $Label })
             Assert-True ($env:KWIL_BUILD_COMMIT -ceq $commit) 'exact build commit environment'
+            Assert-True ($env:RUSTUP_AUTO_INSTALL -ceq '0' -and $env:CARGO_NET_OFFLINE -ceq 'true') 'noninstalling offline build environment retained'
             Assert-True ($env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS -ceq '-C target-feature=+crt-static') 'exact static CRT flag'
             Assert-True ($env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS -ceq '-C target-feature=+crt-static') 'both release target flags'
             Assert-True ([object]::ReferenceEquals([Environment]::GetEnvironmentVariable('CARGO_ENCODED_RUSTFLAGS', 'Process'), $null)) 'encoded flags are absent, not present empty'
@@ -222,9 +232,10 @@ try {
         }
         Assert-True ($script:mockCalls.Count -eq 1) 'no retry after failed build'
         $call = $script:mockCalls[0]
-        $expected = @('run', '--no-auto-install', '1.99.1', 'cargo', 'build', '--release', '-p', 'kwil',
+        $expected = @('run', '1.99.1', 'cargo', 'build', '--release', '-p', 'kwil',
             '--features', 'windows-console', '--target', $target, '--locked', '--offline', '-j', '4')
         Assert-True (($call.Args -join '|') -ceq ($expected -join '|')) 'concrete offline locked release build command'
+        Assert-TestNonInstallingRustupArguments $call.Args
         Assert-True ($call.Cwd -ceq $snapshot -and $call.Timeout -eq 7) 'snapshot cwd and finite timeout'
         # Exercise exact restoration on both callback exits, independently of
         # the inherited environment. None of these callbacks starts a process.
@@ -295,8 +306,15 @@ try {
         Assert-True (@($link[$range[0]..$range[1]] | Where-Object { $_ -ne 0 }).Count -eq 0) 'zero reserved fields, padding and terminal block'
     }
     $guardArgs = @(Get-DistGuardBuildArguments '1.99.1' $target 'E:/fixture guard/Cargo.toml')
-    Assert-True (($guardArgs -join '|') -ceq ('run|--no-auto-install|1.99.1|cargo|build|--release|--lib|--manifest-path|E:/fixture guard/Cargo.toml|--target|' +
+    Assert-True (($guardArgs -join '|') -ceq ('run|1.99.1|cargo|build|--release|--lib|--manifest-path|E:/fixture guard/Cargo.toml|--target|' +
         $target + '|--locked|--offline|-j|4|--config|profile.release.panic="abort"')) 'isolated locked offline static-environment guard build arguments'
+    Assert-TestNonInstallingRustupArguments $guardArgs
+    $rustcArgs = @(Get-DistRustupRunArguments '1.99.1' @('rustc', '-vV'))
+    Assert-TestNonInstallingRustupArguments $rustcArgs
+    Assert-True (($rustcArgs -join '|') -ceq 'run|1.99.1|rustc|-vV') 'rustc version uses the installed CLI grammar without toolchain installation'
+    $metadataArgs = @(Get-DistRustupRunArguments '1.99.1' @('cargo', 'metadata', '--no-deps', '--format-version', '1', '--locked', '--offline'))
+    Assert-TestNonInstallingRustupArguments $metadataArgs
+    Assert-True (($metadataArgs -join '|') -ceq 'run|1.99.1|cargo|metadata|--no-deps|--format-version|1|--locked|--offline') 'application metadata preserves locked offline arguments'
     Assert-True ((Get-DistFileSha256 (Join-Path $checks 'a file.txt')) -ceq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'streamed SHA256 known vector'
     Assert-Throws { Get-DistFileSha256 (Join-Path $checks 'a file.txt') 2 } 'byte limit'
 
@@ -337,6 +355,7 @@ try {
         Assert-True ($script:guardCalls.Count -eq 2 -and $script:guardCalls[0].Label -ceq 'guard-metadata' -and
             $script:guardCalls[1].Label -ceq 'guard-build' -and $script:guardCalls[1].Timeout -eq 7 -and
             $script:guardCalls[1].Cwd -ceq $sourceFixture) 'guard-only manifest metadata/build boundary and timeout'
+        foreach ($guardCall in $script:guardCalls) { Assert-TestNonInstallingRustupArguments $guardCall.Args }
         Assert-True ($guardResult -ceq (Join-Path $bins "$target/release/kwil_installer_guard.dll")) 'DLL target discovered from manifest metadata'
         Assert-True (-not (Test-Path -LiteralPath $guardResult)) 'mock did not build a guard or an application'
     } finally { Set-Item Function:Invoke-DistProcess -Value $originalProcess }

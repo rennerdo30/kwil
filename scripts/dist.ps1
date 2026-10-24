@@ -222,9 +222,17 @@ function Get-DistNames {
     return [pscustomobject]@{ Namespace = $stem; Msi = "$stem.msi"; Zip = "$stem-portable.zip" }
 }
 
+function Get-DistRustupRunArguments {
+    param([string]$Toolchain, [string[]]$Command)
+    # Installed CLI: rustup run [OPTIONS] <TOOLCHAIN> <COMMAND>...
+    # Installation requires explicit --install. Omit it: a missing pinned
+    # toolchain fails; do not bootstrap, update or retry with installation.
+    return @('run', $Toolchain) + $Command
+}
+
 function Get-DistBuildArguments {
     param([string]$Toolchain, [string]$Target)
-    return @('run', '--no-auto-install', $Toolchain, 'cargo', 'build', '--release', '-p', 'kwil',
+    return Get-DistRustupRunArguments $Toolchain @('cargo', 'build', '--release', '-p', 'kwil',
         '--features', 'windows-console', '--target', $Target, '--locked', '--offline', '-j', '4')
 }
 
@@ -471,7 +479,7 @@ function Assert-DistInstallerSources {
 function Get-DistGuardBuildArguments {
     param([string]$Toolchain, [string]$Target, [string]$Manifest)
     # A manifest-scoped lib build, in its own target cache; no application graph build.
-    return @('run', '--no-auto-install', $Toolchain, 'cargo', 'build', '--release', '--lib',
+    return Get-DistRustupRunArguments $Toolchain @('cargo', 'build', '--release', '--lib',
         '--manifest-path', $Manifest, '--target', $Target, '--locked', '--offline', '-j', '4',
         '--config', 'profile.release.panic="abort"')
 }
@@ -480,8 +488,8 @@ function Build-DistGuardSnapshot {
     param([string]$Rustup, [string]$Toolchain, [string]$Target, [string]$Snapshot,
         [string]$Cache, [string]$Logs, [int]$TimeoutSeconds)
     $manifest = Join-Path $Snapshot 'crates/installer-guard/Cargo.toml'
-    $metadataLog = Invoke-DistProcess $Rustup @('run', '--no-auto-install', $Toolchain, 'cargo', 'metadata',
-        '--manifest-path', $manifest, '--no-deps', '--format-version', '1', '--locked', '--offline') $Snapshot 60 $Logs 'guard-metadata'
+    $metadataLog = Invoke-DistProcess $Rustup (Get-DistRustupRunArguments $Toolchain @('cargo', 'metadata',
+        '--manifest-path', $manifest, '--no-deps', '--format-version', '1', '--locked', '--offline')) $Snapshot 60 $Logs 'guard-metadata'
     $metadata = [IO.File]::ReadAllText($metadataLog.FullName) | ConvertFrom-Json
     $packages = @($metadata.packages | Where-Object { [IO.Path]::GetFullPath($_.manifest_path) -eq [IO.Path]::GetFullPath($manifest) })
     if ($packages.Count -ne 1) { throw 'ROOT-integrated guard manifest is absent from Cargo metadata.' }
@@ -1089,7 +1097,7 @@ function Invoke-KwilDist {
         Initialize-DistCache $cache
         $guardCache = Join-Path $cacheParent 'kwil-dist-guard'
         Initialize-DistCache $guardCache
-        $rustcLog = Invoke-DistProcess $tools['rustup.exe'] @('run', '--no-auto-install', $toolchain, 'rustc', '-vV') $snapshot 30 $logs 'rustc-version'
+        $rustcLog = Invoke-DistProcess $tools['rustup.exe'] (Get-DistRustupRunArguments $toolchain @('rustc', '-vV')) $snapshot 30 $logs 'rustc-version'
         $rustcVersion = [IO.File]::ReadAllText($rustcLog.FullName).Trim()
         if ($rustcVersion -notmatch "(?m)^host: $([regex]::Escape($target))\r?$" ) { throw "Pinned toolchain must be native $target; no targets are installed automatically." }
         # The guard is built separately from the archived commit, with its own cache.
@@ -1101,8 +1109,8 @@ function Invoke-KwilDist {
         $machine = if ($architecture -eq 'x64') { 0x8664 } else { 0xaa64 }
         if ($guardInfo.Machine -ne $machine -or -not $guardInfo.IsDll) { throw 'Guard architecture/DLL mismatch before application compilation.' }
         Use-DistBuildEnvironment $commit $cache {
-            # rustup run --no-auto-install fails instead of fetching a missing toolchain.
-            $metadataLog = Invoke-DistProcess $tools['rustup.exe'] @('run', '--no-auto-install', $toolchain, 'cargo', 'metadata', '--no-deps', '--format-version', '1', '--locked', '--offline') $snapshot 60 $logs 'cargo-metadata'
+            # Plain rustup run fails for a missing toolchain; no --install retry.
+            $metadataLog = Invoke-DistProcess $tools['rustup.exe'] (Get-DistRustupRunArguments $toolchain @('cargo', 'metadata', '--no-deps', '--format-version', '1', '--locked', '--offline')) $snapshot 60 $logs 'cargo-metadata'
             $metadata = [IO.File]::ReadAllText($metadataLog.FullName) | ConvertFrom-Json
             $package = @($metadata.packages | Where-Object { $_.name -ceq 'kwil' })
             if ($package.Count -ne 1 -or $package[0].version -cne $cargoVersion) { throw 'Cargo package/workspace version mismatch.' }
