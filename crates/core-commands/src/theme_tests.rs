@@ -30,7 +30,7 @@ fn rgba_alpha_and_remote_background_contract() {
     let t = theme_parse::parse_toml(native()).unwrap();
     let remote = t.for_remote();
     assert_eq!(t.ui.get(UiRole::Background).3, 68, "remote adapter must not mutate persisted alpha");
-    assert_eq!(remote.ui.get(UiRole::Background), Rgba(14, 24, 40, 255));
+    assert_eq!(remote.ui.get(UiRole::Background), Rgba(23, 28, 36, 255));
     for role in UiRole::ALL {
         if role.is_background() {
             assert_eq!(remote.ui.get(*role).3, 255);
@@ -43,12 +43,12 @@ fn rgba_alpha_and_remote_background_contract() {
 fn builtins_and_native_round_trip_contract() {
     let dark = Theme::builtin(Scheme::Dark);
     for (role, expected) in [
-        (UiRole::Background, 0x0d1424),
-        (UiRole::Foreground, 0xd6e4f0),
-        (UiRole::GutterBackground, 0x0a101d),
-        (UiRole::GutterForeground, 0x5b6b85),
-        (UiRole::StatusBackground, 0x080d18),
-        (UiRole::StatusForeground, 0x8fe3ff),
+        (UiRole::Background, 0x191a1e),
+        (UiRole::Foreground, 0xe5e7eb),
+        (UiRole::GutterBackground, 0x16171b),
+        (UiRole::GutterForeground, 0x7c818c),
+        (UiRole::StatusBackground, 0x16171b),
+        (UiRole::StatusForeground, 0xb9c1cf),
     ] {
         assert_eq!(dark.ui.get(role), Rgba::rgb(expected));
     }

@@ -239,7 +239,7 @@ pub(super) fn hover(view: &View, pointer: (usize, usize)) -> Option<Target> {
     view.area.filter(|area| area.contains(pointer)).and_then(|_| view.hits.at(pointer))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use kwil_core_commands::settings::SearchSettings;

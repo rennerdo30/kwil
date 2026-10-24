@@ -10,12 +10,15 @@ pub(crate) const fn native_supported() -> bool {
 }
 
 #[derive(Debug)]
+// Completion variants are produced only by the Windows STA or injected tests.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum Outcome {
     Accepted(PathBuf),
     Cancelled,
     Failed(String),
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum Event {
     Ready,
     Completed { ticket: NativeFilePrompt, outcome: Outcome },
@@ -25,7 +28,9 @@ pub(crate) enum Event {
 pub(crate) struct Request {
     pub ticket: Box<NativeFilePrompt>,
     /// Native owner handle only, never a COM pointer. Owner must outlive Stopped.
+    #[cfg(windows)]
     pub owner: isize,
+    #[cfg(windows)]
     pub suggested_name: Option<std::ffi::OsString>,
 }
 
@@ -53,7 +58,7 @@ impl Gate {
         self.stopped
     }
 
-    pub fn sync(&mut self, workspace: &mut Workspace, owner: isize, port: &mut impl Port) {
+    pub fn sync(&mut self, workspace: &mut Workspace, _owner: isize, port: &mut impl Port) {
         if self.stopping || !self.ready {
             return;
         }
@@ -69,13 +74,20 @@ impl Gate {
         let Some(ticket) = workspace.native_file_prompt() else {
             return;
         };
+        #[cfg(windows)]
         let suggested_name = workspace
             .view(ticket.document())
             .and_then(|view| view.editor())
             .and_then(|editor| editor.document().path())
             .and_then(|path| path.file_name())
             .map(std::ffi::OsStr::to_os_string);
-        let request = Request { ticket: Box::new(ticket.clone()), owner, suggested_name };
+        let request = Request {
+            ticket: Box::new(ticket.clone()),
+            #[cfg(windows)]
+            owner: _owner,
+            #[cfg(windows)]
+            suggested_name,
+        };
         match port.submit(request) {
             Ok(()) => {
                 self.active = Some(ticket);

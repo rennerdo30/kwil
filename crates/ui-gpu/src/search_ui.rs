@@ -2,7 +2,7 @@
 //! clipboard access, IME capture and coherent SearchAction admission.
 use super::*;
 use kwil_core_commands::theme::{Theme, UiRole};
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use kwil_view_model::search_panel::SearchField;
 use kwil_view_model::search_panel::{SearchInput, SearchMode, SearchOutcome, SearchPanel};
 
@@ -20,7 +20,7 @@ pub(super) fn area(size: (usize, usize), cw: usize, ch: usize, mode: SearchMode)
     let (w, h) = (columns * cw, rows * ch);
     Some(Rect { x: (size.0 - w) / 2, y: 0, w, h })
 }
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn label(field: SearchField) -> &'static str {
     match field {
         SearchField::Query => "Find",
@@ -30,7 +30,7 @@ fn label(field: SearchField) -> &'static str {
         SearchField::Exclude => "Exclude",
     }
 }
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(super) fn draw(
     panel: &SearchPanel,
     pixels: &mut [u32],
@@ -146,7 +146,7 @@ pub(super) fn draw(
     draw_text(pixels, size.0, font, rect.x + cw, rect.y + (rows - 1) * ch, help.as_bytes(), columns - 2, muted, bg);
     Some(rect)
 }
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn on(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
