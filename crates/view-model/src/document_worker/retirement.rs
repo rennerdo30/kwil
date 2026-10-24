@@ -155,6 +155,28 @@ impl WorkerBackings {
         Ok(document)
     }
 
+    /// Same physical transport, using the exact owner held by a binary offer.
+    pub(super) fn open_raw_file(
+        &mut self,
+        document: kwil_core_workspace::session::DocumentId,
+        pending: super::binary_offer::Pending,
+        rows: usize,
+        generation: u64,
+        cancel: &AtomicBool,
+        publish: impl FnOnce(crate::hex_session::Page),
+    ) -> io::Result<Document> {
+        let super::binary_offer::Pending { path, file } = pending;
+        self.check_input_path(&path, 0)?;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "raw source backing capacity retained"))?;
+        let document = super::hex_runtime::open_file(document, path, file, rows, generation, cancel, publish)?;
+        *slot = Some(Resource::Raw(document.original.as_ref().expect("raw named original").clone()));
+        Ok(document)
+    }
+
     fn check_input_path(&self, path: &Path, suffix: usize) -> io::Result<()> {
         if path.as_os_str().as_encoded_bytes().len().checked_add(suffix).is_none_or(|bytes| bytes > self.path_cap) {
             return Err(invalid("source or save path exceeds backing metadata admission cap"));
@@ -455,7 +477,7 @@ fn require_unchanged(file: &TextFile) -> io::Result<()> {
     Ok(())
 }
 
-fn source_format(file: &TextFile) -> io::Result<DetectedFormat> {
+pub(super) fn source_format(file: &TextFile) -> io::Result<DetectedFormat> {
     require_unchanged(file)?;
     let bytes = file.bytes().map_err(io::Error::other)?;
     Ok(detect_magic(&bytes[..bytes.len().min(8)]))

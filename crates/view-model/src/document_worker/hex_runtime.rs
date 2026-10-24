@@ -99,7 +99,7 @@ pub(super) fn open(
     open_file(document, path, file, rows, generation, cancel, publish)
 }
 
-fn open_file(
+pub(super) fn open_file(
     document: DocumentId,
     path: PathBuf,
     file: TextFile,

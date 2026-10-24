@@ -107,6 +107,18 @@ impl EncodingRuntime {
         self.backings.open_raw(document, path, rows, generation, cancel, publish)
     }
 
+    pub(super) fn open_raw_file(
+        &mut self,
+        document: kwil_core_workspace::session::DocumentId,
+        pending: super::binary_offer::Pending,
+        rows: usize,
+        generation: u64,
+        cancel: &AtomicBool,
+        publish: impl FnOnce(crate::hex_session::Page),
+    ) -> io::Result<Document> {
+        self.backings.open_raw_file(document, pending, rows, generation, cancel, publish)
+    }
+
     pub(super) fn save(
         &mut self,
         request: SaveRequest,

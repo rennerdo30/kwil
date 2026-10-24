@@ -172,6 +172,21 @@ impl Session {
         self.closed.remove(i);
         true
     }
+    /// Remove a never-accepted, clean open placeholder after its worker has
+    /// acknowledged cancellation. The caller owns that admission proof and
+    /// source retirement; this must not replace ordinary document close.
+    /// Closed history, recent paths and monotonically allocated IDs stay intact.
+    pub fn cancel_open(&mut self, id: DocumentId) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return false };
+        if self.tabs[index].revision != self.tabs[index].saved_revision {
+            return false;
+        }
+        self.tabs.remove(index);
+        if self.active == Some(id) {
+            self.active = self.tabs.get(index.min(self.tabs.len().saturating_sub(1))).map(|tab| tab.id);
+        }
+        true
+    }
     /// Reuses the stable ID and journal. Closing must not delete that journal.
     pub fn reopen_closed(&mut self) -> io::Result<Option<DocumentId>> {
         if self.tabs.len() == MAX_TABS {
@@ -572,6 +587,36 @@ pub(crate) fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod cancelled_open_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_open_preserves_full_history_and_never_reuses_identity() {
+        let mut session = Session::default();
+        for _ in 0..MAX_CLOSED {
+            let id = session.open(None).unwrap();
+            assert!(session.close(id));
+        }
+        session.closed.back_mut().unwrap().revision = 1; // unrecoverable oldest entry must remain
+        let history = session.closed.clone();
+        let remaining = session.open(None).unwrap();
+        let cancelled = session.open(None).unwrap();
+        let recent = session.recent.clone();
+        let next = session.next_id;
+        assert!(session.cancel_open(cancelled));
+        assert_eq!(session.active(), Some(remaining));
+        assert_eq!(session.closed, history);
+        assert_eq!(session.recent, recent);
+        assert_eq!(session.next_id, next);
+        assert!(!session.cancel_open(cancelled));
+        assert_eq!(session.open(None).unwrap().0, next);
+        session.tab_mut(remaining).unwrap().revision = 1;
+        assert!(!session.cancel_open(remaining), "dirty metadata cannot be cancelled as an unopened placeholder");
+        assert!(session.tabs().iter().any(|tab| tab.id == remaining));
     }
 }
 

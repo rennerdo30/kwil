@@ -49,6 +49,15 @@ impl HexFlow {
 }
 
 impl Workspace {
+    pub(super) fn hex_begin_binary_open(&mut self, id: DocumentId, generation: u64, rows: usize) {
+        let mut tab = HexTab::new(rows);
+        tab.opening = Some(generation);
+        self.views.get_mut(&id).unwrap().rows = tab.session.view().rows();
+        self.hex.tabs.insert(id, tab);
+    }
+    pub(super) fn hex_forget_binary_open(&mut self, id: DocumentId) {
+        self.hex.tabs.remove(&id);
+    }
     /// True through read-only preview, loans, save and cached close/reopen.
     /// Hosts must consume ALL body input before ordinary text/search/format.
     pub fn hex_owns_document(&self, id: DocumentId) -> bool {
@@ -418,8 +427,11 @@ impl Workspace {
             self.views.get_mut(&id).unwrap().set_notice(error.to_string());
         }
     }
-    pub(super) fn hex_preview(&mut self, id: DocumentId, revision: u64, mut page: Page) -> Damage {
-        let Some(tab) = self.hex.tabs.get_mut(&id) else { return Damage::default() };
+    pub(super) fn hex_preview(&mut self, id: DocumentId, revision: u64, page: Page) -> Damage {
+        self.hex_preview_accepted(id, revision, page).0
+    }
+    pub(super) fn hex_preview_accepted(&mut self, id: DocumentId, revision: u64, mut page: Page) -> (Damage, bool) {
+        let Some(tab) = self.hex.tabs.get_mut(&id) else { return (Damage::default(), false) };
         let generation = match self.hex.loans.get(&id) {
             Some(Loan::Reopen { generation, target: Representation::RawBytes }) => Some(*generation),
             _ => tab.opening,
@@ -429,7 +441,7 @@ impl Workspace {
             || page.request.source.representation != Representation::RawBytes
             || self.session.tabs().iter().find(|t| t.id == id).is_none_or(|t| t.revision != revision)
         {
-            return Damage::default();
+            return (Damage::default(), false);
         }
         tab.session.bind(page.request.source);
         // Worker transport generations and Session viewport generations have
@@ -437,12 +449,12 @@ impl Workspace {
         // the current viewport, never an old scroll/resize generation.
         let request = tab.session.page_request().unwrap();
         if page.request.top != request.top || page.request.rows != request.rows {
-            return Damage::default();
+            return (Damage::default(), false);
         }
         page.request = request;
-        let damage = tab.session.accept_page_with_damage(page).unwrap_or_default();
+        let Some(damage) = tab.session.accept_page_with_damage(page) else { return (Damage::default(), false) };
         tab.last_page = Some(request);
-        if self.active_id() == id { damage } else { Damage::default() }
+        (if self.active_id() == id { damage } else { Damage::default() }, true)
     }
     pub(super) fn hex_indexed(&mut self, id: DocumentId) {
         let Some(tab) = self.hex.tabs.get_mut(&id) else { return };
@@ -677,6 +689,9 @@ impl Workspace {
     /// does not approve exit or discard unsaved work: metadata and admitted
     /// recovery must be durable before ownership is transferred.
     pub fn prepare_hex_shutdown(&mut self) -> bool {
+        if !self.prepare_binary_shutdown() {
+            return false;
+        }
         if self.hex.disposing {
             self.pump_files();
             return !self.files.queue.iter().any(|request| matches!(request, DocumentRequest::DiscardHex { .. }));

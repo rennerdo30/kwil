@@ -7,6 +7,27 @@ use std::{
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 
+static HOLD_TEXT_COMPLETION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HELD_TEXT_COMPLETION: std::sync::Mutex<Option<Box<kwil_view_model::document_worker::DocumentResult>>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn hold_preview_completion(
+    result: Box<kwil_view_model::document_worker::DocumentResult>,
+    active: kwil_view_model::SessionDocumentId,
+) -> Option<Box<kwil_view_model::document_worker::DocumentResult>> {
+    use std::sync::atomic::Ordering;
+    if matches!(&*result, kwil_view_model::document_worker::DocumentResult::CheckedOpened { ticket, .. } if ticket.document() == active)
+        && HOLD_TEXT_COMPLETION.swap(false, Ordering::AcqRel)
+    {
+        let mut held = HELD_TEXT_COMPLETION.try_lock().expect("finite harness completion slot");
+        assert!(held.is_none());
+        *held = Some(result);
+        None
+    } else {
+        Some(result)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
     MarkdownSplit,
@@ -23,6 +44,19 @@ pub(crate) enum Step {
     HexCheck,
     HexClose,
     HexRestored,
+    BinaryOpen,
+    BinaryOffer,
+    BinaryHex,
+    BinaryHexCheck,
+    BinaryColdCheck,
+    BinaryColdCancelCheck,
+    BinaryText,
+    BinaryTextCheck,
+    BinaryPreviewCheck,
+    BinaryReleasePreview,
+    BinaryCancel,
+    BinaryCancelCheck,
+    BinaryClose,
     LogsOpen,
     LogsCheck,
     LogsClose,
@@ -281,7 +315,47 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (150, Step::GpuFallbackCheck),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_MARKDOWN_PROBE").is_some() {
+        let binary = [
+            (1800, Step::DismissSetup),
+            (100, Step::BinaryOpen),
+            (500, Step::BinaryOffer),
+            (100, Step::UsabilityCapture("binary-offer.bmp")),
+            (100, Step::BinaryHex),
+            (500, Step::BinaryHexCheck),
+            (100, Step::UsabilityCapture("binary-hex.bmp")),
+            (100, Step::BinaryClose),
+            (500, Step::BinaryOpen),
+            (500, Step::BinaryOffer),
+            (100, Step::BinaryText),
+            (500, Step::BinaryPreviewCheck),
+            (100, Step::UsabilityCapture("binary-text-preview.bmp")),
+            (100, Step::BinaryReleasePreview),
+            (500, Step::BinaryTextCheck),
+            (100, Step::BinaryClose),
+            (500, Step::BinaryOpen),
+            (500, Step::BinaryOffer),
+            (100, Step::BinaryCancel),
+            (500, Step::BinaryCancelCheck),
+            (100, Step::End),
+        ];
+        let binary_cold = [
+            (1800, Step::DismissSetup),
+            (500, Step::BinaryOffer),
+            (100, Step::UsabilityCapture("binary-cold-offer.bmp")),
+            (100, Step::BinaryCancel),
+            (500, Step::BinaryColdCancelCheck),
+            (100, Step::BinaryOpen),
+            (500, Step::BinaryOffer),
+            (100, Step::BinaryHex),
+            (500, Step::BinaryHexCheck),
+            (100, Step::BinaryColdCheck),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
+            binary_cold.as_slice()
+        } else if std::env::var_os("KWIL_BINARY_OFFER_PROBE").is_some() {
+            binary.as_slice()
+        } else if std::env::var_os("KWIL_MARKDOWN_PROBE").is_some() {
             markdown.as_slice()
         } else if std::env::var_os("KWIL_PLACEMENT_REPLAY").is_some() {
             replay.as_slice()
@@ -324,6 +398,105 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::BinaryOpen => {
+            assert!(app.opts.hidden, "binary harness never admits visible OS dialogs");
+            let path = PathBuf::from(
+                std::env::var_os("KWIL_BINARY_OFFER_FILE").expect("ROOT supplies a tiny isolated binary fixture"),
+            );
+            assert!(path.is_absolute());
+            app.view.open_path(path).unwrap();
+            app.sync_file_ui();
+            app.apply(Damage { full: true, status: true, ..Default::default() });
+        }
+        Step::BinaryOffer => {
+            let offer = app.view.binary_offer().expect("finite detection step must reach an offer");
+            assert!(offer.len > 0);
+            assert!(app.view.editor().is_none());
+            assert!(app.view.line(0).unwrap_or_default().is_empty());
+            assert!(app.file_modal());
+            assert!(!app.confirmation_worker_busy());
+        }
+        Step::BinaryHex | Step::BinaryText | Step::BinaryCancel => {
+            if matches!(step, Step::BinaryText) {
+                HOLD_TEXT_COMPLETION.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let key = match step {
+                Step::BinaryHex => super::Key::Named(super::NamedKey::Enter),
+                Step::BinaryText => super::Key::Character("t".into()),
+                _ => super::Key::Named(super::NamedKey::Escape),
+            };
+            app.mods = super::ModifiersState::empty();
+            assert!(app.binary_key(&super::HostKey { logical_key: key, text: None, repeat: false }));
+            assert!(app.close_dialog.is_none());
+            assert!(app.view.binary_offer().is_none());
+        }
+        Step::BinaryHexCheck => {
+            assert!(app.view.hex_active());
+            assert!(!app.binary_pending());
+            assert!(!app.view.document_busy(app.view.active_id()));
+            assert!(app.view.hex_session().unwrap().row(app.view.hex_source(), 0).is_some());
+        }
+        Step::BinaryColdCheck => {
+            let row = app.view.hex_session().unwrap().row(app.view.hex_source(), 0).unwrap();
+            assert_eq!(row.bytes, [0, 0, 0xfe, 0xff, 0x41]);
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("binary-cold-result.txt"),
+                    "PASS: cold-start UTF-32 prefix reaches offer and opens exact physical bytes as Hex",
+                )
+                .unwrap();
+            }
+        }
+        Step::BinaryColdCancelCheck => {
+            assert!(!app.binary_pending(), "cancelled first CLI file must not be delivered twice");
+            assert!(app.view.editor().is_some());
+            assert!(
+                app.view
+                    .session()
+                    .tabs()
+                    .iter()
+                    .all(|tab| tab.path.as_ref().is_none_or(|p| p.file_name().unwrap() != "binary-cold.bin"))
+            );
+            assert!(!app.external_inbox.has_pending());
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("binary-cold-cancel-result.txt"),
+                    "PASS: initial delivery callback does not reopen a cancelled first CLI binary",
+                )
+                .unwrap();
+            }
+        }
+        Step::BinaryTextCheck => {
+            assert!(!app.view.hex_active());
+            assert!(!app.binary_pending());
+            assert!(app.view.editor().is_some());
+        }
+        Step::BinaryPreviewCheck => {
+            assert!(HELD_TEXT_COMPLETION.try_lock().unwrap().is_some());
+            assert!(app.view.editor().is_none());
+            assert!(app.binary_pending());
+            assert!(!app.binary_blocks_paint());
+            assert!(app.view.line(0).unwrap().starts_with(b"header"));
+            app.apply(Damage { full: true, ..Default::default() });
+            assert!(app.render(), "actual GUI render paints while final completion is held");
+        }
+        Step::BinaryReleasePreview => {
+            let completion = HELD_TEXT_COMPLETION.try_lock().unwrap().take().unwrap();
+            assert!(app.proxy.send_event(UserEvent::Document(completion)).is_ok());
+        }
+        Step::BinaryClose => {
+            assert!(app.dispatch_file("file.close"));
+            assert!(app.close_dialog.is_none());
+            assert!(!app.view.close_pending());
+        }
+        Step::BinaryCancelCheck => {
+            assert!(!app.binary_pending());
+            assert!(app.close_dialog.is_none());
+            assert!(app.view.editor().is_some());
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join("binary-offer-result.txt"), "PASS: hidden owned prompt; Hex default/Text/Cancel; worker-owned resolution; no visible OS confirmation").unwrap();
+            }
+        }
         Step::FolderOpen => {
             use kwil_view_model::search_panel::{SearchField, SearchInput};
             app.set_search_root(PathBuf::from(std::env::var_os("KWIL_WORKSPACE_ROOT").unwrap()));

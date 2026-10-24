@@ -43,8 +43,51 @@ pub(super) fn submit(workspace: &mut Workspace) -> Damage {
 }
 
 impl App {
+    pub(super) fn external_modal(&self) -> bool {
+        self.file_modal()
+            || self.binary_pending()
+            || self.view.file_prompt().is_some()
+            || self.view.close_pending()
+            || self.settings_open()
+            || self.desktop_window.is_some()
+            || self.welcome.visible()
+            || self.about.open
+    }
+    /// Keep accepted IPC requests in their original fixed 16-slot inbox while
+    /// a modal owns a captured document/prompt ticket. No secondary queue.
+    pub(super) fn external_open_event(&mut self) -> Damage {
+        if self.file_dialogs.exiting() || self.view.wants_exit() {
+            self.external_inbox.close();
+            return Damage::default();
+        }
+        if self.external_modal() {
+            return Damage::default();
+        }
+        let requests = self.external_inbox.drain();
+        if requests.is_empty() {
+            return Damage::default();
+        }
+        for request in requests {
+            if let Err(error) = self.view.open_files(request) {
+                self.view.set_notice(format!("Open failed: {error}"));
+            }
+        }
+        self.sync_file_ui();
+        Damage { full: true, status: true, ..Default::default() }
+    }
+    /// Called only at the end of an existing event-loop turn. The receipt
+    /// clears the inbox's pending bit; this never arms a timer or idle poll.
+    pub(super) fn resume_external_open(&self) {
+        if !self.file_dialogs.exiting()
+            && !self.view.wants_exit()
+            && !self.external_modal()
+            && self.external_inbox.has_pending()
+        {
+            let _ = self.proxy.send_event(UserEvent::OpenExternal);
+        }
+    }
     pub(super) fn dispatch_file(&mut self, command: &str) -> bool {
-        if self.close_dialog.is_some() || self.file_dialogs.exiting() {
+        if self.binary_owns_input() || self.close_dialog.is_some() || self.file_dialogs.exiting() {
             return true;
         }
         if self.file_dialogs.busy() && command.starts_with("file.") {
@@ -84,6 +127,7 @@ impl App {
     }
 
     pub(super) fn sync_file_ui(&mut self) {
+        self.sync_binary_input();
         if let Some(palette) = self.palette.as_mut().filter(|palette| palette.model().is_open()) {
             match palette.refresh_tabs(&self.view) {
                 Ok(changed) => self.palette_dirty |= changed,
@@ -94,9 +138,11 @@ impl App {
         }
         let owner = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
         let proxy = self.proxy.clone();
-        self.file_dialogs.sync(&mut self.view, owner, self.opts.hidden, move |event| {
-            let _ = proxy.send_event(UserEvent::FileDialog(event));
-        });
+        if !self.confirmation_worker_busy() {
+            self.file_dialogs.sync(&mut self.view, owner, self.opts.hidden, move |event| {
+                let _ = proxy.send_event(UserEvent::FileDialog(event));
+            });
+        }
         self.save_path = self
             .view
             .file_prompt()

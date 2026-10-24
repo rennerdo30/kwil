@@ -3,12 +3,16 @@
 use crate::Document;
 use kwil_core_text::{decoded_backing::DecodedPreview, encoding::SavePlan};
 use provenance::journal::RecoveryPolicy;
+#[path = "binary_offer.rs"]
+pub mod binary_offer;
 #[cfg(test)]
 mod compressed_runtime;
 mod decoded;
 mod encoding_runtime;
 mod encoding_seed;
 mod hex_runtime;
+#[cfg(test)]
+mod scheduler_tests;
 pub(crate) use encoding_runtime::document_policy;
 pub mod provenance;
 pub mod retirement;
@@ -72,6 +76,12 @@ pub fn external_open_channel(
 }
 
 impl ExternalOpenInbox {
+    /// Advisory coalesced wake state. Modal hosts leave the bounded inbox
+    /// untouched and use this to reschedule its existing drain on release.
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Close admission without waiting for a producer or its wake callback.
     /// Requests already admitted, including a producer racing this store, stay
     /// in the bounded inbox. Admission acknowledges neither display nor durable
@@ -91,6 +101,23 @@ impl ExternalOpenInbox {
 }
 
 pub enum DocumentRequest {
+    /// Normal frontend open, including startup sources. The scalar ticket is
+    /// bound to an exact path by the model before worker admission.
+    OpenChecked {
+        ticket: binary_offer::Ticket,
+        path: PathBuf,
+        file: Option<TextFile>,
+    },
+    ResolveBinary {
+        ticket: binary_offer::Ticket,
+        choice: binary_offer::Choice,
+        rows: usize,
+    },
+    /// Recovery merged a startup placeholder into an already accepted policy.
+    /// Return its never-painted source to this lane without decoding it.
+    RetireSource {
+        file: TextFile,
+    },
     /// Explicit physical bytes, including BOM and compression headers.
     OpenRaw {
         document: DocumentId,
@@ -205,6 +232,25 @@ pub enum DocumentRequest {
 }
 
 pub enum DocumentResult {
+    BinaryOffer(binary_offer::Offer),
+    BinaryRefused {
+        offer: binary_offer::Offer,
+        error: io::Error,
+    },
+    CheckedPreview {
+        ticket: binary_offer::Ticket,
+        preview: DecodedPreview,
+    },
+    CheckedRawPreview {
+        ticket: binary_offer::Ticket,
+        page: crate::hex_session::Page,
+    },
+    /// None acknowledges cancellation/retirement on the lane. No owner crosses
+    /// with offers, refusals, cancellation, or first-screen text previews.
+    CheckedOpened {
+        ticket: binary_offer::Ticket,
+        result: io::Result<Option<Box<Document>>>,
+    },
     RawPreview {
         document: DocumentId,
         revision: u64,
@@ -405,7 +451,83 @@ impl JournalState {
 pub struct DocumentWorker {
     tx: SyncSender<DocumentRequest>,
     journal_capacity: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    journal_controls: std::sync::Arc<JournalControlCredits>,
     save_destinations: std::sync::Arc<std::sync::Mutex<Vec<(DocumentId, PathBuf)>>>,
+}
+
+// Deferred receipts already retain one of the 16 observer credits. Seed and
+// Finish requests need fixed credits now that lineage barriers must be retained
+// rather than coalesced across one another. One seed per active tab plus one
+// close per active/cached tab bounds deferred controls at 128 + 192; separate
+// quotas prevent seeds waiting for a slot from consuming close admission.
+const JOURNAL_SEED_CAPACITY: usize = session::MAX_TABS;
+const JOURNAL_FINISH_CAPACITY: usize = session::MAX_TABS + session::MAX_CLOSED;
+
+struct JournalControlCredits {
+    seeds: std::sync::atomic::AtomicUsize,
+    finishes: std::sync::atomic::AtomicUsize,
+}
+
+impl JournalControlCredits {
+    fn new() -> Self {
+        Self {
+            seeds: std::sync::atomic::AtomicUsize::new(JOURNAL_SEED_CAPACITY),
+            finishes: std::sync::atomic::AtomicUsize::new(JOURNAL_FINISH_CAPACITY),
+        }
+    }
+
+    fn for_request(&self, request: &DocumentRequest) -> Option<&std::sync::atomic::AtomicUsize> {
+        match request {
+            DocumentRequest::SeedJournal { .. } => Some(&self.seeds),
+            DocumentRequest::FinishJournal { .. } => Some(&self.finishes),
+            _ => None,
+        }
+    }
+
+    fn release(&self, request: &DocumentRequest) {
+        if let Some(credit) = self.for_request(request) {
+            let previous = credit.fetch_add(1, std::sync::atomic::Ordering::Release);
+            let maximum = if matches!(request, DocumentRequest::SeedJournal { .. }) {
+                JOURNAL_SEED_CAPACITY
+            } else {
+                JOURNAL_FINISH_CAPACITY
+            };
+            debug_assert!(previous < maximum, "journal control credit returned twice");
+        }
+    }
+}
+
+fn journal_document(request: &DocumentRequest) -> Option<DocumentId> {
+    match request {
+        DocumentRequest::SeedJournal { document, .. }
+        | DocumentRequest::Journal { document, .. }
+        | DocumentRequest::FinishJournal { document, .. } => Some(*document),
+        _ => None,
+    }
+}
+
+/// Only the first pending operation for a document may change its journal
+/// lineage. Other documents can still advance while this one's seed is busy.
+/// `before` excludes younger successors when selecting a deferred request.
+fn journal_can_run(
+    request: &DocumentRequest,
+    deferred: &std::collections::VecDeque<DocumentRequest>,
+    before: usize,
+    storage: Option<&Storage>,
+) -> bool {
+    let Some(document) = journal_document(request) else { return true };
+    if deferred.iter().take(before).any(|older| journal_document(older) == Some(document)) {
+        return false;
+    }
+    let Some(storage) = storage else { return true };
+    if matches!(request, DocumentRequest::Journal { .. })
+        && storage.journals.get(&document).is_some_and(|journal| !journal.ready && !journal.failed)
+    {
+        return false;
+    }
+    matches!(request, DocumentRequest::FinishJournal { .. })
+        || storage.journals.contains_key(&document)
+        || storage.journals.len() < session::MAX_TABS
 }
 
 impl DocumentWorker {
@@ -456,9 +578,22 @@ impl DocumentWorker {
         })
     }
     pub fn spawn(complete: impl Fn(DocumentResult) + Send + 'static) -> io::Result<Self> {
+        Self::spawn_inner(
+            complete,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn spawn_inner(
+        complete: impl Fn(DocumentResult) + Send + 'static,
+        #[cfg(test)] mut schedule_control: Option<scheduler_tests::Control>,
+    ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(16);
         let journal_capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16));
         let capacity = journal_capacity.clone();
+        let journal_controls = std::sync::Arc::new(JournalControlCredits::new());
+        let controls = journal_controls.clone();
         let save_destinations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let destinations = save_destinations.clone();
         std::thread::Builder::new().name("kwil-documents".into()).spawn(move || {
@@ -468,6 +603,7 @@ impl DocumentWorker {
             let cancel = AtomicBool::new(false);
             let mut storage: Option<Storage> = None;
             let mut hex = hex_runtime::HexRuntime::new();
+            let mut binary = binary_offer::Runtime::new();
             let mut deferred = std::collections::VecDeque::new();
             let mut session_due = None;
             // Worker-owned until the UI publishes the admitted tab and releases
@@ -482,31 +618,10 @@ impl DocumentWorker {
                             !journal.failed && (!journal.ready || journal.flush.is_some() || journal.needs_flush)
                         })
                     });
-                let available = deferred.iter().position(|request| {
-                    if let DocumentRequest::FinishJournal { document, .. } = request
-                        && deferred.iter().any(|older| matches!(older,
-                            DocumentRequest::Journal { document: owner, .. } | DocumentRequest::SeedJournal { document: owner, .. }
-                            if owner == document))
-                    {
-                        return false;
-                    }
-                    if let DocumentRequest::Journal { document, .. } = request
-                        && let Some(journal) = storage.as_ref().and_then(|storage| storage.journals.get(document))
-                        && !journal.ready
-                        && !journal.failed
-                    {
-                        return false;
-                    }
-                    let document = match request {
-                        DocumentRequest::Journal { document, .. } | DocumentRequest::SeedJournal { document, .. } => {
-                            document
-                        }
-                        _ => return true,
-                    };
-                    storage.as_ref().is_none_or(|storage| {
-                        storage.journals.contains_key(document) || storage.journals.len() < session::MAX_TABS
-                    })
+                let available = deferred.iter().enumerate().find_map(|(index, request)| {
+                    journal_can_run(request, &deferred, index, storage.as_ref()).then_some(index)
                 });
+                let from_deferred = available.is_some();
                 let request = if let Some(index) = available {
                     deferred.remove(index)
                 } else if let Some(deadline) = shutdown_deadline {
@@ -514,7 +629,8 @@ impl DocumentWorker {
                         break;
                     }
                     if std::time::Instant::now() >= deadline {
-                        shutdown_error = Some(io::Error::other("Document shutdown timed out draining admitted recovery work"));
+                        shutdown_error =
+                            Some(io::Error::other("Document shutdown timed out draining admitted recovery work"));
                         break;
                     }
                     // Only active seed/flush work remains. Reuse the lane's
@@ -529,7 +645,9 @@ impl DocumentWorker {
                             shutdown_deadline = Some(std::time::Instant::now() + Duration::from_secs(30));
                             session_due = None;
                             if let Some(storage) = &mut storage {
-                                for journal in storage.journals.values_mut() { journal.flush_due = std::time::Instant::now(); }
+                                for journal in storage.journals.values_mut() {
+                                    journal.flush_due = std::time::Instant::now();
+                                }
                             }
                             None
                         }
@@ -545,60 +663,146 @@ impl DocumentWorker {
                     }
                 };
                 if let Some(request) = request {
-                    if let DocumentRequest::FinishJournal { document, .. } = &request
-                        && deferred.iter().any(|older| matches!(older,
-                            DocumentRequest::Journal { document: owner, .. } | DocumentRequest::SeedJournal { document: owner, .. }
-                            if owner == document))
-                    {
-                        deferred.push_back(request);
-                        continue;
+                    #[cfg(test)]
+                    if !from_deferred && let Some(control) = &mut schedule_control {
+                        control.received(&request, &deferred, storage.as_ref());
                     }
-                    let needs_slot = match &request {
-                        DocumentRequest::Journal { document, .. } | DocumentRequest::SeedJournal { document, .. } => {
-                            storage.as_ref().is_some_and(|storage| {
-                                !storage.journals.contains_key(document) && storage.journals.len() >= session::MAX_TABS
-                            })
-                        }
-                        _ => false,
-                    };
-                    if needs_slot {
-                        if let DocumentRequest::SeedJournal { document, .. } = &request {
-                            deferred.retain(
-                                |old| !matches!(old,DocumentRequest::SeedJournal {document:old,..} if old==document),
-                            );
-                        }
+                    if !from_deferred && !journal_can_run(&request, &deferred, deferred.len(), storage.as_ref()) {
                         deferred.push_back(request);
                         complete(DocumentResult::CapacityAvailable);
+                        // Readiness/flush polling must still happen when the
+                        // inbox supplies a successor to a blocked document.
+                        if let Some(storage) = &mut storage {
+                            poll_journals(storage, &complete);
+                        }
                         continue;
                     }
+                    controls.release(&request);
+                    #[cfg(test)]
+                    if let Some(control) = &mut schedule_control {
+                        control.applying(&request);
+                    }
                     match request {
+                        DocumentRequest::RetireSource { file } => {
+                            drop(file);
+                            complete(DocumentResult::CapacityAvailable);
+                        }
+                        DocumentRequest::OpenChecked { ticket, path, file } => {
+                            let detected = if storage.is_some() {
+                                binary.detect(ticket, path, file)
+                            } else {
+                                Err(io::Error::other("Workspace storage is not prepared"))
+                            };
+                            match detected {
+                                Ok(binary_offer::Detection::Offer(offer)) => {
+                                    complete(DocumentResult::BinaryOffer(offer))
+                                }
+                                other => {
+                                    let result = other.and_then(|detected| {
+                                        let binary_offer::Detection::Text(pending) = detected else { unreachable!() };
+                                        let storage = storage.as_mut().expect("prepared checked open");
+                                        storage.encoding.open(pending.path, pending.file, None, &cancel, |preview| {
+                                            complete(DocumentResult::CheckedPreview { ticket, preview });
+                                            Ok(())
+                                        })
+                                    });
+                                    complete(DocumentResult::CheckedOpened {
+                                        ticket,
+                                        result: result.map(|d| Some(Box::new(d))),
+                                    });
+                                }
+                            }
+                        }
+                        DocumentRequest::ResolveBinary { ticket, choice, rows } => {
+                            let result: io::Result<Option<Box<Document>>> = (|| {
+                                let pending = binary.pending(ticket)?;
+                                if choice == binary_offer::Choice::Cancel {
+                                    drop(binary.take(ticket)?);
+                                    return Ok(None);
+                                }
+                                binary_offer::Runtime::unchanged(pending)?;
+                                let storage = storage
+                                    .as_mut()
+                                    .ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
+                                // The pending slot keeps the exact source until
+                                // admission succeeds, including backing refusal.
+                                let retained =
+                                    binary_offer::Pending { path: pending.path.clone(), file: pending.file.clone() };
+                                let document = match choice {
+                                    binary_offer::Choice::Hex => storage.encoding.open_raw_file(
+                                        ticket.document(),
+                                        retained,
+                                        rows.min(crate::hex::MAX_ROWS),
+                                        ticket.generation(),
+                                        &cancel,
+                                        |page| complete(DocumentResult::CheckedRawPreview { ticket, page }),
+                                    ),
+                                    binary_offer::Choice::Text => {
+                                        storage.encoding.open(retained.path, retained.file, None, &cancel, |preview| {
+                                            complete(DocumentResult::CheckedPreview { ticket, preview });
+                                            Ok(())
+                                        })
+                                    }
+                                    binary_offer::Choice::Cancel => unreachable!(),
+                                }?;
+                                Ok(Some(Box::new(document)))
+                            })();
+                            if result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+                                && let Ok(pending) = binary.pending(ticket)
+                            {
+                                complete(DocumentResult::BinaryRefused {
+                                    offer: binary_offer::Offer { ticket, len: pending.file.len() },
+                                    error: result.err().unwrap(),
+                                });
+                            } else {
+                                // A stale choice never removes a newer source.
+                                drop(binary.take(ticket));
+                                complete(DocumentResult::CheckedOpened { ticket, result });
+                            }
+                        }
                         DocumentRequest::OpenRaw { document, revision, path, rows, generation } => {
-                            let result = storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared")).and_then(|storage| {
-                                storage.encoding.open_raw(document, path, rows, generation, &cancel, |page| {
-                                    complete(DocumentResult::RawPreview { document, revision, page });
-                                })
-                            });
+                            let result = storage
+                                .as_mut()
+                                .ok_or_else(|| io::Error::other("Workspace storage is not prepared"))
+                                .and_then(|storage| {
+                                    storage.encoding.open_raw(document, path, rows, generation, &cancel, |page| {
+                                        complete(DocumentResult::RawPreview { document, revision, page });
+                                    })
+                                });
                             complete(DocumentResult::Indexed { document, revision, result: result.map(Box::new) });
                         }
                         DocumentRequest::ReopenRaw { document, generation, mut editor, rows } => {
                             let before_epoch = editor.document().source_epoch;
                             let revision = editor.document().revision();
                             let active_journal = storage.as_ref().is_some_and(|s| s.journals.contains_key(&document));
-                            let result = if editor.document().representation() == crate::hex_session::Representation::DecodedText
-                                && !editor.document().is_dirty() && active_journal {
-                                Err(io::Error::new(io::ErrorKind::WouldBlock, "finish the old transport journal before raw reopen"))
+                            let result = if editor.document().representation()
+                                == crate::hex_session::Representation::DecodedText
+                                && !editor.document().is_dirty()
+                                && active_journal
+                            {
+                                Err(io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    "finish the old transport journal before raw reopen",
+                                ))
                             } else {
                                 hex_runtime::reopen(&mut editor, |path| {
-                                    let storage = storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
+                                    let storage = storage
+                                        .as_mut()
+                                        .ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
                                     reserve_transport(storage, document)?;
                                     storage.encoding.open_raw(document, path, rows, generation, &cancel, |page| {
-                                            complete(DocumentResult::RawPreview { document, revision, page });
-                                        })
+                                        complete(DocumentResult::RawPreview { document, revision, page });
+                                    })
                                 })
                             };
                             if result.as_ref().is_ok_and(|outcome| *outcome == crate::hex_session::OpenOutcome::Ready)
-                                && editor.document().source_epoch != before_epoch {
-                                storage.as_mut().expect("prepared transport storage").transports.insert(document, TransportSeed::document(editor.document()));
+                                && editor.document().source_epoch != before_epoch
+                            {
+                                storage
+                                    .as_mut()
+                                    .expect("prepared transport storage")
+                                    .transports
+                                    .insert(document, TransportSeed::document(editor.document()));
                             }
                             complete(DocumentResult::RawReopened { document, generation, editor, result });
                         }
@@ -606,34 +810,49 @@ impl DocumentWorker {
                             let before_epoch = editor.document().source_epoch;
                             let revision = editor.document().revision();
                             let active_journal = storage.as_ref().is_some_and(|s| s.journals.contains_key(&document));
-                            let result = if editor.document().representation() == crate::hex_session::Representation::RawBytes
-                                && !editor.document().is_dirty() && active_journal {
-                                Err(io::Error::new(io::ErrorKind::WouldBlock, "finish the old transport journal before text reopen"))
+                            let result = if editor.document().representation()
+                                == crate::hex_session::Representation::RawBytes
+                                && !editor.document().is_dirty()
+                                && active_journal
+                            {
+                                Err(io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    "finish the old transport journal before text reopen",
+                                ))
                             } else {
                                 hex_runtime::reopen_text(&mut editor, |path| {
-                                    let storage = storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
+                                    let storage = storage
+                                        .as_mut()
+                                        .ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
                                     reserve_transport(storage, document)?;
                                     let file = kwil_core_workspace::open_for_editing(&path)?;
                                     storage.encoding.open(path.clone(), file.clone(), None, &cancel, |mut preview| {
-                                            // Normal preview decoding can expand malformed bytes
-                                            // into escapes. Bound the text-exit cache as well as
-                                            // its encoded input, without clipping a UTF8 scalar.
-                                            let limit = crate::hex_session::MAX_PAGE_BYTES;
-                                            if preview.text.len() > limit {
-                                                let mut end = limit;
-                                                while end > 0 && preview.text[end] & 0xc0 == 0x80 { end -= 1; }
-                                                preview.text.truncate(end);
-                                                preview.text.shrink_to_fit();
-                                                preview.complete = false;
+                                        // Normal preview decoding can expand malformed bytes
+                                        // into escapes. Bound the text-exit cache as well as
+                                        // its encoded input, without clipping a UTF8 scalar.
+                                        let limit = crate::hex_session::MAX_PAGE_BYTES;
+                                        if preview.text.len() > limit {
+                                            let mut end = limit;
+                                            while end > 0 && preview.text[end] & 0xc0 == 0x80 {
+                                                end -= 1;
                                             }
-                                            complete(DocumentResult::Preview { document, revision, path, file, preview });
-                                            Ok(())
-                                        })
+                                            preview.text.truncate(end);
+                                            preview.text.shrink_to_fit();
+                                            preview.complete = false;
+                                        }
+                                        complete(DocumentResult::Preview { document, revision, path, file, preview });
+                                        Ok(())
+                                    })
                                 })
                             };
                             if result.as_ref().is_ok_and(|outcome| *outcome == crate::hex_session::OpenOutcome::Ready)
-                                && editor.document().source_epoch != before_epoch {
-                                storage.as_mut().expect("prepared transport storage").transports.insert(document, TransportSeed::document(editor.document()));
+                                && editor.document().source_epoch != before_epoch
+                            {
+                                storage
+                                    .as_mut()
+                                    .expect("prepared transport storage")
+                                    .transports
+                                    .insert(document, TransportSeed::document(editor.document()));
                             }
                             complete(DocumentResult::RawReopened { document, generation, editor, result });
                         }
@@ -652,18 +871,27 @@ impl DocumentWorker {
                         }
                         DocumentRequest::SaveRaw { document, request } => {
                             let revision = request.revision;
-                            let mut reserved = destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                            if let Some((owner, _, path)) = &reopening { reserved.push((*owner, path.clone())); }
+                            let mut reserved =
+                                destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if let Some((owner, _, path)) = &reopening {
+                                reserved.push((*owner, path.clone()));
+                            }
                             let result = validate_save_destination(document, &request.path, &reserved).and_then(|()| {
-                                storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?
-                                    .encoding.save_raw(request, &cancel)
+                                storage
+                                    .as_mut()
+                                    .ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?
+                                    .encoding
+                                    .save_raw(request, &cancel)
                             });
                             complete(DocumentResult::Saved { document, revision, result });
                         }
                         DocumentRequest::Replace { document, operation, mut editor, recipe } => {
                             let key = recipe.key;
                             let result = if document.0 != key.document_id {
-                                Err(io::Error::new(io::ErrorKind::InvalidInput, "Replacement document identity mismatch"))
+                                Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "Replacement document identity mismatch",
+                                ))
                             } else {
                                 editor.apply_search_replacement(recipe)
                             };
@@ -703,7 +931,8 @@ impl DocumentWorker {
                                         recover_prepared(&storage.root, &mut storage.encoding, path, &tab)?;
                                     let handle = resume(&storage.service, recovered)?;
                                     let revision = document.revision();
-                                    let mut journal = JournalState::new(handle, revision, 0, document_policy(&document));
+                                    let mut journal =
+                                        JournalState::new(handle, revision, 0, document_policy(&document));
                                     journal.origins = origins;
                                     storage.journals.insert(tab.id, journal);
                                     Ok(document)
@@ -848,6 +1077,10 @@ impl DocumentWorker {
                                     result: Err(error),
                                 });
                             }
+                            #[cfg(test)]
+                            if let Some(control) = &mut schedule_control {
+                                control.hold_ready(document, generation, storage.as_mut());
+                            }
                         }
                         DocumentRequest::Journal { document, receipt, path, first_sequence, generation, policy } => {
                             if let Some(state) = storage.as_mut() {
@@ -869,7 +1102,9 @@ impl DocumentWorker {
                                         .get(&document)
                                         .is_some_and(|journal| !journal.ready && !journal.failed)
                                 {
-                                    deferred.push_back(DocumentRequest::Journal {
+                                    // A first receipt may create its own seed.
+                                    // Keep it ahead of already deferred successors.
+                                    deferred.push_front(DocumentRequest::Journal {
                                         document,
                                         receipt,
                                         path,
@@ -911,7 +1146,9 @@ impl DocumentWorker {
                             complete(DocumentResult::JournalQueued { document, revision, sequence, result });
                         }
                         DocumentRequest::FinishJournal { document, generation } => {
-                            let result = storage.as_mut().map_or(Ok(()), |storage| finish_journal(storage, document, generation));
+                            let result = storage
+                                .as_mut()
+                                .map_or(Ok(()), |storage| finish_journal(storage, document, generation));
                             complete(DocumentResult::JournalClosed { document, result });
                         }
                         DocumentRequest::FlushJournals => {
@@ -941,30 +1178,41 @@ impl DocumentWorker {
             // Every admitted receipt gets a terminal failure if a seed/slot
             // cannot drain. A failed shutdown is never reported as a clean stop.
             for request in deferred {
+                controls.release(&request);
                 match request {
                     DocumentRequest::DiscardHex { document, editor } => hex.discard(document, editor),
                     DocumentRequest::Journal { document, receipt, .. } => {
                         capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
                         complete(DocumentResult::JournalQueued {
-                            document, revision: receipt.after_revision, sequence: receipt.sequence,
+                            document,
+                            revision: receipt.after_revision,
+                            sequence: receipt.sequence,
                             result: Err(io::Error::other("Recovery receipt could not drain before shutdown")),
                         });
                     }
                     DocumentRequest::SeedJournal { document, revision, next_sequence, .. } => {
                         complete(DocumentResult::JournalDurable {
-                            document, revision, sequence: next_sequence.saturating_sub(1),
+                            document,
+                            revision,
+                            sequence: next_sequence.saturating_sub(1),
                             result: Err(io::Error::other("Recovery seed could not drain before shutdown")),
                         });
                     }
                     DocumentRequest::FinishJournal { document, .. } => {
-                        complete(DocumentResult::JournalClosed { document, result: Err(io::Error::other("Recovery close did not drain")) });
+                        complete(DocumentResult::JournalClosed {
+                            document,
+                            result: Err(io::Error::other("Recovery close did not drain")),
+                        });
                     }
                     _ => unreachable!("only recovery requests are deferred"),
                 }
             }
+            // Last unopened offer owners retire here, never with UI teardown.
+            drop(binary);
             let stopped = if let Some(mut storage) = storage {
                 if shutdown_error.is_none() && storage.journals.values().any(|journal| journal.failed) {
-                    shutdown_error = Some(io::Error::other("Recovery failed before document shutdown; changes remain unsaved"));
+                    shutdown_error =
+                        Some(io::Error::other("Recovery failed before document shutdown; changes remain unsaved"));
                 }
                 storage.service.finish();
                 // Shutdown is on this worker. UI never waits for seeding/fsync.
@@ -1000,15 +1248,35 @@ impl DocumentWorker {
             };
             complete(DocumentResult::Stopped(shutdown_error.map_or(stopped, Err)));
         })?;
-        Ok(Self { tx, journal_capacity, save_destinations })
+        Ok(Self { tx, journal_capacity, journal_controls, save_destinations })
     }
 
     /// Full admission returns ownership. Callers must retain/retry or explicitly
     /// reject it; a rejected save must clear the model's in-flight save state.
     pub fn try_submit(&self, request: DocumentRequest) -> Result<(), TrySendError<Box<DocumentRequest>>> {
+        let control = self.journal_controls.for_request(&request);
+        if control.is_some_and(|credit| {
+            credit
+                .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_err()
+        }) {
+            return Err(TrySendError::Full(Box::new(request)));
+        }
         self.tx.try_send(request).map_err(|error| match error {
-            TrySendError::Full(request) => TrySendError::Full(Box::new(request)),
-            TrySendError::Disconnected(request) => TrySendError::Disconnected(Box::new(request)),
+            TrySendError::Full(request) => {
+                if let Some(credit) = control {
+                    credit.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                TrySendError::Full(Box::new(request))
+            }
+            TrySendError::Disconnected(request) => {
+                if let Some(credit) = control {
+                    credit.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                TrySendError::Disconnected(Box::new(request))
+            }
         })
     }
 
@@ -1019,6 +1287,7 @@ impl DocumentWorker {
             Self {
                 tx,
                 journal_capacity: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16)),
+                journal_controls: std::sync::Arc::new(JournalControlCredits::new()),
                 save_destinations: Default::default(),
             },
             rx,
@@ -3613,6 +3882,7 @@ mod tests {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         });
+        assert!(!inbox.has_pending());
         let path = std::env::temp_dir().join("kwil-virtual-日本語.txt");
         let request = OpenFiles { files: vec![OpenFile { path, line: Some(3), column: Some(5) }] };
         for _ in 0..16 {
@@ -3623,7 +3893,9 @@ mod tests {
         };
         assert_eq!(rejected, request);
         assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(inbox.has_pending(), "modal deferral must leave admitted work discoverable");
         let accepted = inbox.drain();
+        assert!(!inbox.has_pending());
         assert_eq!(accepted.len(), 16);
         assert!(accepted.iter().all(|r| r == &request));
         open(rejected).unwrap();
@@ -3720,7 +3992,12 @@ mod tests {
     fn observer_full_retains_the_successful_edit_and_gates_only_later_mutations() {
         let (tx, rx) = mpsc::sync_channel(16);
         let capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        let worker = DocumentWorker { tx, journal_capacity: capacity.clone(), save_destinations: Default::default() };
+        let worker = DocumentWorker {
+            tx,
+            journal_capacity: capacity.clone(),
+            journal_controls: std::sync::Arc::new(JournalControlCredits::new()),
+            save_destinations: Default::default(),
+        };
         let mut editor = crate::Editor::new(Document::new());
         editor
             .set_edit_observer(Some(worker.observer(DocumentId(1), None, 1, 1, document_policy(editor.document()))))

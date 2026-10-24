@@ -9,6 +9,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
+mod binary_offer;
 mod file_prompt;
 mod hex_ui;
 mod palette_ui;
@@ -34,6 +35,47 @@ enum Msg {
     Notice(String),
     InputClosed,
     Settings(Box<Settings>, kwil_view_model::language_selection::AcceptedLanguageMappings),
+}
+
+/// Leave accepted IPC requests in their existing 16-slot inbox while a modal
+/// owns input. One scalar schedules a replay through the ordinary event queue.
+#[derive(Default)]
+struct ExternalGate {
+    pending: bool,
+}
+impl ExternalGate {
+    fn blocked(view: &Workspace, settings_open: bool) -> bool {
+        settings_open
+            || view.file_prompt().is_some()
+            || view.close_pending()
+            || view.wants_exit()
+            || binary_offer::Host::blocked(view)
+    }
+    fn wake(
+        &mut self,
+        view: &mut Workspace,
+        inbox: &kwil_view_model::document_worker::ExternalOpenInbox,
+        settings_open: bool,
+    ) -> bool {
+        self.pending = true;
+        if Self::blocked(view, settings_open) {
+            return false;
+        }
+        self.pending = false;
+        let requests = inbox.drain();
+        let changed = !requests.is_empty();
+        for request in requests {
+            if let Err(error) = view.open_files(request) {
+                view.set_notice(format!("Open failed: {error}"));
+            }
+        }
+        changed
+    }
+    fn replay(&mut self, view: &Workspace, settings_open: bool, sender: &mpsc::Sender<Msg>) {
+        if self.pending && !Self::blocked(view, settings_open) && sender.send(Msg::OpenExternal).is_ok() {
+            self.pending = false;
+        }
+    }
 }
 
 pub fn run(view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
@@ -86,13 +128,18 @@ pub fn run_with_external_open(
     let mut settings_file_pending = false;
     let mut search = search_ui::SearchHost::default();
     let mut language_menu: Option<LanguageMenu> = None;
+    let mut binary_offer = binary_offer::Host::default();
+    let mut external_gate = ExternalGate::default();
     let (document_stopped_sender, document_stopped) = mpsc::sync_channel(1);
     let mut document_started = false;
     let result = (|| -> std::io::Result<()> {
         let size = terminal.size()?;
         let geometry = tabs::geometry(&view, size.width, size.height, Settings::default().tabs.layout);
         view.set_rows(geometry.body.height);
-        terminal.draw(|f| tabs::draw(f, &view, Settings::default().tabs.layout))?;
+        terminal.draw(|f| {
+            tabs::draw(f, &view, Settings::default().tabs.layout);
+            binary_offer.draw(f, &view);
+        })?;
         let document_sender = tx.clone();
         view.start_document_worker(move |result| {
             if let kwil_view_model::document_worker::DocumentResult::Stopped(result) = &result {
@@ -143,6 +190,7 @@ pub fn run_with_external_open(
         });
         let mut input_identity = (view.active_id(), view.input_epoch());
         let mut raw_body = view.hex_active();
+        binary_offer.sync(&mut view, &mut keys);
         while let Ok(msg) = rx.recv() {
             let user_input = matches!(&msg, Msg::Input(_));
             let mut changed = match msg {
@@ -265,21 +313,24 @@ pub fn run_with_external_open(
                     }
                     true
                 }
-                Msg::OpenExternal => {
-                    let requests = external_inbox.drain();
-                    if requests.is_empty() {
-                        continue;
-                    }
-                    for request in requests {
-                        if let Err(error) = view.open_files(request) {
-                            view.set_notice(format!("Open failed: {error}"));
-                        }
-                    }
-                    true
-                }
+                Msg::OpenExternal => external_gate.wake(
+                    &mut view,
+                    &external_inbox,
+                    settings_panel.as_ref().is_some_and(|panel| panel.is_open()),
+                ),
                 Msg::Notice(n) => {
                     view.set_notice(n);
                     true
+                }
+                Msg::Input(event)
+                    if binary_offer::Host::captures(
+                        &view,
+                        &event,
+                        settings_panel.as_ref().is_some_and(|panel| panel.is_open()),
+                    ) =>
+                {
+                    let size = terminal.size()?;
+                    binary_offer.input(&mut view, &mut keys, &event, Rect::new(0, 0, size.width, size.height))
                 }
                 Msg::Input(Event::Resize(_, _)) => {
                     view.cancel_hex_input();
@@ -512,6 +563,8 @@ pub fn run_with_external_open(
                 },
                 Msg::Input(_) => false,
             };
+            changed |= binary_offer.sync(&mut view, &mut keys);
+            external_gate.replay(&view, settings_panel.as_ref().is_some_and(|panel| panel.is_open()), &tx);
             if raw_body != view.hex_active() {
                 raw_body = view.hex_active();
                 view.cancel_hex_input();
@@ -591,6 +644,9 @@ pub fn run_with_external_open(
                     }
                     if let Some(panel) = &settings_panel {
                         settings_ui::draw(f, panel);
+                    }
+                    if !settings_panel.as_ref().is_some_and(|panel| panel.is_open()) {
+                        binary_offer.draw(f, &view);
                     }
                 })?;
             }

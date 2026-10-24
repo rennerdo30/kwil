@@ -8,6 +8,7 @@
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
 mod about;
+mod binary_offer;
 mod chrome;
 mod clipboard;
 mod close_dialog;
@@ -1088,6 +1089,13 @@ impl App {
         if ev.state != ElementState::Pressed {
             return;
         }
+        if self.binary_key(&HostKey {
+            logical_key: ev.logical_key.clone(),
+            text: ev.text.as_deref(),
+            repeat: ev.repeat,
+        }) {
+            return;
+        }
         if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             self.ime_destination = Some(ime::Destination::Cancelled);
             self.composing = false;
@@ -1106,6 +1114,9 @@ impl App {
     }
 
     fn key_after_settings(&mut self, el: Option<&ActiveEventLoop>, ev: &HostKey<'_>) {
+        if self.binary_key(ev) {
+            return;
+        }
         if self.language_key(ev) {
             return;
         }
@@ -1478,13 +1489,13 @@ impl App {
         if self.file_dialogs.exiting() || self.view.wants_exit() {
             self.external_inbox.close();
         }
-        if self.close_dialog.is_some() {
+        if self.confirmation_worker_busy() {
             return false;
         }
         self.file_dialogs.may_exit(&mut self.view) && self.view.prepare_hex_shutdown()
     }
     fn force_exit(&mut self) -> bool {
-        if self.close_dialog.is_some() {
+        if self.confirmation_worker_busy() {
             return false;
         }
         self.external_inbox.close();
@@ -1653,6 +1664,8 @@ impl App {
             native.toolbar_tooltips(&self.menu.toolbar, &self.menu.labels);
         }
         let hex_active = self.view.hex_active();
+        let binary_pending = self.binary_pending();
+        let binary_blocks_paint = self.binary_blocks_paint();
         let (notice, mut segments) = if hex_active {
             (
                 self.hex_status(),
@@ -1676,7 +1689,8 @@ impl App {
         self.body_pixels.resize(bw.saturating_mul(bh), bg());
         let bars = self.bars();
         let rows = geometry.text.height / ch;
-        let palette_open = self.welcome.visible()
+        let palette_open = binary_pending
+            || self.welcome.visible()
             || self.language_open()
             || self.palette_open()
             || self.settings_open()
@@ -1685,7 +1699,7 @@ impl App {
             || self.save_path.is_some();
         let menu_list = self.menu.dropdown.is_some() || self.menu_area.is_some();
         let gpu_active = self.gpu_active();
-        let projection_owns_body = !hex_active && self.logs.owns_body();
+        let projection_owns_body = !binary_pending && !hex_active && self.logs.owns_body();
         let projection_source = log_ui::Source::capture(&self.view);
         let spans: Vec<_> = self
             .highlighting
@@ -1738,7 +1752,7 @@ impl App {
             font.invalidate_rows();
             pixels.fill(bg());
             body_pixels.fill(bg());
-            for row in (0..rows).filter(|_| !projection_owns_body && !hex_active) {
+            for row in (0..rows).filter(|_| !binary_blocks_paint && !projection_owns_body && !hex_active) {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
@@ -1768,7 +1782,9 @@ impl App {
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for &row in p.rows.iter().filter(|&&r| r < rows && !projection_owns_body && !hex_active) {
+            for &row in
+                p.rows.iter().filter(|&&r| r < rows && !binary_blocks_paint && !projection_owns_body && !hex_active)
+            {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
@@ -1778,7 +1794,7 @@ impl App {
                 damage.push(tabs::translated(area, body));
             }
         }
-        if hex_active && body_changed {
+        if hex_active && !binary_blocks_paint && body_changed {
             let mut paint_damage = p.clone();
             // The common retained-body/native path already copied this scroll.
             paint_damage.scroll = 0;
@@ -2072,6 +2088,20 @@ impl App {
             if let Some(area) = self.context_area {
                 damage.push(area);
             }
+        }
+        if let Some(font) = self.ui_font.as_mut()
+            && let Some(area) = binary_offer::draw(
+                &mut self.close_dialog,
+                binary_pending,
+                self.view.binary_offer(),
+                pixels,
+                (w, h),
+                font,
+                theme,
+                &self.ui,
+            )
+        {
+            damage.push(area);
         }
         let mut rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
@@ -2577,6 +2607,8 @@ fn cloak_and_show(hwnd: isize) {
 impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.sync_desktop_window(el);
+        self.sync_close_dialog();
+        self.resume_external_open();
     }
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gfx.is_some() {
@@ -2829,6 +2861,8 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
             UserEvent::Document(result) => {
+                #[cfg(feature = "frame-harness")]
+                let Some(result) = harness::hold_preview_completion(result, self.view.active_id()) else { return };
                 let replacement = match &*result {
                     kwil_view_model::document_worker::DocumentResult::Replaced { key, result, .. } => {
                         Some((*key, result.as_ref().map(|_| ()).map_err(ToString::to_string)))
@@ -2853,27 +2887,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 damage
             }
-            UserEvent::OpenExternal => {
-                if self.file_dialogs.exiting() {
-                    self.external_inbox.close();
-                    return;
-                }
-
-                if self.welcome.visible() {
-                    return;
-                }
-                let requests = self.external_inbox.drain();
-                if requests.is_empty() {
-                    return;
-                }
-                for request in requests {
-                    if let Err(error) = self.view.open_files(request) {
-                        self.view.set_notice(format!("Open failed: {error}"));
-                    }
-                }
-                self.sync_file_ui();
-                Damage { full: true, status: true, ..Default::default() }
-            }
+            UserEvent::OpenExternal => self.external_open_event(),
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else {
@@ -3232,6 +3246,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        if self.binary_window_input(&ev) {
+            return;
+        }
         // Native file/close dialogs and teardown own input ahead of every GUI
         // overlay, including the separate settings window. Worker receipts still drain.
         if self.file_modal() && desktop_window::owns_input(&ev) {

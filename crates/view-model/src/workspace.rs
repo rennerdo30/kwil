@@ -12,7 +12,29 @@ use std::{
 
 #[path = "workspace_hex.rs"]
 mod workspace_hex;
+use crate::document_worker::binary_offer::{Choice as BinaryChoice, Offer as BinaryOffer, Ticket as BinaryTicket};
 use workspace_hex::HexFlow;
+
+enum BinaryPhase {
+    Opening,
+    Offered(BinaryOffer),
+    Resolving(BinaryChoice),
+}
+struct BinaryFlight {
+    ticket: BinaryTicket,
+    path: PathBuf,
+    phase: BinaryPhase,
+    return_to: Option<DocumentId>,
+    preview_ready: bool,
+}
+#[derive(Default)]
+struct BinaryFlow {
+    flights: HashMap<DocumentId, BinaryFlight>,
+    next_generation: u64,
+    // At most one retirement per admitted flight. Refused disposal never
+    // destroys a last source on the UI, even after a stale path completion.
+    retiring: Vec<(DocumentId, Box<Editor>)>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TabArea {
@@ -160,6 +182,7 @@ pub struct EditorInputTicket {
 
 pub struct Workspace {
     hex: HexFlow,
+    binary: BinaryFlow,
     input_epoch: u64,
     editor_settings: Option<kwil_core_commands::Settings>,
     // Tab.path tracks named destinations; recovery_path is display-only context.
@@ -174,6 +197,7 @@ impl Workspace {
     pub fn new(view: View) -> io::Result<Self> {
         let mut workspace = Self {
             hex: HexFlow::default(),
+            binary: BinaryFlow::default(),
             input_epoch: 0,
             editor_settings: None,
             session: Session::default(),
@@ -236,7 +260,9 @@ impl Workspace {
     /// editing, layout reloads and save/close actions for this target while true.
     /// Other tabs remain available. No new event or export is required.
     pub fn document_busy(&self, id: DocumentId) -> bool {
-        self.files.loans.contains_key(&id) || self.hex.busy(id)
+        self.files.loans.contains_key(&id)
+            || self.hex.busy(id)
+            || self.binary.flights.get(&id).is_some_and(|flight| !matches!(flight.phase, BinaryPhase::Offered(_)))
     }
 
     pub fn replacement_busy(&self) -> bool {
@@ -476,6 +502,17 @@ impl Workspace {
         }
         // Reopening an already-open path activates its existing unsaved view.
         self.views.entry(id).or_insert(view);
+        if self.views[&id].editor().is_none()
+            && self.views[&id].file().is_some()
+            && let Some(path) = self.views[&id].path.clone()
+        {
+            // Startup may hand us an unindexed TextFile before recovery is
+            // ready. Suspend its raw display immediately, before set_rows or
+            // the first frontend paint can read it as text.
+            let request = self.checked_open_request(id, 0, path)?;
+            self.binary.flights.get_mut(&id).unwrap().return_to = previous;
+            self.files.queue.push_back(request);
+        }
         self.refresh_save_destinations();
         Ok(id)
     }
@@ -585,6 +622,7 @@ impl Workspace {
         }
         self.cancel_hex_input_for(id);
         self.files.failed_opens.remove(&id);
+        self.retire_binary_offer(id);
         self.files.queue.retain(|request| !matches!(request, DocumentRequest::Open { document, .. } | DocumentRequest::Index { document, .. } if *document == id));
         self.retire_closed_hex_editors();
         self.closed_views.retain(|id, _| self.session.closed().iter().any(|tab| tab.id == *id));
@@ -664,10 +702,9 @@ impl Workspace {
                     self.files.queue.retain(|request|!matches!(request,DocumentRequest::Open {document,..}|DocumentRequest::Index {document,..} if *document==id));
                     let request = if tab.revision != 0 || tab.saved_revision != 0 || tab.recovery_path.is_some() {
                         DocumentRequest::Recover { tab }
-                    } else if let (Some(path), Some(file)) = (&self.views[&id].path, self.views[&id].file()) {
-                        DocumentRequest::Index { document: id, revision: 0, path: path.clone(), file: file.clone() }
                     } else if let Some(path) = &self.views[&id].path {
-                        DocumentRequest::Open { document: id, revision: 0, path: path.clone() }
+                        let path = path.clone();
+                        self.checked_open_request(id, 0, path)?
                     } else {
                         return Err(io::Error::other("Closed document requires recovery"));
                     };
@@ -773,17 +810,21 @@ impl Workspace {
     }
 
     fn queue_initial_indexes(&mut self) {
-        for tab in self.session.tabs() {
+        let tabs = self.session.tabs().to_vec();
+        for tab in tabs {
             let view = &self.views[&tab.id];
             if view.editor().is_none()
-                && let (Some(path), Some(file)) = (&view.path, view.file())
+                && !self.binary.flights.contains_key(&tab.id)
+                && let Some(path) = &view.path
+                && view.file().is_some()
             {
-                self.files.queue.push_back(DocumentRequest::Index {
-                    document: tab.id,
-                    revision: tab.revision,
-                    path: path.clone(),
-                    file: file.clone(),
-                });
+                let path = path.clone();
+                match self.checked_open_request(tab.id, tab.revision, path) {
+                    Ok(request) => self.files.queue.push_back(request),
+                    Err(error) => {
+                        self.views.get_mut(&tab.id).unwrap().set_notice(error.to_string());
+                    }
+                }
             }
         }
         self.pump_files();
@@ -796,6 +837,7 @@ impl Workspace {
         if self.files.worker.is_none() {
             return;
         }
+        self.pump_binary_retirement();
         while let Some(request) = self.files.queue.pop_front() {
             match self.files.worker.as_ref().unwrap().try_submit(request) {
                 Ok(()) => {}
@@ -804,12 +846,18 @@ impl Workspace {
                     break;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(request)) => {
-                    if matches!(&*request, DocumentRequest::DiscardHex { .. }) {
+                    if matches!(
+                        &*request,
+                        DocumentRequest::DiscardHex { .. }
+                            | DocumentRequest::OpenChecked { .. }
+                            | DocumentRequest::RetireSource { .. }
+                            | DocumentRequest::ResolveBinary { choice: BinaryChoice::Cancel, .. }
+                    ) {
                         // Never destroy the last raw Editor/undo root on the UI
                         // merely because its disposal lane disconnected.
                         self.files.queue.push_front(*request);
                         self.cancel_close_intent();
-                        self.set_notice("Raw history disposal awaits the document worker".into());
+                        self.set_notice("Source ownership awaits the document worker".into());
                         break;
                     }
                     if let DocumentRequest::ValidateReopen { document, generation, .. } = &*request
@@ -857,7 +905,17 @@ impl Workspace {
         }
         self.files.persist_pending = false;
         self.files.persist_inflight = true;
-        self.files.queue.push_back(DocumentRequest::Persist(self.session.clone()));
+        let mut snapshot = self.session.clone();
+        for id in self.binary.flights.keys() {
+            if let Some(tab) = snapshot.tab_mut(*id) {
+                // An undecided open has no accepted recovery interpretation.
+                // Persist other work normally, but never restore this physical
+                // binary later as implicitly accepted decoded text.
+                tab.path = None;
+                tab.recovery_path = None;
+            }
+        }
+        self.files.queue.push_back(DocumentRequest::Persist(snapshot));
         self.pump_files();
     }
 
@@ -1049,7 +1107,9 @@ impl Workspace {
         view.set_notice("Openingâ€¦".into());
         self.views.insert(id, view);
         self.refresh_save_destinations();
-        self.files.queue.push_back(DocumentRequest::Open { document: id, revision: 0, path });
+        let request = self.checked_open_request(id, 0, path)?;
+        self.binary.flights.get_mut(&id).unwrap().return_to = previous;
+        self.files.queue.push_back(request);
         self.pump_files();
         self.checkpoint_session();
         Ok(id)
@@ -1454,6 +1514,7 @@ impl Workspace {
         let destinations_changed = matches!(
             &result,
             DocumentResult::Prepared(_)
+                | DocumentResult::CheckedOpened { .. }
                 | DocumentResult::Recovered { .. }
                 | DocumentResult::Opened { .. }
                 | DocumentResult::Preview { .. }
@@ -1468,6 +1529,34 @@ impl Workspace {
         );
         let mut damage = Damage { status: true, ..Default::default() };
         match result {
+            DocumentResult::BinaryOffer(offer) => {
+                damage = self.accept_binary_offer(offer, None);
+            }
+            DocumentResult::BinaryRefused { offer, error } => {
+                damage = self.accept_binary_offer(offer, Some(error));
+            }
+            DocumentResult::CheckedPreview { ticket, preview } => {
+                damage = self.checked_text_preview(ticket, preview.text);
+            }
+            DocumentResult::CheckedRawPreview { ticket, page } => {
+                if self.binary_current(ticket)
+                    && matches!(
+                        self.binary.flights[&ticket.document()].phase,
+                        BinaryPhase::Resolving(BinaryChoice::Hex)
+                    )
+                {
+                    self.binary.flights.get_mut(&ticket.document()).unwrap().preview_ready = false;
+                    let (preview_damage, accepted) =
+                        self.hex_preview_accepted(ticket.document(), ticket.revision(), page);
+                    if accepted {
+                        self.binary.flights.get_mut(&ticket.document()).unwrap().preview_ready = true;
+                    }
+                    damage = preview_damage;
+                }
+            }
+            DocumentResult::CheckedOpened { ticket, result } => {
+                damage = self.checked_opened(ticket, result);
+            }
             DocumentResult::RawPreview { document, revision, page } => {
                 damage = self.hex_preview(document, revision, page);
             }
@@ -2072,8 +2161,27 @@ impl Workspace {
             self.views.insert(id, view);
         }
         // Requests captured while recovery was preparing retain their source tab.
-        for request in &mut self.files.queue {
-            match request {
+        for mut request in std::mem::take(&mut self.files.queue) {
+            if let DocumentRequest::OpenChecked { ticket, .. } = &request
+                && mapping
+                    .get(&ticket.document)
+                    .and_then(|id| self.views.get(id))
+                    .is_some_and(|view| view.editor().is_some())
+            {
+                // The restored journal already owns the accepted text/raw
+                // policy. Its duplicate startup source must never re-offer or
+                // decode, nor lose its last mapping on this UI thread.
+                if let DocumentRequest::OpenChecked { file: Some(file), .. } = request {
+                    self.files.queue.push_back(DocumentRequest::RetireSource { file });
+                }
+                continue;
+            }
+            match &mut request {
+                DocumentRequest::OpenChecked { ticket, .. } => {
+                    if let Some(id) = mapping.get(&ticket.document) {
+                        ticket.document = *id;
+                    }
+                }
                 DocumentRequest::Open { document, .. }
                 | DocumentRequest::Index { document, .. }
                 | DocumentRequest::Save { document, .. } => {
@@ -2083,7 +2191,20 @@ impl Workspace {
                 }
                 _ => {}
             }
+            self.files.queue.push_back(request);
         }
+        self.binary.flights = std::mem::take(&mut self.binary.flights)
+            .into_iter()
+            .filter_map(|(old, mut flight)| {
+                let id = mapping.get(&old).copied()?;
+                if self.views.get(&id).is_none_or(|view| view.editor().is_some()) {
+                    return None;
+                }
+                flight.ticket.document = id;
+                flight.return_to = flight.return_to.and_then(|previous| mapping.get(&previous).copied());
+                Some((id, flight))
+            })
+            .collect();
         self.files.saves = std::mem::take(&mut self.files.saves)
             .into_iter()
             .map(|(id, save)| (*mapping.get(&id).unwrap_or(&id), save))
@@ -2162,6 +2283,298 @@ fn recovery_notice(tab: &kwil_core_workspace::session::Tab) -> String {
             .map_or_else(|| "this tab".into(), |path| path.display().to_string()),
     )
 }
+
+impl Workspace {
+    /// Scalar-only offer for the active tab. Hosts capture its exact ticket in
+    /// the modal callback; never read the source to draw this prompt.
+    pub fn binary_offer(&self) -> Option<BinaryOffer> {
+        self.binary_offer_for(self.active_id())
+    }
+    pub fn binary_offer_for(&self, id: DocumentId) -> Option<BinaryOffer> {
+        let flight = self.binary.flights.get(&id)?;
+        if !self.binary_current(flight.ticket) {
+            return None;
+        }
+        match flight.phase {
+            BinaryPhase::Offered(offer) => Some(offer),
+            _ => None,
+        }
+    }
+    pub fn binary_offer_pending(&self, id: DocumentId) -> bool {
+        self.binary.flights.get(&id).is_some_and(|flight| self.binary_current(flight.ticket))
+    }
+    /// Paint authority for a worker-vetted, bounded first screen only. This
+    /// never releases ownership or input: binary_offer_pending remains true
+    /// until the final checked completion restores the editor. Hosts may paint
+    /// these cached text/hex rows while every body mutation stays fenced.
+    pub fn binary_preview_ready(&self, id: DocumentId) -> bool {
+        self.binary.flights.get(&id).is_some_and(|flight| {
+            flight.preview_ready
+                && self.binary_current(flight.ticket)
+                && matches!(
+                    flight.phase,
+                    BinaryPhase::Opening | BinaryPhase::Resolving(BinaryChoice::Text | BinaryChoice::Hex)
+                )
+        })
+    }
+    fn binary_current(&self, ticket: BinaryTicket) -> bool {
+        self.binary.flights.get(&ticket.document()).is_some_and(|flight| {
+            flight.ticket == ticket
+                && self
+                    .views
+                    .get(&ticket.document())
+                    .is_some_and(|view| view.editor.is_none() && view.path.as_ref() == Some(&flight.path))
+                && self.session.tabs().iter().any(|tab| {
+                    tab.id == ticket.document()
+                        && tab.revision == ticket.revision()
+                        && tab.path.as_ref() == Some(&flight.path)
+                })
+        })
+    }
+    fn checked_open_request(&mut self, id: DocumentId, revision: u64, path: PathBuf) -> io::Result<DocumentRequest> {
+        if self.binary.flights.len() + self.binary.retiring.len() >= kwil_core_workspace::session::MAX_TABS
+            || self.binary.flights.contains_key(&id)
+            || path.capacity() > kwil_core_workspace::session::MAX_PATH_BYTES
+            || path.as_os_str().as_encoded_bytes().len() > kwil_core_workspace::session::MAX_PATH_BYTES
+        {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Binary open admission retained"));
+        }
+        let generation = self
+            .binary
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Binary open identity exhausted"))?;
+        self.binary.flights.try_reserve(1).map_err(io::Error::other)?;
+        // Reserve the eventual stale-owner disposal cell before any source is
+        // admitted. There is no allocation proportional to source length.
+        self.binary.retiring.try_reserve(self.binary.flights.len() + 1).map_err(io::Error::other)?;
+        self.binary.next_generation = generation;
+        let ticket = BinaryTicket { document: id, revision, generation };
+        self.binary.flights.insert(
+            id,
+            BinaryFlight {
+                ticket,
+                path: path.clone(),
+                phase: BinaryPhase::Opening,
+                return_to: None,
+                preview_ready: false,
+            },
+        );
+        let view = self.views.get_mut(&id).expect("checked open placeholder");
+        let file = view.file.take();
+        view.preview = Some(Vec::new());
+        view.set_rows(view.rows);
+        Ok(DocumentRequest::OpenChecked { ticket, path, file })
+    }
+    fn accept_binary_offer(&mut self, offer: BinaryOffer, error: Option<io::Error>) -> Damage {
+        if !self.binary_current(offer.ticket) {
+            return Damage::default();
+        }
+        let id = offer.ticket.document();
+        let allowed = matches!(
+            (&self.binary.flights[&id].phase, error.is_some()),
+            (BinaryPhase::Opening, false) | (BinaryPhase::Resolving(BinaryChoice::Hex | BinaryChoice::Text), true)
+        );
+        if !allowed {
+            return Damage::default();
+        }
+        let flight = self.binary.flights.get_mut(&id).unwrap();
+        flight.phase = BinaryPhase::Offered(offer);
+        flight.preview_ready = false;
+        // A rejected Hex admission may have installed only a bounded preview.
+        // Remove that display before exposing the choice again.
+        self.hex_forget_binary_open(id);
+        let view = self.views.get_mut(&id).unwrap();
+        view.preview = Some(Vec::new());
+        view.set_rows(view.rows);
+        view.set_notice(error.map_or_else(
+            || "Binary file: choose Hex, Text, or Cancel".into(),
+            |e| format!("Binary choice refused: {e}; source retained"),
+        ));
+        Damage { full: self.active_id() == id, status: true, ..Default::default() }
+    }
+    /// Ok means bounded mailbox admission. Full/disconnected leaves the same
+    /// offer and exact worker owner available; the host may retry this ticket.
+    pub fn resolve_binary_offer(
+        &mut self,
+        ticket: BinaryTicket,
+        choice: BinaryChoice,
+        rows: usize,
+    ) -> io::Result<Damage> {
+        if !self.binary_current(ticket)
+            || ticket.document() != self.active_id()
+            || self.binary_offer_for(ticket.document()).is_none()
+        {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Binary offer changed"));
+        }
+        if self.hex.disposing || self.files.preparing || self.files.prompt.is_some() || self.close_pending() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Binary choice awaits current file operation"));
+        }
+        self.pump_files();
+        if !self.files.queue.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Binary choice awaits document queue"));
+        }
+        let worker = self.files.worker.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "Document worker unavailable; offer retained")
+        })?;
+        let request = DocumentRequest::ResolveBinary { ticket, choice, rows: rows.min(crate::hex::MAX_ROWS) };
+        worker.try_submit(request).map_err(|error| {
+            io::Error::new(
+                match error {
+                    std::sync::mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                    std::sync::mpsc::TrySendError::Disconnected(_) => io::ErrorKind::NotConnected,
+                },
+                "Binary choice not admitted; offer retained",
+            )
+        })?;
+        let id = ticket.document();
+        let flight = self.binary.flights.get_mut(&id).unwrap();
+        flight.phase = BinaryPhase::Resolving(choice);
+        flight.preview_ready = false;
+        self.views.get_mut(&id).unwrap().input_incarnation = std::sync::Arc::new(());
+        self.input_epoch = self.input_epoch.wrapping_add(1);
+        if choice == BinaryChoice::Hex {
+            self.hex_begin_binary_open(id, ticket.generation(), rows);
+        }
+        self.views.get_mut(&id).unwrap().set_notice(
+            if choice == BinaryChoice::Cancel { "Cancelling open..." } else { "Opening selected representation..." }
+                .into(),
+        );
+        Ok(Damage { full: true, status: true, ..Default::default() })
+    }
+    fn checked_text_preview(&mut self, ticket: BinaryTicket, text: Vec<u8>) -> Damage {
+        if !self.binary_current(ticket)
+            || !matches!(
+                self.binary.flights[&ticket.document()].phase,
+                BinaryPhase::Opening | BinaryPhase::Resolving(BinaryChoice::Text)
+            )
+        {
+            return Damage::default();
+        }
+        let view = self.views.get_mut(&ticket.document()).unwrap();
+        view.preview = Some(text);
+        view.set_rows(view.rows);
+        view.set_notice("Preparing decoded document...".into());
+        self.binary.flights.get_mut(&ticket.document()).unwrap().preview_ready = true;
+        Damage { full: self.active_id() == ticket.document(), status: true, ..Default::default() }
+    }
+    fn checked_opened(&mut self, ticket: BinaryTicket, result: io::Result<Option<Box<crate::Document>>>) -> Damage {
+        let id = ticket.document();
+        if !self.binary_current(ticket) {
+            if let Ok(Some(document)) = result {
+                // Closed offered flights can only return a scalar Cancel. A
+                // source result belongs to a still-admitted flight, even if
+                // an embedder changed its path while it was on the lane.
+                assert!(self.binary.flights.get(&id).is_some_and(|flight| flight.ticket == ticket));
+                self.binary.flights.remove(&id);
+                self.hex_forget_binary_open(id);
+                self.binary.retiring.push((id, Box::new(Editor::new(*document))));
+                self.pump_binary_retirement();
+            } else if self.binary.flights.get(&id).is_some_and(|flight| flight.ticket == ticket) {
+                self.binary.flights.remove(&id);
+                self.hex_forget_binary_open(id);
+            }
+            return Damage::default();
+        }
+        if matches!(&result, Ok(None))
+            && !matches!(self.binary.flights[&id].phase, BinaryPhase::Resolving(BinaryChoice::Cancel))
+        {
+            return Damage::default();
+        }
+        let flight = self.binary.flights.remove(&id).unwrap();
+        match result {
+            Ok(None) => {
+                self.hex_forget_binary_open(id);
+                // This exact flight was never accepted, and the scalar receipt
+                // proves its physical source retired on the worker. Removing
+                // its placeholder must not evict legitimate closed history.
+                assert!(self.session.cancel_open(id));
+                self.views.remove(&id);
+                self.files.failed_opens.remove(&id);
+                self.input_epoch = self.input_epoch.wrapping_add(1);
+                if let Some(previous) = flight.return_to {
+                    self.session.activate(previous);
+                }
+                if self.views.is_empty() {
+                    self.open(View::new(None)).expect("cancelled placeholder leaves tab capacity");
+                }
+                self.refresh_save_destinations();
+                self.checkpoint_session();
+                Damage { full: true, status: true, ..Default::default() }
+            }
+            result => {
+                let result = result.map(|document| document.expect("accepted checked source"));
+                if let Ok(document) = &result {
+                    self.views.get_mut(&id).unwrap().file = document.original.clone();
+                } else {
+                    self.hex_forget_binary_open(id);
+                }
+                self.document_result(DocumentResult::Indexed { document: id, revision: ticket.revision(), result })
+            }
+        }
+    }
+    fn retire_binary_offer(&mut self, id: DocumentId) {
+        if let Some(flight) = self.binary.flights.remove(&id) {
+            // Close is allowed only in the offered phase, never while a
+            // source-bearing completion can be on its way to this view.
+            debug_assert!(matches!(flight.phase, BinaryPhase::Offered(_)));
+            self.files.queue.push_back(DocumentRequest::ResolveBinary {
+                ticket: flight.ticket,
+                choice: BinaryChoice::Cancel,
+                rows: 0,
+            });
+        }
+    }
+    fn pump_binary_retirement(&mut self) {
+        let Some(worker) = &self.files.worker else { return };
+        while let Some((document, editor)) = self.binary.retiring.pop() {
+            if let Err(error) = worker.try_submit(DocumentRequest::DiscardHex { document, editor }) {
+                let (std::sync::mpsc::TrySendError::Full(request)
+                | std::sync::mpsc::TrySendError::Disconnected(request)) = error;
+                let DocumentRequest::DiscardHex { document, editor } = *request else { unreachable!() };
+                self.binary.retiring.push((document, editor));
+                break;
+            }
+        }
+    }
+    fn prepare_binary_shutdown(&mut self) -> bool {
+        self.pump_files();
+        let ids: Vec<_> = self
+            .binary
+            .flights
+            .iter()
+            .filter_map(|(&id, flight)| matches!(flight.phase, BinaryPhase::Offered(_)).then_some(id))
+            .collect();
+        for id in ids {
+            if self.files.queue.len() >= 256 {
+                break;
+            }
+            let flight = self.binary.flights.get_mut(&id).unwrap();
+            flight.phase = BinaryPhase::Resolving(BinaryChoice::Cancel);
+            flight.preview_ready = false;
+            self.files.queue.push_back(DocumentRequest::ResolveBinary {
+                ticket: flight.ticket,
+                choice: BinaryChoice::Cancel,
+                rows: 0,
+            });
+        }
+        self.pump_files();
+        self.binary.flights.is_empty()
+            && self.binary.retiring.is_empty()
+            && !self.files.queue.iter().any(|request| {
+                matches!(
+                    request,
+                    DocumentRequest::ResolveBinary { choice: BinaryChoice::Cancel, .. }
+                        | DocumentRequest::RetireSource { .. }
+                        | DocumentRequest::OpenChecked { .. }
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+#[path = "binary_offer_model_tests.rs"]
+mod binary_offer_model_tests;
 
 impl Deref for Workspace {
     type Target = View;
@@ -2962,7 +3375,9 @@ mod tests {
         }
         let failed = workspace.open_path(root.join("missing-parent/failed.txt")).unwrap();
         let result = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert!(matches!(&result, DocumentResult::Opened { document, result: Err(_), .. } if *document == failed));
+        assert!(
+            matches!(&result, DocumentResult::CheckedOpened { ticket, result: Err(_), .. } if ticket.document() == failed)
+        );
         workspace.document_result(result);
         workspace.file_command("file.new").unwrap();
         let saving = workspace.active_id();

@@ -12,7 +12,6 @@ use file_argument::FileArgument;
 use kwil_core_text::TextFile;
 use kwil_view_model::{Notify, View};
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -181,24 +180,8 @@ fn run_app(console_launcher: bool) -> ExitCode {
         };
     }
 
-    let open = |path: &PathBuf| -> Result<View, String> {
-        let file = TextFile::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let encoded = kwil_core_text::encoding::EncodedFile::new(file.clone())
-            .map_err(|e| format!("cannot interpret {}: {e}", path.display()))?;
-        let detection = encoded.detection();
-        let interpretation =
-            kwil_core_text::decoded_backing::Interpretation::new(detection.encoding, detection.bom_len)
-                .map_err(|e| format!("cannot interpret {}: {e}", path.display()))?;
-        let preview = kwil_core_text::decoded_backing::decode_preview(
-            &file,
-            interpretation,
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .map_err(|e| format!("cannot preview {}: {e}", path.display()))?;
-        Ok(View::from_preview(path.clone(), file, preview.text))
-    };
     let make_view = || match args.files.first() {
-        Some(file) => open(&file.path),
+        Some(file) => initial_argument_view(file),
         None => Ok(View::new(None)),
     };
     let requests = kwil_core_workspace::instance::OpenFiles {
@@ -300,18 +283,12 @@ fn run_app(console_launcher: bool) -> ExitCode {
         },
         None => None,
     };
+    let remaining = remaining_initial_files(&requests);
     let external_ready = || {
         if let Some(owner) = &instance_owner {
-            owner.ready(requests.clone())
+            owner.ready(remaining.clone())
         } else {
-            let requests = requests.clone();
-            Box::new(move |open: kwil_ui_gpu::ExternalOpen| {
-                if !requests.files.is_empty()
-                    && let Err(error) = open(requests)
-                {
-                    eprintln!("kwil: initial file delivery failed: {error}");
-                }
-            }) as Box<dyn FnOnce(kwil_ui_gpu::ExternalOpen)>
+            initial_delivery(remaining.clone())
         }
     };
     if use_gui {
@@ -373,6 +350,45 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
 }
 
+fn initial_view(path: &std::path::Path) -> Result<View, String> {
+    let file = TextFile::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    // The checked document worker owns binary classification and decoding.
+    // Startup must neither reject binary encodings nor expose physical bytes.
+    Ok(View::from_preview(path.to_path_buf(), file, Vec::new()))
+}
+
+fn initial_argument_view(file: &FileArgument) -> Result<View, String> {
+    let mut view = initial_view(&file.path)?;
+    if let Some(line) = file.line {
+        view.execute(
+            "navigation.goToLine",
+            &kwil_view_model::CommandArgs { line: Some(line), column: file.column, ..Default::default() },
+            1,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(view)
+}
+
+fn remaining_initial_files(
+    requests: &kwil_core_workspace::instance::OpenFiles,
+) -> kwil_core_workspace::instance::OpenFiles {
+    // The first request already owns initial_argument_view, including its
+    // deferred position. Only later CLI files belong to the delivery callback.
+    // Forwarding to an existing instance continues to use the complete batch.
+    kwil_core_workspace::instance::OpenFiles { files: requests.files.iter().skip(1).cloned().collect() }
+}
+
+fn initial_delivery(requests: kwil_core_workspace::instance::OpenFiles) -> Box<dyn FnOnce(kwil_ui_gpu::ExternalOpen)> {
+    Box::new(move |open| {
+        if !requests.files.is_empty()
+            && let Err(error) = open(requests)
+        {
+            eprintln!("kwil: initial file delivery failed: {error}");
+        }
+    })
+}
+
 fn validate_hidden_tui_root(hidden: bool, root: Option<&std::path::Path>) -> Result<(), &'static str> {
     if hidden && root.is_none_or(|root| !root.is_absolute()) {
         Err("hidden terminal runs require an absolute KWIL_WORKSPACE_ROOT; live recovery storage was not accessed")
@@ -384,6 +400,133 @@ fn validate_hidden_tui_root(hidden: bool, root: Option<&std::path::Path>) -> Res
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
+    fn await_initial(
+        workspace: &mut kwil_view_model::Workspace,
+        receiver: &std::sync::mpsc::Receiver<kwil_view_model::document_worker::DocumentResult>,
+        done: impl Fn(&kwil_view_model::Workspace) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(workspace) {
+            let remaining =
+                deadline.checked_duration_since(std::time::Instant::now()).expect("bounded initial delivery");
+            workspace.document_result(receiver.recv_timeout(remaining).expect("initial delivery worker wake"));
+        }
+    }
+
+    #[test]
+    fn initial_delivery_does_not_reoffer_cancelled_binary_and_preserves_cli_locations() {
+        use kwil_core_workspace::instance::{OpenFile, OpenFiles};
+        use kwil_view_model::{
+            Workspace,
+            document_worker::{DocumentResult, binary_offer::Choice},
+        };
+        for binary in [true, false] {
+            let root = std::env::temp_dir().join(format!(
+                "kwil-initial-delivery-{}-{}-{binary}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let first = root.join("first.bin");
+            let later = root.join("later.txt");
+            std::fs::write(&first, if binary { b"header\0binary\x01\n".as_slice() } else { b"first\nsecond\n" })
+                .unwrap();
+            std::fs::write(&later, b"one\nsecond\nthird\n").unwrap();
+            let requests = OpenFiles {
+                files: vec![
+                    OpenFile { path: first.clone(), line: Some(2), column: Some(3) },
+                    OpenFile { path: later.clone(), line: Some(2), column: Some(3) },
+                ],
+            };
+            let view =
+                initial_argument_view(&FileArgument { path: first.clone(), line: Some(2), column: Some(3) }).unwrap();
+            let mut workspace = Workspace::new(view).unwrap();
+            workspace.set_rows(3);
+            let original = workspace.active_id();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            workspace
+                .start_document_worker_at(Some(root.join("state")), move |result| {
+                    let _ = sender.send(result);
+                })
+                .unwrap();
+            await_initial(&mut workspace, &receiver, |w| {
+                if binary { w.binary_offer().is_some() } else { w.editor().is_some() }
+            });
+            if !binary {
+                assert_eq!(workspace.editor().unwrap().primary_cursor().head, 8, "first CLI position is applied once");
+            }
+            let remaining = remaining_initial_files(&requests);
+            assert_eq!(remaining.files, requests.files[1..]);
+            let (open, inbox) = kwil_view_model::document_worker::external_open_channel(|| Ok(()));
+            initial_delivery(remaining)(open);
+            if binary {
+                let offer = workspace.binary_offer().unwrap();
+                workspace.resolve_binary_offer(offer.ticket, Choice::Cancel, 3).unwrap();
+                await_initial(&mut workspace, &receiver, |w| !w.binary_offer_pending(original) && w.editor().is_some());
+            }
+            for request in inbox.drain() {
+                workspace.open_files(request).unwrap();
+            }
+            await_initial(&mut workspace, &receiver, |w| {
+                w.editor().is_some_and(|e| e.document().path() == Some(later.as_path()))
+            });
+            assert_eq!(workspace.editor().unwrap().primary_cursor().head, 6, "later CLI line/column is preserved");
+            if binary {
+                assert!(
+                    workspace.session().tabs().iter().all(|tab| tab.path.as_ref() != Some(&first)),
+                    "Cancel must not reoffer initial file"
+                );
+                // A genuine later open of that same native path remains valid.
+                workspace
+                    .open_files(OpenFiles { files: vec![OpenFile { path: first, line: None, column: None }] })
+                    .unwrap();
+                await_initial(&mut workspace, &receiver, |w| w.binary_offer().is_some());
+                let offer = workspace.binary_offer().unwrap();
+                assert_ne!(offer.ticket.document(), original);
+                workspace.resolve_binary_offer(offer.ticket, Choice::Cancel, 3).unwrap();
+                await_initial(&mut workspace, &receiver, |w| !w.binary_offer_pending(offer.ticket.document()));
+            }
+            await_initial(&mut workspace, &receiver, |w| !w.search_replacement_pending());
+            while !workspace.prepare_hex_shutdown() {
+                workspace.document_result(receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            }
+            drop(workspace);
+            loop {
+                if let DocumentResult::Stopped(result) =
+                    receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+                {
+                    result.unwrap();
+                    break;
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn cold_start_binary_waits_for_worker_choice_without_text_interpretation() {
+        let path = std::env::temp_dir().join(format!(
+            "kwil-startup-binary-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, [0, 0, 0xfe, 0xff, 0x41]).unwrap();
+        let mut view = initial_view(&path).expect("binary startup reaches the checked document worker");
+        assert_eq!(view.file().unwrap().kind().unwrap(), kwil_core_text::FileKind::Binary);
+        assert!(
+            kwil_core_text::encoding::EncodedFile::new(view.file().unwrap().clone()).is_err(),
+            "fixture witnesses the old eager text-detection refusal"
+        );
+        view.set_rows(2);
+        assert!(view.editor().is_none());
+        assert!(
+            view.line(0).unwrap_or_default().is_empty(),
+            "unclassified physical bytes cannot reach the paintable preview"
+        );
+        drop(view);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn renderer_cli_accepts_all_modes_and_rejects_ambiguous_or_missing_values() {
         use kwil_ui_gpu::RenderBackend;

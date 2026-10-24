@@ -64,7 +64,12 @@ fn stop(mut workspace: Workspace, receiver: &mpsc::Receiver<DocumentResult>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !workspace.prepare_hex_shutdown() {
         let remaining = deadline.checked_duration_since(Instant::now()).expect("bounded raw ownership disposal");
-        workspace.document_result(receiver.recv_timeout(remaining).expect("raw disposal wake"));
+        let result = receiver.recv_timeout(remaining).unwrap_or_else(|error| {
+            panic!("raw disposal wake: {error:?}; active={:?} queue={} loans={} opening={} saves_pending={} preparing={} metadata_durable={} persist_pending={} persist_inflight={} recovery={:?} observed={:?} durable={:?} journal_errors={:?}",
+                workspace.active_id(), workspace.files.queue.len(), workspace.hex.loans.len(), workspace.hex.opening(), workspace.file_saves_pending(), workspace.files.preparing,
+                workspace.files.metadata_durable, workspace.files.persist_pending, workspace.files.persist_inflight, workspace.recovery_notice(), workspace.files.observed, workspace.files.durable, workspace.files.journal_failed)
+        });
+        workspace.document_result(result);
     }
     drop(workspace);
     let deadline = Instant::now() + Duration::from_secs(10);
