@@ -1,0 +1,7 @@
+2026-10-24 12:00:00.000 INFO [main] app.Startup - Application started
+2026-10-24 12:00:01.000 DEBUG [worker-1] app.Reader - payload={"user":"alice","count":12,"ok":true}
+2026-10-24 12:00:02.000 WARN [worker-1] app.Reader - Retry scheduled
+2026-10-24 12:00:03.000 ERROR [main] app.Service - java.lang.IllegalStateException: example
+    at example.Service.run(Service.java:42)
+2026-10-24 12:00:04.000 INFO [main] app.Service - Recovery complete
+{"timestamp":"2026-10-24T12:00:05Z","level":"INFO","message":"structured record","details":{"count":3}}
