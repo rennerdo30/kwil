@@ -1,0 +1,220 @@
+{
+  "schema": 1,
+  "componentSchema": 1,
+  "status": "source-frozen-design; implementation and hosted lifecycle acceptance pending",
+  "normativeDocument": "docs/decisions/0004-windows-installer.md",
+  "familyGuid": "{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}",
+  "namespaces": {
+    "product": "{918F53A7-7A40-5E54-96EB-E2FD9B0C605B}",
+    "component": "{E596D49A-3F36-5A1A-89C8-7D052FDE6C47}"
+  },
+  "backend": {
+    "entrypoint": "scripts/windows-msi.ps1",
+    "arguments": [
+      { "name": "PayloadDirectory", "type": "absolute existing directory" },
+      { "name": "OutputPath", "type": "absolute absent .msi file" },
+      { "name": "Version", "type": "canonical decimal major.minor.build; ranges 0..255,0..255,0..65535" },
+      { "name": "Architecture", "type": "x64|arm64" },
+      { "name": "Commit", "type": "40 lowercase hexadecimal characters" },
+      { "name": "IconPath", "type": "absolute path to PayloadDirectory/kwil.ico" }
+    ],
+    "outputs": [ "OutputPath", "OutputPath.manifest.json" ],
+    "successExitCode": 0,
+    "failureExitCode": 1,
+    "inputMetadata": ".installer/input.json",
+    "guardPath": ".installer/kwil-installer-guard.dll",
+    "inputMutation": "forbidden",
+    "temporaryFiles": "private bounded sibling work directory; no other published output; retain failed work with PID receipts",
+    "metadataTransport": "UTF-8 JSON without BOM; exact schema in decision section Input; JSON byte serialization is never an identity input"
+  },
+  "architectures": {
+    "x64": { "target": "x86_64-pc-windows-msvc", "peMachine": 34404, "template": "x64;1033" },
+    "arm64": { "target": "aarch64-pc-windows-msvc", "peMachine": 43620, "template": "Arm64;1033" }
+  },
+  "canonicalEncoding": {
+    "integer": "u32 little-endian except UUID RFC network order and ordinary Windows PE/LNK fields",
+    "string": "LP(s) = u32le(UTF-8 byte count) followed by UTF-8 bytes; no BOM or terminator; no normalization or locale transforms",
+    "hash": "SHA-256; lowercase 64-character hexadecimal string",
+    "guid": "uppercase braced 38-character text; UUIDv5 hashes namespace RFC network-order bytes followed by the specified raw name bytes, sets RFC version/variant, formats from network order; never hash Guid.ToByteArray() mixed-endian bytes",
+    "inventory": "ASCII KWR1 + u32le(row count) + each row's ordered LP fields; sort by ASCII normalizedIdentity ordinal, then id ordinal; reject duplicate normalizedIdentity",
+    "inventoryFields": [ "id", "kind", "root", "relative", "name", "data", "size", "sha256", "component", "source", "fileKey", "registryKey", "valueType" ],
+    "build": "ASCII KWB1 + LP(schema) + LP(componentSchema) + LP(familyGuid) + LP(architecture) + LP(version) + LP(commit) + LP(target) + LP(guardAbi) + LP(guardSha256) + u32le(import count) + ordered LP(load),LP(dll) import pairs + u32le(inventory byte count) + inventory bytes",
+    "buildId": "SHA-256 of build encoding; numeric metadata values encoded as canonical unsigned decimal LP strings",
+    "productName": "ASCII KWP1 + LP(architecture) + LP(version) + LP(buildId)",
+    "productCode": "UUIDv5(product namespace, productName)",
+    "packageCode": "fresh cryptographically random UUIDv4 per successful packaging invocation; excluded from BuildID",
+    "componentName": "ASCII KWC1 + LP(architecture) + LP(resourceKind) + LP(normalizedIdentity) + LP(componentSchema)",
+    "componentCode": "UUIDv5(component namespace, componentName); resourceKind F or R; K rows use their owning R component",
+    "componentIdentifier": "C followed by 32 uppercase component UUID hex digits without braces or hyphens",
+    "identity": "F: root + ':' + ASCII-lower(relative); R: 'H:' + ASCII-lower(relative) + ':' + ASCII-lower(name); K: 'H:' + ASCII-lower(relative) + ':#key'; name is @ for default or n: followed by literal nonempty value name",
+    "unusedField": "literal hyphen (-), never SQL NULL or empty string; valueType is decimal 0 for non-R and 1 for R",
+    "imports": "load N (normal) or D (delay), DLL basenames matching [a-z0-9._-]+[.]dll, sorted ordinal by load then dll; duplicate pair forbidden; empty delay list is an explicit zero count"
+  },
+  "limits": {
+    "inputJsonBytes": 1048576,
+    "jsonDepth": 8,
+    "resourceRows": 512,
+    "fileRows": 128,
+    "registryValueRows": 192,
+    "registryKeyRows": 192,
+    "importRows": 128,
+    "relativePathAsciiBytes": 240,
+    "pathSegments": 32,
+    "valueNameAsciiBytes": 128,
+    "registryDataUtf16BytesIncludingNul": 8192,
+    "guardBytes": 16777216,
+    "singleInstalledFileBytes": 536870912,
+    "totalInstalledFileBytes": 1073741824,
+    "canonicalInventoryBytes": 1048576,
+    "msiStringUtf16CodeUnits": 32767,
+    "absolutePathUtf16CodeUnitsIncludingNul": 32767,
+    "registryAncestrySegments": 64,
+    "relatedProducts": 16,
+    "matchingRegisteredProducts": 1,
+    "apiBufferAttempts": 2,
+    "restartManagerProcesses": 256,
+    "restartManagerListAttempts": 2,
+    "hashReadChunkBytes": 65536,
+    "preflightDeadlineMilliseconds": 30000,
+    "backendTimeoutSeconds": 120,
+    "cabinetTimeoutSeconds": 60,
+    "messageUtf16CodeUnits": 1024,
+    "allocationPolicy": "check counts and lengths before allocation; checked arithmetic; no input-sized unbounded collection; deadline checked between OS calls, not a promise to interrupt a stalled OS API"
+  },
+  "msiTables": {
+    "notation": "i2/i4 = nonnullable MSI integer; sN = nonnullable case-sensitive MSI string maximum N; s0 = nonnullable long MSI string additionally bounded here; listed first column is primary key unless primaryKey says otherwise",
+    "KwilPackage": {
+      "rows": 1,
+      "columns": [
+        [ "Id", "i2" ], [ "Schema", "i2" ], [ "ComponentSchema", "i2" ],
+        [ "Family", "s38" ], [ "Architecture", "s5" ], [ "Version", "s20" ],
+        [ "Commit", "s40" ], [ "Target", "s32" ], [ "GuardAbi", "i2" ],
+        [ "GuardSha256", "s64" ], [ "InventorySha256", "s64" ], [ "BuildId", "s64" ],
+        [ "ProductCode", "s38" ], [ "PackageCode", "s38" ], [ "ResourceCount", "i4" ]
+      ],
+      "constants": { "Id": 1, "Schema": 1, "ComponentSchema": 1, "GuardAbi": 1 }
+    },
+    "KwilResource": {
+      "columns": [
+        [ "Id", "s32" ], [ "Kind", "s1" ], [ "Root", "s1" ], [ "Relative", "s240" ],
+        [ "Name", "s130" ], [ "Data", "s0" ], [ "Size", "s20" ], [ "Sha256", "s64" ],
+        [ "Component_", "s72" ], [ "Source", "s1" ], [ "File_", "s72" ],
+        [ "Registry_", "s72" ], [ "ValueType", "i2" ]
+      ],
+      "kinds": { "F": "regular installed file including generated Start Menu LNK", "R": "individual native64 HKCU REG_SZ value", "K": "explicit registry key existence; never recursive ownership" },
+      "roots": { "I": "canonical current-user LocalAppData/Programs/Kwil", "P": "canonical current-user Programs known folder", "H": "native64 HKCU" },
+      "sources": { "p": "payload file at Relative under PayloadDirectory; root I only", "g": "fixed generated start-menu-v1 LNK; root P only", "-": "non-file" },
+      "idRule": "r followed by 6 zero-padded decimal digits, starting 000001 in normalizedIdentity sort order; File_ F plus same digits for F, Registry_ R plus same digits for R; hyphen otherwise",
+      "dataRule": "R: exact REG_SZ template with ${I} as the only token, expanding to canonical root I plus one trailing backslash; other literal dollar/braces forbidden except the exact fixed braced familyGuid in file Owner data familyGuid|architecture|1|file-normalizedIdentity; empty string represented by ~empty~; non-R hyphen",
+      "keyRule": "K: relative key, name/data/size/sha256/source/fileKey/registryKey hyphen, valueType 0; Component_ is the component of the lexicographically first authored R directly in that key; K must have such an R",
+      "fileRule": "F: name/data/registryKey hyphen, valueType 0; size canonical decimal and sha256 lowercase hex",
+      "valueRule": "R: root H, size/sha256/source/fileKey hyphen, valueType 1; Name @ or n:literal; Registry_ exact corresponding standard Registry row"
+    },
+    "KwilGuardImport": {
+      "primaryKey": [ "Load", "Dll" ],
+      "columns": [ [ "Load", "s1" ], [ "Dll", "s128" ] ],
+      "semantics": "exact normal/delay import DLL evidence for Binary.KwilPreflight, reconstructed by backend PE inspection"
+    }
+  },
+  "properties": {
+    "immutableDatabase": {
+      "ProductName": "Kwil",
+      "Manufacturer": "rennerdo30",
+      "ProductLanguage": "1033",
+      "UpgradeCode": "{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}",
+      "ProductCode": "derived ProductCode",
+      "ProductVersion": "canonical numeric Version",
+      "MSIINSTALLPERUSER": "1",
+      "ARPNOMODIFY": "1",
+      "ARPNOREPAIR": "1",
+      "ARPPRODUCTICON": "KwilIcon",
+      "ARPINSTALLLOCATION": "[INSTALLDIR]",
+      "MSIRESTARTMANAGERCONTROL": "Disable",
+      "REBOOT": "ReallySuppress",
+      "KWIL_SCHEMA": "1",
+      "KWIL_COMPONENT_SCHEMA": "1",
+      "KWIL_GUARD_ABI": "1",
+      "KWIL_FAMILY": "familyGuid",
+      "KWIL_ARCH": "Architecture",
+      "KWIL_BUILD_ID": "BuildID"
+    },
+    "mustBeEmpty": [ "ALLUSERS", "DISABLEROLLBACK", "RollbackDisabled", "SHORTFILENAMES", "TRANSFORMS", "PATCH", "ADDLOCAL", "ADDSOURCE", "ADVERTISE", "REMOVEFEATURES", "ADDDEFAULT", "COMPADDLOCAL", "COMPADDSOURCE", "FILEADDLOCAL", "FILEADDSOURCE" ],
+    "upgradeDetectionOnly": [ "KWIL_OLDER", "KWIL_EQUAL", "KWIL_NEWER" ],
+    "secureCustomProperties": "KWIL_OLDER;KWIL_EQUAL;KWIL_NEWER",
+    "mutableOperationAllowlist": {
+      "REMOVE": "empty or ALL; ALL only for registered product including nested old-product uninstall",
+      "REINSTALL": "empty or ALL; ALL only with original registered PackageCode and REINSTALLMODE=amus",
+      "REINSTALLMODE": "empty or omus when REINSTALL is empty (install/uninstall); exactly amus for explicit REINSTALL=ALL repair"
+    },
+    "guardRule": "read constants from active database Property table, compare effective session values; ARPINSTALLLOCATION is compared to independently resolved INSTALLDIR, not its database format expression; derive Installed, predecessor and operation authority independently from current-user MSI registration, then require effective Installed presence to agree and ACTION=INSTALL; validate detection properties against independent registration without setting them; effective INSTALLDIR and ProgramMenuFolder must equal OS-derived canonical roots"
+  },
+  "guard": {
+    "crate": "crates/installer-guard",
+    "crateType": "cdylib",
+    "integrationOwner": "ROOT",
+    "export": "KwilPreflightV1",
+    "rustAbi": "unsafe extern \"system\" fn KwilPreflightV1(session: u32) -> u32; no unwind; MSIHANDLE is u32 on both targets",
+    "binaryKey": "KwilPreflight",
+    "customAction": { "Action": "KwilPreflight", "Type": 1, "Source": "KwilPreflight", "Target": "KwilPreflightV1" },
+    "executeSequence": { "CostFinalize": 1000, "SetKwilArpLocation": 1010, "InstallValidate": 1400, "KwilPreflight": 1490, "InstallInitialize": 1500, "RemoveExistingProducts": 1501 },
+    "arpPropertyAction": { "Action": "SetKwilArpLocation", "Type": 51, "Source": "ARPINSTALLLOCATION", "Target": "[INSTALLDIR]", "Condition": "1" },
+    "condition": "1 (unconditional execute-sequence guard, also maintenance and nested uninstall)",
+    "success": 0,
+    "failure": 1603,
+    "errorRecord": { "tableErrorId": 25001, "format": "Kwil installer preflight: [2]. [3]", "field0": null, "field1": 25001, "field2": "bounded reason code and resource identity", "field3": "actionable instruction" },
+    "inputAuthority": "active MSI database and independently verified registered cached original package; never command-line KWIL_* detection properties",
+    "inUseCheck": "Restart Manager observation session: RmStartSession, RmRegisterResources for existing registered kwil.exe and kwil.com, bounded RmGetList, RmEndSession; any affected process or reboot reason or API failure refuses. Also read-only CreateFile sharing probe per pair member; no shutdown/restart API. See decision for precise flags and missing-file behavior.",
+    "dependencies": "Windows system FFI and already-approved permissive workspace dependencies only; no editor/GPU/TUI/update dependencies; static CRT; no app startup or DllMain work beyond loader-safe initialization",
+    "forbidden": [ "resource writes", "recursive filesystem or registry scans", "process launches", "process termination", "COM shortcut resolution", "repair requests", "new application provenance hook", "network" ]
+  },
+  "upgradeRows": [
+    { "UpgradeCode": "familyGuid", "VersionMin": "NULL", "VersionMax": "Version", "Language": "NULL", "Attributes": 1, "Remove": "ALL", "ActionProperty": "KWIL_OLDER" },
+    { "UpgradeCode": "familyGuid", "VersionMin": "Version", "VersionMax": "Version", "Language": "NULL", "Attributes": 770, "Remove": "NULL", "ActionProperty": "KWIL_EQUAL" },
+    { "UpgradeCode": "familyGuid", "VersionMin": "Version", "VersionMax": "NULL", "Language": "NULL", "Attributes": 2, "Remove": "NULL", "ActionProperty": "KWIL_NEWER" }
+  ],
+  "installation": {
+    "schema1Counts": { "files": 8, "registryValues": 11, "registryKeys": 10, "resourceRows": 29, "components": 11 },
+    "root": "%LOCALAPPDATA%/Programs/Kwil",
+    "startMenu": "current-user Programs/Kwil.lnk",
+    "shortcut": "nonadvertised deterministic Shell Link installed through File table, generated start-menu-v1; no Shortcut table and no COM; exact 868-byte format in decision",
+    "shellKey": "Software\\Classes\\*\\shell\\Kwil.3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A",
+    "shellValues": [
+      { "subkey": "", "name": "@", "type": 1, "data": "Open with Kwil" },
+      { "subkey": "", "name": "n:Icon", "type": 1, "data": "\"${I}kwil.exe\",0" },
+      { "subkey": "command", "name": "@", "type": 1, "data": "\"${I}kwil.exe\" \"%1\"" }
+    ],
+    "fileComponentKeypath": "native64 HKCU Software\\Kwil\\Installer\\{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}\\Components\\<component GUID>, value Owner; REG_SZ familyGuid|architecture|1|file-normalizedIdentity; same component as F row",
+    "componentAttributes": 260,
+    "componentKeypath": "Registry identifier for individually declared REG_SZ; every file has its own Owner Registry keypath; no file keypaths",
+    "registryRemoval": "individual authored Registry rows only; never RemoveRegistry, recursive delete, or special +,-,* Name rows; preserve unknown values/subkeys",
+    "removeFile": "Mode=2, FileName=NULL, component-associated own implicit install directories deepest first; no wildcard/file-name cleanup; no ProgramMenuFolder removal",
+    "createFolder": "none; schema1 has no genuine empty-directory resource",
+    "msiMarker": "kwil.no-update",
+    "portableMarkers": [ "kwil.portable", "kwil.no-update" ],
+    "neverInstalledOrZipped": [ ".installer/input.json", ".installer/kwil-installer-guard.dll" ],
+    "neverTouched": [ "persistent PATH", "default associations", "settings", "recovery data", "unknown siblings" ],
+    "explicitRepair": "msiexec /i <retained original MSI> REINSTALL=ALL REINSTALLMODE=amus; no advertised/automatic repair"
+  },
+  "packageAuthoring": {
+    "summaryPageCount": 500,
+    "summaryWordCount": 10,
+    "summaryRevisionNumber": "PackageCode",
+    "embeddedCabinet": "#kwil.cab",
+    "cabinetMemberNames": "File primary keys only: F followed by six decimal digits; never raw payload names in DDF directives",
+    "filename": "short|long for every File.FileName; Directory.DefaultDir must match the exact decision rows, using short|long only where specified; stable K plus six digits .ext short alias derived from row id; ASCII long names validated; no colon, pipes, bracket, percent, quotes, controls, wildcard characters or reserved DOS names",
+    "standardRowsCrossCheck": "exact bijections from custom inventory to File, Registry, Component and directory ownership; feature Main contains all components, Level 1, Attributes 0, Directory INSTALLDIR, parent NULL; only the Type1 guard and fixed Type51 ARP setter are custom actions; no authored DisableRollback action, services, Environment, Shortcut, RemoveRegistry, wildcard RemoveFile or deferred/external actions",
+    "staticRuntime": "inspect normal and delay PE imports of both entry points and guard; reject dynamic MSVC/UCRT imports under existing scripts/check-static-runtime.py policy, including api-ms-win-crt-*; guard import evidence is independently reconstructed",
+    "signing": "unsigned local artifact; checksums are not signatures; no publication"
+  },
+  "requiredHostedTests": [
+    "fresh install and exact resources", "explicit original-package repair with missing owned file/value",
+    "higher-version upgrade and old uninstall guard", "same-version distinct-build refusal", "downgrade refusal",
+    "uninstall including changed authored value refusal", "rollback after early predecessor removal",
+    "newly claimed foreign file/key/empty-key/value/shortcut refusal during upgrade",
+    "same ProductCode different PackageCode refusal", "preexisting portable marker refusal",
+    "running exe and running com refuse before transaction", "unknown siblings/subkeys survive",
+    "settings and recovery preserved", "x64 and ARM64 native64 HKCU keypaths",
+    "reparse/registry-link and effective-property override refusal", "static normal/delay imports",
+    "generated shortcut opens GUI and has no advertised repair"
+  ]
+}
