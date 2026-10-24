@@ -2,6 +2,9 @@
 
 A blazing fast plain text editor for GUI and terminal, written in Rust.
 
+Installation packaging is being prepared: see [one-line installation](docs/INSTALL.md)
+for its published-release requirements and platform dependencies.
+
 - Opens files of any size instantly (a 1 GB, 20M-line log shows its first screen in 0.1 ms).
 - One binary: a native window when a desktop is available, a terminal UI when not (`--gui` / `--tui` to force).
 - Built for remote desktops: no frame loop, no idle redraws, damage-only drawing and scrolling by copy.

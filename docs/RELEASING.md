@@ -1,5 +1,11 @@
 # Releasing Kwil
 
+Windows release entry points use a static C runtime and are checked for forbidden
+runtime DLL imports before upload. See [installation](INSTALL.md) for the
+one-line installers and exact platform dependency boundaries. Installer commands
+are not advertised as available until the scripts are on main and the owner has
+published a stable release with both Windows entry points and checksums.
+
 Every publication needs the owner's yes. Agents prepare releases; only the owner publishes them.
 
 ## Steps
