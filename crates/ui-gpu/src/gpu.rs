@@ -51,11 +51,6 @@ impl Shutdown {
             Err(error) => Err(format!("GPU retirement status unavailable: {error}")),
         }
     }
-
-    /// UI-safe, no join or wait. The fixed retirement thread enforces deadline.
-    pub fn try_status(&self) -> Option<ShutdownStatus> {
-        self.result.try_recv().ok()
-    }
 }
 
 struct Shared {
@@ -326,11 +321,6 @@ impl Gpu {
         })
     }
 
-    /// Headless harness compatibility. Interactive hosts use init_with_wake.
-    pub fn init() -> Result<Self, String> {
-        Self::init_with_wake(|_| {})
-    }
-
     /// MAIN/UI THREAD ONLY. Call after GpuReady, and again when replacing the
     /// window. Safe create_surface retains ArcWindow and satisfies Metal's
     /// main-thread requirement. The worker does every subsequent surface call.
@@ -389,9 +379,6 @@ impl Gpu {
             self.shared.owner.pause()
         }
     }
-    /// Windows callback compatibility; availability is released by the worker.
-    pub fn available(&mut self) {}
-
     /// UI: validate/admit/copy/try_send only. No driver/native surface calls,
     /// blocking channel send, mutex wait, readback, polling or joining.
     #[allow(clippy::too_many_arguments)]
@@ -462,6 +449,7 @@ impl Gpu {
         result
     }
 
+    #[cfg(feature = "frame-harness")]
     pub fn update(
         &mut self,
         pixels: &[u32],
@@ -476,6 +464,7 @@ impl Gpu {
 
     /// Legacy headless backing seam, now asynchronous with the same one-frame
     /// admission as present. Do not call it in addition to present for a frame.
+    #[cfg(feature = "frame-harness")]
     #[allow(clippy::too_many_arguments)]
     pub fn update_body(
         &mut self,
@@ -1103,19 +1092,6 @@ impl Backend {
     }
     /// Upload only new damage; preserve scroll pixels via two texture copies
     /// because overlapping self-copies are not valid WebGPU operations.
-    #[cfg_attr(not(feature = "frame-harness"), allow(dead_code))]
-    pub fn update(
-        &mut self,
-        pixels: &[u32],
-        size: (usize, usize),
-        rects: &[Rect],
-        scroll: i64,
-        cell_height: usize,
-        rows: usize,
-    ) -> bool {
-        self.update_body(pixels, size, rects, scroll, cell_height, rows, None)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn update_body(
         &mut self,
@@ -1326,6 +1302,18 @@ const BLIT: &str = r#"
     return textureLoad(backing, vec2<i32>(position.xy), 0);
 }
 "#;
+
+fn extent(w: usize, h: usize) -> wgpu::Extent3d {
+    wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 }
+}
+fn copy(texture: &wgpu::Texture, x: usize, y: usize) -> wgpu::TexelCopyTextureInfo<'_> {
+    wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 },
+        aspect: wgpu::TextureAspect::All,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1658,16 +1646,5 @@ mod tests {
         record_failure(&errors, "device lost".into());
         record_failure(&errors, "secondary validation error".into());
         assert_eq!(errors.lock().unwrap().as_deref(), Some("device lost"));
-    }
-}
-fn extent(w: usize, h: usize) -> wgpu::Extent3d {
-    wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 }
-}
-fn copy(texture: &wgpu::Texture, x: usize, y: usize) -> wgpu::TexelCopyTextureInfo<'_> {
-    wgpu::TexelCopyTextureInfo {
-        texture,
-        mip_level: 0,
-        origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 },
-        aspect: wgpu::TextureAspect::All,
     }
 }
