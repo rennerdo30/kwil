@@ -37,6 +37,8 @@ pub struct SnapshotImporter {
 impl SnapshotImporter {
     pub fn prepare(&self, source: &Snapshot, range: Range<u64>) -> io::Result<Snapshot> {
         source.check_range(&range)?;
+        piece_tree::recovery_cut(&source.root, range.start, &mut || Ok(()))?;
+        piece_tree::recovery_cut(&source.root, range.end, &mut || Ok(()))?;
         let full = range.start == 0 && range.end == source.len();
         let selected = if full {
             source.root.clone()
@@ -395,6 +397,17 @@ impl Buffer {
         count: u64,
     ) -> io::Result<Tree> {
         piece_tree::recovery_opaque(encoding, raw, offsets, count, &self.added)
+    }
+
+    pub(crate) fn recovery_preserved(
+        &self,
+        encoding: crate::encoding::Encoding,
+        bytes: &[u8],
+        raw: &[u8],
+        offsets: &[u8],
+        check: &mut impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Tree> {
+        piece_tree::recovery_preserved(encoding, bytes, raw, offsets, &self.added, check)
     }
 
     pub(crate) fn recovery_snapshot(root: Tree) -> Snapshot {
@@ -856,6 +869,53 @@ mod editing_contract_tests {
         let repeated = tiny.concat(&tiny).unwrap().concat(&tiny).unwrap();
         assert_eq!(repeated.retained_storage.bytes(), source.retained_storage.bytes());
         repeated.retained_storage.assert_matches_tree(&repeated.root);
+    }
+
+    #[test]
+    fn retained_storage_preserved_alias_slices_charge_each_payload_once() {
+        use crate::decoded_backing::{DecodedBacking, Interpretation};
+        use crate::encoding::Encoding;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "kwil-retained-alias-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let owner = DecodedBacking::prepare_from_reader(
+            &mut io::Cursor::new(b"\x88\x62Z"),
+            3,
+            Interpretation::new(Encoding::for_label("big5").unwrap(), 0).unwrap(),
+            &directory,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let foreign = Buffer::from_decoded(owner.snapshot());
+        let mut target = Buffer::with_add_memory_limit(31);
+        target.set_undo_memory_limit(0);
+        target.insert_snapshot_range(0, &foreign.snapshot(), 0..foreign.len()).unwrap();
+        drop(foreign);
+        assert!(owner.try_retire().is_ok());
+        let source = target.snapshot();
+        source.retained_storage.assert_matches_tree(&source.root);
+        let scalar = source.slice(2..4).unwrap();
+        let repeated = scalar.concat(&scalar).unwrap().concat(&scalar).unwrap();
+        assert_eq!(source.retained_storage.bytes(), scalar.retained_storage.bytes());
+        assert_eq!(source.retained_storage.bytes(), repeated.retained_storage.bytes());
+        assert!(source.retained_storage.bytes() >= 31);
+        repeated.retained_storage.assert_matches_tree(&repeated.root);
+        target.begin();
+        target.delete(0..4).unwrap();
+        target.snapshot.retained_storage.assert_matches_tree(&target.snapshot.root);
+        target.cancel();
+        target.snapshot.retained_storage.assert_matches_tree(&target.snapshot.root);
+        target.delete(0..target.len()).unwrap();
+        assert_eq!(target.snapshot.retained_storage.bytes(), 0);
+        assert_eq!(target.add_memory_bytes(), 31);
+        drop((source, scalar, repeated));
+        assert_eq!(target.add_memory_bytes(), 0);
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

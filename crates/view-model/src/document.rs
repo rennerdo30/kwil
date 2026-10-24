@@ -1,12 +1,21 @@
 //! Document identity and byte-preserving storage. Construction and save I/O
 //! belong on workers; the editor only mutates an already indexed buffer.
 
+use crate::hex_session::{Representation, Source};
 use kwil_core_text::{Buffer, Snapshot, TextFile};
 use kwil_core_text::{
     decoded_backing::DecodedSnapshot,
     encoding::{Encoding, SavePlan},
 };
 use std::{io, path::PathBuf};
+
+/// Incarnations never repeat when a revision is reused by undo or reopening.
+pub(crate) fn next_source_epoch() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| epoch.checked_add(1))
+        .expect("document source epoch exhausted")
+}
 
 /// Output encoding is independent of the immutable origins held by pieces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,6 +54,8 @@ pub struct Document {
     pub(crate) buffer: Buffer,
     pub(crate) original: Option<TextFile>,
     pub(crate) path: Option<PathBuf>,
+    pub(crate) representation: Representation,
+    pub(crate) source_epoch: u64,
     /// Output transport is independent of encoding and immutable decoded origins.
     /// Retained even when recovery cannot reattach a verified named original.
     pub compression: kwil_core_workspace::compressed::CompressionFormat,
@@ -68,6 +79,8 @@ impl Document {
             buffer: Buffer::empty(),
             original: None,
             path: None,
+            representation: Representation::DecodedText,
+            source_epoch: next_source_epoch(),
             compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
             encoding: DocumentEncoding::Utf8,
             bom: false,
@@ -89,6 +102,34 @@ impl Document {
     pub(crate) fn from_indexed_file(path: PathBuf, file: TextFile) -> io::Result<Self> {
         let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
         Self::attach(path, file, buffer)
+    }
+
+    /// Worker-only physical transport. Never sniff/decode/decompress these bytes.
+    pub(crate) fn from_raw_file(path: PathBuf, file: TextFile, epoch: u64) -> io::Result<Self> {
+        let buffer = Buffer::from_file(file.clone()).map_err(io::Error::other)?;
+        Ok(Self {
+            buffer,
+            original: Some(file),
+            path: Some(path),
+            representation: Representation::RawBytes,
+            source_epoch: epoch,
+            ..Self::new()
+        })
+    }
+
+    pub fn representation(&self) -> Representation {
+        self.representation
+    }
+
+    /// Scalar identity only; the frontend does not acquire a snapshot.
+    pub fn hex_source(&self, document: u64) -> Source {
+        Source {
+            document,
+            revision: self.revision,
+            epoch: self.source_epoch,
+            len: self.buffer.len(),
+            representation: self.representation,
+        }
     }
 
     /// Worker entry point for a prepared lossless logical backing. The worker

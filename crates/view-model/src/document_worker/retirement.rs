@@ -31,6 +31,7 @@ pub struct BackingLimits {
 }
 
 enum Resource {
+    Raw(TextFile),
     Owner(DecodedBacking),
     Cleanup(Box<BackingPaths>),
     Compressed(Box<CompressedSaveRetirement>),
@@ -120,6 +121,38 @@ impl WorkerBackings {
 
     pub fn retained(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    pub(super) fn retain_raw(&mut self, file: &TextFile) -> io::Result<()> {
+        self.check_input_path(file.path(), 0)?;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "raw source backing capacity retained"))?;
+        *slot = Some(Resource::Raw(file.clone()));
+        Ok(())
+    }
+
+    pub(super) fn open_raw(
+        &mut self,
+        document: kwil_core_workspace::session::DocumentId,
+        path: PathBuf,
+        rows: usize,
+        generation: u64,
+        cancel: &AtomicBool,
+        publish: impl FnOnce(crate::hex_session::Page),
+    ) -> io::Result<Document> {
+        let path = std::path::absolute(&path)?;
+        self.check_input_path(&path, 0)?;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "raw source backing capacity retained"))?;
+        let document = super::hex_runtime::open(document, path, rows, generation, cancel, publish)?;
+        *slot = Some(Resource::Raw(document.original.as_ref().expect("raw named original").clone()));
+        Ok(document)
     }
 
     fn check_input_path(&self, path: &Path, suffix: usize) -> io::Result<()> {
@@ -324,6 +357,30 @@ impl WorkerBackings {
         })
     }
 
+    /// Explicit physical-byte output. In particular, a gzip magic prefix is
+    /// data here and must not enter encoded/compressed checkpoint preparation.
+    pub fn save_raw(&mut self, mut request: SaveRequest, cancel: &AtomicBool) -> io::Result<SavedSnapshot> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        request.path = std::path::absolute(&request.path)?;
+        self.check_input_path(&request.path, 0)?;
+        self.check_input_path(request.path.parent().ok_or_else(|| invalid("save destination has no parent"))?, 64)?;
+        if let Some(original) = &request.original {
+            self.check_input_path(original.path(), 0)?;
+        }
+        request.trim_trailing_whitespace = false;
+        request.compression = CompressionFormat::Raw;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "raw save checkpoint capacity retained"))?;
+        let saved = kwil_core_workspace::save_snapshot(request)?;
+        *slot = Some(Resource::Raw(saved.file.clone()));
+        Ok(saved)
+    }
+
     /// One bounded pass, requested by the document worker after releasing old
     /// receipts/plans. Live owners do not cause a timer, spin, or idle wake.
     pub fn retire(&mut self) -> RetirementReport {
@@ -331,6 +388,16 @@ impl WorkerBackings {
         for slot in &mut self.slots {
             let Some(resource) = slot.take() else { continue };
             let resource = match resource {
+                Resource::Raw(file) => {
+                    match file.try_close() {
+                        Ok(()) => report.retired += 1,
+                        Err(file) => {
+                            report.live += 1;
+                            *slot = Some(Resource::Raw(file));
+                        }
+                    }
+                    continue;
+                }
                 Resource::Compressed(owners) => {
                     match owners.retry() {
                         Ok(()) => report.retired += 1,
@@ -360,6 +427,7 @@ impl WorkerBackings {
                 Resource::Owner(owner) => owner.try_retire(),
                 Resource::Cleanup(paths) => paths.cleanup().map_err(|error| RetirementError::Cleanup { paths, error }),
                 Resource::Compressed(_) => unreachable!(),
+                Resource::Raw(_) => unreachable!(),
             };
             match outcome {
                 Ok(()) => report.retired += 1,

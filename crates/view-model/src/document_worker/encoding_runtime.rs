@@ -95,6 +95,18 @@ impl EncodingRuntime {
         self.backings.open(path, file, interpretation, cancel, publish)
     }
 
+    pub(super) fn open_raw(
+        &mut self,
+        document: kwil_core_workspace::session::DocumentId,
+        path: PathBuf,
+        rows: usize,
+        generation: u64,
+        cancel: &AtomicBool,
+        publish: impl FnOnce(crate::hex_session::Page),
+    ) -> io::Result<Document> {
+        self.backings.open_raw(document, path, rows, generation, cancel, publish)
+    }
+
     pub(super) fn save(
         &mut self,
         request: SaveRequest,
@@ -119,6 +131,10 @@ impl EncodingRuntime {
         // Logical normalization is explicitly flagged in SavedSnapshot, even
         // when lengths agree. The model installs it as an undoable transaction.
         Ok(completed.saved)
+    }
+
+    pub(super) fn save_raw(&mut self, request: SaveRequest, cancel: &AtomicBool) -> io::Result<SavedSnapshot> {
+        self.backings.save_raw(request, cancel)
     }
 
     pub(super) fn retire(&mut self) -> RetirementReport {
@@ -216,6 +232,11 @@ impl EncodingRuntime {
             let buffer = recovery.take_buffer(cancel)?;
             let mut document = Document::new();
             document.buffer = buffer;
+            document.representation = if policy.raw_bytes {
+                crate::hex_session::Representation::RawBytes
+            } else {
+                crate::hex_session::Representation::DecodedText
+            };
             document.encoding = if policy.encoding == Encoding::UTF8 {
                 crate::DocumentEncoding::Utf8
             } else {
@@ -243,6 +264,9 @@ impl EncodingRuntime {
                     kwil_core_workspace::open_for_editing(path)
                         .ok()
                         .filter(|file| {
+                            if policy.raw_bytes {
+                                return matches_physical(&document.snapshot(), file, cancel).unwrap_or(false);
+                            }
                             self.backings
                                 .verify_source(file, policy.compression, cancel, |body| {
                                     matches_raw(&document.snapshot(), document.save_plan(), body, cancel)
@@ -258,6 +282,9 @@ impl EncodingRuntime {
                 return Err(io::ErrorKind::Interrupted.into());
             }
             if let Some((path, file)) = verified {
+                if policy.raw_bytes {
+                    self.backings.retain_raw(&file)?;
+                }
                 document.path = Some(path);
                 document.original = Some(file);
                 document.saved_revision = revision;
@@ -315,7 +342,17 @@ fn matches_raw(
 }
 
 pub(crate) fn document_policy(document: &Document) -> RecoveryPolicy {
+    if document.representation == crate::hex_session::Representation::RawBytes {
+        return RecoveryPolicy {
+            raw_bytes: true,
+            encoding: Encoding::UTF8,
+            bom: false,
+            compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+            preferred_ending: LineEnding::Lf,
+        };
+    }
     RecoveryPolicy {
+        raw_bytes: false,
         encoding: document.encoding.encoding(),
         bom: document.bom,
         compression: document.compression,
@@ -324,4 +361,25 @@ pub(crate) fn document_policy(document: &Document) -> RecoveryPolicy {
             DocumentLineEnding::CrLf => LineEnding::CrLf,
         },
     }
+}
+
+/// Compare physical bytes directly, including BOM, malformed UTF-8 and gzip
+/// headers. Text encoders would change opaque/non-UTF8 atoms during recovery.
+fn matches_physical(snapshot: &kwil_core_text::Snapshot, file: &TextFile, cancel: &AtomicBool) -> io::Result<bool> {
+    if snapshot.len() != file.len() || file.check()? != kwil_core_text::FileState::Unchanged {
+        return Ok(false);
+    }
+    let mut offset = 0usize;
+    for chunk in snapshot.chunks(0..snapshot.len())? {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let chunk = chunk.map_err(io::Error::other)?;
+        let bytes = file.bytes().map_err(io::Error::other)?;
+        if bytes.get(offset..offset + chunk.len()) != Some(chunk) {
+            return Ok(false);
+        }
+        offset += chunk.len();
+    }
+    Ok(file.check()? == kwil_core_text::FileState::Unchanged)
 }

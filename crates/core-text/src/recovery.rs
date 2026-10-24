@@ -363,6 +363,34 @@ impl RecoveryRevision<'_> {
         self.checked(result)
     }
 
+    /// Detached valid text with exact noncanonical source bytes. Admission
+    /// includes the temporary rebased endpoint table as well as all payloads.
+    pub fn append_preserved(
+        &mut self,
+        encoding: Encoding,
+        bytes: &[u8],
+        raw: &[u8],
+        endpoints_le: &[u8],
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let result = (|| {
+            self.ready()?;
+            poll(&mut cancelled)?;
+            let fragment = self.fragment()?;
+            piece_tree::validate_recovery_preserved(encoding, bytes, raw, endpoints_le, &mut || poll(&mut cancelled))?;
+            length(fragment).checked_add(bytes.len() as u64).ok_or_else(overflow)?;
+            let usage = self.reserve(1, 3, sum(&[tree_work(fragment)?, block_work(3)?, endpoints_le.len()])?)?;
+            let tree = self
+                .assembler
+                .buffer
+                .recovery_preserved(encoding, bytes, raw, endpoints_le, &mut || poll(&mut cancelled))?;
+            poll(&mut cancelled)?;
+            self.appended(tree, usage);
+            Ok(())
+        })();
+        self.checked(result)
+    }
+
     /// Apply the complete fragment in the CURRENT staged coordinates. Repeated
     /// replacements form one atomic revision, with no replay undo history.
     pub fn replace(&mut self, range: Range<u64>, mut cancelled: impl FnMut() -> bool) -> io::Result<()> {

@@ -39,6 +39,9 @@ pub trait CapsuleSink {
         endpoints_le: &[u8],
         logical_count: u64,
     ) -> io::Result<()>;
+    fn append_preserved(&mut self, _encoding: Encoding, _bytes: &[u8], _raw: &[u8], _table: &[u8]) -> io::Result<()> {
+        Err(invalid("preserved provenance sink is unavailable"))
+    }
     fn end_fragment(&mut self, logical_len: u64) -> io::Result<()>;
     fn abort(&mut self);
 }
@@ -167,8 +170,9 @@ fn decode_inner(
     }
     let mut input = input.take(physical_len);
     let header = number::<16>(&mut input, cancel)?;
+    let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
     if &header[..4] != b"KWCP"
-        || u16::from_le_bytes(header[4..6].try_into().unwrap()) != CAPSULE_VERSION
+        || !matches!(version, 1 | CAPSULE_VERSION)
         || header[6..8] != [0, 0]
         || u64::from_le_bytes(header[8..].try_into().unwrap()) != expected
     {
@@ -274,6 +278,35 @@ fn decode_inner(
                     return Err(invalid("opaque final endpoint mismatch"));
                 }
                 sink.append_opaque(encoding, &raw, &table, count)?;
+            }
+            5 if version >= 2 => {
+                let label_len = u16::from_le_bytes(number(&mut input, cancel)?);
+                let logical_len = u64_(&mut input, cancel)?;
+                let raw_len = u64_(&mut input, cancel)?;
+                let table_len = u64_(&mut input, cancel)?;
+                if logical_len == 0
+                    || logical_len > MAX_READ_BYTES as u64
+                    || raw_len == 0
+                    || raw_len > MAX_READ_BYTES as u64
+                    || table_len > MAX_READ_BYTES as u64
+                    || logical_len.checked_add(1).and_then(|n| n.checked_mul(4)) != Some(table_len)
+                {
+                    return Err(invalid("invalid preserved block bounds"));
+                }
+                contribution(&mut total, logical_len, expected)?;
+                let encoding = label(&mut input, label_len, cancel)?;
+                let payload_len = logical_len
+                    .checked_add(raw_len)
+                    .and_then(|n| n.checked_add(table_len))
+                    .ok_or_else(|| invalid("preserved payload overflow"))?;
+                if payload_len > input.limit() {
+                    return Err(invalid("preserved payload exceeds capsule"));
+                }
+                let bytes = bounded_bytes(&mut input, logical_len as usize, cancel)?;
+                let raw = bounded_bytes(&mut input, raw_len as usize, cancel)?;
+                let table = bounded_bytes(&mut input, table_len as usize, cancel)?;
+                super::validate_preserved(&bytes, &raw, &table)?;
+                sink.append_preserved(encoding, &bytes, &raw, &table)?;
             }
             _ => return Err(invalid("unknown capsule record")),
         }

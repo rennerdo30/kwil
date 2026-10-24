@@ -689,6 +689,18 @@ impl CapsuleSink for ReplayRevision<'_> {
         })();
         self.checked(result)
     }
+    fn append_preserved(&mut self, encoding: Encoding, bytes: &[u8], raw: &[u8], table: &[u8]) -> io::Result<()> {
+        let result = (|| {
+            self.building()?;
+            let logical = self.next_logical(bytes.len() as u64)?;
+            self.flush_text()?;
+            let cancel = self.cancel;
+            self.core()?.append_preserved(encoding, bytes, raw, table, || cancelled(cancel))?;
+            self.logical = logical;
+            Ok(())
+        })();
+        self.checked(result)
+    }
     fn end_fragment(&mut self, logical_len: u64) -> io::Result<()> {
         let result = (|| {
             self.building()?;
@@ -865,6 +877,31 @@ mod tests {
         }
         bytes.push(0);
         Capsule { bytes, logical: (records * width) as u64 }
+    }
+
+    #[test]
+    fn ordinary_alias_capsule_replays_exact_bytes_after_source_retirement() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("Big5").unwrap();
+        let origin = fixture.origin(b"\x88\x62Z", encoding, 0);
+        let source = Buffer::from_decoded(origin).snapshot();
+        let mut imported = Buffer::empty();
+        imported.insert_snapshot_range(0, &source, 0..source.len()).unwrap();
+        drop(source);
+        for owner in fixture.owners.borrow_mut().drain(..) {
+            assert!(owner.try_retire().is_ok(), "ordinary import must detach raw source ownership");
+        }
+        let snapshot = imported.snapshot();
+        assert_eq!(saved(&snapshot, encoding, false), b"\x88\x62Z");
+        let packet = capsule(&mut registry(), snapshot.clone(), 0..snapshot.len());
+        assert_eq!(u16::from_le_bytes(packet.bytes[4..6].try_into().unwrap()), 2);
+        drop(snapshot);
+        drop(imported);
+        let mut state = fixture.state();
+        accepted(&mut state, &packet, 0..0);
+        assert_eq!(saved(&state.snapshot().unwrap(), encoding, false), b"\x88\x62Z");
+        state.abandon().unwrap();
+        fixture.assert_empty();
     }
 
     #[test]

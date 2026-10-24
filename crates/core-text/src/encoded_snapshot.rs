@@ -165,6 +165,42 @@ fn decoded(
     Ok(())
 }
 
+fn preserved(
+    encoding: crate::encoding::Encoding,
+    bytes: &[u8],
+    raw_bytes: &[u8],
+    raw_offsets: &[u8],
+    output: &mut TextOutput<'_, impl Write>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<(), EncodingError> {
+    poll(cancelled)?;
+    let valid = std::str::from_utf8(bytes).map_err(|_| EncodingError::MalformedSource)?;
+    if output.plan.encoding != encoding {
+        return output.feed(valid);
+    }
+    if output.plan.line_ending.is_none() {
+        return raw(output, raw_bytes, cancelled);
+    }
+    let offset = |at: usize| u32::from_le_bytes(raw_offsets[at * 4..at * 4 + 4].try_into().unwrap()) as usize;
+    let base = offset(0);
+    let mut first = 0;
+    // Newline scalars always have exact atom endpoints, even if an adjacent
+    // legacy atom decodes to several scalars. Never inspect raw byte values
+    // to guess whether a legacy trail byte is a newline.
+    for at in memchr::memchr2_iter(b'\r', b'\n', bytes) {
+        poll(cancelled)?;
+        if first < at {
+            raw(output, &raw_bytes[offset(first) - base..offset(at) - base], cancelled)?;
+        }
+        text(output, &bytes[at..at + 1])?;
+        first = at + 1;
+    }
+    if first < bytes.len() {
+        raw(output, &raw_bytes[offset(first) - base..offset(bytes.len()) - base], cancelled)?;
+    }
+    Ok(())
+}
+
 fn stream(
     snapshot: &Snapshot,
     plan: SavePlan,
@@ -193,6 +229,10 @@ fn stream(
                     return Err(EncodingError::MalformedSource);
                 }
                 raw(&mut output, raw_bytes, cancelled)?;
+            }
+            SourceChunk::Preserved { encoding, bytes, raw_bytes, raw_offsets } => {
+                input.finish()?;
+                preserved(encoding, bytes, raw_bytes, raw_offsets, &mut output, cancelled)?;
             }
             SourceChunk::Original { bytes, .. } | SourceChunk::Added(bytes) => {
                 for chunk in bytes.chunks(16 << 10) {
@@ -818,6 +858,257 @@ mod tests {
         assert_eq!(target.add_memory_bytes(), snapshot.len() as usize, "external snapshot retains capped blocks");
         drop(snapshot);
         assert_eq!(target.add_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn ordinary_import_big5_alias_survives_foreign_retirement_and_charges_all_payloads() {
+        let encoding = Encoding::for_label("big5").unwrap();
+        for (limit, resident, spills) in [(0, 0, 3), (1, 0, 3), (8, 7, 1), (31, 31, 0)] {
+            let fixture = Fixture::new();
+            let source = fixture.decoded(b"\x88\x62Z", encoding, 0);
+            let mut target = Buffer::with_add_memory_limit(limit);
+            target.set_undo_memory_limit(0);
+            let prepared = target.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
+            assert_eq!(target.add_memory_bytes(), resident, "logical 5 + raw 2 + six u32 endpoints");
+            assert_eq!(prepared.storage_resources().blocks, 3);
+            assert_eq!(prepared.storage_resources().spilled_blocks, spills);
+            target.insert_snapshot_range(0, &prepared, 0..prepared.len()).unwrap();
+            assert!(Arc::ptr_eq(target.snapshot().root.as_ref().unwrap(), prepared.root.as_ref().unwrap()));
+            assert_eq!(target.add_memory_bytes(), resident, "inserting prepared storage must not recharge it");
+            drop(source);
+            assert!(fixture.owners.borrow_mut().pop().unwrap().try_retire().is_ok());
+            let snapshot = target.snapshot();
+            assert!(snapshot.originals.is_empty(), "no foreign origin or whole-source pin survives");
+            assert_eq!(saved(&snapshot, plan(encoding, false)), b"\x88\x62Z");
+            assert_eq!(saved(&snapshot, plan(Encoding::UTF8, false)), "Ê\u{304}Z".as_bytes());
+            assert_eq!(saved(&snapshot, plan(Encoding::UTF16_LE, false)), encode("Ê\u{304}Z", Encoding::UTF16_LE));
+            let chunks: Vec<_> = snapshot.source_chunks(0..snapshot.len()).unwrap().map(Result::unwrap).collect();
+            let SourceChunk::Preserved { bytes, raw_bytes, raw_offsets, .. } = &chunks[0] else {
+                panic!("valid alias must retain typed valid provenance");
+            };
+            assert_eq!(*bytes, "Ê\u{304}".as_bytes());
+            assert_eq!(*raw_bytes, b"\x88\x62");
+            let entries: Vec<_> =
+                raw_offsets.as_chunks::<4>().0.iter().map(|entry| u32::from_le_bytes(*entry)).collect();
+            assert_eq!(entries, [0, 1 << 31, 1 << 31, 1 << 31, 2]);
+            assert!(matches!(&chunks[1], SourceChunk::Added(bytes) if *bytes == b"Z"));
+            target.delete(0..target.len()).unwrap();
+            drop(prepared);
+            assert_eq!(target.add_memory_bytes(), resident, "external snapshot owns all three payloads");
+            drop(chunks);
+            drop(snapshot);
+            assert_eq!(target.add_memory_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn ordinary_import_alias_partial_scalars_and_foreign_reimport_never_borrow_raw_endpoints() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        let source = fixture.decoded(b"\x88\x62Z", encoding, 0);
+        let owner = Buffer::with_add_memory_limit(128);
+        let imported = owner.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
+        for source in [source.snapshot(), imported.clone()] {
+            for range in [0..2, 2..4, 2..5] {
+                let target = Buffer::with_add_memory_limit(0);
+                let partial = target.snapshot_importer().prepare(&source, range.clone()).unwrap();
+                let expected = &"Ê\u{304}Z".as_bytes()[range.start as usize..range.end as usize];
+                assert_eq!(saved(&partial, plan(Encoding::UTF8, false)), expected);
+                assert!(
+                    partial
+                        .source_chunks(0..partial.len())
+                        .unwrap()
+                        .all(|chunk| matches!(chunk.unwrap(), SourceChunk::Added(_)))
+                );
+                let mut writer = Untouched::default();
+                assert!(matches!(
+                    write_snapshot(&partial, plan(encoding, false), &mut writer),
+                    Err(EncodingError::Unmappable { .. })
+                ));
+                assert_eq!(writer.calls, 0);
+            }
+            for range in [1..4, 0..3] {
+                let target = Buffer::with_add_memory_limit(0);
+                assert!(target.snapshot_importer().prepare(&source, range).is_err());
+                assert_eq!(target.add_memory_bytes(), 0);
+            }
+        }
+        let second = Buffer::with_add_memory_limit(0);
+        let reimported = second.snapshot_importer().prepare(&imported, 0..imported.len()).unwrap();
+        drop((source, imported));
+        assert!(fixture.owners.borrow_mut().pop().unwrap().try_retire().is_ok());
+        assert_eq!(saved(&reimported, plan(encoding, false)), b"\x88\x62Z");
+        // Slicing a destination block must obey the same partial-atom rule.
+        assert_eq!(saved(&reimported.slice(2..4).unwrap(), plan(Encoding::UTF8, false)), "\u{304}".as_bytes());
+        let mut writer = Untouched::default();
+        assert!(matches!(
+            write_snapshot(&reimported.slice(2..4).unwrap(), plan(encoding, false), &mut writer),
+            Err(EncodingError::Unmappable { .. })
+        ));
+        assert_eq!(writer.calls, 0);
+    }
+
+    #[test]
+    fn ordinary_import_alias_malformed_and_newlines_keep_independent_contracts() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        let source = fixture.decoded(b"\x88\x62\r\n\xffZ", encoding, 0);
+        let mut target = Buffer::with_add_memory_limit(0);
+        target.set_undo_memory_limit(0);
+        target.insert_snapshot_range(0, &source.snapshot(), 0..source.len()).unwrap();
+        drop(source);
+        assert!(fixture.owners.borrow_mut().pop().unwrap().try_retire().is_ok());
+        let snapshot = target.snapshot();
+        assert_eq!(saved(&snapshot, plan(encoding, false)), b"\x88\x62\r\n\xffZ");
+        let mut normalized = plan(encoding, false);
+        normalized.line_ending = Some(LineEnding::Lf);
+        assert_eq!(saved(&snapshot, normalized), b"\x88\x62\n\xffZ");
+        let mut writer = Untouched::default();
+        assert!(matches!(
+            write_snapshot(&snapshot, plan(Encoding::UTF8, false), &mut writer),
+            Err(EncodingError::MalformedSource)
+        ));
+        assert_eq!(writer.calls, 0);
+        assert_eq!(target.line_count(), 2);
+        assert_eq!(target.line_start(1).unwrap(), Some(6));
+        target.begin();
+        target.delete(0..4).unwrap();
+        target.cancel();
+        assert_eq!(saved(&target.snapshot(), plan(encoding, false)), b"\x88\x62\r\n\xffZ");
+    }
+
+    #[test]
+    fn ordinary_import_alias_blocks_bound_payloads_and_explicit_retirement() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        let raw = b"\x88\x62".repeat(4096);
+        let source = fixture.decoded(&raw, encoding, 0);
+        let target = Buffer::with_add_memory_limit(0);
+        let snapshot = target.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
+        let paths = crate::piece_tree::spill_paths(&snapshot.root);
+        assert_eq!(snapshot.storage_resources().blocks, 6, "atom packing leaves no split alias at the table boundary");
+        assert_eq!(paths.len(), 6);
+        for chunk in snapshot.source_chunks(0..snapshot.len()).unwrap() {
+            let SourceChunk::Preserved { bytes, raw_bytes, raw_offsets, .. } = chunk.unwrap() else {
+                panic!("alias lost");
+            };
+            assert!(bytes.len() < 16384 && raw_bytes.len() <= 65536 && raw_offsets.len() <= 65536);
+            assert_eq!(raw_offsets.len(), (bytes.len() + 1) * 4);
+        }
+        drop(source);
+        assert!(fixture.owners.borrow_mut().pop().unwrap().try_retire().is_ok());
+        assert_eq!(saved(&snapshot, plan(encoding, false)), raw);
+        let limits =
+            crate::SpillRetirementLimits { max_block_references: 6, max_metadata_bytes: 1 << 20, max_path_bytes: 4096 };
+        assert!(
+            matches!(snapshot.retain_spills(limits, || true), Err(error) if error.kind() == io::ErrorKind::Interrupted)
+        );
+        let mut retirement = snapshot.retain_spills(limits, || false).unwrap();
+        assert_eq!(retirement.retire().live, 6);
+        drop(snapshot);
+        assert!(paths.iter().all(|path| path.exists()), "last snapshot drop cannot unlink explicitly leased payloads");
+        let report = retirement.retire();
+        assert_eq!((report.retired, report.live, report.cleanup_pending), (6, 0, 0));
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn ordinary_import_alias_save_preflight_stays_cancellable() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        let source = fixture.decoded(b"\x88\x62Z", encoding, 0);
+        let target = Buffer::with_add_memory_limit(0);
+        let snapshot = target.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
+        for target_encoding in [encoding, Encoding::UTF8] {
+            let mut writer = Untouched::default();
+            let mut polls = 0;
+            assert!(matches!(
+                write_snapshot_cancellable(&snapshot, plan(target_encoding, false), &mut writer, || {
+                    polls += 1;
+                    polls == 3
+                }),
+                Err(EncodingError::Cancelled)
+            ));
+            assert_eq!(writer.calls, 0);
+        }
+    }
+
+    #[test]
+    fn ordinary_import_alias_legacy_encoded_file_refuses_typed_valid_source() {
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        let source = fixture.decoded(b"\x88\x62Z", encoding, 0);
+        let target = Buffer::with_add_memory_limit(0);
+        let imported = target.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
+        let path = fixture.directory.join("legacy-raw-api");
+        std::fs::write(&path, b"plain").unwrap();
+        let old = crate::encoding::EncodedFile::new(TextFile::open(&path).unwrap()).unwrap();
+        let mut writer = Untouched::default();
+        assert!(matches!(old.write_to(&imported, old.save_plan(), &mut writer), Err(EncodingError::WrongSource)));
+        assert_eq!(writer.calls, 0);
+    }
+
+    #[test]
+    fn ordinary_alias_reimport_into_tracked_worker_keeps_capacity_and_retirement() {
+        use crate::worker_edit::{WorkerDepotLimits, WorkerEditDepot, WorkerEditPlan};
+        let fixture = Fixture::new();
+        let encoding = Encoding::for_label("big5").unwrap();
+        let source = fixture.decoded(b"\x88\x62Z", encoding, 0);
+        let first = Buffer::with_add_memory_limit(128);
+        let ordinary = first.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
+        drop(source);
+        assert!(fixture.owners.borrow_mut().pop().unwrap().try_retire().is_ok());
+        for mode in 0..3 {
+            let target = Buffer::with_add_memory_limit(0);
+            let mut depot =
+                WorkerEditDepot::new(WorkerDepotLimits { disk_bytes: 4 << 20, metadata_bytes: 8 << 20, slots: 1 })
+                    .unwrap();
+            let baseline = depot.usage();
+            let admission_plan = WorkerEditPlan {
+                disk_bytes: 1 << 20,
+                recipe_bytes: 0,
+                metadata_bytes: 4 << 20,
+                max_new_blocks: if mode == 1 { 2 } else { 3 },
+                max_certificates: 8,
+                max_tree_nodes: 128,
+                max_path_bytes: 4096,
+            };
+            let admission = depot.admit(admission_plan).unwrap();
+            let cancel = AtomicBool::new(false);
+            let mut op = target
+                .worker_edit_seed()
+                .unwrap()
+                .begin(admission, &mut depot, &cancel)
+                .map_err(|refusal| refusal.error)
+                .unwrap();
+            if mode == 2 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            let result = op.import(&ordinary, 0..ordinary.len(), &cancel);
+            if mode == 0 {
+                let imported = result.unwrap();
+                let paths = crate::piece_tree::spill_paths(&imported.root);
+                assert_eq!(paths.len(), 3);
+                assert_eq!(target.add_memory_bytes(), 0);
+                let (token, resources) = op.seal(imported.clone(), &cancel).unwrap();
+                assert_eq!(saved(token.snapshot(), plan(encoding, false)), b"\x88\x62Z");
+                let resources = resources.try_retire(&mut depot).err().expect("live token holds cleanup authority");
+                drop((imported, token, op));
+                assert!(resources.try_retire(&mut depot).is_ok());
+                assert!(paths.iter().all(|path| !path.exists()));
+            } else {
+                assert_eq!(
+                    result.err().unwrap().kind(),
+                    if mode == 1 { io::ErrorKind::WouldBlock } else { io::ErrorKind::Interrupted }
+                );
+                assert!(op.reserve(0, 0).is_err(), "failed/cancelled import stays poisoned");
+                let resources = op.rollback();
+                drop(op);
+                assert!(resources.try_retire(&mut depot).is_ok());
+            }
+            assert_eq!(depot.usage(), baseline, "all disk and metadata reservations return exactly");
+            assert!(depot.try_close().is_ok());
+        }
     }
 
     #[test]

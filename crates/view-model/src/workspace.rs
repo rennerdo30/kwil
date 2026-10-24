@@ -10,6 +10,10 @@ use std::{
     path::PathBuf,
 };
 
+#[path = "workspace_hex.rs"]
+mod workspace_hex;
+use workspace_hex::HexFlow;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TabArea {
     pub x: usize,
@@ -145,6 +149,7 @@ struct FileFlow {
 }
 
 pub struct Workspace {
+    hex: HexFlow,
     input_epoch: u64,
     editor_settings: Option<kwil_core_commands::Settings>,
     // Tab.path tracks named destinations; recovery_path is display-only context.
@@ -158,6 +163,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(view: View) -> io::Result<Self> {
         let mut workspace = Self {
+            hex: HexFlow::default(),
             input_epoch: 0,
             editor_settings: None,
             session: Session::default(),
@@ -197,7 +203,7 @@ impl Workspace {
     /// editing, layout reloads and save/close actions for this target while true.
     /// Other tabs remain available. No new event or export is required.
     pub fn document_busy(&self, id: DocumentId) -> bool {
-        self.files.loans.contains_key(&id)
+        self.files.loans.contains_key(&id) || self.hex.busy(id)
     }
 
     pub fn replacement_busy(&self) -> bool {
@@ -209,13 +215,16 @@ impl Workspace {
     }
 
     pub fn search_replacement_pending(&self) -> bool {
-        !self.files.loans.is_empty()
+        !self.files.loans.is_empty() || !self.hex.loans.is_empty() || self.hex.opening()
     }
 
     /// O(1) UI admission. Recipe validation, iteration and edits run on the
     /// existing fixed worker; queue rejection restores the exact editor.
     pub fn submit_search_replacement(&mut self, recipe: kwil_core_search::worker::ReplaceRecipe) -> io::Result<()> {
         let id = DocumentId(recipe.key.document_id);
+        if self.hex_owns_document(id) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Text replacement is unavailable in hex view"));
+        }
         if self.files.preparing
             || self.files.deferred_recovery.is_some()
             || !self.files.storage_ready
@@ -416,7 +425,7 @@ impl Workspace {
                 })
                 .map(|tab| tab.id)
         {
-            self.session.activate(id);
+            self.activate(id);
             return Ok(id);
         }
         if let Some(settings) = &self.editor_settings
@@ -424,7 +433,14 @@ impl Workspace {
         {
             editor.settings = settings.clone();
         }
+        let previous = self.session.active();
         let id = self.session.open(view.path.clone())?;
+        if previous != self.session.active() {
+            self.input_epoch = self.input_epoch.wrapping_add(1);
+            if let Some(previous) = previous {
+                self.cancel_hex_input_for(previous);
+            }
+        }
         // Reopening an already-open path activates its existing unsaved view.
         self.views.entry(id).or_insert(view);
         self.refresh_save_destinations();
@@ -453,6 +469,10 @@ impl Workspace {
         let activated = self.session.activate(id);
         if activated && previous != self.session.active() {
             self.input_epoch = self.input_epoch.wrapping_add(1);
+            if let Some(previous) = previous {
+                self.cancel_hex_input_for(previous);
+            }
+            self.cancel_hex_input_for(id);
         }
         activated
     }
@@ -463,13 +483,17 @@ impl Workspace {
         let tabs = self.session.tabs();
         let current = tabs.iter().position(|tab| tab.id == self.active_id()).unwrap_or(0);
         let next = if backwards { (current + tabs.len() - 1) % tabs.len() } else { (current + 1) % tabs.len() };
-        self.session.activate(tabs[next].id);
+        let target = tabs[next].id;
+        self.activate(target);
         self.checkpoint_session();
         Damage { full: true, status: true, ..Default::default() }
     }
 
     /// Refuse dirty close until the caller saves or explicitly chooses discard.
     pub fn close(&mut self, id: DocumentId, discard: bool) -> io::Result<bool> {
+        if self.files.queue.len() >= 254 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Recovery queue must drain before closing"));
+        }
         if self.document_busy(id)
             || self
                 .views
@@ -525,9 +549,12 @@ impl Workspace {
             self.input_epoch = self.input_epoch.wrapping_add(1);
             self.closed_views.insert(id, view);
         }
+        self.cancel_hex_input_for(id);
         self.files.failed_opens.remove(&id);
         self.files.queue.retain(|request| !matches!(request, DocumentRequest::Open { document, .. } | DocumentRequest::Index { document, .. } if *document == id));
+        self.retire_closed_hex_editors();
         self.closed_views.retain(|id, _| self.session.closed().iter().any(|tab| tab.id == *id));
+        self.retain_hex_history();
         let generation = self.files.observed.remove(&id).map_or(0, |(_, generation)| generation);
         self.files.observed.retain(|id, _| self.views.contains_key(id) || self.closed_views.contains_key(id));
         self.files.seeded.retain(|id| self.views.contains_key(id) || self.closed_views.contains_key(id));
@@ -631,6 +658,7 @@ impl Workspace {
 
     pub fn sync_active(&mut self) {
         let id = self.active_id();
+        let hex_navigation = self.hex_navigation(id);
         let Some(view) = self.views.get(&id) else { return };
         if let Some(tab) = self.session.tab_mut(id) {
             sync_tab_path(tab, &view.path);
@@ -642,11 +670,18 @@ impl Workspace {
                 tab.cursor = editor.primary_cursor().head;
                 tab.anchor = editor.primary_cursor().anchor;
             }
+            if let Some((cursor, anchor, top)) = hex_navigation {
+                tab.cursor = cursor;
+                tab.anchor = anchor;
+                tab.first_visible_line = top;
+                tab.first_byte_column = 0;
+            }
         }
     }
 
     pub fn sync_all(&mut self) {
         for tab in self.session.tabs().iter().map(|t| t.id).collect::<Vec<_>>() {
+            let hex_navigation = self.hex_navigation(tab);
             if let (Some(view), Some(metadata)) = (self.views.get(&tab), self.session.tab_mut(tab)) {
                 sync_tab_path(metadata, &view.path);
                 metadata.first_visible_line = view.top();
@@ -656,6 +691,12 @@ impl Workspace {
                     metadata.saved_revision = editor.document().saved_revision();
                     metadata.cursor = editor.primary_cursor().head;
                     metadata.anchor = editor.primary_cursor().anchor;
+                }
+                if let Some((cursor, anchor, top)) = hex_navigation {
+                    metadata.cursor = cursor;
+                    metadata.anchor = anchor;
+                    metadata.first_visible_line = top;
+                    metadata.first_byte_column = 0;
                 }
             }
         }
@@ -729,12 +770,21 @@ impl Workspace {
                     break;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(request)) => {
+                    if matches!(&*request, DocumentRequest::DiscardHex { .. }) {
+                        // Never destroy the last raw Editor/undo root on the UI
+                        // merely because its disposal lane disconnected.
+                        self.files.queue.push_front(*request);
+                        self.cancel_close_intent();
+                        self.set_notice("Raw history disposal awaits the document worker".into());
+                        break;
+                    }
                     if let DocumentRequest::ValidateReopen { document, generation, .. } = &*request
                         && self.files.reopen == Some((*document, *generation))
                     {
                         self.files.reopen = None;
                     }
-                    if let DocumentRequest::Save { document, .. } = *request {
+                    if let DocumentRequest::Save { document, .. } | DocumentRequest::SaveRaw { document, .. } = *request
+                    {
                         self.files.saves.remove(&document);
                         if let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut) {
                             let _ = editor.finish_save(Err(io::Error::other("document worker disconnected")));
@@ -749,6 +799,9 @@ impl Workspace {
 
     /// Cheap metadata snapshot. Coalesce writes while one worker write is active.
     pub fn checkpoint_session(&mut self) {
+        if self.hex.disposing {
+            return;
+        }
         self.install_journal_observers();
         self.sync_all();
         self.files.persist_pending = true;
@@ -779,12 +832,12 @@ impl Workspace {
     }
 
     fn install_journal_observers(&mut self) {
-        if !self.files.storage_ready {
+        if self.hex.disposing || !self.files.storage_ready {
             return;
         }
         let Some(worker) = &self.files.worker else { return };
         for (&document, view) in &mut self.views {
-            if self.files.observed.contains_key(&document) {
+            if self.files.observed.contains_key(&document) || self.hex.loans.contains_key(&document) {
                 continue;
             }
             let Some(editor) = view.editor_mut() else { continue };
@@ -799,7 +852,9 @@ impl Workspace {
                 continue;
             }
             self.files.observed.insert(document, (next, generation));
-            if editor.document().is_dirty() {
+            let seed = self.hex.seed.remove(&document)
+                || editor.document().representation() == crate::hex_session::Representation::RawBytes;
+            if editor.document().is_dirty() || seed {
                 self.files.seeded.insert(document);
                 self.files.queue.retain(
                     |request| !matches!(request,DocumentRequest::SeedJournal {document:old,..} if *old==document),
@@ -847,6 +902,7 @@ impl Workspace {
         self.files.exit_without_metadata = false;
     }
     pub fn cancel_file_prompt(&mut self) {
+        self.hex.prompt = false;
         self.files.prompt = None;
         self.files.save_all.clear();
         self.cancel_close_intent();
@@ -875,7 +931,14 @@ impl Workspace {
         let prompt = self.files.prompt.take().unwrap();
         match prompt.kind {
             FilePromptKind::Open => {
-                self.open_path(prompt.text.into())?;
+                if std::mem::take(&mut self.hex.prompt) {
+                    let (_, outcome) = self.open_hex_path(prompt.text.into(), self.rows())?;
+                    if outcome == crate::hex_session::OpenOutcome::NeedsRawReopen {
+                        self.set_notice("Save decoded changes before reopening physical bytes".into());
+                    }
+                } else {
+                    self.open_path(prompt.text.into())?;
+                }
             }
             FilePromptKind::Recent => {
                 let number = prompt.text.trim().parse::<usize>().ok().and_then(|n| n.checked_sub(1));
@@ -938,7 +1001,14 @@ impl Workspace {
         }
         self.cancel_file_prompt();
         self.sync_active();
+        let previous = self.session.active();
         let id = self.session.open(Some(path.clone()))?;
+        if previous != self.session.active() {
+            self.input_epoch = self.input_epoch.wrapping_add(1);
+            if let Some(previous) = previous {
+                self.cancel_hex_input_for(previous);
+            }
+        }
         let mut view = View::new(None);
         view.editor = None;
         view.path = Some(path.clone());
@@ -1020,7 +1090,8 @@ impl Workspace {
             return Ok(());
         }
         let plan = editor.document().save_plan();
-        let request = match editor.save_request(path) {
+        let raw = editor.document().representation() == crate::hex_session::Representation::RawBytes;
+        let request = match if raw { editor.raw_save_request(path) } else { editor.save_request(path) } {
             Ok(request) => request,
             Err(error) => {
                 self.cancel_close_intent();
@@ -1029,7 +1100,11 @@ impl Workspace {
         };
         self.files.saves.insert(id, SaveFlight { revision: request.revision, path: Some(request.path.clone()) });
         self.refresh_save_destinations();
-        self.files.queue.push_back(DocumentRequest::Save { document: id, request, plan });
+        self.files.queue.push_back(if raw {
+            DocumentRequest::SaveRaw { document: id, request }
+        } else {
+            DocumentRequest::Save { document: id, request, plan }
+        });
         if let Some(view) = self.views.get_mut(&id) {
             view.set_notice("Savingâ€¦".into());
         }
@@ -1039,12 +1114,25 @@ impl Workspace {
 
     /// Commands are intercepted before Vim/editor dispatch, preserving keymap tombstones.
     pub fn file_command(&mut self, command: &str) -> io::Result<bool> {
+        if self.hex.disposing {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Raw document disposal is in progress"));
+        }
         match command {
+            "file.openHex" => {
+                self.file_command("file.open")?;
+                self.hex.prompt = true;
+            }
+            "view.toggleHex" => {
+                if self.toggle_hex(self.rows())? == crate::hex_session::OpenOutcome::NeedsRawReopen {
+                    self.set_notice("Save changes before switching between text and physical bytes".into());
+                }
+            }
             "file.new" => {
                 self.cancel_file_prompt();
                 self.open(View::new(None))?;
             }
             "file.open" | "file.recent" | "file.saveAs" => {
+                self.hex.prompt = false;
                 let id = self.active_id();
                 let revision = self.editor().map_or(0, |e| e.document().revision());
                 let kind = match command {
@@ -1307,6 +1395,11 @@ impl Workspace {
     }
 
     pub fn document_result(&mut self, result: DocumentResult) -> Damage {
+        if matches!(&result, DocumentResult::Preview { document, .. } if self.hex_text_preview_pending(*document)) {
+            let DocumentResult::Preview { document, revision, preview, .. } = result else { unreachable!() };
+            self.hex_text_preview(document, revision, preview.text);
+            return Damage::default();
+        }
         // An editor absent because of a loan is not an open/index placeholder.
         let placeholder = match &result {
             DocumentResult::Indexed { document, .. }
@@ -1315,7 +1408,7 @@ impl Workspace {
             | DocumentResult::Recovered { document, .. } => Some(*document),
             _ => None,
         };
-        if placeholder.is_some_and(|id| self.document_busy(id)) {
+        if placeholder.is_some_and(|id| self.files.loans.contains_key(&id) || self.hex.editor_away(id)) {
             return Damage::default();
         }
         let destinations_changed = matches!(
@@ -1335,6 +1428,18 @@ impl Workspace {
         );
         let mut damage = Damage { status: true, ..Default::default() };
         match result {
+            DocumentResult::RawPreview { document, revision, page } => {
+                damage = self.hex_preview(document, revision, page);
+            }
+            DocumentResult::RawReopened { document, generation, editor, result } => {
+                damage = self.hex_reopened(document, generation, editor, result);
+            }
+            DocumentResult::HexPage { document, editor, request, result } => {
+                damage = self.hex_page_result(document, editor, request, result);
+            }
+            DocumentResult::HexEdited { document, editor, completion } => {
+                damage = self.hex_edit_result(document, editor, completion);
+            }
             DocumentResult::Replaced { key, operation, mut editor, result } => {
                 let id = DocumentId(key.document_id);
                 let current =
@@ -1463,20 +1568,28 @@ impl Workspace {
                             if let Some(settings) = &self.editor_settings {
                                 editor.settings = settings.clone();
                             }
-                            let len = editor.document().snapshot().len();
-                            let _ = editor.set_cursors(
-                                vec![crate::Cursor {
-                                    head: tab.cursor.min(len),
-                                    anchor: tab.anchor.min(len),
-                                    desired_column: None,
-                                }],
-                                0,
-                            );
+                            let raw =
+                                editor.document().representation() == crate::hex_session::Representation::RawBytes;
+                            let len = editor.document().hex_source(tab.id.0).len;
+                            if !raw {
+                                let _ = editor.set_cursors(
+                                    vec![crate::Cursor {
+                                        head: tab.cursor.min(len),
+                                        anchor: tab.anchor.min(len),
+                                        desired_column: None,
+                                    }],
+                                    0,
+                                );
+                            }
                             editor.set_viewport(tab.first_visible_line, view.rows);
                             view.editor = Some(editor);
                             view.top = tab.first_visible_line;
-                            view.set_horizontal_window(tab.first_byte_column, 64 << 10);
-                            view.refresh_after_edit(Damage { full: true, ..Default::default() });
+                            if raw {
+                                view.file = view.editor().unwrap().document().original.clone();
+                            } else {
+                                view.set_horizontal_window(tab.first_byte_column, 64 << 10);
+                                view.refresh_after_edit(Damage { full: true, ..Default::default() });
+                            }
                         }
                         Err(error) => {
                             view.set_notice(format!("Recovery failed: {error}; journal retained"));
@@ -1521,13 +1634,19 @@ impl Workspace {
                 if let Some(view) = self.views.get_mut(&document).filter(|v| v.editor().is_none() && revision == 0) {
                     match result {
                         Ok(document) => {
+                            let raw = document.representation() == crate::hex_session::Representation::RawBytes;
                             let mut editor = Editor::new(*document);
                             if let Some(settings) = &self.editor_settings {
                                 editor.settings = settings.clone();
                             }
                             editor.set_viewport(view.top, view.rows);
+                            if raw {
+                                view.file = editor.document().original.clone();
+                            }
                             view.editor = Some(editor);
-                            view.index_ready();
+                            if !raw {
+                                view.index_ready();
+                            }
                             view.set_notice(String::new());
                         }
                         Err(error) => {
@@ -1537,6 +1656,7 @@ impl Workspace {
                     }
                     damage.full = self.active_id() == document;
                 }
+                self.hex_indexed(document);
             }
             DocumentResult::Saved { document, revision, result } => {
                 if result.as_ref().is_ok_and(|saved| saved.revision != revision) {
@@ -1588,6 +1708,7 @@ impl Workspace {
                 }
             }
             DocumentResult::JournalClosed { document, result } => {
+                self.hex_journal_closed(document, &result);
                 damage = Damage::default();
                 if result.is_ok() {
                     self.files.replacement_journals.remove(&document);
@@ -1598,6 +1719,7 @@ impl Workspace {
                 }
             }
         }
+        self.bind_raw_sessions();
         if checkpoint {
             self.checkpoint_session();
         }
@@ -1621,6 +1743,7 @@ impl Workspace {
         }
         self.check_hot_exit();
         self.pump_files();
+        self.pump_hex();
         damage
     }
 
@@ -1646,7 +1769,15 @@ impl Workspace {
                     _ if !may_close => "Saved earlier revision; current changes remain unsaved".into(),
                     _ => "Saved".into(),
                 };
-                let edited = view.refresh_after_edit(result.damage);
+                let edited = if view
+                    .editor()
+                    .is_some_and(|e| e.document().representation() == crate::hex_session::Representation::RawBytes)
+                {
+                    view.file = view.editor().unwrap().document().original.clone();
+                    result.damage
+                } else {
+                    view.refresh_after_edit(result.damage)
+                };
                 if self.session.active() == Some(document) {
                     damage = edited;
                     damage.status = true;
@@ -1755,6 +1886,10 @@ impl Workspace {
     }
 
     fn install_prepared(&mut self, prepared: crate::document_worker::PreparedWorkspace) {
+        if !self.hex.loans.is_empty() {
+            self.files.deferred_recovery = Some(Box::new(prepared));
+            return;
+        }
         self.sync_all();
         let additional = self
             .session
@@ -1785,6 +1920,9 @@ impl Workspace {
         let old_tabs = self.session.tabs().to_vec();
         let old_active = self.active_id();
         let mut old_views = std::mem::take(&mut self.views);
+        // Only bounded display state is discarded. Editor/backing ownership
+        // remains in old_views while document identities are remapped below.
+        self.hex = HexFlow::default();
         self.input_epoch = self.input_epoch.wrapping_add(1);
         self.session = prepared.session;
         for (id, document) in prepared.documents {
@@ -1802,15 +1940,18 @@ impl Workspace {
                     if let Some(settings) = &self.editor_settings {
                         editor.settings = settings.clone();
                     }
-                    let len = editor.document().snapshot().len();
-                    let _ = editor.set_cursors(
-                        vec![crate::Cursor {
-                            head: tab.cursor.min(len),
-                            anchor: tab.anchor.min(len),
-                            desired_column: None,
-                        }],
-                        0,
-                    );
+                    let raw = editor.document().representation() == crate::hex_session::Representation::RawBytes;
+                    let len = editor.document().hex_source(id.0).len;
+                    if !raw {
+                        let _ = editor.set_cursors(
+                            vec![crate::Cursor {
+                                head: tab.cursor.min(len),
+                                anchor: tab.anchor.min(len),
+                                desired_column: None,
+                            }],
+                            0,
+                        );
+                    }
                     editor.set_viewport(tab.first_visible_line, 0);
                     view.editor = Some(editor);
                     view.top = tab.first_visible_line;
@@ -1821,7 +1962,12 @@ impl Workspace {
                     view.set_notice(format!("Recovery failed: {error}; journal retained"));
                 }
             }
-            view.set_horizontal_window(tab.first_byte_column, 64 << 10);
+            if view
+                .editor()
+                .is_none_or(|e| e.document().representation() != crate::hex_session::Representation::RawBytes)
+            {
+                view.set_horizontal_window(tab.first_byte_column, 64 << 10);
+            }
             self.views.insert(id, view);
         }
         let mut mapping = HashMap::new();
@@ -1921,6 +2067,7 @@ impl Workspace {
         if self.views.is_empty() {
             let _ = self.open(View::new(None));
         }
+        self.bind_raw_sessions();
         self.refresh_save_destinations();
     }
 
@@ -2007,8 +2154,10 @@ mod tests {
         assert!(workspace.file_command("file.new").unwrap());
         let second = workspace.active_id();
         assert_ne!(first, second);
+        let epoch = workspace.input_epoch();
         workspace.file_command("file.previousTab").unwrap();
         assert_eq!(workspace.active_id(), first);
+        assert_ne!(workspace.input_epoch(), epoch, "cycling invalidates captured input tickets");
         workspace.file_command("file.close").unwrap();
         assert!(workspace.close_pending());
         assert_eq!(workspace.session().tabs().len(), 2);
@@ -2213,7 +2362,7 @@ mod tests {
         workspace.file_command("file.reopenClosed").unwrap();
         workspace.set_rows(2);
         let mut document = crate::Document::new();
-        document.buffer.insert(0, "ç•Œa\nxyz".as_bytes()).unwrap();
+        document.buffer.insert(0, "\u{754c}a\nxyz".as_bytes()).unwrap();
         document.saved_revision = 1;
         workspace.document_result(DocumentResult::Recovered {
             document: first,
@@ -3163,6 +3312,7 @@ impl Workspace {
     /// deferred until existing recovery/journal admission becomes available.
     pub fn file_saves_pending(&self) -> bool {
         !self.files.saves.is_empty()
+            || self.files.queue.iter().any(|request| matches!(request, DocumentRequest::DiscardHex { .. }))
             || self.search_replacement_pending()
             || !self.files.replacement_journals.is_empty()
             || self
@@ -3225,7 +3375,13 @@ impl Workspace {
             ));
         }
         self.files.prompt = None;
+        let hex = std::mem::take(&mut self.hex.prompt);
         let result = match ticket.kind {
+            FilePromptKind::Open if hex => self.open_hex_path(path, self.rows()).map(|(_, outcome)| {
+                if outcome == crate::hex_session::OpenOutcome::NeedsRawReopen {
+                    self.set_notice("Save decoded changes before reopening physical bytes".into());
+                }
+            }),
             FilePromptKind::Open => self.open_path(path).map(|_| ()),
             FilePromptKind::SaveAs => self.save_document(ticket.document, Some(path)),
             FilePromptKind::Recent => {

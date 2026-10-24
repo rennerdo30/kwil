@@ -11,7 +11,7 @@ use std::{
     io,
     ops::Range,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -287,6 +287,18 @@ struct Shared {
     retirement_due: AtomicBool,
     coordinator: OnceLock<thread::Thread>,
     retry_wake: AtomicBool,
+    completed: AtomicBool,
+    panicked: AtomicBool,
+    completion: Condvar,
+}
+struct Completion<'a>(&'a Shared);
+impl Drop for Completion<'_> {
+    fn drop(&mut self) {
+        let _guard = self.0.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.0.panicked.store(thread::panicking(), Ordering::Release);
+        self.0.completed.store(true, Ordering::Release);
+        self.0.completion.notify_all();
+    }
 }
 /// One publisher can block on result backpressure. An unpark token survives
 /// notification before sleep, including a retry armed while its mailbox is held.
@@ -323,6 +335,9 @@ impl Shared {
             retirement_due: AtomicBool::new(false),
             coordinator: OnceLock::new(),
             retry_wake: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
+            completion: Condvar::new(),
         }
     }
     fn notify(&self) {
@@ -336,6 +351,45 @@ pub struct SearchWorker {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
+/// A failed bounded shutdown retains the exact facade and its retirement
+/// controls. Error transport is Send + Sync and never joins from Drop.
+pub struct ShutdownError {
+    owner: Mutex<Option<SearchWorker>>,
+    panicked: bool,
+}
+impl ShutdownError {
+    pub fn into_worker(self) -> SearchWorker {
+        self.owner.into_inner().unwrap_or_else(|error| error.into_inner()).expect("shutdown owner")
+    }
+    pub fn retry_retirement(&self) {
+        if let Some(worker) = self.owner.lock().unwrap_or_else(|error| error.into_inner()).as_ref() {
+            worker.retry_retirement();
+        }
+    }
+    pub fn retry(self, timeout: Duration) -> Result<(), Self> {
+        let worker = self.into_worker();
+        worker.retry_retirement();
+        worker.shutdown_bounded(timeout)
+    }
+    pub fn retirement_status(&self) -> Option<(usize, Vec<SpoolDiagnostic>)> {
+        self.owner.lock().unwrap_or_else(|error| error.into_inner()).as_ref()?.retirement_status()
+    }
+}
+impl std::fmt::Display for ShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(if self.panicked {
+            "Search worker panicked; exact shutdown owner retained"
+        } else {
+            "Search shutdown deadline reached; exact cleanup owner retained for explicit retry"
+        })
+    }
+}
+impl std::fmt::Debug for ShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, out)
+    }
+}
+impl std::error::Error for ShutdownError {}
 impl SearchWorker {
     /// Starts one sleeping coordinator. Does no source read or filesystem I/O.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
@@ -349,6 +403,9 @@ impl SearchWorker {
         let shared = Arc::new(Shared::new());
         let worker = shared.clone();
         let thread = thread::Builder::new().name("kwil-search".into()).spawn(move || {
+            // Declared first, acknowledged only after jobs, spools and their
+            // cleanup owners have left the coordinator scope, including unwind.
+            let _completion = Completion(&worker);
             let _ = worker.coordinator.set(thread::current());
             let retire_wake = Arc::downgrade(&worker);
             let mut spools = SpoolOwner::with_wake(spool_bytes, move || {
@@ -579,6 +636,31 @@ impl SearchWorker {
     pub fn shutdown(mut self) -> thread::Result<()> {
         self.stop();
         self.thread.take().unwrap().join()
+    }
+    /// OFF UI: waits once for resource cleanup acknowledgement, never joins a
+    /// coordinator parked on failed retirement. Timeout returns exact ownership.
+    /// Successful acknowledgement leaves no accepted work or spool owner; an
+    /// unfinished OS thread handle can only be completing its epilogue.
+    pub fn shutdown_bounded(mut self, timeout: Duration) -> Result<(), ShutdownError> {
+        self.stop();
+        let shared = self.shared.clone();
+        let state = shared.state.lock().unwrap_or_else(|error| error.into_inner());
+        let (state, _) = shared
+            .completion
+            .wait_timeout_while(state, timeout, |_| !shared.completed.load(Ordering::Acquire))
+            .unwrap_or_else(|error| error.into_inner());
+        let completed = shared.completed.load(Ordering::Acquire);
+        drop(state);
+        if !completed {
+            return Err(ShutdownError { owner: Mutex::new(Some(self)), panicked: false });
+        }
+        if shared.panicked.load(Ordering::Acquire) {
+            return Err(ShutdownError { owner: Mutex::new(Some(self)), panicked: true });
+        }
+        // Acknowledged resource scope is finished. Do not introduce an
+        // unbounded OS-thread join for its remaining runtime epilogue.
+        drop(self.thread.take());
+        Ok(())
     }
 }
 impl Drop for SearchWorker {
@@ -900,34 +982,35 @@ fn visit_seed_sources(
     if range.start > range.end || range.end > request.snapshot.len() || range.end - range.start > INPUT_BYTES as u64 {
         return Err(seed_error("seed selection outside snapshot or exceeds input cap"));
     }
-    // SourceChunks can classify a detached run before yielding it: one initial
-    // peek, one delimiter lookahead and two u32 raw-offset table entries. Admit
-    // the remaining clipped extent + that bounded overhead BEFORE next(), then
-    // debit the returned run. The source copy and UTF-8 validation are separate
-    // visits, never hidden inside that classification reservation.
-    const CLASSIFY_OVERHEAD: usize = 2 + 2 * std::mem::size_of::<u32>();
+    // Detached classification can revisit u32 endpoints several times per
+    // logical byte. Admit/debit each actual read, never an estimate based on
+    // the yielded length. Keep the existing logical source visit allowance;
+    // payload copying and UTF-8 validation remain separate visits as before.
+    const SOURCE_OVERHEAD: usize = 2 + 2 * std::mem::size_of::<u32>();
     let mut remaining = (range.end - range.start) as usize;
     let mut chunks = request.snapshot.source_chunks(range)?;
     while remaining != 0 {
         seed_cancel(cancel)?;
-        budget.require(remaining + CLASSIFY_OVERHEAD)?;
         let chunk = chunks
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "seed source range ended early"))?
-            .map_err(io::Error::other)?;
+            .next_admitted(|bytes| {
+                seed_cancel(cancel)?;
+                budget.charge(bytes)
+            })?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "seed source range ended early"))?;
         let len = match &chunk {
             SourceChunk::Added(bytes)
             | SourceChunk::Original { bytes, .. }
             | SourceChunk::Decoded { bytes, .. }
+            | SourceChunk::Preserved { bytes, .. }
             | SourceChunk::Opaque { bytes, .. } => bytes.len(),
         };
         if len == 0 || len > remaining {
             return Err(seed_error("seed source range contract violated"));
         }
-        budget.charge(len + CLASSIFY_OVERHEAD)?;
+        budget.charge(len + SOURCE_OVERHEAD)?;
         remaining -= len;
         let text = match chunk {
-            SourceChunk::Added(bytes) => bytes,
+            SourceChunk::Added(bytes) | SourceChunk::Preserved { bytes, .. } => bytes,
             SourceChunk::Original { bytes, .. } if request.allow_raw_utf8 => bytes,
             SourceChunk::Original { .. } => {
                 return Err(seed_error("seed raw origin has no verified UTF-8 interpretation"));
@@ -1266,6 +1349,31 @@ fn run_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_shutdown_refusal_preserves_exact_worker_and_retry_controls() {
+        let shared = Arc::new(Shared::new());
+        let worker = SearchWorker { shared: shared.clone(), thread: None };
+        let error = worker.shutdown_bounded(Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("owner retained"));
+        error.retry_retirement();
+        assert!(shared.retirement_due.load(Ordering::Acquire));
+        let worker = error.into_worker();
+        assert!(Arc::ptr_eq(&shared, &worker.shared));
+        shared.completed.store(true, Ordering::Release);
+        worker.shutdown_bounded(Duration::ZERO).unwrap();
+    }
+    #[test]
+    fn bounded_shutdown_reports_panics_without_claiming_cleanup_success() {
+        let shared = Arc::new(Shared::new());
+        shared.completed.store(true, Ordering::Release);
+        shared.panicked.store(true, Ordering::Release);
+        let worker = SearchWorker { shared, thread: None };
+        let error = worker.shutdown_bounded(Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("panicked"));
+        assert!(error.retry(Duration::ZERO).is_err());
+        fn error_transport<T: std::error::Error + Send + Sync>() {}
+        error_transport::<ShutdownError>();
+    }
     fn seed_request(text: &[u8], cursors: Vec<SeedCursor>, primary: usize) -> SeedRequest {
         let mut buffer = kwil_core_text::Buffer::empty();
         buffer.insert(0, text).unwrap();
@@ -1410,6 +1518,14 @@ mod tests {
         let mut request =
             SeedRequest { snapshot: buffer.snapshot(), cursors: vec![caret(0)], primary: 0, allow_raw_utf8: false };
         let alias = run_seed(&request, &cancel).unwrap().unwrap();
+        let mut imported = Buffer::empty();
+        imported.insert_snapshot_range(0, &request.snapshot, 0..request.snapshot.len()).unwrap();
+        let imported_request =
+            SeedRequest { snapshot: imported.snapshot(), cursors: vec![caret(0)], primary: 0, allow_raw_utf8: false };
+        let detached_alias = run_seed(&imported_request, &cancel).unwrap().unwrap();
+        assert_eq!(detached_alias.text, alias.text, "preserved valid atoms remain searchable text");
+        drop(imported_request);
+        drop(imported);
         request.cursors = vec![SeedCursor { anchor: 0, head: 2 }];
         let split_refused = run_seed(&request, &cancel).is_err();
         drop(request);
@@ -1452,6 +1568,81 @@ mod tests {
         assert_eq!((alias.text.as_str(), alias.range), ("Ê\u{304}", 0..4));
         assert!(split_refused && opaque_refused && untyped_refused);
         assert_eq!(verified.text, "word");
+    }
+
+    #[test]
+    fn seed_detached_alias_selection_debits_actual_classification_before_copying() {
+        use kwil_core_text::{
+            Buffer,
+            decoded_backing::{DecodedBacking, Interpretation},
+            encoding::Encoding,
+        };
+        let parent = std::env::temp_dir().join(format!(
+            "kwil-seed-admitted-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let raw = b"\x88\x62".repeat(15_000);
+        let owner = DecodedBacking::prepare_from_reader(
+            &mut raw.as_slice(),
+            raw.len() as u64,
+            Interpretation::new(Encoding::for_label("big5").unwrap(), 0).unwrap(),
+            &parent,
+            &cancel,
+        )
+        .unwrap();
+        let source = Buffer::from_decoded(owner.snapshot());
+        let target = Buffer::with_add_memory_limit(400_000);
+        let snapshot = target.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
+        drop(source);
+        owner
+            .try_retire()
+            .map_err(|error| error.with_cause(io::Error::other("alias admission fixture retirement")))
+            .unwrap();
+        assert_eq!(snapshot.len(), 60_000);
+        assert!(snapshot.len() < INPUT_BYTES as u64, "input cap alone cannot detect this case");
+        // Independent unlimited traversal supplies the classification oracle.
+        // The production seed must debit these actual reads in addition to
+        // its logical source, copy and UTF-8 validation visits.
+        let mut chunks = snapshot.source_chunks(0..snapshot.len()).unwrap();
+        let mut classified = 0;
+        let mut logical = 0;
+        while let Some(chunk) = chunks
+            .next_admitted(|bytes| {
+                classified += bytes;
+                Ok(())
+            })
+            .unwrap()
+        {
+            let kwil_core_text::SourceChunk::Preserved { bytes, .. } = chunk else {
+                panic!("alias provenance lost");
+            };
+            logical += bytes.len();
+        }
+        assert_eq!(logical, 60_000);
+        assert!(classified > SEED_WORK_BYTES, "classification alone exceeds the unchanged shared work cap");
+        drop(chunks);
+        let request = SeedRequest {
+            snapshot,
+            cursors: vec![SeedCursor { anchor: 0, head: 60_000 }],
+            primary: 0,
+            allow_raw_utf8: false,
+        };
+        let mut budget = SeedBudget::new();
+        let error = run_seed_with_budget(&request, &cancel, &mut budget).unwrap_err();
+        assert!(error.to_string().contains("aggregate source/validation/copy budget"));
+        assert!(budget.bytes_left <= SEED_WORK_BYTES);
+        for available in [0, 1, 4] {
+            let mut budget = SeedBudget { bytes_left: available, steps_left: 4 * INPUT_BYTES };
+            let mut output = Vec::new();
+            let error = visit_seed_sources(&request, 0..60_000, &cancel, &mut budget, Some(&mut output)).unwrap_err();
+            assert!(error.to_string().contains("aggregate source/validation/copy budget"));
+            assert!(output.is_empty(), "classification refusal cannot publish or copy a source run");
+        }
+        drop(request);
+        std::fs::remove_dir(parent).unwrap();
     }
     #[test]
     fn full_retirement_and_dual_shutdown_keep_sources_until_worker_last_drop() {

@@ -8,6 +8,7 @@ mod compressed_runtime;
 mod decoded;
 mod encoding_runtime;
 mod encoding_seed;
+mod hex_runtime;
 pub(crate) use encoding_runtime::document_policy;
 pub mod provenance;
 pub mod retirement;
@@ -90,6 +91,53 @@ impl ExternalOpenInbox {
 }
 
 pub enum DocumentRequest {
+    /// Explicit physical bytes, including BOM and compression headers.
+    OpenRaw {
+        document: DocumentId,
+        revision: u64,
+        path: PathBuf,
+        rows: usize,
+        generation: u64,
+    },
+    /// Exact Editor returns even on a dirty-text refusal or preparation error.
+    ReopenRaw {
+        document: DocumentId,
+        generation: u64,
+        editor: Box<crate::Editor>,
+        rows: usize,
+    },
+    /// Symmetric transport exit. Uses the normal decompression/decode path;
+    /// RawReopened returns the exact Editor on every refusal or failure.
+    ReopenText {
+        document: DocumentId,
+        generation: u64,
+        editor: Box<crate::Editor>,
+    },
+    HexPage {
+        document: DocumentId,
+        editor: Box<crate::Editor>,
+        request: crate::hex_session::PageRequest,
+    },
+    HexEdit {
+        document: DocumentId,
+        editor: Box<crate::Editor>,
+        request: crate::hex_session::EditRequest,
+    },
+    /// Only after the tab AND its retained undo history have been discarded.
+    ReleaseHex {
+        document: DocumentId,
+        epoch: u64,
+    },
+    /// Final cached-editor eviction. Admission transfers ownership; rejection
+    /// returns the intact request. Drop roots on this lane before fence release.
+    DiscardHex {
+        document: DocumentId,
+        editor: Box<crate::Editor>,
+    },
+    SaveRaw {
+        document: DocumentId,
+        request: SaveRequest,
+    },
     /// Ownership returns in Replaced even when validation/application fails.
     Replace {
         document: DocumentId,
@@ -157,6 +205,28 @@ pub enum DocumentRequest {
 }
 
 pub enum DocumentResult {
+    RawPreview {
+        document: DocumentId,
+        revision: u64,
+        page: crate::hex_session::Page,
+    },
+    RawReopened {
+        document: DocumentId,
+        generation: u64,
+        editor: Box<crate::Editor>,
+        result: io::Result<crate::hex_session::OpenOutcome>,
+    },
+    HexPage {
+        document: DocumentId,
+        editor: Box<crate::Editor>,
+        request: crate::hex_session::PageRequest,
+        result: io::Result<crate::hex_session::Page>,
+    },
+    HexEdited {
+        document: DocumentId,
+        editor: Box<crate::Editor>,
+        completion: crate::hex_session::EditCompletion,
+    },
     Replaced {
         key: kwil_core_search::worker::SearchKey,
         operation: u64,
@@ -266,12 +336,39 @@ struct Storage {
     _ownership: std::fs::File,
     service: JournalService,
     journals: HashMap<DocumentId, JournalState>,
+    /// Finished writers still pin the exact previous provenance until a new
+    /// lineage is durable, or metadata durably evicts the document entirely.
+    finished_journals: HashMap<DocumentId, JournalState>,
+    transports: HashMap<DocumentId, TransportSeed>,
     order: HashMap<DocumentId, u64>,
     durable_session: Session,
     encoding: encoding_runtime::EncodingRuntime,
 }
 
+#[derive(Clone, Copy)]
+struct TransportSeed {
+    policy: RecoveryPolicy,
+    revision: u64,
+    len: u64,
+}
+impl TransportSeed {
+    fn document(document: &Document) -> Self {
+        Self { policy: document_policy(document), revision: document.revision(), len: document.buffer().len() }
+    }
+}
+
+fn reserve_transport(storage: &mut Storage, document: DocumentId) -> io::Result<()> {
+    if storage.transports.contains_key(&document) || storage.transports.len() >= session::MAX_TABS {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "previous transport lineage is not durable; editor retained",
+        ));
+    }
+    storage.transports.try_reserve(1).map_err(io::Error::other)
+}
+
 struct JournalState {
+    policy: RecoveryPolicy,
     handle: JournalSession,
     origins: Option<provenance::OriginRegistry>,
     seed_origins: Option<mpsc::Receiver<io::Result<provenance::AdmissionToken>>>,
@@ -283,10 +380,12 @@ struct JournalState {
     failed: bool,
     flush_due: std::time::Instant,
     generation: u64,
+    promotion: Option<PathBuf>,
 }
 impl JournalState {
-    fn new(handle: JournalSession, revision: u64, sequence: u64) -> Self {
+    fn new(handle: JournalSession, revision: u64, sequence: u64, policy: RecoveryPolicy) -> Self {
         Self {
+            policy,
             handle,
             origins: None,
             seed_origins: None,
@@ -298,6 +397,7 @@ impl JournalState {
             failed: false,
             flush_due: std::time::Instant::now() + Duration::from_secs(2),
             generation: 0,
+            promotion: None,
         }
     }
 }
@@ -367,6 +467,7 @@ impl DocumentWorker {
             // because the UI released its sender.
             let cancel = AtomicBool::new(false);
             let mut storage: Option<Storage> = None;
+            let mut hex = hex_runtime::HexRuntime::new();
             let mut deferred = std::collections::VecDeque::new();
             let mut session_due = None;
             // Worker-owned until the UI publishes the admitted tab and releases
@@ -471,6 +572,94 @@ impl DocumentWorker {
                         continue;
                     }
                     match request {
+                        DocumentRequest::OpenRaw { document, revision, path, rows, generation } => {
+                            let result = storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared")).and_then(|storage| {
+                                storage.encoding.open_raw(document, path, rows, generation, &cancel, |page| {
+                                    complete(DocumentResult::RawPreview { document, revision, page });
+                                })
+                            });
+                            complete(DocumentResult::Indexed { document, revision, result: result.map(Box::new) });
+                        }
+                        DocumentRequest::ReopenRaw { document, generation, mut editor, rows } => {
+                            let before_epoch = editor.document().source_epoch;
+                            let revision = editor.document().revision();
+                            let active_journal = storage.as_ref().is_some_and(|s| s.journals.contains_key(&document));
+                            let result = if editor.document().representation() == crate::hex_session::Representation::DecodedText
+                                && !editor.document().is_dirty() && active_journal {
+                                Err(io::Error::new(io::ErrorKind::WouldBlock, "finish the old transport journal before raw reopen"))
+                            } else {
+                                hex_runtime::reopen(&mut editor, |path| {
+                                    let storage = storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
+                                    reserve_transport(storage, document)?;
+                                    storage.encoding.open_raw(document, path, rows, generation, &cancel, |page| {
+                                            complete(DocumentResult::RawPreview { document, revision, page });
+                                        })
+                                })
+                            };
+                            if result.as_ref().is_ok_and(|outcome| *outcome == crate::hex_session::OpenOutcome::Ready)
+                                && editor.document().source_epoch != before_epoch {
+                                storage.as_mut().expect("prepared transport storage").transports.insert(document, TransportSeed::document(editor.document()));
+                            }
+                            complete(DocumentResult::RawReopened { document, generation, editor, result });
+                        }
+                        DocumentRequest::ReopenText { document, generation, mut editor } => {
+                            let before_epoch = editor.document().source_epoch;
+                            let revision = editor.document().revision();
+                            let active_journal = storage.as_ref().is_some_and(|s| s.journals.contains_key(&document));
+                            let result = if editor.document().representation() == crate::hex_session::Representation::RawBytes
+                                && !editor.document().is_dirty() && active_journal {
+                                Err(io::Error::new(io::ErrorKind::WouldBlock, "finish the old transport journal before text reopen"))
+                            } else {
+                                hex_runtime::reopen_text(&mut editor, |path| {
+                                    let storage = storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
+                                    reserve_transport(storage, document)?;
+                                    let file = kwil_core_workspace::open_for_editing(&path)?;
+                                    storage.encoding.open(path.clone(), file.clone(), None, &cancel, |mut preview| {
+                                            // Normal preview decoding can expand malformed bytes
+                                            // into escapes. Bound the text-exit cache as well as
+                                            // its encoded input, without clipping a UTF8 scalar.
+                                            let limit = crate::hex_session::MAX_PAGE_BYTES;
+                                            if preview.text.len() > limit {
+                                                let mut end = limit;
+                                                while end > 0 && preview.text[end] & 0xc0 == 0x80 { end -= 1; }
+                                                preview.text.truncate(end);
+                                                preview.text.shrink_to_fit();
+                                                preview.complete = false;
+                                            }
+                                            complete(DocumentResult::Preview { document, revision, path, file, preview });
+                                            Ok(())
+                                        })
+                                })
+                            };
+                            if result.as_ref().is_ok_and(|outcome| *outcome == crate::hex_session::OpenOutcome::Ready)
+                                && editor.document().source_epoch != before_epoch {
+                                storage.as_mut().expect("prepared transport storage").transports.insert(document, TransportSeed::document(editor.document()));
+                            }
+                            complete(DocumentResult::RawReopened { document, generation, editor, result });
+                        }
+                        DocumentRequest::HexPage { document, editor, request } => {
+                            let result = hex_runtime::page(document, &editor, request, &cancel);
+                            complete(DocumentResult::HexPage { document, editor, request, result });
+                        }
+                        DocumentRequest::HexEdit { document, mut editor, request } => {
+                            let completion = hex.edit(document, &mut editor, &request);
+                            complete(DocumentResult::HexEdited { document, editor, completion });
+                        }
+                        DocumentRequest::ReleaseHex { document, epoch } => hex.release(document, epoch),
+                        DocumentRequest::DiscardHex { document, editor } => {
+                            hex.discard(document, editor);
+                            complete(DocumentResult::CapacityAvailable);
+                        }
+                        DocumentRequest::SaveRaw { document, request } => {
+                            let revision = request.revision;
+                            let mut reserved = destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if let Some((owner, _, path)) = &reopening { reserved.push((*owner, path.clone())); }
+                            let result = validate_save_destination(document, &request.path, &reserved).and_then(|()| {
+                                storage.as_mut().ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?
+                                    .encoding.save_raw(request, &cancel)
+                            });
+                            complete(DocumentResult::Saved { document, revision, result });
+                        }
                         DocumentRequest::Replace { document, operation, mut editor, recipe } => {
                             let key = recipe.key;
                             let result = if document.0 != key.document_id {
@@ -514,7 +703,7 @@ impl DocumentWorker {
                                         recover_prepared(&storage.root, &mut storage.encoding, path, &tab)?;
                                     let handle = resume(&storage.service, recovered)?;
                                     let revision = document.revision();
-                                    let mut journal = JournalState::new(handle, revision, 0);
+                                    let mut journal = JournalState::new(handle, revision, 0, document_policy(&document));
                                     journal.origins = origins;
                                     storage.journals.insert(tab.id, journal);
                                     Ok(document)
@@ -722,28 +911,7 @@ impl DocumentWorker {
                             complete(DocumentResult::JournalQueued { document, revision, sequence, result });
                         }
                         DocumentRequest::FinishJournal { document, generation } => {
-                            let result = if let Some(storage) = &mut storage
-                                && storage
-                                    .journals
-                                    .get(&document)
-                                    .is_some_and(|journal| journal.generation <= generation)
-                                && let Some(journal) = storage.journals.remove(&document)
-                            {
-                                submit(&journal.handle, kwil_core_workspace::journal::JournalCommand::Finish).and_then(
-                                    |_| {
-                                        journal
-                                            .handle
-                                            .finished
-                                            .recv_timeout(Duration::from_secs(30))
-                                            .map_err(|_| {
-                                                io::Error::other("Journal close timed out; recovery retained")
-                                            })?
-                                            .map(|_| ())
-                                    },
-                                )
-                            } else {
-                                Ok(())
-                            };
+                            let result = storage.as_mut().map_or(Ok(()), |storage| finish_journal(storage, document, generation));
                             complete(DocumentResult::JournalClosed { document, result });
                         }
                         DocumentRequest::FlushJournals => {
@@ -774,6 +942,7 @@ impl DocumentWorker {
             // cannot drain. A failed shutdown is never reported as a clean stop.
             for request in deferred {
                 match request {
+                    DocumentRequest::DiscardHex { document, editor } => hex.discard(document, editor),
                     DocumentRequest::Journal { document, receipt, .. } => {
                         capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
                         complete(DocumentResult::JournalQueued {
@@ -806,6 +975,7 @@ impl DocumentWorker {
                     .map_err(|_| io::Error::other("Journal shutdown timed out; pending seeds are not durable"))
                     .and_then(|result| result);
                 storage.journals.clear();
+                storage.finished_journals.clear();
                 let retirement = storage.encoding.retire();
                 if retirement.live != 0 || retirement.cleanup_pending != 0 || retirement.first_error.is_some() {
                     let error = PendingBackingRetirement {
@@ -1013,7 +1183,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             recovered.and_then(|(document, recovered, origins)| {
                 let handle = resume(&service, recovered)?;
                 let revision = document.revision();
-                let mut journal = JournalState::new(handle, revision, 0);
+                let mut journal = JournalState::new(handle, revision, 0, document_policy(&document));
                 journal.origins = origins;
                 journals.insert(tab.id, journal);
                 Ok(document)
@@ -1039,7 +1209,17 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
     let durable_session = session::load_session(&root.join("session.kws"))?;
     Ok((
         PreparedWorkspace { session, documents },
-        Storage { root, _ownership: ownership, service, journals, order: HashMap::new(), durable_session, encoding },
+        Storage {
+            root,
+            _ownership: ownership,
+            service,
+            journals,
+            finished_journals: HashMap::new(),
+            transports: HashMap::new(),
+            order: HashMap::new(),
+            durable_session,
+            encoding,
+        },
     ))
 }
 
@@ -1086,6 +1266,42 @@ fn persist_session(storage: &mut Storage, next: &Session) -> io::Result<()> {
     retire_evicted(storage, next)?;
     session::store_session(&storage.root.join("session.kws"), next)?;
     storage.durable_session = next.clone();
+    storage.finished_journals.retain(|id, _| next.tabs().iter().chain(next.closed()).any(|tab| tab.id == *id));
+    storage.transports.retain(|id, _| next.tabs().iter().chain(next.closed()).any(|tab| tab.id == *id));
+    Ok(())
+}
+
+fn finish_journal(storage: &mut Storage, document: DocumentId, generation: u64) -> io::Result<()> {
+    if !storage.journals.get(&document).is_some_and(|journal| journal.generation <= generation) {
+        return Ok(());
+    }
+    if storage.transports.contains_key(&document) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "transport seed is not durable; journal and editor retained",
+        ));
+    }
+    if storage.finished_journals.contains_key(&document)
+        || storage.finished_journals.len() >= session::MAX_TABS + session::MAX_CLOSED
+    {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, "previous journal owner capacity retained"));
+    }
+    storage.finished_journals.try_reserve(1).map_err(io::Error::other)?;
+    let journal = storage.journals.get_mut(&document).expect("journal to finish");
+    let result = submit(&journal.handle, kwil_core_workspace::journal::JournalCommand::Finish).and_then(|_| {
+        journal
+            .handle
+            .finished
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| io::Error::other("Journal close timed out; exact previous owners retained"))?
+            .map(|_| ())
+    });
+    if let Err(error) = result {
+        journal.failed = true;
+        return Err(error);
+    }
+    let journal = storage.journals.remove(&document).expect("finished journal still owned");
+    storage.finished_journals.insert(document, journal);
     Ok(())
 }
 
@@ -1105,14 +1321,47 @@ fn seed_journal(
 ) -> io::Result<()> {
     let SeedSnapshot { revision, snapshot } = source;
     if let Some(journal) = storage.journals.get_mut(&document) {
+        if journal.policy.raw_bytes != policy.raw_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal transport policy changed; prior journal retained",
+            ));
+        }
         journal.generation = journal.generation.max(generation);
         return Ok(());
     }
-    let sequence = (*storage.order.entry(document).or_insert(sequence)).max(sequence);
-    let journal_path = storage.root.join(format!("{}.kwj", document.0));
+    let transport = storage.transports.get(&document).copied();
+    if let Some(expected) = transport {
+        if expected.policy != policy || expected.revision != revision || expected.len != snapshot.len() || sequence != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transport seed identity or initial sequence mismatch; prior recovery retained",
+            ));
+        }
+    }
+    let sequence =
+        if transport.is_some() { 0 } else { (*storage.order.entry(document).or_insert(sequence)).max(sequence) };
+    let canonical = storage.root.join(format!("{}.kwj", document.0));
+    let promotion = transport.map(|_| {
+        let mut path = canonical.as_os_str().to_os_string();
+        path.push(".next");
+        PathBuf::from(path)
+    });
+    if let Some(staged) = &promotion {
+        let mut pending = staged.as_os_str().to_os_string();
+        pending.push(".pending");
+        if staged.try_exists()? || PathBuf::from(pending).try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "unselected transport .next recovery retained; reconcile before another transition",
+            ));
+        }
+    }
+    let journal_path = promotion.as_ref().unwrap_or(&canonical).clone();
     let mut origins = Some(provenance::OriginRegistry::new(session::MAX_TABS + session::MAX_CLOSED, 8 * 1024 * 1024));
     let mut seed_origins = None;
-    let handle = if journal_path.try_exists()? {
+    let handle = if promotion.is_none() && journal_path.try_exists()? {
         let metadata = storage
             .durable_session
             .tabs()
@@ -1133,6 +1382,12 @@ fn seed_journal(
             });
         let (replayed, recovered, _, restored_origins) =
             recover_prepared(&storage.root, &mut storage.encoding, journal_path, &metadata)?;
+        if document_policy(&replayed).raw_bytes != policy.raw_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reopened journal transport policy disagrees; recovery retained",
+            ));
+        }
         if recovered.summary().revision != revision || recovered.summary().byte_len != snapshot.len() {
             return Err(io::Error::other("Journal revision disagrees with reopened document; recovery retained"));
         }
@@ -1174,10 +1429,11 @@ fn seed_journal(
             }
         }
     };
-    let mut state = JournalState::new(handle, revision, sequence);
+    let mut state = JournalState::new(handle, revision, sequence, policy);
     state.origins = origins;
     state.seed_origins = seed_origins;
     state.generation = generation;
+    state.promotion = promotion;
     storage.journals.insert(document, state);
     Ok(())
 }
@@ -1196,16 +1452,256 @@ fn submit(handle: &JournalSession, mut command: kwil_core_workspace::journal::Jo
     }
 }
 
-struct JournalBytes<'a>(&'a JournalSession);
-impl io::Write for JournalBytes<'_> {
+#[derive(Clone, Copy, Debug)]
+enum JournalTransportPhase {
+    Count,
+    Counted,
+    Visit,
+    Plan,
+    Copy,
+    Admit,
+    EndReplacement,
+    Commit,
+    Finished,
+    Failed,
+}
+
+/// One worker-owned transport block. Capsule records and source pieces can be
+/// tiny; their boundaries must not become individual queue/disk operations.
+/// Drop deliberately does NOT flush: only an explicit successful boundary can
+/// authorize capsule admission or a journal replacement/batch terminator.
+struct JournalBytes<F> {
+    send: F,
+    pending: Vec<u8>,
+    failed: bool,
+    #[cfg(any(test, debug_assertions))]
+    diagnostics: JournalTransportDiagnostics,
+}
+
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug)]
+struct JournalTransportDiagnostics {
+    started: std::time::Instant,
+    phases: u16,
+    writes: u64,
+    input_bytes: u64,
+    commands: u64,
+    queued_bytes: u64,
+    max_buffer: usize,
+}
+
+impl<F: FnMut(Vec<u8>) -> io::Result<()>> JournalBytes<F> {
+    fn new(send: F) -> Self {
+        Self {
+            send,
+            pending: Vec::with_capacity(kwil_core_workspace::journal::JOURNAL_CHUNK),
+            failed: false,
+            #[cfg(any(test, debug_assertions))]
+            diagnostics: JournalTransportDiagnostics {
+                started: std::time::Instant::now(),
+                phases: 0,
+                writes: 0,
+                input_bytes: 0,
+                commands: 0,
+                queued_bytes: 0,
+                max_buffer: 0,
+            },
+        }
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self.failed { Err(io::Error::other("Journal transport previously failed")) } else { Ok(()) }
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        self.check()?;
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let bytes =
+            std::mem::replace(&mut self.pending, Vec::with_capacity(kwil_core_workspace::journal::JOURNAL_CHUNK));
+        #[cfg(any(test, debug_assertions))]
+        let len = bytes.len() as u64;
+        if let Err(error) = (self.send)(bytes) {
+            self.failed = true;
+            return Err(error);
+        }
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.diagnostics.commands = self.diagnostics.commands.saturating_add(1);
+            self.diagnostics.queued_bytes = self.diagnostics.queued_bytes.saturating_add(len);
+        }
+        Ok(())
+    }
+
+    /// io::copy alone does not flush a short final block. Reader failure also
+    /// poisons the transport, so trailing partial bytes can never be retried as
+    /// a complete capsule. The caller may admit only after this returns Ok.
+    fn copy_from(&mut self, reader: &mut impl io::Read) -> io::Result<u64> {
+        self.check()?;
+        let result = io::copy(reader, self).and_then(|copied| self.flush_pending().map(|()| copied));
+        if result.is_err() {
+            self.failed = true;
+            self.pending.clear();
+        }
+        result
+    }
+
+    // At most ten phase records per receipt, independent of edit/span count.
+    // Debug production logging is opt-in; only its boolean switch is cached.
+    // No release logging or per-piece diagnostics.
+    fn diagnose(&mut self, _document: DocumentId, _sequence: u64, _phase: JournalTransportPhase) {
+        #[cfg(all(debug_assertions, not(test)))]
+        {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !TRACE.get_or_init(|| std::env::var("KWIL_TRACE_JOURNAL_TRANSPORT").is_ok_and(|value| value == "1")) {
+                return;
+            }
+        }
+        #[cfg(any(test, debug_assertions))]
+        {
+            let bit = 1_u16 << (_phase as u8);
+            if self.diagnostics.phases & bit == 0 {
+                self.diagnostics.phases |= bit;
+                eprintln!(
+                    "journal transport diagnostics: document={} sequence={} phase={_phase:?} elapsed={:?} writes={} input_bytes={} commands={} queued_bytes={} max_buffer={}",
+                    _document.0,
+                    _sequence,
+                    self.diagnostics.started.elapsed(),
+                    self.diagnostics.writes,
+                    self.diagnostics.input_bytes,
+                    self.diagnostics.commands,
+                    self.diagnostics.queued_bytes,
+                    self.diagnostics.max_buffer,
+                );
+            }
+        }
+    }
+}
+
+impl<F: FnMut(Vec<u8>) -> io::Result<()>> io::Write for JournalBytes<F> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        for chunk in bytes.chunks(kwil_core_workspace::journal::JOURNAL_CHUNK) {
-            submit(self.0, kwil_core_workspace::journal::JournalCommand::Bytes(chunk.to_vec()))?;
+        self.check()?;
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.diagnostics.writes = self.diagnostics.writes.saturating_add(1);
+            self.diagnostics.input_bytes = self.diagnostics.input_bytes.saturating_add(bytes.len() as u64);
+        }
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let n = remaining.len().min(kwil_core_workspace::journal::JOURNAL_CHUNK - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..n]);
+            remaining = &remaining[n..];
+            #[cfg(any(test, debug_assertions))]
+            {
+                self.diagnostics.max_buffer = self.diagnostics.max_buffer.max(self.pending.len());
+            }
+            if self.pending.len() == kwil_core_workspace::journal::JOURNAL_CHUNK {
+                self.flush_pending()?;
+            }
         }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.flush_pending()
+    }
+}
+
+#[cfg(test)]
+mod journal_transport_tests {
+    use super::*;
+    use kwil_core_workspace::journal::JOURNAL_CHUNK;
+    use std::io::{Read, Write};
+
+    struct ShortReads<R>(R);
+    impl<R: Read> Read for ShortReads<R> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let len = output.len().min(3);
+            self.0.read(&mut output[..len])
+        }
+    }
+
+    #[test]
+    fn journal_transport_short_reads_coalesce_with_exact_final_flush() {
+        let input: Vec<u8> = (0..2 * JOURNAL_CHUNK + 17).map(|n| n as u8).collect();
+        let mut frames = Vec::new();
+        let mut transport = JournalBytes::new(|bytes| {
+            frames.push(bytes);
+            Ok(())
+        });
+        assert_eq!(transport.copy_from(&mut ShortReads(io::Cursor::new(&input))).unwrap(), input.len() as u64);
+        transport.flush().unwrap(); // Empty flush emits no extra command.
+        assert_eq!(transport.diagnostics.commands, 3);
+        assert_eq!(transport.diagnostics.max_buffer, JOURNAL_CHUNK);
+        assert!(transport.diagnostics.writes > transport.diagnostics.commands);
+        drop(transport);
+        assert_eq!(frames.iter().map(Vec::len).collect::<Vec<_>>(), vec![JOURNAL_CHUNK, JOURNAL_CHUNK, 17]);
+        assert_eq!(frames.concat(), input);
+    }
+
+    #[test]
+    fn journal_transport_failed_trailing_flush_cannot_admit_or_retry() {
+        let input = vec![0xa5; JOURNAL_CHUNK + 17];
+        let (mut calls, mut accepted, mut admitted) = (0, Vec::new(), false);
+        let mut transport = JournalBytes::new(|bytes| {
+            calls += 1;
+            if calls == 2 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "refused trailing block"));
+            }
+            accepted.push(bytes);
+            Ok(())
+        });
+        let result = transport.copy_from(&mut ShortReads(io::Cursor::new(&input))).map(|_| admitted = true);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert!(!admitted);
+        assert!(transport.flush().is_err());
+        assert!(transport.write_all(b"must not follow failure").is_err());
+        assert_eq!(transport.diagnostics.commands, 1);
+        drop(transport);
+        assert_eq!(calls, 2, "failed payload is never retried or acknowledged");
+        assert_eq!(accepted, vec![input[..JOURNAL_CHUNK].to_vec()]);
+    }
+
+    #[test]
+    fn journal_transport_reader_error_discards_unacknowledged_tail() {
+        struct FailsAfterBytes(io::Cursor<Vec<u8>>);
+        impl Read for FailsAfterBytes {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.0.position() == self.0.get_ref().len() as u64 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "capsule reader failed"));
+                }
+                self.0.read(output)
+            }
+        }
+        let mut frames = Vec::new();
+        let mut transport = JournalBytes::new(|bytes| {
+            frames.push(bytes);
+            Ok(())
+        });
+        let error = transport.copy_from(&mut FailsAfterBytes(io::Cursor::new(vec![7; JOURNAL_CHUNK + 17])));
+        assert_eq!(error.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert!(transport.pending.is_empty());
+        assert!(transport.flush().is_err());
+        drop(transport);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], vec![7; JOURNAL_CHUNK]);
+    }
+
+    #[test]
+    fn journal_transport_explicit_boundaries_do_not_merge_replacements() {
+        let mut frames = Vec::new();
+        let mut transport = JournalBytes::new(|bytes| {
+            frames.push(bytes);
+            Ok(())
+        });
+        transport.write_all(b"a").unwrap();
+        transport.write_all(b"bc").unwrap();
+        assert_eq!(transport.diagnostics.commands, 0);
+        transport.flush().unwrap();
+        transport.write_all(b"next").unwrap();
+        transport.flush().unwrap();
+        drop(transport);
+        assert_eq!(frames, vec![b"abc".to_vec(), b"next".to_vec()]);
     }
 }
 
@@ -1229,6 +1725,8 @@ fn journal_receipt(
         policy,
     )?;
     let journal = storage.journals.get_mut(&document).unwrap();
+    let handle = &journal.handle;
+    let mut transport = JournalBytes::new(|bytes| submit(handle, C::Bytes(bytes)));
     let result = (|| {
         if journal.failed
             || journal.generation != generation
@@ -1241,11 +1739,13 @@ fn journal_receipt(
         // share a bounded span instead of forcing one tree rewrite/capsule per
         // character. The observer's original receipt/undo recipe stays intact.
         let mut replacements = 0_u64;
+        transport.diagnose(document, receipt.sequence, JournalTransportPhase::Count);
         visit_journal_replacements(&receipt, &mut |_| {
             replacements =
                 replacements.checked_add(1).ok_or_else(|| io::Error::other("Journal replacement count overflow"))?;
             Ok(())
         })?;
+        transport.diagnose(document, receipt.sequence, JournalTransportPhase::Counted);
         #[cfg(test)]
         eprintln!(
             "journal receipt diagnostics: document={} sequence={} recipe_edits={} emitted_spans={replacements}",
@@ -1264,6 +1764,7 @@ fn journal_receipt(
                     replacements,
                 }),
             )?;
+            transport.diagnose(document, receipt.sequence, JournalTransportPhase::Visit);
             visit_journal_replacements(&receipt, &mut |replacement| {
                 submit(
                     &journal.handle,
@@ -1273,9 +1774,14 @@ fn journal_receipt(
                         inserted: replacement.insert.len(),
                     }),
                 )?;
-                replacement.insert.write_to(&mut JournalBytes(&journal.handle))?;
+                transport.diagnose(document, receipt.sequence, JournalTransportPhase::Copy);
+                replacement.insert.write_to(&mut transport)?;
+                transport.flush_pending()?;
+                transport.diagnose(document, receipt.sequence, JournalTransportPhase::EndReplacement);
                 submit(&journal.handle, C::EndReplacement)
             })?;
+            transport.flush_pending()?;
+            transport.diagnose(document, receipt.sequence, JournalTransportPhase::Commit);
             submit(&journal.handle, C::CommitBatch)?;
             journal.revision = receipt.after_revision;
             journal.sequence = receipt.sequence;
@@ -1295,14 +1801,16 @@ fn journal_receipt(
         )?;
         #[cfg(test)]
         let (mut text_records, mut origin_records, mut opaque_records) = (0_u64, 0_u64, 0_u64);
+        transport.diagnose(document, receipt.sequence, JournalTransportPhase::Visit);
         visit_journal_replacements(&receipt, &mut |replacement| {
+            transport.diagnose(document, receipt.sequence, JournalTransportPhase::Plan);
             #[cfg(test)]
             {
                 for chunk in replacement.insert.snapshot.source_chunks(replacement.insert.range.clone())? {
                     match chunk.map_err(io::Error::other)? {
-                        kwil_core_text::SourceChunk::Original { .. } | kwil_core_text::SourceChunk::Added(_) => {
-                            text_records += 1
-                        }
+                        kwil_core_text::SourceChunk::Original { .. }
+                        | kwil_core_text::SourceChunk::Added(_)
+                        | kwil_core_text::SourceChunk::Preserved { .. } => text_records += 1,
                         kwil_core_text::SourceChunk::Decoded { .. } => origin_records += 1,
                         kwil_core_text::SourceChunk::Opaque { .. } => opaque_records += 1,
                     }
@@ -1323,9 +1831,13 @@ fn journal_receipt(
             )?;
             let mut reader = plan.start()?;
             // io::copy's fixed scratch is bounded independently of the file.
-            // Both serialization and queue admission remain on this worker.
-            io::copy(&mut reader, &mut JournalBytes(&journal.handle))?;
+            // Coalesce its short record reads, then explicitly queue the final
+            // block BEFORE admission or any replacement/batch terminator.
+            transport.diagnose(document, receipt.sequence, JournalTransportPhase::Copy);
+            transport.copy_from(&mut reader)?;
+            transport.diagnose(document, receipt.sequence, JournalTransportPhase::Admit);
             reader.admit()?;
+            transport.diagnose(document, receipt.sequence, JournalTransportPhase::EndReplacement);
             submit(&journal.handle, C::EndReplacement)
         })?;
         #[cfg(test)]
@@ -1333,6 +1845,8 @@ fn journal_receipt(
             "journal capsule diagnostics: sequence={} text_records={text_records} origin_records={origin_records} opaque_records={opaque_records}",
             receipt.sequence
         );
+        transport.flush_pending()?;
+        transport.diagnose(document, receipt.sequence, JournalTransportPhase::Commit);
         submit(&journal.handle, C::CommitBatch)?;
         batch.commit()?;
         journal.revision = receipt.after_revision;
@@ -1340,6 +1854,11 @@ fn journal_receipt(
         journal.needs_flush = true;
         Ok(())
     })();
+    transport.diagnose(
+        document,
+        receipt.sequence,
+        if result.is_err() { JournalTransportPhase::Failed } else { JournalTransportPhase::Finished },
+    );
     if result.is_err() {
         journal.failed = true;
     } else {
@@ -1404,6 +1923,32 @@ fn visit_journal_replacements(
     Ok(())
 }
 
+fn promote_transport_seed(
+    root: &std::path::Path,
+    service: &JournalService,
+    document: DocumentId,
+    journal: &mut JournalState,
+) -> io::Result<()> {
+    let staged = journal.promotion.as_ref().expect("staged transport seed");
+    submit(&journal.handle, kwil_core_workspace::journal::JournalCommand::Finish)?;
+    journal
+        .handle
+        .finished
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| io::Error::other("staged transport close timed out; prior recovery and owners retained"))??;
+    let canonical = root.join(format!("{}.kwj", document.0));
+    kwil_core_workspace::journal::promote_finished_seed(staged, &canonical, document)?;
+    let recovered = RecoveredJournal::open(canonical, document, &AtomicBool::new(false), |_| Ok(()))?;
+    let handle = resume(service, recovered)?;
+    handle
+        .ready
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| io::Error::other("promoted transport resume timed out; canonical new recovery retained"))??;
+    journal.handle = handle;
+    journal.promotion = None;
+    Ok(())
+}
+
 fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
     for (&document, journal) in &mut storage.journals {
         if journal.failed {
@@ -1436,6 +1981,34 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
                             result: Err(error),
                         });
                         continue;
+                    }
+                    if journal.promotion.is_some() {
+                        if let Err(error) = promote_transport_seed(&storage.root, &storage.service, document, journal) {
+                            journal.failed = true;
+                            complete(DocumentResult::JournalDurable {
+                                document,
+                                revision: journal.revision,
+                                sequence: journal.sequence,
+                                result: Err(error),
+                            });
+                            continue;
+                        }
+                        // The old receipt counter belongs to the old coordinate
+                        // system. Publish the new zero boundary only AFTER its
+                        // durable seed, atomic authority promotion and resume.
+                        storage.order.insert(document, journal.sequence);
+                        storage.transports.remove(&document);
+                        storage.finished_journals.remove(&document);
+                        journal.needs_flush = false;
+                        journal.flush_due = std::time::Instant::now() + Duration::from_secs(2);
+                        complete(DocumentResult::JournalDurable {
+                            document,
+                            revision: journal.revision,
+                            sequence: journal.sequence,
+                            result: Ok(()),
+                        });
+                    } else {
+                        storage.finished_journals.remove(&document);
                     }
                     journal.ready = true;
                 }
@@ -1941,6 +2514,7 @@ mod tests {
         storage.service.finish();
         storage.service.finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         storage.journals.clear();
+        storage.finished_journals.clear();
         let _ = storage.encoding.retire();
         drop(storage);
     }

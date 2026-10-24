@@ -28,7 +28,10 @@
 //! shutdown.shutdown().map_err(std::io::Error::other)?;
 //! # Ok(()) }
 //! ```
-use crate::settings_panels::{PanelInput, PanelWindow, SettingsPanelController};
+use crate::{
+    language_selection::AcceptedLanguageMappings,
+    settings_panels::{PanelInput, PanelWindow, SettingsPanelController},
+};
 use kwil_core_commands::{
     Settings,
     settings::{SettingsError, SettingsWorker, SettingsWorkerEvent},
@@ -84,14 +87,55 @@ pub enum SettingsAppliedReason {
 pub struct SettingsApplied {
     pub settings: Settings,
     pub file_types: BTreeMap<String, String>,
+    /// Validated on the settings worker for this exact accepted candidate.
+    /// Frontends move/clone this into HighlightSession::apply_mappings; never
+    /// parse language ids or compile a Detector while consuming this receipt.
+    pub language_mappings: AcceptedLanguageMappings,
     pub source: Option<String>,
     pub receipt: u64,
     pub reason: SettingsAppliedReason,
 }
 
+/// Only this prepared form enters the frontend mailbox. Construction runs in
+/// the existing SettingsWorker callback, before taking any queue lock. Loaded
+/// already owns a parsed document; Saved's exact acknowledged source is parsed
+/// here on that same worker, independently of any newer local draft.
+#[derive(Debug)]
+enum PreparedSettingsEvent {
+    Loaded { source: Option<String>, document: Box<SettingsDocument>, language_mappings: AcceptedLanguageMappings },
+    Saved { request: u64, source: String, language_mappings: Result<AcceptedLanguageMappings, String> },
+    Error { request: Option<u64>, message: String },
+}
+impl PreparedSettingsEvent {
+    fn prepare(event: SettingsWorkerEvent) -> Self {
+        match event {
+            SettingsWorkerEvent::Loaded { source, document } => {
+                match AcceptedLanguageMappings::prepare(document.file_types()) {
+                    Ok(language_mappings) => Self::Loaded { source, document, language_mappings },
+                    Err(error) => Self::Error { request: None, message: error.to_string() },
+                }
+            }
+            SettingsWorkerEvent::Saved { request, source } => {
+                let prepared = SettingsDocument::parse(&source)
+                    .and_then(|document| AcceptedLanguageMappings::prepare(document.file_types()));
+                // Retain the source even on semantic failure so the UI still
+                // checks the exact pending receipt before settling a save.
+                // The backend has already acknowledged the write; a failed
+                // candidate never becomes accepted runtime state.
+                Self::Saved {
+                    request,
+                    source,
+                    language_mappings: prepared.map_err(|error| format!("saved settings were not applied: {error}")),
+                }
+            }
+            SettingsWorkerEvent::Error { request, message } => Self::Error { request, message },
+        }
+    }
+}
+
 #[derive(Default)]
 struct Mailbox {
-    events: VecDeque<SettingsWorkerEvent>,
+    events: VecDeque<PreparedSettingsEvent>,
     closed: bool,
     producer_finished: bool,
     #[cfg(test)]
@@ -107,7 +151,7 @@ impl EventQueue {
     // Backpressure belongs exclusively to the producer. Every event survives a
     // burst; in particular Saved cannot evict Loaded, or vice versa. Each event
     // is bounded by the backend's 1 MiB document cap. No lock spans a wake.
-    fn push(&self, event: SettingsWorkerEvent, wake: &dyn Fn()) {
+    fn push_prepared(&self, event: PreparedSettingsEvent, wake: &dyn Fn()) {
         let mut mailbox = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
         while mailbox.events.len() == EVENT_LIMIT && !mailbox.closed {
             mailbox = self.space.wait(mailbox).unwrap_or_else(|e| e.into_inner());
@@ -123,7 +167,12 @@ impl EventQueue {
             wake();
         }
     }
-    fn drain(&self) -> VecDeque<SettingsWorkerEvent> {
+    // Direct event injection prepares on the test producer/setup side too.
+    #[cfg(test)]
+    fn push(&self, event: SettingsWorkerEvent, wake: &dyn Fn()) {
+        self.push_prepared(PreparedSettingsEvent::prepare(event), wake);
+    }
+    fn drain(&self) -> VecDeque<PreparedSettingsEvent> {
         let mut mailbox = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
         let events = std::mem::take(&mut mailbox.events);
         self.space.notify_all();
@@ -161,7 +210,7 @@ impl EventQueue {
 struct EventProducer(Arc<EventQueue>);
 impl EventProducer {
     fn push(&self, event: SettingsWorkerEvent, wake: &dyn Fn()) {
-        self.0.push(event, wake);
+        self.0.push_prepared(PreparedSettingsEvent::prepare(event), wake);
     }
 }
 impl Drop for EventProducer {
@@ -241,6 +290,7 @@ struct PendingSave {
 struct External {
     source: Option<String>,
     document: SettingsDocument,
+    language_mappings: AcceptedLanguageMappings,
 }
 
 #[cfg(test)]
@@ -304,7 +354,12 @@ pub struct SettingsSession {
     retire: Option<mpsc::SyncSender<()>>,
     retirement: Option<JoinHandle<()>>,
     menu: Option<SettingsMenu>,
+    // The accepted runtime document is distinct from the last acknowledged
+    // disk contents. A legacy/rejected Saved still advances the optimistic
+    // write baseline, without accepting its settings or mappings.
     baseline: Option<External>,
+    // Outer None = not loaded; inner None = acknowledged missing file.
+    disk_source: Option<Option<String>>,
     external: Option<External>,
     pending: Option<PendingSave>,
     save_again: bool,
@@ -341,9 +396,13 @@ impl SettingsSession {
                 drop(worker);
             }
         })?;
-        let worker = Arc::new(SettingsWorker::start(path.clone(), move |event| {
-            worker_events.push(event, wake.as_ref());
-        })?);
+        let worker = Arc::new(SettingsWorker::start_with_validator(
+            path.clone(),
+            |document| AcceptedLanguageMappings::prepare(document.file_types()).map(|_| ()),
+            move |event| {
+                worker_events.push(event, wake.as_ref());
+            },
+        )?);
         if let Err(error) = own_tx.send(worker.clone()) {
             // The receiver has no fallible operation before recv. Even if it
             // were to fail unexpectedly, never run backend Drop on the UI.
@@ -367,6 +426,7 @@ impl SettingsSession {
             retirement: None,
             menu: None,
             baseline: None,
+            disk_source: None,
             external: None,
             pending: None,
             save_again: false,
@@ -538,7 +598,7 @@ impl SettingsSession {
         &self.status
     }
     pub fn source_exists(&self) -> bool {
-        self.baseline.as_ref().is_some_and(|base| base.source.is_some())
+        self.disk_source.as_ref().is_some_and(Option::is_some)
     }
     pub fn last_error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -551,7 +611,10 @@ impl SettingsSession {
     }
     pub fn is_dirty(&self) -> bool {
         match (&self.menu, &self.baseline) {
-            (Some(menu), Some(base)) => menu.document().source() != base.document.source(),
+            (Some(menu), Some(base)) => {
+                menu.document().source() != base.document.source()
+                    || self.disk_source.as_ref().is_some_and(|disk| disk != &base.source)
+            }
             _ => false,
         }
     }
@@ -785,7 +848,7 @@ impl SettingsSession {
             return Ok(());
         }
         let document = self.document().ok_or("settings have not loaded")?.clone();
-        let expected = self.baseline.as_ref().ok_or("settings have not loaded")?.source.clone();
+        let expected = self.disk_source.as_ref().ok_or("settings have not loaded")?.clone();
         let request = self.next_request;
         self.next_request = request.checked_add(1).ok_or("settings request identity exhausted")?;
         self.client
@@ -810,9 +873,9 @@ impl SettingsSession {
         self.update_status();
         changed
     }
-    fn receive(&mut self, event: SettingsWorkerEvent) {
+    fn receive(&mut self, event: PreparedSettingsEvent) {
         match event {
-            SettingsWorkerEvent::Loaded { source, document } => {
+            PreparedSettingsEvent::Loaded { source, document, language_mappings } => {
                 // A Saved is followed by Loaded for the same source. It must
                 // not conflict with edits made while that save was in flight.
                 if self.baseline.as_ref().is_some_and(|base| base.source == source) {
@@ -820,12 +883,12 @@ impl SettingsSession {
                     return;
                 }
                 if self.is_dirty() || self.editing.is_some() || self.panel_is_editing() || self.pending.is_some() {
-                    self.external = Some(External { source, document: *document });
+                    self.external = Some(External { source, document: *document, language_mappings });
                 } else {
-                    self.adopt(source, *document, SettingsAppliedReason::Loaded);
+                    self.adopt(source, *document, language_mappings, SettingsAppliedReason::Loaded);
                 }
             }
-            SettingsWorkerEvent::Saved { request, source } => {
+            PreparedSettingsEvent::Saved { request, source, language_mappings } => {
                 let Some(pending) = self.pending.as_ref().filter(|pending| pending.request == request) else {
                     self.error = Some("unexpected settings save acknowledgement".into());
                     self.save_error = self.error.clone();
@@ -836,9 +899,29 @@ impl SettingsSession {
                     self.save_error = self.error.clone();
                     return;
                 }
+                // Receipt identity and contents match the pending write. Its
+                // disk effect is acknowledged even if semantic preparation
+                // subsequently rejects runtime adoption. Corrective saves
+                // must compare against these bytes, not old accepted state.
+                self.disk_source = Some(Some(source.clone()));
+                let language_mappings = match language_mappings {
+                    Ok(mappings) => mappings,
+                    Err(message) => {
+                        self.pending = None;
+                        self.save_again = false;
+                        self.save_error = Some(message.clone());
+                        self.error = Some(message);
+                        return;
+                    }
+                };
                 let pending = self.pending.take().unwrap();
-                self.publish(&pending.document, Some(source.clone()), SettingsAppliedReason::Saved { request });
-                self.baseline = Some(External { source: Some(source), document: pending.document });
+                self.publish(
+                    &pending.document,
+                    &language_mappings,
+                    Some(source.clone()),
+                    SettingsAppliedReason::Saved { request },
+                );
+                self.baseline = Some(External { source: Some(source), document: pending.document, language_mappings });
                 self.save_error = None;
                 if self.save_again {
                     self.save_again = false;
@@ -847,7 +930,7 @@ impl SettingsSession {
                     }
                 }
             }
-            SettingsWorkerEvent::Error { request, message } => {
+            PreparedSettingsEvent::Error { request, message } => {
                 if request.is_some() && request == self.pending.as_ref().map(|pending| pending.request) {
                     self.pending = None;
                     self.save_again = false;
@@ -857,9 +940,16 @@ impl SettingsSession {
             }
         }
     }
-    fn adopt(&mut self, source: Option<String>, document: SettingsDocument, reason: SettingsAppliedReason) {
-        self.publish(&document, source.clone(), reason);
-        self.baseline = Some(External { source, document: document.clone() });
+    fn adopt(
+        &mut self,
+        source: Option<String>,
+        document: SettingsDocument,
+        language_mappings: AcceptedLanguageMappings,
+        reason: SettingsAppliedReason,
+    ) {
+        self.publish(&document, &language_mappings, source.clone(), reason);
+        self.disk_source = Some(source.clone());
+        self.baseline = Some(External { source, document: document.clone(), language_mappings });
         if let Some(menu) = &mut self.menu {
             menu.replace_document(document);
         } else {
@@ -869,11 +959,18 @@ impl SettingsSession {
             self.menu = Some(menu);
         }
     }
-    fn publish(&mut self, document: &SettingsDocument, source: Option<String>, reason: SettingsAppliedReason) {
+    fn publish(
+        &mut self,
+        document: &SettingsDocument,
+        language_mappings: &AcceptedLanguageMappings,
+        source: Option<String>,
+        reason: SettingsAppliedReason,
+    ) {
         self.receipt = self.receipt.checked_add(1).expect("settings receipt identity exhausted");
         self.applied = Some(SettingsApplied {
             settings: document.settings().clone(),
             file_types: document.file_types().clone(),
+            language_mappings: language_mappings.clone(),
             source,
             receipt: self.receipt,
             reason,
@@ -891,7 +988,7 @@ impl SettingsSession {
             self.panel = None;
             self.save_again = false;
             self.save_error = None;
-            self.adopt(external.source, external.document, SettingsAppliedReason::Loaded);
+            self.adopt(external.source, external.document, external.language_mappings, SettingsAppliedReason::Loaded);
             Ok(())
         })();
         self.finish_action(result)
@@ -972,6 +1069,7 @@ impl Drop for SettingsSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::highlighting::Language;
     use std::time::Duration;
 
     type Requests = TestRequests;
@@ -999,6 +1097,256 @@ mod tests {
         session.events.push(SettingsWorkerEvent::Saved { request: request.0, source: request.2.clone() }, &|| {});
         session.worker_ready();
     }
+
+    #[test]
+    fn settings_mapping_loaded_candidate_is_prepared_before_enqueue_and_rejected_whole() {
+        let old = "# old accepted\n[editor]\ntab_size=4\n[file_types]\nrs='rust'\n";
+        let (mut session, _) = fixture(Some(old));
+        let valid = "# new accepted\n[editor]\ntab_size=6\n[file_types]\nrs='py'\n";
+        loaded(&mut session, Some(valid));
+        let accepted = session.take_applied().unwrap();
+        assert_eq!(accepted.settings.editor.tab_size, 6);
+        assert_eq!(accepted.file_types["rs"], "py");
+        assert_eq!(accepted.language_mappings.mappings()[0].language, Language::Python);
+        assert_eq!(accepted.source.as_deref(), Some(valid));
+        let receipt = accepted.receipt;
+        let invalid = "[editor]\ntab_size=9\n[file_types]\nrs='lua'\nz='unknown-grammar'\n";
+        let producer = EventProducer(session.events.clone());
+        producer.push(
+            SettingsWorkerEvent::Loaded {
+                source: Some(invalid.into()),
+                document: Box::new(SettingsDocument::parse(invalid).unwrap()),
+            },
+            &|| {},
+        );
+        // Validation has already finished on the producer side. The UI cannot
+        // see an unprepared candidate, even with otherwise valid editor fields.
+        assert!(matches!(
+            session.events.mailbox.lock().unwrap().events.front(),
+            Some(PreparedSettingsEvent::Error { request: None, .. })
+        ));
+        assert!(session.worker_ready());
+        assert!(session.take_applied().is_none());
+        assert_eq!(session.receipt, receipt);
+        let baseline = session.baseline.as_ref().unwrap();
+        assert_eq!(baseline.source.as_deref(), Some(valid));
+        assert_eq!(baseline.document.settings().editor.tab_size, 6);
+        assert_eq!(baseline.language_mappings, accepted.language_mappings);
+        assert_eq!(session.document().unwrap().source(), valid);
+        assert!(!session.has_conflict(), "invalid reload must not create an adoptable partial candidate");
+        assert!(session.status().contains("unsupported language"));
+
+        // A truly removed file is a valid empty/default candidate, distinct
+        // from an invalid candidate that must retain the previous runtime.
+        loaded(&mut session, None);
+        let defaults = session.take_applied().unwrap();
+        assert_eq!(defaults.settings.editor.tab_size, 4);
+        assert!(defaults.file_types.is_empty());
+        assert!(defaults.language_mappings.mappings().is_empty());
+        assert_eq!(defaults.source, None);
+    }
+
+    #[test]
+    fn settings_mapping_invalid_initial_load_does_not_publish_default_fallback() {
+        let mut session = SettingsSession::state(PathBuf::new(), Arc::new(EventQueue::default()));
+        let source = "[file_types]\nrs='unavailable'\n";
+        loaded(&mut session, Some(source));
+        assert!(session.menu.is_none());
+        assert!(session.baseline.is_none());
+        assert_eq!(session.receipt, 0);
+        assert!(session.take_applied().is_none());
+        assert!(session.error.as_ref().unwrap().contains("unsupported language"));
+    }
+
+    #[test]
+    fn settings_mapping_excessive_loaded_table_retains_accepted_runtime_limit() {
+        let original = "[file_types]\nrs='rust'\n";
+        let (mut session, _) = fixture(Some(original));
+        let receipt = session.receipt;
+        let source = format!(
+            "[file_types]\n{}",
+            (0..=kwil_core_syntax::detection::MAX_MAPPINGS).map(|n| format!("ext{n}='rust'\n")).collect::<String>()
+        );
+        loaded(&mut session, Some(&source));
+        assert!(session.status().contains("at most"));
+        assert_eq!(session.receipt, receipt);
+        assert!(session.take_applied().is_none());
+        assert_eq!(session.document().unwrap().source(), original);
+        assert_eq!(session.baseline.as_ref().unwrap().language_mappings.mappings().len(), 1);
+        assert_eq!(session.disk_source.as_ref().unwrap().as_deref(), Some(original));
+        assert!(!session.has_conflict(), "excessive mappings cannot become an adoptable runtime candidate");
+    }
+
+    #[test]
+    fn settings_mapping_saved_receipt_uses_matching_pending_source_not_latest_draft() {
+        let original = "# preserve this comment\n[file_types]\nrs='rust'\n";
+        let (mut session, requests) = fixture(Some(original));
+        session.edit_document(|doc| doc.map_extension("rs", Some("py"))).unwrap();
+        let a = requests.lock().unwrap()[0].clone();
+        session.edit_document(|doc| doc.map_extension("rs", Some("js"))).unwrap();
+        let b_source = session.document().unwrap().source().to_owned();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        // Invalid candidate preparation must not bypass the source fence and
+        // accidentally settle a different pending document with this request.
+        saved(&mut session, &(a.0, None, "[file_types]\nrs='unavailable'\n".into()));
+        assert!(session.is_saving());
+        assert_eq!(session.pending.as_ref().unwrap().document.source(), a.2);
+        assert_eq!(session.disk_source.as_ref().unwrap().as_deref(), Some(original));
+        assert!(session.take_applied().is_none());
+
+        // A prepared but mismatched acknowledgement must publish neither the
+        // settings nor the mappings from newer B and must keep A in flight.
+        saved(&mut session, &(a.0, None, b_source.clone()));
+        assert!(session.is_saving());
+        assert!(session.take_applied().is_none());
+        assert_eq!(session.baseline.as_ref().unwrap().language_mappings.mappings()[0].language, Language::Rust);
+        saved(&mut session, &a);
+        let applied_a = session.take_applied().unwrap();
+        assert_eq!(applied_a.reason, SettingsAppliedReason::Saved { request: a.0 });
+        assert_eq!(applied_a.source.as_deref(), Some(a.2.as_str()));
+        assert_eq!(applied_a.file_types["rs"], "py");
+        assert_eq!(applied_a.language_mappings.mappings()[0].language, Language::Python);
+        assert_eq!(session.document().unwrap().file_types()["rs"], "js");
+        let b = requests.lock().unwrap()[1].clone();
+        assert_eq!(b.1.as_deref(), Some(a.2.as_str()));
+        assert_eq!(b.2, b_source);
+        assert!(b.2.contains("# preserve this comment"));
+        loaded(&mut session, Some(&a.2));
+        assert!(!session.has_conflict(), "echoed Loaded A must not conflict with pending B");
+        assert!(session.take_applied().is_none());
+        saved(&mut session, &b);
+        let applied_b = session.take_applied().unwrap();
+        assert_eq!(applied_b.file_types["rs"], "js");
+        assert_eq!(applied_b.language_mappings.mappings()[0].language, Language::JavaScript);
+        assert_eq!(applied_b.source.as_deref(), Some(b.2.as_str()));
+        assert!(applied_b.receipt > applied_a.receipt);
+    }
+
+    #[test]
+    fn settings_mapping_external_conflict_adopts_its_own_prepared_candidate_after_pending_save() {
+        let (mut session, requests) = fixture(Some("[file_types]\nrs='rust'\n"));
+        session.edit_document(|doc| doc.map_extension("rs", Some("python"))).unwrap();
+        let a = requests.lock().unwrap()[0].clone();
+        session.edit_document(|doc| doc.map_extension("rs", Some("lua"))).unwrap();
+        let external = "# external candidate\n[editor]\ntab_size=9\n[file_types]\nrs='ruby'\n";
+        loaded(&mut session, Some(external));
+        assert!(session.has_conflict());
+        assert!(session.take_applied().is_none());
+        assert!(session.adopt_external().is_err(), "pending save must settle first");
+        loaded(&mut session, Some("[file_types]\nrs='missing-provider-language'\n"));
+        assert_eq!(session.external.as_ref().unwrap().source.as_deref(), Some(external));
+        assert_eq!(session.external.as_ref().unwrap().language_mappings.mappings()[0].language, Language::Ruby);
+        saved(&mut session, &a);
+        assert_eq!(session.take_applied().unwrap().language_mappings.mappings()[0].language, Language::Python);
+        assert_eq!(requests.lock().unwrap().len(), 1, "external conflict must block coalesced local save");
+        session.adopt_external().unwrap();
+        let adopted = session.take_applied().unwrap();
+        assert_eq!(adopted.reason, SettingsAppliedReason::Loaded);
+        assert_eq!(adopted.source.as_deref(), Some(external));
+        assert_eq!(adopted.settings.editor.tab_size, 9);
+        assert_eq!(adopted.file_types["rs"], "ruby");
+        assert_eq!(adopted.language_mappings.mappings()[0].language, Language::Ruby);
+        assert_eq!(session.document().unwrap().source(), external);
+        assert!(!session.has_conflict());
+    }
+
+    #[test]
+    fn settings_mapping_invalid_saved_candidate_retains_runtime_and_fails_shutdown_drain() {
+        let original = "[editor]\ntab_size=4\n[file_types]\nrs='rust'\n";
+        let (mut session, requests) = fixture(Some(original));
+        let receipt = session.receipt;
+        session
+            .edit_document(|doc| {
+                doc.map_extension("rs", Some("unavailable"))?;
+                doc.edit("editor.tab_size", SettingValue::Integer(9))
+            })
+            .unwrap();
+        let a = requests.lock().unwrap()[0].clone();
+        saved(&mut session, &a);
+        assert!(!session.is_saving());
+        assert!(session.is_dirty(), "retain the rejected local draft for correction");
+        assert_eq!(session.receipt, receipt);
+        assert!(session.take_applied().is_none());
+        let baseline = session.baseline.as_ref().unwrap();
+        assert_eq!(baseline.source.as_deref(), Some(original));
+        assert_eq!(baseline.document.settings().editor.tab_size, 4);
+        assert_eq!(baseline.language_mappings.mappings()[0].language, Language::Rust);
+        assert!(session.status().contains("saved settings were not applied"));
+        // The backend write was acknowledged, so rejection must not claim an
+        // on-disk rollback or a successful accepted-save shutdown.
+        let error = session.stop().shutdown().unwrap_err();
+        assert!(error.contains("unsupported language"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn settings_mapping_rejected_saved_corrections_write_against_acknowledged_disk_source() {
+        struct Disk(PathBuf);
+        impl Drop for Disk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::remove_dir(self.0.parent().unwrap());
+            }
+        }
+        for restore_original in [true, false] {
+            let original = "# retained comment\n[editor]\ntab_size=4\n[file_types]\nrs='rust'\n";
+            let folder = std::env::temp_dir().join(format!(
+                "kwil-settings-correction-{}-{}-{restore_original}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir(&folder).unwrap();
+            let disk = Disk(folder.join("settings.toml"));
+            kwil_core_commands::settings::write_settings_atomic(&disk.0, None, original).unwrap();
+            let (mut session, requests) = fixture(Some(original));
+            let accepted_receipt = session.receipt;
+            session.edit_document(|doc| doc.map_extension("rs", Some("unavailable"))).unwrap();
+            let a = requests.lock().unwrap()[0].clone();
+            // Reproduce an already-written invalid candidate (for example a
+            // legacy writer). The new worker preflight prevents new ones.
+            kwil_core_commands::settings::write_settings_atomic(&disk.0, a.1.as_deref(), &a.2).unwrap();
+            saved(&mut session, &a);
+            assert_eq!(std::fs::read_to_string(&disk.0).unwrap(), a.2);
+            assert_eq!(session.disk_source.as_ref().unwrap().as_deref(), Some(a.2.as_str()));
+            assert_eq!(session.baseline.as_ref().unwrap().source.as_deref(), Some(original));
+            assert_eq!(session.receipt, accepted_receipt);
+            assert!(session.take_applied().is_none());
+            assert!(session.status().contains("saved settings were not applied"));
+
+            let corrected_source =
+                if restore_original { original.to_owned() } else { original.replace("'rust'", "'py'") };
+            // Prepare the test's replacement document outside the session.
+            let corrected = SettingsDocument::parse(&corrected_source).unwrap();
+            session
+                .edit_document(move |doc| {
+                    *doc = corrected;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(session.is_saving(), "restoring exact old source must still enqueue the corrective write");
+            assert!(session.is_dirty());
+            let b = requests.lock().unwrap()[1].clone();
+            assert_eq!(b.1.as_deref(), Some(a.2.as_str()), "compare against bytes actually acknowledged on disk");
+            assert_eq!(b.2, corrected_source);
+            assert_eq!(session.receipt, accepted_receipt, "correction must await its own acknowledgement");
+            assert!(session.take_applied().is_none());
+            kwil_core_commands::settings::write_settings_atomic(&disk.0, b.1.as_deref(), &b.2).unwrap();
+            assert_eq!(std::fs::read_to_string(&disk.0).unwrap(), corrected_source);
+            assert!(session.take_applied().is_none(), "disk write alone cannot advance runtime acceptance");
+            saved(&mut session, &b);
+            let applied = session.take_applied().unwrap();
+            assert_eq!(applied.source.as_deref(), Some(corrected_source.as_str()));
+            assert_eq!(
+                applied.language_mappings.mappings()[0].language,
+                if restore_original { Language::Rust } else { Language::Python }
+            );
+            assert!(applied.receipt > accepted_receipt);
+            assert!(!session.is_dirty());
+            assert!(!session.is_saving());
+        }
+    }
+
     fn select(session: &mut SettingsSession, query: &str) {
         session.query = TextInput::new(query.into()).unwrap();
         session.menu.as_mut().unwrap().search(query);
@@ -1206,7 +1554,12 @@ mod tests {
     #[test]
     fn settings_panel_capacity_rejects_add_before_save_and_never_traps_cancel() {
         let source = format!("[file_types]\n{}", (0..4095).map(|n| format!("ext{n}='rust'\n")).collect::<String>());
-        let (mut session, requests) = fixture(Some(&source));
+        let (mut session, requests) = fixture(Some(""));
+        // Exercise the generic panel's independent row-capacity/escape
+        // contract using a constructed local draft, not an accepted Loaded
+        // event. Production rejects tables above Detector::MAX_MAPPINGS;
+        // the separate semantic-limit test above keeps that bound binding.
+        session.menu = Some(SettingsMenu::new(SettingsDocument::parse(&source).unwrap()));
         activate_panel(&mut session, "file_types");
         session.panel_input(PanelInput::Text("no matching mapping")).unwrap();
         session.panel_input(PanelInput::Accept).unwrap();
@@ -1499,9 +1852,12 @@ mod tests {
         let producer_queue = queue.clone();
         let producer = thread::spawn(move || {
             for request in 0..EVENT_LIMIT as u64 + 3 {
-                producer_queue.push(SettingsWorkerEvent::Saved { request, source: request.to_string() }, &|| {
-                    wake_tx.send(()).unwrap();
-                });
+                producer_queue.push(
+                    SettingsWorkerEvent::Saved { request, source: format!("# event {request}\n") },
+                    &|| {
+                        wake_tx.send(()).unwrap();
+                    },
+                );
             }
             finished_tx.send(()).unwrap();
         });
@@ -1509,7 +1865,7 @@ mod tests {
         while received.len() < EVENT_LIMIT + 3 {
             wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             received.extend(queue.drain().into_iter().map(|event| match event {
-                SettingsWorkerEvent::Saved { request, .. } => request,
+                PreparedSettingsEvent::Saved { request, .. } => request,
                 _ => panic!("unexpected event"),
             }));
         }
@@ -1565,6 +1921,31 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
         session.worker_ready();
         assert_eq!(session.take_applied().unwrap().settings.editor.tab_size, 6);
+        let accepted_source = std::fs::read_to_string(&path).unwrap();
+        let receipt = session.receipt;
+        let drain_save = |session: &mut SettingsSession| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while session.is_saving() {
+                rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+                session.worker_ready();
+            }
+        };
+        session.edit_document(|doc| doc.map_extension("rs", Some("unavailable"))).unwrap();
+        drain_save(&mut session);
+        assert!(session.take_applied().is_none());
+        assert_eq!(session.receipt, receipt);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            accepted_source,
+            "session's production worker must reject mappings BEFORE persistence"
+        );
+        assert_eq!(session.disk_source.as_ref().unwrap().as_deref(), Some(accepted_source.as_str()));
+        assert!(session.status().contains("unsupported language"));
+        session.edit_document(|doc| doc.map_extension("rs", Some("python"))).unwrap();
+        drain_save(&mut session);
+        let corrected = session.take_applied().unwrap();
+        assert_eq!(corrected.language_mappings.mappings()[0].language, Language::Python);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrected.source.unwrap());
         let shutdown = session.stop();
         thread::spawn(move || shutdown.shutdown()).join().unwrap().unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("tab_size = 6"));

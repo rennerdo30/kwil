@@ -656,8 +656,18 @@ pub struct SettingsWorker {
 }
 impl SettingsWorker {
     /// Spawning does no filesystem I/O on the caller. Errors arrive as events.
-    pub fn start(
+    pub fn start(path: PathBuf, callback: impl FnMut(SettingsWorkerEvent) + Send + 'static) -> std::io::Result<Self> {
+        Self::start_with_validator(path, |_| Ok(()), callback)
+    }
+
+    /// Optional application-owned validation, after parsing the exact save
+    /// candidate and BEFORE any atomic write. Runs on this existing worker,
+    /// never on the caller or under a frontend event lock. A rejection sends
+    /// an addressed Error and leaves the file untouched. Loaded documents
+    /// still reach the callback for application-owned runtime preparation.
+    pub fn start_with_validator(
         path: PathBuf,
+        mut validate: impl FnMut(&crate::settings_ui::SettingsDocument) -> Result<(), SettingsError> + Send + 'static,
         mut callback: impl FnMut(SettingsWorkerEvent) + Send + 'static,
     ) -> std::io::Result<Self> {
         use std::sync::{
@@ -725,7 +735,10 @@ impl SettingsWorker {
                         reload(&mut last, &mut callback);
                     }
                     SettingsRequest::Save { request, expected, source } => {
-                        match write_settings_atomic(&path, expected.as_deref(), &source) {
+                        let result = crate::settings_ui::SettingsDocument::parse(&source)
+                            .and_then(|document| validate(&document))
+                            .and_then(|()| write_settings_atomic(&path, expected.as_deref(), &source));
+                        match result {
                             Ok(()) => {
                                 callback(SettingsWorkerEvent::Saved { request, source });
                                 reload(&mut last, &mut callback);
@@ -788,6 +801,51 @@ mod settings_atomic_tests {
             fs::create_dir(&path).unwrap();
             Self(path)
         }
+    }
+
+    #[test]
+    fn settings_worker_validator_rejects_before_write_and_preserves_optimistic_source() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("settings.toml");
+        let original = "# retained\n[editor]\ntab_size=4\n";
+        write_settings_atomic(&path, None, original).unwrap();
+        let caller = std::thread::current().id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = SettingsWorker::start_with_validator(
+            path.clone(),
+            move |document| {
+                assert_ne!(std::thread::current().id(), caller, "validation belongs to the settings worker");
+                if document.settings().editor.tab_size == 9 {
+                    Err(SettingsError("application rejected candidate".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            move |event| {
+                let _ = tx.send(event);
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            SettingsWorkerEvent::Loaded { .. }
+        ));
+        worker.save(1, Some(original.into()), "[editor]\ntab_size=9\n".into()).unwrap();
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            SettingsWorkerEvent::Error { request: Some(1), message } if message == "application rejected candidate"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original, "validation failure must not reach persistence");
+        let valid = "# retained\n[editor]\ntab_size=6\n";
+        worker.save(2, Some(original.into()), valid.into()).unwrap();
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            SettingsWorkerEvent::Saved { request: 2, source } if source == valid));
+        assert_eq!(fs::read_to_string(&path).unwrap(), valid);
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            SettingsWorkerEvent::Loaded { source: Some(source), .. } if source == valid));
+        worker.save(3, Some(original.into()), "[editor]\ntab_size=7\n".into()).unwrap();
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            SettingsWorkerEvent::Error { request: Some(3), message } if message.contains("changed on disk")));
+        assert_eq!(fs::read_to_string(&path).unwrap(), valid, "preflight must preserve optimistic conflicts");
+        worker.shutdown();
     }
     impl Drop for Fixture {
         fn drop(&mut self) {

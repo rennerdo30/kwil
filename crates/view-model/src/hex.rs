@@ -5,7 +5,18 @@ use kwil_core_text::{Snapshot, TextFile};
 use std::{io, ops::Range};
 
 pub const BYTES_PER_ROW: u64 = 16;
-const MAX_ROWS: usize = 4096;
+pub const MAX_ROWS: usize = 4096;
+
+/// Fixed columns shared by paint and hit testing (one extra gap after byte 7).
+pub const ASCII_COLUMN: usize = 70;
+pub fn hex_column(byte: usize) -> usize {
+    18 + byte * 3 + usize::from(byte >= 8)
+}
+pub fn byte_at_column(column: usize) -> Option<usize> {
+    (0..16)
+        .find(|&byte| (hex_column(byte)..hex_column(byte) + 2).contains(&column))
+        .or_else(|| (ASCII_COLUMN..ASCII_COLUMN + 16).contains(&column).then(|| column - ASCII_COLUMN))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HexRow {
@@ -41,6 +52,7 @@ pub struct HexView {
     cursor: u64,
     anchor: u64,
     high: Option<u8>,
+    insert: bool,
 }
 impl HexView {
     pub fn new(rows: usize) -> Self {
@@ -51,6 +63,34 @@ impl HexView {
     }
     pub fn cursor(&self) -> u64 {
         self.cursor
+    }
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+    pub fn insert_mode(&self) -> bool {
+        self.insert
+    }
+    pub fn toggle_insert(&mut self) {
+        self.insert = !self.insert;
+        self.high = None;
+    }
+    pub fn cancel_nibble(&mut self) {
+        self.high = None;
+    }
+    /// No document access. A byte is committed only after both ASCII digits.
+    pub fn input_digit(&mut self, digit: char) -> io::Result<Option<u8>> {
+        let low = digit
+            .to_digit(16)
+            .filter(|_| digit.is_ascii())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Enter a hexadecimal digit (0-9, A-F)"))?
+            as u8;
+        Ok(match self.high.take() {
+            Some(high) => Some((high << 4) | low),
+            None => {
+                self.high = Some(low);
+                None
+            }
+        })
     }
     pub fn pending_high_nibble(&self) -> Option<u8> {
         self.high
@@ -67,6 +107,7 @@ impl HexView {
         self.set_cursor(self.cursor, len, true);
     }
     pub fn set_top(&mut self, row: u64, len: u64) {
+        self.high = None;
         self.top = row.min(Self::row_count(len).saturating_sub(self.rows.max(1) as u64));
     }
     pub fn set_cursor(&mut self, offset: u64, len: u64, extend: bool) {
@@ -83,16 +124,17 @@ impl HexView {
         if self.rows > 0 && row.saturating_sub(self.top) >= self.rows as u64 {
             self.top = row + 1 - self.rows as u64;
         }
+        self.top = self.top.min(Self::row_count(len).saturating_sub(self.rows.max(1) as u64));
     }
     pub fn move_by(&mut self, bytes: i64, len: u64, extend: bool) {
         let next = (i128::from(self.cursor) + i128::from(bytes)).clamp(0, i128::from(len));
         self.set_cursor(next as u64, len, extend);
     }
-    fn range(&self, len: u64) -> Range<u64> {
+    pub fn range(&self, len: u64) -> Range<u64> {
         let start = self.top.saturating_mul(BYTES_PER_ROW).min(len);
         start..start.saturating_add((self.rows.min(MAX_ROWS) as u64) * BYTES_PER_ROW).min(len)
     }
-    fn layout(&self, range: Range<u64>, bytes: &[u8]) -> Vec<HexRow> {
+    pub(crate) fn layout(&self, range: Range<u64>, bytes: &[u8]) -> Vec<HexRow> {
         let mut rows: Vec<_> = bytes
             .chunks(16)
             .enumerate()
@@ -103,6 +145,7 @@ impl HexView {
         }
         rows
     }
+    /// Worker-only: chunks can fault mapped pages or read spilled edit storage.
     pub fn snapshot_rows(&self, snapshot: &Snapshot) -> io::Result<Vec<HexRow>> {
         let range = self.range(snapshot.len());
         let mut bytes = Vec::with_capacity((range.end - range.start) as usize);
@@ -111,31 +154,30 @@ impl HexView {
         }
         Ok(self.layout(range, &bytes))
     }
-    /// First-screen path: no line index or full-file copy is required.
+    /// Worker-only first-screen path. Never pass a decoded document's original
+    /// alongside its logical byte length: these are different representations.
     pub fn file_rows(&self, file: &TextFile) -> io::Result<Vec<HexRow>> {
         let bytes = file.bytes().map_err(io::Error::other)?;
         let range = self.range(bytes.len() as u64);
         Ok(self.layout(range.clone(), &bytes[range.start as usize..range.end as usize]))
     }
+    /// Worker-only legacy synchronous entry point. Frontends use Session's
+    /// request protocol so edit/spill/journal reads cannot run during input.
     pub fn type_hex(&mut self, editor: &mut Editor, digit: char) -> io::Result<Damage> {
-        let value = digit
-            .to_digit(16)
-            .filter(|_| digit.is_ascii())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Enter a hexadecimal digit (0–9, A–F)"))?
-            as u8;
-        let Some(high) = self.high else {
-            self.high = Some(value);
+        let Some(value) = self.input_digit(digit)? else {
             return Ok(self.damage());
         };
         let old_len = editor.document().snapshot().len();
         let start = self.selection().start;
-        let end = if self.selection().is_empty() {
+        let end = if self.selection().is_empty() && self.insert {
+            start
+        } else if self.selection().is_empty() {
             start.saturating_add(1).min(editor.document().snapshot().len())
         } else {
             self.selection().end
         };
         let old_top = self.top;
-        editor.replace_byte_range(start..end, &[(high << 4) | value])?;
+        editor.replace_byte_range(start..end, &[value])?;
         self.set_cursor(start + 1, editor.document().snapshot().len(), false);
         Ok(self.changed(start, old_top, end - start != 1, old_len.max(editor.document().snapshot().len())))
     }

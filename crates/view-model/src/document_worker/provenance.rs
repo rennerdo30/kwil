@@ -2,15 +2,17 @@
 //! acceptance: a decoder, document adoption, raw projection, retention/rotation
 //! and frontend integration are separate gates.
 //!
-//! Version 1 wire format (all integers unsigned little endian):
+//! Version 2 wire format (all integers unsigned little endian; decoder accepts v1):
 //! ```text
-//! header: "KWCP", version:u16=1, flags:u16=0, expected_logical_len:u64
+//! header: "KWCP", version:u16=2, flags:u16=0, expected_logical_len:u64
 //! 1 OriginDefinition: id:u64, label_len:u16, bom_len:u8, raw_len:u64,
 //!                     encoding_label:[u8;label_len], raw:[u8;raw_len]
 //! 2 OriginReference:  id:u64, logical_start:u64, logical_end:u64
 //! 3 LogicalBytes:     len:u64, bytes:[u8;len]
 //! 4 DetachedOpaque:   label_len:u16, logical_count:u64, raw_len:u64,
 //!                     table_len:u64, encoding_label, raw, LE-u32 endpoints
+//! 5 PreservedText:    same fields as 4, then encoding_label, logical UTF-8,
+//!                     raw, LE-u32 endpoints (bit31 marks atom interiors)
 //! 0 End
 //! ```
 //! Definitions contribute ZERO logical bytes; references, text and opaque counts
@@ -72,7 +74,7 @@ use std::{
     },
 };
 
-pub const CAPSULE_VERSION: u16 = 1;
+pub const CAPSULE_VERSION: u16 = 2;
 pub const MAX_READ_BYTES: usize = 64 << 10;
 const HEADER_LEN: u64 = 16;
 const REFERENCE_LEN: u64 = 25;
@@ -330,6 +332,17 @@ impl OriginRegistry {
                     }
                     validate_opaque(bytes, raw_bytes, raw_offsets)?;
                     physical_len = add(physical_len, opaque_len(encoding, raw_bytes.len(), raw_offsets.len())?)?;
+                    count(bytes.len())?
+                }
+                SourceChunk::Preserved { encoding, bytes, raw_bytes, raw_offsets } => {
+                    if seed.is_some() {
+                        return Err(invalid("seed must reference only its decoded origin"));
+                    }
+                    validate_preserved(bytes, raw_bytes, raw_offsets)?;
+                    physical_len = add(
+                        physical_len,
+                        add(opaque_len(encoding, raw_bytes.len(), raw_offsets.len())?, count(bytes.len())?)?,
+                    )?;
                     count(bytes.len())?
                 }
             };
@@ -699,6 +712,32 @@ fn opaque_len(encoding: Encoding, raw: usize, table: usize) -> io::Result<u64> {
 fn endpoint(table: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(table[at..at + 4].try_into().unwrap())
 }
+fn validate_preserved(bytes: &[u8], raw: &[u8], table: &[u8]) -> io::Result<()> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_READ_BYTES
+        || raw.is_empty()
+        || raw.len() > MAX_READ_BYTES
+        || table.len() > MAX_READ_BYTES
+        || table.len() != (bytes.len() + 1) * 4
+        || std::str::from_utf8(bytes).is_err()
+    {
+        return Err(invalid("invalid bounded preserved block"));
+    }
+    let first = endpoint(table, 0);
+    let last = endpoint(table, table.len() - 4);
+    if first & (1 << 31) != 0 || last & (1 << 31) != 0 || last.checked_sub(first) != Some(raw.len() as u32) {
+        return Err(invalid("invalid preserved endpoint extent"));
+    }
+    let mut previous = first;
+    for at in (4..table.len()).step_by(4) {
+        let value = endpoint(table, at) & !(1 << 31);
+        if value < previous || value > last {
+            return Err(invalid("invalid preserved endpoint order"));
+        }
+        previous = value;
+    }
+    Ok(())
+}
 fn validate_opaque(bytes: &[u8], raw: &[u8], table: &[u8]) -> io::Result<()> {
     let expected =
         bytes.len().checked_add(1).and_then(|n| n.checked_mul(4)).ok_or_else(|| invalid("opaque endpoint overflow"))?;
@@ -787,6 +826,7 @@ enum Payload {
     Logical { cursor: u64, end: u64 },
     // Only the current already-capped detached block is copied. No piece list.
     Opaque { raw: Vec<u8>, table: Vec<u8>, offset: usize },
+    Preserved { bytes: Vec<u8>, raw: Vec<u8>, table: Vec<u8>, offset: usize },
 }
 
 pub struct CapsuleReader {
@@ -878,6 +918,25 @@ impl CapsuleReader {
                     self.payload = Payload::Opaque { raw: raw_bytes.to_vec(), table, offset: 0 };
                     self.cursor = add(self.cursor, count(bytes.len())?)?;
                 }
+                SourceChunk::Preserved { encoding, bytes, raw_bytes, raw_offsets } => {
+                    validate_preserved(bytes, raw_bytes, raw_offsets)?;
+                    self.pending.push(5);
+                    self.pending.extend_from_slice(&label_len(encoding)?.to_le_bytes());
+                    self.pending.extend_from_slice(&count(bytes.len())?.to_le_bytes());
+                    self.pending.extend_from_slice(&count(raw_bytes.len())?.to_le_bytes());
+                    self.pending.extend_from_slice(&count(raw_offsets.len())?.to_le_bytes());
+                    self.pending.extend_from_slice(encoding.name().as_bytes());
+                    let first = endpoint(raw_offsets, 0);
+                    let mut table = Vec::with_capacity(raw_offsets.len());
+                    for at in (0..raw_offsets.len()).step_by(4) {
+                        let value = endpoint(raw_offsets, at);
+                        let relative = ((value & !(1 << 31)) - first) | (value & (1 << 31));
+                        table.extend_from_slice(&relative.to_le_bytes());
+                    }
+                    self.payload =
+                        Payload::Preserved { bytes: bytes.to_vec(), raw: raw_bytes.to_vec(), table, offset: 0 };
+                    self.cursor = add(self.cursor, count(bytes.len())?)?;
+                }
             }
         } else if !self.end {
             self.pending.push(0);
@@ -933,6 +992,19 @@ impl CapsuleReader {
                         let bytes = if *offset < raw.len() { &raw[*offset..] } else { &table[*offset - raw.len()..] };
                         let n = output_len.min(bytes.len());
                         output[..n].copy_from_slice(&bytes[..n]);
+                        *offset += n;
+                        n
+                    }
+                    Payload::Preserved { bytes, raw, table, offset } => {
+                        let payload = if *offset < bytes.len() {
+                            &bytes[*offset..]
+                        } else if *offset < bytes.len() + raw.len() {
+                            &raw[*offset - bytes.len()..]
+                        } else {
+                            &table[*offset - bytes.len() - raw.len()..]
+                        };
+                        let n = output_len.min(payload.len());
+                        output[..n].copy_from_slice(&payload[..n]);
                         *offset += n;
                         n
                     }
@@ -1072,7 +1144,7 @@ mod tests {
         }
         let mut bytes = bytes;
         assert_eq!(take(&mut bytes, 4), b"KWCP");
-        assert_eq!(u16_(&mut bytes), 1);
+        assert_eq!(u16_(&mut bytes), CAPSULE_VERSION);
         assert_eq!(u16_(&mut bytes), 0);
         let expected = u64_(&mut bytes);
         let mut logical = 0;
@@ -1580,6 +1652,7 @@ mod tests {
             bom: true,
             preferred_ending: LineEnding::CrLf,
             compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+            raw_bytes: false,
         };
         let path = fixture.directory.join("staged-journal");
         let metadata = JournalBase {

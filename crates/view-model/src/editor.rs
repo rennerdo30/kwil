@@ -255,6 +255,51 @@ impl Editor {
     pub fn document(&self) -> &Document {
         &self.document
     }
+
+    /// Capture raw Save/Save As through the same in-flight save state. The
+    /// worker's SaveRaw request independently enforces these transport rules.
+    pub fn raw_save_request(
+        &mut self,
+        path: Option<std::path::PathBuf>,
+    ) -> io::Result<kwil_core_workspace::SaveRequest> {
+        if self.document.representation != crate::hex_session::Representation::RawBytes {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "raw save requires RawBytes transport"));
+        }
+        let mut request = self.save_request(path)?;
+        request.trim_trailing_whitespace = false;
+        request.compression = kwil_core_workspace::compressed::CompressionFormat::Raw;
+        Ok(request)
+    }
+
+    pub(crate) fn raw_reopen_ready(&self) -> io::Result<()> {
+        if self.saving
+            || self.has_pending_edit_receipt()
+            || self.has_pending_save_completion()
+            || self.compound.is_some()
+        {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "raw reopen awaits admitted editor work"));
+        }
+        Ok(())
+    }
+
+    /// Called only on the document worker. All old roots/history retire there;
+    /// no state is changed until the new physical document has been prepared.
+    pub(crate) fn install_raw_reopen(&mut self, document: Document) {
+        self.end_burst();
+        self.undo.clear();
+        self.redo.clear();
+        self.registers.clear();
+        self.repeat = None;
+        self.insert_prefix = None;
+        self.inserted.clear();
+        self.join_insert = false;
+        self.receipts = ReceiptState::default();
+        self.box_column = None;
+        self.cursors = vec![Cursor::caret(0)];
+        self.primary = 0;
+        self.top = 0;
+        self.document = document;
+    }
     pub fn cursors(&self) -> &[Cursor] {
         &self.cursors
     }

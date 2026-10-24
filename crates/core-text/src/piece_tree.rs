@@ -479,8 +479,8 @@ pub(crate) enum Storage {
         budget: Arc<AddBudget>,
     },
     Disk(DiskBlock),
-    /// Bounded detached mixed text/opaque block. Each payload/table is <= ADD_BLOCK
-    /// and uses the destination budget (or its existing immutable spill path).
+    /// Bounded detached text/opaque/preserved-valid block. Each payload/table
+    /// is <= ADD_BLOCK and uses the destination budget or immutable spill path.
     Opaque {
         encoding: Encoding,
         logical: Arc<Storage>,
@@ -846,6 +846,117 @@ pub(crate) fn recovery_opaque(
     opaque_run(encoding, raw, offsets, budget)
 }
 
+/// Validate bounded complete valid atoms before scratch growth or file creation.
+/// Byte-at-a-time decode prevents forged atom-interior flags across scalars.
+pub(crate) fn validate_recovery_preserved(
+    encoding: Encoding,
+    bytes: &[u8],
+    raw: &[u8],
+    offsets: &[u8],
+    check: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid preserved valid atoms");
+    check()?;
+    if bytes.is_empty()
+        || bytes.len() >= ADD_BLOCK / 4
+        || raw.is_empty()
+        || raw.len() > ADD_BLOCK
+        || offsets.len() != (bytes.len() + 1) * 4
+        || offsets.len() > ADD_BLOCK
+        || std::str::from_utf8(bytes).is_err()
+        || !atom_boundary(offsets, 0)
+        || !atom_boundary(offsets, bytes.len())
+    {
+        return Err(invalid());
+    }
+    let base = offset_at(offsets, 0);
+    if offset_at(offsets, bytes.len() as u64).checked_sub(base) != Some(raw.len())
+        || offset_at(offsets, bytes.len() as u64) > ADD_BLOCK
+    {
+        return Err(invalid());
+    }
+    let codec = encoding_rs::Encoding::for_label_no_replacement(encoding.name().as_bytes()).ok_or_else(invalid)?;
+    if codec == encoding_rs::ISO_2022_JP || codec == encoding_rs::REPLACEMENT {
+        return Err(invalid());
+    }
+    let mut first = 0;
+    while first < bytes.len() {
+        check()?;
+        let start = offset_at(offsets, first as u64);
+        if start < base || start - base >= raw.len() || !atom_boundary(offsets, first) {
+            return Err(invalid());
+        }
+        let mut last = first + 1;
+        while last < bytes.len() && !atom_boundary(offsets, last) {
+            if offset_at(offsets, last as u64) != start || last - first >= 8 {
+                return Err(invalid());
+            }
+            last += 1;
+        }
+        let end = offset_at(offsets, last as u64);
+        if !atom_boundary(offsets, last)
+            || end <= start
+            || end - start > 4
+            || end > base + raw.len()
+            || last - first > 8
+        {
+            return Err(invalid());
+        }
+        let atom_raw = &raw[start - base..end - base];
+        let mut decoder = codec.new_decoder_without_bom_handling();
+        let mut scratch = [0u8; 16];
+        for (i, byte) in atom_raw.iter().enumerate() {
+            check()?;
+            let final_byte = i + 1 == atom_raw.len();
+            let (result, read, written) =
+                decoder.decode_to_utf8_without_replacement(std::slice::from_ref(byte), &mut scratch, final_byte);
+            if !matches!(result, encoding_rs::DecoderResult::InputEmpty)
+                || read != 1
+                || !final_byte && written != 0
+                || final_byte && scratch[..written] != bytes[first..last]
+            {
+                return Err(invalid());
+            }
+        }
+        first = last;
+    }
+    check()
+}
+
+pub(crate) fn recovery_preserved(
+    encoding: Encoding,
+    bytes: &[u8],
+    raw: &[u8],
+    offsets: &[u8],
+    budget: &Arc<AddBudget>,
+    check: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<Tree> {
+    validate_recovery_preserved(encoding, bytes, raw, offsets, check)?;
+    let base = offset_at(offsets, 0) as u32;
+    // Caller admits this transient table (<= ADD_BLOCK) with recovery work.
+    let mut rebased = Vec::with_capacity(offsets.len());
+    for entry in offsets.as_chunks::<4>().0 {
+        let entry = u32::from_le_bytes(*entry);
+        rebased.extend_from_slice(&(((entry & !ATOM_INTERIOR) - base) | (entry & ATOM_INTERIOR)).to_le_bytes());
+    }
+    check()?;
+    let logical = capped_block(bytes, budget)?;
+    check()?;
+    let raw = capped_block(raw, budget)?;
+    check()?;
+    let offsets = capped_block(&rebased, budget)?;
+    check()?;
+    let resident = [&logical, &raw, &offsets].iter().any(|storage| matches!(&***storage, Storage::Memory { .. }));
+    Ok(Some(leaf(Piece {
+        storage: Arc::new(Storage::Opaque { encoding, logical, raw, offsets }),
+        owner: resident.then(|| budget.owner.clone()),
+        start: 0,
+        end: bytes.len() as u64,
+        first_line: 0,
+        breaks: memchr_iter(b'\n', bytes).count() as u64,
+    })))
+}
+
 /// Conservative transient AVL allocation reservation for two splits and joins.
 /// Every recursive join allocates at most a constant number of branch nodes;
 /// split's joins visit at most height squared nodes. Original storage/index
@@ -905,6 +1016,14 @@ pub(crate) fn recovery_cut(tree: &Tree, at: u64, check: &mut impl FnMut() -> io:
             Kind::Leaf(piece) => {
                 if let Storage::Decoded(source) = &*piece.storage {
                     recovery_validate_range(&source.origin, piece.start + at..piece.start + at, check)?;
+                } else if let Storage::Opaque { logical, offsets, .. } = &*piece.storage {
+                    check()?;
+                    validate_detached_endpoint(
+                        logical.bytes().map_err(io::Error::other)?,
+                        offsets.bytes().map_err(io::Error::other)?,
+                        (piece.start + at) as usize,
+                    )?;
+                    check()?;
                 }
                 return Ok(());
             }
@@ -941,10 +1060,37 @@ fn detached_block(
     })))
 }
 
-fn offset_at(offsets: &[u8], at: u64) -> usize {
+const ATOM_INTERIOR: u32 = 1 << 31;
+
+fn offset_entry(offsets: &[u8], at: u64) -> u32 {
     let at = usize::try_from(at).expect("bounded opaque logical offset");
     let bytes = offsets.get(at * 4..at * 4 + 4).expect("opaque endpoint table");
-    u32::from_le_bytes(bytes.try_into().unwrap()) as usize
+    u32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+fn offset_at(offsets: &[u8], at: u64) -> usize {
+    (offset_entry(offsets, at) & !ATOM_INTERIOR) as usize
+}
+
+fn atom_boundary(offsets: &[u8], at: usize) -> bool {
+    offset_entry(offsets, at as u64) & ATOM_INTERIOR == 0
+}
+
+fn validate_detached_endpoint(bytes: &[u8], table: &[u8], at: usize) -> io::Result<()> {
+    if !atom_boundary(table, at) {
+        let mut first = at;
+        let mut last = at;
+        while !atom_boundary(table, first) {
+            first -= 1;
+        }
+        while !atom_boundary(table, last) {
+            last += 1;
+        }
+        if !std::str::from_utf8(&bytes[first..last]).is_ok_and(|text| text.is_char_boundary(at - first)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "import splits a preserved scalar"));
+        }
+    }
+    Ok(())
 }
 
 /// One bounded packing buffer across all short valid/opaque runs. Valid-only
@@ -959,6 +1105,7 @@ struct ImportBuilder<'a> {
     raw: Vec<u8>,
     offsets: Vec<u8>,
     opaque_atoms: usize,
+    encoder: encoding_rs::Encoder,
     tree: Tree,
     allocation: Option<&'a mut WorkerAllocation>,
     worker_cancel: Option<&'a std::sync::atomic::AtomicBool>,
@@ -973,6 +1120,9 @@ impl<'a> ImportBuilder<'a> {
             raw: Vec::with_capacity(ADD_BLOCK),
             offsets: Vec::with_capacity(ADD_BLOCK),
             opaque_atoms: 0,
+            encoder: encoding_rs::Encoding::for_label_no_replacement(encoding.name().as_bytes())
+                .expect("validated stateless encoding")
+                .new_encoder(),
             tree: None,
             admission: None,
             allocation: None,
@@ -1040,6 +1190,44 @@ impl<'a> ImportBuilder<'a> {
         self.raw.extend_from_slice(bytes);
         self.offsets.extend_from_slice(&(self.raw.len() as u32).to_le_bytes());
         self.opaque_atoms += 1;
+        Ok(())
+    }
+    /// Keep only noncanonical valid atoms. The common canonical path retains
+    /// its existing add-byte accounting; comparison uses fixed scalar scratch.
+    fn original_text(&mut self, text: &str, raw: &[u8]) -> io::Result<()> {
+        let mut scratch = [0u8; 32];
+        let utf16 = self.encoding == Encoding::UTF16_LE || self.encoding == Encoding::UTF16_BE;
+        let canonical = if self.encoding == Encoding::UTF8 || text.is_ascii() && !utf16 {
+            text.as_bytes() == raw
+        } else if utf16 {
+            let mut used = 0;
+            for unit in text.encode_utf16() {
+                let bytes = if self.encoding == Encoding::UTF16_LE { unit.to_le_bytes() } else { unit.to_be_bytes() };
+                scratch[used..used + 2].copy_from_slice(&bytes);
+                used += 2;
+            }
+            &scratch[..used] == raw
+        } else {
+            let (result, read, written) = self.encoder.encode_from_utf8_without_replacement(text, &mut scratch, false);
+            matches!(result, encoding_rs::EncoderResult::InputEmpty) && read == text.len() && &scratch[..written] == raw
+        };
+        if canonical { self.text(text.as_bytes()) } else { self.preserved(text.as_bytes(), raw) }
+    }
+    fn preserved(&mut self, bytes: &[u8], raw: &[u8]) -> io::Result<()> {
+        assert!(!bytes.is_empty() && bytes.len() < ADD_BLOCK / 4 && !raw.is_empty() && raw.len() <= ADD_BLOCK);
+        if self.logical.len() + bytes.len() >= ADD_BLOCK / 4 || self.raw.len() + raw.len() > ADD_BLOCK {
+            self.flush()?;
+        }
+        if self.raw.is_empty() {
+            self.offsets.resize((self.logical.len() + 1) * 4, 0);
+        }
+        let interior = (self.raw.len() as u32 | ATOM_INTERIOR).to_le_bytes();
+        self.logical.extend_from_slice(bytes);
+        self.raw.extend_from_slice(raw);
+        for _ in 1..bytes.len() {
+            self.offsets.extend_from_slice(&interior);
+        }
+        self.offsets.extend_from_slice(&(self.raw.len() as u32).to_le_bytes());
         Ok(())
     }
     fn finish(mut self) -> io::Result<Tree> {
@@ -1123,14 +1311,76 @@ fn import_decoded(origin: &DecodedSnapshot, range: Range<u64>, budget: &Arc<AddB
         let atom = atom.map_err(io::Error::other)?;
         budget.observe_import_atom(&atom.raw);
         match atom.content {
-            crate::decoded_backing::AtomContent::Text(_) => {
+            crate::decoded_backing::AtomContent::Text(text) => {
                 let clipped = atom.logical.start.max(range.start)..atom.logical.end.min(range.end);
-                builder.text(&origin.logical_bytes()[clipped.start as usize..clipped.end as usize])?;
+                if clipped == atom.logical {
+                    builder.original_text(text, atom.raw_bytes)?;
+                } else {
+                    builder.text(&origin.logical_bytes()[clipped.start as usize..clipped.end as usize])?;
+                }
             }
             crate::decoded_backing::AtomContent::Opaque => builder.opaque(atom.raw_bytes)?,
         }
     }
     builder.finish()
+}
+
+/// Repack only the selected detached atoms. Partial valid edge atoms become
+/// text; retaining or copying their complete raw bytes would invent endpoints.
+fn feed_detached(
+    builder: &mut ImportBuilder<'_>,
+    bytes: &[u8],
+    raw: &[u8],
+    table: &[u8],
+    range: Range<u64>,
+    check: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    for at in [range.start as usize, range.end as usize] {
+        validate_detached_endpoint(bytes, table, at)?;
+    }
+    let chunks = DetachedChunks {
+        encoding: builder.encoding,
+        bytes,
+        raw,
+        table,
+        next: range.start as usize,
+        end: range.end as usize,
+    };
+    for chunk in chunks {
+        check()?;
+        match chunk {
+            SourceChunk::Added(bytes) => builder.text(bytes)?,
+            SourceChunk::Opaque { raw_bytes, raw_offsets, bytes, .. } => {
+                let base = offset_at(raw_offsets, 0);
+                for at in 0..bytes.len() {
+                    check()?;
+                    builder.opaque(
+                        &raw_bytes
+                            [offset_at(raw_offsets, at as u64) - base..offset_at(raw_offsets, at as u64 + 1) - base],
+                    )?;
+                }
+            }
+            SourceChunk::Preserved { bytes, raw_bytes, raw_offsets, .. } => {
+                let base = offset_at(raw_offsets, 0);
+                let mut first = 0;
+                while first < bytes.len() {
+                    check()?;
+                    let mut last = first + 1;
+                    while !atom_boundary(raw_offsets, last) {
+                        last += 1;
+                    }
+                    builder.preserved(
+                        &bytes[first..last],
+                        &raw_bytes
+                            [offset_at(raw_offsets, first as u64) - base..offset_at(raw_offsets, last as u64) - base],
+                    )?;
+                    first = last;
+                }
+            }
+            _ => unreachable!("detached traversal only yields detached payloads"),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn decoded_checked<E>(
@@ -1176,21 +1426,16 @@ fn import_observed(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>, visit: 
                 return import_decoded(&source.origin, piece.start..piece.end, budget);
             }
             if let Storage::Opaque { encoding, raw, offsets, .. } = &*piece.storage {
-                let offsets = offsets.bytes().map_err(io::Error::other)?;
-                let begin = offset_at(offsets, piece.start);
-                let end = offset_at(offsets, piece.end);
-                let mut rebased = Vec::with_capacity((piece.end - piece.start + 1) as usize * 4);
-                for at in piece.start..=piece.end {
-                    rebased.extend_from_slice(&((offset_at(offsets, at) - begin) as u32).to_le_bytes());
-                }
-                let bytes = piece.storage.bytes().map_err(io::Error::other)?;
-                return detached_block(
-                    *encoding,
-                    &bytes[piece.start as usize..piece.end as usize],
-                    &raw.bytes().map_err(io::Error::other)?[begin..end],
-                    &rebased,
-                    budget,
-                );
+                let mut builder = ImportBuilder::new(*encoding, budget);
+                feed_detached(
+                    &mut builder,
+                    piece.storage.bytes().map_err(io::Error::other)?,
+                    raw.bytes().map_err(io::Error::other)?,
+                    offsets.bytes().map_err(io::Error::other)?,
+                    piece.start..piece.end,
+                    &mut || Ok(()),
+                )?;
+                return builder.finish();
             }
             let foreign = match piece.storage.as_ref() {
                 Storage::Memory { budget: source, .. } => !Arc::ptr_eq(source, budget),
@@ -1764,11 +2009,36 @@ impl WorkerAllocation {
                 {
                     return Err(crate::worker_edit::invalid("opaque table shape"));
                 }
-                for (i, byte) in logical.iter().enumerate() {
+                let mut i = 0;
+                while i < logical.len() {
                     let a = offset_at(offsets, i as u64);
                     let b = offset_at(offsets, i as u64 + 1);
-                    if a > b || b > raw.len() || (*byte == 0xff && a == b) || (*byte != 0xff && a != b) {
+                    if !atom_boundary(offsets, i) || a > b || b > raw.len() {
                         return Err(crate::worker_edit::invalid("opaque provenance offsets"));
+                    }
+                    if logical[i] == 0xff {
+                        if !atom_boundary(offsets, i + 1) || a == b {
+                            return Err(crate::worker_edit::invalid("opaque atom endpoints"));
+                        }
+                        i += 1;
+                    } else if atom_boundary(offsets, i + 1) && a == b {
+                        i += 1; // Canonical/added UTF-8 has no raw payload.
+                    } else {
+                        let first = i;
+                        i += 1;
+                        while i < logical.len() && !atom_boundary(offsets, i) {
+                            if offset_at(offsets, i as u64) != a {
+                                return Err(crate::worker_edit::invalid("preserved atom interior"));
+                            }
+                            i += 1;
+                        }
+                        if !atom_boundary(offsets, i)
+                            || offset_at(offsets, i as u64) <= a
+                            || offset_at(offsets, i as u64) > raw.len()
+                            || std::str::from_utf8(&logical[first..i]).is_err()
+                        {
+                            return Err(crate::worker_edit::invalid("preserved text endpoints"));
+                        }
                     }
                 }
             }
@@ -1799,6 +2069,10 @@ impl WorkerAllocation {
                     }
                     if let Storage::Decoded(source) = piece.storage.as_ref() {
                         crate::decoded_piece::validate_range(&source.origin, piece.start..piece.end)?;
+                    } else if let Storage::Opaque { offsets, .. } = piece.storage.as_ref() {
+                        let offsets = offsets.bytes().map_err(io::Error::other)?;
+                        validate_detached_endpoint(data, offsets, piece.start as usize)?;
+                        validate_detached_endpoint(data, offsets, piece.end as usize)?;
                     }
                     for _ in data[piece.start as usize..piece.end as usize].chunks(ADD_BLOCK) {
                         crate::worker_edit::poll(cancelled)?;
@@ -2116,23 +2390,18 @@ pub(crate) fn worker_import(
                     })))
                 }
                 Storage::Opaque { encoding, raw, offsets, .. } => {
-                    let offsets = offsets.bytes().map_err(io::Error::other)?;
-                    let first = offset_at(offsets, piece.start);
-                    let last = offset_at(offsets, piece.end);
-                    let mut rebased = Vec::with_capacity((piece.end - piece.start + 1) as usize * 4);
-                    for at in piece.start..=piece.end {
-                        rebased.extend_from_slice(&((offset_at(offsets, at) - first) as u32).to_le_bytes());
-                    }
-                    let bytes = piece.storage.bytes().map_err(io::Error::other)?;
-                    worker_detached(
-                        *encoding,
-                        &bytes[piece.start as usize..piece.end as usize],
-                        &raw.bytes().map_err(io::Error::other)?[first..last],
-                        &rebased,
-                        budget,
-                        allocation,
-                        cancelled,
-                    )
+                    let mut builder = ImportBuilder::new(*encoding, budget);
+                    builder.allocation = Some(allocation);
+                    builder.worker_cancel = Some(cancelled);
+                    feed_detached(
+                        &mut builder,
+                        piece.storage.bytes().map_err(io::Error::other)?,
+                        raw.bytes().map_err(io::Error::other)?,
+                        offsets.bytes().map_err(io::Error::other)?,
+                        piece.start..piece.end,
+                        &mut || crate::worker_edit::poll(cancelled),
+                    )?;
+                    builder.finish()
                 }
                 _ => {
                     // COPY foreign spills too, even Free/all-spilled leaves.
@@ -2269,6 +2538,18 @@ pub enum SourceChunk<'a> {
         raw_bytes: &'a [u8],
         raw_offsets: &'a [u8],
     },
+    /// Complete valid UTF-8 atoms with exact noncanonical source bytes. Each
+    /// LE u32 entry describes one logical byte boundary, including the end.
+    /// Bit 31 marks an atom interior, which is NOT a raw boundary; the low bits
+    /// retain that atom's raw start. Exact entries are relative to the storage
+    /// block; subtract the first entry to index this chunk's `raw_bytes`.
+    /// Partial atoms are yielded as Added text, never with invented endpoints.
+    Preserved {
+        encoding: Encoding,
+        bytes: &'a [u8],
+        raw_bytes: &'a [u8],
+        raw_offsets: &'a [u8],
+    },
     /// Added bytes are UTF-8 for an encoding-aware editor.
     Added(&'a [u8]),
 }
@@ -2287,30 +2568,95 @@ struct DetachedChunks<'a> {
     next: usize,
     end: usize,
 }
-impl<'a> Iterator for DetachedChunks<'a> {
-    type Item = SourceChunk<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
+impl<'a> DetachedChunks<'a> {
+    fn byte_admitted<E>(&self, at: usize, admit: &mut impl FnMut(usize) -> Result<(), E>) -> Result<u8, E> {
+        admit(1)?;
+        Ok(self.bytes[at])
+    }
+    fn offset_admitted<E>(&self, at: usize, admit: &mut impl FnMut(usize) -> Result<(), E>) -> Result<usize, E> {
+        admit(std::mem::size_of::<u32>())?;
+        Ok(offset_at(self.table, at as u64))
+    }
+    fn boundary_admitted<E>(&self, at: usize, admit: &mut impl FnMut(usize) -> Result<(), E>) -> Result<bool, E> {
+        admit(std::mem::size_of::<u32>())?;
+        Ok(atom_boundary(self.table, at))
+    }
+    fn next_admitted<E>(
+        &mut self,
+        admit: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Option<SourceChunk<'a>>, E> {
         if self.next == self.end {
-            return None;
+            return Ok(None);
         }
         let start = self.next;
-        let opaque = self.bytes[start] == 0xff;
-        let end =
-            self.bytes[start..self.end].iter().position(|&b| (b == 0xff) != opaque).map_or(self.end, |at| start + at);
-        self.next = end;
-        let bytes = &self.bytes[start..end];
-        Some(if opaque {
-            let begin = offset_at(self.table, start as u64);
-            let finish = offset_at(self.table, end as u64);
-            SourceChunk::Opaque {
+        if self.byte_admitted(start, admit)? == 0xff {
+            let mut end = start;
+            while end < self.end && self.byte_admitted(end, admit)? == 0xff {
+                end += 1;
+            }
+            let begin = self.offset_admitted(start, admit)?;
+            let finish = self.offset_admitted(end, admit)?;
+            self.next = end;
+            return Ok(Some(SourceChunk::Opaque {
                 encoding: self.encoding,
-                bytes,
+                bytes: &self.bytes[start..end],
+                raw_bytes: &self.raw[begin..finish],
+                raw_offsets: &self.table[start * 4..(end + 1) * 4],
+            }));
+        }
+        if !self.boundary_admitted(start, admit)? {
+            let mut end = start + 1;
+            while end < self.end && !self.boundary_admitted(end, admit)? {
+                end += 1;
+            }
+            self.next = end;
+            return Ok(Some(SourceChunk::Added(&self.bytes[start..end])));
+        }
+        let mut end = start;
+        let preserved = !self.boundary_admitted(start + 1, admit)?
+            || self.offset_admitted(start + 1, admit)? > self.offset_admitted(start, admit)?;
+        while end < self.end && self.byte_admitted(end, admit)? != 0xff {
+            let mut next = end + 1;
+            while next < self.end && !self.boundary_admitted(next, admit)? {
+                next += 1;
+            }
+            if !self.boundary_admitted(next, admit)? {
+                // A trailing partial atom has logical bytes only.
+                if end == start {
+                    self.next = self.end;
+                    return Ok(Some(SourceChunk::Added(&self.bytes[start..self.end])));
+                }
+                break;
+            }
+            let has_raw = self.offset_admitted(next, admit)? > self.offset_admitted(end, admit)?;
+            if has_raw != preserved {
+                break;
+            }
+            end = next;
+        }
+        let chunk = if preserved {
+            let begin = self.offset_admitted(start, admit)?;
+            let finish = self.offset_admitted(end, admit)?;
+            SourceChunk::Preserved {
+                encoding: self.encoding,
+                bytes: &self.bytes[start..end],
                 raw_bytes: &self.raw[begin..finish],
                 raw_offsets: &self.table[start * 4..(end + 1) * 4],
             }
         } else {
-            SourceChunk::Added(bytes)
-        })
+            SourceChunk::Added(&self.bytes[start..end])
+        };
+        self.next = end;
+        Ok(Some(chunk))
+    }
+}
+impl<'a> Iterator for DetachedChunks<'a> {
+    type Item = SourceChunk<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_admitted(&mut |_| Ok::<(), std::convert::Infallible>(())) {
+            Ok(chunk) => chunk,
+            Err(never) => match never {},
+        }
     }
 }
 
@@ -2318,15 +2664,34 @@ impl<'a> SourceChunks<'a> {
     pub(crate) fn new(tree: &'a Tree, range: Range<u64>) -> Self {
         Self { chunks: Chunks::new(tree, range), detached: None }
     }
-}
-
-impl<'a> Iterator for SourceChunks<'a> {
-    type Item = Result<SourceChunk<'a>, ReadError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Admit every detached classification read BEFORE accessing the logical
+    /// byte (1 byte) or raw endpoint entry (4 bytes). Borrowing the returned
+    /// slices does not read their contents: callers separately admit payload
+    /// copies, decoding and validation. Plain Added/Original/Decoded pieces
+    /// need no payload classification and do not call `admit`.
+    ///
+    /// Any admission/read error terminates this cursor. Admission errors are
+    /// returned unchanged; no rejected read is performed or replayed later.
+    pub fn next_admitted(
+        &mut self,
+        mut admit: impl FnMut(usize) -> io::Result<()>,
+    ) -> io::Result<Option<SourceChunk<'a>>> {
+        match self.next_checked(&mut admit) {
+            Ok(chunk) => chunk.transpose().map_err(io::Error::other),
+            Err(error) => {
+                self.chunks.stack.clear();
+                self.detached = None;
+                Err(error)
+            }
+        }
+    }
+    fn next_checked<E>(
+        &mut self,
+        admit: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Option<Result<SourceChunk<'a>, ReadError>>, E> {
         if let Some(cursor) = &mut self.detached {
-            if let Some(chunk) = cursor.next() {
-                return Some(Ok(chunk));
+            if let Some(chunk) = cursor.next_admitted(admit)? {
+                return Ok(Some(Ok(chunk)));
             }
             self.detached = None;
         }
@@ -2342,38 +2707,57 @@ impl<'a> Iterator for SourceChunks<'a> {
                 Kind::Leaf(piece) => {
                     let start = piece.start + self.chunks.range.start.saturating_sub(offset);
                     let end = piece.start + (self.chunks.range.end - offset).min(node.metrics.bytes);
-                    let result = piece.storage.bytes().and_then(|bytes| {
-                        if let Storage::Opaque { encoding, raw, offsets, .. } = &*piece.storage {
-                            let mut cursor = DetachedChunks {
-                                encoding: *encoding,
-                                bytes,
-                                raw: raw.bytes()?,
-                                table: offsets.bytes()?,
-                                next: start as usize,
-                                end: end as usize,
-                            };
-                            let first = cursor.next().expect("nonempty detached piece range");
-                            self.detached = Some(cursor);
-                            return Ok(first);
-                        }
-                        let bytes = &bytes[start as usize..end as usize];
-                        Ok(match piece.storage.as_ref() {
-                            Storage::Original(file) => SourceChunk::Original { file, range: start..end, bytes },
-                            Storage::Decoded(source) => {
-                                SourceChunk::Decoded { origin: &source.origin, range: start..end, bytes }
+                    let result = if let Storage::Opaque { encoding, raw, offsets, .. } = &*piece.storage {
+                        let payloads =
+                            piece.storage.bytes().and_then(|bytes| Ok((bytes, raw.bytes()?, offsets.bytes()?)));
+                        match payloads {
+                            Ok((bytes, raw, table)) => {
+                                let mut cursor = DetachedChunks {
+                                    encoding: *encoding,
+                                    bytes,
+                                    raw,
+                                    table,
+                                    next: start as usize,
+                                    end: end as usize,
+                                };
+                                let first = cursor.next_admitted(admit)?.expect("nonempty detached piece range");
+                                self.detached = Some(cursor);
+                                Ok(first)
                             }
-                            _ => SourceChunk::Added(bytes),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        piece.storage.bytes().map(|bytes| {
+                            let bytes = &bytes[start as usize..end as usize];
+                            match piece.storage.as_ref() {
+                                Storage::Original(file) => SourceChunk::Original { file, range: start..end, bytes },
+                                Storage::Decoded(source) => {
+                                    SourceChunk::Decoded { origin: &source.origin, range: start..end, bytes }
+                                }
+                                _ => SourceChunk::Added(bytes),
+                            }
                         })
-                    });
+                    };
                     if result.is_err() {
                         self.chunks.stack.clear();
                         self.detached = None;
                     }
-                    return Some(result);
+                    return Ok(Some(result));
                 }
             }
         }
-        None
+        Ok(None)
+    }
+}
+
+impl<'a> Iterator for SourceChunks<'a> {
+    type Item = Result<SourceChunk<'a>, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_checked(&mut |_| Ok::<(), std::convert::Infallible>(())) {
+            Ok(chunk) => chunk,
+            Err(never) => match never {},
+        }
     }
 }
 
@@ -2473,6 +2857,195 @@ pub(crate) fn assert_valid(tree: &Tree) {
 #[cfg(test)]
 mod spill_tests {
     use super::*;
+
+    #[test]
+    fn source_chunks_admission_refusal_precedes_byte_and_endpoint_reads() {
+        // Deliberately inaccessible payloads: reading before the callback
+        // refuses would panic. Exercise each centralized classification read.
+        let encoding = Encoding::for_label("big5").unwrap();
+        let empty = [];
+        let zero = 0_u32.to_le_bytes();
+        for (bytes, table, refuse_at, refused_width) in [
+            (&empty[..], &empty[..], 1, 1),   // first logical-byte peek
+            (&b"x"[..], &empty[..], 2, 4),    // first atom-boundary entry
+            (&b"\xff"[..], &empty[..], 3, 4), // opaque raw start
+            (&b"\xff"[..], &zero[..], 4, 4),  // opaque raw end
+        ] {
+            let mut cursor = DetachedChunks { encoding, bytes, raw: &[], table, next: 0, end: 1 };
+            let mut calls = 0;
+            let result = cursor.next_admitted(&mut |width| {
+                calls += 1;
+                if calls == refuse_at {
+                    assert_eq!(width, refused_width);
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "classification admission marker"))
+                } else {
+                    Ok(())
+                }
+            });
+            let error = result.err().expect("inaccessible read must be refused first");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(error.to_string(), "classification admission marker");
+            assert_eq!(calls, refuse_at);
+            assert_eq!(cursor.next, 0, "failed classification never publishes advancement");
+        }
+    }
+
+    #[test]
+    fn source_chunks_admitted_preserves_error_identity_and_terminates_after_refusal() {
+        #[derive(Debug)]
+        struct Marker(Arc<()>);
+        impl std::fmt::Display for Marker {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("admission identity")
+            }
+        }
+        impl std::error::Error for Marker {}
+        let encoding = Encoding::for_label("big5").unwrap();
+        let budget = AddBudget::new(128, Arc::new(()));
+        let mut builder = ImportBuilder::new(encoding, &budget);
+        builder.preserved("Ê\u{304}".as_bytes(), b"\x88\x62").unwrap();
+        builder.text(b"tail").unwrap();
+        let tree = builder.finish().unwrap();
+        let identity = Arc::new(());
+        for refuse_at in 1..=12 {
+            let mut chunks = SourceChunks::new(&tree, 0..8);
+            let mut calls = 0;
+            let error = chunks
+                .next_admitted(|_| {
+                    calls += 1;
+                    if calls == refuse_at {
+                        Err(io::Error::new(io::ErrorKind::WouldBlock, Marker(identity.clone())))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .err()
+                .expect("first preserved chunk needs more than twelve classification reads");
+            assert!(Arc::ptr_eq(&error.get_ref().unwrap().downcast_ref::<Marker>().unwrap().0, &identity));
+            assert_eq!(calls, refuse_at);
+            assert!(chunks.next_admitted(|_| panic!("failed cursor must not read again")).unwrap().is_none());
+            assert!(chunks.next().is_none());
+        }
+        drop(tree);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn source_chunks_admitted_matches_ordinary_iteration_for_all_detached_subranges() {
+        fn fingerprint(chunk: SourceChunk<'_>) -> (u8, Vec<u8>, Vec<u8>, Vec<u8>) {
+            match chunk {
+                SourceChunk::Added(bytes) => (0, bytes.to_vec(), vec![], vec![]),
+                SourceChunk::Opaque { bytes, raw_bytes, raw_offsets, .. } => {
+                    (1, bytes.to_vec(), raw_bytes.to_vec(), raw_offsets.to_vec())
+                }
+                SourceChunk::Preserved { bytes, raw_bytes, raw_offsets, .. } => {
+                    (2, bytes.to_vec(), raw_bytes.to_vec(), raw_offsets.to_vec())
+                }
+                _ => panic!("expected detached payload"),
+            }
+        }
+        let encoding = Encoding::for_label("big5").unwrap();
+        let budget = AddBudget::new(128, Arc::new(()));
+        let mut builder = ImportBuilder::new(encoding, &budget);
+        builder.text(b"a").unwrap();
+        builder.preserved("Ê\u{304}".as_bytes(), b"\x88\x62").unwrap();
+        builder.opaque(b"\xff").unwrap();
+        builder.text(b"Z").unwrap();
+        builder.preserved("ê\u{30c}".as_bytes(), b"\x88\xa5").unwrap();
+        let tree = builder.finish().unwrap();
+        for first in 0..=11 {
+            for last in first..=11 {
+                let ordinary: Vec<_> =
+                    SourceChunks::new(&tree, first..last).map(|chunk| fingerprint(chunk.unwrap())).collect();
+                let mut chunks = SourceChunks::new(&tree, first..last);
+                let mut admitted = Vec::new();
+                let mut reads = 0;
+                while let Some(chunk) = chunks
+                    .next_admitted(|width| {
+                        assert!(width == 1 || width == 4);
+                        reads += width;
+                        Ok(())
+                    })
+                    .unwrap()
+                {
+                    admitted.push(fingerprint(chunk));
+                }
+                assert_eq!(admitted, ordinary, "range {first}..{last}");
+                assert_eq!(reads == 0, first == last);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_preserved_validates_codec_atoms_and_offsets_before_allocating() {
+        let encoding = Encoding::for_label("big5").unwrap();
+        let bytes = "Ê\u{304}".as_bytes();
+        let raw = b"\x88\x62";
+        let table: Vec<_> = [7, ATOM_INTERIOR | 7, ATOM_INTERIOR | 7, ATOM_INTERIOR | 7, 9]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let budget = AddBudget::new(128, Arc::new(()));
+        let tree = recovery_preserved(encoding, bytes, raw, &table, &budget, &mut || Ok(())).unwrap();
+        assert_eq!(budget.used.load(Ordering::Relaxed), 4 + 2 + 20);
+        let SourceChunk::Preserved { raw_offsets, raw_bytes, .. } =
+            SourceChunks::new(&tree, 0..4).next().unwrap().unwrap()
+        else {
+            panic!("typed alias lost");
+        };
+        assert_eq!(offset_entry(raw_offsets, 0), 0, "external base is normalized exactly once");
+        assert_eq!(offset_entry(raw_offsets, 2), ATOM_INTERIOR);
+        assert_eq!(raw_bytes, raw);
+        drop(tree);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        let mut tables = vec![table[..16].to_vec()];
+        for (at, value) in [(0, ATOM_INTERIOR | 7), (1, ATOM_INTERIOR | 8), (2, 8), (4, ATOM_INTERIOR | 9), (4, 10)] {
+            let mut broken = table.clone();
+            broken[at * 4..at * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            tables.push(broken);
+        }
+        for broken in tables {
+            assert_eq!(
+                recovery_preserved(encoding, bytes, raw, &broken, &budget, &mut || Ok(())).err().unwrap().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        }
+        assert!(recovery_preserved(Encoding::UTF8, bytes, raw, &table, &budget, &mut || Ok(())).is_err());
+        assert!(recovery_preserved(encoding, "ê\u{304}".as_bytes(), raw, &table, &budget, &mut || Ok(())).is_err());
+        assert!(recovery_preserved(encoding, &[0xff; 4], raw, &table, &budget, &mut || Ok(())).is_err());
+        let forged: Vec<_> = [0, ATOM_INTERIOR, 2].into_iter().flat_map(u32::to_le_bytes).collect();
+        assert!(
+            recovery_preserved(encoding, b"\r\n", b"\r\n", &forged, &budget, &mut || Ok(())).is_err(),
+            "adjacent newline scalars must not become one preserved atom"
+        );
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn recovery_preserved_cancel_after_partial_payload_returns_exact_resident_charge() {
+        let encoding = Encoding::for_label("big5").unwrap();
+        let bytes = "Ê\u{304}".as_bytes();
+        let raw = b"\x88\x62";
+        let table: Vec<_> =
+            [0, ATOM_INTERIOR, ATOM_INTERIOR, ATOM_INTERIOR, 2].into_iter().flat_map(u32::to_le_bytes).collect();
+        let mut validation_polls = 0;
+        validate_recovery_preserved(encoding, bytes, raw, &table, &mut || {
+            validation_polls += 1;
+            Ok(())
+        })
+        .unwrap();
+        for cancel_at in [1, validation_polls + 2, validation_polls + 3, validation_polls + 4] {
+            let budget = AddBudget::new(128, Arc::new(()));
+            let mut polls = 0;
+            let result = recovery_preserved(encoding, bytes, raw, &table, &budget, &mut || {
+                polls += 1;
+                if polls == cancel_at { Err(io::ErrorKind::Interrupted.into()) } else { Ok(()) }
+            });
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Interrupted);
+            assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        }
+    }
 
     #[test]
     fn spill_write_failure_removes_partial_file() {

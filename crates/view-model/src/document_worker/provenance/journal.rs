@@ -34,6 +34,7 @@ use std::{
 
 const POLICY_MAGIC: &[u8; 4] = b"KWJR";
 const POLICY_VERSION: u8 = 2;
+const RAW_POLICY_VERSION: u8 = 3;
 const MAX_ENCODING_NAME: usize = 40;
 
 /// Explicit document output policy, independent of every embedded origin.
@@ -41,6 +42,8 @@ const MAX_ENCODING_NAME: usize = 40;
 /// CR is representable here; existing Document Enter support is a separate gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryPolicy {
+    /// Physical-byte transport, independent of UTF-8 encoding policy.
+    pub raw_bytes: bool,
     pub encoding: Encoding,
     pub bom: bool,
     pub preferred_ending: LineEnding,
@@ -63,11 +66,17 @@ impl RecoveryPolicy {
         let mut tag = Vec::with_capacity(8 + label.len());
         tag.extend_from_slice(POLICY_MAGIC);
         let flags = u8::from(self.bom)
+            | if self.raw_bytes { 4 } else { 0 }
             | match self.compression {
                 kwil_core_workspace::compressed::CompressionFormat::Raw => 0,
                 kwil_core_workspace::compressed::CompressionFormat::Gzip => 2,
             };
-        tag.extend_from_slice(&[POLICY_VERSION, flags, ending, label.len() as u8]);
+        tag.extend_from_slice(&[
+            if self.raw_bytes { RAW_POLICY_VERSION } else { POLICY_VERSION },
+            flags,
+            ending,
+            label.len() as u8,
+        ]);
         tag.extend_from_slice(label);
         Ok(tag)
     }
@@ -75,8 +84,14 @@ impl RecoveryPolicy {
         if tag.len() < 9
             || tag.len() > 8 + MAX_ENCODING_NAME
             || &tag[..4] != POLICY_MAGIC
-            || !matches!(tag[4], 1 | POLICY_VERSION)
-            || tag[5] > if tag[4] == 1 { 1 } else { 3 }
+            || !matches!(tag[4], 1 | POLICY_VERSION | RAW_POLICY_VERSION)
+            || tag[5]
+                > match tag[4] {
+                    1 => 1,
+                    POLICY_VERSION => 3,
+                    _ => 7,
+                }
+            || (tag[4] == RAW_POLICY_VERSION && tag[5] != 4)
             || tag[7] as usize != tag.len() - 8
         {
             return Err(invalid("unsupported encoded recovery codec/version"));
@@ -93,10 +108,11 @@ impl RecoveryPolicy {
             return Err(invalid("noncanonical recovery encoding name"));
         }
         let policy = Self {
+            raw_bytes: tag[4] == RAW_POLICY_VERSION,
             encoding,
             bom: tag[5] & 1 != 0,
             preferred_ending,
-            compression: if tag[4] == POLICY_VERSION && tag[5] & 2 != 0 {
+            compression: if tag[4] >= POLICY_VERSION && tag[5] & 2 != 0 {
                 kwil_core_workspace::compressed::CompressionFormat::Gzip
             } else {
                 kwil_core_workspace::compressed::CompressionFormat::Raw
@@ -106,6 +122,14 @@ impl RecoveryPolicy {
         Ok(policy)
     }
     fn validate(self) -> io::Result<()> {
+        if self.raw_bytes
+            && (self.encoding != Encoding::UTF8
+                || self.bom
+                || self.preferred_ending != LineEnding::Lf
+                || self.compression != kwil_core_workspace::compressed::CompressionFormat::Raw)
+        {
+            return Err(invalid("raw recovery policy forbids text/container transformations"));
+        }
         if self.bom && ![Encoding::UTF8, Encoding::UTF16_LE, Encoding::UTF16_BE].contains(&self.encoding) {
             return Err(invalid("BOM policy is invalid for recovery encoding"));
         }
@@ -739,6 +763,7 @@ mod tests {
             bom: false,
             preferred_ending: LineEnding::CrLf,
             compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+            raw_bytes: false,
         }
     }
     fn registry() -> OriginRegistry {
@@ -928,6 +953,7 @@ mod tests {
                     bom: true,
                     preferred_ending: LineEnding::CrLf,
                     compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+                    raw_bytes: false,
                 },
                 &[EditBatch { from: 9, to: 2, parts: vec![part(base.logical, 0, text(&mut registry, b"!"))] }],
             );
@@ -1268,6 +1294,7 @@ mod tests {
             bom: true,
             preferred_ending: LineEnding::Cr,
             compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+            raw_bytes: false,
         };
         fixture.write(&base, explicit, &batches);
         drop(big5);
@@ -1323,6 +1350,7 @@ mod tests {
             bom: true,
             preferred_ending: LineEnding::Lf,
             compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+            raw_bytes: false,
         };
         fixture.write(&base, explicit, &[]);
         let mut state = fixture.state();
@@ -1757,6 +1785,7 @@ mod tests {
                     bom: encoding != Encoding::for_label("big5").unwrap(),
                     preferred_ending,
                     compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+                    raw_bytes: false,
                 };
                 let codec = explicit.to_codec().unwrap();
                 assert!(codec.len() <= 8 + MAX_ENCODING_NAME);
@@ -1780,6 +1809,7 @@ mod tests {
                 bom: true,
                 preferred_ending: LineEnding::Lf,
                 compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+                raw_bytes: false,
             }
             .to_codec()
             .is_err()
@@ -1813,5 +1843,48 @@ mod tests {
                 assert!(RecoveryPolicy::from_codec(&bad).is_err());
             }
         }
+    }
+
+    #[test]
+    fn raw_transport_journal_preserves_representation_and_physical_payload_after_replay() {
+        use kwil_core_workspace::compressed::CompressionFormat;
+        let fixture = Fixture::new();
+        let mut registry = registry();
+        let raw = b"\x1f\x8b\x08\0\xff\xfeA\0 \t\r\n";
+        let base = text(&mut registry, raw);
+        let inserted = text(&mut registry, b"\x80\xff");
+        let policy = RecoveryPolicy {
+            raw_bytes: true,
+            encoding: Encoding::UTF8,
+            bom: false,
+            preferred_ending: LineEnding::Lf,
+            compression: CompressionFormat::Raw,
+        };
+        let codec = policy.to_codec().unwrap();
+        assert_eq!(codec[4], RAW_POLICY_VERSION);
+        assert_eq!(RecoveryPolicy::from_codec(&codec).unwrap(), policy);
+        // A v2 UTF8 document is still decoded text; no inference from bytes.
+        let mut text_codec = codec.clone();
+        text_codec[4] = POLICY_VERSION;
+        text_codec[5] = 0;
+        assert!(!RecoveryPolicy::from_codec(&text_codec).unwrap().raw_bytes);
+        for altered in [
+            RecoveryPolicy { bom: true, ..policy },
+            RecoveryPolicy { compression: CompressionFormat::Gzip, ..policy },
+            RecoveryPolicy { preferred_ending: LineEnding::CrLf, ..policy },
+            RecoveryPolicy { encoding: Encoding::UTF16_LE, ..policy },
+        ] {
+            assert!(altered.to_codec().is_err());
+        }
+        fixture.write(&base, policy, &[EditBatch { from: 9, to: 10, parts: vec![part(4, 1, inserted)] }]);
+        let mut state = fixture.state();
+        assert_eq!(state.recover(&mut fixture.reader(), &AtomicBool::new(false)).unwrap().policy, policy);
+        let buffer = state.take_buffer(&AtomicBool::new(false)).unwrap();
+        let mut expected = raw.to_vec();
+        expected.splice(4..5, [0x80, 0xff]);
+        assert_eq!(logical(&buffer), expected);
+        drop(buffer);
+        state.abandon().unwrap();
+        assert_eq!(fixture.count(), 0);
     }
 }

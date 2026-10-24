@@ -774,7 +774,9 @@ impl EncodedFile {
                     (bytes, self.detection.encoding)
                 }
                 SourceChunk::Added(bytes) => (bytes, Encoding::UTF8),
-                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } => return Err(EncodingError::WrongSource),
+                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } | SourceChunk::Preserved { .. } => {
+                    return Err(EncodingError::WrongSource);
+                }
             };
             if encoding.utf16() {
                 for at in (0..bytes.len().saturating_sub(1)).step_by(2) {
@@ -861,7 +863,9 @@ impl EncodedFile {
                     finish_source(&mut source_decoder, &mut output)?;
                     added.feed(bytes, |text| output.feed(text))?;
                 }
-                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } => return Err(EncodingError::WrongSource),
+                SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } | SourceChunk::Preserved { .. } => {
+                    return Err(EncodingError::WrongSource);
+                }
             }
         }
         added.finish()?;

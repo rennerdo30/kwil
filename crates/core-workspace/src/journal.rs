@@ -274,6 +274,84 @@ fn journal_lock(path: &Path) -> io::Result<File> {
     Ok(lock)
 }
 
+/// Worker-only transport handoff. Both journal writers must have finished.
+/// The fixed sibling is an unselected seed until this atomic replacement;
+/// recovery continues to select the canonical journal at every earlier cut.
+/// No failure deletes or relabels an uncertain staged journal.
+pub fn promote_finished_seed(staged: &Path, canonical: &Path, document: DocumentId) -> io::Result<()> {
+    promote_finished_seed_with(staged, canonical, document, crate::session::atomic_replace, sync_parent)
+}
+
+fn promote_finished_seed_with(
+    staged: &Path,
+    canonical: &Path,
+    document: DocumentId,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    sync: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut expected = canonical.as_os_str().to_os_string();
+    expected.push(".next");
+    if document.0 == 0
+        || !canonical.is_absolute()
+        || !staged.is_absolute()
+        || staged != Path::new(&expected)
+        || staged.parent() != canonical.parent()
+        || canonical.file_name().and_then(|name| name.to_str()) != Some(format!("{}.kwj", document.0).as_str())
+    {
+        return Err(invalid("transport seed promotion requires the exact canonical .kwj.next sibling"));
+    }
+    let parent = canonical.parent().ok_or_else(|| invalid("transport journal parent missing"))?;
+    let _canonical_lock = journal_lock(canonical)?;
+    let _staged_lock = journal_lock(staged)?;
+    let metadata = std::fs::symlink_metadata(staged)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(invalid("transport staged seed must be a regular private file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(invalid("transport staged seed permissions are not private"));
+        }
+    }
+    match std::fs::symlink_metadata(canonical) {
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            return Err(invalid("canonical transport journal must be a regular file"));
+        }
+        Ok(_) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
+    if pending_path(staged).try_exists()? || pending_path(canonical).try_exists()? {
+        return Err(invalid("transport promotion refused while pending journal data exists"));
+    }
+    let file = OpenOptions::new().read(true).write(true).open(staged)?;
+    let mut reader = JournalReader { file: file.try_clone()?, limit: file.metadata()?.len() };
+    let mut complete = false;
+    let summary = reader.recover(&AtomicBool::new(false), |event| {
+        match event {
+            RecoveryEvent::Base(base) | RecoveryEvent::EncodedBase { base, .. } if base.document == document => (),
+            RecoveryEvent::BaseBytes(_) => (),
+            RecoveryEvent::BaseComplete => complete = true,
+            _ => return Err(invalid("transport promotion requires an authenticated seed with no appended edits")),
+        }
+        Ok(())
+    })?;
+    if !complete || summary.tail != RecoveryTail::Complete || summary.committed_end != reader.limit {
+        return Err(invalid("transport staged seed is incomplete; canonical recovery retained"));
+    }
+    file.sync_all()?;
+    drop(reader);
+    drop(file);
+    replace(staged, canonical)?;
+    sync(parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("transport journal promotion committed; parent durability uncertain: {error}"),
+        )
+    })
+}
+
 fn base_bytes(base: &JournalBase) -> io::Result<Vec<u8>> {
     if base.document.0 == 0 || base.codec.len() > 128 {
         return Err(invalid("base identity or codec"));
@@ -1562,3 +1640,157 @@ fn replay(
 
 #[cfg(test)]
 mod logical_tests;
+
+#[cfg(test)]
+mod transport_promotion_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "kwil-transport-promotion-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn paths(&self) -> (PathBuf, PathBuf) {
+            (self.0.join("7.kwj"), self.0.join("7.kwj.next"))
+        }
+        fn seed(&self, path: &Path, bytes: &[u8]) {
+            let mut file = private_new(path).unwrap();
+            let base = JournalBase {
+                document: DocumentId(7),
+                revision: 0,
+                original_path: None,
+                original_identity: [0; 4],
+                codec: b"raw-v1".to_vec(),
+                byte_len: bytes.len() as u64,
+            };
+            seed(&mut file, &base, None, Some(Box::new(io::Cursor::new(bytes.to_vec()))), &AtomicBool::new(false))
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn transport_promotion_retains_old_authority_before_replace_and_selects_new_after() {
+        let fixture = Fixture::new();
+        let (canonical, staged) = fixture.paths();
+        fixture.seed(&canonical, b"old recovery");
+        fixture.seed(&staged, b"new recovery");
+        let old = std::fs::read(&canonical).unwrap();
+        let new = std::fs::read(&staged).unwrap();
+        let error = promote_finished_seed_with(
+            &staged,
+            &canonical,
+            DocumentId(7),
+            |_, _| Err(io::Error::other("injected pre-replace refusal")),
+            |_| panic!("no sync after refusal"),
+        );
+        assert!(error.is_err());
+        assert_eq!(std::fs::read(&canonical).unwrap(), old);
+        assert_eq!(std::fs::read(&staged).unwrap(), new);
+        promote_finished_seed(&staged, &canonical, DocumentId(7)).unwrap();
+        assert_eq!(std::fs::read(&canonical).unwrap(), new);
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn transport_promotion_refuses_live_writers_pending_data_and_wrong_siblings() {
+        let fixture = Fixture::new();
+        let (canonical, staged) = fixture.paths();
+        fixture.seed(&canonical, b"old");
+        fixture.seed(&staged, b"new");
+        let old = std::fs::read(&canonical).unwrap();
+        for path in [&canonical, &staged] {
+            let lock = journal_lock(path).unwrap();
+            assert!(promote_finished_seed(&staged, &canonical, DocumentId(7)).is_err());
+            drop(lock);
+            assert_eq!(std::fs::read(&canonical).unwrap(), old);
+            assert!(staged.exists());
+        }
+        assert!(promote_finished_seed(&fixture.0.join("other"), &canonical, DocumentId(7)).is_err());
+        assert!(promote_finished_seed(&staged, &canonical, DocumentId(8)).is_err());
+        let pending = pending_path(&staged);
+        drop(private_new(&pending).unwrap());
+        assert!(promote_finished_seed(&staged, &canonical, DocumentId(7)).is_err());
+        assert!(pending.exists());
+        assert!(staged.exists());
+        assert_eq!(std::fs::read(canonical).unwrap(), old);
+    }
+
+    #[test]
+    fn transport_promotion_truncated_or_appended_seed_never_replaces_old_recovery() {
+        for corrupt_tail in [true, false] {
+            let fixture = Fixture::new();
+            let (canonical, staged) = fixture.paths();
+            fixture.seed(&canonical, b"old");
+            fixture.seed(&staged, b"new");
+            let old = std::fs::read(&canonical).unwrap();
+            let mut file = OpenOptions::new().write(true).open(&staged).unwrap();
+            if corrupt_tail {
+                file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+            } else {
+                file.seek(SeekFrom::End(0)).unwrap();
+                write_frame(
+                    &mut file,
+                    &edit_bytes(JournalEdit { from_revision: 0, to_revision: 1, offset: 0, removed: 0, inserted: 1 }),
+                )
+                .unwrap();
+                write_frame(&mut file, &[5, b'x']).unwrap();
+                write_frame(&mut file, &[6]).unwrap();
+            }
+            drop(file);
+            assert!(promote_finished_seed(&staged, &canonical, DocumentId(7)).is_err());
+            assert!(staged.exists());
+            assert_eq!(std::fs::read(canonical).unwrap(), old);
+        }
+    }
+
+    #[test]
+    fn transport_promotion_reports_post_replace_durability_uncertain_as_committed() {
+        let fixture = Fixture::new();
+        let (canonical, staged) = fixture.paths();
+        fixture.seed(&canonical, b"old");
+        fixture.seed(&staged, b"new");
+        let new = std::fs::read(&staged).unwrap();
+        let error =
+            promote_finished_seed_with(&staged, &canonical, DocumentId(7), crate::session::atomic_replace, |_| {
+                Err(io::Error::other("injected directory sync failure"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("promotion committed"));
+        assert_eq!(std::fs::read(canonical).unwrap(), new);
+        assert!(!staged.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transport_promotion_refuses_symlink_and_nonprivate_staged_source() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = Fixture::new();
+        let (canonical, staged) = fixture.paths();
+        fixture.seed(&canonical, b"old");
+        let target = fixture.0.join("other-seed");
+        fixture.seed(&target, b"new");
+        symlink(&target, &staged).unwrap();
+        assert!(promote_finished_seed(&staged, &canonical, DocumentId(7)).is_err());
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::rename(target, &staged).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(promote_finished_seed(&staged, &canonical, DocumentId(7)).is_err());
+        assert!(staged.exists());
+    }
+}
