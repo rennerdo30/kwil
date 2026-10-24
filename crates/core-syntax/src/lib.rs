@@ -6,6 +6,7 @@ pub mod detection;
 mod engine;
 mod language;
 mod lexer;
+pub mod logs;
 mod worker;
 
 #[cfg(feature = "measure")]

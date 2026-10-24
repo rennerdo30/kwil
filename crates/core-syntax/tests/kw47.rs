@@ -52,7 +52,7 @@ fn detection_precedence() {
         assert_eq!(detected("unknown", line).language, language);
         assert_eq!(detected("unknown", line).origin, Origin::Content);
     }
-    assert!(detected("unknown", "2026-10-23 ERROR failed").log_levels);
+    assert!(detected("unknown", "2026-10-23T00:00:00Z ERROR failed").log_levels);
     assert!(detected("server.log", "hello").log_levels);
     assert_eq!(detected("unknown", "unclassified words").language, Language::Generic);
     assert_eq!(detected("script", "#!/usr/bin/perl").language, Language::Generic);
@@ -60,7 +60,7 @@ fn detection_precedence() {
     assert_eq!(detected("script", "#!/usr/bin/env NODE_ENV=python bash").language, Language::Bash);
     assert_eq!(Language::from_id("nonexistent"), None);
     assert_eq!(Language::ALL.len(), 32);
-    assert_eq!(Language::CATALOGUE.len(), 33);
+    assert_eq!(Language::CATALOGUE.len(), 34);
     assert!(Language::Generic.bundled().is_none());
     let bare = Detector::new(&[LanguageMapping { pattern: "foo".into(), language: Language::Json }]).unwrap();
     assert_eq!(bare.detect(Path::new("a.FOO"), None, &source, &|| false).unwrap().language, Language::Json);
@@ -169,26 +169,19 @@ fn log_filename_timestamp_and_level_detection() {
     for path in ["server.log", "server.LOG", "server.log.1", "server.log.2026-10-23", "log"] {
         let d = detected(path, "unclassified words");
         assert!(d.log_levels, "{path}");
-        assert_eq!(d.language, Language::Generic);
+        assert_eq!(d.language, Language::Log);
         assert_eq!(d.origin, Origin::Filename);
     }
-    for line in [
-        "2026-10-23T05:57:00Z ready",
-        "2026/10/23 05:57:00.123 ready",
-        "[2026-10-23 05:57:00] ready",
-        "05:57:00 ready",
-        "Oct 23 05:57:00 host process: ready",
-        "Oct  3 05:57:00 host: ready",
-        "[INFO] ready",
-        "WARN ready",
-    ] {
+    for line in ["2026-10-23T05:57:00Z INFO ready", "[2026-10-23 05:57:00] INFO ready", "[INFO] ready"] {
         let d = detected("unknown", line);
         assert!(d.log_levels, "{line}");
-        assert_eq!(d.language, Language::Generic);
+        assert_eq!(d.language, Language::Log);
         assert_eq!(d.origin, Origin::Content);
     }
     assert!(!detected("server.log.gz", "unclassified words").log_levels);
     assert!(!detected("unknown", "25:00:00 invalid time").log_levels);
     assert!(!detected("unknown", "2026-10-23 not a timestamp").log_levels);
+    assert!(!detected("unknown", "05:57:00 ready").log_levels);
+    assert!(!detected("unknown", "message includes ERROR").log_levels);
     assert_eq!(detected("unknown", "[section] # comment").language, Language::Ini);
 }

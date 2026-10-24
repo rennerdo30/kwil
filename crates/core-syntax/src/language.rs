@@ -4,16 +4,16 @@ use crate::Grammar;
 macro_rules! languages {
     ($(($variant:ident, $id:literal, $feature:literal, $module:ident, $ext:literal, $names:literal, $keywords:literal, $line:literal, $open:literal, $close:literal)),* $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub enum Language { Generic, $($variant),* }
+        pub enum Language { Generic, Log, $($variant),* }
         impl Language {
-            /// The audited 32 grammar identities. Generic has no grammar.
+            /// The audited 32 grammar identities. Generic and Log have no grammar.
             pub const ALL: &'static [Self] = &[$(Self::$variant),*];
             /// Typed picker catalogue, independent of enabled grammar features.
-            pub const CATALOGUE: &'static [Self] = &[Self::Generic, $(Self::$variant),*];
-            pub fn id(self) -> &'static str { match self { Self::Generic => "generic", $(Self::$variant => $id),* } }
-            pub(crate) fn lexical(self) -> Lexical { match self { Self::Generic => Lexical { keywords: "", line: "", open: "/*", close: "*/" }, $(Self::$variant => Lexical { keywords: $keywords, line: $line, open: $open, close: $close }),* } }
-            pub fn extensions(self) -> &'static str { match self { Self::Generic => "", $(Self::$variant => $ext),* } }
-            pub fn filenames(self) -> &'static str { match self { Self::Generic => "", $(Self::$variant => $names),* } }
+            pub const CATALOGUE: &'static [Self] = &[Self::Generic, Self::Log, $(Self::$variant),*];
+            pub fn id(self) -> &'static str { match self { Self::Generic => "generic", Self::Log => "log", $(Self::$variant => $id),* } }
+            pub(crate) fn lexical(self) -> Lexical { match self { Self::Generic | Self::Log => Lexical { keywords: "", line: "", open: "/*", close: "*/" }, $(Self::$variant => Lexical { keywords: $keywords, line: $line, open: $open, close: $close }),* } }
+            pub fn extensions(self) -> &'static str { match self { Self::Generic => "", Self::Log => "log", $(Self::$variant => $ext),* } }
+            pub fn filenames(self) -> &'static str { match self { Self::Generic => "", Self::Log => "log log4j", $(Self::$variant => $names),* } }
             pub fn bundled(self) -> Option<Grammar> { match self { $(
                 #[cfg(feature = $feature)]
                 Self::$variant => Some(Grammar { language: $module::language().into(), highlights: bundled_query(self, &$module::HIGHLIGHTS_QUERY) }),
@@ -88,7 +88,8 @@ languages! {
     (Scala, "scala", "lang-scala", arborium_scala, "scala sc", "", "abstract case catch class def do else enum export extends false final finally for forSome given if implicit import inline lazy match new null object opaque open override package private protected return sealed super then this throw trait transparent true try type using val var while with yield", "//", "/*", "*/"),
 }
 
-/// Filename and extension win over a shebang. Only the first 512 bytes are inspected.
+/// Filename and extension win over a shebang. Shebangs inspect 512 bytes;
+/// structured-log sniffing inspects at most `logs::MAX_PREFIX_BYTES`.
 pub fn detect(path: impl AsRef<std::path::Path>, first_line: &[u8]) -> Option<Language> {
     let name = path.as_ref().file_name()?.to_str()?.to_ascii_lowercase();
     for &language in Language::ALL {
@@ -98,6 +99,9 @@ pub fn detect(path: impl AsRef<std::path::Path>, first_line: &[u8]) -> Option<La
     }
     if name.starts_with("dockerfile.") {
         return Some(Language::Dockerfile);
+    }
+    if crate::detection::log_filename(&name) {
+        return Some(Language::Log);
     }
     if let Some((_, ext)) = name.rsplit_once('.') {
         for &language in Language::ALL {
@@ -133,6 +137,7 @@ pub fn detect(path: impl AsRef<std::path::Path>, first_line: &[u8]) -> Option<La
     } else if line.starts_with("diff --git ") {
         Some(Language::Diff)
     } else {
-        None
+        let meta = crate::logs::metadata(first_line);
+        (meta.level.is_some() && meta.timestamp.is_some()).then_some(Language::Log)
     }
 }

@@ -206,7 +206,7 @@ impl Engine {
         let mut incremental = false;
         let mut mode = Mode::Lexical;
         // Tree-sitter offsets are u32. Huge sources never enter its parser.
-        let parse = language != Language::Generic
+        let parse = !matches!(language, Language::Generic | Language::Log)
             && source.len() <= self.config.parse_limit
             && source.len() < u32::MAX as usize;
         if parse && self.language != Some(language) {

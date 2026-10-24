@@ -20,8 +20,16 @@ pub(crate) fn highlight(
         offset += chunk.len();
         bytes.extend_from_slice(&chunk);
     }
+    if language == Language::Log {
+        return crate::logs::highlight(&bytes, window.start, requested, cancelled);
+    }
     let table = language.lexical();
     let mut spans = Vec::new();
+    let leading = if language == Language::Generic && window.start == 0 {
+        bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len())
+    } else {
+        usize::MAX
+    };
     let mut i = 0;
     while i < bytes.len() {
         if cancelled() {
@@ -84,7 +92,11 @@ pub(crate) fn highlight(
             }
             let token = &bytes[start..i];
             if language == Language::Generic {
-                if let Some(class) = crate::detection::log_class(token) {
+                // Compatibility for leading level records in generic text;
+                // severity words later in prose are ordinary words.
+                if start == leading
+                    && let Some(class) = crate::detection::log_class(token)
+                {
                     let range = (window.start + start).max(requested.start)..(window.start + i).min(requested.end);
                     if !range.is_empty() {
                         spans.push(Span { range, class });

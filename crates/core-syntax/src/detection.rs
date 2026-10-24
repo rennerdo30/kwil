@@ -45,8 +45,7 @@ pub enum DetectionOrigin {
     Generic,
 }
 
-/// Logs retain the Generic language identity, whose lexer recognizes levels.
-/// This does not claim an audited tree-sitter log grammar exists.
+/// Log is a dedicated lexical identity, outside the 32 audited grammars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Detection {
     pub language: Language,
@@ -111,7 +110,7 @@ impl Detector {
         source: &dyn TextSource,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Detection, Error> {
-        let selected = |language, origin| Detection { language, origin, log_levels: false };
+        let selected = |language, origin| Detection { language, origin, log_levels: language == Language::Log };
         if cancelled() {
             return Err(Error::Cancelled);
         }
@@ -147,9 +146,9 @@ impl Detector {
             return Ok(selected(language, DetectionOrigin::Filename));
         }
         if log_filename(basename) {
-            return Ok(Detection { language: Language::Generic, origin: DetectionOrigin::Filename, log_levels: true });
+            return Ok(selected(Language::Log, DetectionOrigin::Filename));
         }
-        if let Some((language, log_levels)) = sniff(line) {
+        if let Some((language, log_levels)) = sniff(line, crate::logs::metadata(&prefix)) {
             return Ok(Detection { language, origin: DetectionOrigin::Content, log_levels });
         }
         Ok(selected(Language::Generic, DetectionOrigin::Generic))
@@ -263,22 +262,13 @@ fn first_line_language(line: &str) -> Option<Language> {
 }
 
 pub(crate) fn log_class(token: &[u8]) -> Option<crate::Class> {
-    use crate::Class;
-    if [b"ERROR".as_slice(), b"FATAL", b"CRITICAL"].iter().any(|s| token.eq_ignore_ascii_case(s)) {
-        Some(Class::Error)
-    } else if [b"WARN".as_slice(), b"WARNING"].iter().any(|s| token.eq_ignore_ascii_case(s)) {
-        Some(Class::Constant)
-    } else if [b"INFO".as_slice(), b"DEBUG", b"TRACE"].iter().any(|s| token.eq_ignore_ascii_case(s)) {
-        Some(Class::Keyword)
-    } else {
-        None
-    }
+    crate::logs::Level::parse(token).map(crate::logs::Level::class)
 }
-fn sniff(line: &str) -> Option<(Language, bool)> {
-    // Check bracketed timestamps before JSON's opening-array heuristic.
-    // A timestamp contains colons/dashes and cannot be a JSON array value.
-    if timestamp_prefix(line.as_bytes()) {
-        return Some((Language::Generic, true));
+fn sniff(line: &str, metadata: crate::logs::Metadata) -> Option<(Language, bool)> {
+    // Require timestamp + structural severity, so prose/JSON containing level
+    // words and dates alone do not acquire log semantics.
+    if metadata.level.is_some() && metadata.timestamp.is_some() {
+        return Some((Language::Log, true));
     }
     let bytes = line.as_bytes();
     let after_open = line.get(1..).unwrap_or("").trim_start();
@@ -296,12 +286,9 @@ fn sniff(line: &str) -> Option<(Language, bool)> {
     if line.starts_with('<') && bytes.get(1).is_some_and(u8::is_ascii_alphabetic) && line.contains('>') {
         return Some((Language::Xml, false));
     }
-    // Timestamped records and bracketed levels are logs rather than INI
-    // sections. Inspect only this already-bounded first line, never a file scan.
-    let level_prefix = line.trim_start_matches(['[', '(', ' ']);
-    let level_prefix = level_prefix.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
-    if log_class(level_prefix.as_bytes()).is_some() {
-        return Some((Language::Generic, true));
+    // Explicitly bracketed leading levels are also useful without a timestamp.
+    if line.starts_with('[') && metadata.level.is_some() {
+        return Some((Language::Log, true));
     }
     if line.starts_with('[')
         && line.find(']').is_some_and(|i| {
@@ -314,63 +301,21 @@ fn sniff(line: &str) -> Option<(Language, bool)> {
     {
         return Some((Language::Ini, false));
     }
-    if line.split(|c: char| !c.is_ascii_alphabetic()).any(|s| log_class(s.as_bytes()).is_some()) {
-        return Some((Language::Generic, true));
-    }
     None
 }
 
-fn log_filename(basename: &str) -> bool {
+pub(crate) fn log_filename(basename: &str) -> bool {
     let name = basename.to_ascii_lowercase();
-    if name == "log" || name.ends_with(".log") {
+    if name == "log" || name == "log4j" || name.ends_with(".log") || name.ends_with(".log4j") {
         return true;
     }
     // Numeric/date rotations are still logs. Compressed suffixes belong to the
     // separate compression worker; never interpret compressed bytes as text.
-    name.rsplit_once(".log.").is_some_and(|(_, suffix)| {
-        !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-'))
-    })
-}
-
-fn clock_prefix(bytes: &[u8]) -> bool {
-    if bytes.len() < 8
-        || bytes[2] != b':'
-        || bytes[5] != b':'
-        || ![0, 1, 3, 4, 6, 7].into_iter().all(|i| bytes[i].is_ascii_digit())
-    {
-        return false;
-    }
-    let pair = |i| (bytes[i] - b'0') * 10 + bytes[i + 1] - b'0';
-    pair(0) <= 23 && pair(3) <= 59 && pair(6) <= 60 && bytes.get(8).is_none_or(|b| !b.is_ascii_digit())
-}
-
-fn timestamp_prefix(bytes: &[u8]) -> bool {
-    let bytes = bytes.strip_prefix(b"[").unwrap_or(bytes);
-    // Time-only logs, ISO 8601 and common slash-separated application dates.
-    if clock_prefix(bytes) {
-        return true;
-    }
-    if bytes.len() >= 19
-        && matches!(bytes[4], b'-' | b'/')
-        && bytes[7] == bytes[4]
-        && matches!(bytes[10], b'T' | b't' | b' ')
-        && [0, 1, 2, 3, 5, 6, 8, 9].into_iter().all(|i| bytes[i].is_ascii_digit())
-        && clock_prefix(&bytes[11..])
-    {
-        return true;
-    }
-    // RFC 3164 style syslog (Oct 23 05:57:00 ...), including a single-digit day.
-    if bytes.len() >= 14
-        && [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"]
-            .iter()
-            .any(|month| bytes[..3].eq_ignore_ascii_case(*month))
-        && bytes[3] == b' '
-    {
-        let rest = &bytes[4..];
-        let spaces = rest.iter().take_while(|b| **b == b' ').count();
-        let rest = &rest[spaces..];
-        let day = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-        return (1..=2).contains(&day) && rest.get(day) == Some(&b' ') && clock_prefix(&rest[day + 1..]);
-    }
-    false
+    name.rsplit_once(".log.").or_else(|| name.strip_prefix("log4j.").map(|suffix| ("", suffix))).is_some_and(
+        |(_, suffix)| {
+            suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                && suffix.as_bytes().last().is_some_and(u8::is_ascii_digit)
+                && suffix.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+        },
+    )
 }
