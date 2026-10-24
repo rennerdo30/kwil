@@ -756,6 +756,8 @@ impl SearchPanel {
         }
         let editor = view.editor().ok_or("Document is not ready for selection search")?;
         self.active = true;
+        self.identity = Self::active(view);
+        self.identity_epoch = view.input_epoch();
         self.seed_epoch = Some(self.epoch);
         self.seed_origin =
             Some((editor.cursors().iter().map(|c| (c.anchor, c.head)).collect(), editor.primary_index()));
@@ -1536,7 +1538,17 @@ mod tests {
         let (mut session, rx) = session();
         let mut panel = SearchPanel::default();
         panel.input(&mut session, &view, SearchInput::AddCursor).unwrap();
-        let action = finish(&mut panel, &mut session, &view, &rx).action.unwrap();
+        let action = finish(&mut panel, &mut session, &view, &rx).action.unwrap_or_else(|| {
+            panic!(
+                "seed action missing: error={:?} status={} seed={:?} epoch={} seed_epoch={:?} cursor_matches={}",
+                panel.error,
+                panel.status,
+                session.state().seed,
+                panel.epoch,
+                panel.seed_epoch,
+                panel.seed_cursor_matches(&view)
+            )
+        });
         assert!(panel.validate_action(&session, &view, &action));
         let key = action.key();
         assert_eq!(session.key(), Some(key));
@@ -1629,9 +1641,9 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
-        #[cfg(not(unix))]
+        #[cfg(any(not(unix), target_os = "macos"))]
         let path = root.join("résumé-界.txt");
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         let path = {
             use std::os::unix::ffi::OsStringExt;
             root.join(std::ffi::OsString::from_vec(b"native-\xff.txt".to_vec()))

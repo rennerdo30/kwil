@@ -468,7 +468,18 @@ fn file_results_revisit_earliest_page_after_stream_and_refuse_old_session() {
         key: SearchKey { document_id: 0, revision: 0, generation: 900 },
         task: SearchTask::FilePage { results: original, page: Page::default() },
     };
-    let rejected = host.worker.as_ref().unwrap().submit(stale).unwrap_err();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut request = stale;
+    let rejected = loop {
+        let rejected = host.worker.as_ref().unwrap().submit(request).unwrap_err();
+        if rejected.reason != "search mailbox busy; retry on wake" {
+            break rejected;
+        }
+        request = *rejected.request;
+        wakes
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("bounded stale-page mailbox wake");
+    };
     assert_eq!(rejected.reason, "stale file result session");
     drop(rejected); // a result lease Drop only notifies its explicit worker owner.
     host.stop();
