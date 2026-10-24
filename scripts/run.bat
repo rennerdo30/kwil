@@ -1,7 +1,7 @@
 @echo off
 rem Build and start Kwil from this checkout, to check the current state.
 rem
-rem   scripts\run.bat                 open README.md in the window UI
+rem   scripts\run.bat                 open the five small editor samples in the window UI
 rem   scripts\run.bat some\file.txt   open a file
 rem   scripts\run.bat --pull          update to the latest main first (fast-forward only)
 rem   scripts\run.bat --release       optimized build (slower to build, the real speed)
@@ -27,7 +27,7 @@ set "ARG=%~1"
 if "!ARG:~0,1!"=="-" (
     set "KWIL_ARGS=!KWIL_ARGS! %1"
 ) else (
-    set "FILE=%~1"
+    set FILE=!FILE! "%~1"
 )
 shift
 goto parse
@@ -41,6 +41,7 @@ if defined PULL (
 rem Use half of the CPU threads so the PC stays responsive while building.
 set /a JOBS=%NUMBER_OF_PROCESSORS% / 2
 if %JOBS% LSS 1 set JOBS=1
+if %JOBS% GTR 8 set JOBS=8
 
 if defined BIG (
     if not exist "fixtures\log-1g.log" (
@@ -48,9 +49,11 @@ if defined BIG (
         if not exist fixtures mkdir fixtures
         cargo run --release -j %JOBS% --quiet --manifest-path spike\textbench\Cargo.toml -- gen fixtures\log-1g.log 1024 || exit /b 1
     )
-    set "FILE=fixtures\log-1g.log"
+    set FILE="fixtures\log-1g.log"
 )
-if not defined FILE if "!KWIL_ARGS!"=="" set "FILE=README.md"
+if not defined FILE if "!KWIL_ARGS!"=="" set FILE="examples\smoke\example.log" "examples\smoke\example.json" "examples\smoke\Example.java" "examples\markdown\showcase.md" "examples\smoke\example.log.gz"
+
+if defined KWIL_RUN_DRY_RUN (echo Files: !FILE! & echo Options: !KWIL_ARGS! & exit /b 0)
 
 echo Building Kwil %RELEASE%...
 cargo build %RELEASE% -j %JOBS% --quiet -p kwil || (echo Build failed. & exit /b 1)

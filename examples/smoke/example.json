@@ -1,0 +1,18 @@
+{
+  "name": "Kwil sample",
+  "enabled": true,
+  "items": [
+    {
+      "id": 1,
+      "message": "Unicode: 日本語 · café · 🪶"
+    },
+    {
+      "id": 2,
+      "tags": [
+        "text",
+        "json"
+      ]
+    }
+  ],
+  "nothing": null
+}
