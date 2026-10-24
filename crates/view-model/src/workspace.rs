@@ -2728,7 +2728,13 @@ mod tests {
 
     #[test]
     fn recovered_context_survives_sync_dedup_reservation_and_cached_reopen_without_becoming_writable() {
-        let path = std::env::temp_dir().join("kwil-virtual-last-named-context.txt");
+        let root = std::env::temp_dir().join(format!(
+            "kwil-recovered-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("last-named-context.txt");
         let mut session = Session::default();
         let id = session.open(Some(path.clone())).unwrap();
         let mut document = crate::Document::new();
@@ -2774,6 +2780,42 @@ mod tests {
             "actual open destination remains reserved"
         );
         workspace.close(other, true).unwrap();
+        assert_eq!(workspace.close(named, true).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(workspace.document_busy(named), "checked open must retain ownership until its terminal receipt");
+        // The name is deliberately absent. Run its exact queued request on an
+        // isolated worker before closing the placeholder; a queued checked open
+        // is still worker-owned even when this fixture has no attached worker.
+        let queued = workspace
+            .files
+            .queue
+            .iter()
+            .position(
+                |request| matches!(request, DocumentRequest::OpenChecked { ticket, .. } if ticket.document() == named),
+            )
+            .expect("named placeholder must have one queued checked open");
+        let request = workspace.files.queue.remove(queued).unwrap();
+        let DocumentRequest::OpenChecked { ticket: opening, .. } = &request else { unreachable!() };
+        let opening = *opening;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = sender.send(result);
+        })
+        .unwrap();
+        worker.try_submit(DocumentRequest::Prepare { root: Some(root.clone()) }).unwrap();
+        match receiver.recv_timeout(std::time::Duration::from_secs(5)).expect("isolated worker preparation") {
+            DocumentResult::Prepared(result) => drop(result.unwrap()),
+            _ => panic!("expected isolated worker preparation"),
+        }
+        worker.try_submit(request).unwrap();
+        let opened =
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).expect("named checked-open terminal receipt");
+        assert!(
+            matches!(&opened, DocumentResult::CheckedOpened { ticket, result: Err(error) }
+                if *ticket == opening && error.kind() == io::ErrorKind::NotFound),
+            "the missing named destination must finish its exact checked-open flight"
+        );
+        workspace.document_result(opened);
+        assert!(!workspace.document_busy(named), "terminal receipt must release checked-open ownership");
         workspace.close(named, true).unwrap();
         workspace.activate(id);
         workspace.close(id, true).unwrap();
@@ -2796,6 +2838,12 @@ mod tests {
         assert_eq!(workspace.file_prompt().unwrap().document, id);
         workspace.cancel_file_prompt();
         assert!(workspace.close(id, false).is_err());
+        drop(worker);
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_secs(5)).expect("isolated worker shutdown"),
+            DocumentResult::Stopped(Ok(()))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

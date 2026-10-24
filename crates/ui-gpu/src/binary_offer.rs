@@ -244,11 +244,47 @@ pub(super) fn draw(
 mod tests {
     use super::*;
     use std::{
-        path::PathBuf,
-        sync::mpsc::Receiver,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc::Receiver,
+        },
         time::{Duration, Instant},
     };
     const BYTES: &[u8] = b"header\0binary\x01\n";
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+    fn fixture_root_in(parent: &Path, next: &AtomicU64) -> std::io::Result<PathBuf> {
+        // Clock resolution is not identity authority for parallel fixtures.
+        // Exclusive creation also protects a directory left by a reused PID.
+        for _ in 0..128 {
+            let sequence = next.fetch_add(1, Ordering::Relaxed);
+            let root = parent.join(format!("kwil-gui-binary-{}-{sequence}", std::process::id()));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Ok(root),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "binary GUI fixture namespace exhausted"))
+    }
+    #[test]
+    fn binary_fixture_identity_is_distinct_and_skips_existing_owner() {
+        let root = fixture_root_in(&std::env::temp_dir(), &NEXT_ROOT).unwrap();
+        let next = AtomicU64::new(0);
+        let first = fixture_root_in(&root, &next).unwrap();
+        let marker = first.join("owner.bin");
+        std::fs::write(&marker, BYTES).unwrap();
+        let second = fixture_root_in(&root, &next).unwrap();
+        assert_ne!(first, second, "each fixture receives a distinct sequence");
+        // Replaying the namespace forces collisions without clocks or threads.
+        let replay = AtomicU64::new(0);
+        let third = fixture_root_in(&root, &replay).unwrap();
+        assert_ne!(first, third);
+        assert_ne!(second, third);
+        assert_eq!(replay.load(Ordering::Relaxed), 3, "both existing owners were skipped");
+        assert_eq!(std::fs::read(marker).unwrap(), BYTES, "an existing owner's bytes stay untouched");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn until(app: &mut App, rx: &Receiver<UserEvent>, done: impl Fn(&App) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         for _ in 0..512 {
@@ -271,12 +307,7 @@ mod tests {
         let (mut app, rx) = search_ui::host_dispatch_tests::host("prior editor");
         app.opts.hidden = true;
         let prior = app.view.active_id();
-        let root = std::env::temp_dir().join(format!(
-            "kwil-gui-binary-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let root = fixture_root_in(&std::env::temp_dir(), &NEXT_ROOT).unwrap();
         let path = root.join("physical.bin");
         std::fs::write(&path, BYTES).unwrap();
         let proxy = app.proxy.clone();
