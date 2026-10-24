@@ -1331,14 +1331,16 @@ fn seed_journal(
         return Ok(());
     }
     let transport = storage.transports.get(&document).copied();
-    if let Some(expected) = transport {
-        if expected.policy != policy || expected.revision != revision || expected.len != snapshot.len() || sequence != 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transport seed identity or initial sequence mismatch; prior recovery retained",
-            ));
-        }
+    if let Some(expected) = transport
+        && (expected.policy != policy
+            || expected.revision != revision
+            || expected.len != snapshot.len()
+            || sequence != 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transport seed identity or initial sequence mismatch; prior recovery retained",
+        ));
     }
     let sequence =
         if transport.is_some() { 0 } else { (*storage.order.entry(document).or_insert(sequence)).max(sequence) };

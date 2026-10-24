@@ -22,10 +22,13 @@ mod filetypes_ui;
 mod font;
 #[cfg(all(windows, feature = "gpu"))]
 mod gpu_surface;
+mod hex_host;
+mod hex_ui;
 mod hit;
 mod icons;
 mod ime;
 mod input;
+mod language_ui;
 mod log_ui;
 mod markdown_diagram;
 mod markdown_images;
@@ -43,6 +46,7 @@ mod tabs;
 mod theme_ui;
 mod welcome;
 mod welcome_ui;
+mod wheel;
 mod zoom;
 
 use font::Font;
@@ -150,7 +154,7 @@ enum UserEvent {
     OpenExternal,
     Notice(String),
     GlyphReady(shaping::Tile, u64),
-    SettingsReady(Box<Settings>),
+    SettingsReady(Box<Settings>, kwil_view_model::language_selection::AcceptedLanguageMappings),
     DiagnosticsReady(String),
     LogReady,
     MarkdownReady(Box<markdown_ui::Completion>),
@@ -336,6 +340,7 @@ struct HostKey<'a> {
 }
 
 struct App {
+    hex: hex_host::Host,
     about: about::About,
     markdown: markdown_ui::Host,
     context: context_menu::Context,
@@ -353,6 +358,7 @@ struct App {
     goto_epoch: u64,
     goto_reveal: Option<(kwil_view_model::SessionDocumentId, u64)>,
     highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
+    language_picker: language_ui::LanguagePickerUi,
     document_stopped: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     palette: Option<kwil_view_model::palette_session::PaletteSession>,
     palette_dirty: bool,
@@ -396,6 +402,7 @@ struct App {
     pending: Damage,
     error: Option<GuiError>,
     horizontal: u64,
+    wheel: wheel::Wheel,
     pointer: (usize, usize),
     drag: Option<scrollbar::Drag>,
     started: std::time::Instant,
@@ -499,6 +506,7 @@ pub fn run_with_external_open(
         }
     };
     let mut app = App {
+        hex: Default::default(),
         search: None,
         search_panel: Default::default(),
         search_origin: None,
@@ -510,6 +518,7 @@ pub fn run_with_external_open(
         goto_epoch: 0,
         goto_reveal: None,
         highlighting: None,
+        language_picker: Default::default(),
         document_stopped: None,
         palette: None,
         palette_dirty: false,
@@ -559,6 +568,7 @@ pub fn run_with_external_open(
         pending: Damage::default(),
         error: None,
         horizontal,
+        wheel: Default::default(),
         pointer: (0, 0),
         drag: None,
         started: std::time::Instant::now(),
@@ -738,10 +748,10 @@ impl App {
     /// Chrome comes from DPI metrics; only the text grid uses the editor font.
     fn body_area(&self) -> kwil_view_model::TabArea {
         let mut area = chrome::layout(self.size, &self.ui, self.settings.tabs.layout).body;
-        if self.markdown_mode() == markdown_ui::Mode::Split {
+        if !self.view.hex_active() && self.markdown_mode() == markdown_ui::Mode::Split {
             area.width /= 2;
         }
-        log_ui::layout(area, &self.ui, self.logs.is_open()).body
+        log_ui::layout(area, &self.ui, !self.view.hex_active() && self.logs.is_open()).body
     }
 
     fn columns(&self) -> u64 {
@@ -750,6 +760,9 @@ impl App {
     }
 
     fn bars(&self) -> (scrollbar::Bar, scrollbar::Bar) {
+        if self.view.hex_active() {
+            return self.hex_bars();
+        }
         let body = self.body_area();
         let height = body.height.saturating_sub(self.ui.bar);
         if self.logs.owns_body() {
@@ -824,14 +837,7 @@ impl App {
         // Text-area moves stay cheap: the horizontal extent reads row tails,
         // so it is measured only while the pointer is over that track.
         if x >= body.width.saturating_sub(self.ui.bar) && y < track {
-            let v = scrollbar::Bar::sized(
-                0,
-                track,
-                self.view.rows() as u64,
-                self.view.line_count().unwrap_or(self.view.rows() as u64),
-                self.view.top(),
-                self.ui.min_thumb,
-            );
+            let v = self.bars().0;
             return (v.maximum > 0 && v.contains_thumb(y)).then_some(chrome::Hover::VerticalThumb);
         }
         if y >= track && y < track + self.ui.bar {
@@ -882,6 +888,7 @@ impl App {
     fn pointer_cursor(&self) -> winit::window::CursorIcon {
         let pointer = self.pointer;
         let modal = self.file_modal()
+            || self.language_owns_input()
             || self.save_path.is_some()
             || self.settings_open()
             || self.palette_open()
@@ -935,6 +942,9 @@ impl App {
     }
 
     fn scroll_bar(&mut self, vertical: bool, offset: u64) {
+        if self.hex_scroll_bar(vertical, offset) {
+            return;
+        }
         if self.logs.owns_body() {
             let (top, horizontal) = self.logs.viewport_position();
             self.logs_scroll_to(if vertical { offset } else { top }, if vertical { horizontal } else { offset });
@@ -967,15 +977,33 @@ impl App {
             (
                 v,
                 y,
-                if self.logs.owns_body() { self.logs.viewport_position().0 } else { self.view.top() },
+                if self.view.hex_active() {
+                    self.view.hex_session().map_or(0, |s| s.view().top())
+                } else if self.logs.owns_body() {
+                    self.logs.viewport_position().0
+                } else {
+                    self.view.top()
+                },
                 self.text_rows() as u64,
             )
         } else {
             (
                 h,
                 x,
-                if self.logs.owns_body() { self.logs.viewport_position().1 } else { self.horizontal },
-                if self.logs.owns_body() { self.columns() } else { self.page_bytes() },
+                if self.view.hex_active() {
+                    self.hex.horizontal
+                } else if self.logs.owns_body() {
+                    self.logs.viewport_position().1
+                } else {
+                    self.horizontal
+                },
+                if self.view.hex_active() {
+                    (body.width.saturating_sub(self.ui.bar) / self.font.as_ref().map_or(8, |f| f.cw).max(1)) as u64
+                } else if self.logs.owns_body() {
+                    self.columns()
+                } else {
+                    self.page_bytes()
+                },
             )
         };
         if bar.contains_thumb(pixel) {
@@ -986,6 +1014,7 @@ impl App {
     }
 
     fn monitor_scale_changed(&mut self, scale_factor: f64) {
+        self.close_language();
         self.drag = None;
         self.selecting = false;
         self.ui = chrome::Metrics::new(scale_factor);
@@ -999,14 +1028,22 @@ impl App {
     }
 
     fn apply(&mut self, mut d: Damage) {
+        let hex_damage = self.sync_hex_host();
+        d.full |= hex_damage.full;
+        d.status |= hex_damage.status;
+        d.rows.extend(hex_damage.rows);
         if self.sync_presenter() {
             d.full = true;
         }
-        self.sync_markdown();
-        self.sync_logs();
+        if !self.view.hex_active() {
+            self.sync_markdown();
+            self.sync_logs();
+        }
         // Addressed events/edits invalidate search by document + revision.
         // This only captures an existing typed Editor snapshot, never decodes.
-        if let Some(session) = &mut self.search {
+        if !self.view.hex_active()
+            && let Some(session) = &mut self.search
+        {
             match self.search_panel.sync_document(session, &self.view) {
                 Ok(outcome) => {
                     self.search_dirty |= outcome.damage.panel || outcome.damage.signal;
@@ -1020,12 +1057,20 @@ impl App {
             }
         }
         self.sync_goto_identity();
+        self.sync_language_identity();
 
-        if let Some(highlighting) = &mut self.highlighting {
+        if !self.view.hex_active()
+            && let Some(highlighting) = &mut self.highlighting
+        {
             highlighting.invalidate_painted(&self.view, &d);
             highlighting.update(&self.view);
         }
-        if d == Damage::default() && !self.chrome_dirty && !self.palette_dirty && !self.menu_dirty && !self.search_dirty
+        if d == Damage::default()
+            && !self.chrome_dirty
+            && !self.palette_dirty
+            && !self.menu_dirty
+            && !self.search_dirty
+            && !self.language_picker.dirty
         {
             return;
         }
@@ -1061,6 +1106,9 @@ impl App {
     }
 
     fn key_after_settings(&mut self, el: Option<&ActiveEventLoop>, ev: &HostKey<'_>) {
+        if self.language_key(ev) {
+            return;
+        }
         if self.file_modal() {
             if self.close_dialog.is_none() && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
                 self.view.cancel_file_prompt();
@@ -1162,6 +1210,10 @@ impl App {
         if matches!(ev.logical_key, Key::Named(NamedKey::ContextMenu))
             || (self.mods.shift_key() && matches!(ev.logical_key, Key::Named(NamedKey::F10)))
         {
+            if self.view.hex_active() {
+                self.hex_cancel_input();
+                return;
+            }
             self.open_context();
             return;
         }
@@ -1182,6 +1234,10 @@ impl App {
         }
         if self.close_pending && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             self.view.cancel_file_prompt();
+            self.hex_cancel_input();
+            if let Some(keys) = &mut self.keys {
+                keys.cancel_pending();
+            }
             self.sync_file_ui();
             let damage = self.view.set_notice(String::new());
             self.apply(damage);
@@ -1195,14 +1251,25 @@ impl App {
                     kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
             }
             if let Some(keys) = &mut self.keys {
+                // Resolve configured commands, tombstones and chord prefixes
+                // in the actual body context before any hex key fallback.
+                keys.set_context(if self.view.hex_active() {
+                    kwil_core_commands::Context::Hex
+                } else {
+                    kwil_core_commands::Context::Editor
+                });
                 use kwil_core_commands::vim::VimResult;
                 match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
+                        if self.dispatch_hex(call.id) {
+                            return;
+                        }
                         if self.logs.owns_body() && call.id.starts_with("edit.") {
                             return;
                         }
                         if self.dispatch_logs(call.id)
+                            || self.dispatch_language(call.id)
                             || self.dispatch_search_call(&call)
                             || self.dispatch_settings(call.id)
                             || self.dispatch_palette(call.id)
@@ -1264,7 +1331,17 @@ impl App {
                         return;
                     }
                     VimResult::Unbound => {
-                        match Self::unbound_key(keys, &ev.logical_key, ev.text, self.mods) {
+                        let suppressed = keys.suppresses_fallback();
+                        let fallback = Self::unbound_key(keys, &ev.logical_key, ev.text, self.mods);
+                        if self.view.hex_active() {
+                            if suppressed {
+                                return;
+                            }
+                            if self.hex_key(ev) {
+                                return;
+                            }
+                        }
+                        match fallback {
                             UnboundKey::Quit => {
                                 if !ev.repeat
                                     && let Some(el) = el
@@ -1279,6 +1356,9 @@ impl App {
                     }
                 }
             }
+        }
+        if self.hex_key(ev) {
+            return;
         }
         if let Some(action) = input::translate(&ev.logical_key, ev.text, self.mods, self.composing) {
             self.edit(action);
@@ -1304,7 +1384,10 @@ impl App {
     }
 
     fn edit(&mut self, action: input::Action) {
-        if self.file_modal() {
+        if self.file_modal() || self.language_owns_input() {
+            return;
+        }
+        if self.hex_edit(&action) {
             return;
         }
         let (id, text) = match action {
@@ -1314,7 +1397,8 @@ impl App {
         if self.logs.owns_body() && (id.starts_with("edit.") || id.starts_with("search.replace")) {
             return;
         }
-        if self.dispatch_logs(id)
+        if self.dispatch_language(id)
+            || self.dispatch_logs(id)
             || self.dispatch_markdown(id)
             || self.dispatch_search(id)
             || self.dispatch_settings(id)
@@ -1365,6 +1449,9 @@ impl App {
     }
 
     fn keep_caret_visible(&mut self) {
+        if self.view.hex_active() {
+            return;
+        }
         let Some(editor) = self.view.editor() else {
             return;
         };
@@ -1394,14 +1481,14 @@ impl App {
         if self.close_dialog.is_some() {
             return false;
         }
-        self.file_dialogs.may_exit(&mut self.view)
+        self.file_dialogs.may_exit(&mut self.view) && self.view.prepare_hex_shutdown()
     }
     fn force_exit(&mut self) -> bool {
         if self.close_dialog.is_some() {
             return false;
         }
         self.external_inbox.close();
-        self.file_dialogs.force_exit(&mut self.view)
+        self.file_dialogs.force_exit(&mut self.view) && self.view.prepare_hex_shutdown()
     }
     fn request_close(&mut self, el: &ActiveEventLoop, discard: bool) {
         if self.file_dialogs.exiting() {
@@ -1428,6 +1515,9 @@ impl App {
     }
 
     fn place_caret(&mut self, extend: bool) {
+        if self.hex_pointer(extend) {
+            return;
+        }
         let body = self.body_area();
         let Some(font) = &self.font else {
             return;
@@ -1501,6 +1591,7 @@ impl App {
             self.pending.full = true;
         }
         if self.pending == Damage::default()
+            && !self.language_picker.dirty
             && !self.chrome_dirty
             && !self.palette_dirty
             && !self.menu_dirty
@@ -1561,13 +1652,24 @@ impl App {
         if let Some(native) = self.gfx.as_mut().and_then(|gfx| gfx.native.as_mut()) {
             native.toolbar_tooltips(&self.menu.toolbar, &self.menu.labels);
         }
-        let (notice, segments) = chrome::status(&self.view, self.zoom.percent());
+        let hex_active = self.view.hex_active();
+        let (notice, mut segments) = if hex_active {
+            (
+                self.hex_status(),
+                vec![chrome::Segment { text: "Physical bytes".into(), command: Some("view.toggleHex"), warn: false }],
+            )
+        } else {
+            chrome::status(&self.view, self.zoom.percent())
+        };
+        if !hex_active && let Some(host) = &self.highlighting {
+            segments.push(chrome::language_segment(host.language_status(&self.view)));
+        }
         let title = chrome::window_title(&self.view);
         let dragging = self.drag.map(|drag| drag.vertical);
         let hover = self.hover;
         let theme = theme_ui::chrome();
-        let markdown_mode = self.markdown_mode();
-        let markdown_eligible = self.view.editor().is_some_and(|editor| editor.is_markdown());
+        let markdown_mode = if hex_active { markdown_ui::Mode::Text } else { self.markdown_mode() };
+        let markdown_eligible = !hex_active && self.view.editor().is_some_and(|editor| editor.is_markdown());
         let markdown_area = tabs::rect(lay.body);
         let body = geometry.body;
         let (bw, bh) = (body.width, body.height);
@@ -1575,6 +1677,7 @@ impl App {
         let bars = self.bars();
         let rows = geometry.text.height / ch;
         let palette_open = self.welcome.visible()
+            || self.language_open()
             || self.palette_open()
             || self.settings_open()
             || self.search_panel.is_open()
@@ -1582,9 +1685,18 @@ impl App {
             || self.save_path.is_some();
         let menu_list = self.menu.dropdown.is_some() || self.menu_area.is_some();
         let gpu_active = self.gpu_active();
-        let projection_owns_body = self.logs.owns_body();
+        let projection_owns_body = !hex_active && self.logs.owns_body();
         let projection_source = log_ui::Source::capture(&self.view);
-        let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
+        let spans: Vec<_> = self
+            .highlighting
+            .as_ref()
+            .filter(|_| !hex_active)
+            .into_iter()
+            .flat_map(|host| host.spans(&self.view))
+            .collect();
+        let hex_source = self.view.hex_source();
+        let hex_read_only = hex_active && self.view.document_busy(self.view.active_id());
+        let hex_horizontal = self.hex.horizontal as usize;
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else {
             return false;
         };
@@ -1602,10 +1714,13 @@ impl App {
         let palette_dirty = std::mem::take(&mut self.palette_dirty);
         let menu_dirty = std::mem::take(&mut self.menu_dirty);
         let search_dirty = std::mem::take(&mut self.search_dirty);
+        let language_dirty = std::mem::take(&mut self.language_picker.dirty);
+        let language_restore = language_dirty && !self.language_picker.is_open();
         if (palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some())
             || search_ui::blocks_copy(self.search_panel.is_open(), self.search_area.is_some())
             || self.context.is_open()
             || self.context_area.is_some()
+            || self.language_picker.area.is_some()
             || self.logs.blocks_copy()
             || menu_list)
             && p.scroll != 0
@@ -1623,7 +1738,7 @@ impl App {
             font.invalidate_rows();
             pixels.fill(bg());
             body_pixels.fill(bg());
-            for row in (0..rows).filter(|_| !projection_owns_body) {
+            for row in (0..rows).filter(|_| !projection_owns_body && !hex_active) {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
@@ -1653,7 +1768,7 @@ impl App {
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for &row in p.rows.iter().filter(|&&r| r < rows && !projection_owns_body) {
+            for &row in p.rows.iter().filter(|&&r| r < rows && !projection_owns_body && !hex_active) {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
@@ -1661,6 +1776,37 @@ impl App {
                 let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
                 damage.push(tabs::translated(area, body));
+            }
+        }
+        if hex_active && body_changed {
+            let mut paint_damage = p.clone();
+            // The common retained-body/native path already copied this scroll.
+            paint_damage.scroll = 0;
+            if let Some(session) = self.view.hex_session() {
+                hex_ui::draw_damage(
+                    session,
+                    body_pixels,
+                    bw,
+                    font,
+                    hex_ui::Paint {
+                        current: hex_source,
+                        horizontal: hex_horizontal,
+                        read_only: hex_read_only,
+                        damage: &paint_damage,
+                    },
+                );
+            } else {
+                // Opening/reopen is still hex-owned even before its first page.
+                body_pixels.fill(bg());
+            }
+            if p.full {
+                tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
+            } else {
+                for &row in p.rows.iter().filter(|&&r| r < rows) {
+                    let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
+                    tabs::composite(body_pixels, bw, pixels, w, body, area);
+                    damage.push(tabs::translated(area, body));
+                }
             }
         }
         if projection_owns_body && body_changed {
@@ -1684,6 +1830,7 @@ impl App {
             (menu_dirty, &mut self.menu_area),
             (menu_dirty, &mut self.context_area),
             (search_dirty, &mut self.search_area),
+            (language_restore, &mut self.language_picker.area),
             (logs_restore_area.is_some(), &mut logs_restore_area),
         ] {
             if dirty && let Some(area) = area.take() {
@@ -1750,7 +1897,9 @@ impl App {
             }
             let signal =
                 Rect { x: vr.x.saturating_sub(self.ui.inset.max(2)), y: 0, w: self.ui.inset.max(2).min(vr.x), h: vr.h };
-            search_ui::draw_signal(&self.search_panel, body_pixels, bw, signal, theme);
+            if !hex_active {
+                search_ui::draw_signal(&self.search_panel, body_pixels, bw, signal, theme);
+            }
             for area in [signal, vr, hr] {
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
                 if !p.full {
@@ -1911,6 +2060,14 @@ impl App {
             }
         }
         if let Some(font) = self.ui_font.as_mut() {
+            let anchor = self
+                .status_hits
+                .iter()
+                .find(|(_, _, command)| *command == "file.setType")
+                .map_or(tabs::rect(lay.status), |(area, _, _)| *area);
+            if let Some(area) = language_ui::draw(&mut self.language_picker, pixels, (w, h), anchor, font, &self.ui) {
+                damage.push(area);
+            }
             self.context_area = context_menu::draw(&mut self.context, pixels, (w, h), font, &self.ui, theme);
             if let Some(area) = self.context_area {
                 damage.push(area);
@@ -2525,7 +2682,9 @@ impl ApplicationHandler<UserEvent> for App {
             let _ = highlight_proxy.send_event(UserEvent::HighlightsReady);
         })
         .ok();
-        if let Some(highlighting) = &mut self.highlighting {
+        if !self.view.hex_active()
+            && let Some(highlighting) = &mut self.highlighting
+        {
             highlighting.update(&self.view);
         }
         let document_proxy = self.proxy.clone();
@@ -2624,10 +2783,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 Damage { full: true, status: true, ..Default::default() }
             }
-            UserEvent::HighlightsReady => {
-                let rows = self.highlighting.as_mut().map_or_else(Vec::new, |host| host.worker_ready(&self.view));
-                Damage { rows, ..Default::default() }
-            }
+            UserEvent::HighlightsReady => self.language_highlights_ready(),
             UserEvent::PaletteRoot(root) => {
                 match root.and_then(|root| {
                     let proxy = self.proxy.clone();
@@ -2844,7 +3000,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }) {
                     Ok(panel) => self.settings_panel = Some(panel),
                     Err(error) => {
-                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default()));
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default(), Default::default()));
                         let damage = self.view.set_notice(format!("Settings: {error}"));
                         self.apply(damage);
                     }
@@ -2857,9 +3013,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.settings_worker_ready();
                 if let Some(panel) = &mut self.settings_panel {
                     if let Some(applied) = panel.take_applied() {
-                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::new(applied.settings)));
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(
+                            Box::new(applied.settings),
+                            applied.language_mappings,
+                        ));
                     } else if !self.settings_loaded && panel.menu().is_none() && panel.last_error().is_some() {
-                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default()));
+                        let _ = self.proxy.send_event(UserEvent::SettingsReady(Box::default(), Default::default()));
                     }
                     if self.settings_file_pending && panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
                         open_path = Some(panel.path().to_path_buf());
@@ -2892,8 +3051,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.markdown_ready(*completion);
                 return;
             }
-            UserEvent::SettingsReady(settings) => {
+            UserEvent::SettingsReady(settings, language_mappings) => {
                 self.settings_loaded = true;
+                self.apply_language_mappings(language_mappings);
                 let font_changed =
                     settings.font.family != self.settings.font.family || settings.font.size != self.settings.font.size;
                 let tabs_changed = settings.editor.tab_size != self.settings.editor.tab_size;
@@ -3116,6 +3276,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if latest == self.pending_resize.unwrap_or(self.size) {
                     return;
                 }
+                self.close_language();
+                self.status_hits.clear();
                 self.drag = None;
                 self.selecting = false;
                 self.pending_resize = Some(latest);
@@ -3138,6 +3300,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
+                if self.language_owns_input() {
+                    self.language_track();
+                    self.update_pointer_cursor();
+                    return;
+                }
                 self.toolbar_track();
                 self.context_track();
                 self.logs_track();
@@ -3178,7 +3345,17 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.update_pointer_cursor();
             }
+            WindowEvent::MouseInput { state, button, .. } if self.language_owns_input() => {
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    self.language_mouse();
+                }
+                self.update_pointer_cursor();
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                if self.view.hex_active() && self.body_area().contains(self.pointer.0, self.pointer.1) {
+                    self.hex_cancel_input();
+                    return;
+                }
                 self.open_context();
                 self.update_pointer_cursor();
             }
@@ -3268,7 +3445,7 @@ impl ApplicationHandler<UserEvent> for App {
                         && self.pointer.0 - body.x < body.width.saturating_sub(self.ui.bar)
                         && self.pointer.1 - body.y < self.bars().0.length
                     {
-                        self.selecting = true;
+                        self.selecting = !self.view.hex_active() || !self.view.document_busy(self.view.active_id());
                         self.place_caret(self.mods.shift_key());
                     }
                     self.view.checkpoint_session();
@@ -3325,7 +3502,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(true) => self.user_event(el, UserEvent::SessionChanged(remote::detect())),
             WindowEvent::Occluded(false) => self.apply(Damage { full: true, ..Default::default() }),
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.save_path.is_none() && self.menu_alt(&event) {
+                if !self.language_owns_input() && self.save_path.is_none() && self.menu_alt(&event) {
                     return;
                 }
                 self.key(el, &event);
@@ -3334,7 +3511,23 @@ impl ApplicationHandler<UserEvent> for App {
                     el.exit();
                 }
             }
+            WindowEvent::Ime(_) if self.language_owns_input() => {
+                self.hex_cancel_input();
+                self.ime_destination = Some(ime::Destination::Cancelled);
+                self.search_ime = None;
+                self.logs_ime = None;
+                self.composing = false;
+            }
             WindowEvent::Ime(_) if self.file_modal() || self.context.is_open() => {}
+            WindowEvent::Ime(Ime::Preedit(text, _)) if self.view.hex_active() && !self.hex_body_blocked() => {
+                self.hex_preedit(&text);
+            }
+            WindowEvent::Ime(Ime::Commit(text))
+                if self.hex_ime_pending() || (self.view.hex_active() && !self.hex_body_blocked()) =>
+            {
+                self.hex_commit(&text);
+                self.view.checkpoint_session();
+            }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
                 if ime::starts_composition(self.composing, &text) {
                     self.search_ime = self.capture_search_composition();
@@ -3409,6 +3602,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.checkpoint_session();
             }
             WindowEvent::Ime(Ime::Disabled) => {
+                self.hex_cancel_input();
                 self.search_ime = None;
                 self.logs_ime = None;
                 self.cancel_logs_composition();
@@ -3417,6 +3611,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.ime_destination = Some(ime::Destination::Cancelled);
             }
             WindowEvent::Ime(Ime::Enabled) => {
+                self.hex_cancel_input();
                 self.search_ime = None;
                 self.logs_ime = None;
                 self.cancel_logs_composition();
@@ -3424,6 +3619,8 @@ impl ApplicationHandler<UserEvent> for App {
                 ime::reset(&mut self.composing, &mut self.ime_destination);
             }
             WindowEvent::Focused(false) => {
+                self.hex_cancel_input();
+                self.close_language();
                 self.search_ime = None;
                 self.logs_ime = None;
                 self.cancel_logs_composition();
@@ -3449,6 +3646,21 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.language_owns_input() {
+                    self.wheel.clear();
+                    self.language_wheel(delta);
+                    return;
+                }
+                if self.save_path.is_some()
+                    || self.context.is_open()
+                    || self.menu.state.is_open()
+                    || self.logs.is_open()
+                    || self.settings_open()
+                    || self.search_panel.is_open()
+                    || self.palette_open()
+                {
+                    self.wheel.clear();
+                }
                 if self.save_path.is_some() {
                     return;
                 }
@@ -3490,13 +3702,35 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.save_path.is_some() && self.prompt_wheel(up) {
                     return;
                 }
-                let (horizontal, vertical) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (-(x * 3.0) as i64, -(y * 3.0) as i64),
-                    MouseScrollDelta::PixelDelta(p) => {
-                        (-(p.x / self.ch() as f64) as i64, -(p.y / self.ch() as f64) as i64)
-                    }
+                let (x, y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-f64::from(x) * 3.0, -f64::from(y) * 3.0),
+                    MouseScrollDelta::PixelDelta(p) => (
+                        -p.x / self.font.as_ref().map_or(1, |font| font.cw).max(1) as f64,
+                        -p.y / self.ch().max(1) as f64,
+                    ),
                 };
+                let context = [
+                    self.view.active_id().0,
+                    self.view.input_epoch(),
+                    self.ch() as u64,
+                    self.font.as_ref().map_or(1, |font| font.cw) as u64,
+                    u64::from(self.mods.shift_key()),
+                ];
+                let (horizontal, vertical) = self.wheel.take(context, x, y);
+                if horizontal == 0 && vertical == 0 {
+                    return;
+                }
                 if self.markdown_wheel(vertical) {
+                    return;
+                }
+                if self.view.hex_active() {
+                    if horizontal != 0 || self.mods.shift_key() {
+                        let delta = if horizontal != 0 { horizontal } else { vertical };
+                        self.hex_scroll_bar(false, self.hex.horizontal.saturating_add_signed(delta));
+                    } else {
+                        self.hex_wheel(vertical);
+                    }
+                    self.view.checkpoint_session();
                     return;
                 }
                 if horizontal != 0 || self.mods.shift_key() {

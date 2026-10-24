@@ -110,6 +110,9 @@ impl App {
         }
     }
     pub(super) fn capture_input_destination(&self) -> ime::Destination {
+        if self.language_owns_input() {
+            return ime::Destination::Cancelled;
+        }
         if self.settings_choice_open() {
             return ime::Destination::Cancelled;
         }
@@ -247,7 +250,12 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
-                if self.dispatch_logs(command)
+                if self.dispatch_hex(command) {
+                    return;
+                }
+                self.close_language();
+                if self.dispatch_language(command)
+                    || self.dispatch_logs(command)
                     || self.dispatch_markdown(command)
                     || self.dispatch_search(command)
                     || self.dispatch_settings(command)

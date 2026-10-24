@@ -274,6 +274,10 @@ pub(super) struct Segment {
     pub warn: bool,
 }
 
+pub(super) fn language_segment(status: kwil_view_model::language_selection::LanguageStatus) -> Segment {
+    Segment { text: status.label().into(), command: Some("file.setType"), warn: false }
+}
+
 /// Left notice plus right-aligned fields, left to right. Every field comes
 /// from a typed accessor; file paths never pass through this text.
 pub(super) fn status(view: &Workspace, zoom: u32) -> (String, Vec<Segment>) {
@@ -432,7 +436,9 @@ pub(super) fn draw_status(
     let field_pad = m.dip(8.0);
     let mut right = area.x + area.width.saturating_sub(m.pad / 2);
     for (index, segment) in segments.iter().enumerate().rev() {
-        let width = font.width(&segment.text) + 2 * field_pad;
+        let dropdown = segment.command == Some("file.setType");
+        let arrow = if dropdown { m.dip(16.0) } else { 0 };
+        let width = font.width(&segment.text) + 2 * field_pad + arrow;
         if width + m.pad > right.saturating_sub(area.x) {
             break;
         }
@@ -452,6 +458,16 @@ pub(super) fn draw_status(
         }
         let color = if segment.warn { theme_ui::rgb(theme, UiRole::Error) } else { fg };
         font.draw(pixels, stride, rect, field.x + field_pad, baseline, &segment.text, color);
+        if dropdown {
+            icons::draw(
+                pixels,
+                stride,
+                icons::Icon::Down,
+                ((field.x + field.w - field_pad - arrow / 2) as f32, (field.y + field.h / 2) as f32),
+                m.dip(12.0),
+                color,
+            );
+        }
         right = field.x;
     }
     if !notice.is_empty() {

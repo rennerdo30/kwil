@@ -10,7 +10,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
 mod file_prompt;
+mod hex_ui;
 mod palette_ui;
+mod search_ui;
 mod settings_ui;
 mod tabs;
 use ratatui::layout::Rect;
@@ -20,6 +22,7 @@ use ratatui::widgets::Paragraph;
 use std::sync::mpsc;
 
 enum Msg {
+    SearchReady,
     HighlightsReady,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
@@ -30,7 +33,7 @@ enum Msg {
     OpenExternal,
     Notice(String),
     InputClosed,
-    Settings(Box<Settings>),
+    Settings(Box<Settings>, kwil_view_model::language_selection::AcceptedLanguageMappings),
 }
 
 pub fn run(view: View, on_first_frame: Box<dyn FnOnce(Notify)>) -> std::io::Result<()> {
@@ -43,6 +46,7 @@ pub fn run_with_external_open(
     on_first_frame: Box<dyn FnOnce(Notify)>,
     on_external_ready: Box<dyn FnOnce(ExternalOpen)>,
 ) -> std::io::Result<()> {
+    ensure_shutdown_idle()?;
     let mut view = Workspace::new(view)?;
     let (tx, rx) = mpsc::channel::<Msg>();
     let external_sender = tx.clone();
@@ -80,6 +84,10 @@ pub fn run_with_external_open(
     let mut highlighting: Option<kwil_view_model::highlight_session::HighlightSession> = None;
     let mut settings_panel: Option<kwil_view_model::settings_session::SettingsSession> = None;
     let mut settings_file_pending = false;
+    let mut search = search_ui::SearchHost::default();
+    let mut language_menu: Option<LanguageMenu> = None;
+    let (document_stopped_sender, document_stopped) = mpsc::sync_channel(1);
+    let mut document_started = false;
     let result = (|| -> std::io::Result<()> {
         let size = terminal.size()?;
         let geometry = tabs::geometry(&view, size.width, size.height, Settings::default().tabs.layout);
@@ -87,8 +95,12 @@ pub fn run_with_external_open(
         terminal.draw(|f| tabs::draw(f, &view, Settings::default().tabs.layout))?;
         let document_sender = tx.clone();
         view.start_document_worker(move |result| {
+            if let kwil_view_model::document_worker::DocumentResult::Stopped(result) = &result {
+                let _ = document_stopped_sender.try_send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+            }
             let _ = document_sender.send(Msg::Document(result));
         })?;
+        document_started = true;
         let t = tx.clone();
         on_first_frame(Box::new(move |msg| {
             let _ = t.send(Msg::Notice(msg));
@@ -125,11 +137,19 @@ pub fn run_with_external_open(
         let mut horizontal = 0u64;
         let mut settings = Settings::default();
         let mut keys = KeymapEngine::new(settings.keymap, &settings.bindings).expect("bundled keymap");
+        let search_sender = tx.clone();
+        search.start(&mut view, &mut keys, move || {
+            let _ = search_sender.send(Msg::SearchReady);
+        });
         let mut input_identity = (view.active_id(), view.input_epoch());
+        let mut raw_body = view.hex_active();
         while let Ok(msg) = rx.recv() {
             let user_input = matches!(&msg, Msg::Input(_));
-            let changed = match msg {
-                Msg::HighlightsReady => highlighting.as_mut().is_some_and(|host| !host.worker_ready(&view).is_empty()),
+            let mut changed = match msg {
+                Msg::SearchReady => search.ready(&mut view, &mut keys),
+                Msg::HighlightsReady => {
+                    !view.hex_active() && highlighting.as_mut().is_some_and(|host| highlighting_ready(host, &view))
+                }
                 Msg::PaletteRoot(root) => {
                     match root.and_then(|root| {
                         let sender = tx.clone();
@@ -167,7 +187,10 @@ pub fn run_with_external_open(
                     }
                     changed
                 }
-                Msg::InputClosed => break,
+                Msg::InputClosed => {
+                    view.cancel_hex_input();
+                    break;
+                }
                 Msg::SettingsPath(path) => {
                     let sender = tx.clone();
                     match path.and_then(|path| {
@@ -191,7 +214,7 @@ pub fn run_with_external_open(
                     if let Some(panel) = &mut settings_panel {
                         panel.worker_ready();
                         if let Some(applied) = panel.take_applied() {
-                            let _ = tx.send(Msg::Settings(Box::new(applied.settings)));
+                            let _ = tx.send(Msg::Settings(Box::new(applied.settings), applied.language_mappings));
                         }
                         if settings_file_pending && panel.source_exists() && !panel.is_saving() && !panel.is_dirty() {
                             open_path = Some(panel.path().to_path_buf());
@@ -209,19 +232,30 @@ pub fn run_with_external_open(
                     }
                     opened || settings_panel.as_ref().is_some_and(|panel| panel.is_open())
                 }
-                Msg::Settings(next) => {
-                    if next.keymap == settings.keymap && next.bindings == settings.bindings {
+                Msg::Settings(next, mappings) => {
+                    let accepted = if next.keymap == settings.keymap && next.bindings == settings.bindings {
                         settings = *next;
+                        true
                     } else if let Ok(next_keys) = KeymapEngine::new(next.keymap, &next.bindings) {
                         keys = next_keys;
                         settings = *next;
+                        true
+                    } else {
+                        false
+                    };
+                    if accepted && let Some(host) = &mut highlighting {
+                        host.apply_mappings(mappings);
+                        if !view.hex_active() {
+                            prepare_highlighting_for_draw(host, &view);
+                        }
                     }
                     view.set_session_restore(settings.files.restore_session);
                     view.set_editor_settings(&settings);
+                    search.settings(&mut view, &mut keys, &settings);
                     true
                 }
                 Msg::Document(result) => {
-                    view.document_result(result);
+                    search.document_result(&mut view, &mut keys, result);
                     if view.wants_exit() {
                         break;
                     }
@@ -243,7 +277,15 @@ pub fn run_with_external_open(
                     view.set_notice(n);
                     true
                 }
-                Msg::Input(Event::Resize(_, _)) => true,
+                Msg::Input(Event::Resize(_, _)) => {
+                    view.cancel_hex_input();
+                    true
+                }
+                Msg::Input(Event::FocusLost | Event::FocusGained) => {
+                    view.cancel_hex_input();
+                    keys.cancel_pending();
+                    true
+                }
                 Msg::Input(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                     let intent = if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
                         if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -257,14 +299,43 @@ pub fn run_with_external_open(
                         }
                     } else if view.file_prompt().is_some() {
                         file_prompt::key(&mut view, k)
+                    } else if language_menu.is_some() {
+                        language_key(
+                            &mut language_menu,
+                            highlighting.as_mut(),
+                            &mut view,
+                            &mut keys,
+                            k,
+                            started.elapsed(),
+                            settings.keymap,
+                        )
                     } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
                         palette_ui::key(&mut view, host, k, &mut keys, started.elapsed(), settings.keymap)
                     } else if view.close_pending() && k.code == KeyCode::Esc {
                         KeyResult::Cancel
+                    } else if view.hex_active() {
+                        hex_ui::host_key(&mut view, k, &mut keys, started.elapsed(), settings.keymap)
                     } else {
-                        key(&mut view, k, started.elapsed(), &mut keys, settings.keymap)
+                        search_ui::key(&mut search, &mut view, k, &mut keys, &settings, started.elapsed())
                     };
+                    let intent = hex_ui::resolve(&mut view, &mut keys, intent);
+                    let intent = search_ui::resolve(&mut search, &mut view, &mut keys, &settings, intent);
                     match intent {
+                        KeyResult::Search(_) => unreachable!("search intent resolved above"),
+                        KeyResult::Hex(_, _) => unreachable!("hex intent resolved above"),
+                        KeyResult::Language => {
+                            if let Some(host) = &highlighting {
+                                if let Some(palette) = &mut palette {
+                                    let _ = palette.input(kwil_view_model::palette_session::PaletteInput::Cancel);
+                                }
+                                keys.cancel_pending();
+                                keys.set_context(kwil_core_commands::Context::Palette);
+                                language_menu = Some(LanguageMenu::new(host, &view));
+                            } else {
+                                view.set_notice("Language highlighting is unavailable".into());
+                            }
+                            true
+                        }
                         KeyResult::SettingsFile => {
                             if let Some(panel) = &mut settings_panel {
                                 panel.open();
@@ -363,8 +434,11 @@ pub fn run_with_external_open(
                         }
                         view.prompt_notice();
                         true
+                    } else if let Some(menu) = &mut language_menu {
+                        menu.text(&mut view, &text);
+                        true
                     } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
-                        let _ = palette_ui::input(
+                        let intent = palette_ui::input(
                             &mut view,
                             host,
                             &mut keys,
@@ -372,7 +446,13 @@ pub fn run_with_external_open(
                             started.elapsed(),
                             settings.keymap,
                         );
+                        let intent = hex_ui::resolve(&mut view, &mut keys, intent);
+                        let _ = search_ui::resolve(&mut search, &mut view, &mut keys, &settings, intent);
                         true
+                    } else if view.hex_active() {
+                        hex_ui::host_paste(&mut view, &text)
+                    } else if search.is_open() {
+                        search.input(&mut view, &mut keys, kwil_view_model::search_panel::SearchInput::Text(&text))
                     } else if keys.mode() == kwil_core_commands::Mode::Insert {
                         execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
                         true
@@ -381,6 +461,18 @@ pub fn run_with_external_open(
                     }
                 }
                 Msg::Input(Event::Mouse(_)) if settings_panel.as_ref().is_some_and(|panel| panel.is_open()) => true,
+                Msg::Input(Event::Mouse(m)) if language_menu.is_some() && view.file_prompt().is_none() => {
+                    let size = terminal.size()?;
+                    language_mouse(
+                        &mut language_menu,
+                        highlighting.as_mut(),
+                        &mut view,
+                        &mut keys,
+                        &m,
+                        Rect::new(0, 0, size.width, size.height),
+                    );
+                    true
+                }
                 Msg::Input(Event::Mouse(m)) if palette.as_ref().is_some_and(|host| host.model().is_open()) => {
                     let size = terminal.size()?;
                     palette_ui::mouse(
@@ -391,6 +483,10 @@ pub fn run_with_external_open(
                         Rect::new(0, 0, size.width, size.height),
                     )
                 }
+                Msg::Input(Event::Mouse(m)) if search.is_open() && view.file_prompt().is_none() => {
+                    let size = terminal.size()?;
+                    search_ui::mouse(&mut search, &mut view, &mut keys, &m, Rect::new(0, 0, size.width, size.height))
+                }
                 Msg::Input(Event::Mouse(m))
                     if {
                         let size = terminal.size()?;
@@ -400,12 +496,40 @@ pub fn run_with_external_open(
                     true
                 }
                 Msg::Input(Event::Mouse(m)) => match m.kind {
+                    _ if view.hex_active() => {
+                        let size = terminal.size()?;
+                        hex_ui::host_mouse(&mut view, m, size.width, size.height, settings.tabs.layout)
+                    }
                     MouseEventKind::ScrollDown => view.scroll(3) != Default::default(),
                     MouseEventKind::ScrollUp => view.scroll(-3) != Default::default(),
                     _ => false,
                 },
                 Msg::Input(_) => false,
             };
+            if raw_body != view.hex_active() {
+                raw_body = view.hex_active();
+                view.cancel_hex_input();
+                keys.cancel_pending();
+                keys.set_context(if raw_body {
+                    kwil_core_commands::Context::Hex
+                } else {
+                    kwil_core_commands::Context::Editor
+                });
+            }
+            if view.hex_active() {
+                search.close(&mut view, &mut keys);
+                if language_menu.take().is_some() {
+                    changed = true;
+                }
+            } else {
+                changed |= search.sync(&mut view, &mut keys);
+            }
+            if language_menu.as_ref().is_some_and(|menu| !menu.ticket.is_current(&view)) {
+                language_menu = None;
+                keys.set_context(kwil_core_commands::Context::Editor);
+                keys.cancel_pending();
+                changed = true;
+            }
             palette_ui::sync_input_identity(&view, &mut keys, &mut input_identity);
             if let Some(host) = palette.as_mut().filter(|host| host.model().is_open())
                 && let Err(error) = host.refresh_tabs(&view)
@@ -421,7 +545,11 @@ pub fn run_with_external_open(
                 if view.rows() != geometry.body.height {
                     view.set_rows(geometry.body.height);
                 }
-                if !palette.as_ref().is_some_and(|host| host.model().is_open()) {
+                if view.hex_active() {
+                    // Resize and scroll submit the latest bounded page through
+                    // Workspace. Editor-bearing requests never live in the UI.
+                    let _ = view.submit_hex_page();
+                } else if !palette.as_ref().is_some_and(|host| host.model().is_open()) {
                     keep_visible(
                         &mut view,
                         &mut horizontal,
@@ -431,14 +559,27 @@ pub fn run_with_external_open(
                 }
                 // ratatui diffs against the previous frame and writes only
                 // the changed cells.
-                if let Some(host) = &mut highlighting {
+                if !view.hex_active()
+                    && let Some(host) = &mut highlighting
+                {
                     prepare_highlighting_for_draw(host, &view);
                 }
                 let spans: Vec<_> = highlighting.as_ref().into_iter().flat_map(|host| host.spans(&view)).collect();
                 terminal.draw(|f| {
                     tabs::draw_highlighted(f, &view, settings.tabs.layout, &spans);
+                    if view.hex_active() {
+                        hex_ui::draw_workspace(f, &view, settings.tabs.layout);
+                    } else {
+                        if let Some(host) = &highlighting {
+                            draw_language_status(f, host, &view);
+                        }
+                        search_ui::draw(f, &search, &view, settings.tabs.layout);
+                    }
                     if let Some(host) = &palette {
                         palette_ui::draw(f, host.model());
+                    }
+                    if let Some(menu) = &language_menu {
+                        draw_language(f, menu);
                     }
                     if let Some(panel) = &settings_panel {
                         settings_ui::draw(f, panel);
@@ -473,13 +614,282 @@ pub fn run_with_external_open(
         crossterm::event::DisableBracketedPaste
     );
     ratatui::restore();
+    // Result owners and the Workspace leave the input/render thread together.
+    // Drain every admitted editor loan before dropping the document worker.
+    let cleanup =
+        std::thread::spawn(move || shutdown_search_workspace(view, search, rx, document_stopped, document_started));
+    let cleanup_result = cleanup.join().map_err(|_| std::io::Error::other("TUI document shutdown lane panicked"))?;
     if let Some(shutdown) = settings_shutdown {
         shutdown
             .join()
             .map_err(|_| std::io::Error::other("settings shutdown worker panicked"))?
             .map_err(std::io::Error::other)?;
     }
-    result
+    combine_shutdown_results(result, cleanup_result)
+}
+
+fn shutdown_search_workspace(
+    view: Workspace,
+    search: search_ui::SearchHost,
+    rx: mpsc::Receiver<Msg>,
+    stopped: mpsc::Receiver<Result<(), String>>,
+    document_started: bool,
+) -> std::io::Result<()> {
+    let mut ticket = ShutdownTicket {
+        view: Some(view),
+        search: Some(search),
+        worker: None,
+        rx: Some(rx),
+        stopped,
+        document_started,
+        terminal_failure: None,
+    };
+    guard_shutdown(&mut ticket, |ticket| finish_shutdown(ticket, std::time::Duration::from_secs(35)))
+        .map_err(|message| retain_shutdown(ticket, message))
+}
+
+/// One retained shutdown owner per process. A failed drain never destroys the
+/// actual Workspace, channel results or search facade on the input thread.
+struct ShutdownTicket {
+    view: Option<Workspace>,
+    search: Option<search_ui::SearchHost>,
+    worker: Option<kwil_view_model::search_session::SearchWorker>,
+    rx: Option<mpsc::Receiver<Msg>>,
+    stopped: mpsc::Receiver<Result<(), String>>,
+    document_started: bool,
+    terminal_failure: Option<String>,
+}
+#[derive(Default)]
+struct ShutdownSlot {
+    ticket: Option<ShutdownTicket>,
+    retrying: bool,
+    terminal_failure: Option<String>,
+}
+fn shutdown_slot() -> &'static std::sync::Mutex<ShutdownSlot> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<ShutdownSlot>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(Default::default)
+}
+fn ensure_shutdown_idle() -> std::io::Result<()> {
+    let slot = shutdown_slot().lock().unwrap_or_else(|error| error.into_inner());
+    if slot.ticket.is_some() || slot.retrying || slot.terminal_failure.is_some() {
+        return Err(std::io::Error::other("TUI cleanup owner is retained; retry_pending_shutdown before another run"));
+    }
+    Ok(())
+}
+/// Retry the ONE process-owned cleanup ticket off the input/render thread.
+/// Failure keeps that exact owner in the slot and reports its remaining phase.
+/// A failed terminal acknowledgement remains failed across retries.
+pub fn retry_pending_shutdown(timeout: std::time::Duration) -> std::io::Result<()> {
+    retry_shutdown_slot(shutdown_slot(), timeout, finish_shutdown)
+}
+fn retry_shutdown_slot(
+    owner_slot: &std::sync::Mutex<ShutdownSlot>,
+    timeout: std::time::Duration,
+    operation: impl FnOnce(&mut ShutdownTicket, std::time::Duration) -> Result<(), String> + Send + 'static,
+) -> std::io::Result<()> {
+    let mut ticket = {
+        let mut slot = owner_slot.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(message) = &slot.terminal_failure {
+            return Err(std::io::Error::other(message.clone()));
+        }
+        if slot.retrying {
+            return Err(std::io::Error::other("TUI cleanup retry is already running"));
+        }
+        let Some(ticket) = slot.ticket.take() else { return Ok(()) };
+        slot.retrying = true;
+        ticket
+    };
+    // Retry callers can be UI code. Preserve worker-only retirement/disposal.
+    let returned = std::thread::spawn(move || {
+        let result = guard_shutdown(&mut ticket, |ticket| operation(ticket, timeout));
+        (ticket, result)
+    })
+    .join();
+    let mut slot = owner_slot.lock().unwrap_or_else(|error| error.into_inner());
+    slot.retrying = false;
+    let (ticket, result) = match returned {
+        Ok(returned) => returned,
+        Err(_) => {
+            let message =
+                "TUI cleanup thread failed outside its ownership guard; no successful shutdown acknowledgement"
+                    .to_owned();
+            slot.terminal_failure = Some(message.clone());
+            return Err(std::io::Error::other(message));
+        }
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(message) => {
+            slot.ticket = Some(ticket);
+            Err(std::io::Error::other(format!(
+                "{message}; exact TUI cleanup owner retained for retry_pending_shutdown"
+            )))
+        }
+    }
+}
+fn guard_shutdown(
+    ticket: &mut ShutdownTicket,
+    operation: impl FnOnce(&mut ShutdownTicket) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(message) = &ticket.terminal_failure {
+        return Err(message.clone());
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(ticket))) {
+        Ok(result) => result,
+        Err(_) => {
+            let message =
+                "TUI cleanup panicked; surviving exact ticket retained without a successful acknowledgement".to_owned();
+            ticket.terminal_failure = Some(message.clone());
+            Err(message)
+        }
+    }
+}
+fn finish_shutdown(ticket: &mut ShutdownTicket, timeout: std::time::Duration) -> Result<(), String> {
+    if let Some(message) = &ticket.terminal_failure {
+        return Err(message.clone());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+    let mut keys = KeymapEngine::new(Preset::VsCode, &[]).expect("bundled keymap");
+    if let (Some(view), Some(search)) = (&mut ticket.view, &mut ticket.search) {
+        search.close(view, &mut keys);
+        view.cancel_hex_input();
+        drain_workspace(
+            view,
+            search,
+            ticket.rx.as_ref().expect("workspace drain channel"),
+            &mut keys,
+            Workspace::prepare_hex_shutdown,
+            &remaining,
+            &mut ticket.terminal_failure,
+        )?;
+    }
+    if let Some(search) = ticket.search.take() {
+        ticket.worker = search.into_shutdown_worker();
+    }
+    // Replacement undo/receipt recipes can pin the search worker's spool.
+    // Loans/disposal have drained above; release these final document/result
+    // owners OFF UI before waiting for that worker to retire its own files.
+    drop(ticket.view.take());
+    drop(ticket.rx.take());
+    if let Some(worker) = ticket.worker.take() {
+        worker.retry_retirement();
+        if let Err(error) = worker.shutdown_bounded(remaining()) {
+            let message = error.to_string();
+            ticket.worker = Some(error.into_worker());
+            return Err(message);
+        }
+    }
+    if ticket.document_started {
+        match ticket.stopped.recv_timeout(remaining()) {
+            Ok(Ok(())) => {
+                ticket.document_started = false;
+            }
+            Ok(Err(error)) => {
+                let message = format!("TUI document worker stopped with error: {error}");
+                ticket.terminal_failure = Some(message.clone());
+                return Err(message);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let message =
+                    "TUI document shutdown receipt channel closed without a successful acknowledgement".to_owned();
+                ticket.terminal_failure = Some(message.clone());
+                return Err(message);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err("TUI document shutdown receipt deadline reached".into()),
+        }
+    }
+    Ok(())
+}
+/// Every refused disposal, pending loan and InputClosed wake uses the SAME
+/// deadline. The normal input loop never waits for raw disposal admission.
+fn drain_workspace(
+    view: &mut Workspace,
+    search: &mut search_ui::SearchHost,
+    rx: &mpsc::Receiver<Msg>,
+    keys: &mut KeymapEngine,
+    mut prepare: impl FnMut(&mut Workspace) -> bool,
+    remaining: &impl Fn() -> std::time::Duration,
+    terminal_failure: &mut Option<String>,
+) -> Result<(), String> {
+    while view.search_replacement_pending() || !prepare(view) {
+        let wait = remaining();
+        if wait.is_zero() {
+            return Err("TUI document/editor disposal deadline reached".into());
+        }
+        match rx.recv_timeout(wait) {
+            Ok(Msg::Document(kwil_view_model::document_worker::DocumentResult::Stopped(result))) => {
+                let message = match result {
+                    Ok(()) => "TUI document worker stopped before editor disposal was admitted".to_owned(),
+                    Err(error) => format!("TUI document worker stopped with error: {error}"),
+                };
+                *terminal_failure = Some(message.clone());
+                return Err(message);
+            }
+            Ok(Msg::Document(message)) => search.document_result(view, keys, message),
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err("TUI document/editor disposal deadline reached".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("TUI document/editor drain disconnected; exact owner retained".into());
+            }
+        }
+    }
+    Ok(())
+}
+struct RetainedShutdownError {
+    message: String,
+    // Only a concurrent caller that bypassed the public run guard can reach
+    // this fallback. Returning the error still preserves the rejected owner.
+    rejected: std::sync::Mutex<Option<ShutdownTicket>>,
+}
+impl std::fmt::Debug for RetainedShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+impl std::fmt::Display for RetainedShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let owns_rejected = self.rejected.lock().unwrap_or_else(|error| error.into_inner()).is_some();
+        write!(
+            formatter,
+            "{}; exact TUI cleanup owner retained{}",
+            self.message,
+            if owns_rejected { " in this error" } else { " for retry_pending_shutdown" }
+        )
+    }
+}
+impl std::error::Error for RetainedShutdownError {}
+fn retain_shutdown(ticket: ShutdownTicket, message: String) -> std::io::Error {
+    let mut slot = shutdown_slot().lock().unwrap_or_else(|error| error.into_inner());
+    let rejected = if slot.ticket.is_none() && !slot.retrying {
+        slot.ticket = Some(ticket);
+        None
+    } else {
+        Some(ticket)
+    };
+    std::io::Error::other(RetainedShutdownError { message, rejected: std::sync::Mutex::new(rejected) })
+}
+#[derive(Debug)]
+struct CombinedShutdownError {
+    primary: std::io::Error,
+    cleanup: std::io::Error,
+}
+impl std::fmt::Display for CombinedShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}; cleanup: {}", self.primary, self.cleanup)
+    }
+}
+impl std::error::Error for CombinedShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cleanup)
+    }
+}
+fn combine_shutdown_results(primary: std::io::Result<()>, cleanup: std::io::Result<()>) -> std::io::Result<()> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(std::io::Error::other(CombinedShutdownError { primary, cleanup })),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(()),
+    }
 }
 
 enum KeyResult {
@@ -492,11 +902,257 @@ enum KeyResult {
     Changed(bool),
     File(&'static str),
     Palette(&'static str),
+    Search(kwil_core_commands::vim::Invocation),
+    Language,
+    Hex(kwil_core_commands::vim::Invocation, bool),
+}
+
+/// Preserve Workspace's body ownership at the palette invocation boundary;
+/// existing View-only key tests retain the same text adapter.
+trait TuiTarget {
+    fn raw_body(&self) -> bool;
+    fn text_view(&self) -> &View;
+    fn text_view_mut(&mut self) -> &mut View;
+}
+impl TuiTarget for View {
+    fn raw_body(&self) -> bool {
+        self.editor().is_some_and(|editor| {
+            editor.document().representation() == kwil_view_model::hex_session::Representation::RawBytes
+        })
+    }
+    fn text_view(&self) -> &View {
+        self
+    }
+    fn text_view_mut(&mut self) -> &mut View {
+        self
+    }
+}
+impl TuiTarget for Workspace {
+    fn raw_body(&self) -> bool {
+        self.hex_active()
+    }
+    fn text_view(&self) -> &View {
+        self
+    }
+    fn text_view_mut(&mut self) -> &mut View {
+        self
+    }
 }
 
 fn prepare_highlighting_for_draw(host: &mut kwil_view_model::highlight_session::HighlightSession, view: &Workspace) {
     if host.update(view) {
         host.invalidate_painted(view, &kwil_view_model::Damage { full: true, ..Default::default() });
+    }
+}
+fn highlighting_ready(host: &mut kwil_view_model::highlight_session::HighlightSession, view: &Workspace) -> bool {
+    let status = host.language_status(view);
+    let rows = host.worker_ready(view);
+    !rows.is_empty() || host.language_status(view) != status
+}
+
+/// The shared immutable ticket fences every row against tab/epoch changes.
+/// This adapter stores only a bounded filter and one catalogue row index.
+struct LanguageMenu {
+    ticket: kwil_view_model::language_selection::LanguagePicker,
+    query: String,
+    selected: usize,
+}
+impl LanguageMenu {
+    fn new(host: &kwil_view_model::highlight_session::HighlightSession, view: &Workspace) -> Self {
+        let ticket = host.language_picker(view);
+        let selected = ticket.items("").position(|row| row.selected).unwrap_or(0);
+        Self { ticket, query: String::new(), selected }
+    }
+    fn text(&mut self, view: &mut Workspace, text: &str) {
+        if self.query.len().saturating_add(text.len()) > 256 || text.chars().any(char::is_control) {
+            view.set_notice("Language filter must be at most 256 bytes without control characters".into());
+            return;
+        }
+        self.query.push_str(text);
+        self.selected = 0;
+    }
+    fn next(&mut self, previous: bool) {
+        let count = self.ticket.items(&self.query).count();
+        self.selected =
+            if previous { self.selected.saturating_sub(1) } else { (self.selected + 1).min(count.saturating_sub(1)) };
+    }
+}
+fn close_language(menu: &mut Option<LanguageMenu>, keys: &mut KeymapEngine) {
+    *menu = None;
+    keys.set_context(kwil_core_commands::Context::Editor);
+    keys.cancel_pending();
+}
+fn accept_language(
+    menu: &mut Option<LanguageMenu>,
+    host: Option<&mut kwil_view_model::highlight_session::HighlightSession>,
+    view: &mut Workspace,
+    keys: &mut KeymapEngine,
+) {
+    let Some(current) = menu.as_ref() else { return };
+    if !current.ticket.is_current(view) {
+        view.set_notice("Language selection cancelled: its document changed".into());
+        close_language(menu, keys);
+        return;
+    }
+    let Some(row) = current.ticket.items(&current.query).nth(current.selected) else { return };
+    if let Some(host) = host {
+        if host.apply_picker(view, &current.ticket, row.choice) {
+            prepare_highlighting_for_draw(host, view);
+        }
+        let label = host.language_status(view).label();
+        view.set_notice(format!("File type: {label}"));
+    } else {
+        view.set_notice("Language highlighting is unavailable".into());
+    }
+    close_language(menu, keys);
+}
+fn language_key(
+    menu: &mut Option<LanguageMenu>,
+    host: Option<&mut kwil_view_model::highlight_session::HighlightSession>,
+    view: &mut Workspace,
+    keys: &mut KeymapEngine,
+    event: KeyEvent,
+    elapsed: std::time::Duration,
+    preset: Preset,
+) -> KeyResult {
+    keys.set_context(kwil_core_commands::Context::Palette);
+    let mut action = None;
+    if let Some(chord) = chord(event) {
+        match keys.feed(chord) {
+            VimResult::Pending => return KeyResult::Changed(false),
+            VimResult::Unbound if keys.suppresses_fallback() => return KeyResult::Changed(false),
+            VimResult::Error(error) => {
+                view.set_notice(error);
+                return KeyResult::Changed(true);
+            }
+            VimResult::Command(call) => match call.id {
+                "palette.cancel" => action = Some(KeyCode::Esc),
+                "palette.accept" => action = Some(KeyCode::Enter),
+                "palette.next" => action = Some(KeyCode::Down),
+                "palette.previous" => action = Some(KeyCode::Up),
+                "edit.backspace" => action = Some(KeyCode::Backspace),
+                _ => {
+                    if call.id.starts_with("edit.") || call.id.starts_with("motion.") {
+                        return KeyResult::Changed(false);
+                    }
+                    close_language(menu, keys);
+                    return invoke(view, call, false, elapsed, preset);
+                }
+            },
+            VimResult::Unbound => {}
+        }
+    }
+    match action.unwrap_or(event.code) {
+        KeyCode::Esc => close_language(menu, keys),
+        KeyCode::Enter => accept_language(menu, host, view, keys),
+        KeyCode::Down => {
+            if let Some(menu) = menu {
+                menu.next(false);
+            }
+        }
+        KeyCode::Up => {
+            if let Some(menu) = menu {
+                menu.next(true);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(menu) = menu {
+                menu.query.pop();
+                menu.selected = 0;
+            }
+        }
+        KeyCode::Char(c)
+            if !event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            if let Some(menu) = menu {
+                menu.text(view, &c.to_string());
+            }
+        }
+        _ => return KeyResult::Changed(false),
+    }
+    KeyResult::Changed(true)
+}
+fn language_area(bounds: Rect) -> Rect {
+    let width = bounds.width.min(64);
+    let height = bounds.height.min(18);
+    Rect { x: bounds.x + (bounds.width - width) / 2, y: bounds.y + (bounds.height - height) / 3, width, height }
+}
+fn draw_language_status(
+    frame: &mut ratatui::Frame,
+    host: &kwil_view_model::highlight_session::HighlightSession,
+    view: &Workspace,
+) {
+    let bounds = frame.area();
+    if bounds.height == 0 {
+        return;
+    }
+    let text = format!(" {} ", host.language_status(view).label());
+    let width = (text.len() as u16).min(bounds.width);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18))),
+        Rect { x: bounds.right() - width, y: bounds.bottom() - 1, width, height: 1 },
+    );
+}
+fn draw_language(frame: &mut ratatui::Frame, menu: &LanguageMenu) {
+    let area = language_area(frame.area());
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+    let style = Style::default().fg(Color::Rgb(0xd6, 0xe4, 0xf0)).bg(Color::Rgb(0x08, 0x0d, 0x18));
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Paragraph::new("").style(style), area);
+    let title = format!("File type ({})  Esc close", menu.ticket.status().label());
+    frame.render_widget(Paragraph::new(title).style(style), Rect { height: 1, ..area });
+    frame.render_widget(
+        Paragraph::new(format!("> {}", menu.query)).style(style),
+        Rect { y: area.y + 1, height: 1, ..area },
+    );
+    let visible = area.height as usize - 3;
+    let first = menu.selected.saturating_sub(visible - 1);
+    for (index, row) in menu.ticket.items(&menu.query).enumerate().skip(first).take(visible) {
+        let background =
+            if index == menu.selected { Color::Rgb(0x19, 0x2a, 0x43) } else { Color::Rgb(0x08, 0x0d, 0x18) };
+        let label = format!(
+            "{} {}{}",
+            if row.selected { "*" } else { " " },
+            row.label,
+            if row.detected { " (detected)" } else { "" }
+        );
+        frame.render_widget(
+            Paragraph::new(label).style(style.bg(background)),
+            Rect { y: area.y + 2 + (index - first) as u16, height: 1, ..area },
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("Enter apply  Up/Down choose  Type to filter").style(style),
+        Rect { y: area.bottom() - 1, height: 1, ..area },
+    );
+    frame.set_cursor_position((area.x + 2, area.y + 1));
+}
+fn language_mouse(
+    menu: &mut Option<LanguageMenu>,
+    host: Option<&mut kwil_view_model::highlight_session::HighlightSession>,
+    view: &mut Workspace,
+    keys: &mut KeymapEngine,
+    event: &event::MouseEvent,
+    bounds: Rect,
+) {
+    let Some(current) = menu.as_mut() else { return };
+    match event.kind {
+        MouseEventKind::ScrollDown => current.next(false),
+        MouseEventKind::ScrollUp => current.next(true),
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            let area = language_area(bounds);
+            if !area.contains((event.column, event.row).into()) {
+                close_language(menu, keys);
+            } else if area.height >= 4 && event.row >= area.y + 2 && event.row < area.bottom() - 1 {
+                let visible = area.height as usize - 3;
+                let first = current.selected.saturating_sub(visible - 1);
+                current.selected = first + (event.row - area.y - 2) as usize;
+                accept_language(menu, host, view, keys);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -666,12 +1322,22 @@ fn key(
 }
 
 fn invoke(
-    view: &mut View,
+    view: &mut impl TuiTarget,
     call: kwil_core_commands::vim::Invocation,
     extend: bool,
     elapsed: std::time::Duration,
     preset: Preset,
 ) -> KeyResult {
+    if view.raw_body() && !hex_ui::chrome_command(call.id) {
+        return KeyResult::Hex(call, extend);
+    }
+    let view = view.text_view_mut();
+    if call.id == "file.setType" {
+        return KeyResult::Language;
+    }
+    if search_ui::is_search(call.id) {
+        return KeyResult::Search(call);
+    }
     if call.id == "view.settings" {
         return KeyResult::Settings;
     }
@@ -698,6 +1364,8 @@ fn invoke(
         call.id,
         "file.new"
             | "file.open"
+            | "file.openHex"
+            | "view.toggleHex"
             | "file.saveAs"
             | "file.saveAll"
             | "file.close"
@@ -801,11 +1469,16 @@ fn draw_area(f: &mut ratatui::Frame, view: &View, area: Rect, status: bool) {
 
 fn draw_area_highlighted(
     f: &mut ratatui::Frame,
-    view: &View,
+    target: &impl TuiTarget,
     area: Rect,
     status: bool,
     highlights: &[&kwil_view_model::highlighting::Span],
 ) {
+    if target.raw_body() {
+        f.render_widget(Paragraph::new(""), area);
+        return;
+    }
+    let view = target.text_view();
     let gutter_style = Style::default().fg(Color::Rgb(0x5b, 0x6b, 0x85));
     for row in 0..view.rows().min(area.height.saturating_sub(u16::from(status)) as usize) {
         let y = area.y + row as u16;
@@ -893,6 +1566,329 @@ fn keep_visible(view: &mut View, horizontal: &mut u64, columns: usize, tab: usiz
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn shutdown_deadline_retains_exact_ticket_refuses_new_run_and_explicit_retry_drains() {
+        ensure_shutdown_idle().unwrap();
+        let (sender, stopped) = mpsc::channel();
+        let mut ticket = ShutdownTicket {
+            view: None,
+            search: None,
+            worker: None,
+            rx: None,
+            stopped,
+            document_started: true,
+            terminal_failure: None,
+        };
+        // A held fake receipt and zero budget reproduce the failed phase
+        // without sleeping, launching a terminal or waiting a real timeout.
+        let message = finish_shutdown(&mut ticket, Duration::ZERO).unwrap_err();
+        assert!(ticket.document_started);
+        let failure = retain_shutdown(ticket, message);
+        assert!(failure.to_string().contains("owner retained"));
+        assert!(ensure_shutdown_idle().is_err(), "another run cannot discard a prior failed owner");
+        sender.send(Ok(())).unwrap();
+        retry_pending_shutdown(Duration::from_millis(100)).unwrap();
+        ensure_shutdown_idle().unwrap();
+    }
+
+    #[test]
+    fn disposal_drain_zero_full_and_disconnected_controls_retain_exact_editor_and_host() {
+        use std::cell::Cell;
+        for control in ["zero", "full", "disconnected"] {
+            let mut view = Workspace::new(View::new(None)).unwrap();
+            view.execute("edit.insert", &CommandArgs { text: Some("host document".into()), ..Default::default() }, 1)
+                .unwrap();
+            let document = view.active_id();
+            let revision = view.editor().unwrap().document().revision();
+            let mut search = search_ui::SearchHost::default();
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
+            let capacity = usize::from(control != "zero");
+            let (admission, requests) = mpsc::sync_channel::<Box<kwil_view_model::Editor>>(capacity);
+            let requests = if control == "disconnected" {
+                drop(requests);
+                None
+            } else {
+                Some(requests)
+            };
+            if control == "full" {
+                assert!(
+                    admission
+                        .try_send(Box::new(kwil_view_model::Editor::new(kwil_view_model::Document::new())))
+                        .is_ok()
+                );
+            }
+            let mut editor = kwil_view_model::Editor::new(kwil_view_model::Document::new());
+            editor.replace_byte_range(0..0, b"exact rejected editor").unwrap();
+            let mut owner = Some(Box::new(editor));
+            let identity = (&**owner.as_ref().unwrap()) as *const kwil_view_model::Editor;
+            let (events, receiver) = mpsc::channel();
+            if control == "disconnected" {
+                drop(events);
+            } else {
+                events.send(Msg::InputClosed).unwrap();
+            }
+            let waits = Cell::new(0);
+            let refusals = Cell::new(0);
+            let remaining = || {
+                let count = waits.get();
+                waits.set(count + 1);
+                if control == "zero" || count != 0 { Duration::ZERO } else { Duration::from_secs(1) }
+            };
+            let mut terminal_failure = None;
+            let error = drain_workspace(
+                &mut view,
+                &mut search,
+                &receiver,
+                &mut keys,
+                |_| {
+                    let rejected = match admission.try_send(owner.take().expect("retained admission owner")) {
+                        Ok(()) => panic!("controlled admission must refuse"),
+                        Err(mpsc::TrySendError::Full(owner)) => {
+                            assert_ne!(control, "disconnected");
+                            owner
+                        }
+                        Err(mpsc::TrySendError::Disconnected(owner)) => {
+                            assert_eq!(control, "disconnected");
+                            owner
+                        }
+                    };
+                    refusals.set(refusals.get() + 1);
+                    owner = Some(rejected);
+                    false
+                },
+                &remaining,
+                &mut terminal_failure,
+            )
+            .unwrap_err();
+            assert!(error.contains(if control == "disconnected" { "disconnected" } else { "deadline" }));
+            assert_eq!((&**owner.as_ref().unwrap()) as *const kwil_view_model::Editor, identity);
+            let mut bytes = Vec::new();
+            owner.as_ref().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+            assert_eq!(bytes, b"exact rejected editor");
+            assert_eq!(view.active_id(), document);
+            assert_eq!(view.editor().unwrap().document().revision(), revision);
+            assert!(refusals.get() >= 1);
+            assert!(terminal_failure.is_none());
+            if control == "full" {
+                assert_eq!(refusals.get(), 2, "InputClosed must neither lose the owner nor start an unbounded recv");
+            }
+            drop(requests);
+        }
+    }
+
+    #[test]
+    fn failed_or_missing_terminal_acknowledgement_never_becomes_success_on_retry() {
+        for disconnected in [false, true] {
+            let (sender, stopped) = mpsc::channel();
+            let sender = if disconnected {
+                drop(sender);
+                None
+            } else {
+                sender.send(Err("controlled Stopped failure".to_owned())).unwrap();
+                Some(sender)
+            };
+            let mut ticket = ShutdownTicket {
+                view: None,
+                search: None,
+                worker: None,
+                rx: None,
+                stopped,
+                document_started: true,
+                terminal_failure: None,
+            };
+            let first = finish_shutdown(&mut ticket, Duration::ZERO).unwrap_err();
+            assert!(ticket.document_started, "only Stopped(Ok) can acknowledge this phase");
+            assert_eq!(ticket.terminal_failure.as_deref(), Some(first.as_str()));
+            if let Some(sender) = sender {
+                sender.send(Ok(())).unwrap();
+            }
+            let slot = std::sync::Mutex::new(ShutdownSlot { ticket: Some(ticket), ..Default::default() });
+            for _ in 0..2 {
+                let error = retry_shutdown_slot(&slot, Duration::ZERO, finish_shutdown).unwrap_err();
+                assert!(error.to_string().contains(first.as_str()));
+                let state = slot.lock().unwrap();
+                assert!(!state.retrying);
+                let retained = state.ticket.as_ref().unwrap();
+                assert!(retained.document_started);
+                assert_eq!(retained.terminal_failure.as_deref(), Some(first.as_str()));
+            }
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn controlled_retry_unwind_keeps_borrowed_ticket_and_releases_retry_slot() {
+        let (_sender, stopped) = mpsc::channel();
+        let view = Workspace::new(View::new(None)).unwrap();
+        let document = view.active_id();
+        let ticket = ShutdownTicket {
+            view: Some(view),
+            search: Some(Default::default()),
+            worker: None,
+            rx: None,
+            stopped,
+            document_started: true,
+            terminal_failure: None,
+        };
+        let slot = std::sync::Mutex::new(ShutdownSlot { ticket: Some(ticket), ..Default::default() });
+        let error = retry_shutdown_slot(&slot, Duration::ZERO, |_, _| {
+            panic!("controlled test-only unwind before owner transfer")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("panicked"));
+        {
+            let state = slot.lock().unwrap();
+            assert!(!state.retrying);
+            assert_eq!(state.ticket.as_ref().unwrap().view.as_ref().unwrap().active_id(), document);
+            assert!(state.ticket.as_ref().unwrap().terminal_failure.is_some());
+        }
+        assert!(
+            retry_shutdown_slot(&slot, Duration::ZERO, |_, _| {
+                panic!("sticky failure must prevent another cleanup attempt")
+            })
+            .is_err()
+        );
+        let state = slot.lock().unwrap();
+        assert!(!state.retrying);
+        assert_eq!(state.ticket.as_ref().unwrap().view.as_ref().unwrap().active_id(), document);
+    }
+
+    #[test]
+    fn empty_document_detection_only_worker_wake_redraws_language_status() {
+        let view = Workspace::new(View::new(None)).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut host = kwil_view_model::highlight_session::HighlightSession::new(move || {
+            let _ = sender.send(());
+        })
+        .unwrap();
+        assert_eq!(host.language_status(&view).detection, None);
+        prepare_highlighting_for_draw(&mut host, &view);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut redraw = false;
+        while host.language_status(&view).detection.is_none() {
+            receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            redraw |= highlighting_ready(&mut host, &view);
+        }
+        assert_eq!(host.spans(&view).count(), 0);
+        assert!(redraw, "detection-only wake must redraw status without hit-row damage");
+        std::thread::spawn(move || {
+            host.shutdown().unwrap();
+            drop(view);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn file_type_dispatch_picker_repaints_and_keeps_tab_choices_and_ticket_identity() {
+        use kwil_view_model::highlighting::{Language, LanguageChoice};
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        view.set_rows(2);
+        view.execute("edit.insert", &CommandArgs { text: Some("fn main() {}".into()), ..Default::default() }, 1)
+            .unwrap();
+        let revision = view.editor().unwrap().document().revision();
+        let first = view.active_id();
+        let (tx, rx) = mpsc::channel();
+        let mut host = kwil_view_model::highlight_session::HighlightSession::new(move || {
+            let _ = tx.send(());
+        })
+        .unwrap();
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+l", "file.setType")]).unwrap();
+        assert!(matches!(
+            key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode
+            ),
+            KeyResult::Language
+        ));
+        let mut menu = Some(LanguageMenu::new(&host, &view));
+        for character in "rust".chars() {
+            language_key(
+                &mut menu,
+                Some(&mut host),
+                &mut view,
+                &mut keys,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                Duration::ZERO,
+                Preset::VsCode,
+            );
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw_language(frame, menu.as_ref().unwrap())).unwrap();
+        language_key(
+            &mut menu,
+            Some(&mut host),
+            &mut view,
+            &mut keys,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Duration::ZERO,
+            Preset::VsCode,
+        );
+        assert!(menu.is_none());
+        assert_eq!(host.language_choice(first), LanguageChoice::Explicit(Language::Rust));
+        assert_eq!(view.editor().unwrap().document().revision(), revision);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while host.detected_language(&view) != Some(Language::Rust) {
+            rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            host.worker_ready(&view);
+        }
+        assert!(host.spans(&view).next().is_some(), "picker acceptance reissues actual highlighting without edits");
+        let old = LanguageMenu::new(&host, &view);
+        view.file_command("file.new").unwrap();
+        let second = view.active_id();
+        menu = Some(old);
+        accept_language(&mut menu, Some(&mut host), &mut view, &mut keys);
+        assert_eq!(
+            host.language_choice(second),
+            LanguageChoice::Automatic,
+            "stale ticket never applies to another tab"
+        );
+        assert_eq!(host.language_choice(first), LanguageChoice::Explicit(Language::Rust));
+        view.activate(first);
+        menu = Some(LanguageMenu::new(&host, &view));
+        menu.as_mut().unwrap().text(&mut view, "automatic");
+        accept_language(&mut menu, Some(&mut host), &mut view, &mut keys);
+        assert_eq!(host.language_choice(first), LanguageChoice::Automatic);
+        assert_eq!(view.editor().unwrap().document().revision(), revision, "automatic resets policy, never content");
+        std::thread::spawn(move || {
+            host.shutdown().unwrap();
+            drop(view);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn language_filter_tombstones_and_paste_limits_preserve_document() {
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        let mut host = kwil_view_model::highlight_session::HighlightSession::new(|| {}).unwrap();
+        let mut menu = Some(LanguageMenu::new(&host, &view));
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("enter", "")]).unwrap();
+        language_key(
+            &mut menu,
+            Some(&mut host),
+            &mut view,
+            &mut keys,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Duration::ZERO,
+            Preset::VsCode,
+        );
+        assert!(menu.is_some(), "explicit unbind suppresses raw Enter acceptance");
+        menu.as_mut().unwrap().text(&mut view, "python");
+        menu.as_mut().unwrap().text(&mut view, &"x".repeat(256));
+        assert_eq!(menu.as_ref().unwrap().query, "python");
+        assert!(view.editor().unwrap().document().snapshot().is_empty());
+        std::thread::spawn(move || {
+            host.shutdown().unwrap();
+            drop(view);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn trailing_space_edit_restores_unchanged_number_highlights() {

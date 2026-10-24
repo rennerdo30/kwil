@@ -712,7 +712,7 @@ pub(super) fn draw_marks(
 }
 
 #[cfg(test)]
-mod host_dispatch_tests {
+pub(crate) mod host_dispatch_tests {
     use super::*;
     use kwil_core_commands::{Binding, Context as KeyContext, Preset, keymap::KeymapEngine};
     use kwil_view_model::search_session::SearchStatus;
@@ -721,7 +721,7 @@ mod host_dispatch_tests {
 
     // No native event loop/window, font loading, catalogue, persistent settings
     // or storage startup. The production App and worker wake dispatch are used.
-    fn host(text: &str) -> (App, Receiver<UserEvent>) {
+    pub(crate) fn host(text: &str) -> (App, Receiver<UserEvent>) {
         let (tx, rx) = mpsc::channel();
         let (_, inbox) = kwil_view_model::document_worker::external_open_channel(|| Ok(()));
         let mut view = Workspace::new(View::new(None)).unwrap();
@@ -734,6 +734,8 @@ mod host_dispatch_tests {
                 about: Default::default(),
                 markdown: Default::default(),
                 context: Default::default(),
+                hex: Default::default(),
+                language_picker: Default::default(),
                 context_area: None,
                 logs: Default::default(),
                 logs_ime: None,
@@ -793,6 +795,7 @@ mod host_dispatch_tests {
                 pending: Default::default(),
                 error: None,
                 horizontal: 0,
+                wheel: Default::default(),
                 pointer: (0, 0),
                 drag: None,
                 started: Instant::now(),

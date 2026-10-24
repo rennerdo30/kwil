@@ -16,6 +16,13 @@ pub(crate) enum Step {
     ContextClose,
     GzipOpen,
     GzipCheck,
+    LanguageOpen,
+    LanguageChoose,
+    LanguageReset,
+    HexOpen,
+    HexCheck,
+    HexClose,
+    HexRestored,
     LogsOpen,
     LogsCheck,
     LogsClose,
@@ -241,6 +248,15 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (100, Step::AboutClose),
             (100, Step::GzipOpen),
             (400, Step::GzipCheck),
+            (100, Step::LanguageOpen),
+            (100, Step::UsabilityCapture("language-picker.bmp")),
+            (100, Step::LanguageChoose),
+            (100, Step::LanguageReset),
+            (100, Step::HexOpen),
+            (500, Step::HexCheck),
+            (100, Step::UsabilityCapture("raw-hex.bmp")),
+            (100, Step::HexClose),
+            (500, Step::HexRestored),
             (100, Step::LogsOpen),
             (300, Step::LogsCheck),
             (100, Step::UsabilityCapture("inline-log-filter.bmp")),
@@ -636,6 +652,66 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 std::fs::write(
                     dir.join("gzip-result.txt"),
                     "PASS: real GUI open decompresses exact committed log sample",
+                )
+                .unwrap();
+            }
+        }
+        Step::LanguageOpen => {
+            assert!(app.dispatch_language("file.setType"));
+            assert!(app.language_open());
+        }
+        Step::LanguageChoose => {
+            for key in [
+                winit::keyboard::NamedKey::Home,
+                winit::keyboard::NamedKey::ArrowDown,
+                winit::keyboard::NamedKey::Enter,
+            ] {
+                assert!(app.language_key(&super::HostKey {
+                    logical_key: winit::keyboard::Key::Named(key),
+                    text: None,
+                    repeat: false
+                }));
+            }
+            assert!(!app.language_open());
+            assert!(matches!(
+                app.highlighting.as_ref().unwrap().language_choice(app.view.active_id()),
+                kwil_view_model::highlighting::LanguageChoice::Explicit(_)
+            ));
+        }
+        Step::LanguageReset => {
+            assert!(app.dispatch_language("file.setType"));
+            for key in [winit::keyboard::NamedKey::Home, winit::keyboard::NamedKey::Enter] {
+                assert!(app.language_key(&super::HostKey {
+                    logical_key: winit::keyboard::Key::Named(key),
+                    text: None,
+                    repeat: false
+                }));
+            }
+            assert_eq!(
+                app.highlighting.as_ref().unwrap().language_choice(app.view.active_id()),
+                kwil_view_model::highlighting::LanguageChoice::Automatic
+            );
+        }
+        Step::HexOpen => assert!(app.dispatch_hex("view.toggleHex")),
+        Step::HexCheck => {
+            assert!(app.view.hex_active());
+            assert!(!app.view.document_busy(app.view.active_id()));
+            let row = app.view.hex_session().unwrap().row(app.view.hex_source(), 0).unwrap();
+            assert_eq!(&row.bytes[..2], &[0x1f, 0x8b], "hex must expose the physical gzip bytes");
+        }
+        Step::HexClose => assert!(app.dispatch_hex("view.toggleHex")),
+        Step::HexRestored => {
+            assert!(!app.view.hex_active());
+            assert!(!app.view.document_busy(app.view.active_id()));
+            let document = app.view.editor().unwrap().document();
+            assert_eq!(document.compression, kwil_core_workspace::compressed::CompressionFormat::Gzip);
+            let mut bytes = Vec::new();
+            document.snapshot().write_to(&mut bytes).unwrap();
+            assert_eq!(bytes, include_bytes!("../../../examples/smoke/example.log"));
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("language-hex-result.txt"),
+                    "PASS: language choice/reset; physical gzip hex; clean return to exact decoded text",
                 )
                 .unwrap();
             }
@@ -1150,9 +1226,9 @@ fn input_ownership(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
         kwil_core_commands::settings::TabLayout::Vertical => kwil_core_commands::settings::TabLayout::Horizontal,
     };
     arm(app);
-    app.user_event(el, UserEvent::SettingsReady(Box::new(changed)));
+    app.user_event(el, UserEvent::SettingsReady(Box::new(changed), Default::default()));
     assert!(app.drag.is_none(), "layout change must release the old coordinate anchor");
-    app.user_event(el, UserEvent::SettingsReady(Box::new(settings)));
+    app.user_event(el, UserEvent::SettingsReady(Box::new(settings), Default::default()));
     let size = app.size;
     arm(app);
     app.window_event(el, window, WindowEvent::Resized(winit::dpi::PhysicalSize::new(size.0 as u32 + 1, size.1 as u32)));

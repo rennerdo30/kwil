@@ -122,6 +122,31 @@ pub enum Input<'a> {
     Redo,
     Cancel,
 }
+/// Commands whose meaning is defined in byte coordinates in both frontends.
+/// This is deliberately the existing TUI allowlist: word/text-object motions,
+/// Go To Line and text transforms must never reach an ordinary Editor here.
+/// `extend` is captured from the invoking shortcut, including configured keys.
+pub fn command_input(id: &str, rows: usize, extend: bool) -> Option<Input<'static>> {
+    let page = rows.clamp(1, MAX_ROWS) as i64 * BYTES_PER_ROW as i64;
+    Some(match id {
+        "edit.undo" => Input::Undo,
+        "edit.redo" => Input::Redo,
+        "edit.selectAll" => Input::SelectAll,
+        "edit.delete" => Input::Delete { backwards: false },
+        "edit.backspace" => Input::Delete { backwards: true },
+        "motion.left" => Input::Move { bytes: -1, extend },
+        "motion.right" => Input::Move { bytes: 1, extend },
+        "motion.up" => Input::Move { bytes: -16, extend },
+        "motion.down" => Input::Move { bytes: 16, extend },
+        "motion.pageUp" => Input::Move { bytes: -page, extend },
+        "motion.pageDown" => Input::Move { bytes: page, extend },
+        "motion.lineStart" | "motion.smartHome" => Input::Home { document: false, extend },
+        "motion.lineEnd" => Input::End { document: false, extend },
+        "motion.firstLine" => Input::Home { document: true, extend },
+        "motion.lastLine" => Input::End { document: true, extend },
+        _ => return None,
+    })
+}
 #[derive(Default, Debug)]
 pub struct Outcome {
     pub damage: Damage,
@@ -539,14 +564,13 @@ fn replacement_range(view: &HexView, len: u64, bytes: u64) -> Range<u64> {
     start..if view.insert_mode() { start } else { start.saturating_add(bytes).min(len) }
 }
 fn validate_mutation(mutation: &Mutation, len: u64) -> io::Result<()> {
-    if let Mutation::Replace { range, bytes } = mutation {
-        if range.start > range.end
+    if let Mutation::Replace { range, bytes } = mutation
+        && (range.start > range.end
             || range.end > len
             || bytes.len() > MAX_EDIT_BYTES
-            || len.checked_sub(range.end - range.start).and_then(|len| len.checked_add(bytes.len() as u64)).is_none()
-        {
-            return Err(invalid_edit());
-        }
+            || len.checked_sub(range.end - range.start).and_then(|len| len.checked_add(bytes.len() as u64)).is_none())
+    {
+        return Err(invalid_edit());
     }
     Ok(())
 }

@@ -1092,7 +1092,7 @@ mod tests {
                 assert_eq!(target.add_memory_bytes(), 0);
                 let (token, resources) = op.seal(imported.clone(), &cancel).unwrap();
                 assert_eq!(saved(token.snapshot(), plan(encoding, false)), b"\x88\x62Z");
-                let resources = resources.try_retire(&mut depot).err().expect("live token holds cleanup authority");
+                let resources = resources.try_retire(&mut depot).expect_err("live token holds cleanup authority");
                 drop((imported, token, op));
                 assert!(resources.try_retire(&mut depot).is_ok());
                 assert!(paths.iter().all(|path| !path.exists()));

@@ -11,6 +11,16 @@ This records delivered behavior separately from prepared source. A scratch recei
 - Dirty tab and app close use Windows Save / Don't save / Cancel confirmation, including when session restore is enabled. Acceptance is bound to the document, revision and workspace incarnation. Failure or cancellation retains the dirty document.
 - Find and Go to Line are connected through the effective keymap, menu and palette. Find has desktop fields/buttons, worker results, Next/Previous navigation and visible hit markers. User binding overrides/unbinds retain precedence.
 - Shutdown closes external-open admission while preserving accepted save completion drainage.
+- Windows GPU presentation uses a disabled child HWND while the parent remains compatible with CPU presentation. Backend transitions transfer a complete authoritative image; failed GPU retirement retains resources on the hidden child and immediately repairs the CPU parent.
+- Markdown Text/Preview/Split is connected, with a bounded native layout for tables, code, task lists, local PNG/JPEG images and the documented Mermaid subset. The mode controls occupy the upper toolbar and remain reachable through View in narrow windows.
+- GUI Replace/Replace All submit authoritative worker transactions and restore editor ownership before acknowledging completion. Inline recipes release replacement payloads; no-op operations preserve history and recovery identity.
+- Gzip signature detection precedes text decoding. Open, edit, atomic compressed save and recovery use the compressed original identity. Inline log level/time filters replace the editor rows while preserving original source coordinates.
+- SVG context-menu actions, I-beam text cursors, About diagnostics/licenses, and an embedded Windows executable icon are connected.
+- Editor and owned dialogs are centered and clamped to usable monitor areas. Editor normal bounds, DPI and maximized state use one bounded background persistence lane; late loading cannot override a window already manipulated by the user.
+- Repository SVG icons compile to cached DPI masks for command buttons, tabs, settings categories and field controls. Windows tooltips show effective shortcuts; SVG parsing performs no runtime file I/O.
+- GUI and TUI expose physical-byte hex views with bounded worker pages, byte editing, shared undo/redo, raw saves, and clean transitions back to decoded text. Dirty transport changes are refused. Recovery changes authority only after the replacement journal seed is durable; the fixed staged sibling is never selected merely because it exists.
+- GUI and TUI language pickers use document-scoped choices and worker-validated extension mappings. Mapping reloads invalidate syntax without editing the document. Raw-byte views defer syntax work.
+- TUI in-file Find/Replace uses the shared search and document workers. Cleanup drains accepted edits before releasing history pins and waiting for search-spool retirement; terminal cleanup failures retain their ownership and cannot become success on retry.
 
 ## Evidence
 
@@ -24,13 +34,10 @@ Actual Shell dialog appearance, overwrite UI, and native dirty-close button inte
 
 ## Still unfinished
 
-- Window placement is now integrated: editor and owned dialogs are centered and clamped to usable monitor areas. Editor normal outer bounds, DPI and maximized state use one bounded debounced background persistence lane. Late loading cannot override a window the user has already manipulated.
-- Verified placement: three focused geometry/parser/file-replacement tests, strict GUI lib/tests Clippy, a two-process hidden native exact-bounds save/restart check, and a native owned-Welcome work-area assertion. Real OS maximize/restore and display hot-plug remain owner/platform checks.
-- Actual onscreen GPU presentation. The existing GPU path maintains a backing texture; CPU still presents. Renderer CLI/settings selection is preparation, not GPU completion.
-- Markdown Text/Preview/Split host integration.
-- SVG icons are now integrated: repository-owned vector assets compile to cached DPI masks, with real command buttons, tab/file icons, settings-category icons and field/navigation controls. Windows command buttons have native tooltip labels with effective keymap shortcuts. SVG parsing performs no runtime file I/O.
-- Search replacement transaction execution, complete viewport hit pages, and regex completeness beyond the backend's bounded match contract. Find navigation is working; these gaps are not full search/replace acceptance.
+- Placement has focused geometry/parser/file-replacement checks and a two-process hidden exact-bounds save/restart check. Real OS maximize/restore and display hot-plug remain owner/platform checks.
+- Native macOS/Linux GPU execution remains unqualified. Their wgpu surface path performs full-surface presentation and does not yet meet the damage-only platform requirement. Windows retained-texture equality does not establish DWM/RDP/VNC compositor behavior.
+- Complete viewport hit pages, folder-search host integration, and regex completeness beyond the backend's bounded match contract remain open.
 - Native dialog implementations on macOS/Linux; those retain their explicit inline workflow.
-- General compression/log/highlighting and other retained worker packages require their own integration checks.
+- General compression beyond gzip, live log follow/rotation, compare hosts, word-wrap layout, verified external grammar loading, and signed update delivery still require implementation and acceptance. Hex commands are reachable; the automatic offer on binary-file detection remains unfinished.
 
 No full-v1, platform, performance or release acceptance is implied.

@@ -53,7 +53,8 @@ pub(super) fn draw_highlighted(
             );
         }
     }
-    let status = Paragraph::new(workspace.status_text())
+    let status = if workspace.hex_active() { hex_ui::workspace_status(workspace) } else { workspace.status_text() };
+    let status = Paragraph::new(status)
         .style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18)));
     frame.render_widget(
         status,

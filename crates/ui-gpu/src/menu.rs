@@ -30,12 +30,14 @@ pub(super) const MENUS: &[Menu] = &[
         entries: &[
             Item("&New File", "file.new"),
             Item("&Open File\u{2026}", "file.open"),
+            Item("Open as &Hex\u{2026}", "file.openHex"),
             Item("Open &Recent\u{2026}", "file.recent"),
             Item("Reopen Close&d Tab", "file.reopenClosed"),
             Separator,
             Item("&Save", "file.save"),
             Item("Save &As\u{2026}", "file.saveAs"),
             Item("Save A&ll", "file.saveAll"),
+            Item("Change File T&ype\u{2026}", "file.setType"),
             Separator,
             Item("&Close Tab", "file.close"),
             Item("Clos&e All Tabs", "file.closeAll"),
@@ -89,6 +91,7 @@ pub(super) const MENUS: &[Menu] = &[
             Item("&Reset Zoom", "view.zoomReset"),
             Separator,
             Item("&Log Filters", "view.logFilters"),
+            Item("Toggle &Hex View", "view.toggleHex"),
             Item("Markdown &Text", "view.markdownText"),
             Item("Markdown &Preview", "view.markdownPreview"),
             Item("Markdown &Split", "view.markdownSplit"),
@@ -821,7 +824,7 @@ pub(super) fn draw_dropdown(
 
 impl App {
     pub(super) fn ime_preedit(&mut self, text: &str) {
-        if self.menu.state.is_open() {
+        if self.menu.state.is_open() || self.language_owns_input() {
             // Reject composition without relinquishing the menu's keyboard and
             // mouse ownership. A later Commit remains cancelled after dismissal.
             self.ime_destination = Some(ime::Destination::Cancelled);
@@ -862,7 +865,8 @@ impl App {
 
     /// Menus never compete with a modal card, the save prompt or an IME.
     fn menu_allowed(&self) -> bool {
-        !self.settings_open()
+        !self.language_owns_input()
+            && !self.settings_open()
             && !self.palette_open()
             && !self.search_panel.is_open()
             && self.save_path.is_none()
@@ -1256,10 +1260,11 @@ mod tests {
         // File is drawn, then Left reaches Help before the next paint.
         let m = Metrics::new(1.0);
         let file = layout_rows(0, (0, 30), 300, 2000, &m, 0);
-        let (_, save) = *file.rows.iter().find(|(index, _)| *index == 5).unwrap();
+        let save_index = MENUS[0].entries.iter().position(|entry| matches!(entry, Item(_, "file.save"))).unwrap();
+        let (_, save) = *file.rows.iter().find(|(index, _)| *index == save_index).unwrap();
         let pointer = (save.x + 2, save.y + 2);
         let open = |menu| State::Open { menu, item: None, keyboard: false };
-        assert_eq!(file.row_at(open(0), pointer), Some((5, "file.save")));
+        assert_eq!(file.row_at(open(0), pointer), Some((save_index, "file.save")));
         let help = title_for('h').unwrap();
         assert_eq!(file.row_at(open(help), pointer), None, "rows of File must not index Help");
         assert_eq!(file.row_at(State::Bar(0), pointer), None);
