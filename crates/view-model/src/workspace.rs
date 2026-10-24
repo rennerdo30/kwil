@@ -148,6 +148,16 @@ struct FileFlow {
     exit_without_metadata: bool,
 }
 
+/// Captured editor input survives tab activation, but never document replacement,
+/// close/reopen, or a file-prompt ownership transition.
+#[derive(Clone)]
+pub struct EditorInputTicket {
+    document: DocumentId,
+    incarnation: std::sync::Arc<()>,
+    prompt_generation: u64,
+    source_epoch: u64,
+}
+
 pub struct Workspace {
     hex: HexFlow,
     input_epoch: u64,
@@ -185,6 +195,29 @@ impl Workspace {
     /// or a tab is closed and its identity can subsequently be reopened.
     pub fn input_epoch(&self) -> u64 {
         self.input_epoch
+    }
+    pub fn editor_input_ticket(&self, document: DocumentId) -> Option<EditorInputTicket> {
+        if self.files.prompt.is_some() || self.hex_owns_document(document) {
+            return None;
+        }
+        let view = self.views.get(&document)?;
+        let editor = view.editor()?;
+        Some(EditorInputTicket {
+            document,
+            incarnation: view.input_incarnation.clone(),
+            prompt_generation: self.files.next_prompt,
+            source_epoch: editor.document().source_epoch,
+        })
+    }
+
+    pub fn editor_input_is_current(&self, ticket: &EditorInputTicket) -> bool {
+        self.files.prompt.is_none()
+            && self.files.next_prompt == ticket.prompt_generation
+            && !self.hex_owns_document(ticket.document)
+            && self.views.get(&ticket.document).is_some_and(|view| {
+                std::sync::Arc::ptr_eq(&view.input_incarnation, &ticket.incarnation)
+                    && view.editor().is_some_and(|editor| editor.document().source_epoch == ticket.source_epoch)
+            })
     }
     pub fn horizontal_origin(&self) -> u64 {
         self.deref().first_byte_column
@@ -545,7 +578,8 @@ impl Workspace {
         if self.files.history_wait == Some(id) {
             self.files.history_wait = None;
         }
-        if let Some(view) = self.views.remove(&id) {
+        if let Some(mut view) = self.views.remove(&id) {
+            view.input_incarnation = std::sync::Arc::new(());
             self.input_epoch = self.input_epoch.wrapping_add(1);
             self.closed_views.insert(id, view);
         }
@@ -1029,6 +1063,12 @@ impl Workspace {
         for file in request.files {
             let id = self.open_path(file.path)?;
             if let Some(line) = file.line {
+                if self.hex_owns_document(id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "Switch physical bytes to text before opening a text-line location",
+                    ));
+                }
                 let view = self.views.get_mut(&id).unwrap();
                 view.execute(
                     "navigation.goToLine",
@@ -1989,6 +2029,7 @@ impl Workspace {
             {
                 if !dirty {
                     if let Some((line, column, extend)) = view.pending_goto
+                        && !self.hex_owns_document(existing)
                         && let Some(recovered) = self.views.get_mut(&existing)
                     {
                         let _ = recovered.execute(
@@ -2142,6 +2183,33 @@ mod replacement_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_merge_never_replays_text_line_navigation_into_raw_bytes() {
+        let path = std::env::temp_dir().join("kwil-deferred-raw-line-no-io.bin");
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let current = workspace.active_id();
+        workspace.session.tab_mut(current).unwrap().path = Some(path.clone());
+        let view = workspace.views.get_mut(&current).unwrap();
+        view.path = Some(path.clone());
+        view.editor = None;
+        view.pending_goto = Some((2, 1, false));
+
+        let mut session = Session::default();
+        let recovered = session.open(Some(path.clone())).unwrap();
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, b"first\nsecond\n").unwrap();
+        document.path = Some(path);
+        document.representation = crate::hex_session::Representation::RawBytes;
+        workspace.install_prepared(crate::document_worker::PreparedWorkspace {
+            session,
+            documents: vec![(recovered, Ok(document))],
+        });
+        assert!(workspace.hex_owns_document(recovered));
+        let editor = workspace.views[&recovered].editor().unwrap();
+        assert_eq!(editor.cursors()[editor.primary_index()].head, 0);
+        assert!(workspace.views[&recovered].pending_goto.is_none());
+    }
     use crate::CommandArgs;
 
     #[test]

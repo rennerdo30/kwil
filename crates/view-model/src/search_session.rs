@@ -2,13 +2,14 @@
 //! drain bounded results. Typed actions are revalidated immediately before the
 //! parent dispatcher changes the editor or opens a native path.
 use crate::{Editor, SessionDocumentId};
+pub use kwil_core_search::FileEvent;
 pub use kwil_core_search::worker::{
     DocumentMatches, DocumentSearch, FileResults, INPUT_BYTES, Navigation, PAGE_HITS, Page, Query, REPLACE_BYTES,
     REPLACE_EDITS, ReplaceRecipe, ReplaceTarget, Replacement, ReplacementEdits, ReplacementIter, SIGNAL_BINS,
     SearchEvent, SearchKey, SearchRequest, SearchTask, SearchUpdate, SearchWorker, SeedCursor, SeedRequest, SeedResult,
     SubmitError,
 };
-use kwil_core_search::{FileEvent, FileSearch, FileSearchSummary, Match};
+use kwil_core_search::{FileSearch, FileSearchSummary, Match};
 use std::{io, ops::Range, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +110,7 @@ pub struct SearchSession {
     state: SearchState,
     rejected: Option<SearchRequest>,
     replacement: Option<ReplaceRecipe>,
+    files_counted_until: u64,
 }
 impl SearchSession {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
@@ -118,6 +120,7 @@ impl SearchSession {
             state: SearchState::default(),
             rejected: None,
             replacement: None,
+            files_counted_until: 0,
         })
     }
     pub fn state(&self) -> &SearchState {
@@ -207,6 +210,9 @@ impl SearchSession {
             Err(error) => return Err(error),
         }
         self.generation = generation;
+        if file_results.is_none() {
+            self.files_counted_until = 0;
+        }
         let (count, file_summary) =
             if file_results.is_some() { (self.state.count, self.state.file_summary.take()) } else { (0, None) };
         self.state = SearchState {
@@ -299,6 +305,21 @@ impl SearchSession {
             }
             SearchUpdate::Files { first, rows, results } => {
                 self.state.status = SearchStatus::Searching;
+                if self.state.file_summary.is_none() {
+                    // Streaming pages contain disjoint result records. Count
+                    // only newly observed hits, never error rows or revisits;
+                    // FilesDone later supplies the exact complete count.
+                    let hits = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, row)| {
+                            first.saturating_add(*index as u64) >= self.files_counted_until
+                                && matches!(row, FileEvent::Hit(_))
+                        })
+                        .count() as u64;
+                    self.state.count = self.state.count.saturating_add(hits);
+                    self.files_counted_until = self.files_counted_until.max(first.saturating_add(rows.len() as u64));
+                }
                 self.state.files_seen = results.as_ref().map_or(first + rows.len() as u64, FileResults::len);
                 self.state.file_results = results;
                 self.state.file_first = first;

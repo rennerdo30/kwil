@@ -151,6 +151,10 @@ pub fn run_with_external_open(
                     !view.hex_active() && highlighting.as_mut().is_some_and(|host| highlighting_ready(host, &view))
                 }
                 Msg::PaletteRoot(root) => {
+                    let search_changed = match &root {
+                        Ok(root) => search.root_ready(&mut view, &mut keys, root.clone()),
+                        Err(_) => false,
+                    };
                     match root.and_then(|root| {
                         let sender = tx.clone();
                         kwil_view_model::palette_session::PaletteSession::new(
@@ -163,7 +167,7 @@ pub fn run_with_external_open(
                     }) {
                         Ok(host) => {
                             palette = Some(host);
-                            false
+                            search_changed
                         }
                         Err(error) => {
                             view.set_notice(format!("Palette: {error}"));
@@ -313,6 +317,8 @@ pub fn run_with_external_open(
                         palette_ui::key(&mut view, host, k, &mut keys, started.elapsed(), settings.keymap)
                     } else if view.close_pending() && k.code == KeyCode::Esc {
                         KeyResult::Cancel
+                    } else if search.is_open() {
+                        search_ui::key(&mut search, &mut view, k, &mut keys, &settings, started.elapsed())
                     } else if view.hex_active() {
                         hex_ui::host_key(&mut view, k, &mut keys, started.elapsed(), settings.keymap)
                     } else {
@@ -449,10 +455,10 @@ pub fn run_with_external_open(
                         let intent = hex_ui::resolve(&mut view, &mut keys, intent);
                         let _ = search_ui::resolve(&mut search, &mut view, &mut keys, &settings, intent);
                         true
-                    } else if view.hex_active() {
-                        hex_ui::host_paste(&mut view, &text)
                     } else if search.is_open() {
                         search.input(&mut view, &mut keys, kwil_view_model::search_panel::SearchInput::Text(&text))
+                    } else if view.hex_active() {
+                        hex_ui::host_paste(&mut view, &text)
                     } else if keys.mode() == kwil_core_commands::Mode::Insert {
                         execute(&mut view, "edit.insert", Some(text), false, started.elapsed());
                         true
@@ -517,7 +523,9 @@ pub fn run_with_external_open(
                 });
             }
             if view.hex_active() {
-                search.close(&mut view, &mut keys);
+                if !search.files_mode() {
+                    search.close(&mut view, &mut keys);
+                }
                 if language_menu.take().is_some() {
                     changed = true;
                 }
@@ -573,8 +581,8 @@ pub fn run_with_external_open(
                         if let Some(host) = &highlighting {
                             draw_language_status(f, host, &view);
                         }
-                        search_ui::draw(f, &search, &view, settings.tabs.layout);
                     }
+                    search_ui::draw(f, &mut search, &view, settings.tabs.layout);
                     if let Some(host) = &palette {
                         palette_ui::draw(f, host.model());
                     }

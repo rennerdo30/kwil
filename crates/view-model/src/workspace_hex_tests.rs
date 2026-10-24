@@ -327,6 +327,7 @@ fn workspace_hex_reopen_waits_for_journal_and_failed_close_keeps_editor_history(
     workspace.install_journal_observers();
     let source = workspace.editor().unwrap().document().hex_source(id.0);
     let observed = workspace.files.observed[&id];
+    let input_ticket = workspace.editor_input_ticket(id).unwrap();
     assert_eq!(workspace.open_hex(2).unwrap(), OpenOutcome::Ready);
     assert!(
         matches!(receiver.try_recv().unwrap(), DocumentRequest::FinishJournal { document, generation } if document == id && generation == observed.1)
@@ -341,6 +342,11 @@ fn workspace_hex_reopen_waits_for_journal_and_failed_close_keeps_editor_history(
     assert_eq!(workspace.files.observed[&id], observed);
     assert!(!workspace.hex_active());
     assert!(!workspace.document_busy(id));
+    assert!(
+        !workspace.editor_input_is_current(&input_ticket),
+        "failed accepted raw transition never revives text input"
+    );
+    assert!(workspace.editor_input_ticket(id).is_some(), "fresh text input is available after refusal");
 }
 
 #[test]

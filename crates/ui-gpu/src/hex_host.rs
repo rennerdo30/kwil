@@ -634,8 +634,10 @@ impl App {
                 self.hex.horizontal = 0;
                 self.selecting = false;
                 self.drag = None;
-                self.composing = false;
-                self.ime_destination = Some(ime::Destination::Cancelled);
+                if !ime::editor_destination_is_current(&self.view, &self.ime_destination) {
+                    self.composing = false;
+                    self.ime_destination = Some(ime::Destination::Cancelled);
+                }
             }
         }
         if changed && active {

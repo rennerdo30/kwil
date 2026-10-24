@@ -198,6 +198,7 @@ pub struct SearchPanel {
     include: TextInput,
     exclude: TextInput,
     root: Option<PathBuf>,
+    result_root: Option<PathBuf>,
     root_edited: bool,
     settings: SearchSettings,
     settings_baseline: Option<SearchSettings>,
@@ -244,6 +245,7 @@ impl Default for SearchPanel {
             include: TextInput::default(),
             exclude: TextInput::default(),
             root: None,
+            result_root: None,
             root_edited: false,
             settings: SearchSettings::default(),
             settings_baseline: None,
@@ -370,8 +372,38 @@ impl SearchPanel {
             return Err("Search root must be absolute".into());
         }
         if !self.root_edited {
+            let changed = self.root.as_ref() != Some(&root);
             self.root_input.set(root.to_string_lossy().into_owned())?;
             self.root = Some(root);
+            self.refresh_needed |= changed && self.mode == SearchMode::Files;
+        }
+        Ok(())
+    }
+    /// Deliver the already resolved native root without filesystem work here.
+    /// A late root starts the retained folder query on the existing worker.
+    pub fn root_ready(
+        &mut self,
+        session: &mut SearchSession,
+        view: &Workspace,
+        root: PathBuf,
+    ) -> Result<SearchOutcome, String> {
+        self.set_root(root)?;
+        if self.active && self.mode == SearchMode::Files && self.refresh_needed {
+            self.refresh(session, view, None, None)?;
+            return Ok(SearchOutcome::panel());
+        }
+        Ok(SearchOutcome::default())
+    }
+    fn check_root_edit(&self, field: SearchField, input: SearchInput<'_>) -> Result<(), String> {
+        if field == SearchField::Root
+            && !self.root_edited
+            && self.root.as_ref().is_some_and(|root| root.to_str().is_none())
+            && !self.root_input.selected
+            && matches!(input, SearchInput::Text(_) | SearchInput::Backspace | SearchInput::Delete)
+        {
+            return Err(
+                "This native folder name cannot be edited as displayed text; select all to enter a new path".into()
+            );
         }
         Ok(())
     }
@@ -642,6 +674,13 @@ impl SearchPanel {
                 return Ok(out);
             }
             SearchInput::PageNext | SearchInput::PagePrevious => {
+                if self.mode == SearchMode::Files
+                    && (self.request_key.is_none()
+                        || self.request_key != session.key()
+                        || self.paint_key != session.key())
+                {
+                    return Err("Folder results changed; wait for the current query before paging".into());
+                }
                 if self.mode != SearchMode::Files {
                     return Ok(out);
                 }
@@ -669,6 +708,7 @@ impl SearchPanel {
             }
             edit => {
                 let field = self.field;
+                self.check_root_edit(field, edit)?;
                 let changed = self.input_mut(field).edit(edit)?;
                 if changed {
                     self.followup = None;
@@ -894,6 +934,7 @@ impl SearchPanel {
             if !root.is_absolute() {
                 return Err("Search root must be absolute".into());
             }
+            self.result_root = Some(root.clone());
             let mut request = FileSearch::new(root, self.query.text.clone());
             request.literal = !self.settings.regex;
             request.options.case_insensitive = !self.settings.case_sensitive;
@@ -948,7 +989,14 @@ impl SearchPanel {
             self.identity_epoch = view.input_epoch();
             return Ok(SearchOutcome::default());
         }
-        if (next == self.identity && self.identity_epoch == view.input_epoch()) || self.mode == SearchMode::Files {
+        if self.mode == SearchMode::Files {
+            if self.refresh_needed {
+                self.refresh(session, view, None, None)?;
+                return Ok(SearchOutcome::panel());
+            }
+            return Ok(SearchOutcome::default());
+        }
+        if next == self.identity && self.identity_epoch == view.input_epoch() {
             return Ok(SearchOutcome::default());
         }
         let rows = self.hit_rows(view);
@@ -970,7 +1018,9 @@ impl SearchPanel {
         })
     }
     pub fn worker_ready(&mut self, session: &mut SearchSession, view: &Workspace) -> SearchOutcome {
-        let Some((document, revision)) = Self::active(view) else {
+        let identity =
+            if self.mode == SearchMode::Files { Some((SessionDocumentId(0), 0)) } else { Self::active(view) };
+        let Some((document, revision)) = identity else {
             return SearchOutcome::default();
         };
         if let Some(request) = self.retry.take() {
@@ -1094,7 +1144,7 @@ impl SearchPanel {
                     FileEvent::Hit(hit) => SearchResultRow {
                         label: format!(
                             "{}:{}  {}",
-                            bounded_label(&hit.path.to_string_lossy(), 512),
+                            bounded_label(&self.result_path(&hit.path).to_string_lossy(), 512),
                             hit.line_number,
                             bounded_label(&String::from_utf8_lossy(&hit.line), 512)
                         ),
@@ -1103,7 +1153,7 @@ impl SearchPanel {
                     FileEvent::Error { path, message } => SearchResultRow {
                         label: format!(
                             "{}: {}",
-                            bounded_label(&path.to_string_lossy(), 512),
+                            bounded_label(&self.result_path(path).to_string_lossy(), 512),
                             bounded_label(message, 512)
                         ),
                         is_hit: false,
@@ -1137,6 +1187,13 @@ impl SearchPanel {
             ..Default::default()
         }
     }
+    pub fn result_path<'a>(&self, path: &'a std::path::Path) -> &'a std::path::Path {
+        self.result_root
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(path)
+    }
     fn row_action(&self, session: &SearchSession, view: &Workspace, row: usize) -> Option<SearchAction> {
         if self.paint_key != session.key() || self.paint_key != self.request_key {
             return None;
@@ -1146,7 +1203,8 @@ impl SearchPanel {
         } else {
             session.selection_action(row, SelectionMode::Replace)
         }?;
-        let (document, revision) = Self::active(view)?;
+        let (document, revision) =
+            if self.mode == SearchMode::Files { (SessionDocumentId(0), 0) } else { Self::active(view)? };
         session.validate_action(&action, document, revision).then_some(action)
     }
     fn file_move(
@@ -1196,6 +1254,12 @@ impl SearchPanel {
         }
     }
     pub fn validate_action(&self, session: &SearchSession, view: &Workspace, action: &SearchAction) -> bool {
+        if self.mode == SearchMode::Files && matches!(action, SearchAction::OpenFile { .. }) {
+            // Folder results belong to their query, not the tab that launched
+            // it. Hosts separately capture the current input/cursor at action
+            // admission; never substitute a newer ticket for an old click.
+            return self.request_key == Some(action.key()) && session.validate_action(action, SessionDocumentId(0), 0);
+        }
         self.request_key == Some(action.key())
             && self.identity_epoch == view.input_epoch()
             && Self::active(view).is_some_and(|(id, revision)| session.validate_action(action, id, revision))
@@ -1261,7 +1325,11 @@ impl SearchPanel {
                 return Ok(SearchOutcome::panel());
             }
             edit => {
-                self.input_mut(self.field).edit(edit)?;
+                let field = self.field;
+                self.check_root_edit(field, edit)?;
+                if self.input_mut(field).edit(edit)? && field == SearchField::Root {
+                    self.root_edited = true;
+                }
             }
         }
         self.refresh_needed = true;
@@ -1616,5 +1684,72 @@ mod tests {
         );
         session.stop();
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn folder_late_root_starts_query_without_an_editor_and_actions_survive_tab_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "kwil-folder-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("keep.txt");
+        std::fs::write(&path, b"hit\n").unwrap();
+        let mut view = workspace("");
+        view.editor = None;
+        let (mut session, rx) = session();
+        let mut panel = SearchPanel::default();
+        panel.open(SearchMode::Files, &SearchSettings::default()).unwrap();
+        panel.deferred_input(SearchInput::Text("hit")).unwrap();
+        panel.root_ready(&mut session, &view, root.clone()).unwrap();
+        finish(&mut panel, &mut session, &view, &rx);
+        assert_eq!(panel.count(), (1, true));
+        assert!(panel.results()[0].label.starts_with("keep.txt:1"));
+        let action = panel.row_action(&session, &view, 0).unwrap();
+        assert!(panel.validate_action(&session, &view, &action));
+        view.file_command("file.new").unwrap();
+        panel.sync_document(&mut session, &view).unwrap();
+        assert!(panel.validate_action(&session, &view, &action), "query identity is independent of the opening tab");
+        assert!(matches!(action, SearchAction::OpenFile { path: actual, .. } if actual == path));
+        panel.deferred_input(SearchInput::Focus(SearchField::Root)).unwrap();
+        panel.deferred_input(SearchInput::SelectAll).unwrap();
+        panel.deferred_input(SearchInput::Text("relative")).unwrap();
+        assert!(panel.root_edited);
+        assert!(panel.sync_document(&mut session, &view).is_err());
+        assert!(
+            panel.input(&mut session, &view, SearchInput::PageNext).is_err(),
+            "invalid root cannot revive old pages"
+        );
+        drop(panel);
+        let worker = session.take_shutdown().unwrap();
+        drop(session);
+        worker.shutdown_bounded(Duration::from_secs(5)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn folder_native_root_display_cannot_be_partially_reconstructed_as_a_new_path() {
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"native-\xff".to_vec())
+        };
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x6e, 0xd800])
+        };
+        let root = std::env::temp_dir().join(name);
+        let mut panel = SearchPanel::default();
+        panel.set_root(root.clone()).unwrap();
+        panel.deferred_input(SearchInput::Focus(SearchField::Root)).unwrap();
+        let display = panel.text(SearchField::Root).0.to_owned();
+        assert!(panel.deferred_input(SearchInput::Text("x")).is_err());
+        assert_eq!(panel.root.as_ref(), Some(&root));
+        assert_eq!(panel.text(SearchField::Root).0, display);
+        assert!(!panel.root_edited);
+        panel.deferred_input(SearchInput::SelectAll).unwrap();
+        panel.deferred_input(SearchInput::Text("new explicit path")).unwrap();
+        assert!(panel.root_edited);
+        assert_eq!(panel.text(SearchField::Root).0, "new explicit path");
     }
 }

@@ -10,39 +10,59 @@ pub(super) struct SearchHost {
     session: Option<SearchSession>,
     panel: SearchPanel,
     origin: Option<Origin>,
+    painted: Option<Painted>,
 }
 
 /// A cursor-only change must invalidate an asynchronous navigation too.
 struct Origin {
     document: kwil_view_model::SessionDocumentId,
     epoch: u64,
+    editor: Option<EditorOrigin>,
+}
+struct EditorOrigin {
     revision: u64,
     sequence: u64,
     cursors: Vec<kwil_view_model::Cursor>,
     primary: usize,
 }
 impl Origin {
-    fn capture(view: &Workspace) -> Option<Self> {
-        let editor = view.editor()?;
-        Some(Self {
+    fn capture(view: &Workspace) -> Self {
+        Self {
             document: view.active_id(),
             epoch: view.input_epoch(),
-            revision: editor.document().revision(),
-            sequence: editor.next_edit_sequence(),
-            cursors: editor.cursors().to_vec(),
-            primary: editor.primary_index(),
-        })
+            editor: view.editor().map(|editor| EditorOrigin {
+                revision: editor.document().revision(),
+                sequence: editor.next_edit_sequence(),
+                cursors: editor.cursors().to_vec(),
+                primary: editor.primary_index(),
+            }),
+        }
     }
     fn matches(&self, view: &Workspace) -> bool {
         self.document == view.active_id()
             && self.epoch == view.input_epoch()
-            && view.editor().is_some_and(|editor| {
-                self.revision == editor.document().revision()
-                    && self.sequence == editor.next_edit_sequence()
-                    && self.cursors == editor.cursors()
-                    && self.primary == editor.primary_index()
-            })
+            && match (&self.editor, view.editor()) {
+                (None, None) => true,
+                (Some(origin), Some(editor)) => {
+                    origin.revision == editor.document().revision()
+                        && origin.sequence == editor.next_edit_sequence()
+                        && origin.cursors == editor.cursors()
+                        && origin.primary == editor.primary_index()
+                }
+                _ => false,
+            }
     }
+}
+
+/// One bounded painted card. A click consumes the native action captured for
+/// those exact cells, never an index into a newer worker page or layout.
+struct Painted {
+    bounds: Rect,
+    area: Rect,
+    epoch: u64,
+    origin: Origin,
+    fields: Vec<(Rect, SearchField)>,
+    rows: Vec<(Rect, SearchAction)>,
 }
 
 impl SearchHost {
@@ -62,6 +82,29 @@ impl SearchHost {
     }
     pub(super) fn is_open(&self) -> bool {
         self.panel.is_open()
+    }
+    pub(super) fn files_mode(&self) -> bool {
+        self.panel.mode() == SearchMode::Files
+    }
+    /// Supplied by the existing worker's PaletteRoot event. Never resolve a
+    /// directory or reconstruct a native path from its display on this thread.
+    pub(super) fn root_ready(
+        &mut self,
+        view: &mut Workspace,
+        keys: &mut KeymapEngine,
+        root: std::path::PathBuf,
+    ) -> bool {
+        let result = match &mut self.session {
+            Some(session) => self.panel.root_ready(session, view, root),
+            None => self.panel.set_root(root).map(|_| SearchOutcome::default()),
+        };
+        match result {
+            Ok(outcome) => self.outcome(view, keys, outcome),
+            Err(error) => {
+                self.notice(view, error);
+                true
+            }
+        }
     }
     fn notice(&mut self, view: &mut Workspace, error: String) {
         self.panel.set_error(error.clone());
@@ -94,22 +137,23 @@ impl SearchHost {
             self.notice(view, "Finish or cancel the current file prompt before Find".into());
             return true;
         }
-        if matches!(call.id, "search.findInFiles" | "search.replaceInFiles" | "search.setInclude" | "search.setExclude")
-        {
-            self.notice(view, "Folder search is not attached to this in-file terminal host".into());
-            return true;
-        }
         if call.id == "search.substitute" {
             self.notice(view, "Vim substitution arguments are not attached; use Replace".into());
             return true;
         }
-        self.origin = Origin::capture(view);
+        self.origin = Some(Origin::capture(view));
         let result = match &mut self.session {
             Some(session) => self.panel.command(session, view, call.id, &settings.search),
             None => self
                 .panel
                 .open(
-                    if call.id == "search.replace" { SearchMode::Replace } else { SearchMode::Find },
+                    match call.id {
+                        "search.replace" => SearchMode::Replace,
+                        "search.findInFiles" | "search.replaceInFiles" | "search.setInclude" | "search.setExclude" => {
+                            SearchMode::Files
+                        }
+                        _ => SearchMode::Find,
+                    },
                     &settings.search,
                 )
                 .map(Some),
@@ -125,6 +169,21 @@ impl SearchHost {
                 self.notice(view, error);
             }
         }
+        if self.session.is_none() {
+            if let Some(field) = match call.id {
+                "search.setInclude" => Some(SearchField::Include),
+                "search.setExclude" => Some(SearchField::Exclude),
+                _ => None,
+            } {
+                self.input(view, keys, SearchInput::Focus(field));
+            }
+            if call.id == "search.replaceInFiles" {
+                self.notice(
+                    view,
+                    "Folder replacement awaits the atomic folder executor; Find in Files remains available".into(),
+                );
+            }
+        }
         if call.id == "search.find"
             && let kwil_core_commands::vim::Argument::Search(query) = &call.argument
         {
@@ -135,7 +194,7 @@ impl SearchHost {
         true
     }
     pub(super) fn input(&mut self, view: &mut Workspace, keys: &mut KeymapEngine, input: SearchInput<'_>) -> bool {
-        self.origin = Origin::capture(view);
+        self.origin = Some(Origin::capture(view));
         let result = match &mut self.session {
             Some(session) => self.panel.input(session, view, input),
             None => self.panel.deferred_input(input),
@@ -178,7 +237,7 @@ impl SearchHost {
         // cursor moved. Changed policy invalidates that old followup in the
         // shared panel before a new origin is captured here.
         if self.panel.epoch() != previous_epoch {
-            self.origin = Origin::capture(view);
+            self.origin = Some(Origin::capture(view));
         }
         match result {
             Ok(outcome) => {
@@ -194,6 +253,23 @@ impl SearchHost {
             || self.origin.as_ref().is_none_or(|origin| !origin.matches(view))
         {
             self.notice(view, "Search navigation cancelled: its document, query or cursor changed".into());
+            return;
+        }
+        if let SearchAction::OpenFile { path, line_number, .. } = action {
+            // Search ranges address ORIGINAL bytes (UTF-16 included). The
+            // document worker's CLI navigation resolves decoded logical lines.
+            if !path.is_absolute() || line_number == 0 {
+                self.notice(view, "Folder result has an invalid native path or line".into());
+                return;
+            }
+            let request = kwil_core_workspace::instance::OpenFiles {
+                files: vec![kwil_core_workspace::instance::OpenFile { path, line: Some(line_number), column: Some(1) }],
+            };
+            self.origin = None;
+            if let Err(error) = view.open_files(request) {
+                self.notice(view, format!("Folder result could not open: {error}"));
+            }
+            self.panel.enter_context(keys);
             return;
         }
         if matches!(&action, SearchAction::Replace(_)) {
@@ -241,17 +317,14 @@ impl SearchHost {
                     )
                 }
             }
-            SearchAction::OpenFile { .. } => {
-                self.notice(view, "Folder result navigation is not attached".into());
-                return;
-            }
+            SearchAction::OpenFile { .. } => unreachable!("native file action handled above"),
             SearchAction::Replace(_) => unreachable!(),
         };
         match result {
             Ok(damage) => {
                 view.refresh_after_edit(damage);
                 let result = self.panel.action_applied(session, view, &action);
-                self.origin = Origin::capture(view);
+                self.origin = Some(Origin::capture(view));
                 match result {
                     Ok(outcome) => {
                         self.outcome(view, keys, outcome);
@@ -282,7 +355,7 @@ impl SearchHost {
             && let Some(session) = &mut self.session
         {
             let outcome = self.panel.replacement_finished(session, view, key, result);
-            self.origin = Origin::capture(view);
+            self.origin = Some(Origin::capture(view));
             match outcome {
                 Ok(outcome) => {
                     self.outcome(view, keys, outcome);
@@ -361,6 +434,10 @@ pub(super) fn key(
                 let input = match call.id {
                     "palette.cancel" => Some(SearchInput::Cancel),
                     "palette.accept" => Some(enter(&host.panel, event)),
+                    "palette.next" if host.files_mode() => Some(SearchInput::RowNext),
+                    "palette.previous" if host.files_mode() => Some(SearchInput::RowPrevious),
+                    "motion.pageDown" if host.files_mode() => Some(SearchInput::PageNext),
+                    "motion.pageUp" if host.files_mode() => Some(SearchInput::PagePrevious),
                     "palette.next" | "search.findNext" => Some(SearchInput::Next),
                     "palette.previous" | "search.findPrevious" => Some(SearchInput::Previous),
                     "edit.selectAll" => Some(SearchInput::SelectAll),
@@ -395,6 +472,10 @@ pub(super) fn key(
         KeyCode::Tab => SearchInput::NextField,
         KeyCode::Enter => enter(&host.panel, event),
         KeyCode::F(3) if event.modifiers.contains(KeyModifiers::SHIFT) => SearchInput::Previous,
+        KeyCode::Down if host.files_mode() => SearchInput::RowNext,
+        KeyCode::Up if host.files_mode() => SearchInput::RowPrevious,
+        KeyCode::PageDown if host.files_mode() => SearchInput::PageNext,
+        KeyCode::PageUp if host.files_mode() => SearchInput::PagePrevious,
         KeyCode::F(3) | KeyCode::Down => SearchInput::Next,
         KeyCode::Up => SearchInput::Previous,
         KeyCode::Left => SearchInput::Left,
@@ -421,7 +502,11 @@ pub(super) fn key(
 }
 fn enter(panel: &SearchPanel, event: KeyEvent) -> SearchInput<'static> {
     let shift = event.modifiers.contains(KeyModifiers::SHIFT);
-    if event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) && panel.mode() == SearchMode::Replace {
+    if panel.mode() == SearchMode::Files {
+        SearchInput::SelectRow(panel.selected())
+    } else if event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && panel.mode() == SearchMode::Replace
+    {
         if shift { SearchInput::ReplaceAll } else { SearchInput::ReplaceNext }
     } else if shift {
         SearchInput::Previous
@@ -435,8 +520,30 @@ pub(super) fn is_search(command: &str) -> bool {
 
 fn card(area: Rect, panel: &SearchPanel) -> Option<Rect> {
     let width = area.width.min(90);
-    let height = (panel.visible_fields().len() as u16 + 4).min(area.height.saturating_sub(1));
-    (width >= 12 && height >= 3).then_some(Rect { x: area.x + area.width - width, y: area.y, width, height })
+    let height = if panel.mode() == SearchMode::Files {
+        (panel.visible_fields().len() as u16 + 15).min(area.height)
+    } else {
+        (panel.visible_fields().len() as u16 + 4).min(area.height.saturating_sub(1))
+    };
+    (width != 0 && height != 0).then_some(Rect { x: area.x + area.width - width, y: area.y, width, height })
+}
+
+/// Field and result windows depend only on bounded metadata. Tiny terminals
+/// keep the focused field and cancel hint; clicks never leak into the body.
+fn visible_fields(panel: &SearchPanel, area: Rect) -> &[SearchField] {
+    let fields = panel.visible_fields();
+    if area.height < fields.len() as u16 + 4 || area.width < 24 {
+        let index = fields.iter().position(|field| *field == panel.field()).unwrap_or(0);
+        &fields[index..index + 1]
+    } else {
+        fields
+    }
+}
+fn result_window(panel: &SearchPanel, area: Rect) -> (usize, u16, usize) {
+    let first_y = visible_fields(panel, area).len() as u16 + 2;
+    let rows = area.height.saturating_sub(first_y + 1) as usize;
+    let first = panel.selected().saturating_add(1).saturating_sub(rows);
+    (first, first_y, rows)
 }
 fn field_label(field: SearchField) -> &'static str {
     match field {
@@ -458,17 +565,18 @@ fn window(text: &str, cursor: usize, columns: usize) -> (String, usize) {
 }
 pub(super) fn draw(
     frame: &mut ratatui::Frame,
-    host: &SearchHost,
+    host: &mut SearchHost,
     view: &Workspace,
     layout: kwil_core_commands::settings::TabLayout,
 ) {
+    host.painted = None;
     let bounds = frame.area();
     let geometry = tabs::geometry(view, bounds.width, bounds.height, layout);
     let body = geometry.body;
     // Recolour existing cells: syntax foreground, tabs and wide-cell geometry
     // stay in the normal text renderer. No snapshot reads or search on draw.
     let hit = Color::Rgb(0x73, 0x59, 0x16);
-    for row in 0..view.rows().min(body.height) {
+    for row in 0..if view.hex_active() { 0 } else { view.rows().min(body.height) } {
         for range in host.panel.highlight_columns(view, row, body.width.saturating_sub(8)) {
             for column in range {
                 let x = bounds.x + body.x as u16 + 8 + column as u16;
@@ -483,7 +591,7 @@ pub(super) fn draw(
             }
         }
     }
-    if body.width != 0 && body.height != 0 {
+    if !view.hex_active() && body.width != 0 && body.height != 0 {
         for (index, count) in host.panel.signal().iter().enumerate().filter(|(_, count)| **count != 0) {
             let _ = count;
             let x = bounds.x + body.x as u16 + body.width as u16 - 1;
@@ -495,11 +603,25 @@ pub(super) fn draw(
         return;
     }
     let Some(area) = card(bounds, &host.panel) else { return };
+    let mut painted = Painted {
+        bounds,
+        area,
+        epoch: host.panel.epoch(),
+        origin: Origin::capture(view),
+        fields: Vec::with_capacity(4),
+        rows: Vec::new(),
+    };
     let style = Style::default().fg(Color::Rgb(0xd6, 0xe4, 0xf0)).bg(Color::Rgb(0x08, 0x0d, 0x18));
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(style), area);
+    if area.width < 12 || area.height < 3 {
+        frame.render_widget(Paragraph::new("Esc cancel").style(style), area);
+        host.painted = Some(painted);
+        return;
+    }
     let mut caret = None;
-    for (row, field) in host.panel.visible_fields().iter().enumerate() {
+    let fields = visible_fields(&host.panel, area);
+    for (row, field) in fields.iter().enumerate() {
         if row as u16 >= area.height.saturating_sub(2) {
             break;
         }
@@ -516,12 +638,85 @@ pub(super) fn draw(
             .style(style),
             field_area,
         );
+        painted.fields.push((field_area, *field));
         if *field == host.panel.field() {
             caret = Some((area.x + 10 + column.min(area.width.saturating_sub(11) as usize) as u16, field_area.y));
         }
     }
     let options = host.panel.options();
     let on = |enabled| if enabled { "on" } else { "off" };
+    if host.files_mode() {
+        let first = fields.len() as u16;
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Alt R regex:{}  C case:{}  W word:{}",
+                on(options.regex),
+                on(options.case_sensitive),
+                on(options.whole_word)
+            ))
+            .style(style),
+            Rect { x: area.x, y: area.y + first, width: area.width, height: 1 },
+        );
+        let (first_row, first_y, rows) = result_window(&host.panel, area);
+        let page = host.session.as_ref().map(|session| session.state());
+        let first_result = page.map_or(0, |state| state.file_first);
+        let page_end = first_result.saturating_add(host.panel.results().len() as u64);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} | rows {}–{}",
+                window(host.panel.status(), 0, area.width as usize).0,
+                if page_end == 0 { 0 } else { first_result + 1 },
+                page_end
+            ))
+            .style(style),
+            Rect { x: area.x, y: area.y + first + 1, width: area.width, height: 1 },
+        );
+        for (visible, (index, row)) in host.panel.results().iter().enumerate().skip(first_row).take(rows).enumerate() {
+            let selected = index == host.panel.selected();
+            // Grid expansion escapes controls, so file names/previews cannot
+            // inject terminal controls or split a row. Native path authority
+            // remains solely in the SearchAction, never this display string.
+            let (label, _) = window(&row.label, 0, area.width.saturating_sub(2) as usize);
+            frame.render_widget(
+                Paragraph::new(format!("{} {label}", if selected { ">" } else { " " })).style(if selected {
+                    style.bg(Color::Rgb(0x1c, 0x35, 0x50))
+                } else if !row.is_hit {
+                    style.fg(Color::Rgb(0xff, 0xb0, 0x80))
+                } else {
+                    style
+                }),
+                Rect { x: area.x, y: area.y + first_y + visible as u16, width: area.width, height: 1 },
+            );
+            if row.is_hit
+                && let Some(session) = &host.session
+                && let Some(action) = session.file_action(index, 0)
+                && host.panel.validate_action(session, view, &action)
+            {
+                painted.rows.push((
+                    Rect { x: area.x, y: area.y + first_y + visible as u16, width: area.width, height: 1 },
+                    action,
+                ));
+            }
+        }
+        let hint = if area.width < 24 {
+            "Esc cancel  Tab field"
+        } else if area.width < 40 {
+            "Esc cancel  Enter open  PgUp/Dn"
+        } else if area.width < 60 {
+            "Enter open  PgUp/Dn page  Esc cancel"
+        } else {
+            "↑↓ select  Enter/click open  PgUp/Dn page  Tab field  Esc cancel"
+        };
+        frame.render_widget(
+            Paragraph::new(hint).style(style),
+            Rect { x: area.x, y: area.bottom() - 1, width: area.width, height: 1 },
+        );
+        if let Some(caret) = caret {
+            frame.set_cursor_position(caret);
+        }
+        host.painted = Some(painted);
+        return;
+    }
     let lines = [
         format!(
             "Alt R regex:{}  C case:{}  W word:{}  S selection:{}",
@@ -537,7 +732,7 @@ pub(super) fn draw(
             "Enter/F3 next  Shift Enter/F3 previous  Tab field  Esc close".into()
         },
     ];
-    let first = host.panel.visible_fields().len() as u16;
+    let first = fields.len() as u16;
     for (row, text) in lines.iter().enumerate() {
         if first + row as u16 >= area.height {
             break;
@@ -550,6 +745,7 @@ pub(super) fn draw(
     if let Some(caret) = caret {
         frame.set_cursor_position(caret);
     }
+    host.painted = Some(painted);
 }
 
 pub(super) fn mouse(
@@ -560,15 +756,33 @@ pub(super) fn mouse(
     bounds: Rect,
 ) -> bool {
     let input = match event.kind {
+        MouseEventKind::ScrollDown if host.files_mode() => SearchInput::RowNext,
+        MouseEventKind::ScrollUp if host.files_mode() => SearchInput::RowPrevious,
         MouseEventKind::ScrollDown => SearchInput::Next,
         MouseEventKind::ScrollUp => SearchInput::Previous,
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            let Some(area) = card(bounds, &host.panel) else { return true };
-            if !area.contains((event.column, event.row).into()) {
+            let Some(painted) = host.painted.take() else {
+                host.notice(view, "Search click cancelled: wait for the panel to redraw".into());
+                return true;
+            };
+            if !host.is_open()
+                || painted.bounds != bounds
+                || painted.epoch != host.panel.epoch()
+                || !painted.origin.matches(view)
+            {
+                host.notice(view, "Search click cancelled: its painted layout, query, tab or cursor changed".into());
+                return true;
+            }
+            let point = (event.column, event.row).into();
+            if !painted.area.contains(point) {
                 SearchInput::Cancel
-            } else if let Some(field) = host.panel.visible_fields().get((event.row - area.y) as usize) {
+            } else if let Some((_, field)) = painted.fields.iter().find(|(rect, _)| rect.contains(point)) {
                 SearchInput::Focus(*field)
             } else {
+                if let Some((_, action)) = painted.rows.into_iter().find(|(rect, _)| rect.contains(point)) {
+                    host.origin = Some(painted.origin);
+                    host.action(view, keys, action);
+                }
                 return true;
             }
         }
@@ -698,15 +912,42 @@ mod tests {
         fn selection(&self) -> std::ops::Range<u64> {
             self.view.editor().unwrap().primary_cursor().selection()
         }
-        fn render(&self, width: u16, height: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        fn render(&mut self, width: u16, height: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
                     tabs::draw(frame, &self.view, self.settings.tabs.layout);
-                    draw(frame, &self.host, &self.view, self.settings.tabs.layout);
+                    draw(frame, &mut self.host, &self.view, self.settings.tabs.layout);
                 })
                 .unwrap();
             terminal
+        }
+        fn files(&mut self, root: PathBuf, query: &str) {
+            self.host.root_ready(&mut self.view, &mut self.keys, root);
+            self.press(KeyCode::Char('f'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+            assert_eq!(self.host.panel.mode(), SearchMode::Files, "actual configured folder command dispatch");
+            self.query(query);
+        }
+        fn field(&mut self, field: SearchField, text: &str) {
+            self.host.input(&mut self.view, &mut self.keys, SearchInput::Focus(field));
+            self.ctrl('a');
+            // Bracketed paste uses this same bounded input dispatcher.
+            self.host.input(&mut self.view, &mut self.keys, SearchInput::Text(text));
+            self.settle();
+        }
+        fn click(&mut self, column: u16, row: u16, width: u16, height: u16) {
+            assert!(mouse(
+                &mut self.host,
+                &mut self.view,
+                &mut self.keys,
+                &event::MouseEvent {
+                    kind: MouseEventKind::Down(event::MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE
+                },
+                Rect::new(0, 0, width, height)
+            ));
         }
         fn finish(self) {
             let root = self.root.clone();
@@ -721,6 +962,396 @@ mod tests {
     }
     fn binding(keys: &str, command: &str, context: Option<Context>) -> Binding {
         Binding { keys: keys.into(), command: command.into(), context, mode: None }
+    }
+
+    #[test]
+    fn folder_r1_resize_between_paint_and_click_cannot_reinterpret_a_row() {
+        let mut h = Harness::new("original");
+        let tree = h.root.join("paint-resize");
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join("hit.txt");
+        std::fs::write(&path, "needle\n".repeat(8)).unwrap();
+        h.files(tree, "needle");
+        h.render(100, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        let original = h.view.active_id();
+        // Narrow geometry displays one field instead of four. Recomputing
+        // it at click time maps these painted row-one cells to row four.
+        h.click(row.x + 2, row.y, 20, 20);
+        assert_eq!(h.view.active_id(), original, "resize must reject the old painted click");
+        assert!(h.host.panel.status().contains("painted layout"));
+        assert!(h.host.is_open(), "a stale click cannot cancel or fall through to the editor");
+        h.render(20, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        h.click(row.x + 2, row.y, 20, 20);
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        h.until(|h| h.selection() == (0..0));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_r1_unpainted_page_and_cursor_or_tab_changes_cannot_retarget_clicks() {
+        let mut h = Harness::new("original");
+        let tree = h.root.join("paint-page");
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join("many.txt");
+        std::fs::write(&path, "needle\n".repeat(300)).unwrap();
+        h.files(tree, "needle");
+        h.render(100, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        let original = h.view.active_id();
+        let old_first = h.host.session.as_ref().unwrap().state().file_first;
+        h.press(KeyCode::PageUp, KeyModifiers::NONE);
+        h.settle();
+        assert_ne!(h.host.session.as_ref().unwrap().state().file_first, old_first);
+        h.click(row.x + 2, row.y, 100, 20);
+        assert_eq!(h.view.active_id(), original, "a new worker page was not painted for this click");
+
+        h.render(100, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        h.view
+            .editor_mut()
+            .unwrap()
+            .set_cursors(vec![kwil_view_model::Cursor { anchor: 2, head: 2, desired_column: None }], 0)
+            .unwrap();
+        h.click(row.x + 2, row.y, 100, 20);
+        assert_eq!(h.view.active_id(), original, "a click cannot bless a newer cursor");
+        assert_eq!(h.selection(), 2..2);
+
+        h.render(100, 20);
+        h.view.file_command("file.new").unwrap();
+        let next = h.view.active_id();
+        h.host.sync(&mut h.view, &mut h.keys);
+        h.click(row.x + 2, row.y, 100, 20);
+        assert_eq!(h.view.active_id(), next, "a click cannot bless a newer tab");
+        assert_eq!(h.host.panel.count(), (300, true));
+
+        h.render(100, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        let first = h.host.session.as_ref().unwrap().state().file_first;
+        h.click(row.x + 2, row.y, 100, 20);
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        h.until(|h| h.selection() == (first * 7..first * 7));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_r1_files_open_from_loading_and_failed_tabs_without_an_editor() {
+        let mut h = Harness::new("original");
+        let tree = h.root.join("editor-absent");
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join("hit.txt");
+        std::fs::write(&path, "prefix\nneedle\n").unwrap();
+        h.files(tree, "needle");
+        let failed = h.view.open_path(h.root.join("missing-parent/absent.txt")).unwrap();
+        assert!(h.view.editor().is_none(), "actual opening placeholder has no editor");
+        h.host.sync(&mut h.view, &mut h.keys);
+        h.press(KeyCode::Enter, KeyModifiers::NONE);
+        assert_ne!(h.view.active_id(), failed, "Files keyboard open is independent of the absent editor");
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        h.until(|h| h.selection() == (7..7));
+        h.until(|h| h.view.view(failed).is_some_and(|view| view.notice().contains("Open failed")));
+        assert!(h.view.activate(failed));
+        assert!(h.view.editor().is_none(), "a real failed-open tab still has no editor");
+        h.host.sync(&mut h.view, &mut h.keys);
+        h.render(100, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        h.click(row.x + 2, row.y, 100, 20);
+        assert_ne!(h.view.active_id(), failed, "painted Files mouse open also works without an editor");
+        h.until(|h| h.selection() == (7..7));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_r1_editor_arrival_invalidates_an_editorless_painted_origin() {
+        let mut h = Harness::new("original");
+        let tree = h.root.join("editor-arrival");
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join("hit.txt");
+        let loading_path = h.root.join("loading.txt");
+        std::fs::write(&path, "needle\n").unwrap();
+        std::fs::write(&loading_path, "unrelated\n").unwrap();
+        h.files(tree, "needle");
+        let loading = h.view.open_path(loading_path).unwrap();
+        assert!(h.view.editor().is_none());
+        h.render(100, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        h.until(|h| h.view.editor().is_some());
+        h.click(row.x + 2, row.y, 100, 20);
+        assert_eq!(h.view.active_id(), loading, "editor arrival cannot validate the old editorless click");
+        h.render(100, 20);
+        let row = h.host.painted.as_ref().unwrap().rows[0].0;
+        h.click(row.x + 2, row.y, 100, 20);
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_r1_files_open_while_replacement_editor_is_loaned_then_shutdown_drains_it() {
+        use kwil_view_model::document_worker::DocumentResult;
+        let mut h = Harness::new("one one");
+        let tree = h.root.join("loaned-editor");
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join("hit.txt");
+        std::fs::write(&path, "needle\n").unwrap();
+        h.host.root_ready(&mut h.view, &mut h.keys, tree);
+        replacement(&mut h, "one", "x");
+        h.command("search.replaceAll");
+        h.until(|h| h.view.search_replacement_pending());
+        let loaned = h.view.active_id();
+        assert!(h.view.editor().is_none());
+        h.command("search.findInFiles");
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectAll);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::Text("needle"));
+        // Hold only the one actual editor-return message, deterministically
+        // exercising Files admission while the Workspace still owns a loan.
+        let mut held = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.host.panel.count() != (1, true) {
+            let message = h.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+            match message {
+                Msg::Document(result @ DocumentResult::Replaced { .. }) => {
+                    assert!(held.replace(result).is_none(), "one bounded retained editor return");
+                }
+                message => h.dispatch(message),
+            }
+        }
+        assert_eq!(h.view.active_id(), loaned);
+        assert!(h.view.editor().is_none());
+        h.press(KeyCode::Enter, KeyModifiers::NONE);
+        assert_ne!(h.view.active_id(), loaned, "a loan in another tab cannot block Files open");
+        if let Some(result) = held {
+            h.dispatch(Msg::Document(result));
+        }
+        // Production shutdown retains the queued return if it was not yet
+        // delivered, drains the real loan and releases history before search.
+        h.finish();
+    }
+
+    #[test]
+    fn folder_dispatch_ignore_include_exclude_options_and_compact_modal() {
+        let mut h = Harness::new("editor stays unchanged");
+        let tree = h.root.join("tree");
+        std::fs::create_dir_all(tree.join(".git")).unwrap();
+        std::fs::write(tree.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(tree.join("ignored.txt"), "needle\n").unwrap();
+        std::fs::write(tree.join("keep.txt"), "needle\nNEEDLE\nneedles\n").unwrap();
+        std::fs::write(tree.join("skip.txt"), "needle\n").unwrap();
+        std::fs::write(tree.join("keep.rs"), "needle\n").unwrap();
+        h.files(tree.clone(), "needle");
+        assert_eq!(h.host.panel.count(), (5, true), "gitignored hit is excluded");
+        h.command("search.setInclude");
+        assert_eq!(h.host.panel.field(), SearchField::Include);
+        h.field(SearchField::Include, "*.txt");
+        assert_eq!(h.host.panel.count(), (4, true), "include never overrides gitignore");
+        h.command("search.setExclude");
+        assert_eq!(h.host.panel.field(), SearchField::Exclude);
+        h.field(SearchField::Exclude, "skip.txt");
+        assert_eq!(h.host.panel.count(), (3, true));
+        h.press(KeyCode::Char('c'), KeyModifiers::ALT);
+        h.settle();
+        assert_eq!(h.host.panel.count(), (2, true));
+        h.press(KeyCode::Char('w'), KeyModifiers::ALT);
+        h.settle();
+        assert_eq!(h.host.panel.count(), (1, true));
+        h.press(KeyCode::Char('r'), KeyModifiers::ALT);
+        h.field(SearchField::Query, "n(eed)le");
+        assert_eq!(h.host.panel.count(), (1, true));
+        let frame = h.render(100, 20);
+        let display: String = frame.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(display.contains("keep.txt:1"), "real results are drawn in the terminal card");
+        assert!(display.contains("PgUp/Dn"));
+        for (width, height) in [(0, 0), (1, 1), (8, 2), (12, 4), (24, 8), (60, 10)] {
+            h.render(width, height);
+            h.press(KeyCode::Delete, KeyModifiers::CONTROL);
+            assert!(h.host.is_open());
+            assert_eq!(h.bytes(), b"editor stays unchanged", "modal input must never fall through to the body");
+        }
+        h.command("search.replaceInFiles");
+        assert!(!h.host.panel.can_replace());
+        assert!(h.host.panel.status().contains("atomic folder executor"));
+        assert_eq!(std::fs::read(tree.join("keep.txt")).unwrap(), b"needle\nNEEDLE\nneedles\n");
+        h.finish();
+    }
+
+    #[test]
+    fn folder_count_over_256_revisits_disk_pages_and_keyboard_selects_without_opening() {
+        let mut h = Harness::new("retain editor");
+        let tree = h.root.join("pages");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("many.txt"), "needle\n".repeat(300)).unwrap();
+        h.files(tree, "needle");
+        assert_eq!(h.host.panel.count(), (300, true));
+        assert!(h.host.panel.results().len() <= 32);
+        let last = h.host.session.as_ref().unwrap().state().file_first;
+        assert!(last >= 256);
+        let active = h.view.active_id();
+        h.press(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(h.view.active_id(), active, "arrow only selects, Enter opens");
+        assert_eq!(h.host.panel.selected(), 1);
+        for _ in 0..last.div_ceil(32) {
+            h.press(KeyCode::PageUp, KeyModifiers::NONE);
+            h.settle();
+            assert!(h.host.panel.results().len() <= 32);
+            assert_eq!(h.host.panel.count(), (300, true));
+        }
+        assert_eq!(h.host.session.as_ref().unwrap().state().file_first, 0);
+        assert!(h.host.panel.results()[0].label.contains("many.txt:1 "));
+        for _ in 0..last.div_ceil(32) {
+            h.press(KeyCode::PageDown, KeyModifiers::NONE);
+            h.settle();
+        }
+        assert_eq!(h.host.session.as_ref().unwrap().state().file_first, last);
+        assert_eq!(h.host.panel.count(), (300, true));
+        let frame = h.render(80, 12);
+        let display: String = frame.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(display.contains("300 matching lines"));
+        assert_eq!(h.bytes(), b"retain editor");
+        h.finish();
+    }
+
+    #[test]
+    fn folder_utf16_result_opens_native_path_at_decoded_line_column_one_by_enter_and_mouse() {
+        let mut h = Harness::new("original");
+        let tree = h.root.join("utf16");
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join("日本語.txt");
+        let text = "α😀 first\nneedle target\nlast\n";
+        let encoded: Vec<u8> = [0xff, 0xfe].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        std::fs::write(&path, encoded).unwrap();
+        h.files(tree, "needle");
+        assert_eq!(h.host.panel.count(), (1, true));
+        let original = h.view.active_id();
+        h.press(KeyCode::Enter, KeyModifiers::NONE);
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        h.until(|h| h.selection() == (13..13));
+        assert_ne!(h.view.active_id(), original);
+        assert_eq!(h.selection(), 13..13, "original UTF-16 match byte ranges are never UTF-8 cursor offsets");
+        assert!(h.host.is_open());
+        assert_eq!(h.host.panel.count(), (1, true), "folder results remain after a tab changes");
+        assert!(h.view.activate(original));
+        h.host.sync(&mut h.view, &mut h.keys);
+        h.render(100, 20);
+        let area = card(Rect::new(0, 0, 100, 20), &h.host.panel).unwrap();
+        let (_, first_y, _) = result_window(&h.host.panel, area);
+        h.click(area.x + 2, area.y + first_y, 100, 20);
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        h.until(|h| h.selection() == (13..13));
+        assert_eq!(h.host.panel.count(), (1, true));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_stale_query_tab_cursor_actions_are_rejected_but_new_tab_actions_work() {
+        let mut h = Harness::new("original");
+        let tree = h.root.join("stale");
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join("hit.txt");
+        std::fs::write(&path, "needle\n").unwrap();
+        h.files(tree, "needle");
+        let action = h.host.session.as_ref().unwrap().file_action(0, 0).unwrap();
+        h.view
+            .editor_mut()
+            .unwrap()
+            .set_cursors(vec![kwil_view_model::Cursor { anchor: 2, head: 2, desired_column: None }], 0)
+            .unwrap();
+        let original = h.view.active_id();
+        h.host.action(&mut h.view, &mut h.keys, action);
+        assert_eq!(h.view.active_id(), original);
+        assert_eq!(h.selection(), 2..2);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::RowNext);
+        let action = h.host.session.as_ref().unwrap().file_action(0, 0).unwrap();
+        h.view.file_command("file.new").unwrap();
+        let next = h.view.active_id();
+        h.host.sync(&mut h.view, &mut h.keys);
+        h.host.action(&mut h.view, &mut h.keys, action);
+        assert_eq!(h.view.active_id(), next, "old user action cannot follow a tab change");
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::RowNext);
+        let action = h.host.session.as_ref().unwrap().file_action(0, 0).unwrap();
+        h.query("missing");
+        h.host.action(&mut h.view, &mut h.keys, action);
+        assert_eq!(h.view.active_id(), next, "old key cannot act after the query changes");
+        h.query("needle");
+        h.press(KeyCode::Enter, KeyModifiers::NONE);
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_cancel_and_bounded_shutdown_release_retained_replace_history() {
+        let mut h = Harness::new("one one");
+        replacement(&mut h, "one", "x");
+        h.command("search.replaceAll");
+        h.settle();
+        h.receipts();
+        assert_eq!(h.bytes(), b"x x");
+        let tree = h.root.join("cancel");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("many.txt"), "needle\n".repeat(300)).unwrap();
+        h.host.root_ready(&mut h.view, &mut h.keys, tree);
+        h.command("search.findInFiles");
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectAll);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::Text("needle"));
+        let action_key = h.host.session.as_ref().unwrap().key();
+        h.press(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!h.host.is_open());
+        assert_ne!(h.host.session.as_ref().unwrap().key(), action_key);
+        assert!(h.host.panel.results().is_empty());
+        assert_eq!(h.bytes(), b"x x", "replacement history stays alive until actual production shutdown");
+        h.finish(); // unchanged bounded shutdown drains loans, drops owners off UI, then retires search
+    }
+
+    #[test]
+    fn folder_delayed_worker_root_and_explicit_root_field_restart_the_query() {
+        let mut h = Harness::new("original");
+        let tree = h.root.join("delayed");
+        let other = h.root.join("other");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(tree.join("hit.txt"), "needle\n").unwrap();
+        std::fs::write(other.join("more.txt"), "needle\nneedle\n").unwrap();
+        h.command("search.findInFiles");
+        h.query("needle");
+        assert!(h.host.panel.status().contains("root"));
+        h.host.root_ready(&mut h.view, &mut h.keys, tree);
+        h.settle();
+        assert_eq!(h.host.panel.count(), (1, true), "a query before PaletteRoot must resume on its worker event");
+        h.field(SearchField::Root, other.to_str().unwrap());
+        assert_eq!(h.host.panel.count(), (2, true), "an explicit root edit is an actual query input");
+        h.render(24, 8);
+        h.press(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!h.host.is_open());
+        assert_eq!(h.bytes(), b"original");
+        h.finish();
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn folder_lossy_native_root_and_result_display_never_replace_path_authority() {
+        #[cfg(windows)]
+        let native = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[b'n' as u16, 0xd800, b'x' as u16])
+        };
+        #[cfg(unix)]
+        let native = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![b'n', 0xff, b'x'])
+        };
+        let mut h = Harness::new("original");
+        let tree = h.root.join(&native);
+        std::fs::create_dir_all(&tree).unwrap();
+        let path = tree.join(native);
+        std::fs::write(&path, "needle\n").unwrap();
+        h.files(tree, "needle");
+        assert_eq!(h.host.panel.count(), (1, true));
+        let action = h.host.session.as_ref().unwrap().file_action(0, 0).unwrap();
+        assert!(matches!(&action, SearchAction::OpenFile { path: actual, .. } if actual == &path));
+        h.render(40, 10); // replacement characters are display only
+        h.press(KeyCode::Enter, KeyModifiers::NONE);
+        h.until(|h| h.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path())));
+        assert_eq!(h.selection(), 0..0);
+        h.finish();
     }
 
     #[test]

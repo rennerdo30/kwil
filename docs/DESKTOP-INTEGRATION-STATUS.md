@@ -21,6 +21,8 @@ This records delivered behavior separately from prepared source. A scratch recei
 - GUI and TUI expose physical-byte hex views with bounded worker pages, byte editing, shared undo/redo, raw saves, and clean transitions back to decoded text. Dirty transport changes are refused. Recovery changes authority only after the replacement journal seed is durable; the fixed staged sibling is never selected merely because it exists.
 - GUI and TUI language pickers use document-scoped choices and worker-validated extension mappings. Mapping reloads invalidate syntax without editing the document. Raw-byte views defer syntax work.
 - TUI in-file Find/Replace uses the shared search and document workers. Cleanup drains accepted edits before releasing history pins and waiting for search-spool retirement; terminal cleanup failures retain their ownership and cannot become success on retry.
+- GUI and TUI Find in Files use the shared bounded worker, include/exclude filters, streaming counts and revisitable result pages. Results preserve native paths and open at decoded line/column coordinates. Painted geometry and document/cursor tickets reject stale clicks. Exact match-range highlighting and folder replacement remain unfinished.
+- Captured editor IME input follows its original document across ordinary text-tab activation. Document incarnation, source, cursor/revision and modal ownership fences reject stale commits. Language detection remains stable while viewport highlight spans are refreshed.
 
 ## Evidence
 
@@ -36,7 +38,7 @@ Actual Shell dialog appearance, overwrite UI, and native dirty-close button inte
 
 - Placement has focused geometry/parser/file-replacement checks and a two-process hidden exact-bounds save/restart check. Real OS maximize/restore and display hot-plug remain owner/platform checks.
 - Native macOS/Linux GPU execution remains unqualified. Their wgpu surface path performs full-surface presentation and does not yet meet the damage-only platform requirement. Windows retained-texture equality does not establish DWM/RDP/VNC compositor behavior.
-- Complete viewport hit pages, folder-search host integration, and regex completeness beyond the backend's bounded match contract remain open.
+- Complete viewport hit pages, exact folder-result range highlighting, folder replacement, and regex completeness beyond the backend's bounded match contract remain open.
 - Native dialog implementations on macOS/Linux; those retain their explicit inline workflow.
 - General compression beyond gzip, live log follow/rotation, compare hosts, word-wrap layout, verified external grammar loading, and signed update delivery still require implementation and acceptance. Hex commands are reachable; the automatic offer on binary-file detection remains unfinished.
 

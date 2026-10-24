@@ -26,6 +26,10 @@ pub(crate) enum Step {
     LogsOpen,
     LogsCheck,
     LogsClose,
+    FolderOpen,
+    FolderCheck,
+    FolderSelect,
+    FolderOpened,
     PresenterCpu,
     PresenterEdit,
     PresenterGpu,
@@ -261,6 +265,11 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
             (300, Step::LogsCheck),
             (100, Step::UsabilityCapture("inline-log-filter.bmp")),
             (100, Step::LogsClose),
+            (100, Step::FolderOpen),
+            (400, Step::FolderCheck),
+            (100, Step::UsabilityCapture("folder-search.bmp")),
+            (100, Step::FolderSelect),
+            (400, Step::FolderOpened),
             (100, Step::PresenterCpu),
             (100, Step::PresenterEdit),
             (100, Step::PresenterGpu),
@@ -315,6 +324,37 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::FolderOpen => {
+            use kwil_view_model::search_panel::{SearchField, SearchInput};
+            app.set_search_root(PathBuf::from(std::env::var_os("KWIL_WORKSPACE_ROOT").unwrap()));
+            assert!(app.dispatch_search("search.findInFiles"));
+            assert!(app.dispatch_search("search.setInclude"));
+            app.search_input(SearchInput::Text("folder-probe.txt"));
+            app.search_input(SearchInput::Focus(SearchField::Query));
+            app.search_input(SearchInput::SelectAll);
+            app.search_input(SearchInput::Text("kwil-native-folder-needle"));
+        }
+        Step::FolderCheck => {
+            assert!(!app.search_panel.is_pending());
+            assert_eq!(app.search_panel.count(), (1, true));
+            assert!(app.search_area.is_some(), "folder card must have painted");
+        }
+        Step::FolderSelect => {
+            app.search_input(kwil_view_model::search_panel::SearchInput::SelectRow(0));
+        }
+        Step::FolderOpened => {
+            let editor = app.view.editor().expect("selected file prepared");
+            assert_eq!(editor.document().path().and_then(|p| p.file_name()).unwrap(), "folder-probe.txt");
+            assert_eq!(editor.cursors()[editor.primary_index()].head, 6, "decoded line two, column one");
+            app.search_input(kwil_view_model::search_panel::SearchInput::Cancel);
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("folder-search-result.txt"),
+                    "PASS: real folder worker, painted card, exact count and native line-two open",
+                )
+                .unwrap();
+            }
+        }
         Step::DesktopWindowProbe => {
             app.sync_desktop_window(el);
             let main = app.gfx.as_ref().unwrap().window.id();
@@ -719,10 +759,26 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::LogsOpen => {
             assert!(app.is_log_document());
             app.filter_log_level(Some(kwil_core_syntax::logs::Level::Error));
+            assert!(
+                app.logs.owns_body(),
+                "log admission: modal={} prompt={} save_path={} settings={} hex={} notice={:?}",
+                app.file_modal(),
+                app.view.file_prompt().is_some(),
+                app.save_path.is_some(),
+                app.settings_open(),
+                app.view.hex_active(),
+                app.view.notice()
+            );
         }
         Step::LogsCheck => {
             let (total, exact, _) = app.logs.viewport_extent();
-            assert!(app.logs.owns_body());
+            assert!(
+                app.logs.owns_body(),
+                "log body closed: is_log={} detected={:?} notice={:?}",
+                app.is_log_document(),
+                app.highlighting.as_ref().and_then(|h| h.detected_language(&app.view)),
+                app.view.notice()
+            );
             assert!(exact);
             assert_eq!(total, 1);
             let original = super::chrome::layout(app.size, &app.ui, app.settings.tabs.layout).body;

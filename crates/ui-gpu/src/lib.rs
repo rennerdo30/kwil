@@ -2785,6 +2785,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::HighlightsReady => self.language_highlights_ready(),
             UserEvent::PaletteRoot(root) => {
+                if let Ok(root) = &root {
+                    self.set_search_root(root.clone());
+                }
                 match root.and_then(|root| {
                     let proxy = self.proxy.clone();
                     kwil_view_model::palette_session::PaletteSession::new(
@@ -3187,12 +3190,12 @@ impl ApplicationHandler<UserEvent> for App {
                     #[allow(unused_mut)]
                     Ok(mut gpu) => {
                         #[cfg(not(windows))]
-                        if let Some(gfx) = &self.gfx {
-                            if let gpu::Presented::Failed(error) = gpu.attach_window(gfx.window.clone()) {
-                                eprintln!("kwil GPU surface unavailable: {error}");
-                                self.apply(Damage { full: true, ..Default::default() });
-                                return;
-                            }
+                        if let Some(gfx) = &self.gfx
+                            && let gpu::Presented::Failed(error) = gpu.attach_window(gfx.window.clone())
+                        {
+                            eprintln!("kwil GPU surface unavailable: {error}");
+                            self.apply(Damage { full: true, ..Default::default() });
+                            return;
                         }
                         self.gpu = Some(*gpu);
                     }

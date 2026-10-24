@@ -8,6 +8,58 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[test]
+fn folder_stream_count_is_hit_only_lower_bound_and_never_counts_revisited_records() {
+    let key = SearchKey { document_id: 0, revision: 0, generation: 1 };
+    let mut host = SearchSession {
+        worker: None,
+        generation: 1,
+        state: SearchState { key: Some(key), ..Default::default() },
+        rejected: None,
+        replacement: None,
+        files_counted_until: 0,
+    };
+    let hit = |line_number| {
+        FileEvent::Hit(kwil_core_search::FileHit {
+            path: PathBuf::from("hit.txt"),
+            line_number,
+            line_offset: 0,
+            line: b"hit".to_vec(),
+            line_truncated: false,
+            match_ranges: std::iter::once(0..3).collect(),
+            ranges_truncated: false,
+        })
+    };
+    let error = || FileEvent::Error { path: PathBuf::from("denied"), message: "denied".into() };
+    host.accept(SearchEvent {
+        key,
+        update: SearchUpdate::Files { first: 0, rows: vec![hit(1), error(), hit(2)], results: None },
+    });
+    assert_eq!(host.state.count, 2);
+    assert_eq!(host.state.files_seen, 3);
+    assert_eq!(host.state.status, SearchStatus::Searching);
+    host.accept(SearchEvent {
+        key,
+        update: SearchUpdate::Files { first: 1, rows: vec![error(), hit(2), hit(3)], results: None },
+    });
+    assert_eq!(host.state.count, 3);
+    host.accept(SearchEvent {
+        key,
+        update: SearchUpdate::FilesDone(FileSearchSummary {
+            files: 2,
+            matching_lines: 3,
+            errors: 1,
+            cancelled: false,
+            workers: 1,
+        }),
+    });
+    host.accept(SearchEvent {
+        key,
+        update: SearchUpdate::Files { first: 0, rows: vec![hit(1), error(), hit(2)], results: None },
+    });
+    assert_eq!(host.state.count, 3, "completed-page revisits preserve exact matching-line count");
+}
+
 fn editor(text: &str) -> Editor {
     let mut editor = Editor::new(Document::new());
     editor.insert_text(text, Duration::ZERO).unwrap();

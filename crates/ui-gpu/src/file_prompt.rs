@@ -77,7 +77,7 @@ impl App {
         // Receipts cannot commit text from a composition started in the old
         // inline GUI prompt. The OS chooser owns its own IME.
         if self.file_modal() {
-            ime::reset(&mut self.composing, &mut self.ime_destination);
+            ime::cancel(&mut self.composing, &mut self.ime_destination);
         }
         self.file_dialogs.event(&mut self.view, event);
         self.sync_file_ui();

@@ -22,7 +22,8 @@ pub mod settings_panels;
 pub mod settings_session;
 mod workspace;
 pub use workspace::{
-    FilePrompt, FilePromptKind, NativeFilePrompt, TabAction, TabArea, TabGeometry, TabMetrics, TabSlot, Workspace,
+    EditorInputTicket, FilePrompt, FilePromptKind, NativeFilePrompt, TabAction, TabArea, TabGeometry, TabMetrics,
+    TabSlot, Workspace,
 };
 pub mod document_worker;
 pub use kwil_core_workspace::session::DocumentId as SessionDocumentId;
@@ -51,6 +52,7 @@ pub struct Damage {
 }
 
 pub struct View {
+    input_incarnation: std::sync::Arc<()>,
     file: Option<TextFile>,
     path: Option<PathBuf>,
     top: u64,
@@ -75,6 +77,7 @@ impl View {
         };
         let editor = if file.is_none() { Some(Editor::new(Document::new())) } else { None };
         let mut view = View {
+            input_incarnation: std::sync::Arc::new(()),
             file,
             path,
             top: 0,

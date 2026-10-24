@@ -261,6 +261,9 @@ impl Workspace {
             return Err(busy());
         }
         let generation = self.hex.generation()?;
+        // Admission permanently retires captured text input even if transport
+        // reopening later fails and restores the same editor.
+        self.views.get_mut(&id).unwrap().input_incarnation = std::sync::Arc::new(());
         let tab = self.hex.tabs.entry(id).or_insert_with(|| HexTab::new(rows));
         tab.session.set_rows(rows);
         self.views.get_mut(&id).unwrap().rows = tab.session.view().rows();

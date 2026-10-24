@@ -16,6 +16,7 @@ const WINDOW: usize = MAX_WINDOW_BYTES - 8192;
 #[derive(PartialEq, Eq)]
 struct Identity {
     document: DocumentId,
+    source_epoch: u64,
     input_epoch: u64,
     revision: u64,
     path: std::path::PathBuf,
@@ -39,6 +40,7 @@ pub struct HighlightSession {
     settings_generation: u64,
     choices: HashMap<DocumentId, LanguageChoice>,
     results: Vec<Arc<PublishedHighlights>>,
+    last_detection: Option<Detection>,
     painted: BTreeMap<u64, Vec<(Range<usize>, Class)>>,
 }
 
@@ -59,6 +61,7 @@ impl HighlightSession {
             settings_generation: 0,
             choices: HashMap::new(),
             results: Vec::new(),
+            last_detection: None,
             painted: BTreeMap::new(),
         })
     }
@@ -125,6 +128,7 @@ impl HighlightSession {
         let identity = self.identity.as_ref()?;
         let editor = view.editor()?;
         (identity.document == view.active_id()
+            && identity.source_epoch == editor.document().source_epoch
             && identity.input_epoch == view.input_epoch()
             && identity.revision == editor.document().revision()
             && identity.path == editor.document().path().unwrap_or(std::path::Path::new(""))
@@ -156,6 +160,7 @@ impl HighlightSession {
         );
         let next = Identity {
             document: view.active_id(),
+            source_epoch: editor.document().source_epoch,
             input_epoch: view.input_epoch(),
             revision: editor.document().revision(),
             path: editor.document().path().unwrap_or(std::path::Path::new("")).to_path_buf(),
@@ -165,6 +170,16 @@ impl HighlightSession {
         };
         if self.identity.as_ref() == Some(&next) {
             return false;
+        }
+        if self.identity.as_ref().is_none_or(|old| {
+            old.document != next.document
+                || old.source_epoch != next.source_epoch
+                || old.revision != next.revision
+                || old.path != next.path
+                || old.settings_generation != next.settings_generation
+                || old.choice != next.choice
+        }) {
+            self.last_detection = None;
         }
         // Release duplicate typed handles while `source` still owns this same
         // object, BEFORE retirement can race with the worker's destruction.
@@ -261,6 +276,7 @@ impl HighlightSession {
             if let Ok(result) = update
                 && result.key == key
             {
+                self.last_detection = Some(result.detection);
                 for row in 0..view.rows() {
                     let Some(source) = view.line_source(row) else { continue };
                     let source = source.start as usize..source.end as usize;
@@ -296,8 +312,21 @@ impl HighlightSession {
     }
 
     pub fn detection(&self, view: &Workspace) -> Option<Detection> {
-        let key = self.current_key(view)?;
-        self.results.iter().rev().find(|result| result.key == key).map(|result| result.detection)
+        if view.hex_active() {
+            return None;
+        }
+        let identity = self.identity.as_ref()?;
+        let editor = view.editor()?;
+        // Language belongs to a source/policy, not to a viewport. A resize or
+        // scroll may invalidate spans while keeping accepted detection valid.
+        (identity.document == view.active_id()
+            && identity.source_epoch == editor.document().source_epoch
+            && identity.revision == editor.document().revision()
+            && identity.path == editor.document().path().unwrap_or(std::path::Path::new(""))
+            && identity.settings_generation == self.settings_generation
+            && identity.choice == self.language_choice(view.active_id()))
+        .then_some(self.last_detection)
+        .flatten()
     }
 
     pub fn detected_language(&self, view: &Workspace) -> Option<Language> {
@@ -408,6 +437,28 @@ mod tests {
             receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
             host.worker_ready(view);
         }
+    }
+
+    #[test]
+    fn viewport_reissue_keeps_language_but_rejects_changed_source_and_policy() {
+        let (mut view, mut host, receiver) = policy_fixture();
+        view.editor_mut().unwrap().document.path = Some("server.log.gz".into());
+        let id = view.active_id();
+        host.set_language_choice(&view, id, LanguageChoice::Explicit(Language::Log));
+        host.update(&view);
+        drain_policy(&mut host, &view, &receiver);
+        assert_eq!(host.detected_language(&view), Some(Language::Log));
+        view.set_rows(0);
+        assert!(host.update(&view));
+        assert!(host.results.is_empty(), "new viewport has no accepted spans yet");
+        assert_eq!(host.detected_language(&view), Some(Language::Log), "language survives pending viewport work");
+        view.editor_mut().unwrap().document.source_epoch = crate::document::next_source_epoch();
+        assert_eq!(host.detected_language(&view), None, "replacement source never inherits accepted detection");
+        host.update(&view);
+        drain_policy(&mut host, &view, &receiver);
+        host.set_language_choice(&view, id, LanguageChoice::Explicit(Language::Generic));
+        assert_eq!(host.detected_language(&view), None, "policy change is immediately authoritative");
+        host.shutdown().unwrap();
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! A composition belongs to the input destination captured at first preedit.
-use kwil_view_model::{CommandArgs, Cursor, Damage, SessionDocumentId, Workspace};
+use kwil_view_model::{CommandArgs, Cursor, Damage, EditorInputTicket, SessionDocumentId, Workspace};
 use std::time::Duration;
 
 pub(super) enum Destination {
@@ -17,7 +17,7 @@ pub(super) enum Destination {
         revision: u64,
     },
     Editor {
-        epoch: u64,
+        ticket: EditorInputTicket,
         document: SessionDocumentId,
         revision: u64,
         sequence: u64,
@@ -36,6 +36,15 @@ pub(super) fn reset(composing: &mut bool, destination: &mut Option<Destination>)
     *destination = None;
 }
 
+pub(super) fn cancel(composing: &mut bool, destination: &mut Option<Destination>) {
+    *composing = false;
+    *destination = Some(Destination::Cancelled);
+}
+
+pub(super) fn editor_destination_is_current(workspace: &Workspace, destination: &Option<Destination>) -> bool {
+    matches!(destination, Some(Destination::Editor { ticket, .. }) if workspace.editor_input_is_current(ticket))
+}
+
 pub(super) fn capture(workspace: &Workspace, insert_mode: bool) -> Destination {
     let epoch = workspace.input_epoch();
     if let Some(prompt) = workspace.file_prompt() {
@@ -47,8 +56,9 @@ pub(super) fn capture(workspace: &Workspace, insert_mode: bool) -> Destination {
         };
     }
     let Some(editor) = workspace.editor() else { return Destination::Cancelled };
+    let Some(ticket) = workspace.editor_input_ticket(workspace.active_id()) else { return Destination::Cancelled };
     Destination::Editor {
-        epoch,
+        ticket,
         document: workspace.active_id(),
         revision: editor.document().revision(),
         sequence: editor.next_edit_sequence(),
@@ -102,11 +112,11 @@ fn commit_inner(
             workspace.file_prompt_mut().unwrap().text.push_str(&text);
             workspace.prompt_notice()
         }
-        Destination::Editor { epoch, document, revision, sequence, cursors, primary, insert_mode } => {
+        Destination::Editor { ticket, document, revision, sequence, cursors, primary, insert_mode } => {
             if !insert_mode {
                 return workspace.set_notice("IME input ignored: composition began outside Insert mode".into());
             }
-            let valid = epoch == workspace.input_epoch()
+            let valid = workspace.editor_input_is_current(&ticket)
                 && workspace.view(document).and_then(|v| v.editor()).is_some_and(|editor| {
                     editor.document().revision() == revision
                         && editor.next_edit_sequence() == sequence
@@ -177,6 +187,51 @@ mod tests {
         commit(&mut workspace, destination, "normal".into(), Default::default());
         assert_eq!(bytes(&workspace, other), 0);
         assert!(workspace.status_text().contains("outside Insert mode"));
+    }
+
+    #[test]
+    fn modal_receipt_keeps_cancellation_until_fresh_input_ownership() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let mut composing = true;
+        let mut destination = Some(capture(&workspace, true));
+        cancel(&mut composing, &mut destination);
+        assert!(!composing);
+        let delayed = destination.take().unwrap_or_else(|| capture(&workspace, true));
+        commit(&mut workspace, delayed, "stale".into(), Default::default());
+        assert_eq!(bytes(&workspace, workspace.active_id()), 0);
+        reset(&mut composing, &mut destination);
+        let fresh = destination.take().unwrap_or_else(|| capture(&workspace, true));
+        commit(&mut workspace, fresh, "fresh".into(), Default::default());
+        assert_eq!(bytes(&workspace, workspace.active_id()), 5);
+    }
+
+    #[test]
+    fn actual_host_tab_handoff_preserves_the_original_editor_destination() {
+        let (mut app, _rx) = super::super::search_ui::host_dispatch_tests::host("");
+        app.apply(Damage::default());
+        let original = app.view.active_id();
+        app.ime_destination = Some(capture(&app.view, true));
+        app.composing = true;
+        app.view.file_command("file.new").unwrap();
+        let other = app.view.active_id();
+        app.apply(Damage::default());
+        assert!(app.composing);
+        let destination = app.ime_destination.take().unwrap();
+        let (_, follow) = commit(&mut app.view, destination, "日本語".into(), Default::default());
+        assert_eq!(bytes(&app.view, original), 9);
+        assert_eq!(bytes(&app.view, other), 0);
+        assert!(!follow);
+    }
+
+    #[test]
+    fn editor_composition_is_cancelled_by_a_completed_prompt_roundtrip() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let destination = capture(&workspace, true);
+        workspace.file_command("file.saveAs").unwrap();
+        workspace.cancel_file_prompt();
+        commit(&mut workspace, destination, "wrong".into(), Default::default());
+        assert_eq!(bytes(&workspace, workspace.active_id()), 0);
+        assert!(workspace.status_text().contains("cancelled"));
     }
 
     #[test]

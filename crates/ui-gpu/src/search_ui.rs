@@ -2,7 +2,6 @@
 //! clipboard access, IME capture and coherent SearchAction admission.
 use super::*;
 use kwil_core_commands::theme::{Theme, UiRole};
-#[cfg(test)]
 use kwil_view_model::search_panel::SearchField;
 use kwil_view_model::search_panel::{SearchInput, SearchMode, SearchOutcome, SearchPanel};
 
@@ -173,12 +172,15 @@ fn input_for_key<'a>(
             }
         }
         Key::Named(NamedKey::Enter | NamedKey::F3) => {
-            if mods.shift_key() {
-                SearchInput::Previous
-            } else {
-                SearchInput::Next
+            if panel.mode() == SearchMode::Files {
+                return Ok(Some(SearchInput::SelectRow(panel.selected())));
             }
+            if mods.shift_key() { SearchInput::Previous } else { SearchInput::Next }
         }
+        Key::Named(NamedKey::ArrowUp) if panel.mode() == SearchMode::Files => SearchInput::RowPrevious,
+        Key::Named(NamedKey::ArrowDown) if panel.mode() == SearchMode::Files => SearchInput::RowNext,
+        Key::Named(NamedKey::PageUp) if panel.mode() == SearchMode::Files => SearchInput::PagePrevious,
+        Key::Named(NamedKey::PageDown) if panel.mode() == SearchMode::Files => SearchInput::PageNext,
         Key::Named(NamedKey::ArrowUp) => SearchInput::Previous,
         Key::Named(NamedKey::ArrowDown) => SearchInput::Next,
         Key::Named(NamedKey::Backspace) => SearchInput::Backspace,
@@ -254,32 +256,36 @@ mod tests {
 pub(super) struct Origin {
     document: kwil_view_model::SessionDocumentId,
     epoch: u64,
-    revision: u64,
-    sequence: u64,
-    cursors: Vec<kwil_view_model::Cursor>,
-    primary: usize,
+    editor: Option<(u64, u64, Vec<kwil_view_model::Cursor>, usize)>,
 }
 impl Origin {
     fn capture(view: &Workspace) -> Option<Self> {
-        let editor = view.editor()?;
         Some(Self {
             document: view.active_id(),
             epoch: view.input_epoch(),
-            revision: editor.document().revision(),
-            sequence: editor.next_edit_sequence(),
-            cursors: editor.cursors().to_vec(),
-            primary: editor.primary_index(),
+            editor: view.editor().map(|editor| {
+                (
+                    editor.document().revision(),
+                    editor.next_edit_sequence(),
+                    editor.cursors().to_vec(),
+                    editor.primary_index(),
+                )
+            }),
         })
     }
     fn matches(&self, view: &Workspace) -> bool {
         self.document == view.active_id()
             && self.epoch == view.input_epoch()
-            && view.editor().is_some_and(|editor| {
-                editor.document().revision() == self.revision
-                    && editor.next_edit_sequence() == self.sequence
-                    && editor.cursors() == self.cursors
-                    && editor.primary_index() == self.primary
-            })
+            && match (&self.editor, view.editor()) {
+                (Some((revision, sequence, cursors, primary)), Some(editor)) => {
+                    editor.document().revision() == *revision
+                        && editor.next_edit_sequence() == *sequence
+                        && editor.cursors() == cursors
+                        && editor.primary_index() == *primary
+                }
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 pub(super) struct Composition {
@@ -288,6 +294,26 @@ pub(super) struct Composition {
 }
 
 impl App {
+    /// ROOT supplies a native absolute workspace root resolved on its existing
+    /// worker. SearchPanel preserves this PathBuf until an explicit field edit.
+    pub(super) fn set_search_root(&mut self, root: std::path::PathBuf) {
+        let result = match &mut self.search {
+            Some(session) => self.search_panel.root_ready(session, &self.view, root),
+            None => self.search_panel.set_root(root).map(|_| SearchOutcome::default()),
+        };
+        match result {
+            Ok(outcome) => self.search_outcome(outcome),
+            Err(error) => {
+                self.search_view.invalidate_painted_tickets();
+                self.search_notice(error);
+                return;
+            }
+        }
+        if self.search_panel.is_open() && self.search_panel.mode() == SearchMode::Files {
+            self.search_dirty = true;
+            self.request_frame();
+        }
+    }
     pub(super) fn start_search(&mut self) {
         if self.search.is_some() {
             return;
@@ -346,14 +372,22 @@ impl App {
             self.search_notice("Finish or cancel the current modal prompt before Find".into());
             return true;
         }
-        if matches!(command, "search.findInFiles" | "search.replaceInFiles" | "search.setInclude" | "search.setExclude")
-        {
-            self.search_notice("Folder search is not attached to this in-file GUI host".into());
-            return true;
-        }
         if command == "search.substitute" {
             self.search_notice("Vim substitution arguments are not attached; use Replace".into());
             return true;
+        }
+        if self.search_panel.is_open() && self.search_panel.mode() == SearchMode::Files {
+            match command {
+                "search.findNext" => {
+                    self.search_input(SearchInput::RowNext);
+                    return true;
+                }
+                "search.findPrevious" => {
+                    self.search_input(SearchInput::RowPrevious);
+                    return true;
+                }
+                _ => {}
+            }
         }
         if self.goto.take().is_some() {
             self.goto_epoch += 1;
@@ -365,13 +399,25 @@ impl App {
         self.menu_set(menu::State::Closed, false);
         self.search_origin = Origin::capture(&self.view);
         if self.search.is_none() {
-            let mode = if command == "search.replace" { SearchMode::Replace } else { SearchMode::Find };
+            let mode = match command {
+                "search.replace" => SearchMode::Replace,
+                "search.findInFiles" | "search.replaceInFiles" | "search.setInclude" | "search.setExclude" => {
+                    SearchMode::Files
+                }
+                _ => SearchMode::Find,
+            };
             match self.search_panel.open(mode, &self.settings.search) {
                 Ok(outcome) => {
                     if let Some(keys) = &mut self.keys {
                         self.search_panel.enter_context(keys);
                     }
                     self.search_outcome(outcome);
+                    if command == "search.setInclude" {
+                        self.search_input(SearchInput::Focus(SearchField::Include));
+                    }
+                    if command == "search.setExclude" {
+                        self.search_input(SearchInput::Focus(SearchField::Exclude));
+                    }
                     self.search_notice("Find is starting or unavailable; query input is retained".into());
                 }
                 Err(error) => self.search_notice(error),
@@ -399,6 +445,9 @@ impl App {
                 {
                     self.search_panel.enter_context(keys);
                 }
+                if self.search_panel.mode() == SearchMode::Files {
+                    self.search_view.invalidate_painted_tickets();
+                }
                 self.search_notice(error);
             }
         }
@@ -420,6 +469,28 @@ impl App {
         true
     }
     pub(super) fn search_input(&mut self, input: SearchInput<'_>) {
+        if self.search_panel.mode() == SearchMode::Files
+            && matches!(input, SearchInput::PageNext | SearchInput::PagePrevious)
+            && self.search.as_ref().is_none_or(|session| !self.search_view.can_page(session))
+        {
+            self.search_notice("Wait for a valid folder result page before paging".into());
+            return;
+        }
+        if let SearchInput::SelectRow(row) = input
+            && self.search_panel.mode() == SearchMode::Files
+        {
+            let admitted = self
+                .search
+                .as_ref()
+                .and_then(|session| session.file_action(row, 0))
+                .is_some_and(|action| self.search_view.admit_file_row(&self.search_panel, row, action));
+            if !admitted {
+                self.search_notice(
+                    "Search results changed; wait for the current page to be painted before opening".into(),
+                );
+                return;
+            }
+        }
         self.search_origin = Origin::capture(&self.view);
         let result = match &mut self.search {
             Some(session) => self.search_panel.input(session, &self.view, input),
@@ -427,10 +498,20 @@ impl App {
         };
         match result {
             Ok(outcome) => self.search_outcome(outcome),
-            Err(error) => self.search_notice(error),
+            Err(error) => {
+                if self.search_panel.mode() == SearchMode::Files {
+                    self.search_view.invalidate_painted_tickets();
+                }
+                self.search_notice(error);
+            }
         }
     }
     pub(super) fn search_outcome(&mut self, mut outcome: SearchOutcome) {
+        if self.search_panel.mode() == SearchMode::Files
+            && let Some(session) = &self.search
+        {
+            self.search_view.sync_query(session, &self.search_panel);
+        }
         if outcome.damage.status {
             self.view.set_notice(if outcome.damage.restore_editor {
                 String::new()
@@ -453,11 +534,20 @@ impl App {
         let Some(session) = &mut self.search else { return };
         // Bounded draining and retry-on-wake are owned by SearchSession/Panel.
         let outcome = self.search_panel.worker_ready(session, &self.view);
+        if self.search_panel.mode() == SearchMode::Files && outcome.damage.panel {
+            self.search_view.capture_results(session, &self.search_panel);
+        }
         self.search_outcome(outcome);
     }
     fn search_action(&mut self, action: kwil_view_model::search_session::SearchAction) {
         use kwil_view_model::search_session::{SearchAction, SelectionMode};
-        if self.search.as_ref().is_none_or(|session| !self.search_panel.validate_action(session, &self.view, &action))
+        let painted_file =
+            !matches!(&action, SearchAction::OpenFile { .. }) || self.search_view.consume_file_intent(&action);
+        if !painted_file
+            || self
+                .search
+                .as_ref()
+                .is_none_or(|session| !self.search_panel.validate_action(session, &self.view, &action))
             || self.search_origin.as_ref().is_none_or(|origin| !origin.matches(&self.view))
         {
             self.search_notice("Search navigation cancelled: its document, query or cursor changed".into());
@@ -487,6 +577,26 @@ impl App {
             }
             return;
         }
+        if let SearchAction::OpenFile { path, line_number, .. } = &action {
+            use kwil_core_workspace::instance::{OpenFile, OpenFiles};
+            // Original-byte ranges (notably UTF-16) are not logical UTF-8
+            // endpoints. Reuse the indexed, deferred CLI line navigation.
+            match self.view.open_files(OpenFiles {
+                files: vec![OpenFile { path: path.clone(), line: Some(*line_number), column: Some(1) }],
+            }) {
+                Ok(()) => {
+                    self.search_origin = Origin::capture(&self.view);
+                    self.search_ime = None;
+                    self.search_dirty = true;
+                    let damage = self.view.set_notice(
+                        "Opened search result at its line; exact match-range highlighting is unavailable".into(),
+                    );
+                    self.apply(damage);
+                }
+                Err(error) => self.search_notice(format!("Search result was not opened: {error}")),
+            }
+            return;
+        }
         let result = match &action {
             SearchAction::Select { range, mode, .. } => {
                 let editor = self.view.editor_mut().unwrap();
@@ -513,10 +623,7 @@ impl App {
                     )
                 }
             }
-            SearchAction::OpenFile { .. } => {
-                self.search_notice("Folder result navigation is not attached".into());
-                return;
-            }
+            SearchAction::OpenFile { .. } => unreachable!("native folder action was consumed above"),
             SearchAction::Replace(_) => unreachable!("owned recipe was consumed by worker admission"),
         };
         match result {
@@ -582,17 +689,21 @@ impl App {
             Some((VimResult::Command(call), _)) => {
                 let input = match call.id {
                     "palette.cancel" => Some(SearchInput::Cancel),
-                    "palette.accept" => Some(
-                        if (self.mods.control_key() || self.mods.super_key())
-                            && self.search_panel.mode() == SearchMode::Replace
-                        {
-                            if self.mods.shift_key() { SearchInput::ReplaceAll } else { SearchInput::ReplaceNext }
-                        } else if self.mods.shift_key() {
-                            SearchInput::Previous
-                        } else {
-                            SearchInput::Next
-                        },
-                    ),
+                    "palette.accept" => Some(if self.search_panel.mode() == SearchMode::Files {
+                        SearchInput::SelectRow(self.search_panel.selected())
+                    } else if (self.mods.control_key() || self.mods.super_key())
+                        && self.search_panel.mode() == SearchMode::Replace
+                    {
+                        if self.mods.shift_key() { SearchInput::ReplaceAll } else { SearchInput::ReplaceNext }
+                    } else if self.mods.shift_key() {
+                        SearchInput::Previous
+                    } else {
+                        SearchInput::Next
+                    }),
+                    "palette.next" if self.search_panel.mode() == SearchMode::Files => Some(SearchInput::RowNext),
+                    "palette.previous" if self.search_panel.mode() == SearchMode::Files => {
+                        Some(SearchInput::RowPrevious)
+                    }
                     "palette.next" => Some(SearchInput::Next),
                     "palette.previous" => Some(SearchInput::Previous),
                     "edit.backspace" => Some(SearchInput::Backspace),
@@ -659,7 +770,12 @@ impl App {
         };
         match result {
             Ok(outcome) => self.search_outcome(outcome),
-            Err(error) => self.search_notice(error),
+            Err(error) => {
+                if self.search_panel.mode() == SearchMode::Files {
+                    self.search_view.invalidate_painted_tickets();
+                }
+                self.search_notice(error);
+            }
         }
     }
     pub(super) fn search_mouse(&mut self) {
@@ -670,6 +786,16 @@ impl App {
             return;
         }
         match search_view::click(&self.search_view, &self.search_panel, Some(rect), self.pointer) {
+            search_view::Click::Input(SearchInput::SelectRow(row)) => {
+                if self
+                    .search
+                    .as_ref()
+                    .and_then(|session| session.file_action(row, 0))
+                    .is_some_and(|action| self.search_view.painted_action_matches(row, action))
+                {
+                    self.search_input(SearchInput::SelectRow(row));
+                }
+            }
             search_view::Click::Input(input) => self.search_input(input),
             search_view::Click::Clear => {
                 for input in search_view::CLEAR_QUERY {
@@ -961,6 +1087,323 @@ pub(crate) mod host_dispatch_tests {
     fn query(app: &mut App, value: &str) {
         ctrl(app, "a");
         text(app, value);
+    }
+    fn folder_query(app: &mut App, value: &str) {
+        app.search_input(SearchInput::Focus(SearchField::Query));
+        app.search_input(SearchInput::SelectAll);
+        app.search_input(SearchInput::Text(value));
+    }
+    fn paint_folder(app: &mut App) -> Rect {
+        let rect = host_area(&app.search_panel, app.size, &app.ui, app.body_area().y).expect("minimum folder geometry");
+        app.search_view.paint_test_rows(&app.search_panel, rect);
+        app.search_area = Some(rect);
+        rect
+    }
+    fn folder_tree(root: &std::path::Path) -> std::path::PathBuf {
+        let tree = root.join("tree");
+        std::fs::create_dir_all(tree.join(".git")).unwrap();
+        tree
+    }
+    #[test]
+    fn actual_host_folder_commands_stream_filters_pages_and_cancel() {
+        let (mut app, rx, root) = worker_host("");
+        let tree = folder_tree(&root);
+        std::fs::write(tree.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(tree.join("ignored.txt"), "needle\n").unwrap();
+        std::fs::write(tree.join("skip.txt"), "needle\n").unwrap();
+        std::fs::write(tree.join("not-included.rs"), "needle\n").unwrap();
+        let content = (0..600).map(|line| format!("needle {line}\n")).collect::<String>();
+        assert!(content.len() < 1_000_000);
+        std::fs::write(tree.join("結果.txt"), content).unwrap();
+        app.set_search_root(tree.clone());
+        assert!(app.dispatch_search("search.findInFiles"));
+        assert_eq!(app.search_panel.mode(), SearchMode::Files);
+        assert!(app.dispatch_search("search.setInclude"));
+        app.search_input(SearchInput::Text("*.txt"));
+        assert!(app.dispatch_search("search.setExclude"));
+        app.search_input(SearchInput::Text("skip.txt"));
+        folder_query(&mut app, "needle");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut streamed = false;
+        while app.search_panel.is_pending() {
+            let event =
+                rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("bounded folder stream");
+            dispatch(&mut app, event);
+            streamed |= app.search_panel.is_pending() && app.search_panel.count().0 != 0;
+            assert!(app.search_panel.results().len() <= kwil_view_model::search_session::PAGE_HITS);
+        }
+        assert!(streamed, "counts arrive before completion on the actual four-event GUI drain");
+        assert_eq!(app.search_panel.count(), (600, true), "include/exclude and gitignore remain backend-owned");
+        let key = app.search.as_ref().unwrap().key();
+        app.dispatch_search("search.setInclude");
+        assert_eq!(app.search_panel.field(), SearchField::Include);
+        app.dispatch_search("search.setExclude");
+        assert_eq!(app.search_panel.field(), SearchField::Exclude);
+        assert_eq!(app.search.as_ref().unwrap().key(), key, "focusing controls does not rescan");
+        named(&mut app, NamedKey::PageUp, false);
+        finish(&mut app, &rx);
+        let first = app.search.as_ref().unwrap().state().file_first;
+        named(&mut app, NamedKey::PageUp, false);
+        finish(&mut app, &rx);
+        assert_eq!(app.search.as_ref().unwrap().state().file_first, first.saturating_sub(32));
+        named(&mut app, NamedKey::PageDown, false);
+        finish(&mut app, &rx);
+        assert_eq!(app.search.as_ref().unwrap().state().file_first, first);
+        assert!(app.dispatch_search("search.replaceInFiles"));
+        assert!(app.search_panel.status().contains("atomic"));
+        assert_eq!(bytes(&app), b"", "unavailable folder replacement never edits a document");
+        app.search_input(SearchInput::Cancel);
+        assert!(!app.search_panel.is_open());
+        assert!(app.search_panel.results().is_empty());
+        assert!(app.search.as_ref().unwrap().state().files.is_empty());
+        // Restart/cancel while results and spool pages are still retiring.
+        for _ in 0..12 {
+            app.dispatch_search("search.findInFiles");
+            folder_query(&mut app, "needle");
+            app.search_input(SearchInput::Cancel);
+        }
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_folder_enter_and_click_open_native_lines_and_keep_query_pages() {
+        use kwil_view_model::search_session::FileEvent;
+        let (mut app, rx, root) = worker_host("");
+        let tree = folder_tree(&root);
+        let path = tree.join("検索-🦊.txt");
+        let content = "before\nneedle first\nbetween\nneedle second\n";
+        std::fs::write(&path, content).unwrap();
+        app.set_search_root(tree);
+        app.dispatch_search("search.findInFiles");
+        folder_query(&mut app, "needle");
+        finish(&mut app, &rx);
+        assert_eq!(app.search_panel.selected(), 0);
+        paint_folder(&mut app);
+        let key = app.search.as_ref().unwrap().key();
+        named(&mut app, NamedKey::Enter, false);
+        until(&mut app, &rx, |app| {
+            app.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path()))
+        });
+        assert_eq!(app.view.editor().unwrap().primary_cursor().head, "before\n".len() as u64);
+        assert_eq!(app.search.as_ref().unwrap().key(), key, "opening a tab leaves the folder session alive");
+        assert_eq!(app.search_panel.text(SearchField::Query).0, "needle");
+        assert_eq!(app.search_panel.results().len(), 2);
+        named(&mut app, NamedKey::ArrowDown, false);
+        assert_eq!(app.search_panel.selected(), 1, "arrows select rows without opening");
+        let rect = paint_folder(&mut app);
+        app.pointer = (rect.x, rect.y + 1);
+        app.search_mouse();
+        until(&mut app, &rx, |app| {
+            app.view
+                .editor()
+                .is_some_and(|editor| editor.primary_cursor().head == "before\nneedle first\nbetween\n".len() as u64)
+        });
+        assert!(
+            matches!(&app.search.as_ref().unwrap().state().files[1], FileEvent::Hit(hit) if hit.path == path && hit.line_number == 4)
+        );
+        assert!(app.search_panel.is_open());
+        assert_eq!(app.search.as_ref().unwrap().key(), key);
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_folder_rejected_input_retains_completed_page_until_repaint() {
+        let (mut app, rx, root) = worker_host("origin");
+        let tree = folder_tree(&root);
+        let path = tree.join("retained.txt");
+        std::fs::write(&path, "before\nneedle\n").unwrap();
+        app.set_search_root(tree);
+        app.dispatch_search("search.findInFiles");
+        folder_query(&mut app, "needle");
+        finish(&mut app, &rx);
+        paint_folder(&mut app);
+        let origin = app.view.active_id();
+        let key = app.search.as_ref().unwrap().key();
+        let too_long = "x".repeat(kwil_view_model::search_session::INPUT_BYTES + 1);
+        for input in [SearchInput::ReplaceAll, SearchInput::Text(&too_long)] {
+            app.search_input(input);
+            assert_eq!(app.search.as_ref().unwrap().key(), key, "rejected input never resubmits the completed query");
+            assert_eq!(app.search_panel.count(), (1, true));
+            assert_eq!(app.search_panel.text(SearchField::Query).0, "needle");
+            assert_eq!(
+                app.search_view.row_text(0),
+                Some(("retained.txt:2", "needle")),
+                "the completed page survives rejected input with its key unchanged"
+            );
+            named(&mut app, NamedKey::Enter, false);
+            assert_eq!(
+                app.view.active_id(),
+                origin,
+                "painted tickets are invalidated independently of retained display rows"
+            );
+            paint_folder(&mut app);
+        }
+        named(&mut app, NamedKey::Enter, false);
+        until(&mut app, &rx, |app| {
+            app.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path()))
+        });
+        assert_eq!(app.view.editor().unwrap().primary_cursor().head, 7);
+        assert_eq!(app.search.as_ref().unwrap().key(), key, "repaint restores opening without a worker rescan");
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_folder_utf16_and_native_root_are_not_lossy_navigation_authority() {
+        let (mut app, rx, root) = worker_host("");
+        let tree = folder_tree(&root);
+        #[cfg(unix)]
+        let tree = {
+            use std::os::unix::ffi::OsStringExt;
+            let native = tree.join(std::ffi::OsString::from_vec(b"native-\xff".to_vec()));
+            std::fs::create_dir(&native).unwrap();
+            native
+        };
+        #[cfg(windows)]
+        let tree = {
+            use std::os::windows::ffi::OsStringExt;
+            let native = tree.join(std::ffi::OsString::from_wide(&[110, 97, 116, 105, 118, 101, 45, 0xd800]));
+            std::fs::create_dir(&native).unwrap();
+            native
+        };
+        let path = tree.join("utf16.txt");
+        let content = "あいう\nneedle\n";
+        let encoded: Vec<u8> =
+            [0xff, 0xfe].into_iter().chain(content.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        std::fs::write(&path, encoded).unwrap();
+        app.dispatch_search("search.findInFiles");
+        folder_query(&mut app, "needle");
+        assert!(app.search_panel.status().contains("root"), "a query waits for ROOT's off-UI root delivery");
+        app.set_search_root(tree.clone());
+        finish(&mut app, &rx);
+        assert_eq!(app.search_panel.count(), (1, true));
+        assert_eq!(
+            app.search_view.row_text(0),
+            Some(("utf16.txt:2", "needle")),
+            "native request root is stripped before display decoding"
+        );
+        app.search_input(SearchInput::Focus(SearchField::Root));
+        app.search_input(SearchInput::End);
+        let native_key = app.search.as_ref().unwrap().key();
+        let root_display = app.search_panel.text(SearchField::Root).0.to_owned();
+        app.search_input(SearchInput::Text("rejected-partial-edit"));
+        assert_eq!(app.search_panel.text(SearchField::Root).0, root_display);
+        assert_eq!(app.search.as_ref().unwrap().key(), native_key);
+        assert_eq!(
+            app.search_view.row_text(0),
+            Some(("utf16.txt:2", "needle")),
+            "rejected native-root editing preserves the completed display page"
+        );
+        app.search_input(SearchInput::Focus(SearchField::Query));
+        paint_folder(&mut app);
+        let action = app.search.as_ref().unwrap().file_action(0, 0).unwrap();
+        assert!(
+            matches!(&action, kwil_view_model::search_session::SearchAction::OpenFile { path: actual, line_number: 2, range, .. } if *actual == path && range.start == 10)
+        );
+        named(&mut app, NamedKey::Enter, false);
+        until(&mut app, &rx, |app| {
+            app.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path()))
+        });
+        assert_eq!(
+            app.view.editor().unwrap().primary_cursor().head,
+            "あいう\n".len() as u64,
+            "UTF-16 original offset is not a logical UTF-8 offset"
+        );
+        assert_eq!(app.search_panel.count(), (1, true));
+        // Editing the display explicitly opts into the typed replacement path.
+        app.search_input(SearchInput::Focus(SearchField::Root));
+        app.search_input(SearchInput::SelectAll);
+        app.search_input(SearchInput::Text(root.to_str().unwrap()));
+        finish(&mut app, &rx);
+        assert_eq!(app.search_panel.text(SearchField::Root).0, root.to_str().unwrap());
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_folder_rejects_unpainted_stale_query_geometry_and_cursor_actions() {
+        let (mut app, rx, root) = worker_host("origin");
+        let tree = folder_tree(&root);
+        std::fs::write(tree.join("hit.txt"), "needle\n").unwrap();
+        app.set_search_root(tree);
+        app.dispatch_search("search.findInFiles");
+        folder_query(&mut app, "needle");
+        finish(&mut app, &rx);
+        let origin = app.view.active_id();
+        named(&mut app, NamedKey::Enter, false);
+        assert_eq!(app.view.active_id(), origin, "a worker result cannot open before its first paint");
+        let rect = paint_folder(&mut app);
+        app.pointer = (rect.x, rect.y);
+        app.size.0 += 10;
+        app.search_mouse();
+        assert_eq!(app.view.active_id(), origin, "resized geometry is fenced");
+        app.size.0 -= 10;
+        for stale_cursor in [true, false] {
+            paint_folder(&mut app);
+            let action = app.search.as_ref().unwrap().file_action(0, 0).unwrap();
+            let admitted = app.search.as_ref().unwrap().file_action(0, 0).unwrap();
+            assert!(app.search_view.admit_file_row(&app.search_panel, 0, admitted));
+            app.search_origin = Origin::capture(&app.view);
+            if stale_cursor {
+                app.view.editor_mut().unwrap().set_cursors(vec![kwil_view_model::Cursor::caret(1)], 0).unwrap();
+            } else {
+                folder_query(&mut app, "absent");
+            }
+            app.search_action(action);
+            assert_eq!(app.view.active_id(), origin);
+            assert!(app.view.notice().contains("cancelled"));
+        }
+        finish(&mut app, &rx);
+        assert_eq!(app.search_panel.count(), (0, true));
+        folder_query(&mut app, "needle");
+        finish(&mut app, &rx);
+        app.search_input(SearchInput::Focus(SearchField::Root));
+        app.search_input(SearchInput::SelectAll);
+        app.search_input(SearchInput::Text("relative-root"));
+        let rejected_key = app.search.as_ref().unwrap().key();
+        named(&mut app, NamedKey::PageDown, false);
+        assert_eq!(
+            app.search.as_ref().unwrap().key(),
+            rejected_key,
+            "invalid root cannot revisit an old query's spool page"
+        );
+        paint_folder(&mut app);
+        named(&mut app, NamedKey::Enter, false);
+        assert_eq!(app.view.active_id(), origin, "rejected root clears old painted result authority");
+        worker_stop(app, rx, root);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn actual_host_folder_painted_widget_click_opens_its_visible_native_row() {
+        let (mut app, rx, root) = worker_host("");
+        let tree = folder_tree(&root);
+        let path = tree.join("painted.txt");
+        std::fs::write(&path, "before\nneedle\n").unwrap();
+        app.set_search_root(tree);
+        app.dispatch_search("search.findInFiles");
+        folder_query(&mut app, "needle");
+        finish(&mut app, &rx);
+        let mut chrome_font = font::UiFont::load(app.ui.text_px()).expect("Windows chrome test face");
+        let mut pixels = vec![0; app.size.0 * app.size.1];
+        app.search_area = search_view::draw(
+            &app.search_panel,
+            &mut pixels,
+            app.size,
+            &mut chrome_font,
+            theme_ui::chrome(),
+            &app.ui,
+            app.body_area().y,
+            &mut app.search_view,
+        );
+        let row = app.search_view.painted_row_rect(0).expect("the actual card paints a result hit target");
+        assert!(row.w > app.ui.dip(100.0) && row.h > app.ui.dip(20.0));
+        assert!(app.search_area.unwrap().contains((row.x, row.y)));
+        app.pointer = (row.x + row.w / 2, row.y + row.h / 2);
+        app.search_mouse();
+        until(&mut app, &rx, |app| {
+            app.view.editor().is_some_and(|editor| editor.document().path() == Some(path.as_path()))
+        });
+        assert_eq!(app.view.editor().unwrap().primary_cursor().head, 7);
+        assert!(app.search_panel.is_open());
+        worker_stop(app, rx, root);
     }
     const DOCUMENT: &str =
         "needle beginning\nline two\nline three\nline four\nline five\nline six\nline seven\nneedle ending\nlast line";
