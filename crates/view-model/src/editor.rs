@@ -18,6 +18,7 @@ use std::{
 mod commands;
 mod compound;
 mod hex;
+mod replacement;
 use compound::CompoundEdit;
 pub(crate) mod receipts;
 mod save;
@@ -184,6 +185,9 @@ struct Edit {
     insert: Insert,
 }
 impl Edit {
+    fn is_noop(&self) -> bool {
+        self.range.is_empty() && self.insert.len() == 0
+    }
     fn bytes(range: Range<u64>, bytes: &[u8]) -> Self {
         Self { range, insert: Insert::Bytes(Arc::from(bytes)) }
     }
@@ -600,10 +604,23 @@ impl Editor {
     where
         I: DoubleEndedIterator<Item = io::Result<Option<Edit>>> + Clone + Send + Sync + 'static,
     {
+        self.apply_descending_with_recipe(edits, None)
+    }
+
+    /// A bounded prepared shape recipe must not retain a byte-producing
+    /// iterator (for example an inline search plan's replacement payloads).
+    fn apply_descending_with_recipe<I>(&mut self, edits: I, prepared: Option<Recipe>) -> io::Result<Damage>
+    where
+        I: DoubleEndedIterator<Item = io::Result<Option<Edit>>> + Clone + Send + Sync + 'static,
+    {
         if self.compound.is_some() {
             return Err(io::Error::other("bulk edits cannot nest inside a compound repeat"));
         }
         self.admit_edit()?;
+        // Application, the retained bulk factory and its replacement count
+        // must all see the same effective edits. Empty-to-empty records are
+        // identities, not model transitions that can outrun core history.
+        let edits = edits.map(|result| result.map(|edit| edit.filter(|edit| !edit.is_noop())));
         let recipe_seed = edits.clone();
         let mut replacement_count = 0;
         let before = self.state();
@@ -613,8 +630,7 @@ impl Editor {
         let mut changed = false;
         let mut first_row = u64::MAX;
         let mut last_row = 0;
-        self.end_burst();
-        self.document.buffer.begin();
+        let mut began = false;
         for edit in edits {
             let result = (|| {
                 let Some(edit) = edit? else {
@@ -622,6 +638,11 @@ impl Editor {
                 };
                 first_row = first_row.min(text::row(&s, edit.range.start)?);
                 last_row = last_row.max(text::row(&s, edit.range.end)?);
+                if !began {
+                    self.end_burst();
+                    self.document.buffer.begin();
+                    began = true;
+                }
                 self.document.buffer.delete(edit.range.clone())?;
                 edit.insert.apply(&mut self.document.buffer, edit.range.start)?;
                 for c in &mut cursors {
@@ -634,14 +655,16 @@ impl Editor {
                 Ok(())
             })();
             if let Err(error) = result {
-                self.document.buffer.cancel();
+                if began {
+                    self.document.buffer.cancel();
+                }
                 return Err(error);
             }
         }
-        self.document.buffer.commit();
         if !changed {
             return Ok(Damage::default());
         }
+        self.document.buffer.commit();
         self.cursors = cursors;
         self.normalize();
         self.document.changed();
@@ -650,7 +673,7 @@ impl Editor {
         let transition = Transition {
             before: s.clone(),
             after: self.document.snapshot(),
-            recipe: Recipe::bulk(recipe_seed, replacement_count),
+            recipe: prepared.unwrap_or_else(|| Recipe::bulk(recipe_seed, replacement_count)),
         };
         self.undo.push_back(HistoryEntry {
             before: before.clone(),

@@ -8,7 +8,10 @@ use kwil_core_text::{
     decoded_backing::{BackingPaths, DecodedBacking, DecodedPreview, RetirementError},
     encoding::{Encoding, SavePlan},
 };
-use kwil_core_workspace::{SaveRequest, SavedSnapshot};
+use kwil_core_workspace::{
+    CompressedSaveRetirement, SaveRequest, SavedSnapshot,
+    compressed::{CompressionFormat, CompressionMode, DetectedFormat, PreparedFile, detect_magic, prepare_file},
+};
 use std::{
     io,
     marker::PhantomData,
@@ -30,6 +33,7 @@ pub struct BackingLimits {
 enum Resource {
     Owner(DecodedBacking),
     Cleanup(Box<BackingPaths>),
+    Compressed(Box<CompressedSaveRetirement>),
 }
 
 #[derive(Default)]
@@ -79,13 +83,17 @@ impl WorkerBackings {
             return Err(invalid("backing parent exceeds private path admission cap"));
         }
         // Core's generated suffix fits64 native bytes. Preparation/retirement
-        // may coexist with up to16 path allocations and2x growth capacity.
+        // may coexist with up to20 path allocations and2x growth capacity
+        // (the compressed body adds four to the decoded owner's sixteen).
         // Match replay owner accounting; mappings and fixed decode scratch are
         // separate from resident metadata. No file-sized heap reservation.
         let per_slot = limits
             .max_private_path_bytes
-            .checked_mul(32)
+            // Compressed checkpoints retain both the decompressed encoded
+            // body and the logical decoded owner, including failure paths.
+            .checked_mul(40)
             .and_then(|bytes| bytes.checked_add(size_of::<BackingPaths>() * 2))
+            .and_then(|bytes| bytes.checked_add(size_of::<CompressedSaveRetirement>()))
             .and_then(|bytes| bytes.checked_add(size_of::<Option<Resource>>()))
             .ok_or_else(|| invalid("backing metadata admission overflow"))?;
         let metadata_reserved = limits
@@ -152,10 +160,99 @@ impl WorkerBackings {
         // DecodedBacking also retains the external source name, independently
         // of its generated private paths. Check the file's actual source name.
         self.check_input_path(file.path(), 0)?;
+        match source_format(&file)? {
+            DetectedFormat::Raw => (),
+            DetectedFormat::Unsupported(format) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("unsupported compressed format: {format}"),
+                ));
+            }
+            DetectedFormat::Gzip => return self.open_compressed(path, file, interpretation, cancel, publish),
+        }
         self.prepare(|parent| {
             let prepared = prepare_decoded_document(path, file, interpretation, parent, cancel, publish)?;
             Ok((prepared.document, prepared.backing))
         })
+    }
+
+    fn open_compressed(
+        &mut self,
+        path: PathBuf,
+        original: TextFile,
+        interpretation: Option<Encoding>,
+        cancel: &AtomicBool,
+        publish: impl FnOnce(DecodedPreview) -> io::Result<()>,
+    ) -> io::Result<Document> {
+        let slot = self.slots.iter_mut().find(|slot| slot.is_none()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "compressed backing capacity retained by snapshots or cleanup")
+        })?;
+        let mut owners = CompressedSaveRetirement { body: None, decoded: None };
+        let result = (|| {
+            owners.body = Some(
+                prepare_file(original.path(), CompressionMode::Auto, &self.parent, cancel)
+                    .map_err(kwil_core_workspace::compressed::CompressionError::into_io_error)?,
+            );
+            require_unchanged(&original)?;
+            let file = owners.body.as_ref().unwrap().text_file().unwrap().clone();
+            let prepared = prepare_decoded_document(path, file, interpretation, &self.parent, cancel, publish)?;
+            owners.decoded = Some(RetirementError::LiveSnapshots(prepared.backing));
+            let mut document = prepared.document;
+            // Save/watch/journal identity always names the compressed source.
+            document.original = Some(original.clone());
+            document.compression = CompressionFormat::Gzip;
+            require_unchanged(&original)?;
+            Ok(document)
+        })();
+        if let Err(error) = &result {
+            owners.body = owners.body.take().or_else(|| PreparedFile::take_from(error));
+            owners.decoded = owners.decoded.take().or_else(|| RetirementError::take_from(error));
+        }
+        if owners.body.is_some() || owners.decoded.is_some() {
+            *slot = Some(Resource::Compressed(Box::new(owners)));
+        }
+        result
+    }
+
+    /// Validate a clean recovered encoded payload against its original
+    /// transport without ever comparing logical text to gzip container bytes.
+    /// Any partial/failed body owner is retained before returning an error.
+    pub(super) fn verify_source(
+        &mut self,
+        original: &TextFile,
+        compression: CompressionFormat,
+        cancel: &AtomicBool,
+        compare: impl FnOnce(&TextFile) -> io::Result<bool>,
+    ) -> io::Result<bool> {
+        self.check_input_path(original.path(), 0)?;
+        let detected = source_format(original)?;
+        match (compression, detected) {
+            (CompressionFormat::Raw, DetectedFormat::Raw) => return compare(original),
+            (CompressionFormat::Gzip, DetectedFormat::Gzip) => (),
+            _ => return Ok(false),
+        }
+        let slot =
+            self.slots.iter_mut().find(|slot| slot.is_none()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "compressed verification capacity retained")
+            })?;
+        let mut owners = CompressedSaveRetirement { body: None, decoded: None };
+        let result = (|| {
+            owners.body = Some(
+                prepare_file(original.path(), CompressionMode::Gzip, &self.parent, cancel)
+                    .map_err(kwil_core_workspace::compressed::CompressionError::into_io_error)?,
+            );
+            require_unchanged(original)?;
+            let equal = compare(owners.body.as_ref().unwrap().text_file().unwrap())?;
+            require_unchanged(original)?;
+            Ok(equal)
+        })();
+        if let Err(error) = &result {
+            owners.body = owners.body.take().or_else(|| PreparedFile::take_from(error));
+        }
+        if owners.body.is_some() {
+            *slot = Some(Resource::Compressed(Box::new(owners)));
+        }
+        result
     }
 
     pub fn save(
@@ -171,6 +268,50 @@ impl WorkerBackings {
         // The checkpoint is prepared from .kwil-save-<u32 PID>-<u64 counter>,
         // not the final destination name. Charge its maximum generated suffix.
         self.check_input_path(request.path.parent().ok_or_else(|| invalid("save destination has no parent"))?, 64)?;
+        if let Some(original) = &request.original {
+            self.check_input_path(original.path(), 0)?;
+            match source_format(original)? {
+                DetectedFormat::Raw => (),
+                DetectedFormat::Unsupported(format) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("unsupported compressed save format: {format}"),
+                    ));
+                }
+                DetectedFormat::Gzip if request.compression == CompressionFormat::Raw => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "gzip original requires explicit gzip output policy",
+                    ));
+                }
+                DetectedFormat::Gzip => (),
+            }
+        }
+        match request.compression {
+            CompressionFormat::Gzip => {
+                let slot = self.slots.iter_mut().find(|slot| slot.is_none()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "compressed checkpoint capacity retained")
+                })?;
+                return match kwil_core_workspace::save_compressed_snapshot(request, plan, &self.parent, cancel) {
+                    Ok(prepared) => {
+                        *slot = Some(Resource::Compressed(Box::new(CompressedSaveRetirement {
+                            body: Some(prepared.owners.body),
+                            decoded: Some(RetirementError::LiveSnapshots(prepared.owners.decoded)),
+                        })));
+                        Ok(WorkerSavedSnapshot {
+                            saved: prepared.saved,
+                            logical_coordinates_changed: prepared.logical_coordinates_changed,
+                        })
+                    }
+                    Err(error) => {
+                        *slot = CompressedSaveRetirement::take_from(&error)
+                            .map(|owners| Resource::Compressed(Box::new(owners)));
+                        Err(error)
+                    }
+                };
+            }
+            CompressionFormat::Raw => (),
+        }
         self.prepare(|parent| {
             let prepared = kwil_core_workspace::save_encoded_snapshot(request, plan, parent, cancel)?;
             Ok((
@@ -189,9 +330,36 @@ impl WorkerBackings {
         let mut report = RetirementReport::default();
         for slot in &mut self.slots {
             let Some(resource) = slot.take() else { continue };
+            let resource = match resource {
+                Resource::Compressed(owners) => {
+                    match owners.retry() {
+                        Ok(()) => report.retired += 1,
+                        Err(owners) => {
+                            let cleanup = owners.body.as_ref().and_then(PreparedFile::cleanup_error).or({
+                                match &owners.decoded {
+                                    Some(RetirementError::Cleanup { error, .. }) => Some(error),
+                                    _ => None,
+                                }
+                            });
+                            if let Some(error) = cleanup {
+                                report.cleanup_pending += 1;
+                                if report.first_error.is_none() {
+                                    report.first_error = Some(io::Error::new(error.kind(), error.to_string()));
+                                }
+                            } else {
+                                report.live += 1;
+                            }
+                            *slot = Some(Resource::Compressed(Box::new(owners)));
+                        }
+                    }
+                    continue;
+                }
+                other => other,
+            };
             let outcome = match resource {
                 Resource::Owner(owner) => owner.try_retire(),
                 Resource::Cleanup(paths) => paths.cleanup().map_err(|error| RetirementError::Cleanup { paths, error }),
+                Resource::Compressed(_) => unreachable!(),
             };
             match outcome {
                 Ok(()) => report.retired += 1,
@@ -210,6 +378,19 @@ impl WorkerBackings {
         }
         report
     }
+}
+
+fn require_unchanged(file: &TextFile) -> io::Result<()> {
+    if file.check()? != kwil_core_text::FileState::Unchanged {
+        return Err(io::Error::other("compressed source changed on disk"));
+    }
+    Ok(())
+}
+
+fn source_format(file: &TextFile) -> io::Result<DetectedFormat> {
+    require_unchanged(file)?;
+    let bytes = file.bytes().map_err(io::Error::other)?;
+    Ok(detect_magic(&bytes[..bytes.len().min(8)]))
 }
 
 #[cfg(test)]

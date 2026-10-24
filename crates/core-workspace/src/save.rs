@@ -18,6 +18,8 @@ pub use compressed::{
 pub use encoded::{EncodedSavedSnapshot, save_encoded_snapshot};
 
 pub struct SaveRequest {
+    /// Output container policy is explicit, including dirty recovered Save As.
+    pub compression: crate::compressed::CompressionFormat,
     pub snapshot: Snapshot,
     pub path: PathBuf,
     /// Current path's original, if this document has one. Older originals
@@ -573,6 +575,7 @@ mod tests {
         }
         fn request(&self, original: TextFile, buffer: &Buffer) -> SaveRequest {
             SaveRequest {
+                compression: crate::compressed::CompressionFormat::Raw,
                 path: self.path(),
                 snapshot: buffer.snapshot(),
                 original: Some(original),

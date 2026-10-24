@@ -103,8 +103,16 @@ struct SaveFlight {
     path: Option<PathBuf>,
 }
 
+struct EditorLoan {
+    key: kwil_core_search::worker::SearchKey,
+    operation: u64,
+}
+
 #[derive(Default)]
 struct FileFlow {
+    loans: HashMap<DocumentId, EditorLoan>,
+    next_loan: u64,
+    replacement_journals: HashMap<DocumentId, u64>,
     worker: Option<DocumentWorker>,
     queue: VecDeque<DocumentRequest>,
     saves: HashMap<DocumentId, SaveFlight>,
@@ -183,6 +191,81 @@ impl Workspace {
     }
     pub fn view_mut(&mut self, id: DocumentId) -> Option<&mut View> {
         self.views.get_mut(&id)
+    }
+
+    /// Frontends keep displaying the cached viewport and gate navigation,
+    /// editing, layout reloads and save/close actions for this target while true.
+    /// Other tabs remain available. No new event or export is required.
+    pub fn document_busy(&self, id: DocumentId) -> bool {
+        self.files.loans.contains_key(&id)
+    }
+
+    pub fn replacement_busy(&self) -> bool {
+        self.replacement_busy_for(self.active_id())
+    }
+
+    pub fn replacement_busy_for(&self, id: DocumentId) -> bool {
+        self.document_busy(id)
+    }
+
+    pub fn search_replacement_pending(&self) -> bool {
+        !self.files.loans.is_empty()
+    }
+
+    /// O(1) UI admission. Recipe validation, iteration and edits run on the
+    /// existing fixed worker; queue rejection restores the exact editor.
+    pub fn submit_search_replacement(&mut self, recipe: kwil_core_search::worker::ReplaceRecipe) -> io::Result<()> {
+        let id = DocumentId(recipe.key.document_id);
+        if self.files.preparing
+            || self.files.deferred_recovery.is_some()
+            || !self.files.storage_ready
+            || self.files.worker.is_none()
+            || self.document_busy(id)
+            || self.files.saves.contains_key(&id)
+            || self.close_pending()
+            || self.files.prompt.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Document/recovery worker is busy; retry replacement",
+            ));
+        }
+        if !self.files.observed.contains_key(&id) || self.files.journal_failed.contains_key(&id) {
+            return Err(io::Error::other("Replacement requires an admitted recovery observer"));
+        }
+        let view =
+            self.views.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Search tab is closed"))?;
+        view.editor()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Document is not ready"))?
+            .admit_worker_loan(recipe.key.revision)?;
+        self.pump_files();
+        if !self.files.queue.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Recovery queue is full; retry replacement"));
+        }
+        self.sync_all();
+        let operation =
+            self.files.next_loan.checked_add(1).ok_or_else(|| io::Error::other("Replacement identity exhausted"))?;
+        self.files.next_loan = operation;
+        let key = recipe.key;
+        let editor = Box::new(self.views.get_mut(&id).unwrap().editor.take().unwrap());
+        let request = DocumentRequest::Replace { document: id, operation, editor, recipe };
+        match self.files.worker.as_ref().unwrap().try_submit(request) {
+            Ok(()) => {
+                self.files.loans.insert(id, EditorLoan { key, operation });
+                self.input_epoch = self.input_epoch.wrapping_add(1);
+                self.views.get_mut(&id).unwrap().set_notice("Replacing...".into());
+                Ok(())
+            }
+            Err(error) => {
+                let (request, kind) = match error {
+                    std::sync::mpsc::TrySendError::Full(request) => (request, io::ErrorKind::WouldBlock),
+                    std::sync::mpsc::TrySendError::Disconnected(request) => (request, io::ErrorKind::BrokenPipe),
+                };
+                let DocumentRequest::Replace { editor, .. } = *request else { unreachable!() };
+                self.views.get_mut(&id).unwrap().editor = Some(*editor);
+                Err(io::Error::new(kind, "Replacement was not admitted; editor retained"))
+            }
+        }
     }
 
     /// Apply accepted settings in memory, including inactive and cached tabs.
@@ -387,6 +470,18 @@ impl Workspace {
 
     /// Refuse dirty close until the caller saves or explicitly chooses discard.
     pub fn close(&mut self, id: DocumentId, discard: bool) -> io::Result<bool> {
+        if self.document_busy(id)
+            || self
+                .views
+                .get(&id)
+                .and_then(View::editor)
+                .is_some_and(|editor| editor.has_pending_edit_receipt() || editor.has_pending_save_completion())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Accepted edit/recovery work must finish before closing",
+            ));
+        }
         if self.files.saves.contains_key(&id) {
             return Err(io::Error::other("Save in progress; wait before closing this tab"));
         }
@@ -730,6 +825,13 @@ impl Workspace {
     }
     pub fn wants_exit(&self) -> bool {
         self.files.exit
+            && !self.search_replacement_pending()
+            && self.files.replacement_journals.is_empty()
+            && (self.files.worker.is_none() || self.files.queue.is_empty())
+            && !self.views.values().chain(self.closed_views.values()).any(|view| {
+                view.editor()
+                    .is_some_and(|editor| editor.has_pending_edit_receipt() || editor.has_pending_save_completion())
+            })
             && (self.files.exit_without_metadata || !self.files.storage_ready || self.files.metadata_durable)
     }
     pub fn close_pending(&self) -> bool {
@@ -869,6 +971,12 @@ impl Workspace {
     }
 
     pub fn save_document(&mut self, id: DocumentId, path: Option<PathBuf>) -> io::Result<()> {
+        if self.document_busy(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Replacement in progress; retry save after completion",
+            ));
+        }
         if self.files.queue.len() >= 256 {
             self.cancel_close_intent();
             return Err(io::Error::other("File worker queue is full; retry save"));
@@ -1101,16 +1209,19 @@ impl Workspace {
 
     fn advance_close(&mut self, mut discard: bool) -> io::Result<()> {
         while let Some(id) = self.files.close.front().copied() {
+            if self.document_busy(id) {
+                self.set_notice("Replacement in progress; close will wait. Esc cancels close".into());
+                return Ok(());
+            }
             if self.files.saves.contains_key(&id) {
                 self.set_notice("Save in progress; close will wait for its revision".into());
                 return Ok(());
             }
-            if !discard
-                && self
-                    .views
-                    .get(&id)
-                    .and_then(View::editor)
-                    .is_some_and(|editor| editor.has_pending_edit_receipt() || editor.has_pending_save_completion())
+            if self
+                .views
+                .get(&id)
+                .and_then(View::editor)
+                .is_some_and(|editor| editor.has_pending_edit_receipt() || editor.has_pending_save_completion())
             {
                 self.set_notice("Recovery queue is busy; close will wait. Esc cancels".into());
                 return Ok(());
@@ -1166,6 +1277,7 @@ impl Workspace {
 
     fn check_hot_exit(&mut self) {
         if !self.files.hot_exit
+            || self.search_replacement_pending()
             || !self.files.metadata_durable
             || self.files.persist_inflight
             || self.files.persist_pending
@@ -1195,6 +1307,17 @@ impl Workspace {
     }
 
     pub fn document_result(&mut self, result: DocumentResult) -> Damage {
+        // An editor absent because of a loan is not an open/index placeholder.
+        let placeholder = match &result {
+            DocumentResult::Indexed { document, .. }
+            | DocumentResult::Opened { document, .. }
+            | DocumentResult::Preview { document, .. }
+            | DocumentResult::Recovered { document, .. } => Some(*document),
+            _ => None,
+        };
+        if placeholder.is_some_and(|id| self.document_busy(id)) {
+            return Damage::default();
+        }
         let destinations_changed = matches!(
             &result,
             DocumentResult::Prepared(_)
@@ -1205,10 +1328,51 @@ impl Workspace {
         );
         let checkpoint = matches!(
             &result,
-            DocumentResult::Indexed { .. } | DocumentResult::Saved { .. } | DocumentResult::Recovered { .. }
+            DocumentResult::Indexed { .. }
+                | DocumentResult::Saved { .. }
+                | DocumentResult::Recovered { .. }
+                | DocumentResult::Replaced { .. }
         );
         let mut damage = Damage { status: true, ..Default::default() };
         match result {
+            DocumentResult::Replaced { key, operation, mut editor, result } => {
+                let id = DocumentId(key.document_id);
+                let current =
+                    self.files.loans.get(&id).is_some_and(|loan| loan.key == key && loan.operation == operation);
+                if !current {
+                    // Such a completion cannot be emitted by the fixed lane:
+                    // accepted loans cannot be closed/remapped/replaced.
+                    // Never overwrite another editor with a stale completion.
+                    self.set_notice("Unexpected replacement completion identity".into());
+                    return damage;
+                }
+                if let Some(settings) = &self.editor_settings {
+                    editor.settings = settings.clone();
+                }
+                let sequence = editor.next_edit_sequence().saturating_sub(1);
+                if editor.document().revision() != key.revision {
+                    self.files.replacement_journals.insert(id, sequence);
+                }
+                let view = self.views.get_mut(&id).expect("loan target cannot close");
+                debug_assert!(view.editor.is_none());
+                view.editor = Some(*editor);
+                self.files.loans.remove(&id);
+                self.input_epoch = self.input_epoch.wrapping_add(1);
+                let notice = match result {
+                    Ok(_) => "Replacement complete".to_string(),
+                    Err(error) => format!("Replacement failed: {error}"),
+                };
+                // The worker's viewport may predate a resize. Rebuild only the
+                // existing bounded visible cache once ownership is restored.
+                view.set_notice(notice);
+                let refreshed = view.refresh_after_edit(Damage { full: true, status: true, ..Default::default() });
+                if id == self.active_id() {
+                    damage = refreshed;
+                }
+                if self.files.hot_exit {
+                    self.files.queue.push_back(DocumentRequest::FlushJournals);
+                }
+            }
             DocumentResult::SessionCheckpointDue => {
                 damage = Damage::default();
                 self.files.persist_timer = false;
@@ -1406,6 +1570,9 @@ impl Workspace {
                 match result {
                     Ok(()) => {
                         self.files.durable.insert(document, (revision, sequence));
+                        if self.files.replacement_journals.get(&document).is_some_and(|needed| sequence >= *needed) {
+                            self.files.replacement_journals.remove(&document);
+                        }
                         damage = Damage {
                             status: pending_before != self.recovery_pending(self.active_id()),
                             ..Default::default()
@@ -1422,6 +1589,9 @@ impl Workspace {
             }
             DocumentResult::JournalClosed { document, result } => {
                 damage = Damage::default();
+                if result.is_ok() {
+                    self.files.replacement_journals.remove(&document);
+                }
                 if let Err(error) = result {
                     damage = self
                         .set_notice(format!("Tab {} journal close incomplete: {error}; recovery retained", document.0));
@@ -1529,6 +1699,9 @@ impl Workspace {
             self.set_notice(format!("Tab {}: {notice}", document.0));
         }
         if may_close && !warning {
+            // An atomic current save is also durable evidence for the accepted
+            // replacement when its recovery journal failed independently.
+            self.files.replacement_journals.remove(&document);
             if self.files.close.contains(&document) {
                 if self.files.quit && self.files.restore_session == Some(true) && self.files.storage_ready {
                     self.begin_hot_exit();
@@ -1814,6 +1987,10 @@ impl DerefMut for Workspace {
         self.views.get_mut(&id).expect("active view exists")
     }
 }
+
+#[cfg(test)]
+#[path = "replacement_tests.rs"]
+mod replacement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2986,6 +3163,13 @@ impl Workspace {
     /// deferred until existing recovery/journal admission becomes available.
     pub fn file_saves_pending(&self) -> bool {
         !self.files.saves.is_empty()
+            || self.search_replacement_pending()
+            || !self.files.replacement_journals.is_empty()
+            || self
+                .views
+                .values()
+                .chain(self.closed_views.values())
+                .any(|view| view.editor().is_some_and(|editor| editor.has_pending_edit_receipt()))
             || self.views.values().any(|view| view.editor().is_some_and(|editor| editor.has_pending_save_completion()))
     }
 

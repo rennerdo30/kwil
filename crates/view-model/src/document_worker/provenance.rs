@@ -1575,7 +1575,12 @@ mod tests {
         let mut registry = registry();
         let p = plan(&registry, &old.snapshot());
         let (base_bytes, base_token) = serialize(&registry, p, 3);
-        let policy = RecoveryPolicy { encoding: Encoding::UTF16_LE, bom: true, preferred_ending: LineEnding::CrLf };
+        let policy = RecoveryPolicy {
+            encoding: Encoding::UTF16_LE,
+            bom: true,
+            preferred_ending: LineEnding::CrLf,
+            compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+        };
         let path = fixture.directory.join("staged-journal");
         let metadata = JournalBase {
             document: DocumentId(41),

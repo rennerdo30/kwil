@@ -20,6 +20,7 @@ impl Editor {
         self.end_burst();
         self.saving = true;
         Ok(SaveRequest {
+            compression: self.document.compression,
             snapshot: self.document.snapshot(),
             path,
             original: self.document.original.clone(),

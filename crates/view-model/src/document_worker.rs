@@ -3,6 +3,8 @@
 use crate::Document;
 use kwil_core_text::{decoded_backing::DecodedPreview, encoding::SavePlan};
 use provenance::journal::RecoveryPolicy;
+#[cfg(test)]
+mod compressed_runtime;
 mod decoded;
 mod encoding_runtime;
 mod encoding_seed;
@@ -88,6 +90,13 @@ impl ExternalOpenInbox {
 }
 
 pub enum DocumentRequest {
+    /// Ownership returns in Replaced even when validation/application fails.
+    Replace {
+        document: DocumentId,
+        operation: u64,
+        editor: Box<crate::Editor>,
+        recipe: kwil_core_search::worker::ReplaceRecipe,
+    },
     Prepare {
         root: Option<PathBuf>,
     },
@@ -148,25 +157,108 @@ pub enum DocumentRequest {
 }
 
 pub enum DocumentResult {
+    Replaced {
+        key: kwil_core_search::worker::SearchKey,
+        operation: u64,
+        editor: Box<crate::Editor>,
+        result: io::Result<crate::Damage>,
+    },
     SessionCheckpointDue,
     CapacityAvailable,
     Stopped(io::Result<()>),
     Prepared(io::Result<PreparedWorkspace>),
     Persisted(io::Result<()>),
-    Recovered { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
-    Opened { document: DocumentId, revision: u64, result: io::Result<(PathBuf, TextFile)> },
-    Preview { document: DocumentId, revision: u64, path: PathBuf, file: TextFile, preview: DecodedPreview },
-    Indexed { document: DocumentId, revision: u64, result: io::Result<Box<Document>> },
-    Saved { document: DocumentId, revision: u64, result: io::Result<SavedSnapshot> },
-    ReopenValidated { document: DocumentId, generation: u64, result: io::Result<bool> },
-    JournalQueued { document: DocumentId, revision: u64, sequence: u64, result: io::Result<()> },
-    JournalDurable { document: DocumentId, revision: u64, sequence: u64, result: io::Result<()> },
-    JournalClosed { document: DocumentId, result: io::Result<()> },
+    Recovered {
+        document: DocumentId,
+        revision: u64,
+        result: io::Result<Box<Document>>,
+    },
+    Opened {
+        document: DocumentId,
+        revision: u64,
+        result: io::Result<(PathBuf, TextFile)>,
+    },
+    Preview {
+        document: DocumentId,
+        revision: u64,
+        path: PathBuf,
+        file: TextFile,
+        preview: DecodedPreview,
+    },
+    Indexed {
+        document: DocumentId,
+        revision: u64,
+        result: io::Result<Box<Document>>,
+    },
+    Saved {
+        document: DocumentId,
+        revision: u64,
+        result: io::Result<SavedSnapshot>,
+    },
+    ReopenValidated {
+        document: DocumentId,
+        generation: u64,
+        result: io::Result<bool>,
+    },
+    JournalQueued {
+        document: DocumentId,
+        revision: u64,
+        sequence: u64,
+        result: io::Result<()>,
+    },
+    JournalDurable {
+        document: DocumentId,
+        revision: u64,
+        sequence: u64,
+        result: io::Result<()>,
+    },
+    JournalClosed {
+        document: DocumentId,
+        result: io::Result<()>,
+    },
 }
 
 pub struct PreparedWorkspace {
     pub session: Session,
     pub documents: Vec<(DocumentId, io::Result<Document>)>,
+}
+
+/// Shutdown could not retire every worker-owned backing. The bounded runtime
+/// is quarantined on its existing worker for the rest of this process, keeping
+/// exact owners alive without unlinking files still referenced by snapshots.
+/// ROOT must release frontend/source snapshots before closing this worker.
+#[derive(Debug)]
+pub struct PendingBackingRetirement {
+    pub root: PathBuf,
+    pub live_owners: usize,
+    pub cleanup_pending: usize,
+    cleanup_error: Option<io::Error>,
+    previous_error: Option<io::Error>,
+    journal_error: Option<io::Error>,
+}
+impl std::fmt::Display for PendingBackingRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Document backing retirement incomplete: {} live owners, {} cleanup pending in {}; exact owners quarantined until process exit",
+            self.live_owners,
+            self.cleanup_pending,
+            self.root.display()
+        )?;
+        for error in [&self.cleanup_error, &self.previous_error, &self.journal_error].into_iter().flatten() {
+            write!(f, "; {error}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for PendingBackingRetirement {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cleanup_error
+            .as_ref()
+            .or(self.previous_error.as_ref())
+            .or(self.journal_error.as_ref())
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
 }
 
 struct Storage {
@@ -280,6 +372,8 @@ impl DocumentWorker {
             // Worker-owned until the UI publishes the admitted tab and releases
             // this reservation. UI registry refreshes cannot erase it early.
             let mut reopening: Option<(DocumentId, u64, PathBuf)> = None;
+            let mut shutdown_deadline = None;
+            let mut shutdown_error = None;
             loop {
                 let waiting = session_due.is_some()
                     || storage.as_ref().is_some_and(|state| {
@@ -288,6 +382,13 @@ impl DocumentWorker {
                         })
                     });
                 let available = deferred.iter().position(|request| {
+                    if let DocumentRequest::FinishJournal { document, .. } = request
+                        && deferred.iter().any(|older| matches!(older,
+                            DocumentRequest::Journal { document: owner, .. } | DocumentRequest::SeedJournal { document: owner, .. }
+                            if owner == document))
+                    {
+                        return false;
+                    }
                     if let DocumentRequest::Journal { document, .. } = request
                         && let Some(journal) = storage.as_ref().and_then(|storage| storage.journals.get(document))
                         && !journal.ready
@@ -307,19 +408,50 @@ impl DocumentWorker {
                 });
                 let request = if let Some(index) = available {
                     deferred.remove(index)
+                } else if let Some(deadline) = shutdown_deadline {
+                    if deferred.is_empty() && !waiting {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        shutdown_error = Some(io::Error::other("Document shutdown timed out draining admitted recovery work"));
+                        break;
+                    }
+                    // Only active seed/flush work remains. Reuse the lane's
+                    // existing bounded readiness wait; never spin on a closed inbox.
+                    std::thread::park_timeout(Duration::from_millis(25));
+                    None
                 } else if waiting {
                     match rx.recv_timeout(Duration::from_millis(25)) {
                         Ok(request) => Some(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            shutdown_deadline = Some(std::time::Instant::now() + Duration::from_secs(30));
+                            session_due = None;
+                            if let Some(storage) = &mut storage {
+                                for journal in storage.journals.values_mut() { journal.flush_due = std::time::Instant::now(); }
+                            }
+                            None
+                        }
                     }
                 } else {
                     match rx.recv() {
                         Ok(request) => Some(request),
-                        Err(_) => break,
+                        Err(_) => {
+                            shutdown_deadline = Some(std::time::Instant::now() + Duration::from_secs(30));
+                            session_due = None;
+                            None
+                        }
                     }
                 };
                 if let Some(request) = request {
+                    if let DocumentRequest::FinishJournal { document, .. } = &request
+                        && deferred.iter().any(|older| matches!(older,
+                            DocumentRequest::Journal { document: owner, .. } | DocumentRequest::SeedJournal { document: owner, .. }
+                            if owner == document))
+                    {
+                        deferred.push_back(request);
+                        continue;
+                    }
                     let needs_slot = match &request {
                         DocumentRequest::Journal { document, .. } | DocumentRequest::SeedJournal { document, .. } => {
                             storage.as_ref().is_some_and(|storage| {
@@ -339,6 +471,15 @@ impl DocumentWorker {
                         continue;
                     }
                     match request {
+                        DocumentRequest::Replace { document, operation, mut editor, recipe } => {
+                            let key = recipe.key;
+                            let result = if document.0 != key.document_id {
+                                Err(io::Error::new(io::ErrorKind::InvalidInput, "Replacement document identity mismatch"))
+                            } else {
+                                editor.apply_search_replacement(recipe)
+                            };
+                            complete(DocumentResult::Replaced { key, operation, editor, result });
+                        }
                         DocumentRequest::Prepare { root } => {
                             let prepared = prepare(root).map(|(prepared, state)| {
                                 storage = Some(state);
@@ -629,7 +770,33 @@ impl DocumentWorker {
                     complete(DocumentResult::SessionCheckpointDue);
                 }
             }
+            // Every admitted receipt gets a terminal failure if a seed/slot
+            // cannot drain. A failed shutdown is never reported as a clean stop.
+            for request in deferred {
+                match request {
+                    DocumentRequest::Journal { document, receipt, .. } => {
+                        capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        complete(DocumentResult::JournalQueued {
+                            document, revision: receipt.after_revision, sequence: receipt.sequence,
+                            result: Err(io::Error::other("Recovery receipt could not drain before shutdown")),
+                        });
+                    }
+                    DocumentRequest::SeedJournal { document, revision, next_sequence, .. } => {
+                        complete(DocumentResult::JournalDurable {
+                            document, revision, sequence: next_sequence.saturating_sub(1),
+                            result: Err(io::Error::other("Recovery seed could not drain before shutdown")),
+                        });
+                    }
+                    DocumentRequest::FinishJournal { document, .. } => {
+                        complete(DocumentResult::JournalClosed { document, result: Err(io::Error::other("Recovery close did not drain")) });
+                    }
+                    _ => unreachable!("only recovery requests are deferred"),
+                }
+            }
             let stopped = if let Some(mut storage) = storage {
+                if shutdown_error.is_none() && storage.journals.values().any(|journal| journal.failed) {
+                    shutdown_error = Some(io::Error::other("Recovery failed before document shutdown; changes remain unsaved"));
+                }
                 storage.service.finish();
                 // Shutdown is on this worker. UI never waits for seeding/fsync.
                 let result = storage
@@ -640,14 +807,28 @@ impl DocumentWorker {
                     .and_then(|result| result);
                 storage.journals.clear();
                 let retirement = storage.encoding.retire();
-                if let Some(error) = retirement.first_error {
-                    eprintln!("Decoded backing shutdown cleanup retained for retry: {error}");
+                if retirement.live != 0 || retirement.cleanup_pending != 0 || retirement.first_error.is_some() {
+                    let error = PendingBackingRetirement {
+                        root: storage.root.clone(),
+                        live_owners: retirement.live,
+                        cleanup_pending: retirement.cleanup_pending,
+                        cleanup_error: retirement.first_error,
+                        previous_error: shutdown_error.take(),
+                        journal_error: result.err(),
+                    };
+                    eprintln!("{error}");
+                    // No indefinite shutdown wait, new thread, global registry
+                    // or last-snapshot Drop cleanup. This finite !Send registry
+                    // retains every exact resource within its admission cap.
+                    std::mem::forget(storage.encoding);
+                    Err(io::Error::other(error))
+                } else {
+                    result
                 }
-                result
             } else {
                 Ok(())
             };
-            complete(DocumentResult::Stopped(stopped));
+            complete(DocumentResult::Stopped(shutdown_error.map_or(stopped, Err)));
         })?;
         Ok(Self { tx, journal_capacity, save_destinations })
     }
@@ -659,6 +840,19 @@ impl DocumentWorker {
             TrySendError::Full(request) => TrySendError::Full(Box::new(request)),
             TrySendError::Disconnected(request) => TrySendError::Disconnected(Box::new(request)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replacement_test_channel(capacity: usize) -> (Self, mpsc::Receiver<DocumentRequest>) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        (
+            Self {
+                tx,
+                journal_capacity: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16)),
+                save_destinations: Default::default(),
+            },
+            rx,
+        )
     }
 }
 
@@ -1043,6 +1237,22 @@ fn journal_receipt(
         {
             return Err(io::Error::other("Journal receipt gap, duplicate or mismatched revision; recovery retained"));
         }
+        // Replay admits cumulative tree-construction work. Dense recipe edits
+        // share a bounded span instead of forcing one tree rewrite/capsule per
+        // character. The observer's original receipt/undo recipe stays intact.
+        let mut replacements = 0_u64;
+        visit_journal_replacements(&receipt, &mut |_| {
+            replacements =
+                replacements.checked_add(1).ok_or_else(|| io::Error::other("Journal replacement count overflow"))?;
+            Ok(())
+        })?;
+        #[cfg(test)]
+        eprintln!(
+            "journal receipt diagnostics: document={} sequence={} recipe_edits={} emitted_spans={replacements}",
+            document.0,
+            receipt.sequence,
+            receipt.replacement_count()
+        );
         if journal.origins.is_none() {
             // Preserve the existing raw-v1 wire lineage. Encoded capsules must
             // not be appended under a raw base that legacy replay cannot decode.
@@ -1051,10 +1261,10 @@ fn journal_receipt(
                 C::BeginBatch(JournalBatch {
                     from_revision: receipt.before_revision,
                     to_revision: receipt.after_revision,
-                    replacements: receipt.replacement_count(),
+                    replacements,
                 }),
             )?;
-            receipt.for_each_replacement(&mut |replacement| {
+            visit_journal_replacements(&receipt, &mut |replacement| {
                 submit(
                     &journal.handle,
                     C::BeginReplacement(JournalReplacement {
@@ -1080,10 +1290,24 @@ fn journal_receipt(
             C::BeginBatch(JournalBatch {
                 from_revision: receipt.before_revision,
                 to_revision: receipt.after_revision,
-                replacements: receipt.replacement_count(),
+                replacements,
             }),
         )?;
-        receipt.for_each_replacement(&mut |replacement| {
+        #[cfg(test)]
+        let (mut text_records, mut origin_records, mut opaque_records) = (0_u64, 0_u64, 0_u64);
+        visit_journal_replacements(&receipt, &mut |replacement| {
+            #[cfg(test)]
+            {
+                for chunk in replacement.insert.snapshot.source_chunks(replacement.insert.range.clone())? {
+                    match chunk.map_err(io::Error::other)? {
+                        kwil_core_text::SourceChunk::Original { .. } | kwil_core_text::SourceChunk::Added(_) => {
+                            text_records += 1
+                        }
+                        kwil_core_text::SourceChunk::Decoded { .. } => origin_records += 1,
+                        kwil_core_text::SourceChunk::Opaque { .. } => opaque_records += 1,
+                    }
+                }
+            }
             let logical_len = replacement.insert.len();
             let plan = batch.plan(replacement.insert.snapshot, replacement.insert.range, cancel.clone())?;
             submit(
@@ -1104,6 +1328,11 @@ fn journal_receipt(
             reader.admit()?;
             submit(&journal.handle, C::EndReplacement)
         })?;
+        #[cfg(test)]
+        eprintln!(
+            "journal capsule diagnostics: sequence={} text_records={text_records} origin_records={origin_records} opaque_records={opaque_records}",
+            receipt.sequence
+        );
         submit(&journal.handle, C::CommitBatch)?;
         batch.commit()?;
         journal.revision = receipt.after_revision;
@@ -1117,6 +1346,62 @@ fn journal_receipt(
         storage.order.insert(document, receipt.sequence);
     }
     result
+}
+
+/// Worker-only streaming journal encoding. Source spans retain the receipt's
+/// authenticated final snapshot, including typed raw/opaque origins. At most
+/// one span is pending and neither recipe records nor file bytes are collected.
+fn visit_journal_replacements(
+    receipt: &crate::EditReceipt,
+    emit: &mut impl FnMut(crate::ByteReplacement) -> io::Result<()>,
+) -> io::Result<()> {
+    const SPAN_BYTES: u64 = 64 << 10;
+    let ascending = receipt.kind == crate::EditKind::Undo;
+    let mut pending: Option<crate::ByteReplacement> = None;
+    receipt.for_each_replacement(&mut |next| {
+        if let Some(group) = &mut pending {
+            let merged = if ascending {
+                // Undo recipes address the intermediate version AFTER earlier
+                // edits. A merged group addresses its version BEFORE those
+                // internal edits, so remove the group's accumulated delta.
+                let delta = group.insert.len() as i128 - (group.range.end - group.range.start) as i128;
+                let start = next.range.start as i128 - delta;
+                let end = next.range.end as i128 - delta;
+                if start >= group.range.end as i128
+                    && end <= u64::MAX as i128
+                    && next.insert.range.start >= group.insert.range.end
+                    && start - group.range.end as i128 == (next.insert.range.start - group.insert.range.end) as i128
+                {
+                    Some((group.range.start..end as u64, group.insert.range.start..next.insert.range.end))
+                } else {
+                    None
+                }
+            } else if next.range.end <= group.range.start
+                && next.insert.range.end <= group.insert.range.start
+                && group.range.start - next.range.end == group.insert.range.start - next.insert.range.end
+            {
+                Some((next.range.start..group.range.end, next.insert.range.start..group.insert.range.end))
+            } else {
+                None
+            };
+            if let Some((target, source)) = merged
+                && target.end - target.start <= SPAN_BYTES
+                && source.end - source.start <= SPAN_BYTES
+            {
+                group.range = target;
+                group.insert.range = source;
+                return Ok(());
+            }
+        }
+        if let Some(previous) = pending.replace(next) {
+            emit(previous)?;
+        }
+        Ok(())
+    })?;
+    if let Some(last) = pending {
+        emit(last)?;
+    }
+    Ok(())
 }
 
 fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
@@ -1509,9 +1794,92 @@ mod tests {
     use super::*;
     use kwil_core_workspace::journal::{JournalBatch, JournalCommand, JournalEdit, JournalReplacement, JournalSeed};
 
-    struct Scratch(PathBuf);
+    fn replacement_journal_span_oracle(receipt: &crate::EditReceipt, expected_groups: Option<usize>) {
+        let mut replay = Vec::new();
+        receipt.before.write_to(&mut replay).unwrap();
+        let mut expected = Vec::new();
+        receipt.after.write_to(&mut expected).unwrap();
+        let mut groups = 0;
+        visit_journal_replacements(receipt, &mut |replacement| {
+            assert!(replacement.range.end - replacement.range.start <= 64 << 10);
+            assert!(replacement.insert.len() <= 64 << 10);
+            let mut inserted = Vec::new();
+            replacement.insert.write_to(&mut inserted)?;
+            replay.splice(replacement.range.start as usize..replacement.range.end as usize, inserted);
+            groups += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            replay, expected,
+            "grouped sequential-coordinate replay must reproduce the authenticated after snapshot"
+        );
+        if let Some(count) = expected_groups {
+            assert_eq!(groups, count);
+        } else {
+            assert!(groups >= 2, "large affected spans must stay in bounded separate groups");
+        }
+    }
+
+    fn replacement_journal_receipts(source: &str, edits: Vec<kwil_core_search::Edit>) -> Vec<crate::EditReceipt> {
+        use kwil_core_search::worker::{ReplaceRecipe, ReplacementEdits, SearchKey};
+        let mut editor = crate::Editor::new(Document::new());
+        editor.insert_text(source, Duration::ZERO).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(3);
+        editor
+            .set_edit_observer(Some(Box::new(move |receipt| {
+                sender.try_send(receipt).map_err(|error| match error {
+                    TrySendError::Full(receipt) | TrySendError::Disconnected(receipt) => receipt,
+                })
+            })))
+            .unwrap();
+        editor
+            .apply_search_replacement(ReplaceRecipe {
+                key: SearchKey { document_id: 1, revision: editor.document().revision(), generation: 1 },
+                edits: ReplacementEdits::Inline(std::sync::Arc::new(edits)),
+            })
+            .unwrap();
+        editor.undo().unwrap();
+        editor.redo().unwrap();
+        (0..3).map(|_| receiver.recv_timeout(Duration::from_secs(1)).unwrap()).collect()
+    }
+
+    #[test]
+    fn replacement_journal_spans_preserve_gaps_and_mixed_size_undo_redo() {
+        let edit = |offset, len, bytes: &[u8]| kwil_core_search::Edit { offset, len, new_bytes: bytes.to_vec() };
+        let receipts = replacement_journal_receipts(
+            "a---a---a---a",
+            vec![edit(0, 1, b"bc"), edit(4, 1, b""), edit(8, 1, b"long"), edit(12, 1, b"z")],
+        );
+        for receipt in receipts {
+            assert_eq!(receipt.replacement_count(), 4, "original observer recipe is unchanged");
+            replacement_journal_span_oracle(&receipt, Some(1));
+        }
+        let receipts = replacement_journal_receipts(
+            "a---a---a",
+            vec![edit(0, 0, b"prefix"), edit(4, 1, b""), edit(9, 0, b"suffix")],
+        );
+        for receipt in receipts {
+            replacement_journal_span_oracle(&receipt, Some(1));
+        }
+    }
+
+    #[test]
+    fn replacement_journal_spans_split_at_bound_without_losing_coordinate_shifts() {
+        let source = "a".repeat((128 << 10) + 1);
+        let edit = |offset, len, bytes: &[u8]| kwil_core_search::Edit { offset, len, new_bytes: bytes.to_vec() };
+        let receipts = replacement_journal_receipts(
+            &source,
+            vec![edit(0, 1, b"start"), edit(4, 1, b""), edit(64 << 10, 1, b"middle"), edit(128 << 10, 1, b"end")],
+        );
+        for receipt in receipts {
+            replacement_journal_span_oracle(&receipt, None);
+        }
+    }
+
+    pub(super) struct Scratch(pub(super) PathBuf);
     impl Scratch {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
                 "kwil-documents-{}-{}-{}",
@@ -1721,7 +2089,11 @@ mod tests {
         assert_eq!(deleted, "¢".as_bytes(), "Delete consumes both newline bytes");
     }
 
-    fn prepare_test_worker(worker: &DocumentWorker, receiver: &mpsc::Receiver<DocumentResult>, root: &std::path::Path) {
+    pub(super) fn prepare_test_worker(
+        worker: &DocumentWorker,
+        receiver: &mpsc::Receiver<DocumentResult>,
+        root: &std::path::Path,
+    ) {
         worker.try_submit(DocumentRequest::Prepare { root: Some(root.to_owned()) }).unwrap();
         loop {
             if let DocumentResult::Prepared(result) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -2799,7 +3171,7 @@ mod tests {
         assert_eq!(bytes, b"xy", "flushing must not retry the successful input");
     }
 
-    fn drive(
+    pub(super) fn drive(
         workspace: &mut crate::Workspace,
         receiver: &mpsc::Receiver<DocumentResult>,
         done: impl Fn(&crate::Workspace) -> bool,
@@ -2813,7 +3185,7 @@ mod tests {
         }
     }
 
-    fn wait_stopped(receiver: &mpsc::Receiver<DocumentResult>) {
+    pub(super) fn wait_stopped(receiver: &mpsc::Receiver<DocumentResult>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let DocumentResult::Stopped(result) =

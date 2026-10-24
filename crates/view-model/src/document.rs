@@ -45,6 +45,9 @@ pub struct Document {
     pub(crate) buffer: Buffer,
     pub(crate) original: Option<TextFile>,
     pub(crate) path: Option<PathBuf>,
+    /// Output transport is independent of encoding and immutable decoded origins.
+    /// Retained even when recovery cannot reattach a verified named original.
+    pub compression: kwil_core_workspace::compressed::CompressionFormat,
     pub encoding: DocumentEncoding,
     pub bom: bool,
     pub line_ending: DocumentLineEnding,
@@ -65,6 +68,7 @@ impl Document {
             buffer: Buffer::empty(),
             original: None,
             path: None,
+            compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
             encoding: DocumentEncoding::Utf8,
             bom: false,
             line_ending: DocumentLineEnding::Lf,

@@ -332,6 +332,17 @@ impl View {
         self.editor.as_mut()
     }
 
+    /// Cursor-only damage never changes source bytes. Retain the viewport cache
+    /// unless navigation actually moved it; mouse drags must not read every line.
+    pub fn refresh_after_cursor(&mut self, damage: Damage) -> Damage {
+        let top = self.editor.as_ref().map_or(self.top, |editor| editor.top());
+        if self.top != top {
+            self.top = top;
+            self.reload();
+        }
+        damage
+    }
+
     pub fn refresh_after_edit(&mut self, damage: Damage) -> Damage {
         if let Some(editor) = &self.editor {
             self.top = editor.top();
@@ -527,3 +538,39 @@ mod viewer_tests {
 }
 
 pub mod file_type_registration;
+
+#[cfg(test)]
+mod cursor_cache_tests {
+    use super::*;
+    #[test]
+    fn cursor_drag_reuses_visible_text_until_the_viewport_moves() {
+        let mut view = View::new(None);
+        view.set_rows(8);
+        view.execute("edit.insert", &CommandArgs { text: Some("one line\n".repeat(64)), ..Default::default() }, 1)
+            .unwrap();
+        let damage = view.editor_mut().unwrap().set_cursors(vec![Cursor::caret(0)], 0).unwrap();
+        view.refresh_after_cursor(damage);
+        view.lines[0].reserve(4096);
+        let capacity = view.lines[0].capacity();
+        let before = view.lines.clone();
+        let damage = view
+            .editor_mut()
+            .unwrap()
+            .set_cursors(vec![Cursor { anchor: 0, head: 20, desired_column: None }], 0)
+            .unwrap();
+        assert!(!damage.rows.is_empty());
+        view.refresh_after_cursor(damage);
+        assert_eq!(view.lines, before);
+        assert_eq!(
+            view.lines[0].capacity(),
+            capacity,
+            "drag must retain the existing byte cache, not read/allocate it again"
+        );
+        let damage = view.editor_mut().unwrap().set_cursors(vec![Cursor::caret(100)], 0).unwrap();
+        view.refresh_after_cursor(damage);
+        assert!(view.top() > 0);
+        assert_eq!(view.line(0), Some(&b"one line"[..]));
+    }
+}
+
+pub mod log_session;

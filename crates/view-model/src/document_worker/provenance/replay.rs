@@ -248,6 +248,10 @@ impl ReplayState {
             committed: false,
             rolled_back: false,
             cleanup_error: None,
+            text: [0; super::MAX_READ_BYTES],
+            text_len: 0,
+            #[cfg(test)]
+            diagnostics: ReplayDiagnostics::default(),
             #[cfg(test)]
             index_cancel_at: None,
         })
@@ -377,8 +381,26 @@ pub struct ReplayRevision<'a> {
     committed: bool,
     rolled_back: bool,
     cleanup_error: Option<io::Error>,
+    // Included in owner_metadata's size_of::<ReplayRevision>() reservation
+    // before any revision is created. One fixed block, independent of input
+    // piece/record count, is reused across the entire authenticated replay.
+    text: [u8; super::MAX_READ_BYTES],
+    text_len: usize,
+    #[cfg(test)]
+    diagnostics: ReplayDiagnostics,
     #[cfg(test)]
     index_cancel_at: Option<usize>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReplayDiagnostics {
+    pub(crate) capsules: u64,
+    pub(crate) text_callbacks: u64,
+    pub(crate) text_bytes: u64,
+    pub(crate) core_text_appends: u64,
+    pub(crate) staged_core_work: RecoveryUsage,
+    reported_error: bool,
 }
 impl<'a> ReplayRevision<'a> {
     fn core(&mut self) -> io::Result<&mut RecoveryRevision<'a>> {
@@ -396,6 +418,7 @@ impl<'a> ReplayRevision<'a> {
             return;
         }
         self.rolled_back = true;
+        self.text_len = 0;
         // This ordering is essential: pending core IDs/roots must release their
         // snapshot pins BEFORE attempting to unlink their backing files.
         drop(self.core.take());
@@ -410,7 +433,16 @@ impl<'a> ReplayRevision<'a> {
         }
     }
     fn checked<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        #[cfg(test)]
+        if let Some(core) = &self.core {
+            self.diagnostics.staged_core_work = core.usage();
+        }
         if let Err(error) = result {
+            #[cfg(test)]
+            if !self.diagnostics.reported_error {
+                self.diagnostics.reported_error = true;
+                eprintln!("replay diagnostics on error: {:?}; error={error}", self.diagnostics);
+            }
             self.rollback();
             if let Some(cleanup) = &self.cleanup_error {
                 return Err(io::Error::new(error.kind(), format!("{error}; {cleanup}")));
@@ -418,6 +450,27 @@ impl<'a> ReplayRevision<'a> {
             return Err(error);
         }
         result
+    }
+
+    fn flush_text(&mut self) -> io::Result<()> {
+        if self.text_len != 0 {
+            let cancel = self.cancel;
+            self.core
+                .as_mut()
+                .ok_or_else(|| invalid("replay revision was aborted"))?
+                .append_bytes(&self.text[..self.text_len], || cancelled(cancel))?;
+            #[cfg(test)]
+            {
+                self.diagnostics.core_text_appends = self.diagnostics.core_text_appends.saturating_add(1);
+            }
+            self.text_len = 0;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostics(&self) -> ReplayDiagnostics {
+        self.diagnostics
     }
     fn next_logical(&self, len: u64) -> io::Result<u64> {
         self.logical
@@ -437,6 +490,10 @@ impl<'a> ReplayRevision<'a> {
             poll(self.cancel)?;
             if self.core.is_none() || self.fragment != Fragment::None {
                 return Err(invalid("unconsumed or aborted replay fragment"));
+            }
+            #[cfg(test)]
+            {
+                self.diagnostics.capsules = self.diagnostics.capsules.saturating_add(1);
             }
             let cancel = self.cancel;
             let limits = self.decode;
@@ -460,13 +517,20 @@ impl<'a> ReplayRevision<'a> {
             if self.fragment != Fragment::None {
                 return Err(invalid("unconsumed fragment at replay commit"));
             }
-            self.core.take().ok_or_else(|| invalid("replay revision was aborted"))?.commit(cancel)?;
+            let core = self.core.take().ok_or_else(|| invalid("replay revision was aborted"))?;
+            #[cfg(test)]
+            {
+                self.diagnostics.staged_core_work = core.usage();
+            }
+            core.commit(cancel)?;
             // Infallible publication after core commit; no cancellation or
             // callback between root/ID publication and owner admission.
             for slot in &mut self.owners.slots[self.pending_start..] {
                 slot.accepted = true;
             }
             self.committed = true;
+            #[cfg(test)]
+            eprintln!("replay diagnostics committed: {:?}", self.diagnostics);
             Ok(())
         })();
         self.checked(result)
@@ -497,6 +561,7 @@ impl CapsuleSink for ReplayRevision<'_> {
             self.core()?.begin_fragment()?;
             self.fragment = Fragment::Building;
             self.logical = 0;
+            self.text_len = 0;
             Ok(())
         })();
         self.checked(result)
@@ -510,6 +575,7 @@ impl CapsuleSink for ReplayRevision<'_> {
     ) -> io::Result<()> {
         let result = (|| {
             self.building()?;
+            self.flush_text()?;
             let storage = self.owners.preflight(id, raw_len)?;
             let logical_bound = raw_len.checked_mul(8).ok_or_else(overflow)?;
             // The constructor charged all path copies in this reservation;
@@ -572,6 +638,7 @@ impl CapsuleSink for ReplayRevision<'_> {
             self.building()?;
             let len = range.end.checked_sub(range.start).ok_or_else(|| invalid("reversed replay origin range"))?;
             let logical = self.next_logical(len)?;
+            self.flush_text()?;
             let cancel = self.cancel;
             self.core()?.append_origin(id, range, || cancelled(cancel))?;
             self.logical = logical;
@@ -583,8 +650,22 @@ impl CapsuleSink for ReplayRevision<'_> {
         let result = (|| {
             self.building()?;
             let logical = self.next_logical(bytes.len() as u64)?;
-            let cancel = self.cancel;
-            self.core()?.append_bytes(bytes, || cancelled(cancel))?;
+            #[cfg(test)]
+            {
+                self.diagnostics.text_callbacks = self.diagnostics.text_callbacks.saturating_add(1);
+                self.diagnostics.text_bytes = self.diagnostics.text_bytes.saturating_add(bytes.len() as u64);
+            }
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                poll(self.cancel)?;
+                let amount = remaining.len().min(self.text.len() - self.text_len);
+                self.text[self.text_len..self.text_len + amount].copy_from_slice(&remaining[..amount]);
+                self.text_len += amount;
+                remaining = &remaining[amount..];
+                if self.text_len == self.text.len() {
+                    self.flush_text()?;
+                }
+            }
             self.logical = logical;
             Ok(())
         })();
@@ -600,6 +681,7 @@ impl CapsuleSink for ReplayRevision<'_> {
         let result = (|| {
             self.building()?;
             let logical = self.next_logical(logical_count)?;
+            self.flush_text()?;
             let cancel = self.cancel;
             self.core()?.append_opaque(encoding, raw, endpoints_le, logical_count, || cancelled(cancel))?;
             self.logical = logical;
@@ -613,6 +695,7 @@ impl CapsuleSink for ReplayRevision<'_> {
             if logical_len != self.logical {
                 return Err(invalid("replay sink logical length mismatch"));
             }
+            self.flush_text()?;
             self.fragment = Fragment::Complete;
             Ok(())
         })();
@@ -768,6 +851,129 @@ mod tests {
         let mut revision = state.begin_revision(&cancel).unwrap();
         apply(&mut revision, capsule, range).unwrap();
         revision.commit().unwrap();
+    }
+
+    fn fragmented_text_capsule(records: usize, width: usize) -> Capsule {
+        let mut bytes = b"KWCP".to_vec();
+        bytes.extend_from_slice(&super::super::CAPSULE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&((records * width) as u64).to_le_bytes());
+        for _ in 0..records {
+            bytes.push(3);
+            bytes.extend_from_slice(&(width as u64).to_le_bytes());
+            bytes.resize(bytes.len() + width, b'x');
+        }
+        bytes.push(0);
+        Capsule { bytes, logical: (records * width) as u64 }
+    }
+
+    #[test]
+    fn replacement_replay_amortizes_fragmented_text_under_unchanged_core_work_limits() {
+        let fixture = Fixture::new();
+        let count = 4096;
+        let capsule = fragmented_text_capsule(count, 1);
+        let mut config = limits();
+        // Only this fixture's wire-record allowance matches its declared
+        // packet. Core's existing 1024-record/16MiB work limits stay unchanged.
+        config.decode.max_records = count as u64;
+        let core_limit = config.core.max_metadata_bytes;
+        let mut state = ReplayState::new(fixture.recovered.clone(), config).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut revision = state.begin_revision(&cancel).unwrap();
+        apply(&mut revision, &capsule, 0..0).unwrap();
+        let diagnostics = revision.diagnostics();
+        assert_eq!(diagnostics.text_callbacks, count as u64);
+        assert_eq!(diagnostics.core_text_appends, 1);
+        assert!(diagnostics.staged_core_work.records < 1024);
+        assert!(diagnostics.staged_core_work.metadata_bytes < core_limit);
+        revision.commit().unwrap();
+        assert_eq!(raw(&state.snapshot().unwrap()), vec![b'x'; count]);
+        assert!(state.usage().unwrap().metadata_bytes < core_limit);
+        state.abandon().unwrap();
+        fixture.assert_empty();
+    }
+
+    #[test]
+    fn replacement_replay_keeps_wire_record_cap_and_discards_buffered_text_on_failure() {
+        let fixture = Fixture::new();
+        let count = 4096;
+        let capsule = fragmented_text_capsule(count, 1);
+        let mut config = limits();
+        config.decode.max_records = count as u64 - 1;
+        let mut state = ReplayState::new(fixture.recovered.clone(), config).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut revision = state.begin_revision(&cancel).unwrap();
+        assert!(apply(&mut revision, &capsule, 0..0).is_err());
+        assert_eq!(revision.text_len, 0, "aborted packet cannot retain or later flush buffered text");
+        assert!(revision.commit().is_err());
+        assert!(state.snapshot().unwrap().is_empty());
+        state.abandon().unwrap();
+        fixture.assert_empty();
+    }
+
+    #[test]
+    fn replacement_replay_text_accumulator_flushes_at_its_fixed_block_bound() {
+        let fixture = Fixture::new();
+        let capsule = fragmented_text_capsule(3000, 24);
+        let mut config = limits();
+        config.decode.max_records = 3000;
+        let mut state = ReplayState::new(fixture.recovered.clone(), config).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut revision = state.begin_revision(&cancel).unwrap();
+        apply(&mut revision, &capsule, 0..0).unwrap();
+        assert_eq!(revision.diagnostics().core_text_appends, 2);
+        assert_eq!(revision.text_len, 0);
+        revision.commit().unwrap();
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.len(), 72000);
+        for chunk in snapshot.chunks(0..snapshot.len()).unwrap() {
+            assert!(chunk.unwrap().iter().all(|byte| *byte == b'x'));
+        }
+        drop(snapshot);
+        state.abandon().unwrap();
+        fixture.assert_empty();
+    }
+
+    #[test]
+    fn replacement_replay_text_accumulator_respects_origin_and_opaque_boundaries() {
+        let fixture = Fixture::new();
+        let origin = fixture.origin(b"\xff\xfeA\0\0\xd8", Encoding::UTF16_LE, 2);
+        let source = Buffer::from_decoded(origin);
+        let mut foreign = Buffer::empty();
+        foreign.insert_snapshot_range(0, &source.snapshot(), 1..2).unwrap();
+        let mixed = literal(b"L\xff")
+            .concat(&source.snapshot().slice(0..1).unwrap())
+            .unwrap()
+            .concat(&literal(b"M"))
+            .unwrap()
+            .concat(&foreign.snapshot())
+            .unwrap()
+            .concat(&literal(b"N\xff"))
+            .unwrap();
+        let mut registry = registry();
+        let capsule = capsule(&mut registry, mixed.clone(), 0..mixed.len());
+        let mut state = fixture.state();
+        let cancel = AtomicBool::new(false);
+        let mut revision = state.begin_revision(&cancel).unwrap();
+        apply(&mut revision, &capsule, 0..0).unwrap();
+        assert_eq!(revision.diagnostics().core_text_appends, 3);
+        revision.commit().unwrap();
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(raw(&snapshot), b"L\xffAM\xffN\xff");
+        let mut opaque = Vec::new();
+        let mut ordinary_ff = 0;
+        for chunk in snapshot.source_chunks(0..snapshot.len()).unwrap() {
+            match chunk.unwrap() {
+                SourceChunk::Opaque { raw_bytes, .. } => opaque.extend_from_slice(raw_bytes),
+                SourceChunk::Added(bytes) => ordinary_ff += bytes.iter().filter(|byte| **byte == 0xff).count(),
+                _ => {}
+            }
+        }
+        assert_eq!(opaque, b"\0\xd8");
+        assert_eq!(ordinary_ff, 2, "ordinary FF bytes must never become opaque atoms");
+        drop(snapshot);
+        state.abandon().unwrap();
+        fixture.assert_empty();
     }
 
     #[test]

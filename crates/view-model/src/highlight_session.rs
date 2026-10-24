@@ -186,6 +186,21 @@ impl HighlightSession {
         changed
     }
 
+    pub fn detected_language(&self, view: &Workspace) -> Option<Language> {
+        self.results
+            .iter()
+            .rev()
+            .find(|result| {
+                view.editor().is_some_and(|editor| {
+                    result.key.document_id == view.active_id()
+                        && result.key.revision == editor.document().revision()
+                        && self.path.as_path() == editor.document().path().unwrap_or(std::path::Path::new(""))
+                        && self.key.is_some_and(|key| key.viewport_generation == result.key.viewport_generation)
+                })
+            })
+            .map(|result| result.detection.language)
+    }
+
     pub fn spans<'a>(&'a self, view: &'a Workspace) -> impl Iterator<Item = &'a Span> {
         self.results
             .iter()
@@ -206,6 +221,15 @@ impl HighlightSession {
         }
     }
 
+    /// Consume on a shutdown owner after the GUI loop, never on input/render.
+    pub fn shutdown(mut self) -> Result<(), String> {
+        let result =
+            self.worker.take().map_or(Ok(()), |worker| worker.shutdown().map_err(|_| "syntax worker panicked".into()));
+        self.source.take();
+        self.rejected.take();
+        self.snapshot.take();
+        result
+    }
     pub fn stop(&mut self) {
         if let Some(worker) = self.worker.take() {
             let source = self.source.take();

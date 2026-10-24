@@ -222,6 +222,7 @@ impl EncodingRuntime {
                 crate::DocumentEncoding::Encoded(policy.encoding)
             };
             document.bom = policy.bom;
+            document.compression = policy.compression;
             document.line_ending = if policy.preferred_ending == LineEnding::CrLf {
                 DocumentLineEnding::CrLf
             } else {
@@ -242,7 +243,11 @@ impl EncodingRuntime {
                     kwil_core_workspace::open_for_editing(path)
                         .ok()
                         .filter(|file| {
-                            matches_raw(&document.snapshot(), document.save_plan(), file, cancel).unwrap_or(false)
+                            self.backings
+                                .verify_source(file, policy.compression, cancel, |body| {
+                                    matches_raw(&document.snapshot(), document.save_plan(), body, cancel)
+                                })
+                                .unwrap_or(false)
                         })
                         .map(|file| (path.clone(), file))
                 })
@@ -313,6 +318,7 @@ pub(crate) fn document_policy(document: &Document) -> RecoveryPolicy {
     RecoveryPolicy {
         encoding: document.encoding.encoding(),
         bom: document.bom,
+        compression: document.compression,
         preferred_ending: match document.line_ending {
             DocumentLineEnding::Lf => LineEnding::Lf,
             DocumentLineEnding::CrLf => LineEnding::CrLf,

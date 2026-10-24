@@ -33,7 +33,7 @@ use std::{
 };
 
 const POLICY_MAGIC: &[u8; 4] = b"KWJR";
-const POLICY_VERSION: u8 = 1;
+const POLICY_VERSION: u8 = 2;
 const MAX_ENCODING_NAME: usize = 40;
 
 /// Explicit document output policy, independent of every embedded origin.
@@ -44,6 +44,7 @@ pub struct RecoveryPolicy {
     pub encoding: Encoding,
     pub bom: bool,
     pub preferred_ending: LineEnding,
+    pub compression: kwil_core_workspace::compressed::CompressionFormat,
 }
 impl RecoveryPolicy {
     /// Small versioned codec tag for an explicitly EncodedJournalBase. This
@@ -61,7 +62,12 @@ impl RecoveryPolicy {
         };
         let mut tag = Vec::with_capacity(8 + label.len());
         tag.extend_from_slice(POLICY_MAGIC);
-        tag.extend_from_slice(&[POLICY_VERSION, u8::from(self.bom), ending, label.len() as u8]);
+        let flags = u8::from(self.bom)
+            | match self.compression {
+                kwil_core_workspace::compressed::CompressionFormat::Raw => 0,
+                kwil_core_workspace::compressed::CompressionFormat::Gzip => 2,
+            };
+        tag.extend_from_slice(&[POLICY_VERSION, flags, ending, label.len() as u8]);
         tag.extend_from_slice(label);
         Ok(tag)
     }
@@ -69,8 +75,8 @@ impl RecoveryPolicy {
         if tag.len() < 9
             || tag.len() > 8 + MAX_ENCODING_NAME
             || &tag[..4] != POLICY_MAGIC
-            || tag[4] != POLICY_VERSION
-            || tag[5] > 1
+            || !matches!(tag[4], 1 | POLICY_VERSION)
+            || tag[5] > if tag[4] == 1 { 1 } else { 3 }
             || tag[7] as usize != tag.len() - 8
         {
             return Err(invalid("unsupported encoded recovery codec/version"));
@@ -86,7 +92,16 @@ impl RecoveryPolicy {
         if encoding.name() != label {
             return Err(invalid("noncanonical recovery encoding name"));
         }
-        let policy = Self { encoding, bom: tag[5] != 0, preferred_ending };
+        let policy = Self {
+            encoding,
+            bom: tag[5] & 1 != 0,
+            preferred_ending,
+            compression: if tag[4] == POLICY_VERSION && tag[5] & 2 != 0 {
+                kwil_core_workspace::compressed::CompressionFormat::Gzip
+            } else {
+                kwil_core_workspace::compressed::CompressionFormat::Raw
+            },
+        };
         policy.validate()?;
         Ok(policy)
     }
@@ -262,6 +277,12 @@ impl JournalRecovery {
                 // value retains owned backend locking across the final core
                 // commit. Any error drops that handle without returning it.
                 revision.commit()?;
+                #[cfg(test)]
+                eprintln!(
+                    "journal replay final work diagnostics: core={:?} owner_metadata_bytes={}",
+                    self.replay.usage(),
+                    self.replay.owner_metadata_reserved()
+                );
                 self.summary = Some(summary);
                 self.phase = Phase::Ready;
                 Ok(value)
@@ -713,7 +734,12 @@ mod tests {
         }
     }
     fn policy() -> RecoveryPolicy {
-        RecoveryPolicy { encoding: Encoding::UTF8, bom: false, preferred_ending: LineEnding::CrLf }
+        RecoveryPolicy {
+            encoding: Encoding::UTF8,
+            bom: false,
+            preferred_ending: LineEnding::CrLf,
+            compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+        }
     }
     fn registry() -> OriginRegistry {
         OriginRegistry::new(8, 8192)
@@ -897,7 +923,12 @@ mod tests {
             let base = seed(&mut registry, fixture.original(raw, Encoding::UTF16_LE, 2));
             fixture.write(
                 &base,
-                RecoveryPolicy { encoding: Encoding::UTF16_LE, bom: true, preferred_ending: LineEnding::CrLf },
+                RecoveryPolicy {
+                    encoding: Encoding::UTF16_LE,
+                    bom: true,
+                    preferred_ending: LineEnding::CrLf,
+                    compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+                },
                 &[EditBatch { from: 9, to: 2, parts: vec![part(base.logical, 0, text(&mut registry, b"!"))] }],
             );
             let path = fixture.root.join("journal");
@@ -1232,7 +1263,12 @@ mod tests {
             to: 4,
             parts: vec![part(base.logical, 0, first.clone()), part(base.logical + first.logical, 0, reference)],
         }];
-        let explicit = RecoveryPolicy { encoding: Encoding::UTF16_LE, bom: true, preferred_ending: LineEnding::Cr };
+        let explicit = RecoveryPolicy {
+            encoding: Encoding::UTF16_LE,
+            bom: true,
+            preferred_ending: LineEnding::Cr,
+            compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+        };
         fixture.write(&base, explicit, &batches);
         drop(big5);
         drop(registry);
@@ -1282,7 +1318,12 @@ mod tests {
         let fixture = Fixture::new();
         let mut registry = registry();
         let base = seed(&mut registry, fixture.original(b"\xfe\xff", Encoding::UTF16_BE, 2));
-        let explicit = RecoveryPolicy { encoding: Encoding::UTF8, bom: true, preferred_ending: LineEnding::Lf };
+        let explicit = RecoveryPolicy {
+            encoding: Encoding::UTF8,
+            bom: true,
+            preferred_ending: LineEnding::Lf,
+            compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
+        };
         fixture.write(&base, explicit, &[]);
         let mut state = fixture.state();
         assert_eq!(
@@ -1443,7 +1484,7 @@ mod tests {
             let base = text(&mut registry, b"base");
             let mut codec = policy().to_codec().unwrap();
             if case == 1 {
-                codec[4] = 2;
+                codec[4] = 99;
             }
             let edits = if case == 2 {
                 vec![EditBatch {
@@ -1715,6 +1756,7 @@ mod tests {
                     encoding,
                     bom: encoding != Encoding::for_label("big5").unwrap(),
                     preferred_ending,
+                    compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
                 };
                 let codec = explicit.to_codec().unwrap();
                 assert!(codec.len() <= 8 + MAX_ENCODING_NAME);
@@ -1722,7 +1764,7 @@ mod tests {
                 for at in 0..codec.len() {
                     assert!(RecoveryPolicy::from_codec(&codec[..at]).is_err());
                 }
-                for (at, value) in [(0, 0), (4, 2), (5, 2), (6, 3), (7, 255)] {
+                for (at, value) in [(0, 0), (4, 99), (5, 4), (6, 3), (7, 255)] {
                     let mut bad = codec.clone();
                     bad[at] = value;
                     assert!(RecoveryPolicy::from_codec(&bad).is_err());
@@ -1736,7 +1778,8 @@ mod tests {
             RecoveryPolicy {
                 encoding: Encoding::for_label("big5").unwrap(),
                 bom: true,
-                preferred_ending: LineEnding::Lf
+                preferred_ending: LineEnding::Lf,
+                compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
             }
             .to_codec()
             .is_err()
@@ -1746,6 +1789,29 @@ mod tests {
             codec.push(label.len() as u8);
             codec.extend_from_slice(label.as_bytes());
             assert!(RecoveryPolicy::from_codec(&codec).is_err(), "strict canonical/stateless policy: {label}");
+        }
+    }
+
+    #[test]
+    fn compressed_worker_recovery_policy_v2_preserves_gzip_and_v1_is_always_raw() {
+        use kwil_core_workspace::compressed::CompressionFormat;
+        let raw = policy();
+        for compression in [CompressionFormat::Raw, CompressionFormat::Gzip] {
+            let explicit = RecoveryPolicy { compression, ..raw };
+            let codec = explicit.to_codec().unwrap();
+            assert_eq!(codec[4], 2);
+            assert_eq!(RecoveryPolicy::from_codec(&codec).unwrap(), explicit);
+            let mut legacy = codec.clone();
+            legacy[4] = 1;
+            legacy[5] &= 1;
+            assert_eq!(RecoveryPolicy::from_codec(&legacy).unwrap(), raw);
+            legacy[5] |= 2;
+            assert!(RecoveryPolicy::from_codec(&legacy).is_err(), "v1 must reject compression flags");
+            for flags in 4..=255 {
+                let mut bad = codec.clone();
+                bad[5] = flags;
+                assert!(RecoveryPolicy::from_codec(&bad).is_err());
+            }
         }
     }
 }
