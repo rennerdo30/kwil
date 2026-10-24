@@ -29,12 +29,12 @@ pub(super) const MENUS: &[Menu] = &[
         title: "&File",
         entries: &[
             Item("&New File", "file.new"),
-            Item("&Open Fileâ€¦", "file.open"),
-            Item("Open &Recentâ€¦", "file.recent"),
+            Item("&Open File\u{2026}", "file.open"),
+            Item("Open &Recent\u{2026}", "file.recent"),
             Item("Reopen Close&d Tab", "file.reopenClosed"),
             Separator,
             Item("&Save", "file.save"),
-            Item("Save &Asâ€¦", "file.saveAs"),
+            Item("Save &As\u{2026}", "file.saveAs"),
             Item("Save A&ll", "file.saveAll"),
             Separator,
             Item("&Close Tab", "file.close"),
@@ -82,26 +82,33 @@ pub(super) const MENUS: &[Menu] = &[
     Menu {
         title: "&View",
         entries: &[
-            Item("&Command Paletteâ€¦", "view.commandPalette"),
+            Item("&Command Palette\u{2026}", "view.commandPalette"),
             Separator,
             Item("Zoom &In", "view.zoomIn"),
             Item("Zoom &Out", "view.zoomOut"),
             Item("&Reset Zoom", "view.zoomReset"),
+            Separator,
+            Item("&Log Filters", "view.logFilters"),
+            Item("Markdown &Text", "view.markdownText"),
+            Item("Markdown &Preview", "view.markdownPreview"),
+            Item("Markdown &Split", "view.markdownSplit"),
         ],
     },
     Menu {
         title: "Sea&rch",
         entries: &[
-            Item("&Findâ€¦", "search.find"),
+            Item("&Find\u{2026}", "search.find"),
+            Item("&Replace\u{2026}", "search.replace"),
+            Item("Replace &All", "search.replaceAll"),
             Separator,
-            Item("Go to &Lineâ€¦", "navigation.goToLine"),
-            Item("&Go to Fileâ€¦", "view.fileFinder"),
+            Item("Go to &Line\u{2026}", "navigation.goToLine"),
+            Item("&Go to File\u{2026}", "view.fileFinder"),
             Item("Go to Matching &Bracket", "navigation.matchBracket"),
         ],
     },
     Menu {
         title: "&Help",
-        entries: &[Item("Show All &Commandsâ€¦", "view.commandPalette"), Separator, Item("&About Kwil", ABOUT)],
+        entries: &[Item("Show All &Commands\u{2026}", "view.commandPalette"), Separator, Item("&About Kwil", ABOUT)],
     },
 ];
 
@@ -138,6 +145,8 @@ pub(super) fn alt_letter(keymap_owns: bool, c: char) -> AltLetter {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Available {
     pub editor: bool,
+    pub markdown: bool,
+    pub log: bool,
     pub selection: bool,
     pub palette: bool,
     pub settings: bool,
@@ -153,7 +162,11 @@ pub(super) struct Available {
 
 pub(super) fn enabled(available: &Available, command: &str) -> bool {
     match command {
-        "search.find" => available.search,
+        "view.logFilters" => available.log,
+        "view.toggleMarkdown" | "view.markdownText" | "view.markdownPreview" | "view.markdownSplit" => {
+            available.markdown
+        }
+        "search.find" | "search.replace" | "search.replaceAll" => available.search,
         "edit.cut" | "edit.copy" => available.editor && available.selection,
         "file.recent" => available.recent,
         "file.reopenClosed" => available.closed,
@@ -333,7 +346,7 @@ impl Keys {
     }
 }
 
-/// "ctrl+shift+p" â†’ "Ctrl+Shift+P"; chords are separated by a space.
+/// "ctrl+shift+p" → "Ctrl+Shift+P"; chords are separated by a space.
 pub(super) fn pretty(keys: &str) -> String {
     keys.split_whitespace()
         .map(|chord| {
@@ -391,6 +404,8 @@ pub(super) struct Tool {
     pub icon: icons::Icon,
     pub command: &'static str,
     pub enabled: bool,
+    pub selected: bool,
+    pub label: Option<&'static str>,
 }
 pub(super) fn toolbar(area: TabArea, titles: &[TabArea], m: &Metrics, available: &Available) -> Vec<Tool> {
     let first = titles.last().map_or(area.x, |r| r.x + r.width).saturating_add(m.gap);
@@ -415,9 +430,44 @@ pub(super) fn toolbar(area: TabArea, titles: &[TabArea], m: &Metrics, available:
             icon,
             command,
             enabled: enabled(available, command),
+            selected: false,
+            label: None,
         });
     }
     tools
+}
+
+pub(super) fn markdown_tools(
+    tools: &mut Vec<Tool>,
+    area: TabArea,
+    titles: &[TabArea],
+    m: &Metrics,
+    mode: markdown_ui::Mode,
+) {
+    let start = titles.last().map_or(area.x, |r| r.x + r.width).saturating_add(m.gap);
+    let end = tools.iter().map(|tool| tool.rect.x).min().unwrap_or(area.x + area.width).saturating_sub(m.gap);
+    let available = end.saturating_sub(start);
+    let labels = available >= m.dip(260.0);
+    let width = if labels { m.dip(84.0) } else { m.dip(30.0) };
+    if available < width * 3 {
+        return;
+    }
+    let mut x = end - width * 3;
+    for (choice, label, icon, command) in [
+        (markdown_ui::Mode::Text, "Text", icons::Icon::Text, "view.markdownText"),
+        (markdown_ui::Mode::Preview, "Preview", icons::Icon::Markdown, "view.markdownPreview"),
+        (markdown_ui::Mode::Split, "Split", icons::Icon::Split, "view.markdownSplit"),
+    ] {
+        tools.push(Tool {
+            rect: Rect { x, y: area.y, w: width, h: area.height },
+            icon,
+            command,
+            enabled: true,
+            selected: choice == mode,
+            label: labels.then_some(label),
+        });
+        x += width;
+    }
 }
 
 impl MenuBar {
@@ -648,23 +698,30 @@ pub(super) fn draw_bar(
     }
     for tool in &bar.toolbar {
         let r = tool.rect;
-        if bar.toolbar_hover == Some(tool.command) && tool.enabled {
+        if tool.selected || (bar.toolbar_hover == Some(tool.command) && tool.enabled) {
             chrome::round_rect(
                 pixels,
                 stride,
                 Rect { x: r.x, y: r.y + inset, w: r.w, h: r.h.saturating_sub(2 * inset) },
                 m.radius,
-                chrome::mix(bg, fg, 0x26),
+                chrome::mix(
+                    bg,
+                    if tool.selected { theme_ui::rgb(theme, UiRole::Accent) } else { fg },
+                    if tool.selected { 0x40 } else { 0x26 },
+                ),
             );
         }
         icons::draw(
             pixels,
             stride,
             tool.icon,
-            ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32),
+            ((r.x + if tool.label.is_some() { m.dip(14.0) } else { r.w / 2 }) as f32, (r.y + r.h / 2) as f32),
             m.dip(18.0),
             if tool.enabled { fg } else { chrome::mix(bg, fg, 0x55) },
         );
+        if let Some(label) = tool.label {
+            font.draw(pixels, stride, r, r.x + m.dip(28.0), baseline, label, fg);
+        }
     }
 }
 
@@ -783,6 +840,8 @@ impl App {
         let tabs = self.view.session().tabs();
         Available {
             editor: editor.is_some(),
+            markdown: self.is_markdown_document(),
+            log: self.is_log_document(),
             selection: editor.is_some_and(|editor| editor.cursors().iter().any(|cursor| cursor.anchor != cursor.head)),
             palette: self.palette.is_some(),
             settings: self.settings_panel.is_some(),
@@ -825,6 +884,9 @@ impl App {
             }
         }
         if state.is_open() {
+            self.close_context();
+            self.cancel_logs_composition();
+            self.logs_ime = None;
             self.drag = None;
             self.selecting = false;
             if let Some(keys) = &mut self.keys {
@@ -1077,8 +1139,11 @@ impl App {
     /// Runs a menu command through the same path as the palette and bindings.
     pub(super) fn run_menu_command(&mut self, el: Option<&ActiveEventLoop>, command: &'static str) {
         if command == ABOUT {
-            let damage = self.view.set_notice(format!("Kwil {} - MIT License", env!("CARGO_PKG_VERSION")));
-            self.apply(damage);
+            self.about.start(&self.proxy);
+            if let Some(el) = el {
+                self.sync_desktop_window(el);
+            }
+            self.request_frame();
             return;
         }
         if command == "file.quit" {

@@ -7,9 +7,11 @@
 //! Scrolling moves existing pixels and draws only the newly exposed rows.
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
+mod about;
 mod chrome;
 mod clipboard;
 mod close_dialog;
+mod context_menu;
 mod desktop;
 mod desktop_window;
 mod file_dialog;
@@ -18,10 +20,16 @@ mod window_placement;
 // Until ROOT adopts the file-type registration backend; then `mod filetypes_ui;`.
 mod filetypes_ui;
 mod font;
+#[cfg(all(windows, feature = "gpu"))]
+mod gpu_surface;
 mod hit;
 mod icons;
 mod ime;
 mod input;
+mod log_ui;
+mod markdown_diagram;
+mod markdown_images;
+mod markdown_ui;
 mod menu;
 mod palette_ui;
 mod palette_view;
@@ -39,7 +47,10 @@ mod zoom;
 
 use font::Font;
 use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View, Workspace};
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(windows)))]
+mod gpu;
+#[cfg(all(feature = "gpu", windows))]
+#[path = "gpu_windows.rs"]
 mod gpu;
 #[cfg(feature = "frame-harness")]
 mod harness;
@@ -56,7 +67,7 @@ use kwil_core_commands::settings::Settings;
 
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
-use std::rc::Rc;
+use std::sync::Arc as Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -140,6 +151,9 @@ enum UserEvent {
     Notice(String),
     GlyphReady(shaping::Tile, u64),
     SettingsReady(Box<Settings>),
+    DiagnosticsReady(String),
+    LogReady,
+    MarkdownReady(Box<markdown_ui::Completion>),
     FontReady(Option<Box<Font>>),
     UiFontReady(Option<Box<font::UiFont>>),
     /// Wide-coverage face read for the chrome face with this id.
@@ -148,6 +162,8 @@ enum UserEvent {
     DroppedFile(std::path::PathBuf),
     #[cfg(feature = "gpu")]
     GpuReady(Result<Box<gpu::Gpu>, String>, f64),
+    #[cfg(feature = "gpu")]
+    GpuAvailable(Result<(), String>),
     #[cfg(feature = "frame-harness")]
     Harness(harness::Step),
 }
@@ -187,6 +203,8 @@ pub enum GuiEvent {
 }
 
 struct Gfx {
+    #[cfg(all(windows, feature = "gpu"))]
+    gpu_canvas: Option<gpu_surface::Canvas>,
     native: Option<platform::Native>,
     window: Rc<Window>,
     surface: Surface<Rc<Window>, Rc<Window>>,
@@ -239,9 +257,9 @@ mod input_dispatch_tests {
             assert_eq!(workspace.file_prompt().unwrap().text, value);
             assert!(workspace.close_pending());
             let mut prompt = Some(workspace.file_prompt().unwrap().text.clone());
-            assert!(input::commit("Ã¦â€”Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt".into(), &mut prompt, false).is_none());
+            assert!(input::commit("Ã¦—Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt".into(), &mut prompt, false).is_none());
             workspace.file_prompt_mut().unwrap().text = prompt.unwrap();
-            assert!(workspace.file_prompt().unwrap().text.ends_with("Ã¦â€”Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt"));
+            assert!(workspace.file_prompt().unwrap().text.ends_with("Ã¦—Â¥Ã¦Å“Â¬Ã¨ÂªÅ¾.txt"));
             assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 4);
             file_prompt::cancel(&mut workspace);
             assert!(!workspace.close_pending());
@@ -286,10 +304,10 @@ mod input_dispatch_tests {
             App::unbound_key(&keys, &Key::Character("q".into()), None, ModifiersState::CONTROL),
             UnboundKey::Ignore
         );
-        assert_eq!(keys.feed_with_selection("Ã§â€¢Å’".parse().unwrap()), VimResult::Unbound);
+        assert_eq!(keys.feed_with_selection("Ã§•Å’".parse().unwrap()), VimResult::Unbound);
         assert_eq!(
-            App::unbound_key(&keys, &Key::Character("Ã§â€¢Å’".into()), Some("Ã§â€¢Å’"), ModifiersState::empty()),
-            UnboundKey::Edit(input::Action::Text("Ã§â€¢Å’".into()))
+            App::unbound_key(&keys, &Key::Character("Ã§•Å’".into()), Some("Ã§•Å’"), ModifiersState::empty()),
+            UnboundKey::Edit(input::Action::Text("Ã§•Å’".into()))
         );
         assert_eq!(keys.feed_with_selection("cmd+s".parse().unwrap()), VimResult::Unbound);
         assert_eq!(
@@ -318,6 +336,12 @@ struct HostKey<'a> {
 }
 
 struct App {
+    about: about::About,
+    markdown: markdown_ui::Host,
+    context: context_menu::Context,
+    context_area: Option<Rect>,
+    logs: log_ui::Host,
+    logs_ime: Option<log_ui::Composition>,
     search: Option<kwil_view_model::search_session::SearchSession>,
     search_panel: kwil_view_model::search_panel::SearchPanel,
     search_origin: Option<search_ui::Origin>,
@@ -329,6 +353,7 @@ struct App {
     goto_epoch: u64,
     goto_reveal: Option<(kwil_view_model::SessionDocumentId, u64)>,
     highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
+    document_stopped: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     palette: Option<kwil_view_model::palette_session::PaletteSession>,
     palette_dirty: bool,
     palette_area: Option<Rect>,
@@ -390,6 +415,7 @@ struct App {
     gpu: Option<gpu::Gpu>,
     #[cfg(feature = "gpu")]
     gpu_started: bool,
+    presenter_gpu: bool,
     font_loading: bool,
     font_reload_pending: bool,
     redraw_requested: bool,
@@ -484,6 +510,7 @@ pub fn run_with_external_open(
         goto_epoch: 0,
         goto_reveal: None,
         highlighting: None,
+        document_stopped: None,
         palette: None,
         palette_dirty: false,
         palette_area: None,
@@ -508,6 +535,12 @@ pub fn run_with_external_open(
         on_first_frame: Some(on_first_frame),
         on_external_ready: Some(on_external_ready),
         external_open: Some(external_open),
+        about: Default::default(),
+        markdown: markdown_ui::Host::default(),
+        context: Default::default(),
+        context_area: None,
+        logs: Default::default(),
+        logs_ime: None,
         external_inbox,
         font_thread,
         font_size: Some(font_size),
@@ -545,6 +578,7 @@ pub fn run_with_external_open(
         gpu: None,
         #[cfg(feature = "gpu")]
         gpu_started: false,
+        presenter_gpu: false,
         font_loading: false,
         font_reload_pending: false,
         redraw_requested: false,
@@ -567,6 +601,7 @@ pub fn run_with_external_open(
         #[cfg(feature = "frame-harness")]
         metrics: Default::default(),
     };
+    app.logs.admit_projection_disk(1 << 30); // Same aggregate disk admission as SearchWorker::new.
     let result = event_loop.run_app(&mut app);
     app.desktop_window.take();
     // Transfer every owner before awaiting any result. The GUI loop has ended;
@@ -621,6 +656,15 @@ pub fn run_with_external_open(
             .map_err(|_| "search shutdown lane panicked".to_owned())?
         }) as shutdown::Job
     });
+    #[cfg(all(feature = "gpu", windows))]
+    let gpu_job = app.gpu.take().map(|gpu| Box::new(move || gpu.shutdown()) as shutdown::Job);
+    #[cfg(all(feature = "gpu", not(windows)))]
+    let gpu_job = app.gpu.take().map(|gpu| Box::new(move || gpu.shutdown().wait()) as shutdown::Job);
+    #[cfg(not(feature = "gpu"))]
+    let gpu_job = None;
+    let diagnostics_job = app.about.shutdown();
+    let markdown_job = app.markdown.shutdown();
+    let logs_job = app.logs.shutdown();
     let placement_latest = app.window_latest;
     let placement_job = app.window_placement.take().map(|service| {
         Box::new(move || {
@@ -629,8 +673,43 @@ pub fn run_with_external_open(
                 .map_err(|_| "Window placement shutdown panicked".to_owned())?
         }) as shutdown::Job
     });
-    let shutdown_result =
-        shutdown::drain([prep_job, welcome_job, registration_job, settings_job, search_job, placement_job]);
+    let syntax_job = app.highlighting.take().map(|host| {
+        Box::new(move || {
+            std::thread::spawn(move || host.shutdown())
+                .join()
+                .map_err(|_| "syntax shutdown lane panicked".to_owned())?
+        }) as shutdown::Job
+    });
+    let document_job = app.document_stopped.take().map(|stopped| {
+        // All snapshot-producing workers settle first. Drop actual documents
+        // on this final lane, then require the existing document-worker receipt.
+        let empty = Workspace::new(View::new(None)).expect("empty shutdown workspace");
+        let workspace = std::mem::replace(&mut app.view, empty);
+        Box::new(move || {
+            std::thread::spawn(move || {
+                drop(workspace);
+                stopped
+                    .recv_timeout(std::time::Duration::from_secs(35))
+                    .map_err(|_| "document shutdown receipt timed out; artifacts retained".to_owned())?
+            })
+            .join()
+            .map_err(|_| "document shutdown lane panicked".to_owned())?
+        }) as shutdown::Job
+    });
+    let shutdown_result = shutdown::drain([
+        prep_job,
+        welcome_job,
+        registration_job,
+        settings_job,
+        search_job,
+        placement_job,
+        markdown_job,
+        logs_job,
+        gpu_job,
+        diagnostics_job,
+        syntax_job,
+        document_job,
+    ]);
     if let Some(palette) = &mut app.palette {
         let handles = palette.stop();
         std::thread::spawn(move || {
@@ -658,7 +737,11 @@ impl App {
 
     /// Chrome comes from DPI metrics; only the text grid uses the editor font.
     fn body_area(&self) -> kwil_view_model::TabArea {
-        chrome::layout(self.size, &self.ui, self.settings.tabs.layout).body
+        let mut area = chrome::layout(self.size, &self.ui, self.settings.tabs.layout).body;
+        if self.markdown_mode() == markdown_ui::Mode::Split {
+            area.width /= 2;
+        }
+        log_ui::layout(area, &self.ui, self.logs.is_open()).body
     }
 
     fn columns(&self) -> u64 {
@@ -669,6 +752,23 @@ impl App {
     fn bars(&self) -> (scrollbar::Bar, scrollbar::Bar) {
         let body = self.body_area();
         let height = body.height.saturating_sub(self.ui.bar);
+        if self.logs.owns_body() {
+            let (top, horizontal) = self.logs.viewport_position();
+            let (total, exact, max_bytes) = self.logs.viewport_extent();
+            let visible = (height / self.ch().max(1)).min(4096) as u64;
+            let total = if exact { total } else { total.max(top.saturating_add(visible + 1)) };
+            return (
+                scrollbar::Bar::sized(0, height, visible, total, top, self.ui.min_thumb),
+                scrollbar::Bar::sized(
+                    0,
+                    body.width.saturating_sub(self.ui.bar),
+                    self.columns(),
+                    max_bytes,
+                    horizontal,
+                    self.ui.min_thumb,
+                ),
+            );
+        }
         let (page, total) =
             horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize);
         (
@@ -693,7 +793,7 @@ impl App {
 
     /// Current tab strip, built exactly as it is drawn.
     fn tab_frame(&mut self) -> tabs::Frame {
-        tabs::frame(
+        let mut frame = tabs::frame(
             &self.view,
             self.size,
             &self.ui,
@@ -701,7 +801,16 @@ impl App {
             self.settings.tabs.layout,
             self.ui_font.as_mut(),
             self.hover,
-        )
+        );
+        let body = self.body_area();
+        frame.geometry.body = body;
+        frame.geometry.text = kwil_view_model::TabArea {
+            x: body.x,
+            y: body.y,
+            width: body.width.saturating_sub(self.ui.bar),
+            height: body.height.saturating_sub(self.ui.bar) / self.ch() * self.ch(),
+        };
+        frame
     }
 
     /// Scrollbar thumb under the pointer, for hover feedback.
@@ -733,6 +842,71 @@ impl App {
     }
 
     /// Recomputes the hover target; a change damages only chrome and status.
+    fn sync_presenter(&mut self) -> bool {
+        let active = self.gpu_active();
+        if active == self.presenter_gpu {
+            return false;
+        }
+        self.presenter_gpu = active;
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &mut self.gpu {
+            gpu.invalidate();
+        }
+        #[cfg(all(windows, feature = "gpu"))]
+        if !active && let Some(canvas) = self.gfx.as_ref().and_then(|gfx| gfx.gpu_canvas.as_ref()) {
+            canvas.hide();
+        }
+        self.pending.full = true;
+        self.chrome_dirty = true;
+        self.request_frame();
+        true
+    }
+    fn gpu_active(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+                && !self.policy.remote()
+                && self.opts.renderer.unwrap_or(self.settings.render.backend)
+                    != kwil_core_commands::settings::RenderBackend::Cpu
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
+    }
+    fn update_pointer_cursor(&self) {
+        if let Some(gfx) = &self.gfx {
+            gfx.window.set_cursor(self.pointer_cursor());
+        }
+    }
+    fn pointer_cursor(&self) -> winit::window::CursorIcon {
+        let pointer = self.pointer;
+        let modal = self.file_modal()
+            || self.save_path.is_some()
+            || self.settings_open()
+            || self.palette_open()
+            || self.search_panel.is_open()
+            || self.logs.is_open()
+            || self.menu.state.is_open();
+        let text = !modal
+            && !self.context.is_open()
+            && self.markdown_mode() != markdown_ui::Mode::Preview
+            && self.chrome_frame.as_ref().is_some_and(|frame| frame.geometry.text.contains(pointer.0, pointer.1))
+            && !markdown_ui::preview_area(self).is_some_and(|area| area.contains(pointer));
+        let button = self.menu.toolbar.iter().any(|tool| tool.enabled && tool.rect.contains(pointer))
+            || self.menu.titles.iter().any(|area| area.contains(pointer.0, pointer.1))
+            || self.status_hits.iter().any(|(area, _, _)| area.contains(pointer))
+            || self.menu.dropdown.as_ref().is_some_and(|list| list.area.contains(pointer));
+        if let Some(drag) = self.drag {
+            if drag.vertical { winit::window::CursorIcon::NsResize } else { winit::window::CursorIcon::EwResize }
+        } else if text {
+            winit::window::CursorIcon::Text
+        } else if button {
+            winit::window::CursorIcon::Pointer
+        } else {
+            winit::window::CursorIcon::Default
+        }
+    }
     fn update_hover(&mut self) {
         let (x, y) = self.pointer;
         let lay = chrome::layout(self.size, &self.ui, self.settings.tabs.layout);
@@ -761,6 +935,11 @@ impl App {
     }
 
     fn scroll_bar(&mut self, vertical: bool, offset: u64) {
+        if self.logs.owns_body() {
+            let (top, horizontal) = self.logs.viewport_position();
+            self.logs_scroll_to(if vertical { offset } else { top }, if vertical { horizontal } else { offset });
+            return;
+        }
         if vertical {
             let delta = (offset as i128 - self.view.top() as i128).clamp(i64::MIN as i128, i64::MAX as i128);
             let damage = self.view.scroll(delta as i64);
@@ -785,9 +964,19 @@ impl App {
             return;
         }
         let (bar, pixel, offset, page) = if vertical {
-            (v, y, self.view.top(), self.view.rows() as u64)
+            (
+                v,
+                y,
+                if self.logs.owns_body() { self.logs.viewport_position().0 } else { self.view.top() },
+                self.text_rows() as u64,
+            )
         } else {
-            (h, x, self.horizontal, self.page_bytes())
+            (
+                h,
+                x,
+                if self.logs.owns_body() { self.logs.viewport_position().1 } else { self.horizontal },
+                if self.logs.owns_body() { self.columns() } else { self.page_bytes() },
+            )
         };
         if bar.contains_thumb(pixel) {
             self.drag = Some(scrollbar::Drag::new(vertical, bar, pixel, offset));
@@ -810,6 +999,11 @@ impl App {
     }
 
     fn apply(&mut self, mut d: Damage) {
+        if self.sync_presenter() {
+            d.full = true;
+        }
+        self.sync_markdown();
+        self.sync_logs();
         // Addressed events/edits invalidate search by document + revision.
         // This only captures an existing typed Editor snapshot, never decodes.
         if let Some(session) = &mut self.search {
@@ -912,6 +1106,28 @@ impl App {
             self.update_file_prompt();
             return;
         }
+        if self.markdown_mode() == markdown_ui::Mode::Preview
+            && !self.palette_open()
+            && !self.search_panel.is_open()
+            && !self.menu.state.is_open()
+            && !self.mods.control_key()
+            && !self.mods.alt_key()
+            && !self.mods.super_key()
+        {
+            match ev.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.dispatch_markdown("view.markdownText");
+                }
+                Key::Named(NamedKey::ArrowDown | NamedKey::PageDown) => {
+                    self.markdown_scroll_key(3);
+                }
+                Key::Named(NamedKey::ArrowUp | NamedKey::PageUp) => {
+                    self.markdown_scroll_key(-3);
+                }
+                _ => {}
+            }
+            return;
+        }
         // A scoped native-window probe can exercise the actual asynchronous
         // save callback without injecting global Ctrl state or taking focus.
         #[cfg(feature = "frame-harness")]
@@ -943,6 +1159,18 @@ impl App {
                 return;
             }
         }
+        if matches!(ev.logical_key, Key::Named(NamedKey::ContextMenu))
+            || (self.mods.shift_key() && matches!(ev.logical_key, Key::Named(NamedKey::F10)))
+        {
+            self.open_context();
+            return;
+        }
+        if self.context_key(ev) {
+            return;
+        }
+        if self.logs_key(ev) {
+            return;
+        }
         if self.search_key(ev) {
             return;
         }
@@ -971,7 +1199,11 @@ impl App {
                 match keys.feed_with_selection(chord) {
                     VimResult::Pending => return,
                     VimResult::Command(call) => {
-                        if self.dispatch_search_call(&call)
+                        if self.logs.owns_body() && call.id.starts_with("edit.") {
+                            return;
+                        }
+                        if self.dispatch_logs(call.id)
+                            || self.dispatch_search_call(&call)
                             || self.dispatch_settings(call.id)
                             || self.dispatch_palette(call.id)
                         {
@@ -1002,6 +1234,9 @@ impl App {
                             if call.id == "file.saveAndQuit" {
                                 self.close_pending = true;
                                 self.save();
+                                return;
+                            }
+                            if self.preview_blocks_command(call.id) {
                                 return;
                             }
                             if let Some(editor) = self.view.editor_mut() {
@@ -1076,12 +1311,20 @@ impl App {
             input::Action::Command(id) => (id, None),
             input::Action::Text(text) => ("edit.insert", Some(text)),
         };
-        if self.dispatch_search(id)
+        if self.logs.owns_body() && (id.starts_with("edit.") || id.starts_with("search.replace")) {
+            return;
+        }
+        if self.dispatch_logs(id)
+            || self.dispatch_markdown(id)
+            || self.dispatch_search(id)
             || self.dispatch_settings(id)
             || self.dispatch_palette(id)
             || self.dispatch_zoom(id)
             || self.dispatch_file(id)
         {
+            return;
+        }
+        if self.markdown_mode() == markdown_ui::Mode::Preview && id.starts_with("edit.") && id != "edit.copy" {
             return;
         }
         let args =
@@ -1213,11 +1456,17 @@ impl App {
         let result = editor.line_range(row).and_then(|range| {
             let offset = (range.start + first + byte as u64).min(range.end);
             let anchor = if extend { editor.primary_cursor().anchor } else { offset };
+            if editor.cursors().len() == 1
+                && editor.primary_cursor().head == offset
+                && editor.primary_cursor().anchor == anchor
+            {
+                return Ok(Damage::default());
+            }
             editor.set_cursors(vec![kwil_view_model::Cursor { anchor, head: offset, desired_column: None }], 0)
         });
         match result {
             Ok(damage) => {
-                let damage = self.view.refresh_after_edit(damage);
+                let damage = self.view.refresh_after_cursor(damage);
                 self.apply(damage);
                 if let Some(damage) = aligned_window {
                     self.apply(damage);
@@ -1231,6 +1480,18 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
+        // A native present already in flight keeps ownership until its worker
+        // acknowledges the pause. Preserve all damage and wait for that wake.
+        #[cfg(all(feature = "gpu", not(windows)))]
+        {
+            let active = self.gpu_active();
+            if let Some(gpu) = &mut self.gpu
+                && !gpu.set_active(active)
+            {
+                self.pending.full = true;
+                return true;
+            }
+        }
         if let Some(size) = self.pending_resize.take() {
             self.size = size;
             self.resize_surface();
@@ -1249,7 +1510,16 @@ impl App {
         }
         // Card-only repaints (hover, wheel) are admitted once; open cards then
         // repaint in place and damage only their own rectangles.
+        let projection_body_dirty = self.logs.body_paint.pending();
         self.take_overlay_paint();
+        let rows = self.text_rows();
+        if rows != self.view.rows() {
+            self.drag = None;
+            self.selecting = false;
+            let damage = self.view.set_rows(rows);
+            queue_damage(&mut self.pending, damage, rows, self.font.as_mut());
+            self.pending.full = true;
+        }
         let (w, h) = self.size;
         let ch = self.ch();
         if w == 0 || h < ch {
@@ -1281,6 +1551,12 @@ impl App {
         }
         let available = self.menu_available();
         self.menu.toolbar = menu::toolbar(lay.menu, &self.menu.titles, &self.ui, &available);
+        if self.view.editor().is_some_and(|editor| editor.is_markdown())
+            || self.markdown_mode() != markdown_ui::Mode::Text
+        {
+            let mode = self.markdown_mode();
+            menu::markdown_tools(&mut self.menu.toolbar, lay.menu, &self.menu.titles, &self.ui, mode);
+        }
         self.menu.toolbar_surface = Some((self.size.0, self.size.1, self.ui.scale.to_bits()));
         if let Some(native) = self.gfx.as_mut().and_then(|gfx| gfx.native.as_mut()) {
             native.toolbar_tooltips(&self.menu.toolbar, &self.menu.labels);
@@ -1290,6 +1566,9 @@ impl App {
         let dragging = self.drag.map(|drag| drag.vertical);
         let hover = self.hover;
         let theme = theme_ui::chrome();
+        let markdown_mode = self.markdown_mode();
+        let markdown_eligible = self.view.editor().is_some_and(|editor| editor.is_markdown());
+        let markdown_area = tabs::rect(lay.body);
         let body = geometry.body;
         let (bw, bh) = (body.width, body.height);
         self.body_pixels.resize(bw.saturating_mul(bh), bg());
@@ -1299,8 +1578,12 @@ impl App {
             || self.palette_open()
             || self.settings_open()
             || self.search_panel.is_open()
+            || self.logs.is_open()
             || self.save_path.is_some();
         let menu_list = self.menu.dropdown.is_some() || self.menu_area.is_some();
+        let gpu_active = self.gpu_active();
+        let projection_owns_body = self.logs.owns_body();
+        let projection_source = log_ui::Source::capture(&self.view);
         let spans: Vec<_> = self.highlighting.as_ref().into_iter().flat_map(|host| host.spans(&self.view)).collect();
         let (Some(gfx), Some(font)) = (self.gfx.as_mut(), self.font.as_mut()) else {
             return false;
@@ -1308,6 +1591,10 @@ impl App {
         if self.window_title != title {
             gfx.window.set_title(&title);
             self.window_title = title;
+        }
+        #[cfg(all(windows, feature = "gpu"))]
+        if !gpu_active && let Some(canvas) = &gfx.gpu_canvas {
+            canvas.hide();
         }
         let pixels = &mut gfx.pixels;
         let body_pixels = &mut self.body_pixels;
@@ -1317,6 +1604,9 @@ impl App {
         let search_dirty = std::mem::take(&mut self.search_dirty);
         if (palette_ui::palette_blocks_copy(palette_open, self.palette_area.is_some())
             || search_ui::blocks_copy(self.search_panel.is_open(), self.search_area.is_some())
+            || self.context.is_open()
+            || self.context_area.is_some()
+            || self.logs.blocks_copy()
             || menu_list)
             && p.scroll != 0
         {
@@ -1328,12 +1618,12 @@ impl App {
         let mut damage = Vec::new();
         #[cfg(feature = "frame-harness")]
         let mut copied = 0u64;
-        let body_changed = p.full || p.scroll != 0 || !p.rows.is_empty();
+        let body_changed = p.full || p.scroll != 0 || !p.rows.is_empty() || projection_body_dirty;
         if p.full {
             font.invalidate_rows();
             pixels.fill(bg());
             body_pixels.fill(bg());
-            for row in 0..rows {
+            for row in (0..rows).filter(|_| !projection_owns_body) {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
@@ -1349,7 +1639,11 @@ impl App {
                 body_pixels.copy_within(from * bw..(from + keep) * bw, to * bw);
                 let moved = Rect { x: 0, y: to, w: bw, h: keep };
                 tabs::composite(body_pixels, bw, pixels, w, body, moved);
-                if !screen_copy_region(&gfx.window, gfx.hwnd, source, target) {
+                #[cfg(feature = "gpu")]
+                let cpu_scroll = !gpu_active;
+                #[cfg(not(feature = "gpu"))]
+                let cpu_scroll = true;
+                if cpu_scroll && !screen_copy_region(&gfx.window, gfx.hwnd, source, target) {
                     damage.push(tabs::rect(target));
                 }
                 #[cfg(feature = "frame-harness")]
@@ -1359,7 +1653,7 @@ impl App {
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for &row in p.rows.iter().filter(|&&r| r < rows) {
+            for &row in p.rows.iter().filter(|&&r| r < rows && !projection_owns_body) {
                 draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
                 search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
@@ -1368,6 +1662,11 @@ impl App {
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
                 damage.push(tabs::translated(area, body));
             }
+        }
+        if projection_owns_body && body_changed {
+            log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source);
+            tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
+            damage.push(tabs::rect(body));
         }
         let chrome_frame = self.chrome_frame.as_ref().unwrap();
         if p.full || chrome_changed {
@@ -1378,12 +1677,17 @@ impl App {
             }
         }
         // Overlays leave by restoring body and chrome pixels underneath them.
+        let mut logs_restore_area = self.logs.take_restore();
+        let mut content_restored = false;
         for (dirty, area) in [
             (palette_dirty, &mut self.palette_area),
             (menu_dirty, &mut self.menu_area),
+            (menu_dirty, &mut self.context_area),
             (search_dirty, &mut self.search_area),
+            (logs_restore_area.is_some(), &mut logs_restore_area),
         ] {
             if dirty && let Some(area) = area.take() {
+                content_restored = true;
                 tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
                 draw_chrome(chrome_frame, &self.menu, pixels, w, self.ui_font.as_mut(), theme, &self.ui, hover);
                 p.status = true;
@@ -1453,6 +1757,34 @@ impl App {
                     damage.push(tabs::translated(area, body));
                 }
             }
+        }
+        if (body_changed || chrome_changed || content_restored)
+            && let Some(ui_font) = self.ui_font.as_mut()
+            && let Some(area) = markdown_ui::draw(
+                &mut self.markdown,
+                markdown_mode,
+                markdown_eligible,
+                self.view.top(),
+                pixels,
+                (w, h),
+                markdown_area,
+                ui_font,
+                &self.ui,
+                theme,
+            )
+        {
+            damage.push(area);
+        }
+        if let Some(font) = self.ui_font.as_mut()
+            && let Some(area) = log_ui::draw(&mut self.logs, pixels, (w, h), font, theme, &self.ui)
+        {
+            damage.push(area);
+        }
+        if let Some(caret) = self.logs.caret() {
+            gfx.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(caret.x as i32, caret.y as i32),
+                winit::dpi::PhysicalSize::new(caret.w as u32, caret.h as u32),
+            );
         }
         if let (Some(dropdown), Some(ui_font)) = (self.menu.dropdown.as_ref(), self.ui_font.as_mut()) {
             menu::draw_dropdown(&self.menu, dropdown, &available, pixels, w, ui_font, theme, &self.ui);
@@ -1578,12 +1910,73 @@ impl App {
                 damage.push(area);
             }
         }
-        let rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
+        if let Some(font) = self.ui_font.as_mut() {
+            self.context_area = context_menu::draw(&mut self.context, pixels, (w, h), font, &self.ui, theme);
+            if let Some(area) = self.context_area {
+                damage.push(area);
+            }
+        }
+        let mut rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
-        if !self.policy.remote()
+        if !rects.is_empty()
+            && !self.policy.remote()
+            && self.opts.renderer.unwrap_or(self.settings.render.backend) != RenderBackend::Cpu
             && let Some(gpu) = &mut self.gpu
         {
-            gpu.update_body(pixels, (w, h), &damage, p.scroll, ch, rows, Some(tabs::rect(geometry.text)));
+            #[cfg(windows)]
+            let presented = {
+                if gfx.gpu_canvas.is_none() {
+                    match gpu_surface::Canvas::create(gfx.hwnd) {
+                        Ok(canvas) => gfx.gpu_canvas = Some(canvas),
+                        Err(error) => {
+                            eprintln!("GPU canvas unavailable: {error}");
+                        }
+                    }
+                }
+                match &gfx.gpu_canvas {
+                    Some(canvas) => gpu.present(
+                        canvas.show((w, h)),
+                        pixels,
+                        (w, h),
+                        &damage,
+                        p.scroll,
+                        ch,
+                        tabs::rect(geometry.text),
+                    ),
+                    None => gpu::Presented::Failed("GPU child surface unavailable".into()),
+                }
+            };
+            #[cfg(not(windows))]
+            let presented =
+                gpu.present(gfx.window.clone(), pixels, (w, h), &damage, p.scroll, ch, tabs::rect(geometry.text));
+            match presented {
+                gpu::Presented::Yes => {
+                    #[cfg(feature = "frame-harness")]
+                    self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
+                    return true;
+                }
+                gpu::Presented::Deferred => {
+                    self.pending.full = true;
+                    return true;
+                }
+                gpu::Presented::Failed(error) => {
+                    eprintln!("kwil GPU presentation failed; using CPU: {error}");
+                    self.gpu = None;
+                    self.presenter_gpu = false;
+                    #[cfg(windows)]
+                    if let Some(canvas) = &gfx.gpu_canvas {
+                        canvas.hide();
+                    }
+                    // CPU owns the untouched parent HWND. Repair the entire
+                    // displayed image immediately, never wait for a later input.
+                    damage.clear();
+                    damage.push(Rect { x: 0, y: 0, w, h });
+                    rects.clear();
+                    if let Some(full) = (Rect { x: 0, y: 0, w, h }).to_softbuffer() {
+                        rects.push(full);
+                    }
+                }
+            }
         }
         if !rects.is_empty() {
             let mut target = match gfx.surface.buffer_mut() {
@@ -2108,7 +2501,15 @@ impl ApplicationHandler<UserEvent> for App {
         self.ui_font = self.ui_font_thread.take().and_then(|t| t.join().ok()).flatten();
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
-        self.gfx = Some(Gfx { native: None, window, surface, hwnd, pixels: vec![bg(); self.size.0 * self.size.1] });
+        self.gfx = Some(Gfx {
+            #[cfg(all(windows, feature = "gpu"))]
+            gpu_canvas: None,
+            native: None,
+            window,
+            surface,
+            hwnd,
+            pixels: vec![bg(); self.size.0 * self.size.1],
+        });
         self.resize_surface();
         let rows = self.text_rows();
         let d = self.view.set_rows(rows);
@@ -2128,7 +2529,12 @@ impl ApplicationHandler<UserEvent> for App {
             highlighting.update(&self.view);
         }
         let document_proxy = self.proxy.clone();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::sync_channel(1);
+        self.document_stopped = Some(stopped_rx);
         let complete = move |result| {
+            if let kwil_view_model::document_worker::DocumentResult::Stopped(result) = &result {
+                let _ = stopped_tx.try_send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+            }
             let _ = document_proxy.send_event(UserEvent::Document(Box::new(result)));
         };
         let worker = if self.opts.hidden {
@@ -2137,6 +2543,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.view.start_document_worker(complete)
         };
         if let Err(error) = worker {
+            self.document_stopped = None;
             let damage = self.view.set_notice(format!("File worker: {error}"));
             self.apply(damage);
         }
@@ -2166,10 +2573,11 @@ impl ApplicationHandler<UserEvent> for App {
             let _ = proxy.send_event(UserEvent::SettingsPath(result));
         });
         #[cfg(feature = "frame-harness")]
-        if self.opts.hidden && std::env::var_os("KWIL_FRAME_SCRIPT").is_some() {
-            if let Some(proxy) = self.proxy.native() {
-                harness::start(proxy);
-            }
+        if self.opts.hidden
+            && std::env::var_os("KWIL_FRAME_SCRIPT").is_some()
+            && let Some(proxy) = self.proxy.native()
+        {
+            harness::start(proxy);
         }
         if let Some(cb) = self.on_first_frame.take() {
             let p = self.proxy.clone();
@@ -2257,8 +2665,21 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 Damage { status: notice, ..Default::default() }
             }
+            UserEvent::LogReady => {
+                self.logs_ready();
+                return;
+            }
             UserEvent::Document(result) => {
+                let replacement = match &*result {
+                    kwil_view_model::document_worker::DocumentResult::Replaced { key, result, .. } => {
+                        Some((*key, result.as_ref().map(|_| ()).map_err(ToString::to_string)))
+                    }
+                    _ => None,
+                };
                 let damage = self.view.document_result(*result);
+                if let Some((key, result)) = replacement {
+                    self.search_replacement_finished(key, result);
+                }
                 self.sync_file_ui();
                 if let Some((document, epoch)) = self.goto_reveal {
                     if document != self.view.active_id() || epoch != self.view.input_epoch() {
@@ -2322,6 +2743,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_native_theme();
                 (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
                 self.start_gpu();
+                if self.sync_presenter() {
+                    self.apply(Damage { full: true, ..Default::default() });
+                }
                 #[cfg(feature = "frame-harness")]
                 println!(
                     "kwil-frame session_detected={detected} remote={} blink={}",
@@ -2457,6 +2881,17 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 return;
             }
+            UserEvent::DiagnosticsReady(platform) => {
+                self.about.platform = Some(platform);
+                if let Some(d) = &self.desktop_window {
+                    d.gfx.window.request_redraw();
+                }
+                return;
+            }
+            UserEvent::MarkdownReady(completion) => {
+                self.markdown_ready(*completion);
+                return;
+            }
             UserEvent::SettingsReady(settings) => {
                 self.settings_loaded = true;
                 let font_changed =
@@ -2495,6 +2930,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.activate_unicode(tabs_changed);
                 }
                 self.start_gpu();
+                if self.sync_presenter() {
+                    self.apply(Damage { full: true, ..Default::default() });
+                }
                 return;
             }
             UserEvent::FontReady(Some(mut font)) => {
@@ -2583,11 +3021,41 @@ impl ApplicationHandler<UserEvent> for App {
             #[cfg(feature = "gpu")]
             UserEvent::GpuReady(result, ms) => {
                 if std::env::var_os("KWIL_TRACE_STARTUP").is_some() {
-                    eprintln!("kwil-gpu device_init_ms={ms:.3} onscreen_takeover=false reason=no-damage-present-api");
+                    eprintln!("kwil-gpu device_init_ms={ms:.3} native_dx12_damage_present={}", cfg!(windows));
                 }
                 match result {
-                    Ok(gpu) => self.gpu = Some(*gpu),
+                    #[allow(unused_mut)]
+                    Ok(mut gpu) => {
+                        #[cfg(not(windows))]
+                        if let Some(gfx) = &self.gfx {
+                            if let gpu::Presented::Failed(error) = gpu.attach_window(gfx.window.clone()) {
+                                eprintln!("kwil GPU surface unavailable: {error}");
+                                self.apply(Damage { full: true, ..Default::default() });
+                                return;
+                            }
+                        }
+                        self.gpu = Some(*gpu);
+                    }
                     Err(error) => eprintln!("kwil-gpu unavailable: {error}"),
+                }
+                self.apply(Damage { full: true, ..Default::default() });
+                return;
+            }
+            #[cfg(feature = "gpu")]
+            UserEvent::GpuAvailable(result) => {
+                #[cfg(windows)]
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.available(result);
+                }
+                #[cfg(not(windows))]
+                if let Err(error) = result {
+                    eprintln!("kwil GPU worker failed; using CPU: {error}");
+                    self.gpu = None;
+                    self.pending.full = true;
+                }
+                // Successful asynchronous completion alone never produces an idle frame.
+                if cfg!(windows) || self.pending != Damage::default() {
+                    self.apply(Damage { full: true, ..Default::default() });
                 }
                 return;
             }
@@ -2642,6 +3110,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Resized(sz) => {
                 self.remember_placement();
+                self.close_context();
                 // The first Resized repeats the creation size.
                 let latest = (sz.width as usize, sz.height as usize);
                 if latest == self.pending_resize.unwrap_or(self.size) {
@@ -2670,6 +3139,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
                 self.toolbar_track();
+                self.context_track();
+                self.logs_track();
                 if self.menu.state.is_open() {
                     self.menu_track();
                 }
@@ -2702,13 +3173,42 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if self.selecting {
                     self.place_caret(true);
                 }
-                if self.drag.is_some() || self.selecting {
+                if self.drag.is_some() {
                     self.view.checkpoint_session();
                 }
+                self.update_pointer_cursor();
             }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                self.open_context();
+                self.update_pointer_cursor();
+            }
+            WindowEvent::MouseInput { button, .. }
+                if button != MouseButton::Left && self.logs.owns_point(self.pointer) && !self.logs_blocked() => {}
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if self.file_modal() {
                     return;
+                }
+                if self.context.is_open() {
+                    if state == ElementState::Pressed {
+                        self.context_mouse();
+                    }
+                    return;
+                }
+                if state == ElementState::Pressed && self.menu.state.is_open() && self.menu_mouse(el) {
+                    return;
+                }
+                if self.logs.owns_body() && !self.logs_blocked() {
+                    if state == ElementState::Pressed {
+                        self.pointer_down();
+                        if self.drag.is_some() {
+                            return;
+                        }
+                        if self.logs_mouse() {
+                            return;
+                        }
+                    } else if self.drag.take().is_some() || self.logs.owns_point(self.pointer) {
+                        return;
+                    }
                 }
                 if self.save_path.is_none() && self.search_panel.is_open() {
                     if state == ElementState::Pressed {
@@ -2756,6 +3256,9 @@ impl ApplicationHandler<UserEvent> for App {
                         self.status_hits.iter().find(|(rect, _, _)| rect.contains(self.pointer))
                     {
                         self.run_menu_command(Some(el), command);
+                        return;
+                    }
+                    if self.markdown_pointer() {
                         return;
                     }
                     self.pointer_down();
@@ -2831,14 +3334,26 @@ impl ApplicationHandler<UserEvent> for App {
                     el.exit();
                 }
             }
-            WindowEvent::Ime(_) if self.file_modal() => {}
+            WindowEvent::Ime(_) if self.file_modal() || self.context.is_open() => {}
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
                 if ime::starts_composition(self.composing, &text) {
                     self.search_ime = self.capture_search_composition();
+                    self.logs_ime = self.capture_logs_composition();
                 }
                 self.ime_preedit(&text);
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
+                if let Some(token) = self.logs_ime.take() {
+                    self.composing = false;
+                    self.ime_destination = None;
+                    self.logs_commit(token, &text);
+                    return;
+                }
+                if self.logs.is_open() {
+                    self.composing = false;
+                    self.ime_destination = Some(ime::Destination::Cancelled);
+                    return;
+                }
                 if let Some(destination) = self
                     .search_ime
                     .take()
@@ -2895,15 +3410,24 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Ime(Ime::Disabled) => {
                 self.search_ime = None;
+                self.logs_ime = None;
+                self.cancel_logs_composition();
+                self.close_context();
                 self.composing = false;
                 self.ime_destination = Some(ime::Destination::Cancelled);
             }
             WindowEvent::Ime(Ime::Enabled) => {
                 self.search_ime = None;
+                self.logs_ime = None;
+                self.cancel_logs_composition();
+                self.close_context();
                 ime::reset(&mut self.composing, &mut self.ime_destination);
             }
             WindowEvent::Focused(false) => {
                 self.search_ime = None;
+                self.logs_ime = None;
+                self.cancel_logs_composition();
+                self.close_context();
                 self.drag = None;
                 self.selecting = false;
                 self.composing = false;
@@ -2933,7 +3457,13 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y > 0.0,
                     MouseScrollDelta::PixelDelta(point) => point.y > 0.0,
                 };
+                if self.context.is_open() {
+                    return;
+                }
                 if self.menu_wheel(up) {
+                    return;
+                }
+                if self.logs_wheel(up) {
                     return;
                 }
                 if self.settings_open() {
@@ -2966,6 +3496,9 @@ impl ApplicationHandler<UserEvent> for App {
                         (-(p.x / self.ch() as f64) as i64, -(p.y / self.ch() as f64) as i64)
                     }
                 };
+                if self.markdown_wheel(vertical) {
+                    return;
+                }
                 if horizontal != 0 || self.mods.shift_key() {
                     let delta = if horizontal != 0 { horizontal } else { vertical };
                     let maximum = self.bars().1.maximum;
@@ -3118,7 +3651,12 @@ impl App {
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
                 let start = std::time::Instant::now();
-                let result = gpu::Gpu::init();
+                let result = {
+                    let wake = proxy.clone();
+                    gpu::Gpu::init_with_wake(move |result| {
+                        let _ = wake.send_event(UserEvent::GpuAvailable(result));
+                    })
+                };
                 let _ =
                     proxy.send_event(UserEvent::GpuReady(result.map(Box::new), start.elapsed().as_secs_f64() * 1000.0));
             });

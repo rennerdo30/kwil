@@ -2,13 +2,8 @@
 //! right of the editor body like a find widget, with real fields, option
 //! toggles, a match count, previous/next and close buttons. It is a visual
 //! adapter over the Find package's `SearchPanel`: every click becomes one of
-//! that panel's own `SearchInput`s, and replace buttons report the host's W2
-//! gate instead of mutating anything.
-//!
-//! Applies to the frozen Find + GoTo candidate
-//! (`E:/AgentData/scratch/kwil-find-goto-host-20261024`); its backend, worker
-//! and host admission are unchanged. `search_ui::draw_host` and the row
-//! arithmetic in `search_mouse` are replaced by `draw` and `click` here.
+//! that panel's own `SearchInput`s. The host admits owned replacement recipes
+//! to the document worker and acknowledges completion after editor return.
 use super::*;
 use chrome::Metrics;
 use desktop::{Colors, Field, Hits, Icon, Sizes, Style, inset};
@@ -37,8 +32,6 @@ pub(super) enum Click {
     /// Empty the Find query: the host sends `CLEAR_QUERY` in order, through
     /// its own `search_input`, so results update and the card stays open.
     Clear,
-    /// Replace is gated until W2 attaches its transaction executor.
-    ReplaceGate,
     Outside,
     Inside,
 }
@@ -164,11 +157,15 @@ pub(super) fn draw(
                 Target::Next => desktop::icon_button(pixels, stride, rect, Icon::Down, hovered, true, &c, &s),
                 Target::Previous => desktop::icon_button(pixels, stride, rect, Icon::Up, hovered, true, &c, &s),
                 Target::ReplaceNext => {
-                    desktop::button(pixels, stride, font, rect, "Replace", Style::Secondary, hovered, &c, &s)
+                    replacement_button(pixels, stride, font, rect, "Replace", hovered, panel.can_replace(), &c, &s)
                 }
-                _ => desktop::button(pixels, stride, font, rect, "Replace all", Style::Secondary, hovered, &c, &s),
+                _ => {
+                    replacement_button(pixels, stride, font, rect, "Replace all", hovered, panel.can_replace(), &c, &s)
+                }
             }
-            view.hits.push(rect, target);
+            if !matches!(target, Target::ReplaceNext | Target::ReplaceAll) || panel.can_replace() {
+                view.hits.push(rect, target);
+            }
         }
         y += s.control + s.gap;
     }
@@ -210,6 +207,31 @@ pub(super) fn draw(
     Some(r)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn replacement_button(
+    pixels: &mut [u32],
+    stride: usize,
+    font: &mut font::UiFont,
+    rect: Rect,
+    text: &str,
+    hovered: bool,
+    enabled: bool,
+    colors: &Colors,
+    sizes: &Sizes,
+) {
+    if enabled {
+        desktop::button(pixels, stride, font, rect, text, Style::Secondary, hovered, colors, sizes);
+    } else {
+        chrome::round_rect(pixels, stride, rect, sizes.radius, colors.border);
+        chrome::round_rect(pixels, stride, inset(rect, sizes.hairline), sizes.radius, colors.control);
+        let clip = inset(rect, sizes.inner.min(rect.w / 4));
+        let fitted = font.fit(text, clip.w);
+        let width = font.measure(&fitted, clip.w);
+        let baseline = font.baseline(rect.y, rect.h);
+        font.draw(pixels, stride, clip, clip.x + (clip.w - width) / 2, baseline, &fitted, colors.faint);
+    }
+}
+
 /// Click against the painted geometry. A repaint for another panel epoch or
 /// a different card rectangle makes older geometry inert.
 pub(super) fn click(view: &View, panel: &SearchPanel, current: Option<Rect>, pointer: (usize, usize)) -> Click {
@@ -230,13 +252,66 @@ pub(super) fn click(view: &View, panel: &SearchPanel, current: Option<Rect>, poi
         Some(Target::Previous) => Click::Input(SearchInput::Previous),
         Some(Target::Next) => Click::Input(SearchInput::Next),
         Some(Target::Close) => Click::Input(SearchInput::Cancel),
-        Some(Target::ReplaceNext | Target::ReplaceAll) if panel.mode() == SearchMode::Replace => Click::ReplaceGate,
+        Some(Target::ReplaceNext) if panel.mode() == SearchMode::Replace && panel.can_replace() => {
+            Click::Input(SearchInput::ReplaceNext)
+        }
+        Some(Target::ReplaceAll) if panel.mode() == SearchMode::Replace && panel.can_replace() => {
+            Click::Input(SearchInput::ReplaceAll)
+        }
         _ => Click::Inside,
     }
 }
 
 pub(super) fn hover(view: &View, pointer: (usize, usize)) -> Option<Target> {
     view.area.filter(|area| area.contains(pointer)).and_then(|_| view.hits.at(pointer))
+}
+
+#[cfg(test)]
+mod replacement_dispatch_tests {
+    use super::*;
+    use kwil_view_model::search_session::SearchSession;
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn replacement_buttons_follow_query_readiness_and_emit_typed_inputs() {
+        let mut workspace = Workspace::new(kwil_view_model::View::new(None)).unwrap();
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("one one".into()), ..Default::default() }, 1)
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut session = SearchSession::new(move || {
+            let _ = tx.send(());
+        })
+        .unwrap();
+        let mut panel = SearchPanel::default();
+        panel.command(&mut session, &workspace, "search.replace", &Default::default()).unwrap();
+        let area = Rect { x: 0, y: 0, w: 100, h: 40 };
+        let one = Rect { x: 0, y: 0, w: 50, h: 40 };
+        let all = Rect { x: 50, ..one };
+        let mut view = View { area: Some(area), epoch: panel.epoch(), ..Default::default() };
+        view.hits.push(one, Target::ReplaceNext);
+        view.hits.push(all, Target::ReplaceAll);
+        assert!(matches!(click(&view, &panel, Some(area), (10, 10)), Click::Inside));
+        panel.input(&mut session, &workspace, SearchInput::Text("one")).unwrap();
+        view.epoch = panel.epoch();
+        assert!(matches!(click(&view, &panel, Some(area), (60, 10)), Click::Inside), "pending matches are disabled");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while panel.is_pending() {
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("bounded search readiness");
+            panel.worker_ready(&mut session, &workspace);
+        }
+        assert!(matches!(click(&view, &panel, Some(area), (10, 10)), Click::Input(SearchInput::ReplaceNext)));
+        assert!(matches!(click(&view, &panel, Some(area), (60, 10)), Click::Input(SearchInput::ReplaceAll)));
+        panel.input(&mut session, &workspace, SearchInput::Focus(SearchField::Replacement)).unwrap();
+        assert!(
+            matches!(click(&view, &panel, Some(area), (10, 10)), Click::Inside),
+            "old input epoch geometry is inert"
+        );
+        panel.take_shutdown(&mut session).unwrap_or_else(|_| panic!("shutdown ownership")).shutdown().unwrap();
+    }
 }
 
 #[cfg(all(test, windows))]

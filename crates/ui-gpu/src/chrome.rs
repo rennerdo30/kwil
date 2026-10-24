@@ -282,6 +282,12 @@ pub(super) fn status(view: &Workspace, zoom: u32) -> (String, Vec<Segment>) {
     if let Some(recovery) = view.recovery_notice() {
         segments.push(segment(recovery.to_owned(), None, true));
     }
+    if view
+        .editor()
+        .is_some_and(|editor| editor.document().compression == kwil_core_workspace::compressed::CompressionFormat::Gzip)
+    {
+        segments.push(segment("Gzip · decoded text".into(), None, false));
+    }
     if zoom != 100 {
         segments.push(segment(format!("Zoom {zoom}%"), Some("view.zoomReset"), false));
     }

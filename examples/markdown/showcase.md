@@ -65,7 +65,7 @@ for item in range(3):
 
 ## Mermaid acceptance cases
 
-Diagram rendering is not currently connected: these must remain explicit code blocks, never be reported as rendered diagrams. These examples pin the desired future acceptance.
+These examples exercise the bounded native flowchart and sequence renderer. Unsupported Mermaid declarations must show a clear explanation and preserve their original fenced source.
 
 ```mermaid
 flowchart LR

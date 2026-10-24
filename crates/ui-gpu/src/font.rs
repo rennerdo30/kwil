@@ -258,6 +258,14 @@ impl UiFace {
     /// Worker-only chain: proportional faces, then every face the editor font
     /// can start from, then any installed sans or monospace face. Whenever the
     /// editor font loads, chrome text therefore has a face too.
+    fn symbols() -> Option<UiFace> {
+        Self::read([
+            (r"C:\Windows\Fonts\seguiemj.ttf", 0),
+            ("/System/Library/Fonts/Apple Color Emoji.ttc", 0),
+            ("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 0),
+            ("/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf", 0),
+        ])
+    }
     fn chain() -> Option<UiFace> {
         Self::chain_from(UI_CANDIDATES.iter().copied(), editor_candidates(), Self::system)
     }
@@ -294,6 +302,7 @@ struct UiGlyph {
     width: usize,
     height: usize,
     alpha: Vec<u8>,
+    color: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +320,7 @@ pub struct UiFont {
     id: u64,
     face: UiFace,
     fallback: Option<UiFace>,
+    symbols: Option<UiFace>,
     fallback_state: Fallback,
     pub px: f32,
     pub descent: usize,
@@ -319,6 +329,7 @@ pub struct UiFont {
     /// Coverage bytes retained by `glyphs`.
     bytes: usize,
     heading: Option<Box<UiFont>>,
+    monospace: Option<Box<UiFont>>,
     #[cfg(test)]
     rasterized: usize,
 }
@@ -328,11 +339,20 @@ impl UiFont {
     /// then the ASCII set is rasterized once the window reports its scale.
     pub fn startup(px: std::sync::mpsc::Receiver<f32>) -> Option<UiFont> {
         let face = UiFace::chain()?;
-        Self::from_face(face, px.recv().ok()?)
+        let mono = UiFace::read(editor_candidates());
+        let symbols = UiFace::symbols();
+        let px = px.recv().ok()?;
+        let mut font = Self::from_face(face, px)?;
+        font.monospace = mono.and_then(|face| Self::single_face(face, px)).map(Box::new);
+        font.install_symbols(symbols);
+        Some(font)
     }
     /// Worker-only (reads files).
     pub fn load(px: f32) -> Option<UiFont> {
-        Self::from_face(UiFace::chain()?, px)
+        let mut font = Self::from_face(UiFace::chain()?, px)?;
+        font.monospace = UiFace::read(editor_candidates()).and_then(|face| Self::single_face(face, px)).map(Box::new);
+        font.install_symbols(UiFace::symbols());
+        Some(font)
     }
     fn from_face(face: UiFace, px: f32) -> Option<UiFont> {
         let mut font = Self::single_face(face.clone(), px)?;
@@ -347,6 +367,7 @@ impl UiFont {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             face,
             fallback: None,
+            symbols: None,
             fallback_state: Fallback::Unneeded,
             px,
             descent: metrics.descent.abs().ceil() as usize,
@@ -354,6 +375,7 @@ impl UiFont {
             glyphs: HashMap::new(),
             bytes: 0,
             heading: None,
+            monospace: None,
             #[cfg(test)]
             rasterized: 0,
         };
@@ -364,8 +386,15 @@ impl UiFont {
     /// Reuses immutable font bytes; no disk access or system-font scan.
     pub(super) fn variant(&self, px: f32) -> Option<Self> {
         let mut font = Self::from_face(self.face.clone(), px)?;
+        font.monospace =
+            self.monospace.as_ref().and_then(|mono| Self::single_face(mono.face.clone(), px)).map(Box::new);
+        font.install_symbols(self.symbols.clone());
         font.fallback = self.fallback.clone();
         font.fallback_state = self.fallback_state;
+        if let Some(mono) = &mut font.monospace {
+            mono.fallback = self.fallback.clone();
+            mono.fallback_state = self.fallback_state;
+        }
         if let Some(heading) = &mut font.heading {
             heading.fallback = self.fallback.clone();
             heading.fallback_state = self.fallback_state;
@@ -373,6 +402,19 @@ impl UiFont {
         Some(font)
     }
 
+    fn install_symbols(&mut self, face: Option<UiFace>) {
+        self.symbols = face.clone();
+        if let Some(font) = &mut self.heading {
+            font.symbols = face.clone();
+        }
+        if let Some(font) = &mut self.monospace {
+            font.symbols = face;
+        }
+    }
+    /// Same-DPI monospace loaded with the chrome face on its font worker.
+    pub(super) fn monospace(&mut self) -> &mut Self {
+        if self.monospace.is_some() { self.monospace.as_deref_mut().unwrap() } else { self }
+    }
     pub(super) fn heading(&mut self) -> &mut Self {
         if self.heading.is_some() { self.heading.as_deref_mut().unwrap() } else { self }
     }
@@ -393,7 +435,9 @@ impl UiFont {
     }
     /// True once per font when a glyph was missing and no fallback was tried.
     pub fn take_fallback_request(&mut self) -> bool {
-        let wanted = self.fallback_state == Fallback::Wanted;
+        let wanted = self.fallback_state == Fallback::Wanted
+            || self.heading.as_ref().is_some_and(|font| font.fallback_state == Fallback::Wanted)
+            || self.monospace.as_ref().is_some_and(|font| font.fallback_state == Fallback::Wanted);
         if wanted {
             self.fallback_state = Fallback::Requested;
         }
@@ -403,6 +447,12 @@ impl UiFont {
         self.install_shared_fallback(face.and_then(|(data, index)| UiFace::from_data(data, index)));
     }
     fn install_shared_fallback(&mut self, face: Option<UiFace>) {
+        if let Some(font) = &mut self.heading {
+            font.install_shared_fallback(face.clone());
+        }
+        if let Some(font) = &mut self.monospace {
+            font.install_shared_fallback(face.clone());
+        }
         self.fallback = face;
         self.fallback_state = if self.fallback.is_some() { Fallback::Installed } else { Fallback::Unavailable };
         // Glyphs drawn as missing boxes are rasterized again from the new face.
@@ -445,9 +495,23 @@ impl UiFont {
                     _ => {}
                 }
             }
+            if id == 0
+                && let Some(symbols) = &self.symbols
+            {
+                let candidate = symbols.font();
+                if candidate.charmap().map(c) != 0 {
+                    font = candidate;
+                    id = candidate.charmap().map(c);
+                }
+            }
             let advance = font.glyph_metrics(&[]).scale(self.px).advance_width(id);
             let mut scaler = context.builder(font).size(self.px).hint(true).build();
-            let image = swash::scale::Render::new(&[swash::scale::Source::Outline]).render(&mut scaler, id);
+            let image = swash::scale::Render::new(&[
+                swash::scale::Source::ColorOutline(0),
+                swash::scale::Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
+                swash::scale::Source::Outline,
+            ])
+            .render(&mut scaler, id);
             #[cfg(test)]
             {
                 self.rasterized += 1;
@@ -457,15 +521,24 @@ impl UiFont {
                 |image| {
                     use swash::scale::image::Content;
                     let (width, height) = (image.placement.width as usize, image.placement.height as usize);
+                    let color = image.content == Content::Color;
                     let alpha = match image.content {
                         Content::Mask => image.data,
                         Content::SubpixelMask => image.data.as_chunks::<4>().0.iter().map(|p| p[0]).collect(),
-                        Content::Color => image.data.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
+                        Content::Color => image.data,
                     };
-                    UiGlyph { advance, left: image.placement.left, top: image.placement.top, width, height, alpha }
+                    UiGlyph {
+                        advance,
+                        left: image.placement.left,
+                        top: image.placement.top,
+                        width,
+                        height,
+                        alpha,
+                        color,
+                    }
                 },
             );
-            if glyph.alpha.len() != glyph.width * glyph.height {
+            if glyph.alpha.len() != glyph.width * glyph.height * if glyph.color { 4 } else { 1 } {
                 glyph = UiGlyph { advance, ..Default::default() };
             }
             if self.bytes + glyph.alpha.len() > UI_GLYPH_BYTES && !pinned(c) {
@@ -556,6 +629,20 @@ impl UiFont {
         text: &str,
         color: u32,
     ) -> usize {
+        self.draw_styled(buf, stride, clip, x, baseline, text, color, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_styled(
+        &mut self,
+        buf: &mut [u32],
+        stride: usize,
+        clip: crate::Rect,
+        x: usize,
+        baseline: usize,
+        text: &str,
+        color: u32,
+        italic: bool,
+    ) -> usize {
         let (right, bottom) = (clip.x + clip.w, (clip.y + clip.h).min(buf.len() / stride.max(1)));
         let mut pen = x as f32;
         for c in text.chars().take(UI_SCALARS) {
@@ -573,13 +660,24 @@ impl UiFont {
                     }
                     let row = y as usize * stride;
                     for gx in 0..glyph.width {
-                        let px = left + gx as i32;
-                        let a = glyph.alpha[gy * glyph.width + gx];
+                        let shear = if italic { (glyph.height.saturating_sub(gy) / 5) as i32 } else { 0 };
+                        let px = left + gx as i32 + shear;
+                        let index = (gy * glyph.width + gx) * if glyph.color { 4 } else { 1 };
+                        let a = glyph.alpha[index + if glyph.color { 3 } else { 0 }];
                         if a == 0 || px < clip.x as i32 || px >= right.min(stride) as i32 {
                             continue;
                         }
                         let dst = &mut buf[row + px as usize];
-                        *dst = blend(*dst, color, a);
+                        *dst = if glyph.color {
+                            let rgba = &glyph.alpha[index..index + 4];
+                            let inverse = 255 - u32::from(a);
+                            let channel = |shift: u32, value: u8| {
+                                (u32::from(value) + (((*dst >> shift) & 255) * inverse + 127) / 255).min(255)
+                            };
+                            (channel(16, rgba[0]) << 16) | (channel(8, rgba[1]) << 8) | channel(0, rgba[2])
+                        } else {
+                            blend(*dst, color, a)
+                        };
                     }
                 }
             }
@@ -909,5 +1007,26 @@ mod tests {
         let arrived = crate::glyph_damage(&mut font, Tile { key, pixels: vec![0; 20] }, 10);
         assert!(arrived.status);
         assert!(arrived.rows.is_empty());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod color_glyph_tests {
+    use super::*;
+    #[test]
+    fn emoji_retains_color_layers_instead_of_a_solid_coverage_disc() {
+        let mut font = UiFont::load(24.0).expect("Windows UI font");
+        font.prepare(std::iter::once('🙂'));
+        let glyph = font.glyphs.get(&'🙂').unwrap();
+        assert!(glyph.color, "emoji must use its color layers");
+        let colors: std::collections::BTreeSet<_> =
+            glyph.alpha.as_chunks::<4>().0.iter().filter(|p| p[3] > 200).map(|p| (p[0], p[1], p[2])).collect();
+        assert!(colors.len() > 4, "facial details and face fill must not collapse into one color");
+        let mut pixels = vec![0x202020; 64 * 48];
+        font.draw(&mut pixels, 64, crate::Rect { x: 0, y: 0, w: 64, h: 48 }, 4, 32, "🙂", 0xffffff);
+        assert!(
+            pixels.iter().any(|p| ((*p >> 16) & 255) > 100 && ((*p >> 8) & 255) > 70 && (*p & 255) < 80),
+            "face's warm color survives drawing"
+        );
     }
 }

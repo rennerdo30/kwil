@@ -5,6 +5,7 @@ use winit::window::WindowButtons;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
+    About,
     Welcome,
     Settings,
 }
@@ -55,6 +56,8 @@ impl App {
     pub(super) fn sync_desktop_window(&mut self, el: &ActiveEventLoop) {
         let wanted = if self.file_dialogs.exiting() {
             None
+        } else if self.about.open {
+            Some(Kind::About)
         } else if self.welcome.visible() {
             Some(Kind::Welcome)
         } else if self.settings_open() {
@@ -91,7 +94,11 @@ impl App {
         let inner = (placement.width as f64 / scale - 16.0, placement.height as f64 / scale - 48.0);
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
-            .with_title(if kind == Kind::Settings { "Settings — Kwil" } else { "Welcome to Kwil" })
+            .with_title(match kind {
+                Kind::Settings => "Settings — Kwil",
+                Kind::About => "About Kwil",
+                Kind::Welcome => "Welcome to Kwil",
+            })
             .with_inner_size(LogicalSize::new(inner.0.max(1.0), inner.1.max(1.0)))
             .with_min_inner_size(LogicalSize::new(560.0f64.min(inner.0).max(1.0), 440.0f64.min(inner.1).max(1.0)))
             .with_position(position)
@@ -131,7 +138,15 @@ impl App {
                 cloak_and_show(hwnd);
             }
             Ok::<_, String>(Dialog {
-                gfx: Gfx { native: None, window, surface, hwnd, pixels: Vec::new() },
+                gfx: Gfx {
+                    #[cfg(all(windows, feature = "gpu"))]
+                    gpu_canvas: None,
+                    native: None,
+                    window,
+                    surface,
+                    hwnd,
+                    pixels: Vec::new(),
+                },
                 kind,
                 size: (size.width as usize, size.height as usize),
                 allocated: (0, 0),
@@ -186,7 +201,9 @@ impl App {
                 self.welcome_view.hits = desktop::Hits::default();
             }
             WindowEvent::CloseRequested => {
-                if self.welcome.visible() {
+                if self.about.open {
+                    self.about.open = false;
+                } else if self.welcome.visible() {
                     if self.welcome.stage() != welcome::Stage::Registering {
                         self.welcome_action(welcome_ui::Action::Skip);
                     }
@@ -197,6 +214,43 @@ impl App {
             }
             WindowEvent::Destroyed => {
                 self.desktop_window.take();
+            }
+            other if self.about.open => {
+                match other {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        if let Some(d) = &mut self.desktop_window {
+                            d.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
+                        }
+                    }
+                    WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                        if let Some(action) = self.desktop_window.as_ref().and_then(|d| self.about.hit(d.pointer)) {
+                            self.about_action(action);
+                        }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => about::wheel(
+                        &mut self.about,
+                        match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                            MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                        },
+                    ),
+                    WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                        match event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                self.about.open = false;
+                            }
+                            Key::Character(c) if self.mods.control_key() && c.eq_ignore_ascii_case("c") => {
+                                self.about_action(about::Action::Copy)
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(d) = &self.desktop_window {
+                    d.gfx.window.request_redraw();
+                }
+                self.sync_desktop_window(el);
             }
             other => {
                 let Some(dialog) = &self.desktop_window else { return };
@@ -240,6 +294,18 @@ impl App {
         dialog.gfx.pixels.fill(colors.sidebar);
         let Some(font) = dialog.font.as_mut() else { return true };
         match dialog.kind {
+            Kind::About => {
+                let diagnostics = self.diagnostics();
+                about::draw(
+                    &mut self.about,
+                    &diagnostics,
+                    &mut dialog.gfx.pixels,
+                    dialog.size,
+                    font,
+                    &dialog.metrics,
+                    theme,
+                );
+            }
             Kind::Welcome => {
                 self.welcome_view.paint.take();
                 welcome_ui::draw(

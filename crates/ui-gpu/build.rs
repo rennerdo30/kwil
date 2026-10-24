@@ -51,6 +51,45 @@ fn geometry(svg: &str) -> String {
     out
 }
 fn main() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let marker = root.join(".git");
+    let git = if marker.is_file() {
+        let data = std::fs::read_to_string(&marker).unwrap_or_default();
+        root.join(data.trim().strip_prefix("gitdir: ").unwrap_or(".git"))
+    } else {
+        marker
+    };
+    println!("cargo:rerun-if-env-changed=KWIL_BUILD_COMMIT");
+    let head = git.join("HEAD");
+    let common_marker = git.join("commondir");
+    println!("cargo:rerun-if-changed={}", head.display());
+    println!("cargo:rerun-if-changed={}", common_marker.display());
+    let common = std::fs::read_to_string(&common_marker).map(|v| git.join(v.trim())).unwrap_or_else(|_| git.clone());
+    let value = std::fs::read_to_string(&head).unwrap_or_default();
+    let id = if let Ok(explicit) = std::env::var("KWIL_BUILD_COMMIT") {
+        assert!(explicit.len() == 40 && explicit.bytes().all(|b| b.is_ascii_hexdigit()), "invalid KWIL_BUILD_COMMIT");
+        explicit
+    } else if let Some(reference) = value.trim().strip_prefix("ref: ") {
+        let path = common.join(reference);
+        let packed = common.join("packed-refs");
+        println!("cargo:rerun-if-changed={}", path.display());
+        println!("cargo:rerun-if-changed={}", packed.display());
+        std::fs::read_to_string(path).unwrap_or_else(|_| {
+            std::fs::read_to_string(packed)
+                .unwrap_or_default()
+                .lines()
+                .find_map(|line| {
+                    line.split_once(' ').filter(|(_, name)| *name == reference).map(|(id, _)| id.to_owned())
+                })
+                .unwrap_or_default()
+        })
+    } else {
+        value
+    };
+    if id.trim().len() == 40 && id.trim().bytes().all(|b| b.is_ascii_hexdigit()) {
+        println!("cargo:rustc-env=KWIL_BUILD_COMMIT={}", id.trim());
+    }
+
     println!("cargo:rerun-if-changed=windows.manifest");
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let path = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("windows.manifest");
@@ -79,6 +118,10 @@ fn main() {
         ("Sun", "sun"),
         ("Moon", "moon"),
         ("Search", "search"),
+        ("Cut", "cut"),
+        ("Copy", "copy"),
+        ("Paste", "paste"),
+        ("Filter", "filter"),
     ] {
         let path = dir.join(format!("{file}.svg"));
         println!("cargo:rerun-if-changed={}", path.display());

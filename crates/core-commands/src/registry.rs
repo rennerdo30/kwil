@@ -75,6 +75,8 @@ commands! {
         "view.toggleHex" => "Toggle Hex View", "view.toggleWordWrap" => "Toggle Word Wrap",
         "view.toggleWhitespace" => "Toggle Whitespace", "view.zoomIn" => "Zoom In",
         "view.zoomOut" => "Zoom Out", "view.zoomReset" => "Reset Zoom",
+        "view.logFilters" => "Filter Log Levels and Time",
+        "view.markdownText" => "Markdown: Text", "view.markdownPreview" => "Markdown: Preview", "view.markdownSplit" => "Markdown: Split",
         "view.toggleMarkdown" => "Toggle Markdown Preview", "view.settings" => "Open Settings",
         "view.settingsFile" => "Open Settings File"
     },

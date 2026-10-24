@@ -124,6 +124,7 @@ impl App {
         }
         match self.palette.as_ref().filter(|palette| palette.model().is_open()) {
             Some(palette) => ime::Destination::Palette { epoch: palette.input_epoch() },
+            None if self.markdown_mode() == markdown_ui::Mode::Preview => ime::Destination::Cancelled,
             None => ime::capture(&self.view, self.insert_mode()),
         }
     }
@@ -246,7 +247,12 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
-                if self.dispatch_search(command) || self.dispatch_settings(command) || self.dispatch_palette(command) {
+                if self.dispatch_logs(command)
+                    || self.dispatch_markdown(command)
+                    || self.dispatch_search(command)
+                    || self.dispatch_settings(command)
+                    || self.dispatch_palette(command)
+                {
                     return;
                 }
                 use kwil_core_commands::vim::VimResult;
@@ -255,6 +261,15 @@ impl App {
                     Some(VimResult::Command(call))
                         if self.settings.keymap == kwil_core_commands::Preset::Vim && model_vim_command(call.id) =>
                     {
+                        if self.logs.owns_body() && call.id.starts_with("edit.") {
+                            return;
+                        }
+                        if self.preview_blocks_command(call.id) {
+                            return;
+                        }
+                        if self.preview_blocks_command(call.id) {
+                            return;
+                        }
                         if let Some(editor) = self.view.editor_mut() {
                             match editor.execute_vim(&call) {
                                 Ok(result) => {

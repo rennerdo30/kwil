@@ -178,6 +178,14 @@ enum Followup {
     ReplaceRecipe,
 }
 
+/// Metadata captured before the owned recipe leaves the coherent dispatcher.
+/// It acknowledges one admission/completion without retaining recipe bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplacementAcknowledgement {
+    key: SearchKey,
+    epoch: u64,
+}
+
 pub struct SearchPanel {
     open: bool,
     active: bool,
@@ -207,6 +215,7 @@ pub struct SearchPanel {
     count: u64,
     exact: bool,
     pending: bool,
+    ready: bool,
     status: String,
     error: Option<String>,
     followup: Option<(SearchKey, Followup)>,
@@ -217,6 +226,9 @@ pub struct SearchPanel {
     pending_seed: Option<(SearchKey, SeedResult)>,
     seed_epoch: Option<u64>,
     seed_origin: Option<(Vec<(u64, u64)>, usize)>,
+    replacement_epoch: Option<u64>,
+    replacement_pending: Option<ReplacementAcknowledgement>,
+    replacement_notice: Option<(u64, String)>,
 }
 impl Default for SearchPanel {
     fn default() -> Self {
@@ -249,6 +261,7 @@ impl Default for SearchPanel {
             count: 0,
             exact: false,
             pending: false,
+            ready: false,
             status: "Find".into(),
             error: None,
             followup: None,
@@ -259,6 +272,9 @@ impl Default for SearchPanel {
             pending_seed: None,
             seed_epoch: None,
             seed_origin: None,
+            replacement_epoch: None,
+            replacement_pending: None,
+            replacement_notice: None,
         }
     }
 }
@@ -267,7 +283,16 @@ impl SearchPanel {
         self.open
     }
     pub fn is_pending(&self) -> bool {
-        self.pending
+        self.pending || self.replacement_pending.is_some()
+    }
+    pub fn can_replace(&self) -> bool {
+        self.mode != SearchMode::Files
+            && !self.query.text.is_empty()
+            && !self.is_pending()
+            && self.ready
+            && self.count != 0
+            && self.paint_key.is_some()
+            && self.paint_key == self.request_key
     }
     pub fn count(&self) -> (u64, bool) {
         (self.count, self.exact)
@@ -501,7 +526,25 @@ impl SearchPanel {
         view: &Workspace,
         input: SearchInput<'_>,
     ) -> Result<SearchOutcome, String> {
+        if matches!(input, SearchInput::ReplaceNext | SearchInput::ReplaceAll) {
+            if self.mode == SearchMode::Files {
+                return Err("Folder replacement awaits the atomic folder executor".into());
+            }
+            if view.document_busy(view.active_id()) || self.replacement_pending.is_some() {
+                return Err("Replacement is still running; wait for the document worker".into());
+            }
+            if self.query.text.is_empty() {
+                return Err("Enter a search query before replacing matches".into());
+            }
+            if self.pending || self.paint_key != self.request_key {
+                return Err("Search results are updating; wait before replacing matches".into());
+            }
+            if !self.ready || self.count == 0 {
+                return Err("No valid search matches are ready for replacement".into());
+            }
+        }
         self.error = None;
+        self.replacement_notice = None;
         self.advance_epoch();
         let old_paint = self.paint_key;
         let old_rows = self.hit_rows(view);
@@ -655,6 +698,9 @@ impl SearchPanel {
         self.error = Some(error.reason.into());
     }
     fn plan_followup(&mut self, follow: Followup) {
+        if matches!(follow, Followup::ReplaceSelected | Followup::ReplaceRecipe) {
+            self.replacement_epoch = Some(self.epoch);
+        }
         if let Some(key) = self.request_key {
             self.followup = Some((key, follow));
         } else if self.retry.is_some() {
@@ -739,6 +785,72 @@ impl SearchPanel {
         }
         Ok(SearchOutcome::panel())
     }
+    pub fn replacement_acknowledgement(
+        &self,
+        session: &SearchSession,
+        view: &Workspace,
+        action: &SearchAction,
+    ) -> Result<ReplacementAcknowledgement, String> {
+        if !matches!(action, SearchAction::Replace(_))
+            || self.replacement_pending.is_some()
+            || !self.validate_action(session, view, action)
+        {
+            return Err("Search replacement changed before admission".into());
+        }
+        Ok(ReplacementAcknowledgement { key: action.key(), epoch: self.epoch })
+    }
+    /// Successful submission is pending work, never an edit acknowledgement.
+    pub fn replacement_admitted(
+        &mut self,
+        session: &mut SearchSession,
+        acknowledgement: ReplacementAcknowledgement,
+    ) -> SearchOutcome {
+        self.replacement_pending = Some(acknowledgement);
+        self.replacement_notice = None;
+        self.error = None;
+        self.status = "Replacing…".into();
+        self.pending = false;
+        self.followup = None;
+        self.request_key = None;
+        session.cancel();
+        SearchOutcome::panel()
+    }
+    /// Call after Workspace has installed the returned editor, even on error.
+    /// A changed input epoch cannot receive an old query's success message.
+    pub fn replacement_finished(
+        &mut self,
+        session: &mut SearchSession,
+        view: &Workspace,
+        key: SearchKey,
+        result: Result<(), String>,
+    ) -> Result<SearchOutcome, String> {
+        let Some(acknowledgement) = self.replacement_pending else {
+            return Ok(SearchOutcome::default());
+        };
+        if acknowledgement.key != key {
+            return Ok(SearchOutcome::default());
+        }
+        if view.document_busy(SessionDocumentId(key.document_id))
+            || view.view(SessionDocumentId(key.document_id)).is_none_or(|view| view.editor().is_none())
+        {
+            return Err("Replacement completion arrived before the editor returned".into());
+        }
+        self.replacement_pending = None;
+        let current = acknowledgement.epoch == self.epoch && view.active_id().0 == key.document_id;
+        let mut out = self.sync_document(session, view)?;
+        out.damage.panel = self.open;
+        if current {
+            let notice = match result {
+                Ok(()) => "Replacement complete".into(),
+                Err(error) => format!("Replacement failed: {error}"),
+            };
+            self.replacement_notice = Some((self.epoch, notice.clone()));
+            self.error = None;
+            self.status = notice;
+            out.damage.status = true;
+        }
+        Ok(out)
+    }
     fn refresh(
         &mut self,
         session: &mut SearchSession,
@@ -748,6 +860,7 @@ impl SearchPanel {
     ) -> Result<(), String> {
         // Even rejected/invalid intent invalidates admission of old actions.
         self.request_key = None;
+        self.ready = false;
         self.followup = None;
         self.retry_followup = None;
         if !self.active && !self.open && navigation.is_none() && replacement.is_none() {
@@ -825,6 +938,11 @@ impl SearchPanel {
     }
     pub fn sync_document(&mut self, session: &mut SearchSession, view: &Workspace) -> Result<SearchOutcome, String> {
         let next = Self::active(view);
+        if self.replacement_pending.is_some_and(|ack| ack.key.document_id == view.active_id().0)
+            && view.document_busy(view.active_id())
+        {
+            return Ok(SearchOutcome::default());
+        }
         if !self.active {
             self.identity = next;
             self.identity_epoch = view.input_epoch();
@@ -894,6 +1012,12 @@ impl SearchPanel {
             && session.state().status == SearchStatus::Complete
         {
             self.followup = None;
+            if matches!(follow, Followup::ReplaceSelected | Followup::ReplaceRecipe)
+                && self.replacement_epoch != Some(self.epoch)
+            {
+                self.error = Some("Replacement cancelled: search input changed".into());
+                return out;
+            }
             match follow {
                 Followup::Seed => {
                     if self.seed_epoch == Some(self.epoch) && self.seed_cursor_matches(view) {
@@ -942,6 +1066,7 @@ impl SearchPanel {
         }
         let mut rows = self.hit_rows(view);
         self.pending = matches!(state.status, SearchStatus::Pending | SearchStatus::Searching);
+        self.ready = state.status == SearchStatus::Complete;
         // core-search's regex contract requires every possible match to fit
         // Query.max_match_bytes. This GUI cannot prove arbitrary patterns fit;
         // completion is an engine count, not all-size regex completeness.
@@ -998,6 +1123,11 @@ impl SearchPanel {
         };
         if self.settings.regex && self.mode != SearchMode::Files {
             self.status.push_str("; regex matches limited to 64 KiB, completeness is not guaranteed");
+        }
+        if let Some((epoch, notice)) = &self.replacement_notice
+            && *epoch == self.epoch
+        {
+            self.status = format!("{notice}; {}", self.status);
         }
         rows.extend(self.hit_rows(view));
         rows.sort_unstable();
@@ -1071,6 +1201,7 @@ impl SearchPanel {
             && Self::active(view).is_some_and(|(id, revision)| session.validate_action(action, id, revision))
             && (!matches!(action, SearchAction::SeedSelections { .. })
                 || (self.seed_epoch == Some(self.epoch) && self.seed_cursor_matches(view)))
+            && (!matches!(action, SearchAction::Replace(_)) || self.replacement_epoch == Some(self.epoch))
     }
     /// Current architecture: cached logical bytes + the existing grid only.
     /// Do not restore projected_row/source-reading fallbacks here. ROOT retains

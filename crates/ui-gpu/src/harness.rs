@@ -4,10 +4,37 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
+    MarkdownSplit,
+    MarkdownSection(u64),
+    MarkdownNarrow,
+    ContextProbe,
+    ContextClose,
+    GzipOpen,
+    GzipCheck,
+    LogsOpen,
+    LogsCheck,
+    LogsClose,
+    PresenterCpu,
+    PresenterEdit,
+    PresenterGpu,
+    PresenterCheck,
+    PresenterRemote,
+    PresenterRemoteCheck,
+    PresenterLocal,
+    GpuFallback,
+    GpuFallbackCheck,
+    MarkdownPreview,
+    MarkdownMenu,
+    MarkdownMenuCheck,
+    AboutOpen,
+    AboutCheck,
+    AboutClose,
+    MarkdownText,
     Idle,
     Scroll,
     Repaint,
@@ -161,7 +188,77 @@ pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
         let placement =
             [(1800, Step::DismissSetup), (200, Step::PlacementSet), (350, Step::PlacementCheck), (100, Step::End)];
         let replay = [(1800, Step::DismissSetup), (250, Step::PlacementCheck), (100, Step::End)];
-        let steps = if std::env::var_os("KWIL_PLACEMENT_REPLAY").is_some() {
+        let markdown = [
+            (1800, Step::DismissSetup),
+            (200, Step::MarkdownSplit),
+            (500, Step::UsabilityCapture("markdown-split.bmp")),
+            (100, Step::MarkdownMenu),
+            (100, Step::MarkdownMenuCheck),
+            (100, Step::UsabilityCapture("markdown-menu.bmp")),
+            (100, Step::MenuClose),
+            (100, Step::MarkdownPreview),
+            (150, Step::UsabilityCapture("markdown-preview.bmp")),
+            (100, Step::MarkdownSection(0)),
+            (100, Step::UsabilityCapture("md-00.bmp")),
+            (100, Step::MarkdownSection(12)),
+            (100, Step::UsabilityCapture("md-12.bmp")),
+            (100, Step::MarkdownSection(25)),
+            (100, Step::UsabilityCapture("md-25.bmp")),
+            (100, Step::MarkdownSection(31)),
+            (100, Step::UsabilityCapture("md-31.bmp")),
+            (100, Step::MarkdownSection(39)),
+            (100, Step::UsabilityCapture("md-39.bmp")),
+            (100, Step::MarkdownSection(47)),
+            (100, Step::UsabilityCapture("md-47.bmp")),
+            (100, Step::MarkdownSection(65)),
+            (100, Step::UsabilityCapture("md-65.bmp")),
+            (100, Step::MarkdownSection(69)),
+            (100, Step::UsabilityCapture("md-69.bmp")),
+            (100, Step::MarkdownSection(77)),
+            (100, Step::UsabilityCapture("md-77.bmp")),
+            (100, Step::MarkdownSection(86)),
+            (100, Step::UsabilityCapture("md-86.bmp")),
+            (100, Step::MarkdownNarrow),
+            (150, Step::MarkdownSection(31)),
+            (100, Step::UsabilityCapture("md-narrow-31.bmp")),
+            (100, Step::MarkdownSection(69)),
+            (100, Step::UsabilityCapture("md-narrow-69.bmp")),
+            (100, Step::MarkdownSection(77)),
+            (100, Step::UsabilityCapture("md-narrow-77.bmp")),
+            (100, Step::MarkdownSection(86)),
+            (100, Step::UsabilityCapture("md-narrow-86.bmp")),
+            (100, Step::MarkdownText),
+            (100, Step::ContextProbe),
+            (100, Step::UsabilityCapture("context-menu.bmp")),
+            (100, Step::ContextClose),
+            (100, Step::UsabilityCapture("markdown-text.bmp")),
+            (100, Step::Idle),
+            (150, Step::Scroll),
+            (150, Step::Repaint),
+            (100, Step::AboutOpen),
+            (200, Step::AboutCheck),
+            (100, Step::UsabilityCapture("about.bmp")),
+            (100, Step::AboutClose),
+            (100, Step::GzipOpen),
+            (400, Step::GzipCheck),
+            (100, Step::LogsOpen),
+            (300, Step::LogsCheck),
+            (100, Step::UsabilityCapture("inline-log-filter.bmp")),
+            (100, Step::LogsClose),
+            (100, Step::PresenterCpu),
+            (100, Step::PresenterEdit),
+            (100, Step::PresenterGpu),
+            (200, Step::PresenterCheck),
+            (100, Step::PresenterRemote),
+            (150, Step::PresenterRemoteCheck),
+            (100, Step::PresenterLocal),
+            (200, Step::GpuFallback),
+            (150, Step::GpuFallbackCheck),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_MARKDOWN_PROBE").is_some() {
+            markdown.as_slice()
+        } else if std::env::var_os("KWIL_PLACEMENT_REPLAY").is_some() {
             replay.as_slice()
         } else if std::env::var_os("KWIL_PLACEMENT_PROBE").is_some() {
             placement.as_slice()
@@ -502,10 +599,287 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(!app.welcome.visible());
             assert_eq!(app.welcome.stage(), super::welcome::Stage::Complete);
         }
+        Step::AboutOpen => app.run_menu_command(Some(el), super::menu::ABOUT),
+        Step::AboutCheck => {
+            app.sync_desktop_window(el);
+            assert_eq!(app.desktop_window.as_ref().unwrap().kind, super::desktop_window::Kind::About);
+            assert!(app.about.platform.is_some());
+            let text = app.diagnostics();
+            assert!(text.contains("Build:"));
+            assert!(text.contains("Renderer:"));
+            assert!(text.contains("License: MIT"));
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join("about-diagnostics.txt"), text).unwrap();
+            }
+            assert!(app.render_desktop_window());
+        }
+        Step::AboutClose => {
+            let id = app.desktop_window.as_ref().unwrap().gfx.window.id();
+            app.desktop_window_event(el, id, winit::event::WindowEvent::CloseRequested);
+            assert!(!app.about.open);
+            assert!(app.desktop_window.is_none());
+        }
+        Step::GzipOpen => {
+            app.view
+                .open_path(PathBuf::from(std::env::var_os("KWIL_WORKSPACE_ROOT").unwrap()).join("example.log.gz"))
+                .unwrap();
+            app.sync_file_ui();
+            app.apply(Damage { full: true, ..Default::default() });
+        }
+        Step::GzipCheck => {
+            let document = app.view.editor().expect("gzip editor indexed").document();
+            assert_eq!(document.compression, kwil_core_workspace::compressed::CompressionFormat::Gzip);
+            let mut bytes = Vec::new();
+            document.snapshot().write_to(&mut bytes).unwrap();
+            assert_eq!(bytes, include_bytes!("../../../examples/smoke/example.log"));
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("gzip-result.txt"),
+                    "PASS: real GUI open decompresses exact committed log sample",
+                )
+                .unwrap();
+            }
+        }
+        Step::LogsOpen => {
+            assert!(app.is_log_document());
+            app.filter_log_level(Some(kwil_core_syntax::logs::Level::Error));
+        }
+        Step::LogsCheck => {
+            let (total, exact, _) = app.logs.viewport_extent();
+            assert!(app.logs.owns_body());
+            assert!(exact);
+            assert_eq!(total, 1);
+            let original = super::chrome::layout(app.size, &app.ui, app.settings.tabs.layout).body;
+            assert!(app.body_area().y > original.y, "filter strip reserves height, no overlay list");
+            let mut bytes = Vec::new();
+            app.view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+            assert_eq!(bytes, include_bytes!("../../../examples/smoke/example.log"));
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("inline-log-result.txt"),
+                    "PASS: one ERROR row in editor body; original source untouched",
+                )
+                .unwrap();
+            }
+        }
+        Step::LogsClose => app.close_logs(),
+        Step::MarkdownSection(line) => app.markdown_probe_position(line),
+        Step::MarkdownNarrow => {
+            let _ = app.gfx.as_ref().unwrap().window.request_inner_size(winit::dpi::LogicalSize::new(640.0, 650.0));
+        }
+        Step::ContextProbe => {
+            let body = app.body_area();
+            app.pointer = (body.x + 80, body.y + 20);
+            assert_eq!(app.pointer_cursor(), winit::window::CursorIcon::Text);
+            app.open_context();
+            assert!(app.context.is_open());
+            assert!(
+                !app.context.probe_labels().any(|label| label.contains("log")),
+                "Markdown context must not show log actions"
+            );
+            app.close_context();
+            if let Some(title) = app.menu.titles.first() {
+                app.pointer = (title.x + 2, title.y + 2);
+                assert_eq!(app.pointer_cursor(), winit::window::CursorIcon::Pointer);
+                app.menu_set(super::menu::State::Open { menu: 0, item: None, keyboard: false }, false);
+                assert_eq!(app.pointer_cursor(), winit::window::CursorIcon::Pointer);
+                app.menu_set(super::menu::State::Closed, false);
+            }
+            app.pointer = (body.x + 80, body.y + 20);
+            app.open_context();
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("context-cursor-result.txt"),
+                    "PASS: editor I-beam, consistent menu pointer, context menu opens",
+                )
+                .unwrap();
+            }
+        }
+        Step::ContextClose => app.close_context(),
+        Step::PresenterCpu => {
+            app.opts.renderer = None;
+            app.settings.render.backend = super::RenderBackend::Cpu;
+            app.apply(Damage::default());
+            #[cfg(all(windows, feature = "gpu"))]
+            unsafe {
+                assert_eq!(
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                        app.gfx.as_ref().unwrap().gpu_canvas.as_ref().unwrap().hwnd() as _
+                    ),
+                    0
+                );
+            }
+            assert!(app.pending.full, "presenter handoff schedules full damage even at idle");
+        }
+        Step::PresenterEdit => app.edit(super::input::Action::Text("CPU presenter marker\n".into())),
+        Step::PresenterGpu => {
+            app.settings.render.backend = super::RenderBackend::Gpu;
+            app.apply(Damage::default());
+            assert!(app.pending.full);
+        }
+        Step::PresenterCheck => {
+            #[cfg(feature = "gpu")]
+            assert_eq!(app.gpu.as_ref().unwrap().matches(&app.gfx.as_ref().unwrap().pixels), Ok(true));
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("presenter-transition-result.txt"),
+                    "PASS: CPU edit survives full GPU takeover",
+                )
+                .unwrap();
+            }
+        }
+        Step::PresenterRemote => app.user_event(el, UserEvent::SessionChanged(true)),
+        Step::PresenterRemoteCheck => {
+            assert!(app.policy.remote());
+            assert!(!app.presenter_gpu);
+            #[cfg(all(windows, feature = "gpu"))]
+            unsafe {
+                assert_eq!(
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                        app.gfx.as_ref().unwrap().gpu_canvas.as_ref().unwrap().hwnd() as _
+                    ),
+                    0
+                );
+            }
+            assert_eq!(app.pending, Damage::default());
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("remote-handoff-result.txt"),
+                    "PASS: idle remote transition hides GPU child and completes full CPU handoff",
+                )
+                .unwrap();
+            }
+        }
+        Step::PresenterLocal => app.user_event(el, UserEvent::SessionChanged(false)),
+        Step::GpuFallback => {
+            #[cfg(all(windows, feature = "gpu"))]
+            {
+                let gfx = app.gfx.as_ref().unwrap();
+                let canvas = gfx.gpu_canvas.as_ref().expect("GPU child surface");
+                assert_ne!(canvas.hwnd(), gfx.hwnd);
+                app.gpu.as_mut().expect("GPU before injected failure").inject_retirement_timeout();
+                app.apply(Damage { status: true, ..Default::default() });
+            }
+        }
+        Step::GpuFallbackCheck => {
+            #[cfg(all(windows, feature = "gpu"))]
+            {
+                assert!(app.gpu.is_none(), "failure must select CPU");
+                let gfx = app.gfx.as_ref().unwrap();
+                unsafe {
+                    assert_eq!(
+                        windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                            gfx.gpu_canvas.as_ref().unwrap().hwnd() as _
+                        ),
+                        0
+                    );
+                }
+                assert_eq!(app.pending, Damage::default(), "full CPU repair must happen immediately");
+                capture(app, dir.as_deref(), "cpu-after-quarantine.bmp");
+                if let Some(dir) = &dir {
+                    std::fs::write(
+                        dir.join("gpu-fallback-result.txt"),
+                        "PASS: child flip HWND hidden; parent CPU full repair, bounded GPU quarantine",
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        Step::MarkdownSplit => {
+            use winit::keyboard::{Key, ModifiersState};
+            app.mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
+            app.key_after_settings(
+                Some(el),
+                &super::HostKey { logical_key: Key::Character("v".into()), text: None, repeat: false },
+            );
+            app.mods = ModifiersState::empty();
+            assert_eq!(app.markdown_mode(), super::markdown_ui::Mode::Split);
+        }
+        Step::MarkdownMenu => {
+            app.menu_set(super::menu::State::Open { menu: 2, item: Some(0), keyboard: true }, true);
+        }
+        Step::MarkdownMenuCheck => {
+            let available = app.menu_available();
+            let dropdown = app.menu.dropdown.as_ref().expect("selection menu painted");
+            let actual = &app.gfx.as_ref().unwrap().pixels;
+            let mut expected = actual.clone();
+            super::menu::draw_dropdown(
+                &app.menu,
+                dropdown,
+                &available,
+                &mut expected,
+                app.size.0,
+                app.ui_font.as_mut().unwrap(),
+                super::theme_ui::chrome(),
+                &app.ui,
+            );
+            let r = dropdown.area;
+            for y in r.y..r.y + r.h {
+                let range = y * app.size.0 + r.x..y * app.size.0 + r.x + r.w;
+                assert_eq!(
+                    actual[range.clone()],
+                    expected[range],
+                    "menu must paint above Markdown controls and preview"
+                );
+            }
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("markdown-menu-result.txt"),
+                    "PASS: native popup pixels remain above the Markdown surface",
+                )
+                .unwrap();
+            }
+        }
+        Step::MarkdownPreview => {
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("markdown-source.txt"),
+                    format!(
+                        "rows={} line0={:?} mode={:?} body={:?} sourcepixels={} bpixels={}",
+                        app.view.rows(),
+                        app.view.line(0),
+                        app.markdown_mode(),
+                        app.body_area(),
+                        app.gfx.as_ref().unwrap().pixels.iter().filter(|p| **p == super::fg()).count(),
+                        app.body_pixels.iter().filter(|p| **p == super::fg()).count()
+                    ),
+                )
+                .unwrap();
+            }
+            assert!(app.markdown.ready(), "real snapshot worker must complete");
+            assert!(app.markdown_probe_click(el, super::markdown_ui::Mode::Preview));
+            assert_eq!(app.markdown_mode(), super::markdown_ui::Mode::Preview);
+        }
+        Step::MarkdownText => {
+            let revision = app.view.editor().unwrap().document().revision();
+            app.key_after_settings(
+                Some(el),
+                &super::HostKey {
+                    logical_key: winit::keyboard::Key::Character("x".into()),
+                    text: Some("x"),
+                    repeat: false,
+                },
+            );
+            assert_eq!(
+                app.view.editor().unwrap().document().revision(),
+                revision,
+                "preview must not edit behind the pane"
+            );
+            if !app.markdown_probe_click(el, super::markdown_ui::Mode::Text) {
+                // Narrow chrome legitimately omits overflow toolbar tools.
+                // The same Text command remains reachable through View.
+                app.run_menu_command(Some(el), "view.markdownText");
+            }
+            assert_eq!(app.markdown_mode(), super::markdown_ui::Mode::Text);
+        }
         Step::Idle => {
+            #[cfg(feature = "gpu")]
+            if std::env::var_os("KWIL_REQUIRE_GPU").is_some() {
+                assert!(app.gpu.is_some(), "hardware GPU required by this probe");
+            }
             // Prime the retained GPU image without an onscreen present, so the
             // following scroll/readback exercises GPU copies, not a fresh upload.
-            #[cfg(feature = "gpu")]
+            #[cfg(all(feature = "gpu", not(windows)))]
             if let (Some(gpu), Some(gfx), Some(font)) = (&mut app.gpu, &app.gfx, &app.font) {
                 gpu.update(
                     &gfx.pixels,
@@ -538,7 +912,26 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             capture(app, dir.as_deref(), "scroll.bmp");
             #[cfg(feature = "gpu")]
             if let (Some(gpu), Some(gfx)) = (&app.gpu, &app.gfx) {
-                println!("kwil-gpu backing_pixels_equal_cpu={:?}", gpu.matches(&gfx.pixels));
+                let equal = gpu.matches(&gfx.pixels);
+                println!("kwil-gpu backing_pixels_equal_cpu={equal:?}");
+                if std::env::var_os("KWIL_REQUIRE_GPU").is_some() {
+                    assert_eq!(equal, Ok(true));
+                }
+                #[cfg(windows)]
+                {
+                    println!("kwil-gpu native_presents={}", gpu.presents());
+                    assert!(gpu.presents() > 0);
+                    if let Some(dir) = &dir {
+                        std::fs::write(
+                            dir.join("gpu-result.txt"),
+                            format!("readback={equal:?} native_presents={}\n", gpu.presents()),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            if std::env::var_os("KWIL_REQUIRE_GPU").is_some() {
+                assert!(app.gpu.is_some(), "GPU must remain active through scroll");
             }
             app.metrics.phase = 3;
             app.apply(Damage { full: true, ..Default::default() });
@@ -835,6 +1228,23 @@ fn choose_theme(app: &mut App, el: &ActiveEventLoop, value: &str) {
 
 fn capture(app: &App, dir: Option<&Path>, name: &str) {
     if let (Some(dir), Some(gfx)) = (dir, app.desktop_window.as_ref().map(|d| &d.gfx).or(app.gfx.as_ref())) {
+        #[cfg(all(windows, feature = "gpu"))]
+        if app.desktop_window.is_none()
+            && let Some(gpu) = &app.gpu
+        {
+            let pixels = gpu.read_pixels().expect("native DX12 capture readback");
+            assert!(
+                pixels.iter().zip(&gfx.pixels).all(|(a, b)| *a == (*b | 0xff000000)),
+                "capture must match actual native GPU backing"
+            );
+            write_pixels(&dir.join(name), app.size, &pixels).expect("DX12 capture write");
+            std::fs::write(
+                dir.join(format!("{name}.backend.txt")),
+                "DX12 retained presentation texture readback (not a DWM/window-DC capture)",
+            )
+            .unwrap();
+            return;
+        }
         #[cfg(windows)]
         {
             if let Err(error) = capture_dc(gfx.hwnd, &dir.join(name), false) {
@@ -940,4 +1350,26 @@ fn capture_dc(hwnd: isize, path: &Path, frame: bool) -> std::io::Result<()> {
         file.extend_from_slice(&pixels);
         std::fs::write(path, file)
     }
+}
+
+#[cfg(all(windows, feature = "gpu"))]
+fn write_pixels(path: &Path, size: (usize, usize), pixels: &[u32]) -> std::io::Result<()> {
+    let (w, h) = size;
+    let len = w * h * 4;
+    assert_eq!(pixels.len(), w * h);
+    let mut file = Vec::with_capacity(54 + len);
+    file.extend_from_slice(b"BM");
+    file.extend_from_slice(&((54 + len) as u32).to_le_bytes());
+    file.extend_from_slice(&[0; 4]);
+    file.extend_from_slice(&54u32.to_le_bytes());
+    file.extend_from_slice(&40u32.to_le_bytes());
+    file.extend_from_slice(&(w as i32).to_le_bytes());
+    file.extend_from_slice(&(-(h as i32)).to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes());
+    file.extend_from_slice(&32u16.to_le_bytes());
+    file.extend_from_slice(&[0; 24]);
+    for pixel in pixels {
+        file.extend_from_slice(&pixel.to_le_bytes());
+    }
+    std::fs::write(path, file)
 }

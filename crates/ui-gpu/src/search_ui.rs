@@ -165,7 +165,13 @@ fn input_for_key<'a>(
                 SearchInput::NextField
             }
         }
-        Key::Named(NamedKey::Enter) if ctrl && panel.mode() == SearchMode::Replace => return Err(REPLACE_GATE.into()),
+        Key::Named(NamedKey::Enter) if ctrl && panel.mode() == SearchMode::Replace => {
+            if mods.shift_key() {
+                SearchInput::ReplaceAll
+            } else {
+                SearchInput::ReplaceNext
+            }
+        }
         Key::Named(NamedKey::Enter | NamedKey::F3) => {
             if mods.shift_key() {
                 SearchInput::Previous
@@ -281,8 +287,6 @@ pub(super) struct Composition {
     origin: Origin,
 }
 
-const REPLACE_GATE: &str = "Replace is unavailable: W2 must attach the journal-admitted transaction executor";
-
 impl App {
     pub(super) fn start_search(&mut self) {
         if self.search.is_some() {
@@ -347,8 +351,8 @@ impl App {
             self.search_notice("Folder search is not attached to this in-file GUI host".into());
             return true;
         }
-        if matches!(command, "search.replaceNext" | "search.replaceAll" | "search.substitute") {
-            self.search_notice(REPLACE_GATE.into());
+        if command == "search.substitute" {
+            self.search_notice("Vim substitution arguments are not attached; use Replace".into());
             return true;
         }
         if self.goto.take().is_some() {
@@ -387,9 +391,6 @@ impl App {
                     self.search_panel.enter_context(keys);
                 }
                 self.search_outcome(outcome);
-                if command == "search.replace" {
-                    self.search_notice(REPLACE_GATE.into());
-                }
             }
             Ok(None) => self.search_notice(format!("Search command is not attached: {command}")),
             Err(error) => {
@@ -419,10 +420,6 @@ impl App {
         true
     }
     pub(super) fn search_input(&mut self, input: SearchInput<'_>) {
-        if matches!(input, SearchInput::ReplaceAll | SearchInput::ReplaceNext) {
-            self.search_notice(REPLACE_GATE.into());
-            return;
-        }
         self.search_origin = Origin::capture(&self.view);
         let result = match &mut self.search {
             Some(session) => self.search_panel.input(session, &self.view, input),
@@ -466,6 +463,30 @@ impl App {
             self.search_notice("Search navigation cancelled: its document, query or cursor changed".into());
             return;
         }
+        let acknowledgement = if matches!(&action, SearchAction::Replace(_)) {
+            match self.search_panel.replacement_acknowledgement(self.search.as_ref().unwrap(), &self.view, &action) {
+                Ok(acknowledgement) => Some(acknowledgement),
+                Err(error) => {
+                    self.search_notice(error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let SearchAction::Replace(recipe) = action {
+            match self.view.submit_search_replacement(recipe) {
+                Ok(()) => {
+                    let outcome =
+                        self.search_panel.replacement_admitted(self.search.as_mut().unwrap(), acknowledgement.unwrap());
+                    self.search_origin = None;
+                    self.search_ime = None;
+                    self.search_outcome(outcome);
+                }
+                Err(error) => self.search_notice(format!("Replacement was not admitted: {error}")),
+            }
+            return;
+        }
         let result = match &action {
             SearchAction::Select { range, mode, .. } => {
                 let editor = self.view.editor_mut().unwrap();
@@ -492,16 +513,11 @@ impl App {
                     )
                 }
             }
-            // Neither branch is requested by this host. Never iterate a
-            // replacement recipe or open an unadmitted file on the UI thread.
             SearchAction::OpenFile { .. } => {
                 self.search_notice("Folder result navigation is not attached".into());
                 return;
             }
-            SearchAction::Replace(_) => {
-                self.search_notice(REPLACE_GATE.into());
-                return;
-            }
+            SearchAction::Replace(_) => unreachable!("owned recipe was consumed by worker admission"),
         };
         match result {
             Ok(damage) => {
@@ -516,6 +532,24 @@ impl App {
                 }
             }
             Err(error) => self.search_notice(error.to_string()),
+        }
+    }
+    /// ROOT calls this immediately after Workspace::document_result installs
+    /// DocumentResult::Replaced, before applying its viewport damage.
+    pub(super) fn search_replacement_finished(
+        &mut self,
+        key: kwil_view_model::search_session::SearchKey,
+        result: Result<(), String>,
+    ) {
+        let Some(session) = &mut self.search else { return };
+        let outcome = self.search_panel.replacement_finished(session, &self.view, key, result);
+        self.search_origin = Origin::capture(&self.view);
+        match outcome {
+            Ok(outcome) => self.search_outcome(outcome),
+            Err(error) => self.search_notice(error),
+        }
+        if key.document_id == self.view.active_id().0 && self.view.editor().is_some() {
+            self.keep_caret_visible();
         }
     }
     pub(super) fn search_key(&mut self, event: &HostKey<'_>) -> bool {
@@ -548,9 +582,17 @@ impl App {
             Some((VimResult::Command(call), _)) => {
                 let input = match call.id {
                     "palette.cancel" => Some(SearchInput::Cancel),
-                    "palette.accept" => {
-                        Some(if self.mods.shift_key() { SearchInput::Previous } else { SearchInput::Next })
-                    }
+                    "palette.accept" => Some(
+                        if (self.mods.control_key() || self.mods.super_key())
+                            && self.search_panel.mode() == SearchMode::Replace
+                        {
+                            if self.mods.shift_key() { SearchInput::ReplaceAll } else { SearchInput::ReplaceNext }
+                        } else if self.mods.shift_key() {
+                            SearchInput::Previous
+                        } else {
+                            SearchInput::Next
+                        },
+                    ),
                     "palette.next" => Some(SearchInput::Next),
                     "palette.previous" => Some(SearchInput::Previous),
                     "edit.backspace" => Some(SearchInput::Backspace),
@@ -634,7 +676,6 @@ impl App {
                     self.search_input(input);
                 }
             }
-            search_view::Click::ReplaceGate => self.search_notice("Replace awaits the W2 transaction executor".into()),
             search_view::Click::Outside => self.search_input(SearchInput::Cancel),
             search_view::Click::Inside => {}
         }
@@ -690,6 +731,12 @@ mod host_dispatch_tests {
         let frontend_epoch = view.input_epoch();
         (
             App {
+                about: Default::default(),
+                markdown: Default::default(),
+                context: Default::default(),
+                context_area: None,
+                logs: Default::default(),
+                logs_ime: None,
                 search: None,
                 search_panel: Default::default(),
                 search_origin: None,
@@ -701,6 +748,7 @@ mod host_dispatch_tests {
                 goto_epoch: 0,
                 goto_reveal: None,
                 highlighting: None,
+                document_stopped: None,
                 palette: None,
                 palette_dirty: false,
                 palette_area: None,
@@ -762,6 +810,7 @@ mod host_dispatch_tests {
                 gpu: None,
                 #[cfg(feature = "gpu")]
                 gpu_started: false,
+                presenter_gpu: false,
                 font_loading: false,
                 font_reload_pending: false,
                 redraw_requested: false,
@@ -809,11 +858,94 @@ mod host_dispatch_tests {
             let event = rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("the real worker must wake the actual GUI host within five seconds");
-            match event {
-                UserEvent::SearchReady => app.search_ready(),
-                _ => panic!("unexpected headless event"),
+            dispatch(app, event);
+        }
+    }
+    fn dispatch(app: &mut App, event: UserEvent) {
+        match event {
+            UserEvent::SearchReady => app.search_ready(),
+            UserEvent::Document(result) => {
+                use kwil_view_model::document_worker::DocumentResult;
+                let replacement = match &*result {
+                    DocumentResult::Replaced { key, result, .. } => {
+                        Some((*key, result.as_ref().map(|_| ()).map_err(ToString::to_string)))
+                    }
+                    _ => None,
+                };
+                let damage = app.view.document_result(*result);
+                if let Some((key, result)) = replacement {
+                    app.search_replacement_finished(key, result);
+                }
+                app.apply(damage);
+            }
+            _ => panic!("unexpected headless event"),
+        }
+    }
+    fn until(app: &mut App, rx: &Receiver<UserEvent>, ready: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready(app) {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("bounded real document worker wake");
+            dispatch(app, event);
+        }
+    }
+    fn worker_host(value: &str) -> (App, Receiver<UserEvent>, std::path::PathBuf) {
+        let (mut app, rx) = host("");
+        let root = std::env::temp_dir().join(format!(
+            "kwil-replace-host-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let proxy = app.proxy.clone();
+        app.view
+            .start_document_worker_at(Some(root.clone()), move |result| {
+                let _ = proxy.send_event(UserEvent::Document(Box::new(result)));
+            })
+            .unwrap();
+        until(&mut app, &rx, |app| app.view.recovery_ready() && app.view.editor().is_some());
+        app.view.execute("edit.insert", &CommandArgs { text: Some(value.into()), ..Default::default() }, 1).unwrap();
+        app.view.sync_all();
+        until(&mut app, &rx, |app| {
+            app.view.recovery_notice().is_none() && !app.view.editor().unwrap().has_pending_edit_receipt()
+        });
+        app.start_search();
+        (app, rx, root)
+    }
+    fn worker_stop(mut app: App, rx: Receiver<UserEvent>, root: std::path::PathBuf) {
+        until(&mut app, &rx, |app| {
+            !app.view.search_replacement_pending()
+                && app.view.editor().is_none_or(|editor| !editor.has_pending_edit_receipt())
+        });
+        stop(app);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let UserEvent::Document(result) = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("bounded document worker shutdown")
+                && let kwil_view_model::document_worker::DocumentResult::Stopped(result) = *result
+            {
+                result.unwrap();
+                break;
             }
         }
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-replace-host-"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    fn bytes(app: &App) -> Vec<u8> {
+        let snapshot = app.view.editor().unwrap().document().snapshot();
+        snapshot.chunks(0..snapshot.len()).unwrap().flat_map(|chunk| chunk.unwrap().to_vec()).collect()
+    }
+    fn replace_query(app: &mut App, rx: &Receiver<UserEvent>, query_text: &str, replacement: &str) {
+        ctrl(app, "h");
+        assert_eq!(app.search_panel.mode(), SearchMode::Replace);
+        query(app, query_text);
+        finish(app, rx);
+        app.search_input(SearchInput::Focus(SearchField::Replacement));
+        app.search_input(SearchInput::SelectAll);
+        app.search_input(SearchInput::Text(replacement));
+        assert!(app.search_panel.can_replace());
     }
     fn stop(mut app: App) {
         if let Some(mut session) = app.search.take() {
@@ -1027,7 +1159,7 @@ mod host_dispatch_tests {
         stop(app);
     }
     #[test]
-    fn actual_host_ime_field_fence_save_prompt_priority_and_replace_gate() {
+    fn actual_host_ime_field_fence_save_prompt_priority_and_replacement_refusal() {
         let (mut app, rx) = host(DOCUMENT);
         app.start_search();
         ctrl(&mut app, "f");
@@ -1047,10 +1179,140 @@ mod host_dispatch_tests {
         named(&mut app, NamedKey::Escape, false);
         ctrl(&mut app, "h");
         assert_eq!(app.search_panel.mode(), SearchMode::Replace);
+        finish(&mut app, &rx);
         let revision = app.view.editor().unwrap().document().revision();
         press(&mut app, Key::Named(NamedKey::Enter), None, ModifiersState::CONTROL | ModifiersState::SHIFT);
+        finish(&mut app, &rx);
         assert_eq!(app.view.editor().unwrap().document().revision(), revision);
-        assert!(app.search_panel.status().contains("W2"));
+        assert!(app.search_panel.status().contains("not admitted"));
+        assert!(!app.view.document_busy(app.view.active_id()));
         stop(app);
+    }
+
+    #[test]
+    fn actual_host_replacement_all_worker_completion_and_one_undo_redo() {
+        let original = b"one two one one";
+        let (mut app, rx, root) = worker_host(std::str::from_utf8(original).unwrap());
+        replace_query(&mut app, &rx, "one", "longer");
+        let revision = app.view.editor().unwrap().document().revision();
+        press(&mut app, Key::Named(NamedKey::Enter), None, ModifiersState::CONTROL | ModifiersState::SHIFT);
+        until(&mut app, &rx, |app| app.view.document_busy(app.view.active_id()));
+        assert!(app.view.editor().is_none(), "the actual editor is owned by the fixed worker");
+        assert!(app.search_panel.status().contains("Replacing"));
+        assert!(!app.search_panel.status().contains("complete"));
+        assert!(!app.search_panel.can_replace());
+        app.search_input(SearchInput::ReplaceAll);
+        assert!(app.search_panel.status().contains("still running"));
+        finish(&mut app, &rx);
+        assert_eq!(bytes(&app), b"longer two longer longer");
+        assert_ne!(app.view.editor().unwrap().document().revision(), revision);
+        assert!(app.search_panel.status().contains("Replacement complete"));
+        assert_eq!(app.search_panel.count(), (0, true));
+        assert_eq!(app.search_panel.text(SearchField::Query).0, "one");
+        assert_eq!(app.search_panel.text(SearchField::Replacement).0, "longer");
+        until(&mut app, &rx, |app| !app.view.editor().unwrap().has_pending_edit_receipt());
+        app.view.execute("edit.undo", &Default::default(), 1).unwrap();
+        assert_eq!(bytes(&app), original, "the whole replacement is one transaction");
+        until(&mut app, &rx, |app| !app.view.editor().unwrap().has_pending_edit_receipt());
+        app.view.execute("edit.redo", &Default::default(), 1).unwrap();
+        assert_eq!(bytes(&app), b"longer two longer longer");
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_replacement_regex_captures_dollars_and_menu_next() {
+        let (mut app, rx, root) = worker_host("x1 x2 x3");
+        app.settings.search.regex = true;
+        replace_query(&mut app, &rx, "x([0-9])", "y${1}$$");
+        // Menu commands share exactly the same dispatcher as the shortcuts.
+        assert!(app.dispatch_search("search.replaceAll"));
+        finish(&mut app, &rx);
+        assert_eq!(bytes(&app), b"y1$ y2$ y3$");
+        assert!(app.search_panel.status().contains("Replacement complete"));
+        app.settings.search.regex = false;
+        replace_query(&mut app, &rx, "y", "z");
+        press(&mut app, Key::Named(NamedKey::Enter), None, ModifiersState::CONTROL);
+        finish(&mut app, &rx);
+        assert_eq!(bytes(&app).iter().filter(|byte| **byte == b'z').count(), 1);
+        assert!(app.dispatch_search("search.replaceNext"));
+        finish(&mut app, &rx);
+        let result = bytes(&app);
+        assert_eq!(result.iter().filter(|byte| **byte == b'z').count(), 2);
+        assert_eq!(result.iter().filter(|byte| **byte == b'y').count(), 1);
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_replacement_completion_does_not_acknowledge_a_new_query() {
+        let (mut app, rx, root) = worker_host("one one");
+        replace_query(&mut app, &rx, "one", "x");
+        app.dispatch_search("search.replaceAll");
+        until(&mut app, &rx, |app| app.view.document_busy(app.view.active_id()));
+        app.search_input(SearchInput::Focus(SearchField::Query));
+        query(&mut app, "x");
+        finish(&mut app, &rx);
+        assert_eq!(bytes(&app), b"x x");
+        assert_eq!(app.search_panel.text(SearchField::Query).0, "x");
+        assert_eq!(app.search_panel.count(), (2, true));
+        assert!(!app.search_panel.status().contains("Replacement complete"));
+        assert!(app.dispatch_search("search.replaceInFiles"));
+        assert!(app.search_panel.status().contains("Folder"));
+        assert_eq!(bytes(&app), b"x x", "unsupported folder replacement never edits the active file");
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
+    fn actual_host_replacement_invalid_empty_and_stale_actions_never_edit() {
+        let (mut app, rx, root) = worker_host("one one");
+        ctrl(&mut app, "h");
+        app.search_input(SearchInput::ReplaceAll);
+        assert!(app.search_panel.status().contains("query"));
+        assert!(!app.search_panel.can_replace());
+        app.settings.search.regex = true;
+        replace_query(&mut app, &rx, "one", "x");
+        app.search_input(SearchInput::Focus(SearchField::Query));
+        query(&mut app, "[");
+        finish(&mut app, &rx);
+        assert!(!app.search_panel.can_replace());
+        app.search_input(SearchInput::ReplaceAll);
+        assert_eq!(bytes(&app), b"one one");
+
+        for change_document in [false, true] {
+            app.settings.search.regex = false;
+            replace_query(&mut app, &rx, "one", "x");
+            app.search_origin = Origin::capture(&app.view);
+            app.search_panel.input(app.search.as_mut().unwrap(), &app.view, SearchInput::ReplaceAll).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let action = loop {
+                match rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("bounded replacement recipe")
+                {
+                    UserEvent::SearchReady => {
+                        let outcome = app.search_panel.worker_ready(app.search.as_mut().unwrap(), &app.view);
+                        if let Some(action) = outcome.action {
+                            break action;
+                        }
+                    }
+                    event => dispatch(&mut app, event),
+                }
+            };
+            assert!(matches!(action, kwil_view_model::search_session::SearchAction::Replace(_)));
+            if change_document {
+                app.view
+                    .execute("edit.insert", &CommandArgs { text: Some("!".into()), ..Default::default() }, 1)
+                    .unwrap();
+            } else {
+                app.search_input(SearchInput::Focus(SearchField::Query));
+                query(&mut app, "absent");
+            }
+            let before = bytes(&app);
+            app.search_action(action);
+            assert_eq!(bytes(&app), before);
+            assert!(!app.view.document_busy(app.view.active_id()));
+            assert!(app.view.notice().contains("cancelled"));
+            finish(&mut app, &rx);
+        }
+        worker_stop(app, rx, root);
     }
 }

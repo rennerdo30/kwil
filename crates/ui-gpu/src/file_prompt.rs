@@ -161,7 +161,7 @@ mod tests {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         workspace.set_rows(2);
         workspace
-            .execute("edit.insert", &CommandArgs { text: Some("Ã§â€¢Å’a\nxyz".into()), ..Default::default() }, 1)
+            .execute("edit.insert", &CommandArgs { text: Some("Ã§•Å’a\nxyz".into()), ..Default::default() }, 1)
             .unwrap();
         workspace.set_horizontal_window(2, 64 << 10);
         let first = workspace.active_id();

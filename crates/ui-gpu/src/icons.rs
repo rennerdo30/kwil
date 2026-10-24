@@ -22,6 +22,10 @@ pub(super) enum Icon {
     Sun,
     Moon,
     Search,
+    Cut,
+    Copy,
+    Paste,
+    Filter,
 }
 const ALL: &[Icon] = &[
     Icon::Close,
@@ -43,6 +47,10 @@ const ALL: &[Icon] = &[
     Icon::Sun,
     Icon::Moon,
     Icon::Search,
+    Icon::Cut,
+    Icon::Copy,
+    Icon::Paste,
+    Icon::Filter,
 ];
 #[derive(Clone, Copy)]
 enum Primitive {
