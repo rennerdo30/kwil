@@ -811,11 +811,7 @@ mod tests {
         fn new(text: &str) -> Self {
             let mut view = Workspace::new(View::new(None)).unwrap();
             view.set_rows(12);
-            let root = std::env::temp_dir().join(format!(
-                "kwil-tui-search-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-            ));
+            let root = crate::test_support::directory("kwil-tui-search").unwrap();
             let (tx, rx) = mpsc::channel();
             let (stop_tx, stopped) = mpsc::sync_channel(1);
             let document_tx = tx.clone();
@@ -1252,7 +1248,31 @@ mod tests {
         h.files(tree, "needle");
         assert_eq!(h.host.panel.count(), (300, true));
         assert!(h.host.panel.results().len() <= 32);
+        // Streaming also flushes partial batches on its 100 ms cadence, so
+        // the completed tail can start at e.g. 274 instead of a multiple of
+        // 32. Keyboard pages step by 32 and saturate at zero: their round trip
+        // must start on that deterministic grid, not a timing-dependent batch.
+        let streamed_last = h.host.session.as_ref().unwrap().state().file_first;
+        assert!(streamed_last >= 256);
+        for _ in 0..streamed_last.div_ceil(32) {
+            h.press(KeyCode::PageUp, KeyModifiers::NONE);
+            h.settle();
+            assert!(h.host.panel.results().len() <= 32);
+            assert_eq!(h.host.panel.count(), (300, true));
+        }
+        assert_eq!(h.host.session.as_ref().unwrap().state().file_first, 0);
+        assert!(h.host.panel.results()[0].label.contains("many.txt:1 "));
+        let canonical_last = (300_u64 - 1) / 32 * 32;
+        for _ in 0..canonical_last / 32 {
+            h.press(KeyCode::PageDown, KeyModifiers::NONE);
+            h.settle();
+            assert!(h.host.panel.results().len() <= 32);
+            assert_eq!(h.host.panel.count(), (300, true));
+        }
         let last = h.host.session.as_ref().unwrap().state().file_first;
+        assert_eq!(last, 288);
+        assert!(h.host.panel.results()[0].label.contains("many.txt:289 "));
+        assert!(h.host.panel.results().last().unwrap().label.contains("many.txt:300 "));
         assert!(last >= 256);
         let active = h.view.active_id();
         h.press(KeyCode::Down, KeyModifiers::NONE);
@@ -1271,6 +1291,8 @@ mod tests {
             h.settle();
         }
         assert_eq!(h.host.session.as_ref().unwrap().state().file_first, last);
+        assert!(h.host.panel.results()[0].label.contains("many.txt:289 "));
+        assert!(h.host.panel.results().last().unwrap().label.contains("many.txt:300 "));
         assert_eq!(h.host.panel.count(), (300, true));
         let frame = h.render(80, 12);
         let display: String = frame.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();

@@ -16,6 +16,8 @@ mod palette_ui;
 mod search_ui;
 mod settings_ui;
 mod tabs;
+#[cfg(test)]
+mod test_support;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};

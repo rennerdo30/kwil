@@ -399,12 +399,7 @@ mod tests {
     }
     impl Host {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "kwil-tui-hex-host-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root = crate::test_support::directory("kwil-tui-hex-host").unwrap();
             let (tx, receiver) = mpsc::channel();
             let (stop_tx, stopped) = mpsc::sync_channel(1);
             let mut workspace = Workspace::new(kwil_view_model::View::new(None)).unwrap();
