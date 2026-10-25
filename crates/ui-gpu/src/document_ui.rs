@@ -700,7 +700,19 @@ pub(crate) mod fixtures {
                     .unwrap();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
-                    match bundle.settle_until(deadline).expect("exact real worker settlement") {
+                    let settled = match bundle.settle_until(deadline) {
+                        Ok(status) => status,
+                        Err(kwil_view_model::workspace_document::DocumentShutdownReason::Transport(
+                            DocumentResultSettlementReason::ThreadExitPending,
+                        )) if Instant::now() < deadline => {
+                            std::thread::sleep(
+                                Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+                            );
+                            continue;
+                        }
+                        Err(reason) => panic!("exact real worker settlement: {reason:?}"),
+                    };
+                    match settled {
                         kwil_view_model::workspace_document::DocumentShutdownStatus::SourcesReleased => {}
                         kwil_view_model::workspace_document::DocumentShutdownStatus::Complete => break,
                         status => panic!("unexpected fixture shutdown control: {status:?}"),
@@ -761,11 +773,14 @@ pub(crate) mod fixtures {
                     drop(std::mem::ManuallyDrop::into_inner(failure));
                     return;
                 }
-                Err(shutdown::Status::Document(
-                    kwil_view_model::workspace_document::DocumentShutdownReason::Transport(
+                Err(
+                    shutdown::Status::Document(kwil_view_model::workspace_document::DocumentShutdownReason::Transport(
                         DocumentResultSettlementReason::ThreadExitPending,
+                    ))
+                    | shutdown::Status::Search(
+                        kwil_view_model::search_session::WorkerSettlementReason::ThreadExitPending,
                     ),
-                )) if Instant::now() < deadline => {
+                ) if Instant::now() < deadline => {
                     std::thread::sleep(
                         Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
                     );
@@ -1100,12 +1115,26 @@ mod tests {
             external_inbox,
             external_open,
         });
-        let recovered = failure.recover_unstarted(Instant::now() + Duration::from_secs(5));
-        let (workspace, budget) = match recovered {
-            std::ops::ControlFlow::Continue(owners) => owners,
-            std::ops::ControlFlow::Break(failure) => {
-                let failure = std::mem::ManuallyDrop::new(failure);
-                panic!("unstarted recovery retained its exact failure: {:?}", failure.status());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (workspace, budget) = loop {
+            match failure.recover_unstarted(deadline) {
+                std::ops::ControlFlow::Continue(owners) => break owners,
+                std::ops::ControlFlow::Break(retained)
+                    if retained.status()
+                        == shutdown::Status::Search(
+                            kwil_view_model::search_session::WorkerSettlementReason::ThreadExitPending,
+                        )
+                        && Instant::now() < deadline =>
+                {
+                    failure = retained;
+                    std::thread::sleep(
+                        Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                std::ops::ControlFlow::Break(retained) => {
+                    let failure = std::mem::ManuallyDrop::new(retained);
+                    panic!("unstarted recovery retained its exact failure: {:?}", failure.status());
+                }
             }
         };
         let before = budget.retained_bytes();
