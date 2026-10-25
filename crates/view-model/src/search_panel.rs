@@ -1735,7 +1735,25 @@ mod tests {
         drop(panel);
         let worker = session.take_shutdown().unwrap();
         drop(session);
-        worker.shutdown_bounded(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut cleanup = worker.shutdown_until(deadline);
+        loop {
+            match cleanup {
+                Err(error)
+                    if error.reason() == kwil_core_search::worker::WorkerSettlementReason::ThreadExitPending
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(
+                        Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    cleanup = error.retry_until(deadline);
+                }
+                terminal => {
+                    terminal.unwrap();
+                    break;
+                }
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

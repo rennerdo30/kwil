@@ -7,6 +7,25 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(5);
 
+fn finish_shutdown(worker: SearchWorker) -> Result<(), kwil_core_search::worker::ShutdownError> {
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut result = worker.shutdown_until(deadline);
+    loop {
+        match result {
+            Err(error)
+                if error.reason() == kwil_core_search::worker::WorkerSettlementReason::ThreadExitPending
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(
+                    Duration::from_millis(1).min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+                result = error.retry_until(deadline);
+            }
+            terminal => return terminal,
+        }
+    }
+}
+
 fn request(generation: u64) -> SearchRequest {
     let mut buffer = kwil_core_text::Buffer::empty();
     buffer.insert(0, b"owned").unwrap();
@@ -37,9 +56,9 @@ fn prebound_host_key_survives_take_without_sync_or_new_search_generation() {
     let receipt = worker.wait_inputs_released(WAIT).unwrap();
     assert!(receipt.valid_for(&key));
     assert!(!receipt.valid_for(&foreign_key));
-    worker.shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(worker).unwrap();
     let mut foreign = foreign;
-    foreign.take_shutdown().unwrap().shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(foreign.take_shutdown().unwrap()).unwrap();
 }
 
 #[test]
@@ -72,8 +91,8 @@ fn close_refusal_restores_original_worker_internal_retry_and_exact_external_owne
     // than being lost in the wrapper's original Option<Box<request>> refusal.
     let retirement = SearchWorker::new(|| {}).unwrap();
     retirement.close_with_requests(host.rejected.take(), Some(*external)).continue_value().unwrap();
-    retirement.shutdown_bounded(WAIT).unwrap();
-    host.worker.take().unwrap().shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(retirement).unwrap();
+    finish_shutdown(host.worker.take().unwrap()).unwrap();
 }
 
 #[test]
