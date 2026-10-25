@@ -1,0 +1,53 @@
+name: Windows installer token preflight
+
+# Internal token experiment only: no dist, Cargo, MSI, editor or lifecycle run.
+# Do not use self-hosted runners. Diagnostic-only paths are excluded from the
+# expensive lifecycle trigger; actual installer dependency triggers/gates remain.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/test-windows-installer-token.ps1'
+      - '.github/workflows/windows-installer-token.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  token:
+    name: Same-SID token (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, architecture: x64 }
+          - { os: windows-11-arm, architecture: arm64 }
+    runs-on: ${{ matrix.os }}
+    # 60s checkout + 120s script fence + 60s upload + 60s slack = 300s.
+    # The script's monotonic 90s includes admission, compilation of its interop,
+    # candidate/launch, one cumulative 10s cleanup reserve across every reap, and
+    # evidence. This is an internal test budget, not installer qualification.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+      - name: Measure and prove one actual same-user standard-token worker
+        timeout-minutes: 2
+        shell: pwsh
+        env:
+          KWIL_INSTALLER_TOKEN_DISPOSABLE: ${{ github.run_id }}:${{ github.run_attempt }}
+        run: |
+          ./scripts/test-windows-installer-token.ps1 -Architecture '${{ matrix.architecture }}' -EvidenceDirectory (Join-Path $env:GITHUB_WORKSPACE '.token-preflight')
+      - name: Keep bounded token facts, exact PID ownership and failure evidence
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer-token-${{ matrix.architecture }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/.token-preflight
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

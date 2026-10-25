@@ -8,6 +8,8 @@ on:
     paths:
       - '.github/workflows/windows-installer.yml'
       - 'scripts/*windows*'
+      # Diagnostic-only changes must not launch the expensive MSI lifecycle.
+      - '!scripts/test-windows-installer-token.ps1'
       - 'scripts/dist.ps1'
       - 'scripts/check-static-runtime.py'
       - 'dist.bat'
