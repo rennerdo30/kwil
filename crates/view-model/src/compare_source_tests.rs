@@ -153,6 +153,33 @@ fn source_preserves_all_identity_words_and_is_send_sync_for_production_accountin
 }
 
 #[test]
+fn read_owner_nonce_survives_moves_and_clones_but_not_equal_identity_leases() {
+    let (store, budget) = fixture();
+    let first = source(&store, &budget);
+    let nonce = first.read_owner_id();
+    let clone = first.try_clone().unwrap_or_else(|_| panic!("available source slot"));
+    let moved = first;
+    let second = source(&store, &budget);
+    assert_eq!(moved.input_identity(), second.input_identity());
+    assert_eq!(moved.read_owner_id(), nonce);
+    assert_eq!(clone.read_owner_id(), nonce);
+    assert_ne!(second.read_owner_id(), nonce);
+    drop(clone);
+    retire_source(moved);
+    retire_source(second);
+    retire_store(store, &budget);
+}
+
+#[test]
+fn read_owner_nonce_exhaustion_never_wraps_or_reuses_an_id() {
+    let counter = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(next_read_owner(&counter), Some(u64::MAX - 1));
+    assert_eq!(next_read_owner(&counter), None);
+    assert_eq!(next_read_owner(&counter), None);
+    assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+}
+
+#[test]
 fn arc_header_is_admitted_before_construction_with_exact_refusal_token() {
     let (store, budget) = fixture();
     let baseline = budget.usage();

@@ -3,6 +3,9 @@
 //! ROOT hooks: `pub mod visual_rows; pub mod wrap_session;` in lib.rs. Raw
 //! `View::line/line_source` are deliberately not changed. Wrapped renderers use
 //! `LayoutPage::rows/atoms/syntax_windows`, never re-layout display payloads.
+#[path = "visual_task.rs"]
+pub mod task;
+
 use crate::grid::{GraphemeStep, GraphemeStepper};
 use kwil_core_text::Snapshot;
 use std::{

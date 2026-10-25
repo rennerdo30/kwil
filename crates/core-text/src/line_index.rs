@@ -28,6 +28,15 @@ struct ChunkResult {
 }
 
 impl LineIndex {
+    /// Constant-time sparse checkpoint access for admitted worker continuations.
+    pub(crate) fn worker_checkpoint_count(&self, ranks: bool) -> usize {
+        if ranks { self.rank_checkpoints.len() } else { self.checkpoints.len() }
+    }
+
+    pub(crate) fn worker_checkpoint(&self, ranks: bool, index: usize) -> Option<(u64, u64)> {
+        if ranks { self.rank_checkpoints.get(index).copied() } else { self.checkpoints.get(index).copied() }
+    }
+
     /// Resident sparse checkpoints, used in conservative undo accounting.
     pub fn memory_bytes(&self) -> usize {
         (self.checkpoints.capacity() + self.rank_checkpoints.capacity()) * std::mem::size_of::<(u64, u64)>()

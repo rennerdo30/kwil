@@ -16,8 +16,17 @@ use kwil_core_text::compare_input::{
 use std::{
     alloc::Layout,
     mem::size_of,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
+
+static NEXT_READ_OWNER: AtomicU64 = AtomicU64::new(1);
+
+fn next_read_owner(counter: &AtomicU64) -> Option<u64> {
+    counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1)).ok()
+}
 
 /// Running/latest desired/ready and retirement owners are bounded explicitly.
 /// The private Arc cannot be downgraded to Weak, which could otherwise keep its
@@ -25,6 +34,7 @@ use std::{
 pub const COMPARE_SOURCE_OWNERS: usize = 5;
 struct Shared<A: Admission> {
     lease: ReadLease<A>,
+    read_owner: u64,
     clone_admission: Mutex<()>,
 }
 
@@ -61,6 +71,7 @@ pub fn compare_source_transfer_charge<A: Admission>() -> Option<usize> {
         .size()
         .checked_add(size_of::<CompareSource<A>>().checked_mul(COMPARE_SOURCE_OWNERS)?)?
         .checked_add(size_of::<CompareSourceStep<A>>())?
+        .checked_add(size_of::<AtomicU64>())?
         .checked_add(size_of::<ReadCredit>())
 }
 
@@ -77,9 +88,12 @@ pub fn begin_compare_source<A: Admission + Send + Sync + 'static>(
         return CompareSourceStep::Rejected { admission, error: InputError::Overflow };
     };
     match store.read_lease_with_transfer(admission, transfer, work, cancel) {
-        ReadLeaseStep::Ready(lease) => CompareSourceStep::Ready(CompareSource {
-            shared: Some(Arc::new(Shared { lease, clone_admission: Mutex::new(()) })),
-        }),
+        ReadLeaseStep::Ready(lease) => match next_read_owner(&NEXT_READ_OWNER) {
+            Some(read_owner) => CompareSourceStep::Ready(CompareSource {
+                shared: Some(Arc::new(Shared { lease, read_owner, clone_admission: Mutex::new(()) })),
+            }),
+            None => CompareSourceStep::Failed { retirement: lease.into_retirement(), error: InputError::Overflow },
+        },
         ReadLeaseStep::Pending(admission) => CompareSourceStep::Pending(admission),
         ReadLeaseStep::Cancelled(admission) => CompareSourceStep::Cancelled(admission),
         ReadLeaseStep::Rejected { admission, error } => CompareSourceStep::Rejected { admission, error },
@@ -96,6 +110,11 @@ impl<A: Admission> CompareSource<A> {
     /// reconstructed filename, new incarnation or source capture is involved.
     pub fn input_identity(&self) -> InputIdentity {
         self.shared().lease.identity()
+    }
+    /// Move-stable identity of this admitted read owner. Slot clones share it;
+    /// separately created leases never reuse it, even for equal input metadata.
+    pub fn read_owner_id(&self) -> u64 {
+        self.shared().read_owner
     }
     pub fn identity(&self) -> SourceIdentity {
         let [document_id, source_epoch, incarnation, revision] = self.input_identity().0;
