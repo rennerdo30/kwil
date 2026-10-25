@@ -11,7 +11,7 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    ops::Range,
+    ops::{ControlFlow, Range},
     sync::Arc,
 };
 
@@ -56,6 +56,38 @@ pub struct HighlightSession {
     painted: BTreeMap<u64, Vec<(Range<usize>, Class)>>,
     prepared_suspended: bool,
     prepared_error: Option<WrapError>,
+}
+
+/// A failed consuming shutdown retains the complete frontend/source facade.
+pub struct HighlightSessionShutdownError {
+    owner: std::sync::Mutex<Option<HighlightSession>>,
+    reason: kwil_core_syntax::WorkerSettlementReason,
+}
+impl HighlightSessionShutdownError {
+    pub fn reason(&self) -> kwil_core_syntax::WorkerSettlementReason {
+        self.reason
+    }
+    pub fn into_session(self) -> HighlightSession {
+        self.owner.into_inner().unwrap_or_else(|error| error.into_inner()).expect("original highlight session")
+    }
+}
+impl std::fmt::Display for HighlightSessionShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "highlight shutdown {:?}; exact session retained", self.reason)
+    }
+}
+impl std::fmt::Debug for HighlightSessionShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, out)
+    }
+}
+impl std::error::Error for HighlightSessionShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.reason {
+            kwil_core_syntax::WorkerSettlementReason::NativeObservation(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 impl HighlightSession {
@@ -565,32 +597,83 @@ impl HighlightSession {
         }
     }
 
-    /// Consume on a shutdown owner after the GUI loop, never on input/render.
-    pub fn shutdown(mut self) -> Result<(), String> {
-        let result =
-            self.worker.take().map_or(Ok(()), |worker| worker.shutdown().map_err(|_| "syntax worker panicked".into()));
+    /// OFF UI only. A failed attempt keeps the exact worker and every frontend
+    /// source/rejected/snapshot owner. Retire those owners here only AFTER an
+    /// actual successful join, using the caller's original deadline throughout.
+    pub fn settle_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), kwil_core_syntax::WorkerSettlementReason> {
+        if let Some(worker) = self.worker.as_mut() {
+            worker.settle_until(deadline)?;
+        }
+        self.retire_frontend();
+        Ok(())
+    }
+
+    pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send + 'static)> {
+        self.worker.as_ref()?.panic_payload()
+    }
+
+    /// Explicit OFF-UI UNBOUNDED compatibility cleanup. A failed attempt keeps
+    /// every frontend source and the original worker, including post-join right.
+    pub fn shutdown(mut self) -> ControlFlow<HighlightSessionShutdownError, ()> {
+        let result = self.worker.as_mut().map_or(Ok(()), HighlightWorker::shutdown_in_place);
+        match result {
+            Ok(()) => {
+                self.retire_frontend();
+                ControlFlow::Continue(())
+            }
+            Err(reason) => {
+                ControlFlow::Break(HighlightSessionShutdownError { owner: std::sync::Mutex::new(Some(self)), reason })
+            }
+        }
+    }
+    pub fn shutdown_until(mut self, deadline: std::time::Instant) -> ControlFlow<HighlightSessionShutdownError, ()> {
+        match self.settle_until(deadline) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(reason) => {
+                ControlFlow::Break(HighlightSessionShutdownError { owner: std::sync::Mutex::new(Some(self)), reason })
+            }
+        }
+    }
+    fn retire_frontend(&mut self) {
+        self.worker.take();
         self.source.take();
         self.rejected.take();
         self.snapshot.take();
-        result
     }
+    /// Request cancellation, retaining this facade for explicit OFF-UI cleanup.
     pub fn stop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            let source = self.source.take();
-            let rejected = self.rejected.take();
-            let snapshot = self.snapshot.take();
-            std::thread::spawn(move || {
-                let _ = worker.shutdown();
-                drop((source, rejected, snapshot));
-            });
+        if let Some(worker) = self.worker.as_ref() {
+            worker.stop();
         }
+    }
+    /// Actual owned-failure/return overlap, BYTES. Include in the SAME host
+    /// metadata precharge alongside HighlightWorker::retained_metadata_bytes.
+    pub const fn shutdown_metadata_bytes() -> Option<usize> {
+        std::mem::size_of::<HighlightSessionShutdownError>()
+            .checked_add(std::mem::size_of::<ControlFlow<HighlightSessionShutdownError, ()>>())
     }
 }
 impl Drop for HighlightSession {
     fn drop(&mut self) {
         self.stop();
+        if self.worker.is_some() {
+            // Misuse quarantine, NOT cleanup: no detached helper and no last
+            // frontend source destruction on UI. Forgetting the whole worker
+            // preserves its same Shared header, original handle/panic and right.
+            std::mem::forget(self.worker.take());
+            std::mem::forget(self.source.take());
+            std::mem::forget(self.rejected.take());
+            std::mem::forget(self.snapshot.take());
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "highlight_settlement_tests.rs"]
+mod highlight_settlement_tests;
 
 fn prepared_current(view: &Workspace, page: &LayoutPage, current: WrapHostContext) -> bool {
     let Some(editor) = view.editor() else { return false };
@@ -678,6 +761,19 @@ mod tests {
         sync::mpsc,
         time::{Duration, Instant},
     };
+
+    // Preserve the existing owned-cleanup assertions without converting the
+    // large original owner back into a Result or adding an error-time Box.
+    trait ShutdownControlFlowExt {
+        fn unwrap(self);
+    }
+    impl ShutdownControlFlowExt for ControlFlow<HighlightSessionShutdownError, ()> {
+        fn unwrap(self) {
+            if let ControlFlow::Break(error) = self {
+                panic!("{error}");
+            }
+        }
+    }
 
     fn policy_fixture() -> (Workspace, HighlightSession, mpsc::Receiver<()>) {
         let mut view = Workspace::new(View::new(None)).unwrap();

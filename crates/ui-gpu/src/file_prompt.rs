@@ -44,7 +44,8 @@ pub(super) fn submit(workspace: &mut Workspace) -> Damage {
 
 impl App {
     pub(super) fn external_modal(&self) -> bool {
-        self.file_modal()
+        self.document_input_blocked()
+            || self.file_modal()
             || self.binary_pending()
             || self.view.file_prompt().is_some()
             || self.view.close_pending()
@@ -205,6 +206,9 @@ mod tests {
     #[test]
     fn worker_receipts_preserve_drag_and_per_row_windows_until_the_active_document_changes() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let root = crate::test_support::directory("kwil-gui-prompt-receipt").unwrap();
+        let lane = crate::document_ui::fixtures::Lane::start(&mut workspace, root.join("state"));
+        lane.until(&mut workspace, |workspace| workspace.recovery_ready());
         workspace.set_rows(2);
         workspace
             .execute("edit.insert", &CommandArgs { text: Some("\u{754c}a\nxyz".into()), ..Default::default() }, 1)
@@ -215,7 +219,8 @@ mod tests {
         assert_eq!(workspace.line_offset(1), 2);
         let (mut previous, mut horizontal, mut selecting, mut drag) = (first, 2, true, Some((true, 3)));
         let mut epoch = workspace.input_epoch();
-        workspace.document_result(kwil_view_model::document_worker::DocumentResult::Persisted(Ok(())));
+        workspace.checkpoint_session();
+        lane.through(&mut workspace, kwil_view_model::workspace_document::ResultKind::Persisted);
         sync_active_document(&workspace, &mut previous, &mut epoch, &mut horizontal, &mut selecting, &mut drag, None);
         assert_eq!(horizontal, 2);
         assert!(selecting);
@@ -230,6 +235,8 @@ mod tests {
         assert_eq!(horizontal, 2);
         assert_eq!(workspace.line_offset(0), 0);
         assert_eq!(workspace.line_offset(1), 2);
+        lane.settle(workspace);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

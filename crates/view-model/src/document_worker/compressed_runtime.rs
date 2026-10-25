@@ -61,7 +61,7 @@ fn compressed_worker_sample_exact_save_reopen_and_clean_session_restore() {
         .unwrap();
     loop {
         if let DocumentResult::Saved { result, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
-            editor.finish_save(result).unwrap();
+            editor.finish_save_for_test(result).unwrap();
             break;
         }
     }
@@ -146,7 +146,7 @@ fn compressed_worker_snapshot_retirement_busy_save_and_exact_cleanup_retry() {
     let error = backings.save(request, editor.document().save_plan(), &cancel).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(std::fs::read(&path).unwrap(), GZIP);
-    editor.finish_save(Err(error)).unwrap_err();
+    editor.finish_save_for_test(Err(error)).unwrap_err();
     // Keep a snapshot pin while the editable document disappears.
     drop(editor);
     assert_eq!(backings.retire().live, 1);
@@ -192,7 +192,7 @@ fn compressed_worker_cancellation_and_changed_original_prevent_save() {
     std::fs::write(&path, b"foreign replacement").unwrap();
     let request = editor.save_request(None).unwrap();
     let error = backings.save(request, editor.document().save_plan(), &cancel).err().unwrap();
-    editor.finish_save(Err(error)).unwrap_err();
+    editor.finish_save_for_test(Err(error)).unwrap_err();
     assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
     drop(editor);
     backings.retire();
@@ -333,7 +333,7 @@ fn compressed_worker_encoding_is_detected_after_decompression_and_roundtrips_opa
         .unwrap();
     loop {
         if let DocumentResult::Saved { result, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
-            editor.finish_save(result).unwrap();
+            editor.finish_save_for_test(result).unwrap();
             break;
         }
     }

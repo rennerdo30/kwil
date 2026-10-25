@@ -19,6 +19,24 @@ fn inline_owner_is_send_sync_errors_are_copy_and_sizes_are_const_evaluable() {
 }
 
 #[test]
+fn registration_error_inspection_preserves_original_evidence_through_retirement() {
+    let observation = NativeExitObservation::new();
+    assert_eq!(observation.registration_error(), None);
+    let error = NativeObservationError::MachValidate { code: 73 };
+    let identity = Identity::current();
+    assert_eq!(
+        observation.register_with(identity, || Attempt { witness: Witness::Mock(73), error: Some(error) }),
+        Err(error)
+    );
+    assert_eq!(observation.registration_error(), Some(error));
+    observation.retire_with(identity.process, |_| Ok(())).unwrap();
+    assert_eq!(observation.registration_error(), Some(error));
+    let successful = NativeExitObservation::new();
+    mock_registration(&successful);
+    assert_eq!(successful.registration_error(), None);
+}
+
+#[test]
 fn registration_is_one_shot_and_foreign_identities_cannot_query_or_retire() {
     let other = thread::spawn(|| thread::current().id()).join().unwrap();
     let observation = NativeExitObservation::new();

@@ -30,6 +30,8 @@
 //! verify permissive licence/version/hash/ABI provenance and retain its library
 //! handles. No downloader or unverified grammar catalogue is implied here.
 use crate::editor::receipts::{EditKind, EditReceipt, SyntaxEdit};
+use kwil_core_runtime::{NativeExitObservation, NativeExitState, NativeObservationError};
+use kwil_core_syntax::WorkerSettlementReason;
 use kwil_core_syntax::detection::Detector;
 pub use kwil_core_syntax::detection::{Detection, DetectionOrigin, LanguageMapping};
 pub use kwil_core_syntax::{Class, Language, Mode, Span};
@@ -43,9 +45,10 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 pub const SOURCE_CHUNK_BYTES: usize = 64 * 1024;
@@ -263,6 +266,16 @@ struct Shared {
     state: Mutex<State>,
     ready: Condvar,
     generation: AtomicU64,
+    completed: AtomicBool,
+    native_exit: NativeExitObservation,
+}
+struct Completion<'a>(&'a Shared);
+impl Drop for Completion<'_> {
+    fn drop(&mut self) {
+        let _state = self.0.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.0.completed.store(true, Ordering::Release);
+        self.0.ready.notify_all();
+    }
 }
 
 /// One active + one latest pending job, eight retirement slots and one result.
@@ -272,8 +285,95 @@ struct Shared {
 pub struct HighlightWorker {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+    native_retired: bool,
+    settled: bool,
 }
+/// Failure owns the original facade; Drop never joins or performs native I/O.
+pub struct HighlightShutdownError {
+    owner: Mutex<Option<HighlightWorker>>,
+    reason: WorkerSettlementReason,
+}
+impl HighlightShutdownError {
+    pub fn reason(&self) -> WorkerSettlementReason {
+        self.reason
+    }
+    pub fn into_worker(self) -> HighlightWorker {
+        self.owner.into_inner().unwrap_or_else(|error| error.into_inner()).expect("original shutdown owner")
+    }
+}
+impl std::fmt::Display for HighlightShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "worker shutdown {:?}; exact owner retained", self.reason)
+    }
+}
+impl std::fmt::Debug for HighlightShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, out)
+    }
+}
+impl std::error::Error for HighlightShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.reason {
+            WorkerSettlementReason::NativeObservation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl HighlightWorker {
+    /// Declared fixed facade/shared headers, aligned Arc allocation and
+    /// completion/typed-return overlap. Host session/source/engine payloads have
+    /// their existing separate caps. Reserve before constructing the worker.
+    pub const fn retained_metadata_bytes() -> usize {
+        match Self::checked_retained_metadata_bytes() {
+            Some(bytes) => bytes,
+            None => usize::MAX,
+        }
+    }
+    pub const fn checked_retained_metadata_bytes() -> Option<usize> {
+        #[repr(C)]
+        struct Allocation {
+            strong: std::sync::atomic::AtomicUsize,
+            weak: std::sync::atomic::AtomicUsize,
+            data: Shared,
+        }
+        let bytes = Some(0usize);
+        let bytes = metadata_add(bytes, std::mem::size_of::<Self>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Allocation>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Completion<'static>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), WorkerSettlementReason>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<HighlightShutdownError>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), HighlightShutdownError>>());
+        match NativeExitObservation::operation_stack_bytes() {
+            Some(scratch) => metadata_add(bytes, scratch),
+            None => None,
+        }
+    }
+    /// Exact fixed facade + aligned Arc<Shared> growth for the existing host
+    /// metadata admission BEFORE construction. Completion and panic retention
+    /// add inline fields only; the thread's original panic Box is never copied.
+    pub const fn settlement_metadata_bytes() -> usize {
+        #[allow(dead_code)]
+        struct BeforeWorker {
+            shared: Arc<Shared>,
+            thread: Option<JoinHandle<()>>,
+        }
+        #[allow(dead_code)]
+        struct BeforeShared {
+            state: Mutex<State>,
+            ready: Condvar,
+            generation: AtomicU64,
+        }
+        #[repr(C)]
+        struct Allocation<T> {
+            strong: std::sync::atomic::AtomicUsize,
+            weak: std::sync::atomic::AtomicUsize,
+            data: T,
+        }
+        std::mem::size_of::<Self>() - std::mem::size_of::<BeforeWorker>() + std::mem::size_of::<Allocation<Shared>>()
+            - std::mem::size_of::<Allocation<BeforeShared>>()
+    }
     pub fn new(config: Config, wake: impl Fn() + Send + Sync + 'static) -> Result<Self, Error> {
         Self::start(config, None, wake)
     }
@@ -301,6 +401,7 @@ impl HighlightWorker {
             Some(provider) => Engine::with_provider(config, provider)?,
             None => Engine::new(config)?,
         };
+        Self::checked_retained_metadata_bytes().ok_or(Error::InvalidConfig)?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 pending: None,
@@ -311,11 +412,17 @@ impl HighlightWorker {
             }),
             ready: Condvar::new(),
             generation: AtomicU64::new(0),
+            completed: AtomicBool::new(false),
+            native_exit: NativeExitObservation::new(),
         });
         let worker = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("kwil-highlighting".into())
             .spawn(move || {
+                let _completion = Completion(&worker);
+                if worker.native_exit.register_current().is_err() {
+                    worker.state.lock().unwrap_or_else(|error| error.into_inner()).stopped = true;
+                }
                 let mut document = None;
                 let mut settings: Option<Arc<[LanguageMapping]>> = None;
                 let mut detector = None;
@@ -471,7 +578,7 @@ impl HighlightWorker {
                 }
             })
             .map_err(Error::Io)?;
-        Ok(Self { shared, thread: Some(thread) })
+        Ok(Self { shared, thread: Some(thread), panic: None, native_retired: false, settled: false })
     }
 
     /// Constant mailbox work, no source access, glob compilation or destruction
@@ -552,22 +659,159 @@ impl HighlightWorker {
         Some(result)
     }
 
-    fn stop(&self) {
-        let mut state = self.shared.state.lock().unwrap();
+    pub(crate) fn stop(&self) {
+        let mut state = self.shared.state.lock().unwrap_or_else(|error| error.into_inner());
         self.shared.generation.fetch_add(1, Ordering::AcqRel);
         state.stopped = true;
         self.shared.ready.notify_one();
     }
-    pub fn shutdown(mut self) -> thread::Result<()> {
+    /// Explicit OFF-UI UNBOUNDED compatibility join. Never call from a bounded
+    /// shutdown protocol; failure retains the complete original owner.
+    pub fn shutdown(mut self) -> Result<(), HighlightShutdownError> {
+        self.shutdown_in_place().map_err(|reason| HighlightShutdownError { owner: Mutex::new(Some(self)), reason })
+    }
+    pub fn shutdown_until(mut self, deadline: Instant) -> Result<(), HighlightShutdownError> {
+        self.settle_until(deadline).map_err(|reason| HighlightShutdownError { owner: Mutex::new(Some(self)), reason })
+    }
+    pub(crate) fn shutdown_in_place(&mut self) -> Result<(), WorkerSettlementReason> {
         self.stop();
-        self.thread.take().unwrap().join()
+        if let Some(handle) = self.thread.take()
+            && let Err(panic) = handle.join()
+        {
+            self.panic = Some(panic);
+        }
+        self.finish_join_with(None, NativeExitObservation::retire_after_join)
+    }
+    /// OFF UI. One existing completion wait, one borrowed native observation,
+    /// the ORIGINAL deadline, and no production polling. ACK/is_finished alone
+    /// never authorizes join. Every refusal retains the exact original owners.
+    pub fn settle_until(&mut self, deadline: Instant) -> Result<(), WorkerSettlementReason> {
+        self.settle_with(
+            deadline,
+            |observation, handle| observation.query(handle),
+            NativeExitObservation::retire_after_join,
+        )
+    }
+    fn settle_with(
+        &mut self,
+        deadline: Instant,
+        query: impl FnOnce(&NativeExitObservation, &JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), WorkerSettlementReason> {
+        self.stop();
+        if self.thread.is_some() {
+            let shared = &self.shared;
+            let guard = shared.state.lock().unwrap_or_else(|error| error.into_inner());
+            let (guard, _) = shared
+                .ready
+                .wait_timeout_while(guard, deadline.saturating_duration_since(Instant::now()), |_| {
+                    !shared.completed.load(Ordering::Acquire)
+                })
+                .unwrap_or_else(|error| error.into_inner());
+            let completed = shared.completed.load(Ordering::Acquire);
+            drop(guard);
+            if !completed {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+            // Query before consuming anything, even after a cleanup ACK. It also
+            // retains original registration errors and any partial owned right.
+            match query(&shared.native_exit, self.thread.as_ref().expect("original worker handle")) {
+                Ok(NativeExitState::Pending) => return Err(WorkerSettlementReason::ThreadExitPending),
+                Err(error) => return Err(WorkerSettlementReason::NativeObservation(error)),
+                Ok(NativeExitState::Exited) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+            if let Err(panic) = self.thread.take().expect("native-exited original handle").join() {
+                self.panic = Some(panic);
+            }
+        }
+        // thread=None means the ORIGINAL join already returned, including panic;
+        // it does not imply native-right retirement completed on a prior call.
+        self.finish_join_with(Some(deadline), retire)
+    }
+    fn finish_join_with(
+        &mut self,
+        deadline: Option<Instant>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), WorkerSettlementReason> {
+        self.finish_join_with_clock(deadline, retire, Instant::now)
+    }
+    fn finish_join_with_clock(
+        &mut self,
+        deadline: Option<Instant>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+        mut now: impl FnMut() -> Instant,
+    ) -> Result<(), WorkerSettlementReason> {
+        // Once the right is retired, sticky diagnostics precede deadline-only
+        // no-op retries. No consumed panic payload can turn into fake success.
+        if self.native_retired {
+            if self.panic.is_some() {
+                return Err(WorkerSettlementReason::WorkerPanicked);
+            }
+            if let Some(error) = self.shared.native_exit.registration_error() {
+                return Err(WorkerSettlementReason::NativeObservation(error));
+            }
+            if self.settled {
+                return Ok(());
+            }
+        }
+        if !self.settled && deadline.is_some_and(|deadline| now() >= deadline) {
+            return Err(WorkerSettlementReason::TimedOut);
+        }
+        if !self.native_retired {
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+            retire(&self.shared.native_exit).map_err(WorkerSettlementReason::NativeObservation)?;
+            self.native_retired = true;
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+        }
+        if self.panic.is_some() {
+            return Err(WorkerSettlementReason::WorkerPanicked);
+        }
+        if let Some(error) = self.shared.native_exit.registration_error() {
+            return Err(WorkerSettlementReason::NativeObservation(error));
+        }
+        self.settled = true;
+        Ok(())
+    }
+    /// Scalar-only original native retirement evidence; no native query or I/O.
+    pub fn first_native_retirement_error(&self) -> Option<NativeObservationError> {
+        self.shared.native_exit.first_retirement_error()
+    }
+    pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send + 'static)> {
+        self.panic.as_deref()
     }
 }
 impl Drop for HighlightWorker {
     fn drop(&mut self) {
         self.stop();
+        if self.thread.is_some() || !self.settled || self.panic.is_some() {
+            // Misuse quarantine, NOT successful retirement: retain the SAME
+            // shared allocation/source headers/native right and exact handle.
+            // No native I/O, source destruction, new allocation or cleanup thread.
+            std::mem::forget(Arc::clone(&self.shared));
+            std::mem::forget(self.thread.take());
+            std::mem::forget(self.panic.take());
+        }
     }
 }
+
+// Checked declared Rust-value accounting, not compiler/native-stack usage.
+const fn metadata_add(bytes: Option<usize>, extra: usize) -> Option<usize> {
+    match bytes {
+        Some(bytes) => bytes.checked_add(extra),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "highlighting/highlight_settlement_tests.rs"]
+mod highlight_settlement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -686,7 +930,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!("kwil-syntax-trim-{}.txt", std::process::id()));
             let before = editor.document().snapshot();
             let request = editor.save_request(Some(path.clone())).unwrap();
-            editor.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+            editor.finish_save_for_test(kwil_core_workspace::save_snapshot(request)).unwrap();
             let trimmed = SnapshotTextSource::from_editor(&editor);
             let receipt = trimmed.edit.as_ref().unwrap().receipt(before.clone(), trimmed.snapshot.clone());
             assert_eq!(receipt.kind, EditKind::WorkerTrim);

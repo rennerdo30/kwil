@@ -55,8 +55,12 @@ pub(super) fn capture(workspace: &Workspace, insert_mode: bool) -> Destination {
             revision: prompt.revision,
         };
     }
-    let Some(editor) = workspace.editor() else { return Destination::Cancelled };
-    let Some(ticket) = workspace.editor_input_ticket(workspace.active_id()) else { return Destination::Cancelled };
+    let Some(editor) = workspace.editor() else {
+        return Destination::Cancelled;
+    };
+    let Some(ticket) = workspace.editor_input_ticket(workspace.active_id()) else {
+        return Destination::Cancelled;
+    };
     Destination::Editor {
         ticket,
         document: workspace.active_id(),
@@ -280,15 +284,15 @@ mod tests {
         let mut session = kwil_core_workspace::session::Session::default();
         let restored = session.open(None).unwrap();
         assert_eq!(restored, original);
-        workspace.document_result(kwil_view_model::document_worker::DocumentResult::Prepared(Ok(
-            kwil_view_model::document_worker::PreparedWorkspace {
-                session,
-                documents: vec![(restored, Ok(kwil_view_model::Document::new()))],
-            },
-        )));
+        let root = crate::test_support::directory("kwil-gui-ime-prepare").unwrap();
+        kwil_core_workspace::session::store_session(&root.join("session.kws"), &session).unwrap();
+        let lane = crate::document_ui::fixtures::Lane::start(&mut workspace, root.clone());
+        lane.until(&mut workspace, |workspace| workspace.recovery_ready() && workspace.editor().is_some());
         commit(&mut workspace, destination, "wrong".into(), Default::default());
         assert_eq!(bytes(&workspace, restored), 0);
         assert!(workspace.status_text().contains("cancelled"));
+        lane.settle(workspace);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

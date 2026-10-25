@@ -766,7 +766,7 @@ mod tests {
         let request = editor.save_request(None).unwrap();
         let completion = registry.save(request, plan, &cancel).unwrap();
         assert!(!completion.logical_coordinates_changed);
-        editor.finish_save(Ok(completion.saved)).unwrap();
+        editor.finish_save_for_test(Ok(completion.saved)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfeA\0x\0");
         assert_eq!(registry.retire().live, 2, "old undo and new checkpoint origins stay worker-owned");
         editor.execute("edit.undo", &crate::CommandArgs::default(), 2).unwrap();
@@ -794,7 +794,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(std::fs::read(&path).unwrap(), raw);
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 2, "no save temporary or second backing");
-        editor.finish_save(Err(error)).unwrap_err();
+        editor.finish_save_for_test(Err(error)).unwrap_err();
         drop(editor);
         assert_eq!(registry.retire().retired, 1);
     }

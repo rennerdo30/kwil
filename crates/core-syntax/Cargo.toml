@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+kwil-core-runtime = { path = "../core-runtime" }
 globset = "0.4.20"
 tree-sitter = "=0.27.1"
 arborium-c = { version = "=2.18.2", optional = true, default-features = false }

@@ -72,6 +72,12 @@ const INPUT_BYTES: usize = 256;
 const PREVIEW_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementReason {
+    Worker(kwil_view_model::log_session::LogSettlementReason),
+    Retirement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Source {
     pub document: u64,
     pub revision: u64,
@@ -226,6 +232,7 @@ pub(super) struct Host {
     // Never replace/drop a rejected snapshot on UI. Retry this exact owner
     // before acquiring another, including after close or source changes.
     retry: Option<Retry>,
+    retirement_failure: Option<String>,
     open: bool,
     source: Option<Source>,
     expected: Option<Version>,
@@ -276,6 +283,7 @@ impl Default for Host {
         Self {
             session: None,
             retry: None,
+            retirement_failure: None,
             open: false,
             source: None,
             expected: None,
@@ -324,6 +332,41 @@ fn all_levels() -> u8 {
     Level::ALL.iter().fold(0, |mask, level| mask | level.bit())
 }
 impl Host {
+    pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.session.as_ref().and_then(|session| session.panic_payload())
+    }
+    /// OFF UI. Keep the original session and failed retirement in this host;
+    /// the shared producer owns its bounded wait and actual thread join.
+    pub fn retirement_error(&self) -> Option<&str> {
+        self.retirement_failure.as_deref()
+    }
+    /// Explicit OFF-UI producer retry. Only that producer can reap its inactive
+    /// registry entries and clear the original sticky retirement diagnostic.
+    pub fn retry_retirement_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), kwil_view_model::log_session::LogRetirementRetryReason> {
+        let session =
+            self.session.as_mut().ok_or(kwil_view_model::log_session::LogRetirementRetryReason::WorkerNotJoined)?;
+        session.retry_retirement_until(deadline)?;
+        self.retirement_failure = None;
+        Ok(())
+    }
+    pub fn settle_until(&mut self, deadline: std::time::Instant) -> Result<(), SettlementReason> {
+        if self.retirement_failure.is_some() {
+            return Err(SettlementReason::Retirement);
+        }
+        self.close();
+        drop(self.retry.take());
+        if let Some(session) = &mut self.session {
+            session.settle_until(deadline).map_err(SettlementReason::Worker)?;
+            if let Err(error) = session.retirement_status().result() {
+                self.retirement_failure = Some(error);
+                return Err(SettlementReason::Retirement);
+            }
+        }
+        Ok(())
+    }
     /// Configure once, before opening. ROOT uses the existing search spool
     /// cap (currently SearchWorker::new's 1 GiB), not a new product setting.
     pub fn admit_projection_disk(&mut self, bytes: u64) {
@@ -754,20 +797,6 @@ impl Host {
         }
         "Filter view · read-only · Apply to show matching lines".into()
     }
-    pub fn shutdown(&mut self) -> Option<shutdown::Job> {
-        self.close();
-        let retry = self.retry.take();
-        let status = self.session.as_ref().map(LogSession::retirement_status);
-        let worker = self.session.take().map(LogSession::stop);
-        if retry.is_none() && worker.is_none() {
-            return None;
-        }
-        Some(Box::new(move || {
-            drop(retry); // the shutdown owner is off UI, including rejection.
-            worker.map_or(Ok(()), |worker| worker.join().map_err(|_| "Log worker panicked".to_owned()))?;
-            status.map_or(Ok(()), |status| status.result())
-        }))
-    }
 }
 
 impl App {
@@ -984,7 +1013,9 @@ impl App {
         }
     }
     fn logs_activate(&mut self, index: usize) {
-        let Some(line) = self.logs.navigation(Source::capture(&self.view), index) else { return };
+        let Some(line) = self.logs.navigation(Source::capture(&self.view), index) else {
+            return;
+        };
         self.logs.selected = index;
         // ROOT explicitly retains the same bounded Go to Line / Find adapter.
         // No new source lookup is introduced here to build snippets/offsets.

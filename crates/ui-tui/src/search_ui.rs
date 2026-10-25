@@ -11,6 +11,10 @@ pub(super) struct SearchHost {
     panel: SearchPanel,
     origin: Option<Origin>,
     painted: Option<Painted>,
+    body_gate: Option<kwil_view_model::wrap_session::MutationGate>,
+    body_closed: bool,
+    replacement: Option<(kwil_view_model::search_session::SearchKey, u64)>,
+    closing_request: Option<Box<kwil_view_model::search_session::SearchRequest>>,
 }
 
 /// A cursor-only change must invalidate an asynchronous navigation too.
@@ -66,6 +70,23 @@ struct Painted {
 }
 
 impl SearchHost {
+    pub(super) fn body_gate(&mut self, gate: kwil_view_model::wrap_session::MutationGate, closed: bool) {
+        self.body_gate = Some(gate);
+        self.body_closed = closed;
+    }
+    fn body_refused(&mut self, view: &mut Workspace) -> bool {
+        let message = if self.body_closed {
+            Some("Wrapped body is settling; document input was not applied")
+        } else {
+            self.body_gate.and_then(wrap_ui::mutation_notice)
+        };
+        if let Some(message) = message {
+            self.notice(view, message.into());
+            true
+        } else {
+            false
+        }
+    }
     pub(super) fn start(
         &mut self,
         view: &mut Workspace,
@@ -194,6 +215,9 @@ impl SearchHost {
         true
     }
     pub(super) fn input(&mut self, view: &mut Workspace, keys: &mut KeymapEngine, input: SearchInput<'_>) -> bool {
+        if matches!(input, SearchInput::ReplaceNext | SearchInput::ReplaceAll) && self.body_refused(view) {
+            return true;
+        }
         self.origin = Some(Origin::capture(view));
         let result = match &mut self.session {
             Some(session) => self.panel.input(session, view, input),
@@ -248,6 +272,9 @@ impl SearchHost {
         self.panel.enter_context(keys);
     }
     fn action(&mut self, view: &mut Workspace, keys: &mut KeymapEngine, action: SearchAction) {
+        if !matches!(&action, SearchAction::OpenFile { .. }) && self.body_refused(view) {
+            return;
+        }
         let Some(session) = &mut self.session else { return };
         if !self.panel.validate_action(session, view, &action)
             || self.origin.as_ref().is_none_or(|origin| !origin.matches(view))
@@ -281,8 +308,12 @@ impl SearchHost {
                 }
             };
             let SearchAction::Replace(recipe) = action else { unreachable!() };
+            let key = recipe.key;
             match view.submit_search_replacement(recipe) {
                 Ok(()) => {
+                    // ROOT supplies this scalar-only accessor over the exact
+                    // accepted loan; the editor remains solely model-owned.
+                    self.replacement = view.search_replacement_operation(key).map(|operation| (key, operation));
                     let outcome = self.panel.replacement_admitted(session, acknowledgement);
                     self.origin = None;
                     self.outcome(view, keys, outcome);
@@ -335,26 +366,41 @@ impl SearchHost {
             Err(error) => self.notice(view, error.to_string()),
         }
     }
-    /// The actual message dispatcher and tests share this ordering: restore
-    /// the loaned editor first, then acknowledge this exact replacement key.
-    pub(super) fn document_result(
+    /// Sealed receive has already restored the original editor. Match the
+    /// scalar key AND operation before normal interactive search follow-up.
+    pub(super) fn document_update(
         &mut self,
         view: &mut Workspace,
         keys: &mut KeymapEngine,
-        result: kwil_view_model::document_worker::DocumentResult,
-    ) {
-        use kwil_view_model::document_worker::DocumentResult;
-        let replacement = match &result {
-            DocumentResult::Replaced { key, result, .. } => {
-                Some((*key, result.as_ref().map(|_| ()).map_err(ToString::to_string)))
+        update: &kwil_view_model::workspace_document::WorkspaceDocumentUpdate,
+        info: Option<kwil_view_model::workspace_document::ResultInfo>,
+        interactive: bool,
+    ) -> Result<(), String> {
+        if let Some(receipt) = update.replacement {
+            // The slot can become occupied between scalar inspection and
+            // receive. The original admitted (key, operation) is authoritative;
+            // an empty earlier inspection must not reject a newly ready loan.
+            if !info.is_none_or(|info| {
+                info.kind == kwil_view_model::workspace_document::ResultKind::Replaced
+                    && info.document == Some(kwil_view_model::SessionDocumentId(receipt.key.document_id))
+                    && info.operation == Some(receipt.operation)
+            }) || self.replacement != Some((receipt.key, receipt.operation))
+            {
+                return Err("Replacement receipt does not match the admitted search loan".into());
             }
-            _ => None,
-        };
-        view.document_result(result);
-        if let Some((key, result)) = replacement
+        }
+        if !interactive {
+            if let Some(receipt) = update.replacement {
+                self.acknowledge_shutdown_replacement(receipt)?;
+            }
+            return Ok(());
+        }
+        if let Some(receipt) = update.replacement
             && let Some(session) = &mut self.session
         {
-            let outcome = self.panel.replacement_finished(session, view, key, result);
+            let result = if receipt.succeeded { Ok(()) } else { Err(view.notice().to_owned()) };
+            let outcome = self.panel.replacement_finished(session, view, receipt.key, result);
+            self.replacement = None;
             self.origin = Some(Origin::capture(view));
             match outcome {
                 Ok(outcome) => {
@@ -366,27 +412,62 @@ impl SearchHost {
         // A receipt can unblock a retained replacement recipe even when the
         // search worker has no further results (and therefore no further wake).
         self.ready(view, keys);
+        Ok(())
     }
-    /// Called on the shutdown lane, with all panel retry owners still alive.
-    pub(super) fn into_shutdown_worker(mut self) -> Option<kwil_view_model::search_session::SearchWorker> {
-        if let Some(mut session) = self.session.take() {
-            match self.panel.take_shutdown(&mut session) {
-                Ok(worker) => {
-                    drop(self.panel);
-                    drop(session);
-                    return Some(worker);
-                }
-                Err(owner) => {
-                    // Even this stopped-session fallback is disposed off UI.
-                    drop(owner);
-                }
+    /// No sync, worker_ready, cancellation, fresh snapshot or new search while
+    /// the original Workspace is sealed inside its shutdown bundle.
+    pub(super) fn acknowledge_shutdown_replacement(
+        &mut self,
+        receipt: kwil_view_model::workspace_document::ExactReplacementReceipt,
+    ) -> Result<(), String> {
+        if self.replacement != Some((receipt.key, receipt.operation)) {
+            return Err("Shutdown replacement receipt does not match the admitted search loan".into());
+        }
+        self.replacement = None;
+        Ok(())
+    }
+    pub(super) fn shutdown_replacement_matches(
+        &self,
+        receipt: kwil_view_model::workspace_document::ExactReplacementReceipt,
+    ) -> bool {
+        self.replacement == Some((receipt.key, receipt.operation))
+    }
+    pub(super) fn source_release_binding(&self) -> kwil_view_model::workspace_document::DocumentSearchBinding {
+        use kwil_view_model::workspace_document::DocumentSearchBinding;
+        self.session
+            .as_ref()
+            .and_then(SearchSession::source_release_key)
+            .map_or(DocumentSearchBinding::NoSearchWorker, DocumentSearchBinding::SearchWorker)
+    }
+    /// Transfer both existing request owners to their actual search worker.
+    /// A refusal stays in this same retained facade, never in a new executor.
+    pub(super) fn take_shutdown_worker(
+        &mut self,
+    ) -> Result<Option<kwil_view_model::search_session::SearchWorker>, String> {
+        let Some(session) = &mut self.session else {
+            return if self.closing_request.is_none() {
+                Ok(None)
+            } else {
+                Err("Search closing request has no worker".into())
+            };
+        };
+        let result = if let Some(request) = self.closing_request.take() {
+            session.take_shutdown_with(Some(*request))
+        } else {
+            self.panel.take_shutdown(session)
+        };
+        match result {
+            Ok(worker) => Ok(Some(worker)),
+            Err(request) => {
+                self.closing_request = request;
+                Err("Search close refused; exact session and request retained".into())
             }
         }
-        None
     }
     #[cfg(test)]
-    fn shutdown(self) -> std::io::Result<()> {
-        self.into_shutdown_worker()
+    fn shutdown(mut self) -> std::io::Result<()> {
+        self.take_shutdown_worker()
+            .map_err(std::io::Error::other)?
             .map_or(Ok(()), |worker| worker.shutdown_bounded(Duration::from_secs(5)).map_err(std::io::Error::other))
     }
 }
@@ -563,11 +644,38 @@ fn window(text: &str, cursor: usize, columns: usize) -> (String, usize) {
         cells.into_iter().map(|cell| if cell.text == "\t" { " ".repeat(cell.width) } else { cell.text }).collect();
     (label, caret)
 }
+#[cfg(test)]
 pub(super) fn draw(
     frame: &mut ratatui::Frame,
     host: &mut SearchHost,
     view: &Workspace,
     layout: kwil_core_commands::settings::TabLayout,
+) {
+    draw_prepared(frame, host, view, layout, None, false);
+}
+fn paint_prepared_hits(frame: &mut ratatui::Frame, host: &SearchHost, wrap: &wrap_ui::Host) {
+    if let Some(key) = wrap.key() {
+        let hits =
+            host.panel.visible_hits(kwil_view_model::SessionDocumentId(key.source.document_id), key.source.revision);
+        wrap.paint_search(frame, |range| {
+            let index = hits.partition_point(|hit| hit.offset.saturating_add(hit.len) < range.start);
+            hits[index..].iter().take_while(|hit| hit.offset < range.end).any(|hit| {
+                if hit.len == 0 {
+                    range.start <= hit.offset && hit.offset < range.end
+                } else {
+                    hit.offset < range.end && range.start < hit.offset.saturating_add(hit.len)
+                }
+            })
+        });
+    }
+}
+pub(super) fn draw_prepared(
+    frame: &mut ratatui::Frame,
+    host: &mut SearchHost,
+    view: &Workspace,
+    layout: kwil_core_commands::settings::TabLayout,
+    wrap: Option<&wrap_ui::Host>,
+    prepared: bool,
 ) {
     host.painted = None;
     let bounds = frame.area();
@@ -576,7 +684,10 @@ pub(super) fn draw(
     // Recolour existing cells: syntax foreground, tabs and wide-cell geometry
     // stay in the normal text renderer. No snapshot reads or search on draw.
     let hit = Color::Rgb(0x73, 0x59, 0x16);
-    for row in 0..if view.hex_active() { 0 } else { view.rows().min(body.height) } {
+    if let Some(wrap) = wrap {
+        paint_prepared_hits(frame, host, wrap);
+    }
+    for row in 0..if view.hex_active() || prepared { 0 } else { view.rows().min(body.height) } {
         for range in host.panel.highlight_columns(view, row, body.width.saturating_sub(8)) {
             for column in range {
                 let x = bounds.x + body.x as u16 + 8 + column as u16;
@@ -804,8 +915,12 @@ mod tests {
         keys: KeymapEngine,
         settings: Settings,
         rx: mpsc::Receiver<Msg>,
-        stopped: mpsc::Receiver<Result<(), String>>,
+        document: DocumentLane,
+        budget: AllocationBudget,
         root: PathBuf,
+        wrap: Option<wrap_ui::Runtime>,
+        wake: mpsc::Sender<Msg>,
+        wrap_body: Rect,
     }
     impl Harness {
         fn new(text: &str) -> Self {
@@ -813,18 +928,31 @@ mod tests {
             view.set_rows(12);
             let root = crate::test_support::directory("kwil-tui-search").unwrap();
             let (tx, rx) = mpsc::channel();
-            let (stop_tx, stopped) = mpsc::sync_channel(1);
+            let budget = AllocationBudget::default();
+            let mut document = DocumentLane::new(&budget).unwrap();
             let document_tx = tx.clone();
-            view.start_document_worker_at(Some(root.clone()), move |result| {
-                if let kwil_view_model::document_worker::DocumentResult::Stopped(result) = &result {
-                    let _ = stop_tx.try_send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
-                }
-                let _ = document_tx.send(Msg::Document(result));
-            })
-            .unwrap();
+            document
+                .started(view.start_bounded_document_worker_at(Some(root.clone()), &budget, move || {
+                    document_tx
+                        .send(Msg::DocumentReady)
+                        .map_err(|_| std::io::Error::other("search fixture wake closed"))
+                }))
+                .unwrap();
             let settings = Settings::default();
             let keys = KeymapEngine::new(settings.keymap, &settings.bindings).unwrap();
-            let mut harness = Self { host: SearchHost::default(), view, keys, settings, rx, stopped, root };
+            let mut harness = Self {
+                host: SearchHost::default(),
+                view,
+                keys,
+                settings,
+                rx,
+                document,
+                budget,
+                root,
+                wrap: None,
+                wake: tx.clone(),
+                wrap_body: Rect::new(0, 1, 12, 12),
+            };
             harness.until_stage("initial workspace recovery and editor", |h| {
                 h.view.recovery_ready() && h.view.editor().is_some()
             });
@@ -841,13 +969,42 @@ mod tests {
         }
         fn dispatch(&mut self, message: Msg) {
             match message {
+                Msg::WrapReady => {
+                    self.wrap.as_mut().expect("wrap wake has a registered runtime").ready(&mut self.view);
+                }
                 Msg::SearchReady => {
                     self.host.ready(&mut self.view, &mut self.keys);
                 }
-                Msg::Document(result) => self.host.document_result(&mut self.view, &mut self.keys, result),
+                Msg::DocumentReady => {
+                    self.document.ready(&mut self.view, &mut self.host, &mut self.keys).unwrap();
+                }
                 _ => panic!("unexpected headless message"),
             }
             self.host.sync(&mut self.view, &mut self.keys);
+            self.sync_wrap();
+        }
+        fn sync_wrap(&mut self) {
+            if let Some(wrap) = &mut self.wrap {
+                wrap.sync(&mut self.view, self.wrap_body, self.host.is_open());
+                self.host.body_gate(wrap.gate(), wrap.closed() || self.view.wrap_input_blocked());
+            }
+        }
+        fn enable_wrap(&mut self) {
+            self.settings.editor.word_wrap = true;
+            self.view.set_body_policy(kwil_view_model::ViewBodyPolicy::Prepared);
+            self.view.set_editor_settings(&self.settings);
+            self.view.editor_mut().unwrap().set_cursors(vec![kwil_view_model::Cursor::caret(0)], 0).unwrap();
+            let sender = self.wake.clone();
+            let mut wrap = wrap_ui::Runtime::new(
+                wrap_ui::Host::with_budget(self.budget.clone(), move || {
+                    let _ = sender.send(Msg::WrapReady);
+                })
+                .unwrap(),
+            );
+            wrap.attach(&mut self.view).unwrap();
+            self.wrap = Some(wrap);
+            self.sync_wrap();
+            self.until_stage("prepared first page", |h| h.wrap.as_ref().unwrap().host().unwrap().page().is_some());
         }
         fn until(&mut self, ready: impl Fn(&Self) -> bool) {
             self.until_stage("worker condition", ready);
@@ -901,6 +1058,7 @@ mod tests {
             self.until_stage("search panel completion", |h| !h.host.panel.is_pending());
         }
         fn press(&mut self, code: KeyCode, modifiers: KeyModifiers) -> KeyResult {
+            self.sync_wrap();
             let intent = key(
                 &mut self.host,
                 &mut self.view,
@@ -910,7 +1068,13 @@ mod tests {
                 Duration::ZERO,
             );
             let intent = resolve(&mut self.host, &mut self.view, &mut self.keys, &self.settings, intent);
+            self.sync_wrap();
+            let intent = resolve_wrap(&mut self.view, self.wrap.as_mut(), intent, Duration::ZERO, self.settings.keymap);
+            if let Some(wrap) = &self.wrap {
+                self.host.body_gate(wrap.gate(), wrap.closed() || self.view.wrap_input_blocked());
+            }
             self.host.sync(&mut self.view, &mut self.keys);
+            self.sync_wrap();
             intent
         }
         fn ctrl(&mut self, c: char) {
@@ -942,11 +1106,26 @@ mod tests {
             self.view.editor().unwrap().primary_cursor().selection()
         }
         fn render(&mut self, width: u16, height: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+            if self.wrap.is_some() {
+                self.wrap_body = wrap_body_rect(&self.view, width, height, self.settings.tabs.layout);
+                self.sync_wrap();
+            }
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    tabs::draw(frame, &self.view, self.settings.tabs.layout);
-                    draw(frame, &mut self.host, &self.view, self.settings.tabs.layout);
+                    if let Some(wrap) = &self.wrap {
+                        let status = wrap.status(&self.view);
+                        tabs::draw_prepared(frame, &self.view, self.settings.tabs.layout, &[], true, Some(&status));
+                        if let Some(host) = wrap.host()
+                            && let Some(key) = host.key()
+                        {
+                            host.draw(frame, &wrap_ui::Paint::empty(key));
+                        }
+                        draw_prepared(frame, &mut self.host, &self.view, self.settings.tabs.layout, wrap.host(), true);
+                    } else {
+                        tabs::draw(frame, &self.view, self.settings.tabs.layout);
+                        draw(frame, &mut self.host, &self.view, self.settings.tabs.layout);
+                    }
                 })
                 .unwrap();
             terminal
@@ -981,7 +1160,7 @@ mod tests {
         fn finish(self) {
             let root = self.root.clone();
             let cleanup = std::thread::spawn(move || {
-                shutdown_search_workspace(self.view, self.host, self.rx, self.stopped, true)
+                shutdown_bounded_workspace(self.view, self.host, self.rx, self.document, self.wrap, None)
             });
             cleanup.join().unwrap().unwrap();
             assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
@@ -991,6 +1170,129 @@ mod tests {
     }
     fn binding(keys: &str, command: &str, context: Option<Context>) -> Binding {
         Binding { keys: keys.into(), command: command.into(), context, mode: None }
+    }
+
+    #[test]
+    fn wrapped_real_keys_refuse_mutation_until_worker_publication_and_use_prepared_search_paint() {
+        let mut h = Harness::new("abcdefghijklmnopqrstuvwxyz0123456789");
+        h.enable_wrap();
+        assert!(h.view.line(0).is_none(), "live prepared mode exposes no logical cache");
+        let revision = h.view.editor().unwrap().document().revision();
+        assert!(matches!(h.press(KeyCode::Down, KeyModifiers::NONE), KeyResult::Changed(true)));
+        assert_eq!(h.wrap.as_ref().unwrap().gate(), kwil_view_model::wrap_session::MutationGate::RefusedPending);
+        h.press(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(h.view.editor().unwrap().document().revision(), revision);
+        assert_eq!(h.selection(), 0..0, "typing never applies at the old caret");
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::ReplaceAll);
+        assert!(h.view.notice().contains("Wrapped movement is pending"));
+        assert_eq!(h.view.editor().unwrap().document().revision(), revision);
+        h.until_stage("wrapped Down worker publication", |h| {
+            h.selection() == (4..4)
+                && h.wrap.as_ref().unwrap().gate() == kwil_view_model::wrap_session::MutationGate::Allowed
+        });
+        h.ctrl('f');
+        h.query("ijkl");
+        assert_eq!(h.host.panel.count(), (1, true));
+        h.view.editor_mut().unwrap().set_cursors(vec![kwil_view_model::Cursor::caret(4)], 0).unwrap();
+        h.sync_wrap();
+        h.until_stage("prepared external cursor reveal", |h| h.wrap.as_ref().unwrap().host().unwrap().page().is_some());
+        h.render(12, 16);
+        h.until_stage("prepared resize page", |h| h.wrap.as_ref().unwrap().host().unwrap().page().is_some());
+        let terminal = h.render(12, 16);
+        assert!(h.view.line_source(0).is_none(), "paint never repopulates legacy text");
+        assert!(
+            h.wrap.as_ref().unwrap().host().unwrap().page().unwrap().rows().iter().all(|row| row.logical_line == 0)
+        );
+        let wrap = h.wrap.as_ref().unwrap().host().unwrap();
+        let point = wrap.shared().caret(8, kwil_view_model::visual_rows::CaretAffinity::Downstream).unwrap();
+        let geometry = wrap.geometry();
+        let mut body = ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 16)).unwrap();
+        body.draw(|frame| {
+            wrap.draw(frame, &wrap_ui::Paint::empty(wrap.key().unwrap()));
+            paint_prepared_hits(frame, &h.host, wrap);
+        })
+        .unwrap();
+        assert_eq!(
+            body.backend().buffer()[(geometry.text.x + point.cell, geometry.text.y + point.row as u16)].bg,
+            Color::Rgb(0x65, 0x51, 0x20),
+            "search paints prepared atom source spans with no logical cache"
+        );
+        assert_eq!(terminal.backend().buffer().area.width, 12);
+        h.finish(); // typed document-worker settlement must precede disposal
+    }
+
+    #[test]
+    fn wrapped_resolved_tombstone_custom_motion_and_palette_goto_share_the_busy_gate() {
+        let mut h = Harness::new("abcdefghijklmnop\nsecond line");
+        h.enable_wrap();
+        h.keys = KeymapEngine::new(
+            Preset::VsCode,
+            &[binding("down", "", Some(Context::Editor)), binding("ctrl+j", "motion.down", Some(Context::Editor))],
+        )
+        .unwrap();
+        assert!(matches!(h.press(KeyCode::Down, KeyModifiers::NONE), KeyResult::Changed(false)));
+        assert_eq!(h.wrap.as_ref().unwrap().gate(), kwil_view_model::wrap_session::MutationGate::Allowed);
+        h.press(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(h.wrap.as_ref().unwrap().gate(), kwil_view_model::wrap_session::MutationGate::RefusedPending);
+        let mut palette =
+            kwil_view_model::palette_session::PaletteSession::new(h.root.clone(), std::sync::Arc::new(|| {})).unwrap();
+        palette.open(":2").unwrap();
+        let intent = palette_ui::input(
+            &mut h.view,
+            &mut palette,
+            &mut h.keys,
+            kwil_view_model::palette_session::PaletteInput::Accept,
+            Duration::ZERO,
+            Preset::VsCode,
+        );
+        assert!(matches!(&intent, KeyResult::BodyExecute("navigation.goToLine", _, _)));
+        let _ = resolve_wrap(&mut h.view, h.wrap.as_mut(), intent, Duration::ZERO, Preset::VsCode);
+        assert_eq!(h.selection(), 0..0, "palette GoTo cannot discard accepted movement");
+        assert!(h.view.notice().contains("pending"));
+        for handle in palette.stop() {
+            handle.join().unwrap();
+        }
+        h.until_stage("custom bound visual motion", |h| h.selection() == (4..4));
+        h.finish();
+    }
+
+    #[test]
+    fn wrapped_vim_jk_stays_logical_and_counted_gj_gk_uses_worker_visual_rows() {
+        let mut h = Harness::new("abcdefghijklmnop\nsecond line");
+        h.enable_wrap();
+        h.settings.keymap = Preset::Vim;
+        h.keys = KeymapEngine::new(Preset::Vim, &[]).unwrap();
+        h.press(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(h.selection(), 17..17, "plain j moves to the next logical line");
+        h.press(KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(h.selection(), 0..0);
+        h.until_stage("logical Vim reveal", |h| h.wrap.as_ref().unwrap().host().unwrap().page().is_some());
+        h.press(KeyCode::Char('2'), KeyModifiers::NONE);
+        h.press(KeyCode::Char('g'), KeyModifiers::NONE);
+        h.press(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(h.wrap.as_ref().unwrap().gate(), kwil_view_model::wrap_session::MutationGate::RefusedPending);
+        h.until_stage("counted gj visual publication", |h| h.selection() == (8..8));
+        h.press(KeyCode::Char('g'), KeyModifiers::NONE);
+        h.press(KeyCode::Char('k'), KeyModifiers::NONE);
+        h.until_stage("gk visual publication", |h| h.selection() == (4..4));
+        h.finish();
+    }
+
+    #[test]
+    fn accepted_wrap_exit_defers_palette_body_commands_even_after_wrap_is_disabled() {
+        let mut h = Harness::new("retain text");
+        h.enable_wrap();
+        h.settings.editor.word_wrap = false;
+        h.view.set_editor_settings(&h.settings);
+        h.sync_wrap();
+        h.view.begin_wrap_shutdown();
+        assert!(h.view.wrap_input_blocked());
+        let VimResult::Command(call) = h.keys.invoke_named("edit.selectAll") else { panic!("registered command") };
+        let intent = invoke(&mut h.view, call, false, Duration::ZERO, Preset::VsCode);
+        assert!(matches!(&intent, KeyResult::BodyInvoke(_, _)), "Workspace's exit gate survives View coercion");
+        let _ = resolve_wrap(&mut h.view, h.wrap.as_mut(), intent, Duration::ZERO, Preset::VsCode);
+        assert_eq!(h.selection(), 0..0, "failed/settling exit cannot mutate the old selection");
+        h.finish();
     }
 
     #[test]
@@ -1065,9 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_open_missing_path_preserves_open_failure_and_indexed_failure_stage() {
-        use kwil_view_model::document_worker::DocumentResult;
-
+    fn checked_open_missing_path_preserves_exact_open_failure_stage() {
         let mut h = Harness::new("original");
         let failed = h.view.open_path(h.root.join("missing-parent/absent.txt")).unwrap();
         assert!(h.view.editor().is_none(), "actual checked-open placeholder has no editor");
@@ -1083,17 +1383,63 @@ mod tests {
             h.view.notice()
         );
 
-        // Keep the distinct legacy index-result branch covered through the
-        // same host dispatcher. Only this control event is synthetic; the
-        // missing-path completion above comes from the actual document worker.
-        h.dispatch(Msg::Document(DocumentResult::Indexed {
-            document: failed,
-            revision: 0,
-            result: Err(std::io::Error::other("injected index-stage failure")),
-        }));
-        assert!(h.view.editor().is_none());
-        assert_eq!(h.view.notice(), "Index failed: injected index-stage failure");
+        // ROOT relocated the distinct legacy Indexed-error assertions, with
+        // their exact error literal, to the model's guarded commit control:
+        // guarded_index_failure_preserves_absent_editor_and_exact_stage_notice.
+        // Frontend dependencies cannot inject source-bearing completions.
         h.finish();
+    }
+
+    #[test]
+    fn checked_open_changed_startup_source_is_rejected_by_the_actual_worker() {
+        let root = crate::test_support::directory("kwil-tui-search-changed-source").unwrap();
+        let path = root.join("startup.txt");
+        let preserved = root.join("preserved-original.txt");
+        std::fs::write(&path, b"original tiny source\n").unwrap();
+        let source = kwil_core_workspace::open_for_editing(&path).unwrap();
+        let mut view = Workspace::new(View::new(Some((path.clone(), source)))).unwrap();
+        let id = view.active_id();
+        assert!(view.editor().is_none());
+        // Replace path identity while preserving the exact old file and its
+        // tiny immutable source. No mapped file is truncated or overwritten.
+        std::fs::rename(&path, &preserved).unwrap();
+        std::fs::write(&path, b"different replacement identity\n").unwrap();
+        let budget = AllocationBudget::default();
+        let mut document = DocumentLane::new(&budget).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        document
+            .started(view.start_bounded_document_worker_at(Some(root.join("recovery")), &budget, move || {
+                sender.send(Msg::DocumentReady).map_err(|_| std::io::Error::other("changed-source fixture closed"))
+            }))
+            .unwrap();
+        let mut search = SearchHost::default();
+        let mut keys = KeymapEngine::new(Preset::VsCode, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !view.recovery_ready() || view.binary_offer_pending(id) {
+            assert!(matches!(
+                receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap(),
+                Msg::DocumentReady
+            ));
+            document.ready(&mut view, &mut search, &mut keys).unwrap();
+        }
+        assert_eq!(view.active_id(), id);
+        assert!(view.editor().is_none(), "changed-source rejection cannot fabricate an indexed editor");
+        assert!(!view.document_busy(id));
+        assert!(view.binary_offer().is_none());
+        assert!(
+            view.notice().starts_with("Open failed:"),
+            "startup checked-open retains its actual stage: {}",
+            view.notice()
+        );
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"original tiny source\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"different replacement identity\n");
+        std::thread::spawn(move || shutdown_bounded_workspace(view, search, receiver, document, None, None))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-tui-search-changed-source-"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1153,7 +1499,7 @@ mod tests {
 
     #[test]
     fn folder_r1_files_open_while_replacement_editor_is_loaned_then_shutdown_drains_it() {
-        use kwil_view_model::document_worker::DocumentResult;
+        use kwil_view_model::workspace_document::ResultKind;
         let mut h = Harness::new("one one");
         let tree = h.root.join("loaned-editor");
         std::fs::create_dir_all(&tree).unwrap();
@@ -1175,8 +1521,20 @@ mod tests {
         while h.host.panel.count() != (1, true) {
             let message = h.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
             match message {
-                Msg::Document(result @ DocumentResult::Replaced { .. }) => {
-                    assert!(held.replace(result).is_none(), "one bounded retained editor return");
+                Msg::DocumentReady
+                    if h.document
+                        .transport
+                        .as_ref()
+                        .unwrap()
+                        .result_info()
+                        .is_some_and(|info| info.kind == ResultKind::Replaced) =>
+                {
+                    let transport = h.document.transport.as_ref().unwrap();
+                    let info = transport.result_info().unwrap();
+                    assert!(held.replace(info).is_none(), "one bounded retained editor return");
+                    let before = transport.status();
+                    assert!(h.document.receive(&mut h.view, &mut h.host, &mut h.keys, false).unwrap().is_none());
+                    assert_eq!(h.document.transport.as_ref().unwrap().status(), before);
                 }
                 message => h.dispatch(message),
             }
@@ -1185,8 +1543,9 @@ mod tests {
         assert!(h.view.editor().is_none());
         h.press(KeyCode::Enter, KeyModifiers::NONE);
         assert_ne!(h.view.active_id(), loaned, "a loan in another tab cannot block Files open");
-        if let Some(result) = held {
-            h.dispatch(Msg::Document(result));
+        if let Some(info) = held {
+            assert_eq!(h.document.transport.as_ref().unwrap().result_info(), Some(info));
+            h.document.transport.as_ref().unwrap().wake_ready();
         }
         // Production shutdown retains the queued return if it was not yet
         // delivered, drains the real loan and releases history before search.
@@ -1696,20 +2055,27 @@ mod tests {
         h.receipts();
         assert_eq!(h.bytes(), b"x x");
         assert!(!h.view.search_replacement_pending());
-        let Harness { host, view, rx, stopped, root, .. } = h;
-        let worker = host.into_shutdown_worker().expect("actual search worker");
+        let Harness { mut host, view, rx, document, root, .. } = h;
+        let binding = host.source_release_binding();
+        let worker = host.take_shutdown_worker().unwrap().expect("actual search worker");
         // Replace-all is spooled even for this small fixture. The real
         // Workspace undo/receipt recipe pins its iterator: zero-time close
         // cannot acknowledge retirement while the document still owns it.
         let pinned =
             worker.shutdown_bounded(Duration::ZERO).expect_err("actual replacement history must pin search retirement");
         let mut ticket = crate::ShutdownTicket {
+            document: Some(document),
+            highlighting: None,
+            search_binding: Some(binding),
+            search_release_refusal: None,
+            terminal_panic: None,
+            wrap: None,
             view: Some(view),
-            search: None,
+            search: Some(host),
             worker: Some(pinned.into_worker()),
             rx: Some(rx),
-            stopped,
-            document_started: true,
+            stopped: None,
+            document_started: false,
             terminal_failure: None,
         };
         let ticket = std::thread::spawn(move || {
@@ -1721,7 +2087,10 @@ mod tests {
         assert!(ticket.view.is_none());
         assert!(ticket.rx.is_none());
         assert!(ticket.worker.is_none());
-        assert!(!ticket.document_started, "successful document Stopped acknowledgement is still required");
+        assert!(
+            ticket.document.as_ref().unwrap().settled,
+            "successful document Stopped and actual join are still required"
+        );
         assert!(ticket.terminal_failure.is_none());
         assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
         assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-tui-search-"));

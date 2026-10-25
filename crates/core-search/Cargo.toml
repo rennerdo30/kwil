@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+kwil-core-runtime = { path = "../core-runtime" }
 kwil-core-text = { path = "../core-text" }
 memchr = "2.8.3"
 regex = "1.13.1"

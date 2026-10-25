@@ -375,7 +375,7 @@ mod tests {
         assert!(result.is_err());
         assert!(!output.exists(), "raw checkpoint capacity must be admitted before atomic output");
         assert_eq!(backings.retained(), 1, "capacity refusal keeps the exact original source owner");
-        assert!(editor.finish_save(result).is_err());
+        assert!(editor.finish_save_for_test(result).is_err());
         assert_eq!(bytes(editor.document()), b"\xff\xfeA\0 \t\r\n");
         drop(editor);
         assert_eq!(backings.retire().retired, 1);
@@ -772,7 +772,7 @@ mod tests {
             let output = fixture.0.join(if clean { "clean-copy" } else { "dirty-copy" });
             let request = editor.raw_save_request(Some(output.clone())).unwrap();
             let saved = storage.encoding.save_raw(request, &AtomicBool::new(false));
-            editor.finish_save(saved).unwrap();
+            editor.finish_save_for_test(saved).unwrap();
             assert_eq!(fs::read(output).unwrap(), raw);
             drop(editor);
             drop(origins);
@@ -862,7 +862,7 @@ mod tests {
         assert!(worker.try_submit(DocumentRequest::SaveRaw { document: DocumentId(8), request }).is_ok());
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             DocumentResult::Saved { result, .. } => {
-                editor.finish_save(result).unwrap();
+                editor.finish_save_for_test(result).unwrap();
             }
             _ => panic!("raw save completion"),
         }

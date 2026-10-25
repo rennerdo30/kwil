@@ -8,7 +8,7 @@ pub use kwil_core_search::worker::{
     REPLACE_EDITS, ReplaceRecipe, ReplaceTarget, Replacement, ReplacementEdits, ReplacementIter,
     SEARCH_SOURCE_RELEASE_METADATA_BYTES, SIGNAL_BINS, SearchCloseError, SearchEvent, SearchInputsReleaseError,
     SearchInputsReleased, SearchKey, SearchRequest, SearchSourceReleaseKey, SearchTask, SearchUpdate, SearchWorker,
-    SeedCursor, SeedRequest, SeedResult, SubmitError,
+    SeedCursor, SeedRequest, SeedResult, SubmitError, WorkerSettlementReason,
 };
 use kwil_core_search::{FileSearch, FileSearchSummary, Match};
 use std::{
@@ -416,7 +416,12 @@ impl SearchSession {
     /// Nonblocking. The worker's reserved closing slot accepts the one retained
     /// rejected snapshot and destroys it on its own thread.
     pub fn stop(&mut self) {
-        drop(self.take_shutdown());
+        let Some(worker) = self.worker.as_ref() else { return };
+        if let ControlFlow::Break(error) = worker.close_with_requests(self.rejected.take(), None) {
+            self.rejected = error.internal;
+        }
+        // Keep the original worker and all facade pins for explicit handoff.
+        // A stop request is not a join or native-right retirement.
     }
     /// Return a panel-owned rejected request for worker retirement. Backpressure
     /// returns the complete boxed owner; retain it until retry or shutdown.
@@ -460,6 +465,14 @@ impl SearchSession {
 impl Drop for SearchSession {
     fn drop(&mut self) {
         self.stop();
+        if self.worker.is_some() {
+            // Misuse quarantine retains source/spool pins and the exact worker;
+            // it performs no source/native I/O and is not successful shutdown.
+            std::mem::forget(self.worker.take());
+            std::mem::forget(self.rejected.take());
+            std::mem::forget(self.state.file_results.take());
+            std::mem::forget(self.replacement.take());
+        }
     }
 }
 

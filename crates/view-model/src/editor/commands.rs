@@ -212,21 +212,21 @@ impl Editor {
                                 s = s.concat(&snapshot)?;
                             }
                             let len = s.len();
-                            self.registers.insert(
+                            self.install_register(
                                 key,
                                 ClipboardData {
                                     snapshot: s,
                                     ranges: std::iter::once(0..len).collect(),
                                     linewise: data.linewise,
                                 },
-                            );
+                            )?;
                         } else {
-                            self.registers.insert(key, data.clone());
+                            self.install_register(key, data.clone())?;
                         }
                     } else {
-                        self.registers.insert(register, data.clone());
+                        self.install_register(register, data.clone())?;
                     }
-                    self.registers.insert('"', data);
+                    self.install_register('"', data)?;
                 }
                 if call.id == "operator.yank" {
                     self.mode = Mode::Normal;

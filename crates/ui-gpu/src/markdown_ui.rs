@@ -1,6 +1,7 @@
 //! Bounded native Markdown host. One worker, one admitted snapshot, no UI reads.
 use super::*;
 use kwil_core_markdown::{BlockKind, InlineKind, ListMarker, Model, Span};
+use kwil_core_runtime::{NativeExitObservation, NativeExitState, NativeObservationError};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -60,13 +61,39 @@ type CodeHighlights = std::collections::HashMap<usize, Vec<kwil_core_syntax::Spa
 type Diagrams = std::collections::HashMap<usize, Result<kwil_core_markdown::diagram::Diagram, String>>;
 type DiagramLayouts = std::collections::HashMap<usize, ((usize, u64, u64), Result<markdown_diagram::Layout, String>)>;
 struct Lane {
-    tx: mpsc::SyncSender<Work>,
-    thread: std::thread::JoinHandle<()>,
+    tx: Option<mpsc::SyncSender<Work>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    retirement_pending: bool,
+}
+#[derive(Default)]
+struct Terminal {
+    done: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+    native: NativeExitObservation,
+}
+struct ExitGuard(Arc<Terminal>);
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        *self.0.done.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        self.0.changed.notify_all();
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementReason {
+    TimedOut,
+    ThreadExitPending,
+    WorkerPanicked,
+    Native(NativeObservationError),
 }
 #[derive(Default)]
 pub(super) struct Host {
     modes: std::collections::HashMap<kwil_view_model::SessionDocumentId, Mode>,
     lane: Option<Lane>,
+    terminal: Option<Arc<Terminal>>,
+    _terminal_charge: Option<kwil_view_model::visual_rows::MetadataReservation>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+    deadline: Option<std::time::Instant>,
+    native_error: Option<NativeObservationError>,
     stop: Arc<AtomicBool>,
     busy: bool,
     desired: Option<Key>,
@@ -84,6 +111,110 @@ pub(super) struct Host {
     probe_target: Option<u64>,
 }
 impl Host {
+    pub fn with_budget(
+        budget: &kwil_view_model::visual_rows::AllocationBudget,
+    ) -> kwil_view_model::visual_rows::WrapResult<Self> {
+        // Full Terminal includes its inline observation/right. All widened
+        // owner/return and native operation overlap is admitted before startup.
+        let bytes = std::mem::size_of::<Self>()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(std::mem::size_of::<Terminal>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<usize>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<ExitGuard>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Lane>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Work>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<AtomicBool>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<usize>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Result<(), SettlementReason>>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(NativeExitObservation::operation_stack_bytes()?))
+            .ok_or(kwil_view_model::visual_rows::WrapError::Admission("Markdown native-exit metadata overflow"))?;
+        let charge = budget.reserve_metadata(bytes)?;
+        Ok(Self { terminal: Some(Arc::new(Terminal::default())), _terminal_charge: Some(charge), ..Self::default() })
+    }
+    pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.panic.as_deref()
+    }
+    /// Cached registration evidence only; querying it never performs native I/O.
+    fn registration_failure(&mut self) -> Option<NativeObservationError> {
+        let error = self.terminal.as_ref()?.native.registration_error()?;
+        Some(*self.native_error.get_or_insert(error))
+    }
+    /// OFF UI; borrow the original host through timeout, panic and retry.
+    pub fn settle_until(&mut self, deadline: std::time::Instant) -> Result<(), SettlementReason> {
+        let deadline = self.deadline.map_or(deadline, |stored| stored.min(deadline));
+        self.deadline = Some(deadline);
+        self.stop.store(true, Ordering::Release);
+        if let Some(lane) = &mut self.lane {
+            drop(lane.tx.take());
+        }
+        self.retire_native(deadline)?;
+        if self.panic.is_some() {
+            return Err(SettlementReason::WorkerPanicked);
+        }
+        if self.lane.is_none() {
+            return Ok(());
+        }
+        Self::check_deadline(deadline)?;
+        if self.lane.as_ref().unwrap().thread.is_none() {
+            return Ok(());
+        }
+        {
+            let terminal = self.terminal.as_ref().expect("admitted before worker startup");
+            let done = terminal.done.lock().unwrap_or_else(|error| error.into_inner());
+            let (done, _) = terminal
+                .changed
+                .wait_timeout_while(done, deadline.saturating_duration_since(std::time::Instant::now()), |done| !*done)
+                .unwrap_or_else(|error| error.into_inner());
+            if !*done {
+                return Err(SettlementReason::TimedOut);
+            }
+        }
+        Self::check_deadline(deadline)?;
+        let observed =
+            self.terminal.as_ref().unwrap().native.query(self.lane.as_ref().unwrap().thread.as_ref().unwrap());
+        let observed = match observed {
+            Err(error) => return Err(self.retain_native_error(error)),
+            Ok(state) => state,
+        };
+        Self::check_deadline(deadline)?;
+        if observed == NativeExitState::Pending {
+            return Err(SettlementReason::ThreadExitPending);
+        }
+        let lane = self.lane.as_mut().unwrap();
+        if let Err(panic) = lane.thread.take().unwrap().join() {
+            self.panic = Some(panic);
+        }
+        lane.retirement_pending = true;
+        self.retire_native(deadline)?;
+        if self.panic.is_some() {
+            return Err(SettlementReason::WorkerPanicked);
+        }
+        Ok(())
+    }
+    fn check_deadline(deadline: std::time::Instant) -> Result<(), SettlementReason> {
+        if std::time::Instant::now() >= deadline { Err(SettlementReason::TimedOut) } else { Ok(()) }
+    }
+    fn retain_native_error(&mut self, error: NativeObservationError) -> SettlementReason {
+        SettlementReason::Native(*self.native_error.get_or_insert(error))
+    }
+    fn retire_native(&mut self, deadline: std::time::Instant) -> Result<(), SettlementReason> {
+        self.retire_native_with(deadline, NativeExitObservation::retire_after_join)
+    }
+    fn retire_native_with(
+        &mut self,
+        deadline: std::time::Instant,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), SettlementReason> {
+        if self.lane.as_ref().is_some_and(|lane| lane.retirement_pending) {
+            Self::check_deadline(deadline)?;
+            if let Err(error) = retire(&self.terminal.as_ref().unwrap().native) {
+                return Err(self.retain_native_error(error));
+            }
+            self.lane.as_mut().unwrap().retirement_pending = false;
+            Self::check_deadline(deadline)?;
+        }
+        Ok(())
+    }
     #[cfg(feature = "frame-harness")]
     pub fn ready(&self) -> bool {
         self.model.as_ref().is_some_and(|model| !model.blocks.is_empty()) && self.current == self.desired
@@ -113,15 +244,6 @@ impl Host {
             }
         }
     }
-    pub fn shutdown(&mut self) -> Option<shutdown::Job> {
-        self.stop.store(true, Ordering::Release);
-        self.lane.take().map(|Lane { tx, thread }| {
-            Box::new(move || {
-                drop(tx);
-                thread.join().map_err(|_| "Markdown worker panicked".into())
-            }) as shutdown::Job
-        })
-    }
 }
 fn code_highlights(model: &Model, stop: &AtomicBool) -> CodeHighlights {
     use kwil_core_syntax::{Config, Engine, Language};
@@ -134,7 +256,9 @@ fn code_highlights(model: &Model, stop: &AtomicBool) -> CodeHighlights {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let BlockKind::CodeBlock { language: Some(language), raw } = &block.kind else { continue };
+        let BlockKind::CodeBlock { language: Some(language), raw } = &block.kind else {
+            continue;
+        };
         let language = language.split_whitespace().next().unwrap_or("");
         let Some(language) = Language::ALL.iter().copied().find(|candidate| {
             candidate.id().eq_ignore_ascii_case(language)
@@ -227,7 +351,9 @@ impl App {
             Mode::Preview => "view.markdownPreview",
             Mode::Split => "view.markdownSplit",
         };
-        let Some(tool) = self.menu.toolbar.iter().find(|tool| tool.command == command) else { return false };
+        let Some(tool) = self.menu.toolbar.iter().find(|tool| tool.command == command) else {
+            return false;
+        };
         self.pointer = (tool.rect.x + tool.rect.w / 2, tool.rect.y + tool.rect.h / 2);
         self.menu_mouse(el)
     }
@@ -271,7 +397,13 @@ impl App {
             self.markdown.desired = None;
             return;
         }
-        let Some(editor) = self.view.editor() else { return };
+        if self.markdown.registration_failure().is_some() {
+            self.markdown.busy = false;
+            return;
+        }
+        let Some(editor) = self.view.editor() else {
+            return;
+        };
         let path = editor.document().path().map(std::path::Path::to_path_buf);
         if path != self.markdown.base_path {
             let Some(generation) = self.markdown.path_generation.checked_add(1) else {
@@ -300,50 +432,75 @@ impl App {
             return;
         }
         if self.markdown.lane.is_none() {
+            let Some(terminal) = self.markdown.terminal.clone() else {
+                self.markdown.error = Some("Markdown shutdown metadata was not admitted before startup".into());
+                return;
+            };
             let (tx, rx) = mpsc::sync_channel::<Work>(1);
             let proxy = self.proxy.clone();
             let stop = self.markdown.stop.clone();
             match std::thread::Builder::new().name("kwil-markdown".into()).spawn(move || {
-                while let Ok(work) = rx.recv() {
-                    if stop.load(Ordering::Acquire) {
-                        break;
+                let exit = ExitGuard(terminal);
+                // This inner scope destroys the receiver and every queued or
+                // active Snapshot before the terminal acknowledgement.
+                {
+                    let rx = rx;
+                    if exit.0.native.register_current().is_err() {
+                        // Exact failed/partial registration stays in Terminal;
+                        // a racing admitted source stays on this SAME receiver.
+                        // Drain without parsing until the normal sender close.
+                        while let Ok(work) = rx.recv() {
+                            drop(work);
+                        }
+                        return;
                     }
-                    let result = parse(&work.snapshot, &stop);
-                    let images = result.as_ref().map_or_else(
-                        |_| Default::default(),
-                        |model| markdown_images::load_images(model, work.path.as_deref(), &stop),
-                    );
-                    let diagrams = result.as_ref().map(diagrams).unwrap_or_default();
-                    let highlights = result.as_ref().map(|model| code_highlights(model, &stop)).unwrap_or_default();
-                    // Snapshot and its file/spill leases retire on this worker.
-                    drop(work.snapshot);
-                    if proxy
-                        .send_event(UserEvent::MarkdownReady(Box::new(Completion {
-                            key: work.key,
-                            result,
-                            images,
-                            diagrams,
-                            highlights,
-                        })))
-                        .is_err()
-                    {
-                        break;
+                    while let Ok(work) = rx.recv() {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let result = parse(&work.snapshot, &stop);
+                        let images = result.as_ref().map_or_else(
+                            |_| Default::default(),
+                            |model| markdown_images::load_images(model, work.path.as_deref(), &stop),
+                        );
+                        let diagrams = result.as_ref().map(diagrams).unwrap_or_default();
+                        let highlights = result.as_ref().map(|model| code_highlights(model, &stop)).unwrap_or_default();
+                        // Snapshot and its file/spill leases retire on this worker.
+                        drop(work.snapshot);
+                        if proxy
+                            .send_event(UserEvent::MarkdownReady(Box::new(Completion {
+                                key: work.key,
+                                result,
+                                images,
+                                diagrams,
+                                highlights,
+                            })))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }) {
-                Ok(thread) => self.markdown.lane = Some(Lane { tx, thread }),
+                Ok(thread) => {
+                    self.markdown.lane = Some(Lane { tx: Some(tx), thread: Some(thread), retirement_pending: false })
+                }
                 Err(error) => {
                     self.markdown.error = Some(error.to_string());
                     return;
                 }
             }
         }
+        if self.markdown.registration_failure().is_some() {
+            self.markdown.busy = false;
+            return;
+        }
         let work = Work {
             key,
             snapshot: editor.document().snapshot(),
             path: editor.document().path().map(|p| p.to_path_buf()),
         };
-        match self.markdown.lane.as_ref().unwrap().tx.try_send(work) {
+        match self.markdown.lane.as_ref().unwrap().tx.as_ref().expect("live sender").try_send(work) {
             Ok(()) => self.markdown.busy = true,
             Err(error) => {
                 self.markdown.error = Some(format!("Preview worker unavailable: {error}"));
@@ -1009,6 +1166,33 @@ pub(super) fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn joined_markdown_panic_retries_right_retirement_before_sticky_failure() {
+        let budget = kwil_view_model::visual_rows::AllocationBudget::default();
+        let mut host = std::mem::ManuallyDrop::new(Host::with_budget(&budget).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        host.deadline = Some(deadline);
+        let terminal = host.terminal.as_ref().unwrap().clone();
+        let thread: std::thread::JoinHandle<()> = std::thread::spawn(move || {
+            let exit = ExitGuard(terminal);
+            exit.0.native.register_current().unwrap();
+            panic!("original Markdown worker panic");
+        });
+        // Explicit tiny fixture join establishes the retirement precondition;
+        // it is not a production bounded-settlement or native-exit claim.
+        host.panic = Some(thread.join().unwrap_err());
+        assert_eq!(host.panic_payload().unwrap().downcast_ref::<&str>(), Some(&"original Markdown worker panic"));
+        host.lane = Some(Lane { tx: None, thread: None, retirement_pending: true });
+        let payload = std::ptr::from_ref(host.panic_payload().unwrap());
+        let original = NativeObservationError::MachRetire { code: 73 };
+        assert_eq!(host.retire_native_with(deadline, |_| Err(original)), Err(SettlementReason::Native(original)));
+        assert!(host.lane.as_ref().unwrap().retirement_pending);
+        assert_eq!(host.settle_until(deadline), Err(SettlementReason::WorkerPanicked));
+        assert!(!host.lane.as_ref().unwrap().retirement_pending);
+        assert!(std::ptr::eq(payload, std::ptr::from_ref(host.panic_payload().unwrap())));
+        assert_eq!(host.native_error, Some(original));
+        drop(std::mem::ManuallyDrop::into_inner(host));
+    }
     #[test]
     fn save_as_plain_text_keeps_an_exit_without_admitting_another_preview() {
         for old in [Mode::Preview, Mode::Split] {

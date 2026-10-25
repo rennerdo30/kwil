@@ -151,6 +151,12 @@ impl NativeExitObservation {
     pub fn register_current(&self) -> Result<(), NativeObservationError> {
         self.register_with(Identity::current(), register_native)
     }
+    /// Original registration evidence, once published. This scalar inspection
+    /// performs no native operation and does not establish thread exit.
+    /// `None` also covers registration that has not yet published its record.
+    pub fn registration_error(&self) -> Option<NativeObservationError> {
+        self.registration.get().and_then(|record| record.error)
+    }
     pub fn query<T>(&self, handle: &JoinHandle<T>) -> Result<NativeExitState, NativeObservationError> {
         self.query_with(handle.thread().id(), std::process::id(), |witness| query_native(witness, handle))
     }

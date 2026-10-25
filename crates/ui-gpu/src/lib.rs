@@ -15,6 +15,7 @@ mod close_dialog;
 mod context_menu;
 mod desktop;
 mod desktop_window;
+mod document_ui;
 mod file_dialog;
 mod file_prompt;
 mod window_placement;
@@ -44,10 +45,13 @@ mod search_ui;
 mod search_view;
 mod settings_ui;
 mod tabs;
+#[cfg(test)]
+mod test_support;
 mod theme_ui;
 mod welcome;
 mod welcome_ui;
 mod wheel;
+mod wrap_ui;
 mod zoom;
 
 use font::Font;
@@ -63,6 +67,10 @@ mod platform;
 pub mod remote;
 mod shaping;
 mod shutdown;
+pub use document_ui::{FontSettlementReason as GuiFontSettlementReason, GuiStartReason, GuiStartRefusal};
+pub use log_ui::SettlementReason as GuiLogSettlementReason;
+pub use markdown_ui::SettlementReason as GuiMarkdownSettlementReason;
+pub use shutdown::{Failure as GuiShutdownFailure, Status as GuiShutdownStatus};
 pub mod text;
 mod trace;
 pub use kwil_core_commands::settings::RenderBackend;
@@ -122,6 +130,8 @@ pub enum GuiError {
     /// The window closed, but accepted settings or a worker could not drain.
     /// This is not a display failure and must not launch another frontend.
     Settings(String),
+    /// Exact failed owners remain available for explicit off-UI retry.
+    Shutdown(Box<shutdown::Failure>),
 }
 
 impl std::fmt::Display for GuiError {
@@ -130,6 +140,7 @@ impl std::fmt::Display for GuiError {
             GuiError::Unavailable(e) => write!(f, "no window available: {e}"),
             GuiError::NoFont => write!(f, "no monospace font found"),
             GuiError::Settings(error) => write!(f, "settings save failed during exit: {error}"),
+            GuiError::Shutdown(failure) => std::fmt::Display::fmt(failure, f),
         }
     }
 }
@@ -138,6 +149,8 @@ enum UserEvent {
     FileDialog(file_dialog::Event),
     CloseDialog(close_dialog::Reply),
     HighlightsReady,
+    WrapReady,
+    StartupFontReady,
     SearchReady,
     WindowPlacementLoaded(Result<Option<window_placement::Placement>, String>),
     WindowPlacementProgress,
@@ -150,8 +163,8 @@ enum UserEvent {
     WelcomeReady,
     RegistrationReady,
     RegistrationStarted(Result<Box<kwil_view_model::file_type_registration::FileTypeRegistration>, String>),
-    /// Boxed on the worker that completes it: keeps every queued event small.
-    Document(Box<kwil_view_model::document_worker::DocumentResult>),
+    /// Owner-free wake for the single bounded worker result slot.
+    DocumentReady,
     OpenExternal,
     Notice(String),
     GlyphReady(shaping::Tile, u64),
@@ -340,8 +353,17 @@ struct HostKey<'a> {
     repeat: bool,
 }
 
+#[derive(Default)]
+struct StartupFonts {
+    editor_ready: bool,
+    chrome_ready: bool,
+    finished: bool,
+}
+
 struct App {
+    startup_fonts: StartupFonts,
     hex: hex_host::Host,
+    wrap: wrap_ui::Host,
     about: about::About,
     markdown: markdown_ui::Host,
     context: context_menu::Context,
@@ -360,7 +382,7 @@ struct App {
     goto_reveal: Option<(kwil_view_model::SessionDocumentId, u64)>,
     highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
     language_picker: language_ui::LanguagePickerUi,
-    document_stopped: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    document: Box<shutdown::Failure>,
     palette: Option<kwil_view_model::palette_session::PaletteSession>,
     palette_dirty: bool,
     palette_area: Option<Rect>,
@@ -386,7 +408,7 @@ struct App {
     on_external_ready: Option<Box<dyn FnOnce(ExternalOpen)>>,
     external_open: Option<ExternalOpen>,
     external_inbox: kwil_view_model::document_worker::ExternalOpenInbox,
-    font_thread: Option<std::thread::JoinHandle<Option<Font>>>,
+    font_thread: Option<document_ui::StartupFont<Font>>,
     font_size: Option<std::sync::mpsc::SyncSender<f32>>,
     font: Option<Font>,
     gfx: Option<Gfx>,
@@ -434,7 +456,7 @@ struct App {
     /// Chrome sizes for the window's monitor; independent of editor zoom.
     ui: chrome::Metrics,
     ui_font: Option<font::UiFont>,
-    ui_font_thread: Option<std::thread::JoinHandle<Option<font::UiFont>>>,
+    ui_font_thread: Option<document_ui::StartupFont<font::UiFont>>,
     ui_font_size: Option<std::sync::mpsc::SyncSender<f32>>,
     /// Bounded DPI reloads of the chrome face.
     ui_font_jobs: font::Coalesce,
@@ -452,168 +474,220 @@ struct App {
     metrics: harness::Metrics,
 }
 
-/// Runs the GUI until the window closes. `on_first_frame` runs once the
-/// first frame is on screen; it receives a `Notify` that shows a message in
-/// the status bar from any thread (used for update notices).
-pub fn run(view: View, opts: GuiOptions, on_first_frame: Box<dyn FnOnce(Notify)>) -> Result<(), GuiError> {
-    run_with_events(view, opts, on_first_frame, Box::new(|_| {}))
-}
-
-pub fn run_with_events(
-    view: View,
-    opts: GuiOptions,
-    on_first_frame: Box<dyn FnOnce(Notify)>,
-    on_event: Box<dyn FnMut(GuiEvent)>,
-) -> Result<(), GuiError> {
-    run_with_external_open(view, opts, on_first_frame, on_event, Box::new(|_| {}))
-}
-
 pub use kwil_view_model::document_worker::ExternalOpen;
 
-/// The launcher can wire CLI/IPC requests without owning a frontend event loop.
-pub fn run_with_external_open(
-    view: View,
+/// Run with the original source owner and allocation counter. Pre-worker
+/// refusal returns both unchanged; admitted failures retain their shutdown box.
+#[must_use = "a refused startup returns the original Workspace and budget"]
+pub fn run_workspace_with_external_open(
+    workspace: Workspace,
+    budget: kwil_view_model::visual_rows::AllocationBudget,
     opts: GuiOptions,
     on_first_frame: Box<dyn FnOnce(Notify)>,
     on_event: Box<dyn FnMut(GuiEvent)>,
     on_external_ready: Box<dyn FnOnce(ExternalOpen)>,
-) -> Result<(), GuiError> {
-    trace::mark("gui entry");
-    // Font loading runs while the event loop and window are created.
-    let (font_size, font_size_rx) = std::sync::mpsc::sync_channel(1);
-    let font_thread = Some(std::thread::spawn(move || Font::startup(font_size_rx)));
-    let event_loop =
-        EventLoop::<UserEvent>::with_user_event().build().map_err(|e| GuiError::Unavailable(e.to_string()))?;
-    event_loop.set_control_flow(ControlFlow::Wait);
-    let proxy = HostProxy::Native(event_loop.create_proxy());
-    let open_proxy = proxy.clone();
-    // The chrome face is read in parallel and rasterized at the monitor scale.
-    let (ui_font_size, ui_font_size_rx) = std::sync::mpsc::sync_channel(1);
-    let ui_font_thread = Some(std::thread::spawn(move || font::UiFont::startup(ui_font_size_rx)));
-    let (external_open, external_inbox) = kwil_view_model::document_worker::external_open_channel(move || {
-        open_proxy
-            .send_event(UserEvent::OpenExternal)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GUI closed"))
-    });
-    let view = Workspace::new(view).map_err(|e| GuiError::Unavailable(e.to_string()))?;
-    let frontend_document = view.active_id();
-    let frontend_epoch = view.input_epoch();
-    let horizontal = view.horizontal_origin();
-    let window_placement = match window_placement::Service::start(opts.hidden, proxy.clone()) {
-        Ok(worker) => Some(worker),
-        Err(error) => {
-            let _ = proxy.send_event(UserEvent::Notice(format!("Window placement worker unavailable: {error}")));
-            None
+) -> std::ops::ControlFlow<GuiStartRefusal, Result<(), GuiError>> {
+    let (document, event_loop, budget) = match document_ui::prepare_startup(workspace, budget, || {
+        trace::mark("gui entry");
+        EventLoop::<UserEvent>::with_user_event().build().map_err(GuiStartReason::EventLoop)
+    }) {
+        std::ops::ControlFlow::Break(refusal) => return std::ops::ControlFlow::Break(refusal),
+        std::ops::ControlFlow::Continue(prepared) => prepared,
+    };
+    // The retained original owner stays outside this guard too. Fallible font
+    // spawns and source-free App initialization only borrow its preallocated box.
+    let mut document = Some(document);
+    let initialized =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<App, document_ui::FontSpawnFailure> {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            let proxy = HostProxy::Native(event_loop.create_proxy());
+            let open_proxy = proxy.clone();
+            let (external_open, external_inbox) = kwil_view_model::document_worker::external_open_channel(move || {
+                open_proxy
+                    .send_event(UserEvent::OpenExternal)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GUI closed"))
+            });
+            let failure = document.as_mut().unwrap();
+            failure.external_producer = Some(external_open);
+            failure.external_inbox = Some(external_inbox);
+            let (font_size, font_size_rx) = std::sync::mpsc::sync_channel(1);
+            failure.font_size = Some(font_size);
+            let font_proxy = proxy.clone();
+            failure.font.as_mut().unwrap().spawn_with_wake(
+                move || Font::startup(font_size_rx),
+                move || {
+                    font_proxy
+                        .send_event(UserEvent::StartupFontReady)
+                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                },
+            )?;
+            let (ui_font_size, ui_font_size_rx) = std::sync::mpsc::sync_channel(1);
+            failure.chrome_font_size = Some(ui_font_size);
+            let font_proxy = proxy.clone();
+            failure.chrome_font.as_mut().unwrap().spawn_with_wake(
+                move || font::UiFont::startup(ui_font_size_rx),
+                move || {
+                    font_proxy
+                        .send_event(UserEvent::StartupFontReady)
+                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                },
+            )?;
+            let view = failure.workspace.as_ref().unwrap();
+            let frontend_document = view.active_id();
+            let frontend_epoch = view.input_epoch();
+            let horizontal = view.horizontal_origin();
+            Ok(App {
+                startup_fonts: StartupFonts::default(),
+                hex: Default::default(),
+                wrap: wrap_ui::Host::with_budget(budget),
+                search: None,
+                search_panel: Default::default(),
+                search_origin: None,
+                search_ime: None,
+                search_dirty: false,
+                search_area: None,
+                search_view: Default::default(),
+                goto: None,
+                goto_epoch: 0,
+                goto_reveal: None,
+                highlighting: None,
+                language_picker: Default::default(),
+                palette: None,
+                palette_dirty: false,
+                palette_area: None,
+                settings_panel: None,
+                settings_epoch: 0,
+                settings_file_pending: false,
+                settings_view: Default::default(),
+                palette_view: Default::default(),
+                prompt_view: Default::default(),
+                welcome: Default::default(),
+                welcome_view: Default::default(),
+                welcome_worker: None,
+                file_types: None,
+                registration_path: None,
+                registration_starting: false,
+                registration_prep: None,
+                frontend_document,
+                frontend_epoch,
+                opts,
+                proxy,
+                on_first_frame: Some(on_first_frame),
+                on_external_ready: Some(on_external_ready),
+                external_open: failure.external_producer.take(),
+                about: Default::default(),
+                markdown: failure.markdown.take().unwrap(),
+                context: Default::default(),
+                context_area: None,
+                logs: Default::default(),
+                logs_ime: None,
+                external_inbox: failure.external_inbox.take().unwrap(),
+                font_thread: None,
+                font_size: None,
+                font: None,
+                gfx: None,
+                desktop_window: None,
+                desktop_dispatch: false,
+                pending_resize: None,
+                window_placement: None,
+                window_normal: None,
+                window_latest: None,
+                window_placement_loaded: false,
+                window_touched: false,
+                size: (0, 0),
+                mods: ModifiersState::empty(),
+                pending: Damage::default(),
+                error: None,
+                horizontal,
+                wheel: Default::default(),
+                pointer: (0, 0),
+                drag: None,
+                started: std::time::Instant::now(),
+                composing: false,
+                ime_destination: None,
+                selecting: false,
+                close_pending: false,
+                save_path: None,
+                file_dialogs: file_dialog::Dialogs::default(),
+                close_dialog: None,
+                keys: None,
+                settings: Settings::default(),
+                zoom: zoom::Zoom::default(),
+                policy: RenderPolicy::new(Default::default(), remote::detect()),
+                on_event,
+                #[cfg(feature = "gpu")]
+                gpu: None,
+                #[cfg(feature = "gpu")]
+                gpu_started: false,
+                presenter_gpu: false,
+                font_loading: false,
+                font_reload_pending: false,
+                redraw_requested: false,
+                settings_loaded: false,
+                body_pixels: Vec::new(),
+                chrome_frame: None,
+                chrome_dirty: true,
+                ui: chrome::Metrics::default(),
+                ui_font: None,
+                ui_font_thread: None,
+                ui_font_size: None,
+                ui_font_jobs: font::Coalesce::default(),
+                ui_fallback: font::FallbackJobs::default(),
+                menu: menu::MenuBar::default(),
+                menu_area: None,
+                menu_dirty: false,
+                hover: chrome::Hover::None,
+                status_hits: Vec::new(),
+                window_title: String::new(),
+                #[cfg(feature = "frame-harness")]
+                metrics: Default::default(),
+                // All setup above is source-free. These final two moves cannot invoke
+                // allocation, callbacks or I/O; no panic can strand a temporary source.
+                view: document.as_mut().unwrap().workspace.take().unwrap(),
+                document: document.take().unwrap(),
+            })
+        }));
+    let mut app = match initialized {
+        Ok(Ok(app)) => app,
+        result => {
+            let mut failure = document.take().unwrap();
+            match result {
+                Ok(Err(error)) => {
+                    failure.font_spawn_error = Some(error);
+                    failure.frontend_error = Some(GuiError::Unavailable("font startup refused".into()));
+                }
+                Err(payload) => failure.panic = Some(payload),
+                Ok(Ok(_)) => unreachable!(),
+            }
+            let _ = failure.retry();
+            return std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(failure)));
         }
     };
-    let mut app = App {
-        hex: Default::default(),
-        search: None,
-        search_panel: Default::default(),
-        search_origin: None,
-        search_ime: None,
-        search_dirty: false,
-        search_area: None,
-        search_view: Default::default(),
-        goto: None,
-        goto_epoch: 0,
-        goto_reveal: None,
-        highlighting: None,
-        language_picker: Default::default(),
-        document_stopped: None,
-        palette: None,
-        palette_dirty: false,
-        palette_area: None,
-        settings_panel: None,
-        settings_epoch: 0,
-        settings_file_pending: false,
-        settings_view: Default::default(),
-        palette_view: Default::default(),
-        prompt_view: Default::default(),
-        welcome: Default::default(),
-        welcome_view: Default::default(),
-        welcome_worker: None,
-        file_types: None,
-        registration_path: None,
-        registration_starting: false,
-        registration_prep: None,
-        view,
-        frontend_document,
-        frontend_epoch,
-        opts,
-        proxy,
-        on_first_frame: Some(on_first_frame),
-        on_external_ready: Some(on_external_ready),
-        external_open: Some(external_open),
-        about: Default::default(),
-        markdown: markdown_ui::Host::default(),
-        context: Default::default(),
-        context_area: None,
-        logs: Default::default(),
-        logs_ime: None,
-        external_inbox,
-        font_thread,
-        font_size: Some(font_size),
-        font: None,
-        gfx: None,
-        desktop_window: None,
-        desktop_dispatch: false,
-        pending_resize: None,
-        window_placement,
-        window_normal: None,
-        window_latest: None,
-        window_placement_loaded: false,
-        window_touched: false,
-        size: (0, 0),
-        mods: ModifiersState::empty(),
-        pending: Damage::default(),
-        error: None,
-        horizontal,
-        wheel: Default::default(),
-        pointer: (0, 0),
-        drag: None,
-        started: std::time::Instant::now(),
-        composing: false,
-        ime_destination: None,
-        selecting: false,
-        close_pending: false,
-        save_path: None,
-        file_dialogs: file_dialog::Dialogs::default(),
-        close_dialog: None,
-        keys: None,
-        settings: Settings::default(),
-        zoom: zoom::Zoom::default(),
-        policy: RenderPolicy::new(Default::default(), remote::detect()),
-        on_event,
-        #[cfg(feature = "gpu")]
-        gpu: None,
-        #[cfg(feature = "gpu")]
-        gpu_started: false,
-        presenter_gpu: false,
-        font_loading: false,
-        font_reload_pending: false,
-        redraw_requested: false,
-        settings_loaded: false,
-        body_pixels: Vec::new(),
-        chrome_frame: None,
-        chrome_dirty: true,
-        ui: chrome::Metrics::default(),
-        ui_font: None,
-        ui_font_thread,
-        ui_font_size: Some(ui_font_size),
-        ui_font_jobs: font::Coalesce::default(),
-        ui_fallback: font::FallbackJobs::default(),
-        menu: menu::MenuBar::default(),
-        menu_area: None,
-        menu_dirty: false,
-        hover: chrome::Hover::None,
-        status_hits: Vec::new(),
-        window_title: String::new(),
-        #[cfg(feature = "frame-harness")]
-        metrics: Default::default(),
+    app.font_thread = app.document.font.take();
+    app.font_size = app.document.font_size.take();
+    app.ui_font_thread = app.document.chrome_font.take();
+    app.ui_font_size = app.document.chrome_font_size.take();
+    // The complete App also stays outside catch_unwind during native setup and
+    // dispatch. Every original source/worker owner survives an unexpected panic.
+    let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.window_placement = match window_placement::Service::start(app.opts.hidden, app.proxy.clone()) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                let _ =
+                    app.proxy.send_event(UserEvent::Notice(format!("Window placement worker unavailable: {error}")));
+                None
+            }
+        };
+        app.logs.admit_projection_disk(1 << 30); // Same aggregate disk admission as SearchWorker::new.
+        event_loop.run_app(&mut app)
+    }));
+    let result = match attempted {
+        Ok(result) => result,
+        Err(payload) => {
+            app.document.panic = Some(payload);
+            Ok(())
+        }
     };
-    app.logs.admit_projection_disk(1 << 30); // Same aggregate disk admission as SearchWorker::new.
-    let result = event_loop.run_app(&mut app);
     app.desktop_window.take();
     // Transfer every owner before awaiting any result. The GUI loop has ended;
     // these jobs await existing workers, which keep all I/O off the frontend.
@@ -649,24 +723,6 @@ pub fn run_with_external_open(
         let handle = panel.stop();
         Box::new(move || handle.shutdown()) as shutdown::Job
     });
-    let search_job = app.search.take().map(|mut session| {
-        let mut panel = std::mem::take(&mut app.search_panel);
-        Box::new(move || {
-            std::thread::spawn(move || match panel.take_shutdown(&mut session) {
-                Ok(worker) => {
-                    drop(panel);
-                    drop(session);
-                    worker.shutdown().map_err(|_| "search worker panicked".to_owned())
-                }
-                Err(owner) => {
-                    drop(owner);
-                    Ok(())
-                }
-            })
-            .join()
-            .map_err(|_| "search shutdown lane panicked".to_owned())?
-        }) as shutdown::Job
-    });
     #[cfg(all(feature = "gpu", windows))]
     let gpu_job = app.gpu.take().map(|gpu| Box::new(move || gpu.shutdown()) as shutdown::Job);
     #[cfg(all(feature = "gpu", not(windows)))]
@@ -674,8 +730,6 @@ pub fn run_with_external_open(
     #[cfg(not(feature = "gpu"))]
     let gpu_job = None;
     let diagnostics_job = app.about.shutdown();
-    let markdown_job = app.markdown.shutdown();
-    let logs_job = app.logs.shutdown();
     let placement_latest = app.window_latest;
     let placement_job = app.window_placement.take().map(|service| {
         Box::new(move || {
@@ -684,60 +738,208 @@ pub fn run_with_external_open(
                 .map_err(|_| "Window placement shutdown panicked".to_owned())?
         }) as shutdown::Job
     });
-    let syntax_job = app.highlighting.take().map(|host| {
-        Box::new(move || {
-            std::thread::spawn(move || host.shutdown())
-                .join()
-                .map_err(|_| "syntax shutdown lane panicked".to_owned())?
-        }) as shutdown::Job
-    });
-    let document_job = app.document_stopped.take().map(|stopped| {
-        // All snapshot-producing workers settle first. Drop actual documents
-        // on this final lane, then require the existing document-worker receipt.
-        let empty = Workspace::new(View::new(None)).expect("empty shutdown workspace");
-        let workspace = std::mem::replace(&mut app.view, empty);
-        Box::new(move || {
-            std::thread::spawn(move || {
-                drop(workspace);
-                stopped
-                    .recv_timeout(std::time::Duration::from_secs(35))
-                    .map_err(|_| "document shutdown receipt timed out; artifacts retained".to_owned())?
-            })
-            .join()
-            .map_err(|_| "document shutdown lane panicked".to_owned())?
-        }) as shutdown::Job
-    });
     let shutdown_result = shutdown::drain([
         prep_job,
         welcome_job,
         registration_job,
         settings_job,
-        search_job,
         placement_job,
-        markdown_job,
-        logs_job,
         gpu_job,
         diagnostics_job,
-        syntax_job,
-        document_job,
     ]);
     if let Some(palette) = &mut app.palette {
         let handles = palette.stop();
-        std::thread::spawn(move || {
-            for handle in handles {
-                let _ = handle.join();
-            }
-        });
+        // Preserve the existing palette cleanup and require its actual joins.
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
-    shutdown_result.map_err(GuiError::Settings)?;
-    result.map_err(|e| GuiError::Unavailable(e.to_string()))?;
-    match app.error {
-        Some(e) => Err(e),
-        None => Ok(()),
+    let App {
+        document: mut failure,
+        view,
+        wrap,
+        markdown,
+        logs,
+        highlighting,
+        search_panel,
+        search,
+        error,
+        external_inbox,
+        external_open,
+        font_thread,
+        font_size,
+        ui_font_thread,
+        ui_font_size,
+        ..
+    } = app;
+    failure.auxiliary_error = shutdown_result.err();
+    failure.frontend_error = error;
+    failure.event_loop_error = result.err();
+    failure.font = font_thread;
+    failure.font_size = font_size;
+    failure.chrome_font = ui_font_thread;
+    failure.chrome_font_size = ui_font_size;
+    failure.attach(shutdown::Owners {
+        view,
+        wrap,
+        markdown,
+        logs,
+        highlighting,
+        search_panel,
+        search,
+        external_inbox,
+        external_open,
+    });
+    let cleanup = failure.retry();
+    if cleanup.is_err()
+        || failure.auxiliary_error.is_some()
+        || failure.frontend_error.is_some()
+        || failure.event_loop_error.is_some()
+        || failure.live.start_failure.is_some()
+        || failure.live.prepare_refusal.is_some()
+    {
+        return std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(failure)));
     }
+    std::ops::ControlFlow::Continue(Ok(()))
 }
 
 impl App {
+    fn try_finish_startup(&mut self, el: &ActiveEventLoop) {
+        use document_ui::FontProduct;
+        if self.startup_fonts.finished || self.gfx.is_none() {
+            return;
+        }
+        if !self.startup_fonts.editor_ready {
+            match self.font_thread.as_mut().map(|worker| worker.try_take_product()) {
+                Some(FontProduct::Ready(Some(font))) => {
+                    self.font = Some(font);
+                    self.startup_fonts.editor_ready = true;
+                }
+                Some(FontProduct::Pending) => return,
+                Some(FontProduct::Failed(reason)) => {
+                    self.error = Some(GuiError::Unavailable(format!("font startup retained: {reason:?}")));
+                    el.exit();
+                    return;
+                }
+                Some(FontProduct::Ready(None)) | None => {
+                    self.error = Some(GuiError::NoFont);
+                    el.exit();
+                    return;
+                }
+            }
+        }
+        if !self.startup_fonts.chrome_ready {
+            match self.ui_font_thread.as_mut().map(|worker| worker.try_take_product()) {
+                Some(FontProduct::Ready(font)) => {
+                    self.ui_font = font;
+                    self.startup_fonts.chrome_ready = true;
+                }
+                Some(FontProduct::Pending) => return,
+                Some(FontProduct::Failed(reason)) => {
+                    self.error = Some(GuiError::Unavailable(format!("chrome font startup retained: {reason:?}")));
+                    el.exit();
+                    return;
+                }
+                None => self.startup_fonts.chrome_ready = true,
+            }
+        }
+        self.startup_fonts.finished = true;
+        let size = self.gfx.as_ref().unwrap().window.inner_size();
+        self.size = (size.width as usize, size.height as usize);
+        let scale = self.gfx.as_ref().unwrap().window.scale_factor();
+        if self.ui.scale != scale {
+            self.monitor_scale_changed(scale);
+        }
+        self.finish_startup(el);
+    }
+
+    fn finish_startup(&mut self, el: &ActiveEventLoop) {
+        self.resize_surface();
+        let rows = self.text_rows();
+        let d = self.view.set_rows(rows);
+        self.apply(d);
+        if !self.render() && self.force_exit() {
+            el.exit();
+            return;
+        }
+        trace::mark("first frame presented");
+        self.start_search();
+        let highlight_proxy = self.proxy.clone();
+        self.highlighting = kwil_view_model::highlight_session::HighlightSession::new(move || {
+            let _ = highlight_proxy.send_event(UserEvent::HighlightsReady);
+        })
+        .ok();
+        if !self.wrap_owns_text()
+            && !self.view.wrap_input_blocked()
+            && !self.view.hex_active()
+            && let Some(highlighting) = &mut self.highlighting
+        {
+            highlighting.update(&self.view);
+        }
+        if self.wrap_owns_text() {
+            self.wrap_update_highlights();
+        }
+        let root = if self.opts.hidden {
+            match std::env::var_os("KWIL_WORKSPACE_ROOT")
+                .map(std::path::PathBuf::from)
+                .filter(|root| root.is_absolute())
+            {
+                Some(root) => Some(root),
+                None => {
+                    self.error = Some(GuiError::Settings(
+                        "Hidden document worker requires an absolute isolated workspace root".into(),
+                    ));
+                    el.exit();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.start_document_at(root);
+        let proxy = self.proxy.clone();
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.native = Some(platform::Native::register(gfx.hwnd, move |e| {
+                let _ = proxy.send_event(e);
+            }));
+        }
+        self.apply_native_theme();
+        (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
+        let proxy = self.proxy.clone();
+        let hidden = self.opts.hidden;
+        std::thread::spawn(move || {
+            let root = if hidden {
+                std::env::var_os("KWIL_WORKSPACE_ROOT")
+                    .map(std::path::PathBuf::from)
+                    .filter(|root| root.is_absolute())
+                    .ok_or_else(|| "Hidden palette requires an absolute isolated workspace root".to_string())
+            } else {
+                std::env::current_dir().map_err(|error| error.to_string())
+            };
+            let _ = proxy.send_event(UserEvent::PaletteRoot(root));
+            let result = std::env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()));
+            let _ = proxy.send_event(UserEvent::SettingsPath(result));
+        });
+        #[cfg(feature = "frame-harness")]
+        if self.opts.hidden
+            && std::env::var_os("KWIL_FRAME_SCRIPT").is_some()
+            && let Some(proxy) = self.proxy.native()
+        {
+            harness::start(proxy);
+        }
+        if let Some(cb) = self.on_first_frame.take() {
+            let p = self.proxy.clone();
+            cb(Box::new(move |msg| {
+                let _ = p.send_event(UserEvent::Notice(msg));
+            }));
+        }
+        if let Some(callback) = self.on_external_ready.take() {
+            callback(self.external_open.take().unwrap());
+        }
+    }
+
     fn ch(&self) -> usize {
         self.font.as_ref().map_or(16, |f| f.ch)
     }
@@ -781,6 +983,13 @@ impl App {
                     horizontal,
                     self.ui.min_thumb,
                 ),
+            );
+        }
+        if self.wrap_owns_text() {
+            return (
+                self.wrap_source_scrollbar()
+                    .unwrap_or_else(|| scrollbar::Bar::sized(0, height, 0, 0, 0, self.ui.min_thumb)),
+                scrollbar::Bar::sized(0, body.width.saturating_sub(self.ui.bar), 0, 0, 0, self.ui.min_thumb),
             );
         }
         let (page, total) =
@@ -939,6 +1148,13 @@ impl App {
     }
 
     fn page_bytes(&self) -> u64 {
+        if self.wrap_owns_text() {
+            return self.wrap_page().map_or(1, |page| {
+                page.rows()
+                    .last()
+                    .map_or(1, |row| row.source_coverage.end.saturating_sub(page.anchor.source_byte).max(1))
+            });
+        }
         horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize).0
     }
 
@@ -949,6 +1165,17 @@ impl App {
         if self.logs.owns_body() {
             let (top, horizontal) = self.logs.viewport_position();
             self.logs_scroll_to(if vertical { offset } else { top }, if vertical { horizontal } else { offset });
+            return;
+        }
+        self.wrap_sync_live();
+        if self.wrap_owns_text() {
+            if vertical
+                && let Err(error) = self
+                    .wrap_fill(kwil_view_model::visual_rows::TopAnchor { source_byte: offset, ..Default::default() })
+            {
+                let damage = self.view.set_notice(error.to_string());
+                self.apply(damage);
+            }
             return;
         }
         if vertical {
@@ -982,10 +1209,12 @@ impl App {
                     self.view.hex_session().map_or(0, |s| s.view().top())
                 } else if self.logs.owns_body() {
                     self.logs.viewport_position().0
+                } else if self.wrap_owns_text() {
+                    self.wrap_page().map_or(0, |page| page.anchor.source_byte)
                 } else {
                     self.view.top()
                 },
-                self.text_rows() as u64,
+                if self.wrap_owns_text() { self.page_bytes() } else { self.text_rows() as u64 },
             )
         } else {
             (
@@ -1029,6 +1258,15 @@ impl App {
     }
 
     fn apply(&mut self, mut d: Damage) {
+        if self.document_input_blocked() {
+            let rows = self.text_rows();
+            if self.document.live.update.is_some() {
+                self.document.live.row_shift = self.document.live.row_shift.saturating_sub(d.scroll);
+            }
+            queue_damage(&mut self.pending, d, rows, self.font.as_mut());
+            self.request_frame();
+            return;
+        }
         let hex_damage = self.sync_hex_host();
         d.full |= hex_damage.full;
         d.status |= hex_damage.status;
@@ -1040,6 +1278,8 @@ impl App {
             self.sync_markdown();
             self.sync_logs();
         }
+        self.wrap_sync_live();
+        self.wrap_lend_source();
         // Addressed events/edits invalidate search by document + revision.
         // This only captures an existing typed Editor snapshot, never decodes.
         if !self.view.hex_active()
@@ -1049,7 +1289,11 @@ impl App {
                 Ok(outcome) => {
                     self.search_dirty |= outcome.damage.panel || outcome.damage.signal;
                     d.status |= outcome.damage.status;
-                    d.rows.extend(outcome.damage.hit_rows);
+                    if self.wrap_owns_text() {
+                        d.rows.extend(0..self.text_rows());
+                    } else {
+                        d.rows.extend(outcome.damage.hit_rows);
+                    }
                 }
                 Err(error) => {
                     self.search_panel.set_error(error);
@@ -1060,11 +1304,16 @@ impl App {
         self.sync_goto_identity();
         self.sync_language_identity();
 
-        if !self.view.hex_active()
+        if !self.wrap_owns_text()
+            && !self.view.wrap_input_blocked()
+            && !self.view.hex_active()
             && let Some(highlighting) = &mut self.highlighting
         {
             highlighting.invalidate_painted(&self.view, &d);
             highlighting.update(&self.view);
+        }
+        if self.wrap_owns_text() || self.view.wrap_input_blocked() {
+            self.wrap_update_highlights();
         }
         if d == Damage::default()
             && !self.chrome_dirty
@@ -1075,7 +1324,11 @@ impl App {
         {
             return;
         }
-        queue_damage(&mut self.pending, d, self.view.rows(), self.font.as_mut());
+        let rows = self.text_rows();
+        if self.document.live.update.is_some() {
+            self.document.live.row_shift = self.document.live.row_shift.saturating_sub(d.scroll);
+        }
+        queue_damage(&mut self.pending, d, rows, self.font.as_mut());
         if let Some(dialog) = &self.desktop_window {
             dialog.gfx.window.request_redraw();
         }
@@ -1114,6 +1367,14 @@ impl App {
     }
 
     fn key_after_settings(&mut self, el: Option<&ActiveEventLoop>, ev: &HostKey<'_>) {
+        if self.document_input_blocked() && self.document.live.wrap_retry.is_none() {
+            self.wrap_shutdown_key(ev);
+            return;
+        }
+        if self.wrap_shutdown_key(ev) {
+            return;
+        }
+        self.wrap_sync_live();
         if self.binary_key(ev) {
             return;
         }
@@ -1243,6 +1504,9 @@ impl App {
         if self.menu_key(el, ev) {
             return;
         }
+        if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) && self.wrap_cancel() {
+            return;
+        }
         if self.close_pending && matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
             self.view.cancel_file_prompt();
             self.hex_cancel_input();
@@ -1317,10 +1581,14 @@ impl App {
                             if self.preview_blocks_command(call.id) {
                                 return;
                             }
+                            if self.wrap_vim_command(&call) {
+                                return;
+                            }
                             if let Some(editor) = self.view.editor_mut() {
                                 match editor.execute_vim(&call) {
                                     Ok(result) => {
                                         let damage = self.view.refresh_after_edit(result.damage);
+                                        let damage = self.wrap_model_damage(damage);
                                         self.apply(damage);
                                         self.keep_caret_visible();
                                         self.command_status(result.status);
@@ -1422,6 +1690,9 @@ impl App {
         if self.markdown_mode() == markdown_ui::Mode::Preview && id.starts_with("edit.") && id != "edit.copy" {
             return;
         }
+        if self.wrap_command(id, 1, self.mods.shift_key()) {
+            return;
+        }
         let args =
             CommandArgs { text, at: self.started.elapsed(), extend: self.mods.shift_key(), ..Default::default() };
         let result = if matches!(id, "edit.copy" | "edit.cut" | "edit.paste") {
@@ -1439,7 +1710,8 @@ impl App {
         };
         match result {
             Ok(result) => {
-                self.apply(result.damage);
+                let damage = self.wrap_model_damage(result.damage);
+                self.apply(damage);
                 self.keep_caret_visible();
                 self.command_status(result.status);
             }
@@ -1461,6 +1733,18 @@ impl App {
 
     fn keep_caret_visible(&mut self) {
         if self.view.hex_active() {
+            return;
+        }
+        self.wrap_sync_live();
+        if self.wrap_owns_text() {
+            if let Some(byte) = self.view.editor().map(|editor| editor.primary_cursor().head)
+                && self.wrap_caret(byte, kwil_view_model::visual_rows::CaretAffinity::Downstream).is_none()
+            {
+                let _ = self.wrap_reveal(kwil_view_model::visual_rows::SourcePoint {
+                    byte,
+                    affinity: kwil_view_model::visual_rows::CaretAffinity::Downstream,
+                });
+            }
             return;
         }
         let Some(editor) = self.view.editor() else {
@@ -1487,21 +1771,46 @@ impl App {
 
     fn may_exit(&mut self) -> bool {
         if self.file_dialogs.exiting() || self.view.wants_exit() {
+            self.document
+                .deadline
+                .get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(35));
             self.external_inbox.close();
         }
         if self.confirmation_worker_busy() {
             return false;
         }
-        self.file_dialogs.may_exit(&mut self.view) && self.view.prepare_hex_shutdown()
+        if self.document_input_blocked() && (self.file_dialogs.exiting() || self.view.wants_exit()) {
+            return self.file_dialogs.document_shutdown(&mut self.view);
+        }
+        self.file_dialogs.may_exit(&mut self.view)
+            && (self.document_input_blocked() || (self.wrap_shutdown_ready() && self.view.prepare_hex_shutdown()))
     }
     fn force_exit(&mut self) -> bool {
         if self.confirmation_worker_busy() {
             return false;
         }
         self.external_inbox.close();
-        self.file_dialogs.force_exit(&mut self.view) && self.view.prepare_hex_shutdown()
+        self.document.deadline.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(35));
+        if self.document_input_blocked() {
+            return self.file_dialogs.document_shutdown(&mut self.view);
+        }
+        self.file_dialogs.force_exit(&mut self.view)
+            && (self.document_input_blocked() || (self.wrap_shutdown_ready() && self.view.prepare_hex_shutdown()))
     }
     fn request_close(&mut self, el: &ActiveEventLoop, discard: bool) {
+        if self.document_input_blocked() {
+            self.external_inbox.close();
+            self.document
+                .deadline
+                .get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(35));
+            if !self.confirmation_worker_busy() && self.file_dialogs.document_shutdown(&mut self.view) {
+                el.exit();
+            }
+            return;
+        }
+        if self.wrap_retry_shutdown() {
+            return;
+        }
         if self.file_dialogs.exiting() {
             if self.may_exit() {
                 el.exit();
@@ -1527,6 +1836,10 @@ impl App {
 
     fn place_caret(&mut self, extend: bool) {
         if self.hex_pointer(extend) {
+            return;
+        }
+        self.wrap_sync_live();
+        if self.wrap_pointer(extend) {
             return;
         }
         let body = self.body_area();
@@ -1601,7 +1914,10 @@ impl App {
             queue_damage(&mut self.pending, damage, rows, self.font.as_mut());
             self.pending.full = true;
         }
+        self.wrap_sync_live();
+        self.wrap_lend_source();
         if self.pending == Damage::default()
+            && self.document.live.update.is_none()
             && !self.language_picker.dirty
             && !self.chrome_dirty
             && !self.palette_dirty
@@ -1665,12 +1981,14 @@ impl App {
         }
         let hex_active = self.view.hex_active();
         let binary_pending = self.binary_pending();
-        let binary_blocks_paint = self.binary_blocks_paint();
+        let binary_blocks_paint = self.binary_blocks_paint() || self.document_input_blocked();
         let (notice, mut segments) = if hex_active {
             (
                 self.hex_status(),
                 vec![chrome::Segment { text: "Physical bytes".into(), command: Some("view.toggleHex"), warn: false }],
             )
+        } else if self.wrap_owns_text() || self.view.wrap_input_blocked() {
+            self.wrap_status()
         } else {
             chrome::status(&self.view, self.zoom.percent())
         };
@@ -1701,13 +2019,27 @@ impl App {
         let gpu_active = self.gpu_active();
         let projection_owns_body = !binary_pending && !hex_active && self.logs.owns_body();
         let projection_source = log_ui::Source::capture(&self.view);
-        let spans: Vec<_> = self
-            .highlighting
-            .as_ref()
-            .filter(|_| !hex_active)
-            .into_iter()
-            .flat_map(|host| host.spans(&self.view))
-            .collect();
+        let wrap_active = self.wrap_owns_text() || self.view.wrap_input_blocked();
+        self.wrap_prepare_font();
+        let wrap_identity = self.wrap_paint_identity();
+        let wrap_context = self.wrap.context_for_paint();
+        let markdown_source_top =
+            self.wrap_page().and_then(|page| page.rows().first()).map_or(self.view.top(), |row| row.logical_line);
+        let mut spans: Vec<_> = Vec::new();
+        if let Some(host) = self.highlighting.as_ref().filter(|_| !hex_active) {
+            if wrap_active {
+                if let (Some(page), Some(context)) = (self.wrap_page(), wrap_context) {
+                    spans.extend(host.spans_prepared(&self.view, page, context));
+                }
+            } else if !projection_owns_body && markdown_mode != markdown_ui::Mode::Preview {
+                spans.extend(host.spans(&self.view));
+            }
+        }
+        spans.sort_unstable_by_key(|span| span.range.start);
+        let wrapped_hits = self
+            .search_panel
+            .visible_hits(self.view.active_id(), wrap_context.map_or(0, |context| context.key.source.revision));
+        let mut wrapped_paint = self.wrap.paint(wrap_identity.map(|(key, _)| key));
         let hex_source = self.view.hex_source();
         let hex_read_only = hex_active && self.view.document_busy(self.view.active_id());
         let hex_horizontal = self.hex.horizontal as usize;
@@ -1725,6 +2057,18 @@ impl App {
         let pixels = &mut gfx.pixels;
         let body_pixels = &mut self.body_pixels;
         let mut p = std::mem::take(&mut self.pending);
+        // Only fixed paint metadata moves here. Keep its original charge alive
+        // throughout rasterization/presentation; never clone its row vector.
+        let document_update = self.document.live.update.take();
+        let document_shift = self.document.live.row_shift;
+        let document_rows = || {
+            document_update
+                .iter()
+                .flat_map(|update| update.damage().rows.iter())
+                .filter_map(|row| i64::try_from(*row).ok()?.checked_add(document_shift))
+                .filter(|row| (0..rows as i64).contains(row))
+                .map(|row| row as usize)
+        };
         let palette_dirty = std::mem::take(&mut self.palette_dirty);
         let menu_dirty = std::mem::take(&mut self.menu_dirty);
         let search_dirty = std::mem::take(&mut self.search_dirty);
@@ -1747,15 +2091,28 @@ impl App {
         let mut damage = Vec::new();
         #[cfg(feature = "frame-harness")]
         let mut copied = 0u64;
-        let body_changed = p.full || p.scroll != 0 || !p.rows.is_empty() || projection_body_dirty;
+        let body_changed =
+            p.full || p.scroll != 0 || !p.rows.is_empty() || document_rows().next().is_some() || projection_body_dirty;
         if p.full {
             font.invalidate_rows();
             pixels.fill(bg());
             body_pixels.fill(bg());
             for row in (0..rows).filter(|_| !binary_blocks_paint && !projection_owns_body && !hex_active) {
-                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
-                search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
-                draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
+                if wrap_active {
+                    wrapped_paint.row(
+                        body_pixels,
+                        bw,
+                        row,
+                        font,
+                        theme,
+                        &spans,
+                        wrapped_hits.iter().map(|hit| hit.offset..hit.offset.saturating_add(hit.len)),
+                    );
+                } else {
+                    draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
+                    search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
+                    draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
+                }
             }
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             p.status = true;
@@ -1782,24 +2139,40 @@ impl App {
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for &row in
-                p.rows.iter().filter(|&&r| r < rows && !binary_blocks_paint && !projection_owns_body && !hex_active)
+            for row in p
+                .rows
+                .iter()
+                .copied()
+                .chain(document_rows())
+                .filter(|&r| r < rows && !binary_blocks_paint && !projection_owns_body && !hex_active)
             {
-                draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
-                search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
-                search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
-                draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
+                if wrap_active {
+                    wrapped_paint.row(
+                        body_pixels,
+                        bw,
+                        row,
+                        font,
+                        theme,
+                        &spans,
+                        wrapped_hits.iter().map(|hit| hit.offset..hit.offset.saturating_add(hit.len)),
+                    );
+                } else {
+                    draw_row(body_pixels, bw, font, &self.view, row, self.horizontal, &spans);
+                    search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
+                    search_ui::draw_marks(&self.search_panel, body_pixels, bw, font, &self.view, row);
+                    draw_editor_marks(body_pixels, bw, font, &self.view, row, self.view.line_offset(row));
+                }
                 let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
                 tabs::composite(body_pixels, bw, pixels, w, body, area);
                 damage.push(tabs::translated(area, body));
             }
         }
         if hex_active && !binary_blocks_paint && body_changed {
-            let mut paint_damage = p.clone();
-            // The common retained-body/native path already copied this scroll.
-            paint_damage.scroll = 0;
             if let Some(session) = self.view.hex_session() {
-                hex_ui::draw_damage(
+                // The common path already copied the scroll. The predicate
+                // borrows both original row owners until publication completes.
+                let scalar = Damage { full: p.full, status: p.status, ..Default::default() };
+                hex_ui::draw_borrowed(
                     session,
                     body_pixels,
                     bw,
@@ -1808,8 +2181,9 @@ impl App {
                         current: hex_source,
                         horizontal: hex_horizontal,
                         read_only: hex_read_only,
-                        damage: &paint_damage,
+                        damage: &scalar,
                     },
+                    |row| p.rows.contains(&row) || document_rows().any(|dirty| dirty == row),
                 );
             } else {
                 // Opening/reopen is still hex-owned even before its first page.
@@ -1818,7 +2192,7 @@ impl App {
             if p.full {
                 tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             } else {
-                for &row in p.rows.iter().filter(|&&r| r < rows) {
+                for row in p.rows.iter().copied().chain(document_rows()).filter(|&r| r < rows) {
                     let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
                     tabs::composite(body_pixels, bw, pixels, w, body, area);
                     damage.push(tabs::translated(area, body));
@@ -1929,7 +2303,7 @@ impl App {
                 &mut self.markdown,
                 markdown_mode,
                 markdown_eligible,
-                self.view.top(),
+                markdown_source_top,
                 pixels,
                 (w, h),
                 markdown_area,
@@ -2140,10 +2514,16 @@ impl App {
                 gpu::Presented::Yes => {
                     #[cfg(feature = "frame-harness")]
                     self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
+                    drop(document_update);
+                    self.document_frame_painted();
+                    if self.wrap_frame_painted() {
+                        self.wrap_ready();
+                    }
                     return true;
                 }
                 gpu::Presented::Deferred => {
                     self.pending.full = true;
+                    self.document.live.update = document_update;
                     return true;
                 }
                 gpu::Presented::Failed(error) => {
@@ -2170,11 +2550,15 @@ impl App {
                 Ok(target) => target,
                 Err(error) => {
                     self.error = Some(GuiError::Unavailable(error.to_string()));
+                    self.pending.full = true;
+                    self.document.live.update = document_update;
                     return false;
                 }
             };
             if target.len() != pixels.len() {
                 self.error = Some(GuiError::Unavailable("CPU surface resize failed".into()));
+                self.pending.full = true;
+                self.document.live.update = document_update;
                 return false;
             }
             target.copy_from_slice(pixels);
@@ -2185,9 +2569,16 @@ impl App {
                 }
                 Err(error) => {
                     self.error = Some(GuiError::Unavailable(error.to_string()));
+                    self.pending.full = true;
+                    self.document.live.update = document_update;
                     return false;
                 }
             }
+        }
+        drop(document_update);
+        self.document_frame_painted();
+        if self.wrap_frame_painted() {
+            self.wrap_ready();
         }
         true
     }
@@ -2677,17 +3068,6 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(ui_font_size) = self.ui_font_size.take() {
             let _ = ui_font_size.try_send(self.ui.text_px());
         }
-        match self.font_thread.take().and_then(|t| t.join().ok()).flatten() {
-            Some(f) => self.font = Some(f),
-            None => {
-                self.error = Some(GuiError::NoFont);
-                el.exit();
-                return;
-            }
-        }
-        // Read in parallel with window creation; chrome text is optional, so a
-        // missing face leaves shapes without labels instead of failing startup.
-        self.ui_font = self.ui_font_thread.take().and_then(|t| t.join().ok()).flatten();
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
         self.gfx = Some(Gfx {
@@ -2699,90 +3079,15 @@ impl ApplicationHandler<UserEvent> for App {
             hwnd,
             pixels: vec![bg(); self.size.0 * self.size.1],
         });
-        self.resize_surface();
-        let rows = self.text_rows();
-        let d = self.view.set_rows(rows);
-        self.apply(d);
-        if !self.render() && self.force_exit() {
-            el.exit();
-            return;
-        }
-        trace::mark("first frame presented");
-        self.start_search();
-        let highlight_proxy = self.proxy.clone();
-        self.highlighting = kwil_view_model::highlight_session::HighlightSession::new(move || {
-            let _ = highlight_proxy.send_event(UserEvent::HighlightsReady);
-        })
-        .ok();
-        if !self.view.hex_active()
-            && let Some(highlighting) = &mut self.highlighting
-        {
-            highlighting.update(&self.view);
-        }
-        let document_proxy = self.proxy.clone();
-        let (stopped_tx, stopped_rx) = std::sync::mpsc::sync_channel(1);
-        self.document_stopped = Some(stopped_rx);
-        let complete = move |result| {
-            if let kwil_view_model::document_worker::DocumentResult::Stopped(result) = &result {
-                let _ = stopped_tx.try_send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
-            }
-            let _ = document_proxy.send_event(UserEvent::Document(Box::new(result)));
-        };
-        let worker = if self.opts.hidden {
-            self.view.start_isolated_document_worker(complete)
-        } else {
-            self.view.start_document_worker(complete)
-        };
-        if let Err(error) = worker {
-            self.document_stopped = None;
-            let damage = self.view.set_notice(format!("File worker: {error}"));
-            self.apply(damage);
-        }
-        let proxy = self.proxy.clone();
-        if let Some(gfx) = self.gfx.as_mut() {
-            gfx.native = Some(platform::Native::register(gfx.hwnd, move |e| {
-                let _ = proxy.send_event(e);
-            }));
-        }
-        self.apply_native_theme();
-        (self.on_event)(GuiEvent::RenderPolicyChanged(self.policy.clone()));
-        let proxy = self.proxy.clone();
-        let hidden = self.opts.hidden;
-        std::thread::spawn(move || {
-            let root = if hidden {
-                std::env::var_os("KWIL_WORKSPACE_ROOT")
-                    .map(std::path::PathBuf::from)
-                    .filter(|root| root.is_absolute())
-                    .ok_or_else(|| "Hidden palette requires an absolute isolated workspace root".to_string())
-            } else {
-                std::env::current_dir().map_err(|error| error.to_string())
-            };
-            let _ = proxy.send_event(UserEvent::PaletteRoot(root));
-            let result = std::env::current_exe()
-                .map_err(|e| e.to_string())
-                .and_then(|exe| Settings::path(&exe).map_err(|e| e.to_string()));
-            let _ = proxy.send_event(UserEvent::SettingsPath(result));
-        });
-        #[cfg(feature = "frame-harness")]
-        if self.opts.hidden
-            && std::env::var_os("KWIL_FRAME_SCRIPT").is_some()
-            && let Some(proxy) = self.proxy.native()
-        {
-            harness::start(proxy);
-        }
-        if let Some(cb) = self.on_first_frame.take() {
-            let p = self.proxy.clone();
-            cb(Box::new(move |msg| {
-                let _ = p.send_event(UserEvent::Notice(msg));
-            }));
-        }
-        if let Some(callback) = self.on_external_ready.take() {
-            callback(self.external_open.take().unwrap());
-        }
+        self.try_finish_startup(el);
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
         let d = match ev {
+            UserEvent::StartupFontReady => {
+                self.try_finish_startup(el);
+                return;
+            }
             UserEvent::WindowPlacementLoaded(result) => {
                 self.placement_loaded(result);
                 Damage::default()
@@ -2816,6 +3121,11 @@ impl ApplicationHandler<UserEvent> for App {
                 Damage { full: true, status: true, ..Default::default() }
             }
             UserEvent::HighlightsReady => self.language_highlights_ready(),
+            UserEvent::WrapReady => {
+                self.wrap_ready();
+                self.wrap_update_highlights();
+                Damage::default()
+            }
             UserEvent::PaletteRoot(root) => {
                 if let Ok(root) = &root {
                     self.set_search_root(root.clone());
@@ -2860,32 +3170,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.logs_ready();
                 return;
             }
-            UserEvent::Document(result) => {
-                #[cfg(feature = "frame-harness")]
-                let Some(result) = harness::hold_preview_completion(result, self.view.active_id()) else { return };
-                let replacement = match &*result {
-                    kwil_view_model::document_worker::DocumentResult::Replaced { key, result, .. } => {
-                        Some((*key, result.as_ref().map(|_| ()).map_err(ToString::to_string)))
-                    }
-                    _ => None,
-                };
-                let damage = self.view.document_result(*result);
-                if let Some((key, result)) = replacement {
-                    self.search_replacement_finished(key, result);
-                }
-                self.sync_file_ui();
-                if let Some((document, epoch)) = self.goto_reveal {
-                    if document != self.view.active_id() || epoch != self.view.input_epoch() {
-                        self.goto_reveal = None;
-                    } else if self.view.editor().is_some() {
-                        self.goto_reveal = None;
-                        self.keep_caret_visible();
-                    }
-                }
+            UserEvent::DocumentReady => {
+                self.document_ready();
                 if self.may_exit() {
                     el.exit();
                 }
-                damage
+                return;
             }
             UserEvent::OpenExternal => self.external_open_event(),
             UserEvent::Notice(msg) => self.view.set_notice(msg),
@@ -3113,6 +3403,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
             UserEvent::FontReady(Some(mut font)) => {
+                self.wrap_font_changed();
                 self.font_loading = false;
                 if self.font_reload_pending {
                     self.font_reload_pending = false;
@@ -3145,6 +3436,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.view.set_notice("Configured font is unavailable".into())
             }
             UserEvent::UiFontReady(font) => {
+                self.wrap_font_changed();
                 // One job at a time; a scale change during it gets one rerun
                 // with the latest scale. A failed load keeps the current face.
                 if self.ui_font_jobs.finished() {
@@ -3159,6 +3451,7 @@ impl ApplicationHandler<UserEvent> for App {
                 Damage { status: true, ..Default::default() }
             }
             UserEvent::UiFallbackReady(id, face) => {
+                self.wrap_font_changed();
                 // Bind only to the face that asked; a newer face that missed
                 // glyphs meanwhile gets exactly one retry, still one read at a time.
                 let (bind, retry) = self.ui_fallback.finished(id, self.ui_font.as_ref().map(font::UiFont::id));
@@ -3246,12 +3539,42 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        if !self.startup_fonts.finished {
+            match ev {
+                WindowEvent::ModifiersChanged(modifiers) => self.mods = modifiers.state(),
+                WindowEvent::CloseRequested | WindowEvent::Destroyed => el.exit(),
+                _ => {}
+            }
+            return;
+        }
+        if self.document_input_blocked() && desktop_window::owns_input(&ev) {
+            if let WindowEvent::KeyboardInput { event, .. } = &ev
+                && event.state == ElementState::Pressed
+            {
+                self.wrap_shutdown_key(&HostKey {
+                    logical_key: event.logical_key.clone(),
+                    text: event.text.as_deref(),
+                    repeat: event.repeat,
+                });
+            }
+            return;
+        }
         if self.binary_window_input(&ev) {
             return;
         }
         // Native file/close dialogs and teardown own input ahead of every GUI
         // overlay, including the separate settings window. Worker receipts still drain.
         if self.file_modal() && desktop_window::owns_input(&ev) {
+            if let WindowEvent::KeyboardInput { event, .. } = &ev
+                && event.state == ElementState::Pressed
+                && self.wrap_shutdown_key(&HostKey {
+                    logical_key: event.logical_key.clone(),
+                    text: event.text.as_deref(),
+                    repeat: event.repeat,
+                })
+            {
+                return;
+            }
             if !self.file_dialogs.exiting()
                 && self.close_dialog.is_none()
                 && matches!(&ev,WindowEvent::KeyboardInput{event,..} if event.state==ElementState::Pressed && matches!(event.logical_key,Key::Named(NamedKey::Escape)))
@@ -3301,6 +3624,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.drag = None;
                 self.selecting = false;
                 self.pending_resize = Some(latest);
+                self.wrap_geometry_pending();
                 self.pending.full = true;
                 if let Some(gfx) = &self.gfx {
                     self.redraw_requested = true;
@@ -3612,9 +3936,17 @@ impl ApplicationHandler<UserEvent> for App {
                             )
                         }
                     }
-                    destination => ime::commit(&mut self.view, destination, text, self.started.elapsed()),
+                    destination => {
+                        self.wrap_sync_live();
+                        if matches!(&destination, ime::Destination::Editor { .. }) && !self.wrap_mutation_allowed() {
+                            (Damage { status: true, ..Default::default() }, false)
+                        } else {
+                            ime::commit(&mut self.view, destination, text, self.started.elapsed())
+                        }
+                    }
                 };
                 self.sync_file_ui();
+                let damage = self.wrap_model_damage(damage);
                 self.apply(damage);
                 if follow_active {
                     self.keep_caret_visible();
@@ -3753,6 +4085,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.view.checkpoint_session();
                     return;
                 }
+                self.wrap_sync_live();
+                if self.wrap_wheel(vertical, horizontal) {
+                    return;
+                }
                 if horizontal != 0 || self.mods.shift_key() {
                     let delta = if horizontal != 0 { horizontal } else { vertical };
                     let maximum = self.bars().1.maximum;
@@ -3849,6 +4185,11 @@ impl App {
             font.enable_unicode(self.settings.font.family.clone(), move |tile, generation| {
                 let _ = proxy.send_event(UserEvent::GlyphReady(tile, generation));
             });
+        }
+        if self.wrap_owns_text() {
+            self.wrap_font_changed();
+            self.apply(Damage { rows: (0..self.text_rows()).collect(), status: true, ..Default::default() });
+            return;
         }
         self.apply(Damage {
             rows: (0..self.view.rows())

@@ -20,13 +20,264 @@ mod compound;
 mod hex;
 mod replacement;
 use compound::CompoundEdit;
+#[cfg(test)]
+mod receipt_delivery_tests;
 pub(crate) mod receipts;
-mod save;
+pub(crate) mod save;
+pub use save::{SaveCompletionRefusal, SaveCompletionRefusalReason};
+#[cfg(test)]
+mod save_completion_tests;
 pub mod visual;
+pub(crate) use receipts::ReceiptDeliveryRefusal;
 use receipts::{EditKind, ReceiptState, Recipe, Transition};
+pub use receipts::{EditObserverRefusal, EditObserverRefusalReason};
 
 const MAX_CURSORS: usize = 4096;
 const BURST_GAP: Duration = Duration::from_millis(500);
+
+fn metadata_overflow() -> io::Error {
+    // ErrorKind-only construction keeps the read-only inspector allocation
+    // free even on refusal; diagnostic context belongs to its caller.
+    io::Error::from(io::ErrorKind::InvalidData)
+}
+fn metadata_add(total: &mut usize, bytes: usize) -> io::Result<()> {
+    *total = total.checked_add(bytes).ok_or_else(metadata_overflow)?;
+    Ok(())
+}
+fn metadata_capacity<T>(capacity: usize) -> io::Result<usize> {
+    capacity.checked_mul(std::mem::size_of::<T>()).ok_or_else(metadata_overflow)
+}
+fn invocation_metadata_bytes(call: &Invocation) -> io::Result<usize> {
+    use kwil_core_commands::vim::Argument;
+    match &call.argument {
+        Argument::Search(pattern) => Ok(pattern.capacity()),
+        Argument::Substitute { pattern, replacement, .. } => {
+            pattern.capacity().checked_add(replacement.capacity()).ok_or_else(metadata_overflow)
+        }
+        _ => Ok(0),
+    }
+}
+fn register_entry_metadata_bytes(data: &ClipboardData) -> io::Result<usize> {
+    // Conservative node bound for the pinned BTreeMap implementation: a full
+    // node per ENTRY, allowing 16 key/value slots and 32 pointer-sized header/
+    // edge slots (the implementation uses 11 entries and 12 child edges).
+    // Every nonempty node owns at least one entry. This is an allocation upper
+    // bound, not a measurement of physical nodes or RSS. Snapshot payloads keep
+    // their existing source accounting; only inline handles/ranges count here.
+    let node = std::mem::size_of::<(char, ClipboardData)>()
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(32 * std::mem::size_of::<usize>()))
+        .ok_or_else(metadata_overflow)?;
+    node.checked_add(metadata_capacity::<Range<u64>>(data.ranges.capacity())?).ok_or_else(metadata_overflow)
+}
+fn register_map_metadata_bytes(registers: &BTreeMap<char, ClipboardData>) -> io::Result<usize> {
+    // Called only when an existing compound transaction CLONES its rollback
+    // map: cloned range vectors can have different capacities. Never called by
+    // the document-response inspector.
+    let mut bytes = 0;
+    for data in registers.values() {
+        metadata_add(&mut bytes, register_entry_metadata_bytes(data)?)?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod document_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn register_scalar_tracks_all_vim_write_paths_and_actual_range_capacities() {
+        let mut editor = Editor::new(Document::new());
+        editor.insert_text("abcd", Duration::ZERO).unwrap();
+        editor.set_cursors(vec![Cursor::caret(0)], 0).unwrap();
+        for register in ['a', 'a', 'A', 'b', '_'] {
+            let call = Invocation {
+                id: "operator.yank",
+                count: 1,
+                explicit_count: false,
+                motion: Some(VimMotion::Right),
+                register: Some(register),
+                argument: kwil_core_commands::vim::Argument::None,
+            };
+            editor.execute_vim(&call).unwrap();
+            assert_eq!(
+                editor.register_metadata_bytes,
+                register_map_metadata_bytes(&editor.registers).unwrap(),
+                "cache follows overwrite, append, named and unnamed register writes"
+            );
+        }
+        assert!(editor.register_metadata_bytes > 0);
+        let before = editor.register_metadata_bytes;
+        let mut data = ClipboardData::text(b"z").unwrap();
+        data.ranges.reserve(64);
+        let expected = register_entry_metadata_bytes(&data).unwrap();
+        let replaced = register_entry_metadata_bytes(editor.registers.get(&'a').unwrap()).unwrap();
+        editor.install_register('a', data).unwrap();
+        assert_eq!(editor.register_metadata_bytes, before - replaced + expected);
+        assert_eq!(editor.register_metadata_bytes, register_map_metadata_bytes(&editor.registers).unwrap());
+    }
+
+    #[test]
+    fn inspector_excludes_nested_history_with_existing_buffer_charge_witness() {
+        let mut editor = Editor::new(Document::new());
+        editor.insert_text("x", Duration::ZERO).unwrap();
+        let metadata = editor.document_metadata_bytes().unwrap();
+        let history = editor.document.buffer.undo_memory_bytes();
+        editor.undo.back_mut().unwrap().before.cursors.reserve(256);
+        editor.charge_model_history();
+        assert!(
+            editor.document.buffer.undo_memory_bytes() > history,
+            "nested history metadata is charged by the document history owner"
+        );
+        assert_eq!(
+            editor.document_metadata_bytes().unwrap(),
+            metadata,
+            "aggregate counts deque allocation headers without charging nested history twice"
+        );
+    }
+}
+
+// One normalization algorithm serves ordinary edits and guarded save staging.
+fn normalize_cursor_set(cursors: &mut Vec<Cursor>, primary: &mut usize) {
+    let selected = cursors[*primary].clone();
+    cursors.sort_by_key(|c| (c.selection().start, c.selection().end));
+    let mut output = 0;
+    let mut selected_index = 0;
+    for index in 0..cursors.len() {
+        let cursor = cursors[index].clone();
+        let is_primary = cursor == selected;
+        if output > 0
+            && (cursor.selection().start < cursors[output - 1].selection().end
+                || cursor.selection() == cursors[output - 1].selection())
+        {
+            let last = &mut cursors[output - 1];
+            let start = last.selection().start.min(cursor.selection().start);
+            let end = last.selection().end.max(cursor.selection().end);
+            let reverse = if is_primary { cursor.head < cursor.anchor } else { last.head < last.anchor };
+            last.anchor = if reverse { end } else { start };
+            last.head = if reverse { start } else { end };
+            if is_primary {
+                selected_index = output - 1;
+            }
+        } else {
+            if is_primary {
+                selected_index = output;
+            }
+            cursors[output] = cursor;
+            output += 1;
+        }
+    }
+    cursors.truncate(output);
+    *primary = selected_index.min(output - 1);
+}
+
+enum CursorDamageBefore<'a> {
+    Rows(&'a [u64]),
+    Source { snapshot: &'a Snapshot, cursors: &'a [Cursor], top: u64 },
+}
+fn visit_cursor_rows(
+    snapshot: &Snapshot,
+    cursors: &[Cursor],
+    top: u64,
+    rows: usize,
+    visit: &mut impl FnMut(u64),
+) -> io::Result<()> {
+    for cursor in cursors {
+        let start = text::row(snapshot, cursor.selection().start)?;
+        let end = text::row(snapshot, cursor.selection().end)?;
+        visit(start);
+        visit(end);
+        for row in start.max(top)..=end.min(top.saturating_add(rows as u64)) {
+            visit(row);
+        }
+    }
+    Ok(())
+}
+/// Reads/reveal/damage are shared by legacy publication and sealed preparation.
+/// The latter passes only staged scalars, cursors and borrowed guarded sources.
+fn evaluate_cursor_damage(
+    snapshot: &Snapshot,
+    cursors: &[Cursor],
+    primary: usize,
+    top: &mut u64,
+    visible_rows: usize,
+    before: CursorDamageBefore<'_>,
+    edited: Option<&Range<u64>>,
+) -> io::Result<Damage> {
+    let row = text::row(snapshot, cursors[primary].head)?;
+    let previous_top = *top;
+    if visible_rows > 0 {
+        if row < *top {
+            *top = row;
+        } else if row >= top.saturating_add(visible_rows as u64) {
+            *top = row + 1 - visible_rows as u64;
+        }
+    }
+    let delta = *top as i128 - previous_top as i128;
+    let mut damage = Damage { status: true, ..Damage::default() };
+    if delta.unsigned_abs() >= visible_rows.max(1) as u128 {
+        damage.full = true;
+        return Ok(damage);
+    }
+    damage.scroll = delta as i64;
+    let mut rows = save::reserve_vec::<bool>(visible_rows)?;
+    rows.resize(visible_rows, false);
+    {
+        let mut mark = |row: u64| {
+            if row >= *top && row - *top < visible_rows as u64 {
+                rows[(row - *top) as usize] = true;
+            }
+        };
+        match before {
+            CursorDamageBefore::Rows(old) => {
+                for row in old {
+                    mark(*row);
+                }
+            }
+            CursorDamageBefore::Source { snapshot, cursors, top } => {
+                visit_cursor_rows(snapshot, cursors, top, visible_rows, &mut mark)?
+            }
+        }
+        visit_cursor_rows(snapshot, cursors, *top, visible_rows, &mut mark)?;
+    }
+    for (index, changed) in rows.iter_mut().enumerate() {
+        if edited.is_some_and(|range| range.contains(&top.saturating_add(index as u64)))
+            || delta > 0 && index >= visible_rows - delta as usize
+            || delta < 0 && index < (-delta) as usize
+        {
+            *changed = true;
+        }
+    }
+    let mut result = save::reserve_vec(visible_rows)?;
+    result.extend(rows.into_iter().enumerate().filter_map(|(index, changed)| changed.then_some(index)));
+    damage.rows = result;
+    Ok(damage)
+}
+
+#[cfg(test)]
+mod workspace_wrap_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_wrap_external_normalization_restore_and_exhaustion_are_explicit() {
+        let mut editor = Editor::new(Document::new());
+        let initial = editor.external_cursor_generation().unwrap();
+        editor.set_viewport(0, 2);
+        assert_eq!(editor.external_cursor_generation().unwrap(), initial);
+        editor.normalize();
+        assert!(editor.external_cursor_generation().unwrap() > initial);
+        let before_restore = editor.external_cursor_generation().unwrap();
+        let state = editor.state();
+        editor.restore(state);
+        assert_eq!(editor.primary_cursor(), &Cursor::caret(0));
+        assert!(editor.external_cursor_generation().unwrap() > before_restore);
+        editor.external_cursor_generation = Some(u64::MAX);
+        editor.normalize();
+        assert!(editor.external_cursor_generation().is_err());
+        editor.restore(editor.state());
+        assert!(editor.external_cursor_generation().is_err(), "exhausted identities never restart");
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
@@ -209,6 +460,9 @@ pub struct Editor {
     // A wrap-created cursor allocation remains charged while Editor owns it,
     // independently of transient visual display state.
     visual_cursor_charge: Option<crate::visual_rows::AllocationCharge>,
+    // External normalization/restore is distinct from atomic wrap publication,
+    // including normalization that preserves every byte endpoint.
+    external_cursor_generation: Option<u64>,
     primary: usize,
     top: u64,
     rows: usize,
@@ -218,6 +472,9 @@ pub struct Editor {
     burst: Option<(Duration, Vec<Cursor>)>,
     pub mode: Mode,
     registers: BTreeMap<char, ClipboardData>,
+    // Maintained at each register replacement/clear and compound rollback.
+    // Includes conservative map nodes and actual range-vector capacities.
+    register_metadata_bytes: usize,
     repeat: Option<Repeat>,
     insert_prefix: Option<Invocation>,
     inserted: Vec<u8>,
@@ -236,6 +493,7 @@ impl Editor {
             document,
             cursors: vec![Cursor::caret(0)],
             visual_cursor_charge: None,
+            external_cursor_generation: Some(0),
             primary: 0,
             top: 0,
             rows: 0,
@@ -245,6 +503,7 @@ impl Editor {
             burst: None,
             mode: Mode::Normal,
             registers: BTreeMap::new(),
+            register_metadata_bytes: 0,
             repeat: None,
             insert_prefix: None,
             inserted: Vec::new(),
@@ -259,6 +518,72 @@ impl Editor {
     }
     pub fn document(&self) -> &Document {
         &self.document
+    }
+
+    /// Current non-source model metadata. No history/register traversal,
+    /// allocation, source access, or charge release occurs here.
+    ///
+    /// Dynamic Settings are covered separately by Workspace's borrowed current
+    /// Settings measurement. Nested history State/Recipe storage remains in the
+    /// document history budget (`charge_model_history`); saved/deferred states
+    /// retain their independent reservations. This is not a growth permit.
+    pub(crate) fn document_metadata_bytes(&self) -> io::Result<usize> {
+        let mut bytes = std::mem::size_of::<Self>();
+        metadata_add(&mut bytes, metadata_capacity::<Cursor>(self.cursors.capacity())?)?;
+        metadata_add(&mut bytes, metadata_capacity::<HistoryEntry>(self.undo.capacity())?)?;
+        metadata_add(&mut bytes, metadata_capacity::<HistoryEntry>(self.redo.capacity())?)?;
+        if let Some((_, cursors)) = &self.burst {
+            metadata_add(&mut bytes, metadata_capacity::<Cursor>(cursors.capacity())?)?;
+        }
+        metadata_add(&mut bytes, self.inserted.capacity())?;
+        metadata_add(&mut bytes, self.language.as_ref().map_or(0, String::capacity))?;
+        metadata_add(&mut bytes, self.comment_override.as_ref().map_or(0, String::capacity))?;
+        metadata_add(&mut bytes, self.register_metadata_bytes)?;
+        if let Some(call) = &self.insert_prefix {
+            metadata_add(&mut bytes, invocation_metadata_bytes(call)?)?;
+        }
+        if let Some(repeat) = &self.repeat {
+            match repeat {
+                Repeat::Insert(data) => metadata_add(&mut bytes, data.capacity())?,
+                Repeat::Vim(call, data) => {
+                    metadata_add(&mut bytes, data.capacity())?;
+                    metadata_add(&mut bytes, invocation_metadata_bytes(call)?)?;
+                }
+            }
+        }
+        if let Some(compound) = &self.compound {
+            metadata_add(&mut bytes, compound.document_metadata_bytes()?)?;
+        }
+        metadata_add(&mut bytes, self.receipts.document_metadata_bytes()?)?;
+        Ok(bytes)
+    }
+
+    fn install_register(&mut self, key: char, data: ClipboardData) -> io::Result<()> {
+        let incoming = register_entry_metadata_bytes(&data)?;
+        let old = self.registers.get(&key).map(register_entry_metadata_bytes).transpose()?.unwrap_or(0);
+        let next = self
+            .register_metadata_bytes
+            .checked_sub(old)
+            .and_then(|n| n.checked_add(incoming))
+            .ok_or_else(metadata_overflow)?;
+        self.registers.insert(key, data);
+        self.register_metadata_bytes = next;
+        Ok(())
+    }
+
+    /// Cached scalar only. Exhaustion disables wrap admission explicitly;
+    /// generations never wrap and borrowing an editor does not advance them.
+    pub fn external_cursor_generation(&self) -> io::Result<u64> {
+        self.external_cursor_generation.ok_or_else(|| io::Error::other("external cursor generation exhausted"))
+    }
+    fn note_external_cursor_change(&mut self) {
+        self.external_cursor_generation = self.external_cursor_generation.and_then(|value| value.checked_add(1));
+    }
+
+    /// Settle a failed save only after Workspace validates its active flight.
+    /// The caller retains the error and every source-bearing owner.
+    pub(crate) fn fail_save_completion(&mut self) {
+        self.saving = false;
     }
 
     /// Capture raw Save/Save As through the same in-flight save state. The
@@ -284,21 +609,25 @@ impl Editor {
         {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "raw reopen awaits admitted editor work"));
         }
+        self.receipts.destination_change_ready()?;
         Ok(())
     }
 
     /// Called only on the document worker. All old roots/history retire there;
     /// no state is changed until the new physical document has been prepared.
     pub(crate) fn install_raw_reopen(&mut self, document: Document) {
+        self.receipts.destination_change_ready().expect("worker raw reopen destination preflight");
+        self.note_external_cursor_change();
         self.end_burst();
         self.undo.clear();
         self.redo.clear();
         self.registers.clear();
+        self.register_metadata_bytes = 0;
         self.repeat = None;
         self.insert_prefix = None;
         self.inserted.clear();
         self.join_insert = false;
-        self.receipts = ReceiptState::default();
+        self.receipts.reset_for_raw_reopen();
         self.box_column = None;
         self.cursors = vec![Cursor::caret(0)];
         self.primary = 0;
@@ -387,6 +716,7 @@ impl Editor {
         }
     }
     fn restore(&mut self, state: State) {
+        self.note_external_cursor_change();
         self.cursors = state.cursors;
         self.primary = state.primary;
         self.document.revision = state.revision;
@@ -415,96 +745,28 @@ impl Editor {
     }
 
     fn normalize(&mut self) {
-        let primary = self.primary_cursor().clone();
-        self.cursors.sort_by_key(|c| (c.selection().start, c.selection().end));
-        let mut merged: Vec<Cursor> = Vec::with_capacity(self.cursors.len());
-        let mut selected = 0;
-        for cursor in self.cursors.drain(..) {
-            let is_primary = cursor == primary;
-            if let Some(last) = merged.last_mut()
-                && (cursor.selection().start < last.selection().end || cursor.selection() == last.selection())
-            {
-                let start = last.selection().start.min(cursor.selection().start);
-                let end = last.selection().end.max(cursor.selection().end);
-                let reverse = if is_primary { cursor.head < cursor.anchor } else { last.head < last.anchor };
-                last.anchor = if reverse { end } else { start };
-                last.head = if reverse { start } else { end };
-                if is_primary {
-                    selected = merged.len() - 1;
-                }
-            } else {
-                if is_primary {
-                    selected = merged.len();
-                }
-                merged.push(cursor);
-            }
-        }
-        self.cursors = merged;
-        self.primary = selected.min(self.cursors.len() - 1);
+        self.note_external_cursor_change();
+        normalize_cursor_set(&mut self.cursors, &mut self.primary);
     }
 
     fn cursor_rows(&self) -> io::Result<Vec<u64>> {
         let s = self.document.snapshot();
         let mut result = Vec::with_capacity(self.cursors.len() * 2 + self.rows);
-        for c in &self.cursors {
-            let a = text::row(&s, c.selection().start)?;
-            let b = text::row(&s, c.selection().end)?;
-            result.extend([a, b]);
-            result.extend(a.max(self.top)..=b.min(self.top + self.rows as u64));
-        }
+        visit_cursor_rows(&s, &self.cursors, self.top, self.rows, &mut |row| result.push(row))?;
         Ok(result)
     }
 
     fn finish_damage(&mut self, old: Vec<u64>, edited: Option<Range<u64>>) -> io::Result<Damage> {
         let s = self.document.snapshot();
-        let row = text::row(&s, self.primary_cursor().head)?;
-        let before = self.top;
-        if self.rows > 0 {
-            if row < self.top {
-                self.top = row;
-            } else if row >= self.top + self.rows as u64 {
-                self.top = row + 1 - self.rows as u64;
-            }
-        }
-        let delta = self.top as i128 - before as i128;
-        let mut d = Damage { status: true, ..Damage::default() };
-        if delta.unsigned_abs() >= self.rows.max(1) as u128 {
-            d.full = true;
-            return Ok(d);
-        }
-        d.scroll = delta as i64;
-        let mut rows = vec![false; self.rows];
-        for r in old.into_iter().chain(self.cursor_rows()?) {
-            if r >= self.top
-                && let Some(changed) = rows.get_mut((r - self.top) as usize)
-            {
-                *changed = true;
-            }
-        }
-        // Selections may cover many rows; damage is clipped to the viewport.
-        for c in &self.cursors {
-            let a = text::row(&s, c.selection().start)?;
-            let b = text::row(&s, c.selection().end)?;
-            for (i, changed) in rows.iter_mut().enumerate() {
-                if (a..=b).contains(&(self.top + i as u64)) {
-                    *changed = true;
-                }
-            }
-        }
-        if let Some(range) = edited {
-            for (i, changed) in rows.iter_mut().enumerate() {
-                if range.contains(&(self.top + i as u64)) {
-                    *changed = true;
-                }
-            }
-        }
-        for (i, changed) in rows.iter_mut().enumerate() {
-            if delta > 0 && i >= self.rows - delta as usize || delta < 0 && i < (-delta) as usize {
-                *changed = true;
-            }
-        }
-        d.rows = rows.into_iter().enumerate().filter_map(|(i, b)| b.then_some(i)).collect();
-        Ok(d)
+        evaluate_cursor_damage(
+            &s,
+            &self.cursors,
+            self.primary,
+            &mut self.top,
+            self.rows,
+            CursorDamageBefore::Rows(&old),
+            edited.as_ref(),
+        )
     }
 
     fn apply(&mut self, mut edits: Vec<Edit>, typing: Option<Duration>, caret_at_end: bool) -> io::Result<Damage> {
@@ -650,16 +912,25 @@ impl Editor {
 
     /// Streaming bulk edits arrive in descending original offsets. Only one
     /// line's recipe and the cursor set are resident, even for select-all.
+    #[cfg(test)]
     fn apply_descending<I>(&mut self, edits: I) -> io::Result<Damage>
     where
         I: DoubleEndedIterator<Item = io::Result<Option<Edit>>> + Clone + Send + Sync + 'static,
     {
-        self.apply_descending_with_recipe(edits, None)
+        // Compatibility for private/test callers whose captures are unknown.
+        // A retained receipt from this route explicitly refuses metadata
+        // admission until its producer supplies a certified heap bound.
+        self.apply_descending_with_recipe(edits, None, None)
     }
 
     /// A bounded prepared shape recipe must not retain a byte-producing
     /// iterator (for example an inline search plan's replacement payloads).
-    fn apply_descending_with_recipe<I>(&mut self, edits: I, prepared: Option<Recipe>) -> io::Result<Damage>
+    fn apply_descending_with_recipe<I>(
+        &mut self,
+        edits: I,
+        prepared: Option<Recipe>,
+        seed_heap_bytes: Option<usize>,
+    ) -> io::Result<Damage>
     where
         I: DoubleEndedIterator<Item = io::Result<Option<Edit>>> + Clone + Send + Sync + 'static,
     {
@@ -723,7 +994,7 @@ impl Editor {
         let transition = Transition {
             before: s.clone(),
             after: self.document.snapshot(),
-            recipe: prepared.unwrap_or_else(|| Recipe::bulk(recipe_seed, replacement_count)),
+            recipe: prepared.unwrap_or_else(|| Recipe::bulk(recipe_seed, replacement_count, seed_heap_bytes)),
         };
         self.undo.push_back(HistoryEntry {
             before: before.clone(),
@@ -881,6 +1152,8 @@ impl Editor {
     }
     fn move_cursors_checked(&mut self, motion: Motion, count: u32, extend: bool) -> io::Result<Damage> {
         let old = self.cursor_rows()?;
+        // A later source lookup may fail after earlier cursors moved.
+        self.note_external_cursor_change();
         self.end_burst();
         let s = self.document.snapshot();
         for c in &mut self.cursors {
@@ -1205,6 +1478,12 @@ impl Editor {
             }
         }
         let settings = self.settings.editor.clone();
+        // The retained seed owns only the selected-range iterator and comment
+        // String beyond its inline captures. Iterator/String clones retain at
+        // most the original capacities; snapshots keep their source budget.
+        let seed_heap_bytes = metadata_capacity::<Range<u64>>(ranges.capacity())?
+            .checked_add(token.capacity())
+            .ok_or_else(metadata_overflow)?;
         let edits = ranges.into_iter().rev().flat_map(|r| r.rev()).map(move |row| {
             let bounds = text::line(&s, row)?;
             let bytes = text::read(&s, bounds.start..bounds.end.min(bounds.start + text::WINDOW), text::WINDOW)?;
@@ -1243,7 +1522,7 @@ impl Editor {
                     .then(|| Edit::bytes(at..at, format!("{token} ").as_bytes())),
             })
         });
-        self.apply_descending(edits)
+        self.apply_descending_with_recipe(edits, None, Some(seed_heap_bytes))
     }
     pub fn indent(&mut self, outdent: bool) -> io::Result<Damage> {
         self.line_edits(if outdent { LineEdit::Outdent } else { LineEdit::Indent })
@@ -1273,7 +1552,8 @@ impl Editor {
             }
             Ok((end < bounds.end).then(|| Edit::delete(end..bounds.end)))
         });
-        self.apply_descending(edits)
+        // This seed captures only inline range counters and a Snapshot handle.
+        self.apply_descending_with_recipe(edits, None, Some(0))
     }
 
     fn comment_token(&self) -> Option<String> {

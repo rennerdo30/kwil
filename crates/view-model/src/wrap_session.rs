@@ -5,8 +5,10 @@
 //! session/ticket is never an acknowledgement of successful cleanup.
 use crate::visual_rows::task::{TaskRequest, TaskStep};
 use crate::visual_rows::*;
+use kwil_core_runtime::{NativeExitObservation, NativeExitState, NativeObservationError};
 use kwil_core_text::compare_input::ReadWork;
 use std::{
+    any::Any,
     cell::Cell,
     fmt,
     mem::size_of,
@@ -23,6 +25,9 @@ use std::{
 pub const RELATIVE_CAPACITY: usize = 128;
 const RETIREMENT_SLOTS: usize = 2;
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+#[cfg(test)]
+pub(crate) use tests::settle_final;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelativeKind {
@@ -268,11 +273,14 @@ struct State {
     progress: Option<LayoutProgress>,
     admission_closed: bool,
     terminal_failure: bool,
+    worker_panic: Option<Box<dyn Any + Send>>,
+    join_panic: Option<Box<dyn Any + Send>>,
     terminal_notified: bool,
     intake_waiting_slots: usize,
     relative_admission_waiting: bool,
 }
 struct Shared {
+    native_exit: NativeExitObservation,
     state: Mutex<State>,
     changed: Condvar,
     desired_generation: AtomicU64,
@@ -284,7 +292,7 @@ struct Shared {
     #[cfg(test)]
     completion_gate: Mutex<Option<Arc<tests::CompletionGate>>>,
     #[cfg(test)]
-    settlement_waiting: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    native_teardown: Mutex<Option<Arc<tests::CompletionGate>>>,
     #[cfg(test)]
     work_quantum: Mutex<ReadWork>,
 }
@@ -390,6 +398,13 @@ impl WrapSession {
                 )
             })
             .and_then(|v| v.checked_add(5 * (size_of::<SnapshotSource>() + 2 * size_of::<usize>())))
+            // Shared/Self already include the inline observation and retained
+            // panic headers. Admit native scratch and typed return overlap too.
+            .and_then(|v| v.checked_add(NativeExitObservation::operation_stack_bytes()?))
+            .and_then(|v| v.checked_add(2 * size_of::<Result<(), SettlementFailure>>()))
+            .and_then(|v| v.checked_add(2 * size_of::<Result<(), WrapError>>()))
+            .and_then(|v| v.checked_add(size_of::<std::thread::Result<()>>()))
+            .and_then(|v| v.checked_add(size_of::<std::thread::Result<WrapResult<()>>>()))
             .ok_or(WrapError::Admission("worker metadata overflow"))
     }
     pub fn with_budget(budget: AllocationBudget, wake: impl Fn() + Send + Sync + 'static) -> WrapResult<Self> {
@@ -398,6 +413,7 @@ impl WrapSession {
         }
         let charge = budget.reserve(Self::fixed_allocation_bytes()?)?;
         let shared = Arc::new(Shared {
+            native_exit: NativeExitObservation::new(),
             state: Mutex::new(State {
                 dispatch: None,
                 desired: None,
@@ -409,6 +425,8 @@ impl WrapSession {
                 progress: None,
                 admission_closed: false,
                 terminal_failure: false,
+                worker_panic: None,
+                join_panic: None,
                 terminal_notified: false,
                 intake_waiting_slots: 0,
                 relative_admission_waiting: false,
@@ -423,7 +441,7 @@ impl WrapSession {
             #[cfg(test)]
             completion_gate: Mutex::new(None),
             #[cfg(test)]
-            settlement_waiting: Mutex::new(None),
+            native_teardown: Mutex::new(None),
             #[cfg(test)]
             work_quantum: Mutex::new(ReadWork::new(SOURCE_WINDOW as u64, SOURCE_WINDOW as u64)),
         });
@@ -433,9 +451,17 @@ impl WrapSession {
             .name("kwil-wrap".into())
             .stack_size(WORKER_STACK_BYTES)
             .spawn(move || {
-                let outcome = catch_unwind(AssertUnwindSafe(|| worker_loop(&worker_shared, worker_budget)));
+                // One registration in the ORIGINAL worker, before source work.
+                // Its exact error/partial right stays in this Shared on failure.
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    worker_shared.native_exit.register_current().map_err(WrapError::NativeExit)?;
+                    worker_loop(&worker_shared, worker_budget)
+                }));
                 if !matches!(outcome, Ok(Ok(()))) {
                     let mut state = worker_shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Err(payload) = outcome {
+                        state.worker_panic = Some(payload);
+                    }
                     state.terminal_failure = true;
                     state.admission_closed = true;
                     state.processing = false;
@@ -463,8 +489,13 @@ impl WrapSession {
                         }
                     };
                     let Some(owner) = owner else { break };
-                    if catch_unwind(AssertUnwindSafe(|| drop(owner))).is_err() {
-                        worker_shared.state.lock().unwrap_or_else(|e| e.into_inner()).terminal_failure = true;
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(owner))) {
+                        let mut state = worker_shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.terminal_failure = true;
+                        if state.worker_panic.is_none() {
+                            state.worker_panic = Some(payload);
+                        }
+                        drop(state);
                         notify_terminal_failure(&worker_shared);
                     }
                 }
@@ -479,6 +510,10 @@ impl WrapSession {
                 #[cfg(test)]
                 if let Some(gate) = worker_shared.completion_gate.lock().unwrap().take() {
                     gate.wait();
+                }
+                #[cfg(test)]
+                if let Some(gate) = worker_shared.native_teardown.lock().unwrap().take() {
+                    tests::install_native_teardown(gate);
                 }
             })
             .map_err(WrapError::Io)?;
@@ -499,7 +534,7 @@ impl WrapSession {
         if let Some(head) = self.relative.head() {
             let _ = self.relative.mark_failed(head.id);
         }
-        Some(WrapError::WorkerPanicked)
+        Some(self.shared.native_exit.registration_error().map_or(WrapError::WorkerPanicked, WrapError::NativeExit))
     }
     /// Only Fill/absolute Reveal replace the latest desired request. A relative
     /// request must match the already-begun FIFO head, and never supersedes it.
@@ -818,6 +853,8 @@ impl WrapSession {
             worker: self.worker.take(),
             acknowledged: false,
             sticky_failure: false,
+            native_retired: false,
+            native_retirement_error: None,
         }
     }
 }
@@ -833,6 +870,8 @@ impl Drop for WrapSession {
                 worker: Some(worker),
                 acknowledged: false,
                 sticky_failure: false,
+                native_retired: false,
+                native_retirement_error: None,
             });
         }
         // This cancellation fallback is NOT successful settlement. The host
@@ -1034,10 +1073,15 @@ fn drain_retired(shared: &Arc<Shared>) -> bool {
         state.retirement_reserved[index] = true;
         (index, state.retired[index].take().expect("occupied retirement slot"))
     };
-    let failed = catch_unwind(AssertUnwindSafe(|| drop(owner.1))).is_err();
+    let outcome = catch_unwind(AssertUnwindSafe(|| drop(owner.1)));
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     state.retirement_reserved[owner.0] = false;
-    state.terminal_failure |= failed;
+    if let Err(payload) = outcome {
+        state.terminal_failure = true;
+        if state.worker_panic.is_none() {
+            state.worker_panic = Some(payload);
+        }
+    }
     drop(state);
     shared.changed.notify_all();
     true
@@ -1049,6 +1093,8 @@ pub struct SettlementTicket {
     worker: Option<JoinHandle<()>>,
     acknowledged: bool,
     sticky_failure: bool,
+    native_retired: bool,
+    native_retirement_error: Option<NativeObservationError>,
 }
 pub struct SettlementFailure {
     pub ticket: SettlementTicket,
@@ -1062,11 +1108,25 @@ impl fmt::Debug for SettlementFailure {
 impl SettlementTicket {
     /// OFF UI only. Timeout returns every owner unchanged. A terminal worker
     /// panic remains failed on subsequent attempts; it is not timeout success.
-    pub fn settle(mut self, timeout: Duration) -> Result<(), SettlementFailure> {
+    pub fn settle(self, timeout: Duration) -> Result<(), SettlementFailure> {
+        self.settle_with(timeout, NativeExitObservation::query, NativeExitObservation::retire_after_join)
+    }
+    // Private synchronous effects: no production slot, timer or replacement
+    // worker. Tests can refuse retirement AFTER the real join without native I/O.
+    fn settle_with(
+        mut self,
+        timeout: Duration,
+        query: impl FnOnce(&NativeExitObservation, &JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), SettlementFailure> {
         let started = Instant::now();
-        if self.sticky_failure {
-            return Err(SettlementFailure { ticket: self, error: WrapError::WorkerPanicked });
-        }
+        let deadline = match started.checked_add(timeout) {
+            Some(deadline) => deadline,
+            // Already-joined retries must reach native retirement even when
+            // the supplied duration cannot form a new wait deadline.
+            None if self.worker.is_none() => started,
+            None => return Err(SettlementFailure { ticket: self, error: WrapError::TimedOut }),
+        };
         if !self.acknowledged {
             let shared = self.shared.clone();
             let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1082,38 +1142,36 @@ impl SettlementTicket {
                 return Err(SettlementFailure { ticket: self, error: WrapError::TimedOut });
             }
         }
-        while self.worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
+        if let Some(worker) = self.worker.as_ref() {
+            if Instant::now() >= deadline {
                 return Err(SettlementFailure { ticket: self, error: WrapError::TimedOut });
             }
-            #[cfg(test)]
-            if let Some(waiting) = self.shared.settlement_waiting.lock().unwrap().take() {
-                let _ = waiting.try_send(());
+            match query(&self.shared.native_exit, worker) {
+                Ok(NativeExitState::Pending) => {
+                    return Err(SettlementFailure { ticket: self, error: WrapError::ThreadExitPending });
+                }
+                Err(error) => {
+                    return Err(SettlementFailure { ticket: self, error: WrapError::NativeExit(error) });
+                }
+                Ok(NativeExitState::Exited) => {}
             }
-            // Rust has no portable timed JoinHandle::join or thread-exit
-            // notification. Only an active off-UI settle passively waits here;
-            // the single fixed worker and UI have no timer/polling wakeups.
-            // The SAME monotonic budget covers acknowledgement and actual exit,
-            // including retries which have already observed acknowledgement.
-            let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                drop(state);
+            // A query does not renew the original acknowledgement deadline.
+            if Instant::now() >= deadline {
                 return Err(SettlementFailure { ticket: self, error: WrapError::TimedOut });
             }
-            drop(
-                self.shared
-                    .changed
-                    .wait_timeout(state, remaining.min(Duration::from_millis(1)))
-                    .unwrap_or_else(|e| e.into_inner()),
-            );
+            if let Err(payload) = self.worker.take().expect("native-exited original worker").join() {
+                self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).join_panic = Some(payload);
+                self.sticky_failure = true;
+            }
         }
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            self.sticky_failure = true;
+        // Both successful and panicked joins reach retirement. Retries with no
+        // handle still retire, including sticky panic and zero-timeout retries.
+        if let Err(error) = retire(&self.shared.native_exit) {
+            let first = *self.native_retirement_error.get_or_insert(error);
+            return Err(SettlementFailure { ticket: self, error: WrapError::NativeExit(first) });
         }
+        self.native_retired = true;
+        self.native_retirement_error = None;
         self.sticky_failure |= self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).terminal_failure;
         if self.sticky_failure {
             Err(SettlementFailure { ticket: self, error: WrapError::WorkerPanicked })
@@ -1127,7 +1185,7 @@ impl SettlementTicket {
 }
 impl Drop for SettlementTicket {
     fn drop(&mut self) {
-        if self.worker.is_some() || self.sticky_failure {
+        if self.worker.is_some() || self.sticky_failure || !self.native_retired {
             // Deliberate last-resort retention, analogous to the document
             // depot's undrained-owner rule. This is NOT settlement success or
             // permission to start a replacement worker. A failed settle returns
@@ -1227,7 +1285,7 @@ mod tests {
         assert!(matches!(refused.error, WrapError::WorkerPanicked));
         assert!(Arc::ptr_eq(&refused.request.source, &source));
         drop(refused);
-        let failure = session.stop().settle(Duration::from_secs(2)).unwrap_err();
+        let failure = settle_final(session.stop(), Duration::from_secs(2)).unwrap_err();
         assert!(matches!(failure.error, WrapError::WorkerPanicked));
         let identity = Arc::as_ptr(&failure.ticket.shared);
         let again = failure.ticket.settle(Duration::ZERO).unwrap_err();
@@ -1241,6 +1299,36 @@ mod tests {
         entered: std::sync::mpsc::SyncSender<()>,
         open: Mutex<bool>,
         changed: Condvar,
+        panic: Mutex<Option<Box<dyn Any + Send>>>,
+    }
+
+    struct NativeTeardown(Arc<CompletionGate>);
+    impl Drop for NativeTeardown {
+        fn drop(&mut self) {
+            self.0.wait();
+        }
+    }
+    thread_local! {
+        static NATIVE_TEARDOWN: std::cell::RefCell<Option<NativeTeardown>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn install_native_teardown(gate: Arc<CompletionGate>) {
+        NATIVE_TEARDOWN.with(|slot| *slot.borrow_mut() = Some(NativeTeardown(gate)));
+    }
+
+    // Test-only readiness backoff. One original deadline; only explicit native
+    // Pending retries. Production settlement itself never polls or schedules.
+    pub(crate) fn settle_final(mut ticket: SettlementTicket, timeout: Duration) -> Result<(), SettlementFailure> {
+        let deadline = Instant::now().checked_add(timeout).expect("bounded test deadline");
+        loop {
+            match ticket.settle(deadline.saturating_duration_since(Instant::now())) {
+                Err(failure) if matches!(failure.error, WrapError::ThreadExitPending) => {
+                    ticket = failure.ticket;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    thread::park_timeout(remaining.min(Duration::from_millis(1)));
+                }
+                result => return result,
+            }
+        }
     }
     impl CompletionGate {
         pub(super) fn wait(&self) {
@@ -1248,6 +1336,9 @@ mod tests {
             let open = self.open.lock().unwrap();
             let (open, _) = self.changed.wait_timeout_while(open, Duration::from_secs(2), |open| !*open).unwrap();
             assert!(*open, "bounded post-ack test gate timed out");
+            if let Some(payload) = self.panic.lock().unwrap().take() {
+                std::panic::resume_unwind(payload);
+            }
         }
         fn release(&self) {
             *self.open.lock().unwrap() = true;
@@ -1259,7 +1350,12 @@ mod tests {
     fn wrap_settlement_single_deadline_waits_for_actual_exit_and_retries_exact_ticket() {
         let session = WrapSession::new(|| {}).unwrap();
         let (entered, reached) = std::sync::mpsc::sync_channel(1);
-        let gate = Arc::new(CompletionGate { entered, open: Mutex::new(false), changed: Condvar::new() });
+        let gate = Arc::new(CompletionGate {
+            entered,
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+            panic: Mutex::new(None),
+        });
         *session.shared.completion_gate.lock().unwrap() = Some(gate.clone());
         let ticket = session.stop();
         reached.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1269,29 +1365,140 @@ mod tests {
         let worker = ticket.worker.as_ref().unwrap().thread().id();
         let interval = Duration::from_millis(5);
         let started = Instant::now();
-        let first = ticket.settle(interval).unwrap_err();
-        assert!(matches!(first.error, WrapError::TimedOut));
-        assert!(started.elapsed() >= interval, "ack is not actual completion and must not cause an early timeout");
+        let queries = std::sync::atomic::AtomicUsize::new(0);
+        let first = ticket
+            .settle_with(
+                interval,
+                |observation, handle| {
+                    queries.fetch_add(1, Ordering::Relaxed);
+                    observation.query(handle)
+                },
+                |_| panic!("Pending must retain the registration"),
+            )
+            .unwrap_err();
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
+        assert!(matches!(first.error, WrapError::ThreadExitPending));
+        assert!(started.elapsed() < Duration::from_secs(2), "pending is one explicit observation");
         assert_eq!(Arc::as_ptr(&first.ticket.shared), identity);
         assert_eq!(first.ticket.worker.as_ref().unwrap().thread().id(), worker);
         let started = Instant::now();
         let second = first.ticket.settle(interval).unwrap_err();
-        assert!(matches!(second.error, WrapError::TimedOut));
+        assert!(matches!(second.error, WrapError::ThreadExitPending));
         assert!(
-            started.elapsed() >= interval,
-            "retry with acknowledgement already observed still gets its full deadline"
+            started.elapsed() < Duration::from_secs(2),
+            "acknowledged retry observes native exit once without waiting for its deadline"
         );
         assert_eq!(Arc::as_ptr(&second.ticket.shared), identity);
         assert_eq!(second.ticket.worker.as_ref().unwrap().thread().id(), worker);
-        let (waiting, passive) = std::sync::mpsc::sync_channel(1);
-        *second.ticket.shared.settlement_waiting.lock().unwrap() = Some(waiting);
-        thread::scope(|scope| {
-            // A controlled test caller, never a production replacement worker.
-            let result = scope.spawn(move || second.ticket.settle(Duration::from_secs(2)));
-            passive.recv_timeout(Duration::from_secs(2)).unwrap();
-            gate.release();
-            result.join().unwrap().unwrap();
+        gate.release();
+        settle_final(second.ticket, Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn wrap_native_tls_teardown_is_pending_after_ack_and_keeps_original_worker() {
+        let session = WrapSession::new(|| {}).unwrap();
+        let (entered, reached) = std::sync::mpsc::sync_channel(1);
+        let gate = Arc::new(CompletionGate {
+            entered,
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+            panic: Mutex::new(None),
         });
+        *session.shared.native_teardown.lock().unwrap() = Some(gate.clone());
+        let ticket = session.stop();
+        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        let identity = Arc::as_ptr(&ticket.shared);
+        let original = ticket.worker.as_ref().unwrap().thread().id();
+        let queries = std::sync::atomic::AtomicUsize::new(0);
+        let result = ticket.settle_with(
+            Duration::from_secs(2),
+            |observation, handle| {
+                queries.fetch_add(1, Ordering::Relaxed);
+                observation.query(handle)
+            },
+            |_| panic!("TLS Pending cannot retire"),
+        );
+        gate.release();
+        let failure = result.unwrap_err();
+        assert!(matches!(failure.error, WrapError::ThreadExitPending));
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
+        assert_eq!(Arc::as_ptr(&failure.ticket.shared), identity);
+        assert_eq!(failure.ticket.worker.as_ref().unwrap().thread().id(), original);
+        assert!(failure.ticket.shared.acknowledged.load(Ordering::Acquire));
+        settle_final(failure.ticket, Duration::from_secs(2)).unwrap();
+    }
+
+    struct PanicOwner(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for PanicOwner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn wrap_join_panic_retirement_refusal_keeps_payload_and_first_error_without_handle() {
+        let session = WrapSession::new(|| {}).unwrap();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered, reached) = std::sync::mpsc::sync_channel(1);
+        let gate = Arc::new(CompletionGate {
+            entered,
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+            panic: Mutex::new(Some(Box::new(PanicOwner(drops.clone())))),
+        });
+        *session.shared.completion_gate.lock().unwrap() = Some(gate.clone());
+        let mut ticket = session.stop();
+        reached.recv_timeout(Duration::from_secs(2)).unwrap();
+        gate.release();
+        let identity = Arc::as_ptr(&ticket.shared);
+        let error = NativeObservationError::MachRetire { code: 37 };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let failure = loop {
+            match ticket.settle_with(
+                deadline.saturating_duration_since(Instant::now()),
+                NativeExitObservation::query,
+                |_| Err(error),
+            ) {
+                Err(failure) if matches!(failure.error, WrapError::ThreadExitPending) => {
+                    ticket = failure.ticket;
+                    thread::park_timeout(
+                        deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(1)),
+                    );
+                }
+                result => break result.unwrap_err(),
+            }
+        };
+        assert!(matches!(failure.error, WrapError::NativeExit(value) if value == error));
+        assert!(failure.ticket.worker.is_none());
+        let payload_identity = {
+            let state = failure.ticket.shared.state.lock().unwrap();
+            let payload = state.join_panic.as_ref().unwrap().downcast_ref::<PanicOwner>().unwrap();
+            assert!(Arc::ptr_eq(&payload.0, &drops));
+            payload as *const PanicOwner
+        };
+        let again = failure
+            .ticket
+            .settle_with(
+                Duration::ZERO,
+                |_, _| panic!("consumed handle queried"),
+                |_| Err(NativeObservationError::MachRetire { code: 99 }),
+            )
+            .unwrap_err();
+        assert!(matches!(again.error, WrapError::NativeExit(value) if value == error));
+        assert_eq!(Arc::as_ptr(&again.ticket.shared), identity);
+        assert_eq!(
+            again.ticket.shared.state.lock().unwrap().join_panic.as_ref().unwrap().downcast_ref::<PanicOwner>().unwrap()
+                as *const PanicOwner,
+            payload_identity
+        );
+        let final_failure = again.ticket.settle(Duration::ZERO).unwrap_err();
+        assert!(matches!(final_failure.error, WrapError::WorkerPanicked));
+        assert!(final_failure.ticket.native_retired);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        let shared = Arc::downgrade(&final_failure.ticket.shared);
+        drop(final_failure);
+        assert!(shared.upgrade().is_some(), "failed-owner Drop keeps the original Shared");
+        assert_eq!(drops.load(Ordering::Relaxed), 0, "Drop must not destroy the original panic owner");
     }
 
     #[test]
@@ -1336,7 +1543,7 @@ mod tests {
         assert_eq!(session.relative.len(), 1);
         assert_eq!(session.relative.mutation_gate(), MutationGate::RefusedPending);
         drop(refused);
-        let failure = session.stop().settle(Duration::from_secs(2)).unwrap_err();
+        let failure = settle_final(session.stop(), Duration::from_secs(2)).unwrap_err();
         assert!(
             matches!(failure.error, WrapError::WorkerPanicked),
             "exhausted cancellation is a sticky terminal failure"
@@ -1383,7 +1590,7 @@ mod tests {
             _ => panic!("retirement owner changed"),
         }
         let ticket = session.stop();
-        ticket.settle(Duration::from_secs(2)).unwrap();
+        settle_final(ticket, Duration::from_secs(2)).unwrap();
     }
     #[test]
     fn wrap_terminal_worker_failure_retains_same_ticket_and_never_becomes_success() {
@@ -1402,7 +1609,7 @@ mod tests {
         };
         assert!(matches!(session.submit(request), ControlFlow::Continue(())));
         wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let first = match session.stop().settle(Duration::from_secs(2)) {
+        let first = match settle_final(session.stop(), Duration::from_secs(2)) {
             Err(failure) => failure,
             Ok(()) => panic!("worker failure became success"),
         };
@@ -1550,7 +1757,7 @@ mod tests {
                 session.published_relative(id, fence).unwrap();
             }
             assert!(matches!(session.retire_owner(RetiredOwner::Update(update)), ControlFlow::Continue(())));
-            session.stop().settle(Duration::from_secs(2)).unwrap();
+            settle_final(session.stop(), Duration::from_secs(2)).unwrap();
         }
     }
 }

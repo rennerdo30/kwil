@@ -24,7 +24,10 @@ use std::{
     fmt,
     mem::size_of,
     ops::{ControlFlow, Range},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -211,6 +214,8 @@ struct ActiveRelative {
 }
 
 pub struct WrapHost {
+    workspace_identity: u64,
+    workspace_owner: AtomicU64,
     session: WrapSession,
     display: Option<Box<VisualEditorState>>,
     context: Option<WrapHostContext>,
@@ -225,20 +230,47 @@ pub struct WrapHost {
     _charge: AllocationCharge,
 }
 
+/// A registration claim is provisional until Workspace publishes its matching
+/// obligation. Failed admission releases only this claim, never another owner.
+pub(crate) struct WorkspaceClaim<'a> {
+    host: &'a WrapHost,
+    owner: u64,
+    committed: bool,
+}
+impl WorkspaceClaim<'_> {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for WorkspaceClaim<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.host.workspace_owner.compare_exchange(self.owner, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
 impl WrapHost {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> WrapResult<Self> {
         Self::with_budget(AllocationBudget::default(), wake)
     }
     pub fn with_budget(budget: AllocationBudget, wake: impl Fn() + Send + Sync + 'static) -> WrapResult<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let workspace_identity = NEXT
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .map_err(|_| WrapError::Admission("wrap host identity exhausted"))?;
         // Fixed scratch covers stack/Box transfers, including refused results.
         let charge = budget.reserve(
             size_of::<Self>()
                 + size_of::<WrapHostSettlementTicket>()
                 + 2 * size_of::<ResolvedNavigation>()
-                + size_of::<LayoutPage>(),
+                + size_of::<LayoutPage>()
+                + size_of::<WorkspaceClaim<'_>>(),
         )?;
         let session = WrapSession::with_budget(budget, wake)?;
         Ok(Self {
+            workspace_identity,
+            workspace_owner: AtomicU64::new(0),
             session,
             display: None,
             context: None,
@@ -255,6 +287,26 @@ impl WrapHost {
     }
     pub fn budget(&self) -> &AllocationBudget {
         self.session.budget()
+    }
+    pub(crate) fn workspace_identity(&self) -> u64 {
+        self.workspace_identity
+    }
+    pub(crate) fn claim_workspace(&self, owner: u64) -> WrapResult<WorkspaceClaim<'_>> {
+        if owner == 0 {
+            return Err(WrapError::Invalid("zero workspace owner identity"));
+        }
+        self.workspace_owner
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| WrapError::Busy)?;
+        Ok(WorkspaceClaim { host: self, owner, committed: false })
+    }
+    pub(crate) fn workspace_owned_by(&self, owner: u64) -> bool {
+        owner != 0 && self.workspace_owner.load(Ordering::Acquire) == owner
+    }
+    /// Transfer the COMPLETE refused source/request to the existing fixed
+    /// worker. Saturation/closure returns the same owner without allocation.
+    pub fn retire_owner(&self, owner: RetiredOwner) -> ControlFlow<RetiredOwner, ()> {
+        self.session.retire_owner(owner)
     }
     pub fn availability(&self) -> WrapHostAvailability {
         if self.terminal { WrapHostAvailability::Failed } else { self.availability }

@@ -347,7 +347,7 @@ fn journal_scheduler_held_ready_preserves_cached_raw_lineage_and_undo_receipts()
     assert!(worker.try_submit(DocumentRequest::SaveRaw { document: DocumentId(7), request }).is_ok());
     loop {
         if let DocumentResult::Saved { result, .. } = next_result(&results, deadline) {
-            editor.finish_save(result).unwrap();
+            editor.finish_save_for_test(result).unwrap();
             break;
         }
     }

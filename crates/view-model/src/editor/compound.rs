@@ -7,6 +7,9 @@ pub(super) struct CompoundEdit {
     shapes: Vec<Shape>,
 }
 impl CompoundEdit {
+    pub(super) fn document_metadata_bytes(&self) -> io::Result<usize> {
+        metadata_capacity::<Shape>(self.shapes.capacity())
+    }
     /// Fold intermediate-coordinate replacements into original-coordinate net
     /// spans. Payloads remain ranges in the final snapshot, never copied text.
     pub fn add(&mut self, edits: &[Edit]) -> io::Result<()> {
@@ -68,6 +71,42 @@ impl CompoundEdit {
     }
 }
 
+#[cfg(test)]
+mod document_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_restores_cached_register_bytes_for_the_actual_cloned_map() {
+        let mut editor = Editor::new(Document::new());
+        let mut data = ClipboardData::text(b"kept").unwrap();
+        data.ranges.reserve(64);
+        editor.install_register('a', data).unwrap();
+        let result = editor.compound_edit(|editor| {
+            editor.install_register('a', ClipboardData::text(b"changed")?)?;
+            editor.install_register('b', ClipboardData::text(b"discarded")?)?;
+            Err(io::Error::other("controlled rollback"))
+        });
+        assert!(result.is_err());
+        assert_eq!(editor.registers.len(), 1);
+        let mut bytes = Vec::new();
+        editor.registers.get(&'a').unwrap().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"kept");
+        assert_eq!(editor.register_metadata_bytes, register_map_metadata_bytes(&editor.registers).unwrap());
+        assert!(editor.document_metadata_bytes().is_ok());
+    }
+
+    #[test]
+    fn compound_scalar_reports_capacity_without_consuming_shapes() {
+        let mut compound = CompoundEdit::default();
+        compound.shapes.reserve(32);
+        compound.shapes.push(Shape { range: 0..0, inserted: 1 });
+        let capacity = compound.shapes.capacity();
+        assert_eq!(compound.document_metadata_bytes().unwrap(), capacity * std::mem::size_of::<Shape>());
+        assert_eq!(compound.shapes.len(), 1);
+        assert_eq!(compound.shapes.capacity(), capacity);
+    }
+}
+
 impl Editor {
     pub(super) fn compound_edit(
         &mut self,
@@ -82,6 +121,7 @@ impl Editor {
         let top = self.top;
         let mode = self.mode;
         let registers = self.registers.clone();
+        let register_metadata_bytes = register_map_metadata_bytes(&registers)?;
         let repeat = self.repeat.clone();
         let prefix = self.insert_prefix.clone();
         let inserted = self.inserted.clone();
@@ -105,6 +145,7 @@ impl Editor {
                 self.top = top;
                 self.mode = mode;
                 self.registers = registers;
+                self.register_metadata_bytes = register_metadata_bytes;
                 self.repeat = repeat;
                 self.insert_prefix = prefix;
                 self.inserted = inserted;
@@ -247,7 +288,7 @@ mod tests {
             .compound_edit(|editor| {
                 editor.insert_text("changed", Duration::ZERO)?;
                 editor.mode = Mode::Insert;
-                editor.registers.insert('a', ClipboardData::text(b"lost")?);
+                editor.install_register('a', ClipboardData::text(b"lost")?)?;
                 editor.repeat = Some(Repeat::Insert(b"lost".to_vec()));
                 Err(io::Error::other("injected second operation failure"))
             })
@@ -289,7 +330,7 @@ mod tests {
                 editor.apply(edits, None, false)?;
                 assert_eq!(editor.compound.as_ref().unwrap().shapes.len(), MAX_CURSORS);
                 editor.mode = Mode::Insert;
-                editor.registers.insert('a', ClipboardData::text(b"lost")?);
+                editor.install_register('a', ClipboardData::text(b"lost")?)?;
                 editor.repeat = Some(Repeat::Insert(b"lost".to_vec()));
                 let end = editor.document.buffer.len();
                 editor.apply(vec![Edit::bytes(end..end, b"overflow")], None, true)?;

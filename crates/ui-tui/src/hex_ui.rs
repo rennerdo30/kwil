@@ -393,7 +393,7 @@ mod tests {
         search: crate::search_ui::SearchHost,
         keys: KeymapEngine,
         receiver: mpsc::Receiver<Msg>,
-        stopped: mpsc::Receiver<Result<(), String>>,
+        document: crate::DocumentLane,
         root: PathBuf,
         trail: VecDeque<String>,
     }
@@ -401,16 +401,14 @@ mod tests {
         fn new() -> Self {
             let root = crate::test_support::directory("kwil-tui-hex-host").unwrap();
             let (tx, receiver) = mpsc::channel();
-            let (stop_tx, stopped) = mpsc::sync_channel(1);
+            let budget = crate::AllocationBudget::default();
+            let mut document = crate::DocumentLane::new(&budget).unwrap();
             let mut workspace = Workspace::new(kwil_view_model::View::new(None)).unwrap();
             workspace.set_rows(3);
-            workspace
-                .start_document_worker_at(Some(root.join("recovery")), move |result| {
-                    if let kwil_view_model::document_worker::DocumentResult::Stopped(result) = &result {
-                        let _ = stop_tx.try_send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
-                    }
-                    let _ = tx.send(Msg::Document(result));
-                })
+            document
+                .started(workspace.start_bounded_document_worker_at(Some(root.join("recovery")), &budget, move || {
+                    tx.send(Msg::DocumentReady).map_err(|_| std::io::Error::other("hex fixture wake closed"))
+                }))
                 .unwrap();
             let bindings = [
                 kwil_core_commands::Binding {
@@ -431,7 +429,7 @@ mod tests {
                 search: Default::default(),
                 keys: KeymapEngine::new(Preset::VsCode, &bindings).unwrap(),
                 receiver,
-                stopped,
+                document,
                 root,
                 trail: VecDeque::new(),
             };
@@ -441,7 +439,11 @@ mod tests {
         fn dispatch(&mut self, message: Msg) {
             self.record(format!("worker {}", message_summary(&message)));
             match message {
-                Msg::Document(result) => self.search.document_result(&mut self.workspace, &mut self.keys, result),
+                Msg::DocumentReady => {
+                    let info = self.document.transport.as_ref().unwrap().result_info();
+                    self.record(format!("document slot {info:?}"));
+                    self.document.ready(&mut self.workspace, &mut self.search, &mut self.keys).unwrap();
+                }
                 Msg::SearchReady => {
                     self.search.ready(&mut self.workspace, &mut self.keys);
                 }
@@ -563,7 +565,7 @@ mod tests {
         fn finish(self) {
             let root = self.root.clone();
             std::thread::spawn(move || {
-                crate::shutdown_search_workspace(self.workspace, self.search, self.receiver, self.stopped, true)
+                crate::shutdown_bounded_workspace(self.workspace, self.search, self.receiver, self.document, None, None)
             })
             .join()
             .unwrap()
@@ -574,58 +576,9 @@ mod tests {
         }
     }
     fn message_summary(message: &Msg) -> String {
-        use kwil_view_model::document_worker::DocumentResult as D;
-        let result =
-            |result: Result<(), &std::io::Error>| result.map_or_else(|error| error.to_string(), |()| "ok".into());
-        match message {
-            Msg::Document(D::RawPreview { document, revision, page }) => format!(
-                "RawPreview tab={} rev={} top={} rows={}",
-                document.0,
-                revision,
-                page.request.top,
-                page.rows.len()
-            ),
-            Msg::Document(D::RawReopened { document, generation, result: value, .. }) => {
-                format!("RawReopened tab={} gen={} {}", document.0, generation, result(value.as_ref().map(|_| ())))
-            }
-            Msg::Document(D::HexPage { document, request, result: value, .. }) => format!(
-                "HexPage tab={} top={} gen={} {}",
-                document.0,
-                request.top,
-                request.generation,
-                result(value.as_ref().map(|_| ()))
-            ),
-            Msg::Document(D::HexEdited { document, completion, .. }) => format!(
-                "HexEdited tab={} op={} epoch={} rev={}->{} {:?}",
-                document.0,
-                completion.operation,
-                completion.input_epoch,
-                completion.before.revision,
-                completion.after.revision,
-                completion.result
-            ),
-            Msg::Document(D::JournalQueued { document, sequence, result: value, .. }) => {
-                format!("JournalQueued tab={} seq={} {}", document.0, sequence, result(value.as_ref().map(|_| ())))
-            }
-            Msg::Document(D::JournalDurable { document, sequence, result: value, .. }) => {
-                format!("JournalDurable tab={} seq={} {}", document.0, sequence, result(value.as_ref().map(|_| ())))
-            }
-            Msg::Document(D::JournalClosed { document, result: value }) => {
-                format!("JournalClosed tab={} {}", document.0, result(value.as_ref().map(|_| ())))
-            }
-            Msg::Document(D::Prepared(value)) => format!("Prepared {}", result(value.as_ref().map(|_| ()))),
-            Msg::Document(D::Indexed { document, result: value, .. }) => {
-                format!("Indexed tab={} {}", document.0, result(value.as_ref().map(|_| ())))
-            }
-            Msg::Document(D::CapacityAvailable) => "CapacityAvailable".into(),
-            Msg::Document(D::SessionCheckpointDue) => "SessionCheckpointDue".into(),
-            Msg::Document(D::Persisted(value)) => format!("Persisted {}", result(value.as_ref().map(|_| ()))),
-            Msg::Document(D::Stopped(value)) => format!("Stopped {}", result(value.as_ref().map(|_| ()))),
-            Msg::Document(value) => format!("{:?}", std::mem::discriminant(value)),
-            _ => format!("{:?}", std::mem::discriminant(message)),
-        }
+        // Diagnostic history stores discriminants/scalar ResultInfo only.
+        format!("{:?}", std::mem::discriminant(message))
     }
-
     #[test]
     fn actual_tui_hex_dispatch_edit_loan_keeps_cache_blocks_text_and_shares_undo_raw_save() {
         let mut host = Host::new();

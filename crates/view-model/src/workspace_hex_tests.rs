@@ -45,7 +45,7 @@ fn drive(workspace: &mut Workspace, receiver: &mpsc::Receiver<DocumentResult>, d
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done(workspace) {
         let remaining = deadline.checked_duration_since(Instant::now()).expect("bounded workspace hex worker deadline");
-        workspace.document_result(receiver.recv_timeout(remaining).expect("workspace hex worker completion"));
+        workspace.test_document_result(receiver.recv_timeout(remaining).expect("workspace hex worker completion"));
     }
 }
 fn real_workspace(fixture: &Fixture) -> (Workspace, mpsc::Receiver<DocumentResult>) {
@@ -69,7 +69,7 @@ fn stop(mut workspace: Workspace, receiver: &mpsc::Receiver<DocumentResult>) {
                 workspace.active_id(), workspace.files.queue.len(), workspace.hex.loans.len(), workspace.hex.opening(), workspace.file_saves_pending(), workspace.files.preparing,
                 workspace.files.metadata_durable, workspace.files.persist_pending, workspace.files.persist_inflight, workspace.recovery_notice(), workspace.files.observed, workspace.files.durable, workspace.files.journal_failed)
         });
-        workspace.document_result(result);
+        workspace.test_document_result(result);
     }
     drop(workspace);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -278,7 +278,8 @@ fn workspace_hex_page_loan_caches_scroll_coalesces_latest_and_routes_inactive_re
     assert_eq!(input(&mut workspace, hex::Input::Paste("FF")).unwrap_err().kind(), io::ErrorKind::WouldBlock);
     let page = hex::read_page(&editor.document().snapshot(), request, || false).unwrap();
     let other = workspace.open(View::new(None)).unwrap();
-    let damage = workspace.document_result(DocumentResult::HexPage { document: id, editor, request, result: Ok(page) });
+    let damage =
+        workspace.test_document_result(DocumentResult::HexPage { document: id, editor, request, result: Ok(page) });
     assert_eq!(damage, Damage::default(), "inactive hex completion cannot damage another tab body");
     assert_eq!(workspace.active_id(), other);
     assert_eq!(bytes(&workspace, other), b"");
@@ -291,7 +292,7 @@ fn workspace_hex_page_loan_caches_scroll_coalesces_latest_and_routes_inactive_re
     let (editor, request) = latest.expect("latest page retried after old loan returned");
     assert_eq!(request.top, 2);
     let page = hex::read_page(&editor.document().snapshot(), request, || false).unwrap();
-    workspace.document_result(DocumentResult::HexPage { document: id, editor, request, result: Ok(page) });
+    workspace.test_document_result(DocumentResult::HexPage { document: id, editor, request, result: Ok(page) });
     assert!(workspace.views[&id].editor().is_some());
     assert!(workspace.hex.tabs[&id].session.row(Some(first_source), 0).is_some());
 }
@@ -339,7 +340,7 @@ fn workspace_hex_reopen_waits_for_journal_and_failed_close_keeps_editor_history(
     );
     assert!(receiver.try_recv().is_err(), "raw reopen must await successful JournalClosed");
     assert!(workspace.views[&id].editor().is_some(), "journal wait holds editor without mutation");
-    workspace.document_result(DocumentResult::JournalClosed {
+    workspace.test_document_result(DocumentResult::JournalClosed {
         document: id,
         result: Err(io::Error::other("fixture journal refusal")),
     });
@@ -374,7 +375,7 @@ fn workspace_hex_shutdown_backpressure_retries_exact_editor_and_keeps_cached_bod
     assert_eq!(session.view().pending_high_nibble(), None);
     assert_eq!(workspace.files.queue.len(), 1);
     assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
-    workspace.document_result(DocumentResult::CapacityAvailable);
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
     assert!(workspace.prepare_hex_shutdown());
     let DocumentRequest::DiscardHex { document, editor } = receiver.try_recv().unwrap() else {
         panic!("exact editor disposal request")

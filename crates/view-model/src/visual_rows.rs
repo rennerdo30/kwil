@@ -54,6 +54,8 @@ pub enum WrapError {
     Busy,
     Closed,
     TimedOut,
+    ThreadExitPending,
+    NativeExit(kwil_core_runtime::NativeObservationError),
     WorkerPanicked,
 }
 impl fmt::Display for WrapError {

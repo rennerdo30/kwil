@@ -22,13 +22,15 @@ pub mod settings_panels;
 pub mod settings_session;
 pub mod visual_rows;
 mod workspace;
+pub use workspace::workspace_document;
+pub use workspace::workspace_wrap;
 pub mod wrap_host;
 pub mod wrap_session;
 #[cfg(test)]
 mod wrap_tests;
 pub use workspace::{
     EditorInputTicket, FilePrompt, FilePromptKind, NativeFilePrompt, TabAction, TabArea, TabGeometry, TabMetrics,
-    TabSlot, Workspace,
+    TabSlot, Workspace, WorkspaceInitRefusal,
 };
 pub mod document_worker;
 pub use kwil_core_workspace::session::DocumentId as SessionDocumentId;
@@ -42,6 +44,8 @@ pub use editor::visual::{
     RetiredVisualState, VisualEditorState,
 };
 pub use editor::{Clipboard, ClipboardData, CommandArgs, CommandResult, CommandStatus, Cursor, Editor, Motion};
+pub use editor::{EditObserverRefusal, EditObserverRefusalReason};
+pub use editor::{SaveCompletionRefusal, SaveCompletionRefusalReason};
 
 /// A message from a worker thread for the status bar (update notices,
 /// errors). Frontends turn it into a wake-up of their event loop.

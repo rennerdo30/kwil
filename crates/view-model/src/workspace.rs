@@ -1,12 +1,12 @@
 //! Open views retain their own cursor, undo history and viewport. Worker
 //! completions address a document ID, never whichever tab happens to be active.
 use crate::document_worker::{DocumentRequest, DocumentResult, DocumentWorker};
-use crate::{CommandStatus, Damage, Editor, View};
+use crate::{CommandStatus, Damage, Editor, View, ViewBodyPolicy};
 use kwil_core_workspace::session::{DocumentId, Session};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
-    ops::{Deref, DerefMut},
+    ops::{ControlFlow, Deref, DerefMut},
     path::PathBuf,
 };
 
@@ -14,6 +14,13 @@ use std::{
 mod workspace_hex;
 use crate::document_worker::binary_offer::{Choice as BinaryChoice, Offer as BinaryOffer, Ticket as BinaryTicket};
 use workspace_hex::HexFlow;
+
+#[path = "workspace_wrap.rs"]
+pub mod workspace_wrap;
+use workspace_wrap::WorkspaceWrapState;
+
+#[path = "workspace_document.rs"]
+pub mod workspace_document;
 
 enum BinaryPhase {
     Opening,
@@ -127,6 +134,51 @@ pub struct FilePrompt {
 struct SaveFlight {
     revision: u64,
     path: Option<PathBuf>,
+    source_epoch: u64,
+    resume_generation: u64,
+    resume: SaveResumePhase,
+    preparation_error: Option<io::Error>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveResumePhase {
+    Local,
+    Needed,
+    Queued,
+    Transport,
+    Exhausted,
+}
+
+impl SaveFlight {
+    fn resume_key(&self, document: DocumentId) -> crate::document_worker::SaveResumeKey {
+        crate::document_worker::SaveResumeKey {
+            document,
+            source_epoch: self.source_epoch,
+            revision: self.revision,
+            generation: self.resume_generation,
+        }
+    }
+
+    /// Only scalar scheduling state changes here; Editor retains the saved owner.
+    fn retain_stale_preparation(&mut self, source_epoch: u64, generation: &mut u64, error: io::Error) {
+        if self.preparation_error.is_none() {
+            self.preparation_error = Some(error);
+        }
+        if self.resume != SaveResumePhase::Local {
+            return;
+        }
+        if self.source_epoch != source_epoch {
+            self.resume = SaveResumePhase::Exhausted;
+            return;
+        }
+        if let Some(next) = generation.checked_add(1) {
+            *generation = next;
+            self.resume_generation = next;
+            self.resume = SaveResumePhase::Needed;
+        } else {
+            self.resume = SaveResumePhase::Exhausted;
+        }
+    }
 }
 
 struct EditorLoan {
@@ -136,12 +188,22 @@ struct EditorLoan {
 
 #[derive(Default)]
 struct FileFlow {
+    live_document_metadata: Option<crate::visual_rows::MetadataReservation>,
+    document_budget: Option<crate::visual_rows::AllocationBudget>,
+    // Bound shutdown keeps the actual sender alive, but ordinary pumps must
+    // leave accepted requests in their existing queue for the private permit.
+    document_shutdown: bool,
+    bounded_document: bool,
+    document_started: bool,
+    #[cfg(test)]
+    next_document_commit_fault: workspace_document::commit::CommitFault,
     loans: HashMap<DocumentId, EditorLoan>,
     next_loan: u64,
     replacement_journals: HashMap<DocumentId, u64>,
     worker: Option<DocumentWorker>,
     queue: VecDeque<DocumentRequest>,
     saves: HashMap<DocumentId, SaveFlight>,
+    next_save_resume: u64,
     failed_opens: HashSet<DocumentId>,
     save_all: VecDeque<DocumentId>,
     close: VecDeque<DocumentId>,
@@ -155,6 +217,7 @@ struct FileFlow {
     persist_pending: bool,
     persist_timer: bool,
     deferred_recovery: Option<Box<crate::document_worker::PreparedWorkspace>>,
+    deferred_recovery_kind: Option<workspace_document::RecoveryDeferKind>,
     observed: HashMap<DocumentId, (u64, u64)>,
     next_observer: u64,
     seeded: HashSet<DocumentId>,
@@ -181,6 +244,7 @@ pub struct EditorInputTicket {
 }
 
 pub struct Workspace {
+    wrap: WorkspaceWrapState,
     hex: HexFlow,
     binary: BinaryFlow,
     input_epoch: u64,
@@ -193,9 +257,68 @@ pub struct Workspace {
     files: FileFlow,
 }
 
+/// Constructor refusal retains the one incoming source in `input` before
+/// publication, or in `workspace` after publication, with the original error.
+#[must_use = "retain the original input and partial Workspace for off-UI recovery or retirement"]
+pub struct WorkspaceInitRefusal {
+    pub input: Option<View>,
+    pub workspace: Workspace,
+    pub error: io::Error,
+}
+impl std::fmt::Debug for WorkspaceInitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceInitRefusal")
+            .field("input_retained", &self.input.is_some())
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Workspace {
+    /// Test-only identity invalidation while the original transport slot owns a
+    /// prepared save. Production editor access retains its document-busy gate.
+    #[cfg(test)]
+    pub(crate) fn editor_mut_for_document_transport_test(&mut self) -> Option<&mut Editor> {
+        let id = self.active_id();
+        self.views.get_mut(&id)?.editor.as_mut()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_document_worker_for_transport_test(
+        &mut self,
+        worker: Option<DocumentWorker>,
+    ) -> Option<DocumentWorker> {
+        std::mem::replace(&mut self.files.worker, worker)
+    }
+
+    /// New publications cannot inherit another tab's body owner. Cache only
+    /// the admitted wrap obligation and accepted settings; the frontend still
+    /// supplies the actual raw/preview/log/modal body policy before dispatch.
+    fn intended_wrap_publication(&self) -> bool {
+        !self.wrap_cleanup_ready() && self.editor_settings.as_ref().is_some_and(|settings| settings.editor.word_wrap)
+    }
     pub fn new(view: View) -> io::Result<Self> {
-        let mut workspace = Self {
+        match Self::try_new(view) {
+            ControlFlow::Continue(workspace) => Ok(workspace),
+            ControlFlow::Break(refusal) => {
+                // Transitional fatal compatibility: io::Result cannot return
+                // the rejected source owners. Quarantine them rather than run
+                // source destruction on UI. This leak is NOT cleanup; owned
+                // frontend entries use try_new and retain the exact refusal.
+                let WorkspaceInitRefusal { input, workspace, error } = refusal;
+                std::mem::forget((input, workspace));
+                Err(error)
+            }
+        }
+    }
+
+    pub fn try_new(view: View) -> ControlFlow<WorkspaceInitRefusal, Self> {
+        Self::empty().initialize(view)
+    }
+
+    fn empty() -> Self {
+        Self {
+            wrap: WorkspaceWrapState::default(),
             hex: HexFlow::default(),
             binary: BinaryFlow::default(),
             input_epoch: 0,
@@ -204,9 +327,18 @@ impl Workspace {
             views: HashMap::new(),
             closed_views: HashMap::new(),
             files: FileFlow::default(),
-        };
-        workspace.open(view)?;
-        Ok(workspace)
+        }
+    }
+
+    fn initialize(mut self, view: View) -> ControlFlow<WorkspaceInitRefusal, Self> {
+        let mut input = Some(view);
+        match self.open_pending(&mut input) {
+            Ok(_) => {
+                debug_assert!(input.is_none(), "a new Workspace publishes its one incoming view");
+                ControlFlow::Continue(self)
+            }
+            Err(error) => ControlFlow::Break(WorkspaceInitRefusal { input, workspace: self, error }),
+        }
     }
 
     pub fn session(&self) -> &Session {
@@ -261,6 +393,7 @@ impl Workspace {
     /// Other tabs remain available. No new event or export is required.
     pub fn document_busy(&self, id: DocumentId) -> bool {
         self.files.loans.contains_key(&id)
+            || self.files.saves.get(&id).is_some_and(|flight| flight.resume == SaveResumePhase::Transport)
             || self.hex.busy(id)
             || self.binary.flights.get(&id).is_some_and(|flight| !matches!(flight.phase, BinaryPhase::Offered(_)))
     }
@@ -279,6 +412,11 @@ impl Workspace {
 
     /// O(1) UI admission. Recipe validation, iteration and edits run on the
     /// existing fixed worker; queue rejection restores the exact editor.
+    /// Cached identity of an accepted editor loan; this never acquires a source.
+    pub fn search_replacement_operation(&self, key: kwil_core_search::worker::SearchKey) -> Option<u64> {
+        self.files.loans.get(&DocumentId(key.document_id)).filter(|loan| loan.key == key).map(|loan| loan.operation)
+    }
+
     pub fn submit_search_replacement(&mut self, recipe: kwil_core_search::worker::ReplaceRecipe) -> io::Result<()> {
         let id = DocumentId(recipe.key.document_id);
         if self.hex_owns_document(id) {
@@ -340,6 +478,7 @@ impl Workspace {
     /// Keep the policy for editors installed by later open/recovery results.
     /// Frontends retain responsibility for settings receipts and visual damage.
     pub fn set_editor_settings(&mut self, settings: &kwil_core_commands::Settings) {
+        self.wrap.settings_changed();
         self.editor_settings = Some(settings.clone());
         for view in self.views.values_mut().chain(self.closed_views.values_mut()) {
             if let Some(editor) = view.editor_mut() {
@@ -463,7 +602,22 @@ impl Workspace {
         Ok(())
     }
 
-    pub fn open(&mut self, mut view: View) -> io::Result<DocumentId> {
+    pub fn open(&mut self, view: View) -> io::Result<DocumentId> {
+        // Keep the existing open compatibility behavior, including an unused
+        // duplicate input. Constructor callers retain it through initialize.
+        self.open_pending(&mut Some(view))
+    }
+
+    fn open_pending(&mut self, input: &mut Option<View>) -> io::Result<DocumentId> {
+        let view = input.as_mut().expect("pending view belongs to the caller");
+        self.wrap.path_changed();
+        // from_preview supplies an immutable worker cache with its file. Loan
+        // and checked-open sentinels have no such incoming source contract.
+        let worker_preview = view.editor.is_none()
+            && view.file.is_some()
+            && view.preview.is_some()
+            && view.body_policy() == ViewBodyPolicy::LogicalLines;
+        prepare_view_publication(view, self.intended_wrap_publication(), worker_preview);
         if self.session.active().is_some() {
             self.sync_active();
         }
@@ -501,7 +655,7 @@ impl Workspace {
             }
         }
         // Reopening an already-open path activates its existing unsaved view.
-        self.views.entry(id).or_insert(view);
+        self.views.entry(id).or_insert_with(|| input.take().expect("publish the original pending view"));
         if self.views[&id].editor().is_none()
             && self.views[&id].file().is_some()
             && let Some(path) = self.views[&id].path.clone()
@@ -662,6 +816,7 @@ impl Workspace {
     }
 
     fn reopen_closed(&mut self, keep_path: bool) -> io::Result<()> {
+        let intended_wrap = self.intended_wrap_publication();
         self.check_reopen_destination()?;
         if let Some(tab) = self.session.closed().front() {
             let cached = self.closed_views.get(&tab.id);
@@ -677,6 +832,7 @@ impl Workspace {
             }
         }
         if let Some(id) = self.session.reopen_closed()? {
+            self.wrap.path_changed();
             if !keep_path {
                 let tab = self.session.tab_mut(id).unwrap();
                 if let Some(path) = tab.path.take() {
@@ -695,7 +851,8 @@ impl Workspace {
             // Publish before recovery/index requests can pump more saves. The
             // worker also retains its provisional reservation until release.
             self.refresh_save_destinations();
-            if let Some(view) = self.closed_views.remove(&id) {
+            if let Some(mut view) = self.closed_views.remove(&id) {
+                prepare_view_publication(&mut view, intended_wrap, false);
                 self.views.insert(id, view);
                 if self.views[&id].editor().is_none() {
                     let tab = self.session.tabs().iter().find(|tab| tab.id == id).unwrap().clone();
@@ -716,7 +873,10 @@ impl Workspace {
                 let mut view = View::new(None);
                 view.path = tab.path.clone();
                 view.editor = None;
-                view.top = tab.first_visible_line;
+                prepare_view_publication(&mut view, intended_wrap, false);
+                if view.body_policy() == ViewBodyPolicy::LogicalLines {
+                    view.top = tab.first_visible_line;
+                }
                 view.set_horizontal_window(tab.first_byte_column, 64 << 10);
                 view.set_notice("Recovering closed tabâ€¦".into());
                 self.views.insert(id, view);
@@ -798,6 +958,7 @@ impl Workspace {
             return Ok(());
         }
         self.files.worker = Some(DocumentWorker::spawn(complete)?);
+        self.files.document_started = true;
         self.refresh_save_destinations();
         self.files
             .worker
@@ -831,6 +992,9 @@ impl Workspace {
     }
 
     fn pump_files(&mut self) {
+        if self.files.document_shutdown {
+            return;
+        }
         if self.files.preparing {
             return;
         }
@@ -938,10 +1102,20 @@ impl Workspace {
             let generation = self.files.next_observer;
             let path = editor.document().path().map(PathBuf::from);
             let policy = crate::document_worker::document_policy(editor.document());
-            let observer = worker.observer(document, path.clone(), next, generation, policy);
-            if let Err(error) = editor.set_edit_observer(Some(observer)) {
-                view.set_notice(format!("Recovery observer unavailable: {error}"));
-                continue;
+            if self.files.bounded_document {
+                let sink = worker.journal_sink(document, path.clone(), next, generation, policy);
+                if editor.set_journal_sink(sink).is_err() {
+                    view.set_notice("Recovery sink unavailable; exact receipt retained".into());
+                    continue;
+                }
+            } else {
+                // Ordinary legacy callback workers retain observer compatibility.
+                // The bounded production path never installs this callback.
+                let observer = worker.observer(document, path.clone(), next, generation, policy);
+                if let Err(error) = editor.set_edit_observer(Some(observer)) {
+                    view.set_notice(format!("Recovery observer unavailable: {error}"));
+                    continue;
+                }
             }
             self.files.observed.insert(document, (next, generation));
             let seed = self.hex.seed.remove(&document)
@@ -1095,6 +1269,7 @@ impl Workspace {
         self.sync_active();
         let previous = self.session.active();
         let id = self.session.open(Some(path.clone()))?;
+        self.wrap.path_changed();
         if previous != self.session.active() {
             self.input_epoch = self.input_epoch.wrapping_add(1);
             if let Some(previous) = previous {
@@ -1104,6 +1279,7 @@ impl Workspace {
         let mut view = View::new(None);
         view.editor = None;
         view.path = Some(path.clone());
+        prepare_view_publication(&mut view, self.intended_wrap_publication(), false);
         view.set_notice("Openingâ€¦".into());
         self.views.insert(id, view);
         self.refresh_save_destinations();
@@ -1198,7 +1374,17 @@ impl Workspace {
                 return Err(error);
             }
         };
-        self.files.saves.insert(id, SaveFlight { revision: request.revision, path: Some(request.path.clone()) });
+        self.files.saves.insert(
+            id,
+            SaveFlight {
+                revision: request.revision,
+                path: Some(request.path.clone()),
+                source_epoch: editor.document().source_epoch,
+                resume_generation: 0,
+                resume: SaveResumePhase::Local,
+                preparation_error: None,
+            },
+        );
         self.refresh_save_destinations();
         self.files.queue.push_back(if raw {
             DocumentRequest::SaveRaw { document: id, request }
@@ -1297,7 +1483,20 @@ impl Workspace {
                 self.save_document(self.active_id(), None)?;
             }
             "file.restoreSession" => {
-                if let Some(prepared) = self.files.deferred_recovery.take() {
+                if self.files.bounded_document {
+                    if self.files.deferred_recovery.is_some()
+                        && let Some(worker) = &self.files.worker
+                    {
+                        worker.restore_prepared_live(&mut self.files.deferred_recovery).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "Recovery continuation was not admitted; retained for retry",
+                            )
+                        })?;
+                        self.files.preparing = true;
+                        self.files.deferred_recovery_kind = None;
+                    }
+                } else if let Some(prepared) = self.files.deferred_recovery.take() {
                     self.install_prepared(*prepared);
                     self.files.storage_ready = self.files.deferred_recovery.is_none();
                 }
@@ -1494,11 +1693,47 @@ impl Workspace {
         }
     }
 
-    pub fn document_result(&mut self, result: DocumentResult) -> Damage {
+    /// Ordinary completions publish damage. The wrap settlement result has its
+    /// own exact-owner acceptance path; refusal returns the ORIGINAL event.
+    #[cfg(test)]
+    pub fn document_result(&mut self, result: DocumentResult) -> std::ops::ControlFlow<DocumentResult, Damage> {
+        if matches!(&result, DocumentResult::WrapSettled(_)) {
+            return std::ops::ControlFlow::Break(result);
+        }
+        self.apply_document_result(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_document_result(&mut self, result: DocumentResult) -> Damage {
+        match self.document_result(result) {
+            std::ops::ControlFlow::Continue(damage) => damage,
+            std::ops::ControlFlow::Break(_) => panic!("unexpected wrap settlement in ordinary document fixture"),
+        }
+    }
+
+    fn apply_document_result(&mut self, result: DocumentResult) -> std::ops::ControlFlow<DocumentResult, Damage> {
+        self.apply_document_result_with_receipts(result, true)
+    }
+
+    fn apply_document_result_with_receipts(
+        &mut self,
+        result: DocumentResult,
+        retry_receipts: bool,
+    ) -> std::ops::ControlFlow<DocumentResult, Damage> {
+        let intended_wrap = self.intended_wrap_publication();
+        if matches!(
+            &result,
+            DocumentResult::Recovered { .. }
+                | DocumentResult::Preview { .. }
+                | DocumentResult::Opened { .. }
+                | DocumentResult::Indexed { .. }
+        ) {
+            self.wrap.path_changed();
+        }
         if matches!(&result, DocumentResult::Preview { document, .. } if self.hex_text_preview_pending(*document)) {
             let DocumentResult::Preview { document, revision, preview, .. } = result else { unreachable!() };
             self.hex_text_preview(document, revision, preview.text);
-            return Damage::default();
+            return std::ops::ControlFlow::Continue(Damage::default());
         }
         // An editor absent because of a loan is not an open/index placeholder.
         let placeholder = match &result {
@@ -1509,7 +1744,7 @@ impl Workspace {
             _ => None,
         };
         if placeholder.is_some_and(|id| self.files.loans.contains_key(&id) || self.hex.editor_away(id)) {
-            return Damage::default();
+            return std::ops::ControlFlow::Continue(Damage::default());
         }
         let destinations_changed = matches!(
             &result,
@@ -1529,6 +1764,10 @@ impl Workspace {
         );
         let mut damage = Damage { status: true, ..Default::default() };
         match result {
+            DocumentResult::SourceBarrier(_) => {
+                damage = Damage::default();
+            }
+            DocumentResult::WrapSettled(_) => unreachable!("wrap settlement handled before ordinary document work"),
             DocumentResult::BinaryOffer(offer) => {
                 damage = self.accept_binary_offer(offer, None);
             }
@@ -1554,9 +1793,10 @@ impl Workspace {
                     damage = preview_damage;
                 }
             }
-            DocumentResult::CheckedOpened { ticket, result } => {
-                damage = self.checked_opened(ticket, result);
-            }
+            DocumentResult::CheckedOpened { ticket, result } => match self.checked_opened(ticket, result) {
+                std::ops::ControlFlow::Continue(update) => damage = update,
+                std::ops::ControlFlow::Break(result) => return std::ops::ControlFlow::Break(result),
+            },
             DocumentResult::RawPreview { document, revision, page } => {
                 damage = self.hex_preview(document, revision, page);
             }
@@ -1569,7 +1809,7 @@ impl Workspace {
             DocumentResult::HexEdited { document, editor, completion } => {
                 damage = self.hex_edit_result(document, editor, completion);
             }
-            DocumentResult::Replaced { key, operation, mut editor, result } => {
+            DocumentResult::Replaced { key, operation, editor, result } => {
                 let id = DocumentId(key.document_id);
                 let current =
                     self.files.loans.get(&id).is_some_and(|loan| loan.key == key && loan.operation == operation);
@@ -1578,8 +1818,14 @@ impl Workspace {
                     // accepted loans cannot be closed/remapped/replaced.
                     // Never overwrite another editor with a stale completion.
                     self.set_notice("Unexpected replacement completion identity".into());
-                    return damage;
+                    return std::ops::ControlFlow::Continue(damage);
                 }
+                let view = self.views.get_mut(&id).expect("loan target cannot close");
+                debug_assert!(view.editor.is_none());
+                view.editor = Some(*editor);
+                // Restore the accepted loan before any settings allocation,
+                // viewport read or notice formatting can unwind.
+                let editor = view.editor.as_mut().unwrap();
                 if let Some(settings) = &self.editor_settings {
                     editor.settings = settings.clone();
                 }
@@ -1587,9 +1833,7 @@ impl Workspace {
                 if editor.document().revision() != key.revision {
                     self.files.replacement_journals.insert(id, sequence);
                 }
-                let view = self.views.get_mut(&id).expect("loan target cannot close");
-                debug_assert!(view.editor.is_none());
-                view.editor = Some(*editor);
+                prepare_view_publication(view, intended_wrap, false);
                 self.files.loans.remove(&id);
                 self.input_epoch = self.input_epoch.wrapping_add(1);
                 let notice = match result {
@@ -1616,6 +1860,11 @@ impl Workspace {
             }
             DocumentResult::CapacityAvailable => {
                 damage = Damage::default();
+            }
+            DocumentResult::ResumeSaveCompletion { key } => {
+                // This scalar carrier must be accepted through the guarded
+                // bounded slot; legacy owned delivery cannot transfer its save.
+                return std::ops::ControlFlow::Break(DocumentResult::ResumeSaveCompletion { key });
             }
             DocumentResult::Stopped(result) => {
                 damage = Damage::default();
@@ -1710,9 +1959,12 @@ impl Workspace {
                                     0,
                                 );
                             }
-                            editor.set_viewport(tab.first_visible_line, view.rows);
                             view.editor = Some(editor);
-                            view.top = tab.first_visible_line;
+                            prepare_view_publication(view, intended_wrap, false);
+                            if view.body_policy() == ViewBodyPolicy::LogicalLines {
+                                view.editor.as_mut().unwrap().set_viewport(tab.first_visible_line, view.rows);
+                                view.top = tab.first_visible_line;
+                            }
                             if raw {
                                 view.file = view.editor().unwrap().document().original.clone();
                             } else {
@@ -1735,6 +1987,7 @@ impl Workspace {
                     view.path = Some(path);
                     view.file = Some(file);
                     view.preview = Some(preview.text);
+                    prepare_view_publication(view, intended_wrap, true);
                     let rows = view.rows();
                     view.set_rows(rows);
                     view.set_notice("Preparing decoded documentâ€¦".into());
@@ -1749,6 +2002,7 @@ impl Workspace {
                             let rows = view.rows();
                             view.path = Some(path);
                             view.file = Some(file);
+                            prepare_view_publication(view, intended_wrap, false);
                             view.set_rows(rows);
                         }
                         Err(error) => {
@@ -1768,11 +2022,14 @@ impl Workspace {
                             if let Some(settings) = &self.editor_settings {
                                 editor.settings = settings.clone();
                             }
-                            editor.set_viewport(view.top, view.rows);
                             if raw {
                                 view.file = editor.document().original.clone();
                             }
                             view.editor = Some(editor);
+                            prepare_view_publication(view, intended_wrap, false);
+                            if view.body_policy() == ViewBodyPolicy::LogicalLines {
+                                view.editor.as_mut().unwrap().set_viewport(view.top, view.rows);
+                            }
                             if !raw {
                                 view.index_ready();
                             }
@@ -1790,14 +2047,24 @@ impl Workspace {
             DocumentResult::Saved { document, revision, result } => {
                 if result.as_ref().is_ok_and(|saved| saved.revision != revision) {
                     self.set_notice("Ignored save completion with mismatched source revision".into());
-                    return damage;
+                    return std::ops::ControlFlow::Continue(damage);
                 }
                 if self.files.saves.get(&document).is_some_and(|save| save.revision == revision)
                     && let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut)
                 {
                     let current = editor.document().revision() == revision;
-                    let result = editor.finish_save(result);
-                    damage = self.complete_save(document, current, result);
+                    match editor.finish_save(result) {
+                        std::ops::ControlFlow::Continue(result) => {
+                            damage = self.complete_save(document, current, result)
+                        }
+                        std::ops::ControlFlow::Break(refusal) => {
+                            return std::ops::ControlFlow::Break(DocumentResult::Saved {
+                                document,
+                                revision,
+                                result: refusal.result,
+                            });
+                        }
+                    }
                 }
             }
             DocumentResult::JournalQueued { document, revision, sequence: _, result } => match result {
@@ -1855,7 +2122,7 @@ impl Workspace {
         if destinations_changed {
             self.refresh_save_destinations();
         }
-        let retried = self.flush_receipts();
+        let retried = if retry_receipts { self.flush_receipts() } else { Damage::default() };
         damage.full |= retried.full;
         damage.status |= retried.status;
         damage.scroll += retried.scroll;
@@ -1873,7 +2140,7 @@ impl Workspace {
         self.check_hot_exit();
         self.pump_files();
         self.pump_hex();
-        damage
+        std::ops::ControlFlow::Continue(damage)
     }
 
     fn complete_save(
@@ -1882,6 +2149,9 @@ impl Workspace {
         current: bool,
         result: io::Result<crate::CommandResult>,
     ) -> Damage {
+        // Save As can replace a path without changing source revision/bytes.
+        // Also covers deferred completion retried by flush_receipts.
+        self.wrap.path_changed();
         let mut damage = Damage { status: true, ..Default::default() };
         let mut may_close = false;
         let mut warning = false;
@@ -1942,11 +2212,20 @@ impl Workspace {
                 }
                 notice
             }
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    && view.editor().is_some_and(|editor| editor.has_pending_save_completion()) =>
-            {
-                view.set_notice("Save completion is waiting for recovery queue admission".into());
+            Err(error) if view.editor().is_some_and(|editor| editor.has_pending_save_completion()) => {
+                let notice = format!("Save completion retained: {error}");
+                if let Some(save) = self.files.saves.get_mut(&document) {
+                    if workspace_document::stale_save_preparation(&error) {
+                        save.retain_stale_preparation(
+                            view.editor().unwrap().document().source_epoch,
+                            &mut self.files.next_save_resume,
+                            error,
+                        );
+                    } else if save.preparation_error.is_none() {
+                        save.preparation_error = Some(error);
+                    }
+                }
+                view.set_notice(notice);
                 return damage;
             }
             Err(error) => {
@@ -1984,19 +2263,43 @@ impl Workspace {
 
     fn flush_receipts(&mut self) -> Damage {
         let mut finished = Vec::new();
+        let budget = self.files.document_budget.clone();
         for (&document, view) in &mut self.views {
             let Some(editor) = view.editor_mut() else { continue };
-            if editor.flush_edit_receipt().is_err() {
+            let flushed = if budget.is_some() {
+                editor.flush_edit_receipt_sealed(None).is_ok()
+            } else {
+                editor.flush_edit_receipt().is_ok()
+            };
+            if !flushed {
                 continue;
             }
             if editor.has_pending_save_completion()
-                && let Some(save) = self.files.saves.get(&document)
+                && let Some(save) = self.files.saves.get_mut(&document)
             {
+                if save.resume != SaveResumePhase::Local {
+                    continue;
+                }
                 let current = editor.document().revision() == save.revision;
-                match editor.finish_pending_save() {
+                let result = if let Some(budget) = &budget {
+                    editor.finish_pending_save_sealed(budget)
+                } else {
+                    editor.finish_pending_save()
+                };
+                match result {
                     Ok(Some(result)) => finished.push((document, current, Ok(result))),
+                    Err(error) if workspace_document::stale_save_preparation(&error) => {
+                        save.retain_stale_preparation(
+                            editor.document().source_epoch,
+                            &mut self.files.next_save_resume,
+                            error,
+                        );
+                    }
                     Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
                         finished.push((document, current, Err(error)))
+                    }
+                    Err(error) if editor.has_pending_save_completion() && save.preparation_error.is_none() => {
+                        save.preparation_error = Some(error);
                     }
                     _ => {}
                 }
@@ -2011,14 +2314,19 @@ impl Workspace {
             damage.rows.extend(changed.rows);
             self.checkpoint_session();
         }
+        self.pump_live_save_resumes();
         damage
     }
 
     fn install_prepared(&mut self, prepared: crate::document_worker::PreparedWorkspace) {
+        self.files.deferred_recovery_kind = None;
+        let intended_wrap = self.intended_wrap_publication();
         if !self.hex.loans.is_empty() {
             self.files.deferred_recovery = Some(Box::new(prepared));
+            self.files.deferred_recovery_kind = Some(workspace_document::RecoveryDeferKind::HexLoans);
             return;
         }
+        self.wrap.path_changed();
         self.sync_all();
         let additional = self
             .session
@@ -2041,6 +2349,7 @@ impl Workspace {
             || !self.closed_views.is_empty()
         {
             self.files.deferred_recovery = Some(Box::new(prepared));
+            self.files.deferred_recovery_kind = Some(workspace_document::RecoveryDeferKind::Structural);
             let reason =
                 if self.closed_views.is_empty() { "tab limit reached" } else { "reopen recently closed tabs first" };
             self.set_notice(format!("Recovery retained: {reason}; then Restore Session. Active work is unchanged"));
@@ -2081,13 +2390,17 @@ impl Workspace {
                             0,
                         );
                     }
-                    editor.set_viewport(tab.first_visible_line, 0);
                     view.editor = Some(editor);
-                    view.top = tab.first_visible_line;
+                    prepare_view_publication(&mut view, intended_wrap, false);
+                    if view.body_policy() == ViewBodyPolicy::LogicalLines {
+                        view.editor.as_mut().unwrap().set_viewport(tab.first_visible_line, 0);
+                        view.top = tab.first_visible_line;
+                    }
                     view.file = view.editor().unwrap().document().original.clone();
                 }
                 Err(error) => {
                     view.editor = None;
+                    prepare_view_publication(&mut view, intended_wrap, false);
                     view.set_notice(format!("Recovery failed: {error}; journal retained"));
                 }
             }
@@ -2265,6 +2578,25 @@ impl Workspace {
     }
 }
 
+/// Publication only suppresses unsafe legacy work. It does not assert that
+/// normal-text wrapping owns a raw/log/preview body or release a modal's
+/// underlying prepared editor. The frontend supplies that actual policy.
+fn prepare_view_publication(view: &mut View, intended_wrap: bool, authoritative_preview: bool) {
+    if authoritative_preview && view.editor.is_none() && view.preview.is_some() {
+        // The worker's bounded first block is already the paint authority.
+        // Switching here can only slice that cache, never read an original.
+        view.set_body_policy(ViewBodyPolicy::LogicalLines);
+    } else if intended_wrap
+        || view.body_policy() == ViewBodyPolicy::Prepared
+        || view.editor.is_none()
+        || view
+            .editor()
+            .is_some_and(|editor| editor.document().representation() == crate::hex_session::Representation::RawBytes)
+    {
+        view.set_body_policy(ViewBodyPolicy::Prepared);
+    }
+}
+
 fn sync_tab_path(tab: &mut kwil_core_workspace::session::Tab, path: &Option<PathBuf>) {
     if let Some(path) = path {
         tab.path = Some(path.clone());
@@ -2363,6 +2695,7 @@ impl Workspace {
         let view = self.views.get_mut(&id).expect("checked open placeholder");
         let file = view.file.take();
         view.preview = Some(Vec::new());
+        prepare_view_publication(view, false, false);
         view.set_rows(view.rows);
         Ok(DocumentRequest::OpenChecked { ticket, path, file })
     }
@@ -2386,6 +2719,7 @@ impl Workspace {
         self.hex_forget_binary_open(id);
         let view = self.views.get_mut(&id).unwrap();
         view.preview = Some(Vec::new());
+        prepare_view_publication(view, false, false);
         view.set_rows(view.rows);
         view.set_notice(error.map_or_else(
             || "Binary file: choose Hex, Text, or Cancel".into(),
@@ -2453,12 +2787,17 @@ impl Workspace {
         }
         let view = self.views.get_mut(&ticket.document()).unwrap();
         view.preview = Some(text);
+        prepare_view_publication(view, false, true);
         view.set_rows(view.rows);
         view.set_notice("Preparing decoded document...".into());
         self.binary.flights.get_mut(&ticket.document()).unwrap().preview_ready = true;
         Damage { full: self.active_id() == ticket.document(), status: true, ..Default::default() }
     }
-    fn checked_opened(&mut self, ticket: BinaryTicket, result: io::Result<Option<Box<crate::Document>>>) -> Damage {
+    fn checked_opened(
+        &mut self,
+        ticket: BinaryTicket,
+        result: io::Result<Option<Box<crate::Document>>>,
+    ) -> std::ops::ControlFlow<DocumentResult, Damage> {
         let id = ticket.document();
         if !self.binary_current(ticket) {
             if let Ok(Some(document)) = result {
@@ -2474,12 +2813,12 @@ impl Workspace {
                 self.binary.flights.remove(&id);
                 self.hex_forget_binary_open(id);
             }
-            return Damage::default();
+            return std::ops::ControlFlow::Continue(Damage::default());
         }
         if matches!(&result, Ok(None))
             && !matches!(self.binary.flights[&id].phase, BinaryPhase::Resolving(BinaryChoice::Cancel))
         {
-            return Damage::default();
+            return std::ops::ControlFlow::Continue(Damage::default());
         }
         let flight = self.binary.flights.remove(&id).unwrap();
         match result {
@@ -2500,11 +2839,11 @@ impl Workspace {
                 }
                 self.refresh_save_destinations();
                 self.checkpoint_session();
-                Damage { full: true, status: true, ..Default::default() }
+                std::ops::ControlFlow::Continue(Damage { full: true, status: true, ..Default::default() })
             }
             Err(error) => {
                 self.hex_forget_binary_open(id);
-                self.document_result(DocumentResult::Opened {
+                self.apply_document_result(DocumentResult::Opened {
                     document: id,
                     revision: ticket.revision(),
                     result: Err(error),
@@ -2512,7 +2851,7 @@ impl Workspace {
             }
             Ok(Some(document)) => {
                 self.views.get_mut(&id).unwrap().file = document.original.clone();
-                self.document_result(DocumentResult::Indexed {
+                self.apply_document_result(DocumentResult::Indexed {
                     document: id,
                     revision: ticket.revision(),
                     result: Ok(document),
@@ -2533,6 +2872,9 @@ impl Workspace {
         }
     }
     fn pump_binary_retirement(&mut self) {
+        if self.files.document_shutdown {
+            return;
+        }
         let Some(worker) = &self.files.worker else { return };
         while let Some((document, editor)) = self.binary.retiring.pop() {
             if let Err(error) = worker.try_submit(DocumentRequest::DiscardHex { document, editor }) {
@@ -2545,6 +2887,11 @@ impl Workspace {
         }
     }
     fn prepare_binary_shutdown(&mut self) -> bool {
+        // prepare_hex_shutdown calls this BEFORE discarding any document
+        // owner. Only the bound wrap worker's settlement receipt opens it.
+        if !self.wrap_cleanup_ready() {
+            return false;
+        }
         self.pump_files();
         let ids: Vec<_> = self
             .binary
@@ -2582,6 +2929,10 @@ impl Workspace {
 #[cfg(test)]
 #[path = "binary_offer_model_tests.rs"]
 mod binary_offer_model_tests;
+
+#[cfg(test)]
+#[path = "workspace_constructor_tests.rs"]
+mod workspace_constructor_tests;
 
 impl Deref for Workspace {
     type Target = View;
@@ -2761,7 +3112,7 @@ mod tests {
         let (owner, request) = take_save(&mut workspace);
         assert_eq!(owner, candidate);
         assert_eq!(request.path, path);
-        workspace.document_result(DocumentResult::Saved {
+        workspace.test_document_result(DocumentResult::Saved {
             document: candidate,
             revision: request.revision,
             result: Err(io::Error::new(io::ErrorKind::PermissionDenied, "fake save boundary")),
@@ -2814,13 +3165,17 @@ mod tests {
                 if *ticket == opening && error.kind() == io::ErrorKind::NotFound),
             "the missing named destination must finish its exact checked-open flight"
         );
-        workspace.document_result(opened);
+        workspace.test_document_result(opened);
         assert!(!workspace.document_busy(named), "terminal receipt must release checked-open ownership");
         workspace.close(named, true).unwrap();
         workspace.activate(id);
         workspace.close(id, true).unwrap();
         workspace.files.reopen = Some((id, 1));
-        workspace.document_result(DocumentResult::ReopenValidated { document: id, generation: 1, result: Ok(false) });
+        workspace.test_document_result(DocumentResult::ReopenValidated {
+            document: id,
+            generation: 1,
+            result: Ok(false),
+        });
         assert_eq!(workspace.active_id(), id);
         let restored = workspace.session().tabs().iter().find(|t| t.id == id).unwrap();
         assert!(restored.path.is_none());
@@ -2900,7 +3255,7 @@ mod tests {
         let mut document = crate::Document::new();
         document.buffer.insert(0, "\u{754c}a\nxyz".as_bytes()).unwrap();
         document.saved_revision = 1;
-        workspace.document_result(DocumentResult::Recovered {
+        workspace.test_document_result(DocumentResult::Recovered {
             document: first,
             revision: 0,
             result: Ok(Box::new(document)),
@@ -2921,7 +3276,7 @@ mod tests {
         workspace.execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1).unwrap();
         workspace.file_command("file.new").unwrap();
         let second = workspace.active_id();
-        workspace.document_result(DocumentResult::Indexed {
+        workspace.test_document_result(DocumentResult::Indexed {
             document: first,
             revision: 0,
             result: Ok(Box::new(crate::Document::new())),
@@ -2948,13 +3303,198 @@ mod tests {
         settings
     }
 
+    fn publication_wrap_owner(
+        workspace: &mut Workspace,
+        enabled: bool,
+    ) -> (workspace_wrap::WorkspaceWrap, crate::wrap_host::WrapHost) {
+        let mut settings = kwil_core_commands::Settings::default();
+        settings.editor.word_wrap = enabled;
+        workspace.set_editor_settings(&settings);
+        let host = crate::wrap_host::WrapHost::new(|| {}).unwrap();
+        let owner = workspace_wrap::WorkspaceWrap::new(workspace, &host).unwrap();
+        (owner, host)
+    }
+
+    fn settle_publication_wrap(
+        workspace: &mut Workspace,
+        owner: workspace_wrap::WorkspaceWrap,
+        host: crate::wrap_host::WrapHost,
+    ) {
+        let std::ops::ControlFlow::Continue(ticket) = owner.stop(host) else {
+            panic!("publication fixture lost its host binding")
+        };
+        let receipt = ticket.settle(std::time::Duration::from_secs(2)).unwrap();
+        assert!(workspace.acknowledge_wrap_settled(receipt).is_continue());
+    }
+
+    #[test]
+    fn workspace_wrap_new_view_publication_uses_registered_settings_not_previous_body_owner() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let (owner, host) = publication_wrap_owner(&mut workspace, true);
+        assert_eq!(workspace.body_policy(), ViewBodyPolicy::LogicalLines);
+        let mut view = View::new(None);
+        view.editor_mut().unwrap().document.buffer.insert(0, b"a\nb\nc").unwrap();
+        view.set_rows(2);
+        assert!(view.line(0).is_some(), "negative control: the old logical cache exists");
+        let id = workspace.open(view).unwrap();
+        let view = workspace.view(id).unwrap();
+        assert_eq!(view.body_policy(), ViewBodyPolicy::Prepared);
+        assert!(view.lines.is_empty());
+        assert!(view.line_sources.is_empty());
+        assert_eq!(view.line(0), None);
+        // Previous tab's Prepared policy cannot enable wrapping in a new tab
+        // after the accepted word-wrap setting has been disabled.
+        let mut settings = kwil_core_commands::Settings::default();
+        settings.editor.word_wrap = false;
+        workspace.set_editor_settings(&settings);
+        let plain = workspace.open(View::new(None)).unwrap();
+        assert_eq!(workspace.view(plain).unwrap().body_policy(), ViewBodyPolicy::LogicalLines);
+        settle_publication_wrap(&mut workspace, owner, host);
+    }
+
+    #[test]
+    fn workspace_wrap_new_recovery_publication_precedes_horizontal_refresh_and_direct_viewport() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let (owner, host) = publication_wrap_owner(&mut workspace, true);
+        let mut session = Session::default();
+        let restored = session.open(None).unwrap();
+        session.tab_mut(restored).unwrap().first_visible_line = 4;
+        session.tab_mut(restored).unwrap().first_byte_column = 1;
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, b"a\nb\nc\nd\ne\nf").unwrap();
+        workspace.install_prepared(crate::document_worker::PreparedWorkspace {
+            session,
+            documents: vec![(restored, Ok(document))],
+        });
+        let view = workspace.view(restored).unwrap();
+        assert_eq!(view.body_policy(), ViewBodyPolicy::Prepared);
+        assert_eq!(view.top(), 0, "saved logical rows must not become a visual anchor");
+        assert_eq!((view.editor().unwrap().top(), view.editor().unwrap().rows()), (0, 0));
+        assert_eq!(view.first_byte_column, 1, "horizontal metadata remains cached without reload");
+        assert!(view.lines.is_empty());
+        assert!(view.line_sources.is_empty());
+        workspace.view_mut(restored).unwrap().set_rows(3);
+        workspace.view_mut(restored).unwrap().refresh_after_edit(Damage { full: true, ..Default::default() });
+        assert_eq!((workspace.editor().unwrap().top(), workspace.editor().unwrap().rows()), (0, 0));
+        workspace.file_command("file.saveAs").unwrap();
+        assert!(workspace.file_prompt().is_some());
+        workspace.test_document_result(DocumentResult::CapacityAvailable);
+        assert_eq!(workspace.body_policy(), ViewBodyPolicy::Prepared, "a modal does not release the text body");
+        assert!(workspace.lines.is_empty());
+        workspace.cancel_file_prompt();
+        settle_publication_wrap(&mut workspace, owner, host);
+    }
+
+    #[test]
+    fn workspace_wrap_worker_preview_remains_authority_until_editable_index_publication() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let (owner, host) = publication_wrap_owner(&mut workspace, true);
+        let id = workspace.active_id();
+        let view = workspace.views.get_mut(&id).unwrap();
+        view.editor = None;
+        view.rows = 2;
+        view.path = Some(std::env::temp_dir().join("kwil-wrap-publication-unavailable.txt"));
+        prepare_view_publication(view, true, false);
+        assert_eq!(view.body_policy(), ViewBodyPolicy::Prepared, "an unknown original is never read for paint");
+        let path = view.path.clone().unwrap();
+        workspace.session.set_path(id, path.clone()).unwrap();
+        let DocumentRequest::OpenChecked { ticket, .. } = workspace.checked_open_request(id, 0, path).unwrap() else {
+            panic!("expected checked open")
+        };
+        assert!(
+            workspace.binary_current(ticket),
+            "the preview must reach an admitted current source before testing its policy"
+        );
+        assert_eq!(
+            workspace.body_policy(),
+            ViewBodyPolicy::Prepared,
+            "an empty loan sentinel is not an authoritative preview"
+        );
+        workspace.checked_text_preview(ticket, Vec::new());
+        assert!(workspace.binary_preview_ready(id), "the actual zero-byte preview was accepted");
+        assert_eq!(
+            workspace.body_policy(),
+            ViewBodyPolicy::LogicalLines,
+            "a real zero-byte worker preview remains authoritative"
+        );
+        assert_eq!(workspace.line(0), Some(&b""[..]));
+        workspace.checked_text_preview(ticket, b"worker first\nsecond".to_vec());
+        assert_eq!(workspace.body_policy(), ViewBodyPolicy::LogicalLines);
+        assert_eq!(workspace.line(0), Some(&b"worker first"[..]));
+        assert!(workspace.file().is_none(), "preview cache is the only readable source here");
+        workspace.views.get_mut(&id).unwrap().top = 5;
+        let mut document = crate::Document::new();
+        document.buffer.insert(0, b"a\nb\nc\nd\ne\nf").unwrap();
+        workspace.test_document_result(DocumentResult::Indexed {
+            document: id,
+            revision: 0,
+            result: Ok(Box::new(document)),
+        });
+        assert_eq!(workspace.body_policy(), ViewBodyPolicy::Prepared);
+        assert_eq!(workspace.top(), 5, "index publication must not synchronize the logical viewport");
+        assert_eq!((workspace.editor().unwrap().top(), workspace.editor().unwrap().rows()), (0, 0));
+        assert!(workspace.lines.is_empty());
+        assert_eq!(workspace.line(0), None);
+        let incarnation = workspace.input_incarnation.clone();
+        workspace.views.get_mut(&id).unwrap().editor = None;
+        workspace.views.get_mut(&id).unwrap().preview = Some(Vec::new());
+        let mut restored = crate::Document::new();
+        restored.buffer.insert(0, b"x\ny\nz").unwrap();
+        workspace.test_document_result(DocumentResult::Recovered {
+            document: id,
+            revision: 0,
+            result: Ok(Box::new(restored)),
+        });
+        assert_eq!(
+            workspace.body_policy(),
+            ViewBodyPolicy::Prepared,
+            "same-View recovery preserves suppression across a loan sentinel"
+        );
+        assert_eq!(workspace.top(), 5);
+        assert_eq!((workspace.editor().unwrap().top(), workspace.editor().unwrap().rows()), (0, 0));
+        assert!(std::sync::Arc::ptr_eq(&incarnation, &workspace.input_incarnation));
+        settle_publication_wrap(&mut workspace, owner, host);
+    }
+
+    fn save_policy_directory(parent: &std::path::Path, next: &std::sync::atomic::AtomicU64) -> io::Result<PathBuf> {
+        for _ in 0..128 {
+            let sequence = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = parent.join(format!("kwil-save-policy-{}-{sequence}", std::process::id()));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Ok(root),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, "save-policy fixture namespace exhausted"))
+    }
+
+    fn save_policy_root() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        save_policy_directory(&std::env::temp_dir(), &NEXT).unwrap()
+    }
+
+    #[test]
+    fn save_policy_fixture_identity_skips_existing_owners_without_changing_bytes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let parent = save_policy_root();
+        let next = AtomicU64::new(0);
+        let first = save_policy_directory(&parent, &next).unwrap();
+        let marker = first.join("owner.txt");
+        std::fs::write(&marker, b"retained owner").unwrap();
+        let second = save_policy_directory(&parent, &next).unwrap();
+        assert_ne!(first, second);
+        let replay = AtomicU64::new(0);
+        let third = save_policy_directory(&parent, &replay).unwrap();
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+        assert_eq!(replay.load(Ordering::Relaxed), 3);
+        assert_eq!(std::fs::read(marker).unwrap(), b"retained owner");
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
     fn inactive_save_all_after_settings_reload(trim: bool) {
-        let root = std::env::temp_dir().join(format!(
-            "kwil-save-policy-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let root = save_policy_root();
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         workspace.set_editor_settings(&settings_with_trim(!trim));
         let first = workspace.active_id();
@@ -2981,7 +3521,7 @@ mod tests {
             let path = request.path.clone();
             let revision = request.revision;
             let result = kwil_core_workspace::save_snapshot(request);
-            let damage = workspace.document_result(DocumentResult::Saved { document, revision, result });
+            let damage = workspace.test_document_result(DocumentResult::Saved { document, revision, result });
             if document == first {
                 assert!(!damage.full, "inactive save must not repaint the active text");
                 assert_eq!(workspace.active_id(), second);
@@ -3031,7 +3571,7 @@ mod tests {
         assert!(workspace.view(opened).unwrap().editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
         let indexed = workspace.open_path(std::env::temp_dir().join("kwil-virtual-settings-index.txt")).unwrap();
         workspace.activate(first);
-        let damage = workspace.document_result(DocumentResult::Indexed {
+        let damage = workspace.test_document_result(DocumentResult::Indexed {
             document: indexed,
             revision: 0,
             result: Ok(Box::new(crate::Document::new())),
@@ -3056,7 +3596,7 @@ mod tests {
         workspace.file_command("file.new").unwrap();
         let active = workspace.active_id();
         workspace.set_editor_settings(&settings_with_trim(false));
-        workspace.document_result(DocumentResult::Recovered {
+        workspace.test_document_result(DocumentResult::Recovered {
             document: recovered,
             revision: 0,
             result: Ok(Box::new(crate::Document::new())),
@@ -3064,7 +3604,7 @@ mod tests {
         assert!(!workspace.view(recovered).unwrap().editor().unwrap().settings.editor.trim_trailing_whitespace_on_save);
         workspace.views.get_mut(&recovered).unwrap().editor = None;
         workspace.set_editor_settings(&settings_with_trim(true));
-        let damage = workspace.document_result(DocumentResult::Recovered {
+        let damage = workspace.test_document_result(DocumentResult::Recovered {
             document: recovered,
             revision: 0,
             result: Ok(Box::new(crate::Document::new())),
@@ -3217,8 +3757,8 @@ mod tests {
             matches!(&result, DocumentResult::Saved { document, result: Err(error), .. } if *document == saving && error.kind() == io::ErrorKind::AlreadyExists),
             "reopened native destination must be reserved before the worker writes"
         );
-        workspace.document_result(result);
-        workspace.document_result(admitted);
+        workspace.test_document_result(result);
+        workspace.test_document_result(admitted);
         assert_eq!(workspace.active_id(), reopening);
         assert_eq!(workspace.session.tabs().iter().find(|tab| tab.id == reopening).unwrap().path, Some(path.clone()));
         assert_eq!(std::fs::read(&path).unwrap(), b"protected");
@@ -3233,7 +3773,7 @@ mod tests {
         assert!(
             matches!(&result, DocumentResult::Saved { result: Err(error), .. } if error.kind() == io::ErrorKind::AlreadyExists)
         );
-        workspace.document_result(result);
+        workspace.test_document_result(result);
         assert_eq!(std::fs::read(&path).unwrap(), b"protected");
         drop(workspace);
         assert!(matches!(
@@ -3301,20 +3841,20 @@ mod tests {
         assert!(
             matches!(&rejected, DocumentResult::ReopenValidated { result: Err(error), .. } if error.kind() == io::ErrorKind::AlreadyExists)
         );
-        workspace.document_result(rejected);
+        workspace.test_document_result(rejected);
         assert_eq!(workspace.active_id(), saving);
         assert_eq!(workspace.session.closed().front().unwrap().id, reopening);
         assert_eq!(workspace.closed_views[&reopening].editor().unwrap().document().snapshot().len(), 9);
         let saved = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(matches!(&saved, DocumentResult::Saved { result: Ok(_), .. }));
-        workspace.document_result(saved);
+        workspace.test_document_result(saved);
         assert_eq!(std::fs::read(&path).unwrap(), b"protected");
         // The atomic alias save replaced only that hardlink name. After its
         // completion the unchanged closed backing is safe to admit and retry.
         workspace.file_command("file.reopenClosed").unwrap();
         let admitted = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(matches!(&admitted, DocumentResult::ReopenValidated { result: Ok(true), .. }));
-        workspace.document_result(admitted);
+        workspace.test_document_result(admitted);
         assert_eq!(workspace.active_id(), reopening);
         drop(workspace);
         assert!(matches!(
@@ -3334,7 +3874,7 @@ mod tests {
         edit(&mut workspace, "recovered bytes");
         workspace.close(reopening, true).unwrap();
         workspace.files.reopen = Some((reopening, 1));
-        workspace.document_result(DocumentResult::ReopenValidated {
+        workspace.test_document_result(DocumentResult::ReopenValidated {
             document: reopening,
             generation: 1,
             result: Ok(false),
@@ -3371,9 +3911,17 @@ mod tests {
         workspace.close(newest, true).unwrap();
         workspace.files.queue.clear();
         workspace.files.reopen = Some((first, 7));
-        workspace.document_result(DocumentResult::ReopenValidated { document: first, generation: 6, result: Ok(true) });
+        workspace.test_document_result(DocumentResult::ReopenValidated {
+            document: first,
+            generation: 6,
+            result: Ok(true),
+        });
         assert_eq!(workspace.files.reopen, Some((first, 7)), "stale receipt cannot cancel the live admission");
-        workspace.document_result(DocumentResult::ReopenValidated { document: first, generation: 7, result: Ok(true) });
+        workspace.test_document_result(DocumentResult::ReopenValidated {
+            document: first,
+            generation: 7,
+            result: Ok(true),
+        });
         assert!(workspace.files.reopen.is_none());
         assert_eq!(workspace.session.closed().front().unwrap().id, newest);
         assert!(workspace.closed_views.contains_key(&first));
@@ -3433,7 +3981,7 @@ mod tests {
         assert!(
             matches!(&result, DocumentResult::CheckedOpened { ticket, result: Err(_), .. } if ticket.document() == failed)
         );
-        workspace.document_result(result);
+        workspace.test_document_result(result);
         workspace.file_command("file.new").unwrap();
         let saving = workspace.active_id();
         edit(&mut workspace, "saved");
@@ -3441,7 +3989,7 @@ mod tests {
         workspace.save_document(saving, Some(path.clone())).unwrap();
         let result = receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(matches!(&result, DocumentResult::Saved { document, result: Ok(_), .. } if *document == saving));
-        workspace.document_result(result);
+        workspace.test_document_result(result);
         assert_eq!(std::fs::read(&path).unwrap(), b"saved");
         assert!(workspace.view(failed).is_some(), "failed placeholder stays visible to its owner");
         drop(workspace);
@@ -3466,7 +4014,7 @@ mod tests {
         assert_eq!(workspace.session.closed().back().unwrap().id, oldest);
         assert!(workspace.view(current).is_some());
         assert!(workspace.files.persist_inflight);
-        workspace.document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
+        workspace.test_document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
         assert_eq!(workspace.session.closed().back().unwrap().id, oldest);
         assert!(workspace.view(current).is_some());
         assert!(!workspace.files.metadata_durable);
@@ -3491,7 +4039,7 @@ mod tests {
             kwil_core_workspace::session::MAX_TABS - kwil_core_workspace::session::MAX_CLOSED
         );
         assert_eq!(workspace.files.close.front(), Some(&original[64]));
-        workspace.document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
+        workspace.test_document_result(DocumentResult::Persisted(Err(io::Error::other("fixture checkpoint failure"))));
         assert_eq!(workspace.files.close.front(), Some(&original[64]));
         assert!(original[..64].iter().all(|id| workspace.session.closed().iter().any(|tab| tab.id == *id)));
         assert!(original[64..].iter().all(|id| workspace.view(*id).is_some()));
@@ -3520,7 +4068,7 @@ mod tests {
         let second = workspace.active_id();
         workspace.session.set_path(second, path.clone()).unwrap();
         workspace.files.close.push_back(first);
-        workspace.document_result(DocumentResult::Saved {
+        workspace.test_document_result(DocumentResult::Saved {
             document: first,
             revision,
             result: kwil_core_workspace::save_snapshot(request),
@@ -3551,7 +4099,7 @@ mod tests {
         workspace.file_command("file.new").unwrap();
         let second = workspace.active_id();
         edit(&mut workspace, "other");
-        workspace.document_result(DocumentResult::Saved {
+        workspace.test_document_result(DocumentResult::Saved {
             document,
             revision,
             result: kwil_core_workspace::save_snapshot(request),
@@ -3586,7 +4134,7 @@ mod tests {
         workspace.submit_file_prompt().unwrap();
         let (document, request) = take_save(&mut workspace);
         let revision = request.revision;
-        workspace.document_result(DocumentResult::Saved {
+        workspace.test_document_result(DocumentResult::Saved {
             document,
             revision,
             result: kwil_core_workspace::save_snapshot(request),
@@ -3600,7 +4148,7 @@ mod tests {
         result.warnings.push("security metadata warning".into());
         workspace.files.quit = true;
         workspace.files.close.push_back(second);
-        workspace.document_result(DocumentResult::Saved { document, revision, result: Ok(result) });
+        workspace.test_document_result(DocumentResult::Saved { document, revision, result: Ok(result) });
         assert!(!workspace.wants_exit());
         assert!(!workspace.close_pending());
         assert!(workspace.status_text().contains("security metadata warning"));
@@ -3615,17 +4163,27 @@ mod tests {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         edit(&mut workspace, "unsaved");
         let document = workspace.active_id();
-        workspace.files.saves.insert(document, SaveFlight { revision: 1, path: None });
+        workspace.files.saves.insert(
+            document,
+            SaveFlight {
+                revision: 1,
+                path: None,
+                source_epoch: workspace.views[&document].editor().unwrap().document().source_epoch,
+                resume_generation: 0,
+                resume: SaveResumePhase::Local,
+                preparation_error: None,
+            },
+        );
         workspace.files.quit = true;
         workspace.files.close.push_back(document);
-        workspace.document_result(DocumentResult::Saved {
+        workspace.test_document_result(DocumentResult::Saved {
             document,
             revision: 999,
             result: Err(io::Error::other("unrelated")),
         });
         assert!(workspace.files.saves.contains_key(&document));
         assert!(!workspace.wants_exit());
-        workspace.document_result(DocumentResult::Saved {
+        workspace.test_document_result(DocumentResult::Saved {
             document,
             revision: 1,
             result: Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
@@ -3679,7 +4237,7 @@ mod tests {
         assert_eq!(owner, document);
         assert_eq!(request.path, target);
         let revision = request.revision;
-        workspace.document_result(DocumentResult::Saved {
+        workspace.test_document_result(DocumentResult::Saved {
             document,
             revision,
             result: kwil_core_workspace::save_snapshot(request),

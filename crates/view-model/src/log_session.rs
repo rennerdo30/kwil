@@ -25,17 +25,19 @@
 //! source/filter changes retire, same-key scrolling resumes the partial cursor.
 //! No append/rotation identity is inferred: ROOT must change its epoch/revision.
 //! Disk quota failure is explicit, never an apparently complete truncated view.
+use kwil_core_runtime::{NativeExitObservation, NativeExitState, NativeObservationError};
 use kwil_core_syntax::logs::{self, MAX_PREFIX_BYTES};
 pub use kwil_core_syntax::logs::{Level, Metadata, Timestamp};
 use kwil_core_text::Snapshot;
 use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 pub const PAGE_HITS: usize = 256;
@@ -224,6 +226,35 @@ struct Shared {
     // A retained token prevents lost notifications when stop/submit races with
     // recv. try_send coalesces tokens; neither UI nor worker waits to send.
     signal: mpsc::SyncSender<()>,
+    completed: AtomicBool,
+    completion: Condvar,
+    native_exit: NativeExitObservation,
+}
+struct Completion<'a>(&'a Shared);
+impl Drop for Completion<'_> {
+    fn drop(&mut self) {
+        let _mailbox = self.0.mailbox.lock().unwrap_or_else(|error| error.into_inner());
+        self.0.completed.store(true, Ordering::Release);
+        self.0.completion.notify_all();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogSettlementReason {
+    TimedOut,
+    ThreadExitPending,
+    WorkerPanicked,
+    NativeObservation(NativeObservationError),
+}
+
+/// Explicit producer-owned OFF-UI retirement, separate from worker settlement.
+/// A retained handle OR original worker panic refuses this capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogRetirementRetryReason {
+    WorkerNotJoined,
+    TimedOut,
+    /// Registered unlink failed, or a metadata lock is currently unavailable.
+    Failed,
 }
 
 impl Shared {
@@ -287,9 +318,124 @@ pub struct LogSession {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
     generation: u64,
+    panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+    native_retired: bool,
+    settled: bool,
+}
+
+/// Failure owns the original facade; Drop never joins or performs native I/O.
+pub struct LogShutdownError {
+    owner: Mutex<Option<LogSession>>,
+    reason: LogSettlementReason,
+}
+impl LogShutdownError {
+    pub fn reason(&self) -> LogSettlementReason {
+        self.reason
+    }
+    pub fn into_session(self) -> LogSession {
+        self.owner.into_inner().unwrap_or_else(|error| error.into_inner()).expect("original shutdown owner")
+    }
+}
+impl std::fmt::Display for LogShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "worker shutdown {:?}; exact owner retained", self.reason)
+    }
+}
+impl std::fmt::Debug for LogShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, out)
+    }
+}
+impl std::error::Error for LogShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.reason {
+            LogSettlementReason::NativeObservation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Original log session, including the native observation and spool status.
+pub struct LogShutdown {
+    session: LogSession,
+}
+impl LogShutdown {
+    /// Explicit OFF-UI UNBOUNDED compatibility join and native-right cleanup.
+    pub fn join(self) -> Result<(), LogShutdownError> {
+        self.session.shutdown()
+    }
+    pub fn settle_until(&mut self, deadline: Instant) -> Result<(), LogSettlementReason> {
+        self.session.settle_until(deadline)
+    }
+    pub fn into_session(self) -> LogSession {
+        self.session
+    }
 }
 
 impl LogSession {
+    /// Declared facade/shared headers, aligned Arc allocation, retirement and
+    /// completion guards and one typed return. The existing sync-channel's
+    /// opaque std allocation, projection/index and source accounting remain
+    /// separate; this does not claim to size private std channel internals.
+    /// Reserve this in host aggregate metadata BEFORE construction.
+    pub const fn retained_metadata_bytes() -> usize {
+        match Self::checked_retained_metadata_bytes() {
+            Some(bytes) => bytes,
+            None => usize::MAX,
+        }
+    }
+    pub const fn checked_retained_metadata_bytes() -> Option<usize> {
+        #[repr(C)]
+        struct Allocation {
+            strong: std::sync::atomic::AtomicUsize,
+            weak: std::sync::atomic::AtomicUsize,
+            data: Shared,
+        }
+        let bytes = Some(0usize);
+        let bytes = metadata_add(bytes, std::mem::size_of::<Self>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Allocation>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<WorkerRetirement>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Completion<'static>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), LogSettlementReason>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), LogRetirementRetryReason>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), LogRetirementRetryReason>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<LogShutdownError>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), LogShutdownError>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<LogShutdown>());
+        match NativeExitObservation::operation_stack_bytes() {
+            Some(scratch) => metadata_add(bytes, scratch),
+            None => None,
+        }
+    }
+    /// Exact fixed facade + aligned existing Shared allocation growth, prepaid
+    /// by the host's aggregate metadata admission before starting this worker.
+    /// Scalars/Condvar/panic slot add no new allocation.
+    pub const fn settlement_metadata_bytes() -> usize {
+        #[allow(dead_code)]
+        struct BeforeSession {
+            shared: Arc<Shared>,
+            worker: Option<JoinHandle<()>>,
+            generation: u64,
+        }
+        #[allow(dead_code)]
+        struct BeforeShared {
+            mailbox: Mutex<Mailbox>,
+            latest: AtomicU64,
+            closed: AtomicBool,
+            retry_wake: AtomicBool,
+            retire_index: AtomicBool,
+            retirement_error: Mutex<Option<String>>,
+            signal: mpsc::SyncSender<()>,
+        }
+        #[repr(C)]
+        struct Allocation<T> {
+            strong: std::sync::atomic::AtomicUsize,
+            weak: std::sync::atomic::AtomicUsize,
+            data: T,
+        }
+        std::mem::size_of::<Self>() - std::mem::size_of::<BeforeSession>() + std::mem::size_of::<Allocation<Shared>>()
+            - std::mem::size_of::<Allocation<BeforeShared>>()
+    }
     pub fn start(wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
         Self::start_with_index_limit(0, wake)
     }
@@ -298,6 +444,7 @@ impl LogSession {
     /// log projection registry, not a source-size or RAM limit. Zero keeps the
     /// old hit-only API. No directory, source read or file open happens here.
     pub fn start_with_index_limit(max_index_bytes: u64, wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
+        Self::checked_retained_metadata_bytes().ok_or(io::Error::from(io::ErrorKind::OutOfMemory))?;
         let (signal, ready) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared {
             mailbox: Mutex::new(Mailbox::default()),
@@ -307,13 +454,20 @@ impl LogSession {
             retire_index: AtomicBool::new(false),
             retirement_error: Mutex::new(None),
             signal,
+            completed: AtomicBool::new(false),
+            native_exit: NativeExitObservation::new(),
+            completion: Condvar::new(),
         });
         let worker_shared = shared.clone();
         let worker = thread::Builder::new().name("kwil-log".into()).spawn(move || {
+            let _completion = Completion(&worker_shared);
+            if worker_shared.native_exit.register_current().is_err() {
+                worker_shared.closed.store(true, Ordering::Release);
+            }
             let _retirement = WorkerRetirement(worker_shared.clone());
             worker_loop(&worker_shared, ready, &wake, max_index_bytes);
         })?;
-        Ok(Self { shared, worker: Some(worker), generation: 0 })
+        Ok(Self { shared, worker: Some(worker), generation: 0, panic: None, native_retired: false, settled: false })
     }
 
     /// Nonblocking: takes ownership only on acceptance. A full/busy mailbox
@@ -434,12 +588,207 @@ impl LogSession {
         RetirementStatus(self.shared.clone())
     }
 
-    /// Cancels without locking, reading or dropping sources on the caller.
-    /// Move the returned handle to the host's shutdown owner and join off UI.
-    /// The worker retires active, pending and superseded sources before exit.
-    pub fn stop(mut self) -> JoinHandle<()> {
+    /// Explicit OFF-UI UNBOUNDED compatibility join. Never call from a bounded
+    /// shutdown protocol; failure retains the complete original owner.
+    pub fn shutdown(mut self) -> Result<(), LogShutdownError> {
+        self.shutdown_in_place().map_err(|reason| LogShutdownError { owner: Mutex::new(Some(self)), reason })
+    }
+    pub fn shutdown_until(mut self, deadline: Instant) -> Result<(), LogShutdownError> {
+        self.settle_until(deadline).map_err(|reason| LogShutdownError { owner: Mutex::new(Some(self)), reason })
+    }
+    pub(crate) fn shutdown_in_place(&mut self) -> Result<(), LogSettlementReason> {
         self.close();
-        self.worker.take().expect("log worker handle already taken")
+        if let Some(handle) = self.worker.take()
+            && let Err(panic) = handle.join()
+        {
+            self.panic = Some(panic);
+        }
+        self.finish_join_with(None, NativeExitObservation::retire_after_join)
+    }
+    /// OFF UI. One existing completion wait, one borrowed native observation,
+    /// the ORIGINAL deadline, and no production polling. ACK/is_finished alone
+    /// never authorizes join. Every refusal retains the exact original owners.
+    pub fn settle_until(&mut self, deadline: Instant) -> Result<(), LogSettlementReason> {
+        self.settle_with(
+            deadline,
+            |observation, handle| observation.query(handle),
+            NativeExitObservation::retire_after_join,
+        )
+    }
+    fn settle_with(
+        &mut self,
+        deadline: Instant,
+        query: impl FnOnce(&NativeExitObservation, &JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), LogSettlementReason> {
+        self.close();
+        if self.worker.is_some() {
+            let shared = &self.shared;
+            let guard = shared.mailbox.lock().unwrap_or_else(|error| error.into_inner());
+            let (guard, _) = shared
+                .completion
+                .wait_timeout_while(guard, deadline.saturating_duration_since(Instant::now()), |_| {
+                    !shared.completed.load(Ordering::Acquire)
+                })
+                .unwrap_or_else(|error| error.into_inner());
+            let completed = shared.completed.load(Ordering::Acquire);
+            drop(guard);
+            if !completed {
+                return Err(LogSettlementReason::TimedOut);
+            }
+            // Query before consuming anything, even after a cleanup ACK. It also
+            // retains original registration errors and any partial owned right.
+            match query(&shared.native_exit, self.worker.as_ref().expect("original worker handle")) {
+                Ok(NativeExitState::Pending) => return Err(LogSettlementReason::ThreadExitPending),
+                Err(error) => return Err(LogSettlementReason::NativeObservation(error)),
+                Ok(NativeExitState::Exited) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(LogSettlementReason::TimedOut);
+            }
+            if let Err(panic) = self.worker.take().expect("native-exited original handle").join() {
+                self.panic = Some(panic);
+            }
+        }
+        // thread=None means the ORIGINAL join already returned, including panic;
+        // it does not imply native-right retirement completed on a prior call.
+        self.finish_join_with(Some(deadline), retire)
+    }
+    fn finish_join_with(
+        &mut self,
+        deadline: Option<Instant>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), LogSettlementReason> {
+        self.finish_join_with_clock(deadline, retire, Instant::now)
+    }
+    fn finish_join_with_clock(
+        &mut self,
+        deadline: Option<Instant>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+        mut now: impl FnMut() -> Instant,
+    ) -> Result<(), LogSettlementReason> {
+        // Once the right is retired, sticky diagnostics precede deadline-only
+        // no-op retries. No consumed panic payload can turn into fake success.
+        if self.native_retired {
+            if self.panic.is_some() {
+                return Err(LogSettlementReason::WorkerPanicked);
+            }
+            if let Some(error) = self.shared.native_exit.registration_error() {
+                return Err(LogSettlementReason::NativeObservation(error));
+            }
+            if self.settled {
+                return Ok(());
+            }
+        }
+        if !self.settled && deadline.is_some_and(|deadline| now() >= deadline) {
+            return Err(LogSettlementReason::TimedOut);
+        }
+        if !self.native_retired {
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Err(LogSettlementReason::TimedOut);
+            }
+            retire(&self.shared.native_exit).map_err(LogSettlementReason::NativeObservation)?;
+            self.native_retired = true;
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Err(LogSettlementReason::TimedOut);
+            }
+        }
+        if self.panic.is_some() {
+            return Err(LogSettlementReason::WorkerPanicked);
+        }
+        if let Some(error) = self.shared.native_exit.registration_error() {
+            return Err(LogSettlementReason::NativeObservation(error));
+        }
+        self.settled = true;
+        Ok(())
+    }
+    /// Scalar-only original native retirement evidence; no native query or I/O.
+    pub fn first_native_retirement_error(&self) -> Option<NativeObservationError> {
+        self.shared.native_exit.first_retirement_error()
+    }
+    pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send + 'static)> {
+        self.panic.as_deref()
+    }
+
+    /// Explicit OFF-UI retry after this original worker has successfully joined.
+    /// This is the SAME process-private inactive-registry capability used by
+    /// IndexSpool admission/retirement: one pass over at most four registered
+    /// owners, never active entries, caller-supplied paths or a directory scan.
+    ///
+    /// The first String diagnostic stays unchanged on every failed/late retry;
+    /// only an on-time full reap clears it. It is existing formatted diagnostic
+    /// evidence, NOT the original io::Error. An OS unlink cannot be preempted:
+    /// late success retires its exact charge but still returns TimedOut.
+    pub fn retry_retirement_until(&mut self, deadline: Instant) -> Result<(), LogRetirementRetryReason> {
+        self.retry_retirement_with(
+            deadline,
+            || {
+                let mut leases = match INDEX_LEASES.try_lock() {
+                    Ok(leases) => leases,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        return Err(if Instant::now() >= deadline {
+                            LogRetirementRetryReason::TimedOut
+                        } else {
+                            LogRetirementRetryReason::Failed
+                        });
+                    }
+                };
+                reap_indexes_until_with(&mut leases, deadline, |path| std::fs::remove_file(path), Instant::now)
+            },
+            Instant::now,
+        )
+    }
+
+    fn retry_retirement_with(
+        &mut self,
+        deadline: Instant,
+        reap: impl FnOnce() -> Result<(), LogRetirementRetryReason>,
+        mut now: impl FnMut() -> Instant,
+    ) -> Result<(), LogRetirementRetryReason> {
+        // Only the successful settle join can consume the handle without
+        // installing a sticky panic. Do not stop, join or replace anything here.
+        if self.worker.is_some()
+            || !self.native_retired
+            || self.panic.is_some()
+            || self.shared.native_exit.registration_error().is_some()
+            || !self.shared.completed.load(Ordering::Acquire)
+        {
+            return Err(LogRetirementRetryReason::WorkerNotJoined);
+        }
+        if now() >= deadline {
+            return Err(LogRetirementRetryReason::TimedOut);
+        }
+        let result = reap();
+        if now() >= deadline {
+            return Err(LogRetirementRetryReason::TimedOut);
+        }
+        result?;
+        // Never hold this UI-readable status lock across filesystem I/O, and
+        // never wait unboundedly for it. A later explicit pass can clear status.
+        let mut diagnostic = match self.shared.retirement_error.try_lock() {
+            Ok(diagnostic) => diagnostic,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(if now() >= deadline {
+                    LogRetirementRetryReason::TimedOut
+                } else {
+                    LogRetirementRetryReason::Failed
+                });
+            }
+        };
+        if now() >= deadline {
+            return Err(LogRetirementRetryReason::TimedOut);
+        }
+        diagnostic.take();
+        Ok(())
+    }
+
+    /// Nonblocking whole-session ownership transfer. No raw handle escapes;
+    /// join/retirement belong to the explicit OFF-UI receiver of this ticket.
+    pub fn stop(self) -> LogShutdown {
+        self.close();
+        LogShutdown { session: self }
     }
 
     fn close(&self) {
@@ -450,11 +799,29 @@ impl LogSession {
 
 impl Drop for LogSession {
     fn drop(&mut self) {
-        // Detach only the thread handle. WorkerRetirement still clears every
-        // source on the worker, including during unwinding after a panic.
         self.close();
+        if self.worker.is_some() || !self.settled || self.panic.is_some() {
+            // Misuse quarantine, NOT successful retirement: retain the SAME
+            // shared allocation/source headers/native right and exact handle.
+            // No native I/O, source destruction, new allocation or cleanup thread.
+            std::mem::forget(Arc::clone(&self.shared));
+            std::mem::forget(self.worker.take());
+            std::mem::forget(self.panic.take());
+        }
     }
 }
+
+// Checked declared Rust-value accounting, not compiler/native-stack usage.
+const fn metadata_add(bytes: Option<usize>, extra: usize) -> Option<usize> {
+    match bytes {
+        Some(bytes) => bytes.checked_add(extra),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "log_session/bounded_settlement_tests.rs"]
+mod bounded_settlement_tests;
 
 struct WorkerRetirement(Arc<Shared>);
 impl Drop for WorkerRetirement {
@@ -579,6 +946,33 @@ fn reap_indexes_with(
         }
     }
     Ok(())
+}
+
+/// One existing registered-reap pass, with deadline checks around each actual
+/// unlink. Keep its original successful/NotFound retirement and failed-charge
+/// semantics. The injected clock/remove seams only mock slow/failing I/O in
+/// source tests; production invokes them synchronously on the OFF-UI producer.
+fn reap_indexes_until_with(
+    leases: &mut [Option<IndexLease>; INDEX_OWNERS],
+    deadline: Instant,
+    mut remove: impl FnMut(&std::path::Path) -> io::Result<()>,
+    mut now: impl FnMut() -> Instant,
+) -> Result<(), LogRetirementRetryReason> {
+    let mut late = false;
+    let result = reap_indexes_with(leases, |path| {
+        if now() >= deadline {
+            late = true;
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        let result = remove(path);
+        late |= now() >= deadline;
+        result
+    });
+    if late || now() >= deadline {
+        Err(LogRetirementRetryReason::TimedOut)
+    } else {
+        result.map_err(|_| LogRetirementRetryReason::Failed)
+    }
 }
 
 struct IndexSpool {
@@ -1599,7 +1993,7 @@ mod tests {
         }
         let shared = session.shared.clone();
         let join = session.stop();
-        assert!(!join.is_finished(), "stop must not wait for the gated worker");
+        assert!(!join.session.worker.as_ref().unwrap().is_finished(), "stop must not wait for the gated worker");
         assert_eq!(shared.mailbox.lock().unwrap().retired.iter().flatten().count(), RETIRED);
         release.send(()).unwrap();
         join.join().unwrap();

@@ -87,7 +87,9 @@ impl App {
         self.apply(Damage { full: true, status: true, ..Default::default() });
     }
     fn binary_choose(&mut self, choice: Choice) {
-        let Some(close_dialog::Ticket::Binary(prompt)) = self.close_dialog.as_ref() else { return };
+        let Some(close_dialog::Ticket::Binary(prompt)) = self.close_dialog.as_ref() else {
+            return;
+        };
         if prompt.native {
             return;
         }
@@ -104,7 +106,9 @@ impl App {
             return false;
         }
         self.sync_binary_input();
-        let Some(close_dialog::Ticket::Binary(prompt)) = self.close_dialog.as_mut() else { return true };
+        let Some(close_dialog::Ticket::Binary(prompt)) = self.close_dialog.as_mut() else {
+            return true;
+        };
         if prompt.native {
             return true;
         }
@@ -191,7 +195,9 @@ pub(super) fn draw(
     if !pending {
         return None;
     }
-    let Some(close_dialog::Ticket::Binary(prompt)) = state else { return None };
+    let Some(close_dialog::Ticket::Binary(prompt)) = state else {
+        return None;
+    };
     prompt.surface = None;
     prompt.buttons = [None; 3];
     if prompt.native || !offer.is_some_and(|offer| offer.ticket == prompt.ticket) {
@@ -293,10 +299,9 @@ mod tests {
             }
             let remaining = deadline.checked_duration_since(Instant::now()).expect("binary GUI deadline");
             match rx.recv_timeout(remaining).expect("binary GUI worker wake") {
-                UserEvent::Document(result) => {
-                    let damage = app.view.document_result(*result);
-                    app.sync_file_ui();
-                    app.apply(damage);
+                UserEvent::DocumentReady => {
+                    app.document_ready();
+                    crate::document_ui::fixtures::publish(app);
                 }
                 _ => panic!("unexpected binary GUI test wake"),
             }
@@ -310,12 +315,8 @@ mod tests {
         let root = fixture_root_in(&std::env::temp_dir(), &NEXT_ROOT).unwrap();
         let path = root.join("physical.bin");
         std::fs::write(&path, BYTES).unwrap();
-        let proxy = app.proxy.clone();
-        app.view
-            .start_document_worker_at(Some(root.join("state")), move |result| {
-                let _ = proxy.send_event(UserEvent::Document(Box::new(result)));
-            })
-            .unwrap();
+        app.start_document_at(Some(root.join("state")));
+        assert!(app.document.live.transport.is_some());
         until(&mut app, &rx, |a| a.view.recovery_ready());
         (app, rx, root, path, prior)
     }
@@ -340,10 +341,9 @@ mod tests {
         for _ in 0..512 {
             match rx.try_recv() {
                 Ok(UserEvent::OpenExternal) => wakes += 1,
-                Ok(UserEvent::Document(result)) => {
-                    let damage = app.view.document_result(*result);
-                    app.sync_file_ui();
-                    app.apply(damage);
+                Ok(UserEvent::DocumentReady) => {
+                    app.document_ready();
+                    crate::document_ui::fixtures::publish(app);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return wakes,
                 _ => panic!("unexpected external-open test wake"),
@@ -362,25 +362,17 @@ mod tests {
             let event = rx
                 .recv_timeout(deadline.checked_duration_since(Instant::now()).expect("binary GUI shutdown deadline"))
                 .unwrap();
-            if let UserEvent::Document(result) = event {
-                app.view.document_result(*result);
+            if let UserEvent::DocumentReady = event {
+                app.document_ready();
+                crate::document_ui::fixtures::publish(&mut app);
             }
         }
         assert!(app.view.prepare_hex_shutdown());
-        drop(app);
-        for _ in 0..512 {
-            let event = rx
-                .recv_timeout(deadline.checked_duration_since(Instant::now()).expect("binary GUI stopped deadline"))
-                .unwrap();
-            if matches!(event, UserEvent::Document(result) if matches!(*result, kwil_view_model::document_worker::DocumentResult::Stopped(Ok(()))))
-            {
-                assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
-                assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-gui-binary-"));
-                std::fs::remove_dir_all(root).unwrap();
-                return;
-            }
-        }
-        panic!("binary GUI worker did not stop");
+        crate::document_ui::fixtures::settle_app(app);
+        drop(rx);
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-gui-binary-"));
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn actual_gui_binary_offer_choices_hide_content_and_preserve_physical_bytes_and_cancel_history() {
@@ -583,7 +575,7 @@ mod tests {
     }
     #[test]
     fn actual_gui_vetted_preview_paints_while_real_open_completion_is_held() {
-        use kwil_view_model::document_worker::DocumentResult;
+        use kwil_view_model::workspace_document::ResultKind;
         // None exercises normal classified text, whose first screen must not
         // wait for indexing either. Text/Hex exercise the accepted binary path.
         for choice in [None, Some(Choice::Text), Some(Choice::Hex)] {
@@ -614,7 +606,7 @@ mod tests {
                 if preview && completion.is_some() {
                     break;
                 }
-                let UserEvent::Document(result) = rx
+                let UserEvent::DocumentReady = rx
                     .recv_timeout(
                         deadline.checked_duration_since(Instant::now()).expect("held GUI completion deadline"),
                     )
@@ -622,18 +614,23 @@ mod tests {
                 else {
                     panic!("unexpected held GUI completion event")
                 };
-                if matches!(&*result, DocumentResult::CheckedOpened { ticket, .. } if ticket.document() == id) {
-                    assert!(completion.is_none(), "one finite held final result cell");
-                    assert!(matches!(&*result, DocumentResult::CheckedOpened { result: Ok(Some(_)), .. }));
-                    completion = Some(result);
+                let info = app.document.live.transport.as_ref().unwrap().result_info();
+                if info.is_some_and(|info| info.kind == ResultKind::Opened && info.document == Some(id)) {
+                    assert!(completion.is_none(), "one original worker slot");
+                    completion = info;
+                    let refused = app.document.live.transport.as_mut().unwrap().receive(&mut app.view, false);
+                    assert!(matches!(
+                        refused,
+                        Err(kwil_view_model::document_worker::DocumentResultSettlementReason::ConsumerRefused)
+                    ));
+                    assert!(app.document.live.transport.as_ref().unwrap().status().failure.is_none());
+                    assert_eq!(app.document.live.transport.as_ref().unwrap().result_info(), completion);
                     continue;
                 }
-                let current_preview = matches!(&*result,
-                    DocumentResult::CheckedPreview { ticket, .. } | DocumentResult::CheckedRawPreview { ticket, .. }
-                    if ticket.document() == id);
-                let damage = app.view.document_result(*result);
-                app.sync_file_ui();
-                app.apply(damage);
+                let current_preview =
+                    info.is_some_and(|info| info.kind == ResultKind::Preview && info.document == Some(id));
+                app.document_ready();
+                crate::document_ui::fixtures::publish(&mut app);
                 preview |= current_preview;
             }
             assert!(preview, "the actual worker published a first-screen preview");
@@ -673,9 +670,9 @@ mod tests {
             assert_eq!(app.view.hex_session().map(|session| session.view().cursor()), raw_cursor);
             assert!(app.view.editor().is_none());
             assert!(!app.binary_blocks_paint(), "input refusal must preserve the vetted preview");
-            let damage = app.view.document_result(*completion);
-            app.sync_file_ui();
-            app.apply(damage);
+            let transport = app.document.live.transport.as_ref().unwrap();
+            assert_eq!(transport.result_info(), Some(completion));
+            transport.wake_ready();
             until(&mut app, &rx, |a| !a.view.document_busy(id) && a.view.editor().is_some());
             assert!(!app.binary_pending());
             assert_eq!(bytes(&app), if choice.is_some() { BYTES } else { b"first screen\nsecond line\n" });

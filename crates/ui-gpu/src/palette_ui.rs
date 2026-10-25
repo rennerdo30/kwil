@@ -250,6 +250,9 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
+                if command == "view.retryWrap" && self.wrap_command(command, 1, false) {
+                    return;
+                }
                 if self.dispatch_hex(command) {
                     return;
                 }
@@ -275,6 +278,9 @@ impl App {
                         if self.preview_blocks_command(call.id) {
                             return;
                         }
+                        if self.wrap_vim_command(&call) {
+                            return;
+                        }
                         if self.preview_blocks_command(call.id) {
                             return;
                         }
@@ -282,6 +288,7 @@ impl App {
                             match editor.execute_vim(&call) {
                                 Ok(result) => {
                                     let damage = self.view.refresh_after_edit(result.damage);
+                                    let damage = self.wrap_model_damage(damage);
                                     self.apply(damage);
                                     self.keep_caret_visible();
                                     self.command_status(result.status);
@@ -318,6 +325,10 @@ impl App {
                 self.apply(Damage { full: true, status: true, ..Default::default() });
             }
             PaletteAction::GoTo { line, column } => {
+                self.wrap_sync_live();
+                if !self.wrap_mutation_allowed() {
+                    return;
+                }
                 // The existing View queues a goto until indexing attaches its
                 // Editor. Reveal its horizontal window on that addressed event.
                 let target = (self.view.active_id(), self.view.input_epoch());
@@ -329,7 +340,8 @@ impl App {
                 match result {
                     Ok(result) => {
                         self.goto_reveal = (result.status == CommandStatus::IndexNotReady).then_some(target);
-                        self.apply(result.damage);
+                        let damage = self.wrap_model_damage(result.damage);
+                        self.apply(damage);
                         self.keep_caret_visible();
                         self.command_status(result.status);
                     }

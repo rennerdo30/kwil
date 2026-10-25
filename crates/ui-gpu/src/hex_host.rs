@@ -22,9 +22,9 @@ mod tests {
     };
     fn dispatch(app: &mut App, event: UserEvent) {
         match event {
-            UserEvent::Document(result) => {
-                let damage = app.view.document_result(*result);
-                app.apply(damage);
+            UserEvent::DocumentReady => {
+                app.document_ready();
+                crate::document_ui::fixtures::publish(app);
             }
             UserEvent::Notice(notice) => {
                 let damage = app.view.set_notice(notice);
@@ -71,58 +71,14 @@ mod tests {
             workspace.notice()
         )
     }
-    fn wake_description(event: &UserEvent) -> String {
-        use kwil_view_model::document_worker::DocumentResult as R;
-        let UserEvent::Document(result) = event else {
-            return match event {
-                UserEvent::Notice(notice) => format!("Notice({notice:?})"),
-                _ => "non-document wake".into(),
-            };
-        };
-        match &**result {
-            R::RawPreview { document, revision, page } => {
-                format!("RawPreview document={document:?} revision={revision} request={:?}", page.request)
-            }
-            R::RawReopened { document, generation, result, .. } => format!(
-                "RawReopened document={document:?} generation={generation} result={:?}",
-                result.as_ref().map_err(ToString::to_string)
+    fn wake_description(app: &App, event: &UserEvent) -> String {
+        match event {
+            UserEvent::DocumentReady => format!(
+                "DocumentReady {:?}",
+                app.document.live.transport.as_ref().and_then(|transport| transport.result_info())
             ),
-            R::HexPage { document, request, result, .. } => format!(
-                "HexPage document={document:?} request={request:?} result={:?}",
-                result.as_ref().map(|_| ()).map_err(ToString::to_string)
-            ),
-            R::HexEdited { document, completion, .. } => format!(
-                "HexEdited document={document:?} operation={} before={:?} after={:?} result={:?}",
-                completion.operation, completion.before, completion.after, completion.result
-            ),
-            R::Saved { document, revision, result } => format!(
-                "Saved document={document:?} revision={revision} result={:?}",
-                result.as_ref().map(|_| ()).map_err(ToString::to_string)
-            ),
-            R::Preview { document, revision, .. } => format!("TextPreview document={document:?} revision={revision}"),
-            R::Indexed { document, revision, result } => format!(
-                "Indexed document={document:?} revision={revision} result={:?}",
-                result.as_ref().map(|_| ()).map_err(ToString::to_string)
-            ),
-            R::JournalQueued { document, revision, sequence, result } => format!(
-                "JournalQueued document={document:?} revision={revision} sequence={sequence} result={:?}",
-                result.as_ref().map_err(ToString::to_string)
-            ),
-            R::JournalDurable { document, revision, sequence, result } => format!(
-                "JournalDurable document={document:?} revision={revision} sequence={sequence} result={:?}",
-                result.as_ref().map_err(ToString::to_string)
-            ),
-            R::JournalClosed { document, result } => {
-                format!("JournalClosed document={document:?} result={:?}", result.as_ref().map_err(ToString::to_string))
-            }
-            R::Prepared(result) => {
-                format!("Prepared result={:?}", result.as_ref().map(|_| ()).map_err(ToString::to_string))
-            }
-            R::Persisted(result) => format!("Persisted result={:?}", result.as_ref().map_err(ToString::to_string)),
-            R::Stopped(result) => format!("Stopped result={:?}", result.as_ref().map_err(ToString::to_string)),
-            R::SessionCheckpointDue => "SessionCheckpointDue".into(),
-            R::CapacityAvailable => "CapacityAvailable".into(),
-            _ => "other document result".into(),
+            UserEvent::Notice(notice) => format!("Notice({notice:?})"),
+            _ => "non-document wake".into(),
         }
     }
     fn until(app: &mut App, rx: &Receiver<UserEvent>, stage: &'static str, done: impl Fn(&App) -> bool) {
@@ -136,7 +92,7 @@ mod tests {
             let event = rx.recv_timeout(remaining).unwrap_or_else(|error| {
                 panic!("hex-host stage={stage} worker wake {error:?}; {}; recent wakes={recent:#?}", pending_state(app))
             });
-            let description = wake_description(&event);
+            let description = wake_description(app, &event);
             dispatch(app, event);
             if recent.len() == 24 {
                 recent.pop_front();
@@ -149,24 +105,15 @@ mod tests {
         let (mut app, rx) = search_ui::host_dispatch_tests::host("");
         app.opts.hidden = true;
         app.size = (800, 240);
-        let root = std::env::temp_dir().join(format!(
-            "kwil-gui-hex-host-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let root = crate::test_support::directory("kwil-gui-hex-host").unwrap();
         let path = root.join("physical.bin");
         let mut content = vec![b'x'; 1024];
         content[0] = 0x12;
         content[1] = 0xff;
         content[2] = 0;
         std::fs::write(&path, content).unwrap();
-        let proxy = app.proxy.clone();
-        app.view
-            .start_document_worker_at(Some(root.join("recovery")), move |result| {
-                let _ = proxy.send_event(UserEvent::Document(Box::new(result)));
-            })
-            .unwrap();
+        app.start_document_at(Some(root.join("recovery")));
+        assert!(app.document.live.transport.is_some());
         until(&mut app, &rx, "fixture/prepare-recovery", |a| a.view.recovery_ready());
         app.view.open_hex_path(path.clone(), 3).unwrap();
         app.apply(kwil_view_model::hex_session::body_damage());
@@ -205,28 +152,11 @@ mod tests {
             let event = rx.recv_timeout(remaining).unwrap_or_else(|error| {
                 panic!("hex-host stage=shutdown/raw-editor-retirement wake {error:?}; {}", pending_state(&app))
             });
-            eprintln!("hex-host stage=shutdown/raw-editor-retirement wake {}", wake_description(&event));
+            eprintln!("hex-host stage=shutdown/raw-editor-retirement wake {}", wake_description(&app, &event));
             dispatch(&mut app, event);
         }
-        let before_drop = pending_state(&app);
-        eprintln!("hex-host stage=shutdown/worker-stopped begin {before_drop}");
-        drop(app);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or_else(|| {
-                panic!("hex-host stage=shutdown/worker-stopped deadline expired; before drop {before_drop}")
-            });
-            let event = rx.recv_timeout(remaining).unwrap_or_else(|error| {
-                panic!("hex-host stage=shutdown/worker-stopped wake {error:?}; before drop {before_drop}")
-            });
-            eprintln!("hex-host stage=shutdown/worker-stopped wake {}", wake_description(&event));
-            if let UserEvent::Document(result) = event
-                && let kwil_view_model::document_worker::DocumentResult::Stopped(result) = *result
-            {
-                result.unwrap();
-                break;
-            }
-        }
+        crate::document_ui::fixtures::settle_app(app);
+        drop(rx);
         assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
         assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-gui-hex-host-"));
         std::fs::remove_dir_all(root).unwrap();
@@ -875,7 +805,9 @@ impl App {
         }
         if vertical {
             let result = self.view.hex_session_mut().map(|s| {
-                let Some(source) = s.source() else { return Ok(Outcome::default()) };
+                let Some(source) = s.source() else {
+                    return Ok(Outcome::default());
+                };
                 s.input(source, s.input_epoch(), Input::ScrollTo(offset)).map_err(|e| e.to_string())
             });
             if let Some(result) = result {

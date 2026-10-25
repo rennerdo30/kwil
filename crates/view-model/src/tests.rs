@@ -423,7 +423,7 @@ fn saved_revision_and_concurrent_edits_keep_undo_and_dirty_state() {
     ));
     let request = e.save_request(Some(path.clone())).unwrap();
     let saved = std::thread::spawn(|| kwil_core_workspace::save_snapshot(request)).join().unwrap();
-    e.finish_save(saved).unwrap();
+    e.finish_save_for_test(saved).unwrap();
     assert!(!e.document().is_dirty());
     e.undo().unwrap();
     assert_eq!(bytes(&e), b"old");
@@ -431,7 +431,7 @@ fn saved_revision_and_concurrent_edits_keep_undo_and_dirty_state() {
     let request = e.save_request(None).unwrap();
     type_text(&mut e, "!", 1000);
     let saved = std::thread::spawn(|| kwil_core_workspace::save_snapshot(request)).join().unwrap();
-    e.finish_save(saved).unwrap();
+    e.finish_save_for_test(saved).unwrap();
     assert!(e.document().is_dirty());
     assert_eq!(std::fs::read(&path).unwrap(), b"old");
     assert_eq!(bytes(&e), b"!old");
@@ -455,7 +455,7 @@ fn save_rebases_current_root_and_keeps_pre_save_worker_alive() {
     type_text(&mut e, "new ", 0);
     let worker = e.document().snapshot();
     let request = e.save_request(None).unwrap();
-    e.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+    e.finish_save_for_test(kwil_core_workspace::save_snapshot(request)).unwrap();
     e.set_undo_memory_limit(0);
     let mut output = Vec::new();
     worker.write_to(&mut output).unwrap();
@@ -495,7 +495,7 @@ fn trim_save_request_does_no_reads_and_worker_completion_is_undoable() {
     assert_eq!(e.document().revision(), 0);
     std::fs::rename(&moved, &path).unwrap();
     let saved = std::thread::spawn(|| kwil_core_workspace::save_snapshot(request)).join().unwrap();
-    let result = e.finish_save(saved).unwrap();
+    let result = e.finish_save_for_test(saved).unwrap();
     assert_eq!(bytes(&e), b"a\r\nb\nlast");
     assert!(!e.document().is_dirty());
     assert_eq!(result.damage.rows, vec![0, 1, 2]);
@@ -527,7 +527,7 @@ fn concurrent_trim_save_never_marks_untrimmed_undo_version_clean() {
     e.settings.editor.trim_trailing_whitespace_on_save = true;
     let request = e.save_request(None).unwrap();
     type_text(&mut e, "!", 100);
-    e.finish_save(std::thread::spawn(|| kwil_core_workspace::save_snapshot(request)).join().unwrap()).unwrap();
+    e.finish_save_for_test(std::thread::spawn(|| kwil_core_workspace::save_snapshot(request)).join().unwrap()).unwrap();
     assert_eq!(bytes(&e), b"!a  \n");
     assert_eq!(std::fs::read(&path).unwrap(), b"a\n");
     assert!(e.document().is_dirty());
@@ -692,7 +692,7 @@ fn whole_document_line_move_and_clipboard_reuse_keep_original_pieces_owned() {
     assert_eq!(e.document().buffer().add_memory_bytes(), 0);
     assert_eq!(bytes(&e), content);
     let request = e.save_request(None).unwrap();
-    e.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+    e.finish_save_for_test(kwil_core_workspace::save_snapshot(request)).unwrap();
     e.select_all().unwrap();
     e.delete(false, false).unwrap();
     e.paste(&mut clipboard).unwrap();
@@ -922,7 +922,7 @@ fn receipts_backpressure_retains_save_completion_and_stale_save_settles() {
     assert!(e.set_edit_observer(None).is_err());
     let request = e.save_request(Some(path.clone())).unwrap();
     let saved = kwil_core_workspace::save_snapshot(request);
-    assert_eq!(e.finish_save(saved).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(e.finish_save_for_test(saved).unwrap_err().kind(), io::ErrorKind::WouldBlock);
     assert!(e.has_pending_save_completion());
     accepting.store(true, Ordering::Relaxed);
     e.flush_edit_receipt().unwrap();
@@ -936,7 +936,7 @@ fn receipts_backpressure_retains_save_completion_and_stale_save_settles() {
     let request = e.save_request(None).unwrap();
     type_text(&mut e, "  ", 1000);
     let count = accepted.lock().unwrap().len();
-    e.finish_save(kwil_core_workspace::save_snapshot(request)).unwrap();
+    e.finish_save_for_test(kwil_core_workspace::save_snapshot(request)).unwrap();
     assert_eq!(accepted.lock().unwrap().len(), count);
     let end = e.line_range(0).unwrap().end;
     at(&mut e, end);
@@ -948,7 +948,7 @@ fn receipts_backpressure_retains_save_completion_and_stale_save_settles() {
     let count = accepted.lock().unwrap().len();
     let saved = kwil_core_workspace::save_snapshot(request).unwrap();
     assert!(saved.trimmed_rows.is_some(), "exercise a transformed stale result");
-    e.finish_save(Ok(saved)).unwrap();
+    e.finish_save_for_test(Ok(saved)).unwrap();
     assert_eq!(accepted.lock().unwrap().len(), count);
     assert!(e.has_pending_edit_receipt());
     assert!(!e.has_pending_save_completion());

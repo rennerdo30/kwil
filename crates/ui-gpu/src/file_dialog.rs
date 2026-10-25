@@ -199,6 +199,18 @@ pub(crate) struct Dialogs {
     exiting: bool,
 }
 impl Dialogs {
+    /// An accepted close after a document delivery refusal transfers pending
+    /// saves to the sealed bundle. Only the native dialog's real stop receipt
+    /// must still arrive on this event loop; no document result is discarded.
+    pub fn document_shutdown(&mut self, workspace: &mut Workspace) -> bool {
+        self.exiting = true;
+        if let Some(worker) = &mut self.worker {
+            self.gate.shutdown(workspace, worker);
+            self.gate.stopped()
+        } else {
+            true
+        }
+    }
     pub fn exiting(&self) -> bool {
         self.exiting
     }
@@ -411,83 +423,46 @@ mod tests {
 
     #[test]
     fn forced_exit_waits_for_accepted_save_receipt_without_starting_new_transactions() {
-        let (mut workspace, _gate, _fake) = setup();
+        let (mut workspace, rx, root) = isolated();
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("dirty 日本語".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.file_command("file.save").unwrap();
         let ticket = workspace.native_file_prompt().unwrap();
-        workspace.submit_native_file_prompt(&ticket, std::env::temp_dir().join("kw56-pending-receipt.txt")).unwrap();
+        workspace.submit_native_file_prompt(&ticket, root.join("missing-parent").join("pending-receipt.txt")).unwrap();
         assert!(workspace.file_saves_pending());
         let mut dialogs = Dialogs::default();
         assert!(!dialogs.force_exit(&mut workspace));
         assert!(!workspace.close_pending());
-        let document = workspace.active_id();
-        let revision = workspace.editor().unwrap().document().revision();
-        workspace.document_result(kwil_view_model::document_worker::DocumentResult::Saved {
-            document,
-            revision,
-            result: Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "mock save error")),
-        });
+        drain_until(&mut workspace, &rx, |workspace| !workspace.file_saves_pending());
         assert!(!workspace.file_saves_pending());
         assert!(dialogs.may_exit(&mut workspace));
         assert!(workspace.editor().unwrap().document().is_dirty());
+        settle_and_remove(workspace, rx, root);
     }
 
     // ROOT-only draft: actual Workspace + existing DocumentWorker + fake native
     // backend. Every write is under this test's newly created explicit root.
     // No environment override, profile lookup or real native window is needed.
-    fn isolated() -> (Workspace, std::sync::mpsc::Receiver<kwil_view_model::document_worker::DocumentResult>, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "kw56-dialog-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
+    fn isolated() -> (Workspace, crate::document_ui::fixtures::Lane, PathBuf) {
+        let root = crate::test_support::directory("kw56-dialog").unwrap();
         let mut workspace = Workspace::new(View::new(None)).unwrap();
-        workspace
-            .start_document_worker_at(Some(root.join("state")), move |result| {
-                let _ = tx.send(result);
-            })
-            .unwrap();
-        drain_until(&mut workspace, &rx, |workspace| workspace.recovery_ready());
-        (workspace, rx, root)
+        let lane = crate::document_ui::fixtures::Lane::start(&mut workspace, root.join("state"));
+        drain_until(&mut workspace, &lane, |workspace| workspace.recovery_ready());
+        (workspace, lane, root)
     }
     fn drain_until(
         workspace: &mut Workspace,
-        rx: &std::sync::mpsc::Receiver<kwil_view_model::document_worker::DocumentResult>,
+        lane: &crate::document_ui::fixtures::Lane,
         done: impl Fn(&Workspace) -> bool,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for _ in 0..512 {
-            if done(workspace) {
-                return;
-            }
-            let remaining =
-                deadline.checked_duration_since(std::time::Instant::now()).expect("bounded Workspace worker deadline");
-            let result = rx.recv_timeout(remaining).expect("Workspace worker receipt before deadline");
-            workspace.document_result(result);
-        }
-        panic!("bounded Workspace receipt count exceeded");
+        lane.until(workspace, done);
     }
-    fn settle_and_remove(
-        workspace: Workspace,
-        rx: std::sync::mpsc::Receiver<kwil_view_model::document_worker::DocumentResult>,
-        root: PathBuf,
-    ) {
-        use kwil_view_model::document_worker::DocumentResult;
-        drop(workspace);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for _ in 0..512 {
-            let remaining =
-                deadline.checked_duration_since(std::time::Instant::now()).expect("bounded worker shutdown deadline");
-            if matches!(rx.recv_timeout(remaining).unwrap(), DocumentResult::Stopped(Ok(()))) {
-                // Root was create_dir'ed by this test (not create_dir_all), and
-                // worker owns no handle after Stopped. Never follow a fallback.
-                assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
-                assert!(root.file_name().unwrap().to_string_lossy().starts_with("kw56-dialog-"));
-                std::fs::remove_dir_all(root).unwrap();
-                return;
-            }
-        }
-        panic!("worker did not settle within bounded receipt count");
+    fn settle_and_remove(workspace: Workspace, lane: crate::document_ui::fixtures::Lane, root: PathBuf) {
+        lane.settle(workspace);
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(root.file_name().unwrap().to_string_lossy().starts_with("kw56-dialog-"));
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn mocked_native_accept_is_the_only_point_that_can_start_real_save_and_named_save_reuses_path() {

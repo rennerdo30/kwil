@@ -1964,6 +1964,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "kwil-core-runtime",
  "kwil-core-text",
  "memchr",
  "regex",
@@ -2006,6 +2007,7 @@ dependencies = [
  "arborium-xml",
  "arborium-yaml",
  "globset",
+ "kwil-core-runtime",
  "memmap2",
  "tree-sitter",
  "tree-sitter-rust",
@@ -2050,6 +2052,7 @@ dependencies = [
  "fontdue",
  "kwil-core-commands",
  "kwil-core-markdown",
+ "kwil-core-runtime",
  "kwil-core-syntax",
  "kwil-core-text",
  "kwil-core-workspace",
@@ -2095,6 +2098,7 @@ name = "kwil-view-model"
 version = "0.1.0"
 dependencies = [
  "kwil-core-commands",
+ "kwil-core-runtime",
  "kwil-core-search",
  "kwil-core-syntax",
  "kwil-core-text",

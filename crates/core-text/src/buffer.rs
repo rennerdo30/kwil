@@ -269,6 +269,23 @@ pub struct Buffer {
     pub(crate) owner: Arc<()>,
 }
 
+/// Guarded saved-root preparation. The caller admits `saved_install_metadata_bytes`
+/// in its aggregate budget before preparation and retains that charge alongside
+/// this value until off-UI retirement. No source bytes are cloned.
+pub struct PreparedSavedInstall {
+    owner: Arc<()>,
+    epoch: u64,
+    replacement: Snapshot,
+    history: Option<crate::undo::PreparedHistory>,
+    retired: crate::undo::SavedHistoryRetirement,
+    committed: bool,
+}
+impl PreparedSavedInstall {
+    pub fn is_committed(&self) -> bool {
+        self.committed
+    }
+}
+
 impl Default for Buffer {
     fn default() -> Self {
         Self::empty()
@@ -276,6 +293,72 @@ impl Default for Buffer {
 }
 
 impl Buffer {
+    pub fn saved_install_metadata_bytes(&self) -> io::Result<usize> {
+        self.history
+            .saved_metadata_bytes()?
+            .checked_add(std::mem::size_of::<PreparedSavedInstall>())
+            // own_saved_original constructs exactly one leaf with an Arc header.
+            .and_then(|n| n.checked_add(std::mem::size_of::<piece_tree::Node>() + 2 * std::mem::size_of::<usize>()))
+            .ok_or_else(crate::worker_edit::overflow)
+    }
+    pub fn prepare_saved_install(
+        &mut self,
+        saved: &Snapshot,
+        changed: bool,
+        model_bytes: usize,
+    ) -> io::Result<PreparedSavedInstall> {
+        self.worker_epoch.checked_add(1).ok_or_else(crate::worker_edit::overflow)?;
+        if self.transaction.is_some()
+            || (!changed && (saved.len() != self.len() || saved.line_count() != self.line_count()))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid prepared saved checkpoint"));
+        }
+        if !piece_tree::saved_original(&saved.root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "saved install requires a complete file-backed original",
+            ));
+        }
+        let retired = self.history.prepare_saved_retirement()?;
+        let mut replacement = saved.clone();
+        replacement.root = piece_tree::own_saved_original(replacement.root, &self.owner);
+        let history = if changed {
+            Some(self.history.prepare_saved_entry(self.snapshot(), replacement.clone(), model_bytes)?)
+        } else {
+            None
+        };
+        Ok(PreparedSavedInstall {
+            owner: self.owner.clone(),
+            epoch: self.worker_epoch,
+            replacement,
+            history,
+            retired,
+            committed: false,
+        })
+    }
+    /// Borrowed prepublication identity check shared with commit. No source
+    /// reads, allocation, history traversal or owner transfer occurs here.
+    pub fn saved_install_matches(&self, prepared: &PreparedSavedInstall) -> bool {
+        !prepared.committed
+            && Arc::ptr_eq(&self.owner, &prepared.owner)
+            && self.worker_epoch == prepared.epoch
+            && self.transaction.is_none()
+            && self.worker_epoch != u64::MAX
+    }
+    pub fn commit_saved_install(&mut self, prepared: &mut PreparedSavedInstall) -> io::Result<()> {
+        if !self.saved_install_matches(prepared) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "stale prepared saved install"));
+        }
+        // No source read, allocation, callbacks or owner destruction below.
+        self.worker_epoch += 1;
+        std::mem::swap(&mut self.snapshot, &mut prepared.replacement);
+        self.typing = None;
+        if let Some(history) = prepared.history.take() {
+            self.history.install_saved_prepared(history, &mut prepared.retired);
+        }
+        prepared.committed = true;
+        Ok(())
+    }
     /// Existing non-Result mutators fail closed by panicking BEFORE any state
     /// change on exhaustion. Result mutators propagate InvalidInput instead.
     /// Even empty/no-op transaction boundaries invalidate outstanding seeds.
@@ -1433,6 +1516,77 @@ mod tests {
         let mut out = Vec::new();
         snapshot.write_to(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn prepared_saved_install_refuses_epoch_owner_and_checkpoint_shape_without_publication() {
+        let fixture = Fixture::new(b"saved");
+        let saved = Buffer::from_file(TextFile::open_saved_version(&fixture.0).unwrap()).unwrap().snapshot();
+        let mut target = Buffer::empty();
+        target.insert(0, b"old").unwrap();
+        let old = target.snapshot();
+        let epoch = target.worker_epoch;
+        assert!(target.prepare_saved_install(&saved, false, 0).is_err());
+        assert_eq!(target.worker_epoch, epoch);
+        assert!(Arc::ptr_eq(target.snapshot.root.as_ref().unwrap(), old.root.as_ref().unwrap()));
+        target.begin();
+        let compound_epoch = target.worker_epoch;
+        assert!(target.prepare_saved_install(&saved, true, 0).is_err());
+        assert_eq!(target.worker_epoch, compound_epoch);
+        target.cancel();
+        let mut prepared = target.prepare_saved_install(&saved, true, 0).unwrap();
+        let mut wrong = Buffer::empty();
+        assert!(target.saved_install_matches(&prepared));
+        assert!(!wrong.saved_install_matches(&prepared));
+        assert!(wrong.commit_saved_install(&mut prepared).is_err());
+        assert!(!prepared.is_committed());
+        target.end_typing_burst();
+        assert!(!target.saved_install_matches(&prepared));
+        assert!(target.commit_saved_install(&mut prepared).is_err());
+        assert!(!prepared.is_committed());
+        assert!(Arc::ptr_eq(target.snapshot.root.as_ref().unwrap(), old.root.as_ref().unwrap()));
+        target.worker_epoch = u64::MAX;
+        assert!(target.prepare_saved_install(&saved, true, 0).is_err());
+        assert_eq!(target.worker_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn prepared_saved_install_keeps_replaced_root_until_explicit_retirement() {
+        let fixture = Fixture::new(b"saved");
+        let saved = Buffer::from_file(TextFile::open_saved_version(&fixture.0).unwrap()).unwrap().snapshot();
+        let mut target = Buffer::empty();
+        target.insert(0, b"old").unwrap();
+        target.set_undo_memory_limit(0);
+        let old = Arc::downgrade(target.snapshot.root.as_ref().unwrap());
+        let mut prepared = target.prepare_saved_install(&saved, true, 0).unwrap();
+        assert!(target.saved_install_matches(&prepared));
+        target.commit_saved_install(&mut prepared).unwrap();
+        assert!(prepared.is_committed());
+        assert!(!target.saved_install_matches(&prepared));
+        assert_eq!(bytes(&target.snapshot()), b"saved");
+        assert_eq!(target.history_depth(), (0, 0));
+        assert!(old.upgrade().is_some(), "evicted history and replaced root stay guarded");
+        assert!(target.commit_saved_install(&mut prepared).is_err(), "completed core phase cannot replay");
+        drop(prepared); // explicit off-UI retirement in the production caller
+        assert!(old.upgrade().is_none());
+    }
+
+    #[test]
+    fn saved_preparation_abandonment_leaves_live_history_capacity_unchanged() {
+        let fixture = Fixture::new(b"saved");
+        let saved = Buffer::from_file(TextFile::open_saved_version(&fixture.0).unwrap()).unwrap().snapshot();
+        let mut target = Buffer::empty();
+        for byte in b"abcd" {
+            target.insert(target.len(), &[*byte]).unwrap();
+        }
+        let before = target.history.saved_capacity_for_test();
+        let epoch = target.worker_epoch;
+        let prepared = target.prepare_saved_install(&saved, true, 0).unwrap();
+        assert_eq!(target.history.saved_capacity_for_test(), before, "preparation owns its replacement deque");
+        drop(prepared);
+        assert_eq!(target.history.saved_capacity_for_test(), before, "abandonment cannot leak uncharged live capacity");
+        assert_eq!(target.worker_epoch, epoch);
+        assert_eq!(bytes(&target.snapshot()), b"abcd");
     }
 
     fn check(buffer: &Buffer, model: &[u8], step: usize) {

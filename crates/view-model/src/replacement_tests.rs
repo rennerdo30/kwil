@@ -85,7 +85,7 @@ fn drive(workspace: &mut Workspace, receiver: &mpsc::Receiver<DocumentResult>, d
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done(workspace) {
         let remaining = deadline.checked_duration_since(Instant::now()).expect("replacement deadline");
-        workspace.document_result(receiver.recv_timeout(remaining).expect("replacement worker completion"));
+        workspace.test_document_result(receiver.recv_timeout(remaining).expect("replacement worker completion"));
     }
 }
 
@@ -211,7 +211,7 @@ fn replacement_loan_freezes_target_and_exit_but_preserves_other_tab_and_cache() 
     assert!(!workspace.replacement_busy());
     assert_eq!(bytes(&workspace, other), b"other");
     let (operation, editor, recipe) = take_loan(&receiver);
-    workspace.document_result(DocumentResult::Replaced {
+    workspace.test_document_result(DocumentResult::Replaced {
         key: recipe.key,
         operation,
         editor,
@@ -244,7 +244,7 @@ fn replacement_pending_receipt_and_save_are_refused_before_transfer() {
         workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
-    workspace.editor_mut().unwrap().finish_save(Err(io::Error::other("cancel fixture save"))).unwrap_err();
+    workspace.editor_mut().unwrap().finish_save_for_test(Err(io::Error::other("cancel fixture save"))).unwrap_err();
     assert_eq!(bytes(&workspace, workspace.active_id()), b"retained");
     assert!(receiver.try_recv().is_err());
 }
@@ -260,13 +260,13 @@ fn replacement_returned_pending_receipt_blocks_discard_close_and_is_pumped() {
     assert!(result.is_ok());
     assert!(editor.has_pending_edit_receipt());
     let key = workspace.files.loans[&id].key;
-    workspace.document_result(DocumentResult::Replaced { key, operation, editor, result });
+    workspace.test_document_result(DocumentResult::Replaced { key, operation, editor, result });
     assert!(!workspace.document_busy(id));
     assert_eq!(bytes(&workspace, id), b"replaced");
     assert!(workspace.editor().unwrap().has_pending_edit_receipt());
     assert_eq!(workspace.close(id, true).unwrap_err().kind(), io::ErrorKind::WouldBlock);
     assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
-    workspace.document_result(DocumentResult::CapacityAvailable);
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
     assert!(!workspace.editor().unwrap().has_pending_edit_receipt());
     let DocumentRequest::Journal { receipt, .. } = receiver.try_recv().unwrap() else { panic!("receipt missing") };
     assert_eq!(receipt.after_revision, workspace.editor().unwrap().document().revision());
@@ -274,7 +274,7 @@ fn replacement_returned_pending_receipt_blocks_discard_close_and_is_pumped() {
     workspace.files.exit_without_metadata = true;
     workspace.files.queue.clear(); // fixture excludes unrelated metadata requests
     assert!(!workspace.wants_exit(), "receipt queue admission alone is not durability");
-    workspace.document_result(DocumentResult::JournalDurable {
+    workspace.test_document_result(DocumentResult::JournalDurable {
         document: id,
         revision: receipt.after_revision,
         sequence: receipt.sequence,

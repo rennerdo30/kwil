@@ -35,9 +35,80 @@ pub(crate) struct PreparedHistory {
     entry: Entry,
 }
 
+/// Replaced roots stay here until the guarded save state is retired off UI.
+pub(crate) struct SavedHistoryRetirement {
+    entries: Vec<Entry>,
+    undo: VecDeque<Entry>,
+    redo: VecDeque<Entry>,
+}
+
 impl History {
+    #[cfg(test)]
+    pub(crate) fn saved_capacity_for_test(&self) -> (usize, usize) {
+        (self.undo.capacity(), self.redo.capacity())
+    }
+    pub(crate) fn saved_metadata_bytes(&self) -> std::io::Result<usize> {
+        // Both actual history growth and the maximum retirement overlap are
+        // admitted before reserving. VecDeque may round to its next capacity.
+        self.undo
+            .len()
+            .checked_add(self.redo.len())
+            .and_then(|n| n.checked_add(2))
+            .and_then(|n| n.checked_mul(std::mem::size_of::<Entry>()))
+            .and_then(|n| n.checked_mul(8))
+            .ok_or_else(crate::worker_edit::overflow)
+    }
+    pub(crate) fn prepare_saved_retirement(&self) -> std::io::Result<SavedHistoryRetirement> {
+        let count = self
+            .undo
+            .len()
+            .checked_add(self.redo.len())
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(crate::worker_edit::overflow)?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).map_err(std::io::Error::other)?;
+        if entries.capacity() > count.saturating_mul(2) {
+            return Err(std::io::Error::other("allocator exceeded admitted saved retirement metadata"));
+        }
+        let mut undo = VecDeque::new();
+        let undo_count = self.undo.len().checked_add(1).ok_or_else(crate::worker_edit::overflow)?;
+        undo.try_reserve_exact(undo_count).map_err(std::io::Error::other)?;
+        if undo.capacity() > undo_count.saturating_mul(2) {
+            return Err(std::io::Error::other("allocator exceeded admitted saved undo metadata"));
+        }
+        Ok(SavedHistoryRetirement { entries, undo, redo: VecDeque::new() })
+    }
+    pub(crate) fn install_saved_prepared(&mut self, prepared: PreparedHistory, retired: &mut SavedHistoryRetirement) {
+        std::mem::swap(&mut self.undo, &mut retired.undo);
+        std::mem::swap(&mut self.redo, &mut retired.redo);
+        for entry in &retired.redo {
+            self.bytes -= entry.cost;
+        }
+        while let Some(entry) = retired.undo.pop_front() {
+            self.undo.push_back(entry);
+        }
+        self.bytes += prepared.entry.cost;
+        self.undo.push_back(prepared.entry);
+        while self.bytes > self.limit {
+            let Some(entry) = self.undo.pop_front() else { break };
+            self.bytes -= entry.cost;
+            retired.entries.push(entry);
+        }
+    }
     pub(crate) fn prepare_worker(
         &mut self,
+        before: Snapshot,
+        after: Snapshot,
+        model_cost: usize,
+    ) -> std::io::Result<PreparedHistory> {
+        let prepared = self.prepare_saved_entry(before, after, model_cost)?;
+        self.undo.try_reserve(1).map_err(std::io::Error::other)?;
+        Ok(prepared)
+    }
+    /// Saved completion owns its replacement deque. Refusal or abandonment
+    /// cannot leave capacity behind in this live history without its charge.
+    pub(crate) fn prepare_saved_entry(
+        &self,
         before: Snapshot,
         after: Snapshot,
         model_cost: usize,
@@ -49,7 +120,6 @@ impl History {
             .and_then(|n| n.checked_add(model_cost))
             .ok_or_else(crate::worker_edit::overflow)?;
         self.bytes.checked_add(cost).ok_or_else(crate::worker_edit::overflow)?;
-        self.undo.try_reserve(1).map_err(std::io::Error::other)?;
         Ok(PreparedHistory { entry: Entry { before, after, cost, model_cost } })
     }
     pub(crate) fn install_prepared(&mut self, prepared: PreparedHistory) {

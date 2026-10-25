@@ -14,7 +14,7 @@ mod recovery;
 mod undo;
 pub mod worker_edit;
 
-pub use buffer::{Buffer, Lines, Snapshot, SnapshotImporter};
+pub use buffer::{Buffer, Lines, PreparedSavedInstall, Snapshot, SnapshotImporter};
 pub use file::with_checked_read_batch;
 pub use file::{FileKind, FileState, IndexProgress, OpenError, ReadError, TextFile};
 pub use file::{OriginalSavePin, cleanup_stale_save_backups};

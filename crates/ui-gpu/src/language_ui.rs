@@ -178,6 +178,9 @@ pub(super) fn draw(
 
 impl App {
     pub(super) fn language_highlights_ready(&mut self) -> Damage {
+        if let Some(damage) = self.wrap_highlights_ready() {
+            return damage;
+        }
         if self.view.hex_active() {
             return Damage::default();
         }
@@ -190,11 +193,15 @@ impl App {
         mappings: kwil_view_model::language_selection::AcceptedLanguageMappings,
     ) {
         self.close_language();
+        let wrapped = self.wrap_owns_text() || self.view.wrap_input_blocked();
         if let Some(host) = &mut self.highlighting {
             host.apply_mappings(mappings);
-            if !self.view.hex_active() {
+            if !wrapped && !self.view.hex_active() {
                 host.update(&self.view);
             }
+        }
+        if wrapped {
+            self.wrap_update_highlights();
         }
         self.apply(Damage { status: true, ..Default::default() });
     }
@@ -276,6 +283,7 @@ impl App {
     }
 
     fn accept_language(&mut self, index: usize) {
+        let wrapped = self.wrap_owns_text() || self.view.wrap_input_blocked();
         let ticket = self.language_picker.ticket.clone();
         let row = self.language_picker.rows.get(index).copied();
         if let (Some(ticket), Some(row), Some(host)) = (ticket, row, &mut self.highlighting)
@@ -284,7 +292,12 @@ impl App {
             // Same choice still needs fresh status and an update after closing;
             // a changed choice reissues highlighting without a document edit.
             host.apply_picker(&self.view, &ticket, row.choice);
-            host.update(&self.view);
+            if !wrapped {
+                host.update(&self.view);
+            }
+        }
+        if wrapped {
+            self.wrap_update_highlights();
         }
         self.close_language();
         self.apply(Damage { status: true, ..Default::default() });
@@ -361,6 +374,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn shutdown_highlights(host: kwil_view_model::highlight_session::HighlightSession) {
+        if let std::ops::ControlFlow::Break(error) = host.shutdown() {
+            panic!("highlight shutdown refused: {error:?}");
+        }
+    }
     use kwil_view_model::highlight_session::HighlightSession;
     use std::time::{Duration, Instant};
 
@@ -429,7 +447,7 @@ mod tests {
         app.mods = ModifiersState::CONTROL;
         app.key_after_settings(None, &HostKey { logical_key: Key::Character("l".into()), text: None, repeat: false });
         assert!(app.language_open(), "configured keymap reaches the same picker");
-        app.highlighting.take().unwrap().shutdown().unwrap();
+        shutdown_highlights(app.highlighting.take().unwrap());
     }
 
     #[test]
@@ -455,7 +473,7 @@ mod tests {
         assert_eq!(app.view.active_id(), new_document);
         app.language_picker.area.take();
         assert!(!app.language_owns_input());
-        app.highlighting.take().unwrap().shutdown().unwrap();
+        shutdown_highlights(app.highlighting.take().unwrap());
     }
 
     #[test]
@@ -501,7 +519,7 @@ mod tests {
             assert_eq!(app.highlighting.as_ref().unwrap().language_status(&app.view).label(), language.id());
             assert_eq!(app.view.editor().unwrap().document().revision(), revision);
         }
-        app.highlighting.take().unwrap().shutdown().unwrap();
+        shutdown_highlights(app.highlighting.take().unwrap());
         drop(app);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
@@ -539,7 +557,7 @@ mod tests {
         assert_eq!(picker.hit(point, surface, &workspace), None, "same revision in another tab");
         assert!(workspace.activate(original));
         assert_eq!(picker.hit(point, surface, &workspace), None, "returning to a tab cannot revive its ticket");
-        host.shutdown().unwrap();
+        shutdown_highlights(host);
     }
 
     #[test]
@@ -563,7 +581,7 @@ mod tests {
         picker.close();
         assert!(!picker.is_open());
         assert_eq!(picker.hit((30, 30), surface, &workspace), None);
-        host.shutdown().unwrap();
+        shutdown_highlights(host);
     }
 
     #[test]

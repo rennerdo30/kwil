@@ -28,9 +28,24 @@ pub(super) fn draw_highlighted(
     layout: TabLayout,
     highlights: &[&kwil_view_model::highlighting::Span],
 ) {
+    draw_prepared(frame, workspace, layout, highlights, false, None);
+}
+
+/// Chrome remains independent of body ownership. A wrapped/settling body must
+/// never invoke the logical text painter or its source-derived status position.
+pub(super) fn draw_prepared(
+    frame: &mut ratatui::Frame,
+    workspace: &Workspace,
+    layout: TabLayout,
+    highlights: &[&kwil_view_model::highlighting::Span],
+    prepared_body: bool,
+    prepared_status: Option<&str>,
+) {
     let area = frame.area();
     let geometry = geometry(workspace, area.width, area.height, layout);
-    super::draw_area_highlighted(frame, workspace, rect(geometry.body, area), false, highlights);
+    if !prepared_body {
+        super::draw_area_highlighted(frame, workspace, rect(geometry.body, area), false, highlights);
+    }
     let idle = Color::Rgb(0x10, 0x1d, 0x31);
     let foreground = Color::Rgb(0xd6, 0xe4, 0xf0);
     frame.render_widget(Paragraph::new("").style(Style::default().bg(idle)), rect(geometry.chrome, area));
@@ -53,7 +68,13 @@ pub(super) fn draw_highlighted(
             );
         }
     }
-    let status = if workspace.hex_active() { hex_ui::workspace_status(workspace) } else { workspace.status_text() };
+    let status = if let Some(status) = prepared_status {
+        status.to_owned()
+    } else if workspace.hex_active() {
+        hex_ui::workspace_status(workspace)
+    } else {
+        workspace.status_text()
+    };
     let status = Paragraph::new(status)
         .style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18)));
     frame.render_widget(

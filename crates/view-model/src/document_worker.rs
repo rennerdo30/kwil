@@ -11,6 +11,7 @@ mod decoded;
 mod encoding_runtime;
 mod encoding_seed;
 mod hex_runtime;
+pub mod result_transport;
 #[cfg(test)]
 mod scheduler_tests;
 pub(crate) use encoding_runtime::document_policy;
@@ -23,13 +24,22 @@ use kwil_core_workspace::{
     journal::{JournalBase, JournalService, JournalSession, RecoveredJournal, RecoveryEvent},
     session::{self, Session, Tab},
 };
+pub use result_transport::{
+    DocumentBarrierId, DocumentBarrierReceipt, DocumentBarrierRequest, DocumentDeliveryFailure, DocumentDeliveryId,
+    DocumentProducerRetryRefusal, DocumentProducerRetryToken, DocumentResultReceiveError, DocumentResultReceiver,
+    DocumentResultSettlementFailure, DocumentResultSettlementReason, DocumentResultSettlementTicket,
+    DocumentResultStopRefusal, DocumentResultTransportStatus, DocumentWrapRetryRefusal, DocumentWrapRetryToken,
+};
+pub(crate) use result_transport::{DocumentContinuationPermit, DocumentJournalSink};
+#[cfg(test)]
+use std::sync::mpsc::SyncSender;
 use std::{
     collections::HashMap,
     io,
     path::PathBuf,
     sync::{
         atomic::AtomicBool,
-        mpsc::{self, SyncSender, TrySendError},
+        mpsc::{self, TrySendError},
     },
     time::Duration,
 };
@@ -100,7 +110,31 @@ impl ExternalOpenInbox {
     }
 }
 
+/// Source-free identity for one already accepted deferred save completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveResumeKey {
+    pub(crate) document: DocumentId,
+    pub(crate) source_epoch: u64,
+    pub(crate) revision: u64,
+    pub(crate) generation: u64,
+}
+
 pub enum DocumentRequest {
+    ResumeSaveCompletion {
+        key: SaveResumeKey,
+    },
+    /// Privately minted control through this SAME bounded request lane.
+    SourceBarrier(result_transport::DocumentBarrierRequest),
+    /// Concrete journal delivery; admitted metadata follows its exact receipt.
+    SealedJournal(result_transport::SealedJournalRequest),
+    /// Already accepted recovery merge returns through the same result slot.
+    RestorePrepared(result_transport::RestorePreparedRequest),
+    /// Accepted exit only: settle the shared wrap worker before this lane may
+    /// clean document backings. The normal completion callback wakes the UI.
+    SettleWrap {
+        ticket: crate::workspace::workspace_wrap::WorkspaceWrapSettlementTicket,
+        timeout: Duration,
+    },
     /// Normal frontend open, including startup sources. The scalar ticket is
     /// bound to an exact path by the model before worker admission.
     OpenChecked {
@@ -232,6 +266,16 @@ pub enum DocumentRequest {
 }
 
 pub enum DocumentResult {
+    ResumeSaveCompletion {
+        key: SaveResumeKey,
+    },
+    SourceBarrier(result_transport::DocumentBarrierReceipt),
+    WrapSettled(
+        Result<
+            crate::workspace::workspace_wrap::WorkspaceWrapSettled,
+            crate::workspace::workspace_wrap::WorkspaceWrapSettlementFailure,
+        >,
+    ),
     BinaryOffer(binary_offer::Offer),
     BinaryRefused {
         offer: binary_offer::Offer,
@@ -427,6 +471,8 @@ struct JournalState {
     flush_due: std::time::Instant,
     generation: u64,
     promotion: Option<PathBuf>,
+    /// Scheduler proof only; no authority or source owner is stored here.
+    barrier_durable_sequence: Option<u64>,
 }
 impl JournalState {
     fn new(handle: JournalSession, revision: u64, sequence: u64, policy: RecoveryPolicy) -> Self {
@@ -444,12 +490,13 @@ impl JournalState {
             flush_due: std::time::Instant::now() + Duration::from_secs(2),
             generation: 0,
             promotion: None,
+            barrier_durable_sequence: None,
         }
     }
 }
 
 pub struct DocumentWorker {
-    tx: SyncSender<DocumentRequest>,
+    tx: result_transport::RequestSender,
     journal_capacity: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     journal_controls: std::sync::Arc<JournalControlCredits>,
     save_destinations: std::sync::Arc<std::sync::Mutex<Vec<(DocumentId, PathBuf)>>>,
@@ -462,6 +509,85 @@ pub struct DocumentWorker {
 // quotas prevent seeds waiting for a slot from consuming close admission.
 const JOURNAL_SEED_CAPACITY: usize = session::MAX_TABS;
 const JOURNAL_FINISH_CAPACITY: usize = session::MAX_TABS + session::MAX_CLOSED;
+const DEFERRED_REQUEST_LIMIT: usize = JOURNAL_SEED_CAPACITY + JOURNAL_FINISH_CAPACITY + 16 + 1;
+pub(super) const DEFERRED_STORAGE_CAPACITY: usize = DEFERRED_REQUEST_LIMIT.next_power_of_two();
+const MAX_BARRIER_TARGETS: usize = session::MAX_TABS + JOURNAL_SEED_CAPACITY + 16;
+
+#[derive(Clone, Copy)]
+struct SourceBarrierTarget {
+    document: DocumentId,
+    generation: u64,
+    sequence: u64,
+}
+pub(super) struct SourceBarrierTracker {
+    request: result_transport::DocumentBarrierRequest,
+    targets: [Option<SourceBarrierTarget>; MAX_BARRIER_TARGETS],
+    failed: bool,
+}
+impl SourceBarrierTracker {
+    fn new(request: result_transport::DocumentBarrierRequest, storage: Option<&mut Storage>) -> Self {
+        let mut tracker = Self { request, targets: [None; MAX_BARRIER_TARGETS], failed: false };
+        if let Some(storage) = storage {
+            for (&document, journal) in &mut storage.journals {
+                tracker.record_journal(document, journal);
+            }
+        }
+        tracker
+    }
+    fn record_journal(&mut self, document: DocumentId, journal: &mut JournalState) {
+        let target = SourceBarrierTarget { document, generation: journal.generation, sequence: journal.sequence };
+        if let Some(slot) =
+            self.targets.iter_mut().find(|target| target.as_ref().is_some_and(|target| target.document == document))
+        {
+            *slot = Some(target);
+        } else if let Some(slot) = self.targets.iter_mut().find(|target| target.is_none()) {
+            *slot = Some(target);
+        } else {
+            self.failed = true;
+        }
+        // A barrier is a real flush trigger, not a new readiness timer. Later
+        // receipts do not expand this target, so a younger Finish cannot form
+        // a wait cycle with acknowledgement of this marker.
+        if !journal.failed && journal.barrier_durable_sequence.is_none_or(|durable| durable < target.sequence) {
+            journal.needs_flush = true;
+            journal.flush_due = std::time::Instant::now();
+        }
+    }
+    fn record(&mut self, document: DocumentId, storage: Option<&mut Storage>) {
+        if let Some(journal) = storage.and_then(|storage| storage.journals.get_mut(&document)) {
+            self.record_journal(document, journal);
+        }
+    }
+    fn ready(&self, storage: Option<&Storage>) -> bool {
+        self.failed
+            || self.targets.iter().flatten().all(|target| {
+                storage.and_then(|storage| storage.journals.get(&target.document)).is_none_or(|journal| {
+                    journal.failed
+                        || journal.generation != target.generation
+                        || (journal.ready
+                            && journal.barrier_durable_sequence.is_some_and(|sequence| sequence >= target.sequence))
+                })
+            })
+    }
+}
+
+fn unpack_sealed(request: DocumentRequest) -> (DocumentRequest, Option<crate::visual_rows::MetadataReservation>) {
+    match request {
+        DocumentRequest::SealedJournal(packet) => {
+            let result_transport::SealedJournalRequest {
+                document,
+                receipt,
+                path,
+                first_sequence,
+                generation,
+                policy,
+                charge,
+            } = packet;
+            (DocumentRequest::Journal { document, receipt, path, first_sequence, generation, policy }, Some(charge))
+        }
+        request => (request, None),
+    }
+}
 
 struct JournalControlCredits {
     seeds: std::sync::atomic::AtomicUsize,
@@ -499,6 +625,8 @@ impl JournalControlCredits {
 
 fn journal_document(request: &DocumentRequest) -> Option<DocumentId> {
     match request {
+        DocumentRequest::SealedJournal(packet) => Some(packet.document),
+        DocumentRequest::ResumeSaveCompletion { key } => Some(key.document),
         DocumentRequest::SeedJournal { document, .. }
         | DocumentRequest::Journal { document, .. }
         | DocumentRequest::FinishJournal { document, .. } => Some(*document),
@@ -519,8 +647,13 @@ fn journal_can_run(
     if deferred.iter().take(before).any(|older| journal_document(older) == Some(document)) {
         return false;
     }
+    // A scalar completion respects preceding same-document journal work, but
+    // cannot consume a journal slot or require a new journal lineage.
+    if matches!(request, DocumentRequest::ResumeSaveCompletion { .. }) {
+        return true;
+    }
     let Some(storage) = storage else { return true };
-    if matches!(request, DocumentRequest::Journal { .. })
+    if matches!(request, DocumentRequest::Journal { .. } | DocumentRequest::SealedJournal(_))
         && storage.journals.get(&document).is_some_and(|journal| !journal.ready && !journal.failed)
     {
         return false;
@@ -557,14 +690,15 @@ impl DocumentWorker {
             {
                 return Err(receipt);
             }
-            match sender.try_send(DocumentRequest::Journal {
-                document,
-                receipt,
-                path: path.clone(),
-                first_sequence,
-                generation,
-                policy,
-            }) {
+            let request =
+                DocumentRequest::Journal { document, receipt, path: path.clone(), first_sequence, generation, policy };
+            let gate = sender.lock_sender();
+            let delivered = match gate.get() {
+                Some(sender) => sender.try_send(request),
+                None => Err(TrySendError::Disconnected(request)),
+            };
+            drop(gate);
+            match delivered {
                 Ok(()) => Ok(()),
                 Err(
                     TrySendError::Full(DocumentRequest::Journal { receipt, .. })
@@ -587,16 +721,58 @@ impl DocumentWorker {
 
     fn spawn_inner(
         complete: impl Fn(DocumentResult) + Send + 'static,
+        #[cfg(test)] schedule_control: Option<scheduler_tests::Control>,
+    ) -> io::Result<Self> {
+        Self::spawn_transport_inner(
+            complete,
+            None,
+            #[cfg(test)]
+            schedule_control,
+        )
+    }
+
+    /// One worker-owned result slot, shared with the frontend's wrap aggregate.
+    /// Wakes carry no document ownership. Receive/close/settle contracts live in
+    /// `result_transport`; the legacy callback constructor remains unchanged.
+    pub fn spawn_bounded(
+        budget: &crate::visual_rows::AllocationBudget,
+        wake: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) -> io::Result<(Self, DocumentResultReceiver)> {
+        let (shared, receiver) = result_transport::Shared::new(budget, wake)?;
+        let delivery = shared.clone();
+        let worker = Self::spawn_transport_inner(
+            move |result| delivery.publish(result),
+            Some(shared),
+            #[cfg(test)]
+            None,
+        )?;
+        Ok((worker, receiver))
+    }
+
+    fn spawn_transport_inner(
+        complete: impl Fn(DocumentResult) + Send + 'static,
+        transport: Option<std::sync::Arc<result_transport::Shared>>,
         #[cfg(test)] mut schedule_control: Option<scheduler_tests::Control>,
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(16);
+        let tx = result_transport::RequestSender::new(tx, transport.as_ref());
         let journal_capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16));
         let capacity = journal_capacity.clone();
         let journal_controls = std::sync::Arc::new(JournalControlCredits::new());
         let controls = journal_controls.clone();
         let save_destinations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let destinations = save_destinations.clone();
-        std::thread::Builder::new().name("kwil-documents".into()).spawn(move || {
+        let mut deferred = std::collections::VecDeque::new();
+        deferred.try_reserve_exact(DEFERRED_REQUEST_LIMIT).map_err(io::Error::other)?;
+        if deferred.capacity() > DEFERRED_STORAGE_CAPACITY {
+            return Err(io::Error::other("deferred document metadata capacity"));
+        }
+        let worker_transport = transport.clone();
+        let worker = std::thread::Builder::new().name("kwil-documents".into()).spawn(move || {
+            let _exit = result_transport::WorkerExit(worker_transport);
+            if let Some(shared) = &_exit.0 {
+                shared.register_worker();
+            }
             // Existing requests drain on shutdown. Request-scoped cancellation
             // remains an integration task; never cancel an accepted save merely
             // because the UI released its sender.
@@ -604,7 +780,7 @@ impl DocumentWorker {
             let mut storage: Option<Storage> = None;
             let mut hex = hex_runtime::HexRuntime::new();
             let mut binary = binary_offer::Runtime::new();
-            let mut deferred = std::collections::VecDeque::new();
+            let mut source_barrier: Option<SourceBarrierTracker> = None;
             let mut session_due = None;
             // Worker-owned until the UI publishes the admitted tab and releases
             // this reservation. UI registry refreshes cannot erase it early.
@@ -618,10 +794,20 @@ impl DocumentWorker {
                             !journal.failed && (!journal.ready || journal.flush.is_some() || journal.needs_flush)
                         })
                     });
+                let barrier_index =
+                    deferred.iter().position(|request| matches!(request, DocumentRequest::SourceBarrier(_)));
                 let available = deferred.iter().enumerate().find_map(|(index, request)| {
-                    journal_can_run(request, &deferred, index, storage.as_ref()).then_some(index)
+                    let ready = if matches!(request, DocumentRequest::SourceBarrier(_)) {
+                        index == 0
+                            && session_due.is_none()
+                            && source_barrier.as_ref().is_some_and(|barrier| barrier.ready(storage.as_ref()))
+                    } else {
+                        journal_can_run(request, &deferred, index, storage.as_ref())
+                    };
+                    ready.then_some(index)
                 });
                 let from_deferred = available.is_some();
+                let precedes_barrier = available.zip(barrier_index).is_some_and(|(index, barrier)| index < barrier);
                 let request = if let Some(index) = available {
                     deferred.remove(index)
                 } else if let Some(deadline) = shutdown_deadline {
@@ -663,11 +849,28 @@ impl DocumentWorker {
                     }
                 };
                 if let Some(request) = request {
+                    if let DocumentRequest::SourceBarrier(marker) = &request {
+                        if source_barrier.is_none() {
+                            source_barrier = Some(SourceBarrierTracker::new(*marker, storage.as_mut()));
+                        }
+                        if session_due.is_some() {
+                            session_due = Some(std::time::Instant::now());
+                        }
+                    }
+                    let preceding_journal = precedes_barrier.then(|| journal_document(&request)).flatten();
                     #[cfg(test)]
                     if !from_deferred && let Some(control) = &mut schedule_control {
                         control.received(&request, &deferred, storage.as_ref());
                     }
-                    if !from_deferred && !journal_can_run(&request, &deferred, deferred.len(), storage.as_ref()) {
+                    let can_run = if matches!(&request, DocumentRequest::SourceBarrier(_)) {
+                        deferred.is_empty()
+                            && session_due.is_none()
+                            && source_barrier.as_ref().is_some_and(|barrier| barrier.ready(storage.as_ref()))
+                    } else {
+                        journal_can_run(&request, &deferred, deferred.len(), storage.as_ref())
+                    };
+                    if !from_deferred && !can_run {
+                        debug_assert!(deferred.len() < DEFERRED_REQUEST_LIMIT);
                         deferred.push_back(request);
                         complete(DocumentResult::CapacityAvailable);
                         // Readiness/flush polling must still happen when the
@@ -678,11 +881,44 @@ impl DocumentWorker {
                         continue;
                     }
                     controls.release(&request);
+                    if let Some(shared) = &_exit.0 {
+                        shared.request_capacity_available();
+                    }
+                    let (request, mut sealed_charge) = unpack_sealed(request);
                     #[cfg(test)]
                     if let Some(control) = &mut schedule_control {
                         control.applying(&request);
                     }
                     match request {
+                        DocumentRequest::ResumeSaveCompletion { key } => {
+                            complete(DocumentResult::ResumeSaveCompletion { key });
+                        }
+                        DocumentRequest::SourceBarrier(marker) => {
+                            let tracker = source_barrier.take().expect("received barrier has one fixed tracker");
+                            #[cfg(test)]
+                            if tracker.failed || tracker.request != marker {
+                                eprintln!(
+                                    "document worker failed barrier: tracker_failed={} marker_equal={}",
+                                    tracker.failed,
+                                    tracker.request == marker,
+                                );
+                            }
+                            let receipt = if tracker.failed || tracker.request != marker {
+                                result_transport::DocumentBarrierReceipt::failed(marker)
+                            } else {
+                                result_transport::DocumentBarrierReceipt::reached(marker)
+                            };
+                            complete(DocumentResult::SourceBarrier(receipt));
+                        }
+                        DocumentRequest::RestorePrepared(packet) => {
+                            complete(DocumentResult::Prepared(Ok(*packet.prepared)));
+                        }
+                        DocumentRequest::SealedJournal(_) => {
+                            unreachable!("sealed packet unpacked before canonical journal application")
+                        }
+                        DocumentRequest::SettleWrap { ticket, timeout } => {
+                            complete(DocumentResult::WrapSettled(ticket.settle(timeout)));
+                        }
                         DocumentRequest::RetireSource { file } => {
                             drop(file);
                             complete(DocumentResult::CapacityAvailable);
@@ -1104,14 +1340,32 @@ impl DocumentWorker {
                                 {
                                     // A first receipt may create its own seed.
                                     // Keep it ahead of already deferred successors.
-                                    deferred.push_front(DocumentRequest::Journal {
-                                        document,
-                                        receipt,
-                                        path,
-                                        first_sequence,
-                                        generation,
-                                        policy,
-                                    });
+                                    let request = if let Some(charge) = sealed_charge.take() {
+                                        DocumentRequest::SealedJournal(result_transport::SealedJournalRequest {
+                                            document,
+                                            receipt,
+                                            path,
+                                            first_sequence,
+                                            generation,
+                                            policy,
+                                            charge,
+                                        })
+                                    } else {
+                                        DocumentRequest::Journal {
+                                            document,
+                                            receipt,
+                                            path,
+                                            first_sequence,
+                                            generation,
+                                            policy,
+                                        }
+                                    };
+                                    deferred.push_front(request);
+                                    if preceding_journal.is_some()
+                                        && let Some(barrier) = &mut source_barrier
+                                    {
+                                        barrier.record(document, Some(state));
+                                    }
                                     // Poll readiness once before the next event-driven wait.
                                     poll_journals(state, &complete);
                                     continue;
@@ -1160,6 +1414,11 @@ impl DocumentWorker {
                             }
                         }
                     }
+                    if let Some(document) = preceding_journal
+                        && let Some(barrier) = &mut source_barrier
+                    {
+                        barrier.record(document, storage.as_mut());
+                    }
                 }
                 if let Some(storage) = &mut storage {
                     poll_journals(storage, &complete);
@@ -1179,7 +1438,14 @@ impl DocumentWorker {
             // cannot drain. A failed shutdown is never reported as a clean stop.
             for request in deferred {
                 controls.release(&request);
+                let (request, _sealed_charge) = unpack_sealed(request);
                 match request {
+                    DocumentRequest::ResumeSaveCompletion { key } => {
+                        complete(DocumentResult::ResumeSaveCompletion { key });
+                    }
+                    DocumentRequest::SourceBarrier(marker) => complete(DocumentResult::SourceBarrier(
+                        result_transport::DocumentBarrierReceipt::failed(marker),
+                    )),
                     DocumentRequest::DiscardHex { document, editor } => hex.discard(document, editor),
                     DocumentRequest::Journal { document, receipt, .. } => {
                         capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1248,12 +1514,27 @@ impl DocumentWorker {
             };
             complete(DocumentResult::Stopped(shutdown_error.map_or(stopped, Err)));
         })?;
+        if let Some(transport) = transport {
+            transport.install_worker(worker);
+        }
         Ok(Self { tx, journal_capacity, journal_controls, save_destinations })
     }
 
     /// Full admission returns ownership. Callers must retain/retry or explicitly
     /// reject it; a rejected save must clear the model's in-flight save state.
     pub fn try_submit(&self, request: DocumentRequest) -> Result<(), TrySendError<Box<DocumentRequest>>> {
+        let receipt_credit = matches!(&self.tx, result_transport::RequestSender::Bounded(_))
+            && matches!(&request, DocumentRequest::Journal { .. });
+        if receipt_credit
+            && self
+                .journal_capacity
+                .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_err()
+        {
+            return Err(TrySendError::Full(Box::new(request)));
+        }
         let control = self.journal_controls.for_request(&request);
         if control.is_some_and(|credit| {
             credit
@@ -1262,16 +1543,31 @@ impl DocumentWorker {
                 })
                 .is_err()
         }) {
+            if receipt_credit {
+                self.journal_capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
             return Err(TrySendError::Full(Box::new(request)));
         }
-        self.tx.try_send(request).map_err(|error| match error {
+        let gate = self.tx.lock_sender();
+        let delivered = match gate.get() {
+            Some(sender) => sender.try_send(request),
+            None => Err(TrySendError::Disconnected(request)),
+        };
+        drop(gate);
+        delivered.map_err(|error| match error {
             TrySendError::Full(request) => {
+                if receipt_credit {
+                    self.journal_capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
                 if let Some(credit) = control {
                     credit.fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
                 TrySendError::Full(Box::new(request))
             }
             TrySendError::Disconnected(request) => {
+                if receipt_credit {
+                    self.journal_capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
                 if let Some(credit) = control {
                     credit.fetch_add(1, std::sync::atomic::Ordering::Release);
                 }
@@ -1285,13 +1581,21 @@ impl DocumentWorker {
         let (tx, rx) = mpsc::sync_channel(capacity);
         (
             Self {
-                tx,
+                tx: result_transport::RequestSender::new(tx, None),
                 journal_capacity: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16)),
                 journal_controls: std::sync::Arc::new(JournalControlCredits::new()),
                 save_destinations: Default::default(),
             },
             rx,
         )
+    }
+}
+
+impl Drop for DocumentWorker {
+    fn drop(&mut self) {
+        // Bounded observers share the sole sender gate. Existing accepted work
+        // still drains; a retained result is never destroyed by this UI drop.
+        self.tx.close_bounded();
     }
 }
 
@@ -2282,6 +2586,7 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
                         storage.finished_journals.remove(&document);
                     }
                     journal.ready = true;
+                    journal.barrier_durable_sequence = Some(journal.sequence);
                 }
                 Err(mpsc::TryRecvError::Empty) => continue,
                 outcome => {
@@ -2303,6 +2608,8 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
         if let Some((sequence, receiver)) = journal.flush.take() {
             match receiver.try_recv() {
                 Ok(Ok(revision)) => {
+                    journal.barrier_durable_sequence =
+                        Some(journal.barrier_durable_sequence.map_or(sequence, |previous| previous.max(sequence)));
                     if sequence == journal.sequence && revision == journal.revision {
                         complete(DocumentResult::JournalDurable { document, revision, sequence, result: Ok(()) });
                     } else {
@@ -2871,7 +3178,7 @@ mod tests {
         let before_revision = editor.document().revision();
         let request = editor.save_request(None).unwrap();
         let saved = storage.encoding.save(request, editor.document().save_plan(), &cancel).unwrap();
-        editor.finish_save(Ok(saved)).unwrap();
+        editor.finish_save_for_test(Ok(saved)).unwrap();
         let after_revision = editor.document().revision();
         let recorded = receipts.lock().unwrap();
         let receipt_count = recorded.len();
@@ -2917,7 +3224,7 @@ mod tests {
         editor.set_cursors(vec![crate::Cursor { anchor: 3, head: 3, desired_column: None }], 0).unwrap();
         let request = editor.save_request(None).unwrap();
         let saved = storage.encoding.save(request, editor.document().save_plan(), &cancel).unwrap();
-        editor.finish_save(Ok(saved)).unwrap();
+        editor.finish_save_for_test(Ok(saved)).unwrap();
         let saved_caret = editor.cursors()[0].head;
         editor.execute("edit.undo", &Default::default(), 2).unwrap();
         let undone_caret = editor.cursors()[0].head;
@@ -2992,13 +3299,13 @@ mod tests {
                     .execute("edit.insert", &crate::CommandArgs { text: Some("!".into()), ..Default::default() }, 2)
                     .unwrap();
                 let live_revision = editor.document().revision();
-                editor.finish_save(Ok(saved)).unwrap();
+                editor.finish_save_for_test(Ok(saved)).unwrap();
                 assert!(!editor.has_pending_save_completion());
                 assert!(editor.has_pending_edit_receipt());
                 assert!(editor.document().is_dirty());
                 assert_eq!(editor.document().revision(), live_revision);
             } else {
-                let error = editor.finish_save(Ok(saved)).unwrap_err();
+                let error = editor.finish_save_for_test(Ok(saved)).unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
                 assert!(editor.has_pending_save_completion());
                 assert_eq!(editor.document().revision(), source_revision);
@@ -3080,7 +3387,7 @@ mod tests {
         let save_succeeded = loop {
             if let DocumentResult::Saved { result, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 let succeeded = result.is_ok();
-                let _ = editor.finish_save(result);
+                let _ = editor.finish_save_for_test(result);
                 break succeeded;
             }
         };
@@ -3251,7 +3558,7 @@ mod tests {
                 assert_eq!(source, revision);
                 let error = result.err().expect("native alias must be rejected");
                 assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-                assert!(editor.finish_save(Err(error)).is_err());
+                assert!(editor.finish_save_for_test(Err(error)).is_err());
             }
             _ => panic!("expected addressed worker save rejection"),
         }
@@ -3305,7 +3612,7 @@ mod tests {
             let destination = scratch.0.join("recovered.txt");
             let request = editor.save_request(Some(destination.clone())).unwrap();
             let saved = kwil_core_workspace::save_snapshot(request).unwrap();
-            editor.finish_save(Ok(saved)).unwrap();
+            editor.finish_save_for_test(Ok(saved)).unwrap();
             assert!(!editor.document().is_dirty());
             assert_eq!(std::fs::read(destination).unwrap(), recovered_bytes);
             assert_eq!(std::fs::read(&path).unwrap(), disk_bytes);
@@ -3340,7 +3647,7 @@ mod tests {
         let (prepared, storage) = prepare_root(scratch.0.clone()).unwrap();
         stop_storage(storage);
         let mut workspace = crate::Workspace::new(crate::View::new(None)).unwrap();
-        workspace.document_result(DocumentResult::Prepared(Ok(prepared)));
+        workspace.test_document_result(DocumentResult::Prepared(Ok(prepared)));
         workspace.sync_active();
         workspace.sync_all();
         let document = workspace.editor().unwrap().document();
@@ -3567,7 +3874,7 @@ mod tests {
         let mut editor = crate::Editor::new(document);
         editor.execute("edit.insert", &crate::CommandArgs { text: Some("x".into()), ..Default::default() }, 1).unwrap();
         let saved = kwil_core_workspace::save_snapshot(editor.save_request(None).unwrap()).unwrap();
-        editor.finish_save(Ok(saved)).unwrap();
+        editor.finish_save_for_test(Ok(saved)).unwrap();
         assert!(!editor.document().is_dirty());
         assert_eq!(std::fs::read(&path).unwrap(), [b"x".as_slice(), original].concat());
         assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
@@ -3993,7 +4300,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let worker = DocumentWorker {
-            tx,
+            tx: result_transport::RequestSender::new(tx, None),
             journal_capacity: capacity.clone(),
             journal_controls: std::sync::Arc::new(JournalControlCredits::new()),
             save_destinations: Default::default(),
@@ -4034,7 +4341,7 @@ mod tests {
             let wait = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!wait.is_zero(), "workspace condition timed out: {}", workspace.status_text());
             let result = receiver.recv_timeout(wait).expect("worker result before deadline");
-            workspace.document_result(result);
+            workspace.test_document_result(result);
         }
     }
 

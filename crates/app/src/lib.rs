@@ -10,8 +10,9 @@ use frontend::{Flags, Frontend, ProcessEnv, after_gui_failure, choose_frontend, 
 
 use file_argument::FileArgument;
 use kwil_core_text::TextFile;
-use kwil_view_model::{Notify, View};
+use kwil_view_model::{Notify, View, Workspace, visual_rows::AllocationBudget};
 use std::io::IsTerminal;
+use std::ops::ControlFlow;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -291,60 +292,114 @@ fn run_app(console_launcher: bool) -> ExitCode {
             initial_delivery(remaining.clone())
         }
     };
-    if use_gui {
-        let view = match make_view() {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("kwil: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden, renderer: args.renderer };
-        match kwil_ui_gpu::run_with_external_open(view, opts, on_first_frame(true), Box::new(|_| {}), external_ready())
-        {
-            Ok(()) => return ExitCode::SUCCESS,
-            Err(e @ kwil_ui_gpu::GuiError::Settings(_)) => {
-                presentation.report(&format!("kwil: {e}"), |message| eprintln!("{message}"), dialog);
-                return ExitCode::FAILURE;
-            }
-            #[cfg(windows)]
-            Err(e) if windows::gui_child() => {
-                windows::report_gui_failure(&e);
-                return ExitCode::from(75);
-            }
-            // Spec §6: fall back to the TUI when the window fails and a
-            // terminal is attached.
-            Err(e) if after_gui_failure(in_terminal) == Frontend::Tui => eprintln!("kwil: {e}; using the terminal UI"),
-            Err(e) => {
-                let message = format!("{e}; no interactive terminal is attached");
-                presentation.report(&format!("kwil: {message}"), |message| eprintln!("{message}"), dialog);
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    if let Err(error) = validate_hidden_tui_root(
-        args.hidden,
-        std::env::var_os("KWIL_WORKSPACE_ROOT").as_deref().map(std::path::Path::new),
-    ) {
-        eprintln!("kwil: {error}");
-        return ExitCode::FAILURE;
-    }
-    if !in_terminal {
+    if !use_gui && !in_terminal {
         eprintln!("kwil: the terminal UI needs an interactive terminal");
         return ExitCode::FAILURE;
     }
     let view = match make_view() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("kwil: {e}");
+        Ok(view) => view,
+        Err(error) => {
+            eprintln!("kwil: {error}");
             return ExitCode::FAILURE;
         }
     };
-    match kwil_ui_tui::run_with_external_open(view, on_first_frame(false), external_ready()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+    let workspace = match Workspace::try_new(view) {
+        ControlFlow::Continue(workspace) => workspace,
+        ControlFlow::Break(refusal) => {
+            // Fatal process exit retains the original input or partial
+            // workspace. This is not successful source retirement.
+            let retained = std::mem::ManuallyDrop::new(refusal);
+            presentation.report(&format!("kwil: {}", retained.error), |message| eprintln!("{message}"), dialog);
+            return ExitCode::FAILURE;
+        }
+    };
+    let budget = AllocationBudget::default();
+    let (workspace, budget) = if use_gui {
+        let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden, renderer: args.renderer };
+        match kwil_ui_gpu::run_workspace_with_external_open(
+            workspace,
+            budget,
+            opts,
+            on_first_frame(true),
+            Box::new(|_| {}),
+            external_ready(),
+        ) {
+            ControlFlow::Continue(Ok(())) => return ExitCode::SUCCESS,
+            ControlFlow::Break(refusal)
+                if after_gui_failure(in_terminal) == Frontend::Tui
+                    && matches!(
+                        &refusal.reason,
+                        kwil_ui_gpu::GuiStartReason::Admission(_)
+                            | kwil_ui_gpu::GuiStartReason::Markdown(_)
+                            | kwil_ui_gpu::GuiStartReason::EventLoop(_)
+                    ) =>
+            {
+                eprintln!("kwil: {:?}; using the terminal UI", refusal.reason);
+                (refusal.workspace, refusal.budget)
+            }
+            ControlFlow::Break(refusal) => {
+                let retained = std::mem::ManuallyDrop::new(refusal);
+                presentation.report(
+                    &format!("kwil: GUI startup retained: {:?}", retained.reason),
+                    |message| eprintln!("{message}"),
+                    dialog,
+                );
+                return ExitCode::FAILURE;
+            }
+            ControlFlow::Continue(Err(kwil_ui_gpu::GuiError::Shutdown(failure))) => {
+                if after_gui_failure(in_terminal) == Frontend::Tui {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    match failure.recover_unstarted(deadline) {
+                        ControlFlow::Continue(original) => original,
+                        ControlFlow::Break(failure) => {
+                            let retained = std::mem::ManuallyDrop::new(failure);
+                            presentation.report(
+                                &format!("kwil: {}", **retained),
+                                |message| eprintln!("{message}"),
+                                dialog,
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    let retained = std::mem::ManuallyDrop::new(failure);
+                    presentation.report(&format!("kwil: {}", **retained), |message| eprintln!("{message}"), dialog);
+                    return ExitCode::FAILURE;
+                }
+            }
+            ControlFlow::Continue(Err(error)) => {
+                // Unexpected legacy startup refusals may also retain sources.
+                // Never reopen a file or fall back after losing its owner.
+                let retained = std::mem::ManuallyDrop::new(error);
+                presentation.report(&format!("kwil: {}", *retained), |message| eprintln!("{message}"), dialog);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        (workspace, budget)
+    };
+    if let Err(error) = validate_hidden_tui_root(
+        args.hidden,
+        std::env::var_os("KWIL_WORKSPACE_ROOT").as_deref().map(std::path::Path::new),
+    ) {
+        let _retained = std::mem::ManuallyDrop::new((workspace, budget));
+        eprintln!("kwil: {error}");
+        return ExitCode::FAILURE;
+    }
+    if !in_terminal {
+        let _retained = std::mem::ManuallyDrop::new((workspace, budget));
+        eprintln!("kwil: the terminal UI needs an interactive terminal");
+        return ExitCode::FAILURE;
+    }
+    match kwil_ui_tui::run_workspace_with_external_open(workspace, budget, on_first_frame(false), external_ready()) {
+        ControlFlow::Continue(Ok(())) => ExitCode::SUCCESS,
+        ControlFlow::Continue(Err(e)) => {
             eprintln!("kwil: {e}");
+            ExitCode::FAILURE
+        }
+        ControlFlow::Break(refusal) => {
+            let retained = std::mem::ManuallyDrop::new(refusal);
+            eprintln!("kwil: {}", retained.error);
             ExitCode::FAILURE
         }
     }
@@ -402,14 +457,19 @@ mod isolation_tests {
     use super::*;
     fn await_initial(
         workspace: &mut kwil_view_model::Workspace,
-        receiver: &std::sync::mpsc::Receiver<kwil_view_model::document_worker::DocumentResult>,
+        transport: &mut kwil_view_model::workspace_document::WorkspaceDocumentTransport,
+        receiver: &std::sync::mpsc::Receiver<()>,
         done: impl Fn(&kwil_view_model::Workspace) -> bool,
     ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !done(workspace) {
+        // A published offer is not reusable request capacity until its
+        // completed carrier has retired on the original producer. Observe
+        // that capacity through the same owner-free worker events.
+        while !done(workspace) || transport.status().occupied {
             let remaining =
                 deadline.checked_duration_since(std::time::Instant::now()).expect("bounded initial delivery");
-            workspace.document_result(receiver.recv_timeout(remaining).expect("initial delivery worker wake"));
+            receiver.recv_timeout(remaining).expect("initial delivery worker wake");
+            transport.receive(workspace, true).expect("sealed initial delivery");
         }
     }
 
@@ -418,7 +478,8 @@ mod isolation_tests {
         use kwil_core_workspace::instance::{OpenFile, OpenFiles};
         use kwil_view_model::{
             Workspace,
-            document_worker::{DocumentResult, binary_offer::Choice},
+            document_worker::binary_offer::Choice,
+            workspace_document::{DocumentSearchBinding, DocumentShutdownReason, DocumentShutdownStatus},
         };
         for binary in [true, false] {
             let root = std::env::temp_dir().join(format!(
@@ -444,12 +505,13 @@ mod isolation_tests {
             workspace.set_rows(3);
             let original = workspace.active_id();
             let (sender, receiver) = std::sync::mpsc::channel();
-            workspace
-                .start_document_worker_at(Some(root.join("state")), move |result| {
-                    let _ = sender.send(result);
+            let budget = AllocationBudget::default();
+            let mut transport = workspace
+                .start_bounded_document_worker_at(Some(root.join("state")), &budget, move || {
+                    sender.send(()).map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fixture closed"))
                 })
                 .unwrap();
-            await_initial(&mut workspace, &receiver, |w| {
+            await_initial(&mut workspace, &mut transport, &receiver, |w| {
                 if binary { w.binary_offer().is_some() } else { w.editor().is_some() }
             });
             if !binary {
@@ -462,12 +524,14 @@ mod isolation_tests {
             if binary {
                 let offer = workspace.binary_offer().unwrap();
                 workspace.resolve_binary_offer(offer.ticket, Choice::Cancel, 3).unwrap();
-                await_initial(&mut workspace, &receiver, |w| !w.binary_offer_pending(original) && w.editor().is_some());
+                await_initial(&mut workspace, &mut transport, &receiver, |w| {
+                    !w.binary_offer_pending(original) && w.editor().is_some()
+                });
             }
             for request in inbox.drain() {
                 workspace.open_files(request).unwrap();
             }
-            await_initial(&mut workspace, &receiver, |w| {
+            await_initial(&mut workspace, &mut transport, &receiver, |w| {
                 w.editor().is_some_and(|e| e.document().path() == Some(later.as_path()))
             });
             assert_eq!(workspace.editor().unwrap().primary_cursor().head, 6, "later CLI line/column is preserved");
@@ -480,25 +544,41 @@ mod isolation_tests {
                 workspace
                     .open_files(OpenFiles { files: vec![OpenFile { path: first, line: None, column: None }] })
                     .unwrap();
-                await_initial(&mut workspace, &receiver, |w| w.binary_offer().is_some());
+                await_initial(&mut workspace, &mut transport, &receiver, |w| w.binary_offer().is_some());
                 let offer = workspace.binary_offer().unwrap();
                 assert_ne!(offer.ticket.document(), original);
                 workspace.resolve_binary_offer(offer.ticket, Choice::Cancel, 3).unwrap();
-                await_initial(&mut workspace, &receiver, |w| !w.binary_offer_pending(offer.ticket.document()));
+                await_initial(&mut workspace, &mut transport, &receiver, |w| {
+                    !w.binary_offer_pending(offer.ticket.document())
+                });
             }
-            await_initial(&mut workspace, &receiver, |w| !w.search_replacement_pending());
-            while !workspace.prepare_hex_shutdown() {
-                workspace.document_result(receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
-            }
-            drop(workspace);
-            loop {
-                if let DocumentResult::Stopped(result) =
-                    receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
-                {
-                    result.unwrap();
-                    break;
-                }
-            }
+            await_initial(&mut workspace, &mut transport, &receiver, |w| !w.search_replacement_pending());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        let ControlFlow::Continue(mut shutdown) = workspace.into_document_shutdown(transport) else {
+                            panic!("original initial-delivery transport must bind shutdown")
+                        };
+                        shutdown.bind_search_sources(DocumentSearchBinding::NoSearchWorker).unwrap();
+                        loop {
+                            match shutdown.settle_until(deadline) {
+                                Ok(DocumentShutdownStatus::Complete) => break,
+                                Ok(DocumentShutdownStatus::SourcesReleased) => {}
+                                Err(DocumentShutdownReason::Transport(
+                                    kwil_view_model::document_worker::DocumentResultSettlementReason::ThreadExitPending,
+                                )) => {
+                                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                                    assert!(!remaining.is_zero(), "same initial-delivery exit deadline");
+                                    std::thread::park_timeout(std::time::Duration::from_millis(1).min(remaining));
+                                }
+                                other => panic!("initial-delivery shutdown: {other:?}"),
+                            }
+                        }
+                    })
+                    .join()
+                    .unwrap();
+            });
             std::fs::remove_dir_all(root).unwrap();
         }
     }

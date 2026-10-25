@@ -524,14 +524,18 @@ impl App {
         }
         self.search_dirty |= outcome.damage.panel || outcome.damage.signal;
         // The normal Damage merger clips and deduplicates these visible rows.
-        let damage = Damage { rows: outcome.damage.hit_rows, status: outcome.damage.status, ..Default::default() };
+        let rows =
+            if self.wrap_owns_text() { self.wrap_damage_source(0..u64::MAX).rows } else { outcome.damage.hit_rows };
+        let damage = Damage { rows, status: outcome.damage.status, ..Default::default() };
         if let Some(action) = outcome.action.take() {
             self.search_action(action);
         }
         self.apply(damage);
     }
     pub(super) fn search_ready(&mut self) {
-        let Some(session) = &mut self.search else { return };
+        let Some(session) = &mut self.search else {
+            return;
+        };
         // Bounded draining and retry-on-wake are owned by SearchSession/Panel.
         let outcome = self.search_panel.worker_ready(session, &self.view);
         if self.search_panel.mode() == SearchMode::Files && outcome.damage.panel {
@@ -541,6 +545,10 @@ impl App {
     }
     fn search_action(&mut self, action: kwil_view_model::search_session::SearchAction) {
         use kwil_view_model::search_session::{SearchAction, SelectionMode};
+        self.wrap_sync_live();
+        if !self.wrap_mutation_allowed() {
+            return;
+        }
         let painted_file =
             !matches!(&action, SearchAction::OpenFile { .. }) || self.search_view.consume_file_intent(&action);
         if !painted_file
@@ -565,8 +573,15 @@ impl App {
             None
         };
         if let SearchAction::Replace(recipe) = action {
+            let key = recipe.key;
+            let Some(slot) = self.document.replacements.iter().position(Option::is_none) else {
+                self.search_notice("Replacement acknowledgement capacity is occupied".into());
+                return;
+            };
             match self.view.submit_search_replacement(recipe) {
                 Ok(()) => {
+                    let operation = self.view.search_replacement_operation(key).expect("accepted original editor loan");
+                    self.document.replacements[slot] = Some((key, operation));
                     let outcome =
                         self.search_panel.replacement_admitted(self.search.as_mut().unwrap(), acknowledgement.unwrap());
                     self.search_origin = None;
@@ -623,14 +638,19 @@ impl App {
                     )
                 }
             }
-            SearchAction::OpenFile { .. } => unreachable!("native folder action was consumed above"),
-            SearchAction::Replace(_) => unreachable!("owned recipe was consumed by worker admission"),
+            SearchAction::OpenFile { .. } => {
+                unreachable!("native folder action was consumed above")
+            }
+            SearchAction::Replace(_) => {
+                unreachable!("owned recipe was consumed by worker admission")
+            }
         };
         match result {
             Ok(damage) => {
                 let damage = self.view.refresh_after_edit(damage);
                 let acknowledged = self.search_panel.action_applied(self.search.as_mut().unwrap(), &self.view, &action);
                 self.search_origin = Origin::capture(&self.view);
+                let damage = self.wrap_model_damage(damage);
                 self.apply(damage);
                 self.keep_caret_visible();
                 match acknowledged {
@@ -641,14 +661,28 @@ impl App {
             Err(error) => self.search_notice(error.to_string()),
         }
     }
-    /// ROOT calls this immediately after Workspace::document_result installs
-    /// DocumentResult::Replaced, before applying its viewport damage.
+    /// The exact scalar receipt follows sealed editor installation. Interactive
+    /// follow-up remains SearchPanel's normal document/key/revision mapping.
     pub(super) fn search_replacement_finished(
         &mut self,
-        key: kwil_view_model::search_session::SearchKey,
-        result: Result<(), String>,
+        receipt: kwil_view_model::workspace_document::ExactReplacementReceipt,
     ) {
-        let Some(session) = &mut self.search else { return };
+        let Some(session) = &mut self.search else {
+            return;
+        };
+        let key = receipt.key;
+        let Some(slot) = self.document.replacements.iter_mut().find(|slot| **slot == Some((key, receipt.operation)))
+        else {
+            self.document.live.failure =
+                Some(kwil_view_model::document_worker::DocumentResultSettlementReason::ConsumerRefused);
+            return;
+        };
+        *slot = None;
+        let result = if receipt.succeeded {
+            Ok(())
+        } else {
+            Err("replacement worker failed; original error retained in Workspace".into())
+        };
         let outcome = self.search_panel.replacement_finished(session, &self.view, key, result);
         self.search_origin = Origin::capture(&self.view);
         match outcome {
@@ -849,18 +883,23 @@ pub(crate) mod host_dispatch_tests {
     // or storage startup. The production App and worker wake dispatch are used.
     pub(crate) fn host(text: &str) -> (App, Receiver<UserEvent>) {
         let (tx, rx) = mpsc::channel();
-        let (_, inbox) = kwil_view_model::document_worker::external_open_channel(|| Ok(()));
+        let (external_open, inbox) = kwil_view_model::document_worker::external_open_channel(|| Ok(()));
         let mut view = Workspace::new(View::new(None)).unwrap();
         view.set_rows(3);
         view.execute("edit.insert", &CommandArgs { text: Some(text.into()), ..Default::default() }, 1).unwrap();
+        let budget = kwil_view_model::visual_rows::AllocationBudget::default();
+        let document = shutdown::Failure::admit(&budget).unwrap();
+        let markdown = markdown_ui::Host::with_budget(&budget).unwrap();
         let frontend_document = view.active_id();
         let frontend_epoch = view.input_epoch();
         (
             App {
+                startup_fonts: StartupFonts { editor_ready: true, chrome_ready: true, finished: true },
                 about: Default::default(),
-                markdown: Default::default(),
+                markdown,
                 context: Default::default(),
                 hex: Default::default(),
+                wrap: wrap_ui::Host::with_budget(budget),
                 language_picker: Default::default(),
                 context_area: None,
                 logs: Default::default(),
@@ -876,7 +915,7 @@ pub(crate) mod host_dispatch_tests {
                 goto_epoch: 0,
                 goto_reveal: None,
                 highlighting: None,
-                document_stopped: None,
+                document,
                 palette: None,
                 palette_dirty: false,
                 palette_area: None,
@@ -910,7 +949,7 @@ pub(crate) mod host_dispatch_tests {
                 proxy: HostProxy::Test(tx),
                 on_first_frame: None,
                 on_external_ready: None,
-                external_open: None,
+                external_open: Some(external_open),
                 external_inbox: inbox,
                 font_thread: None,
                 font_size: None,
@@ -993,20 +1032,11 @@ pub(crate) mod host_dispatch_tests {
     fn dispatch(app: &mut App, event: UserEvent) {
         match event {
             UserEvent::SearchReady => app.search_ready(),
-            UserEvent::Document(result) => {
-                use kwil_view_model::document_worker::DocumentResult;
-                let replacement = match &*result {
-                    DocumentResult::Replaced { key, result, .. } => {
-                        Some((*key, result.as_ref().map(|_| ()).map_err(ToString::to_string)))
-                    }
-                    _ => None,
-                };
-                let damage = app.view.document_result(*result);
-                if let Some((key, result)) = replacement {
-                    app.search_replacement_finished(key, result);
-                }
-                app.apply(damage);
+            UserEvent::DocumentReady => {
+                app.document_ready();
+                crate::document_ui::fixtures::publish(app);
             }
+            UserEvent::WrapReady => app.wrap_ready(),
             _ => panic!("unexpected headless event"),
         }
     }
@@ -1021,17 +1051,9 @@ pub(crate) mod host_dispatch_tests {
     }
     fn worker_host(value: &str) -> (App, Receiver<UserEvent>, std::path::PathBuf) {
         let (mut app, rx) = host("");
-        let root = std::env::temp_dir().join(format!(
-            "kwil-replace-host-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        let proxy = app.proxy.clone();
-        app.view
-            .start_document_worker_at(Some(root.clone()), move |result| {
-                let _ = proxy.send_event(UserEvent::Document(Box::new(result)));
-            })
-            .unwrap();
+        let root = crate::test_support::directory("kwil-replace-host").unwrap();
+        app.start_document_at(Some(root.clone()));
+        assert!(app.document.live.transport.is_some());
         until(&mut app, &rx, |app| app.view.recovery_ready() && app.view.editor().is_some());
         app.view.execute("edit.insert", &CommandArgs { text: Some(value.into()), ..Default::default() }, 1).unwrap();
         app.view.sync_all();
@@ -1046,18 +1068,8 @@ pub(crate) mod host_dispatch_tests {
             !app.view.search_replacement_pending()
                 && app.view.editor().is_none_or(|editor| !editor.has_pending_edit_receipt())
         });
-        stop(app);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let UserEvent::Document(result) = rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("bounded document worker shutdown")
-                && let kwil_view_model::document_worker::DocumentResult::Stopped(result) = *result
-            {
-                result.unwrap();
-                break;
-            }
-        }
+        crate::document_ui::fixtures::settle_app(app);
+        drop(rx);
         assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
         assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-replace-host-"));
         std::fs::remove_dir_all(root).unwrap();
@@ -1076,13 +1088,8 @@ pub(crate) mod host_dispatch_tests {
         app.search_input(SearchInput::Text(replacement));
         assert!(app.search_panel.can_replace());
     }
-    fn stop(mut app: App) {
-        if let Some(mut session) = app.search.take() {
-            let worker = app.search_panel.take_shutdown(&mut session).unwrap_or_else(|_| panic!("shutdown ownership"));
-            drop(app);
-            drop(session);
-            worker.shutdown().unwrap();
-        }
+    fn stop(app: App) {
+        crate::document_ui::fixtures::settle_app(app);
     }
     fn query(app: &mut App, value: &str) {
         ctrl(app, "a");

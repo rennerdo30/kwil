@@ -5,6 +5,7 @@ use crate::{
     Cancellation, Edit, FileEvent, FileSearch, FileSearchSummary, Match, Options, Pattern, Progress, SearchMode,
     find_in_files, plan_replace, search_default,
 };
+use kwil_core_runtime::{NativeExitObservation, NativeExitState, NativeObservationError};
 use kwil_core_text::Snapshot;
 use std::{
     collections::VecDeque,
@@ -373,6 +374,7 @@ struct Shared {
     completed: AtomicBool,
     panicked: AtomicBool,
     completion: Condvar,
+    native_exit: NativeExitObservation,
 }
 struct Completion<'a>(&'a Shared);
 impl Drop for Completion<'_> {
@@ -424,6 +426,7 @@ impl Shared {
             coordinator: OnceLock::new(),
             retry_wake: AtomicBool::new(false),
             completed: AtomicBool::new(false),
+            native_exit: NativeExitObservation::new(),
             panicked: AtomicBool::new(false),
             completion: Condvar::new(),
         }
@@ -438,14 +441,28 @@ impl Shared {
 pub struct SearchWorker {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+    native_retired: bool,
+    settled: bool,
+}
+/// Cleanup acknowledgement is distinct from actual thread exit and join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerSettlementReason {
+    TimedOut,
+    ThreadExitPending,
+    WorkerPanicked,
+    NativeObservation(NativeObservationError),
 }
 /// A failed bounded shutdown retains the exact facade and its retirement
 /// controls. Error transport is Send + Sync and never joins from Drop.
 pub struct ShutdownError {
     owner: Mutex<Option<SearchWorker>>,
-    panicked: bool,
+    reason: WorkerSettlementReason,
 }
 impl ShutdownError {
+    pub fn reason(&self) -> WorkerSettlementReason {
+        self.reason
+    }
     pub fn into_worker(self) -> SearchWorker {
         self.owner.into_inner().unwrap_or_else(|error| error.into_inner()).expect("shutdown owner")
     }
@@ -453,6 +470,11 @@ impl ShutdownError {
         if let Some(worker) = self.owner.lock().unwrap_or_else(|error| error.into_inner()).as_ref() {
             worker.retry_retirement();
         }
+    }
+    pub fn retry_until(self, deadline: Instant) -> Result<(), Self> {
+        let worker = self.into_worker();
+        worker.retry_retirement();
+        worker.shutdown_until(deadline)
     }
     pub fn retry(self, timeout: Duration) -> Result<(), Self> {
         let worker = self.into_worker();
@@ -465,11 +487,15 @@ impl ShutdownError {
 }
 impl std::fmt::Display for ShutdownError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.write_str(if self.panicked {
-            "Search worker panicked; exact shutdown owner retained"
-        } else {
-            "Search shutdown deadline reached; exact cleanup owner retained for explicit retry"
-        })
+        match self.reason {
+            WorkerSettlementReason::WorkerPanicked => {
+                out.write_str("Search worker panicked; exact shutdown owner retained")
+            }
+            WorkerSettlementReason::NativeObservation(error) => {
+                write!(out, "Search native observation failed: {error}; exact owner retained")
+            }
+            _ => out.write_str("Search shutdown deadline reached; exact cleanup owner retained for explicit retry"),
+        }
     }
 }
 impl std::fmt::Debug for ShutdownError {
@@ -477,8 +503,78 @@ impl std::fmt::Debug for ShutdownError {
         std::fmt::Display::fmt(self, out)
     }
 }
-impl std::error::Error for ShutdownError {}
+impl std::error::Error for ShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.reason {
+            WorkerSettlementReason::NativeObservation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 impl SearchWorker {
+    /// Declared fixed headers, aligned Arc allocations, fixed event backing and
+    /// one shutdown-error/typed-return overlap. Source payloads, source-release
+    /// transfer tokens and existing spool/engine accounting remain separate.
+    /// The host must reserve this before construction, deduplicating any old
+    /// header charges rather than assuming the baseline worker was free.
+    pub const fn retained_metadata_bytes() -> usize {
+        match Self::checked_retained_metadata_bytes() {
+            Some(bytes) => bytes,
+            None => usize::MAX,
+        }
+    }
+    pub const fn checked_retained_metadata_bytes() -> Option<usize> {
+        #[repr(C)]
+        struct Allocation {
+            strong: AtomicUsize,
+            weak: AtomicUsize,
+            data: Shared,
+        }
+        let bytes = Some(0usize);
+        let bytes = metadata_add(bytes, std::mem::size_of::<Self>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Allocation>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<SourceReleaseAllocation>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<[SearchEvent; EVENTS]>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Completion<'static>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<ShutdownError>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), WorkerSettlementReason>>());
+        let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), ShutdownError>>());
+        match NativeExitObservation::operation_stack_bytes() {
+            Some(scratch) => metadata_add(bytes, scratch),
+            None => None,
+        }
+    }
+    /// Exact fixed header growth from bounded settlement. The host prepays this
+    /// in its existing aggregate metadata admission BEFORE constructing us.
+    /// No new allocation: the slot retains only the original thread panic Box.
+    pub const fn settlement_metadata_bytes() -> usize {
+        #[allow(dead_code)]
+        struct Before {
+            shared: Arc<Shared>,
+            thread: Option<JoinHandle<()>>,
+        }
+        #[allow(dead_code)]
+        struct BeforeShared {
+            state: Mutex<State>,
+            source_identity: Arc<SourceReleaseIdentity>,
+            space: PublisherWake,
+            stopped: AtomicBool,
+            retirement_due: AtomicBool,
+            coordinator: OnceLock<thread::Thread>,
+            retry_wake: AtomicBool,
+            completed: AtomicBool,
+            panicked: AtomicBool,
+            completion: Condvar,
+        }
+        #[repr(C)]
+        struct Allocation<T> {
+            strong: AtomicUsize,
+            weak: AtomicUsize,
+            data: T,
+        }
+        std::mem::size_of::<Self>() - std::mem::size_of::<Before>() + std::mem::size_of::<Allocation<Shared>>()
+            - std::mem::size_of::<Allocation<BeforeShared>>()
+    }
     /// Starts one sleeping coordinator. Does no source read or filesystem I/O.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
         Self::with_spool_limit(1 << 30, wake)
@@ -488,12 +584,16 @@ impl SearchWorker {
         if spool_bytes < 32 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "spool cap too small"));
         }
+        Self::checked_retained_metadata_bytes().ok_or(io::Error::from(io::ErrorKind::OutOfMemory))?;
         let shared = Arc::new(Shared::new());
         let worker = shared.clone();
         let thread = thread::Builder::new().name("kwil-search".into()).spawn(move || {
             // Declared first, acknowledged only after jobs, spools and their
             // cleanup owners have left the coordinator scope, including unwind.
             let _completion = Completion(&worker);
+            if worker.native_exit.register_current().is_err() {
+                worker.stopped.store(true, Ordering::Release);
+            }
             let _ = worker.coordinator.set(thread::current());
             let retire_wake = Arc::downgrade(&worker);
             let mut spools = SpoolOwner::with_wake(spool_bytes, move || {
@@ -636,7 +736,7 @@ impl SearchWorker {
                 wake();
             }
         })?;
-        Ok(Self { shared, thread: Some(thread) })
+        Ok(Self { shared, thread: Some(thread), panic: None, native_retired: false, settled: false })
     }
     /// Nonblocking, one active plus one latest queued request. Superseded
     /// pending requests go to bounded worker retirement before replacement.
@@ -862,41 +962,159 @@ impl SearchWorker {
         let state = self.shared.state.try_lock().ok()?;
         Some((state.live_spools, state.retirement_errors.clone()))
     }
-    pub fn shutdown(mut self) -> thread::Result<()> {
-        self.stop();
-        self.thread.take().unwrap().join()
+    /// Explicit OFF-UI UNBOUNDED compatibility join. Never call from a bounded
+    /// shutdown protocol; failure retains the complete original owner.
+    pub fn shutdown(mut self) -> Result<(), ShutdownError> {
+        self.shutdown_in_place().map_err(|reason| ShutdownError { owner: Mutex::new(Some(self)), reason })
     }
-    /// OFF UI: waits once for resource cleanup acknowledgement, never joins a
-    /// coordinator parked on failed retirement. Timeout returns exact ownership.
-    /// Successful acknowledgement leaves no accepted work or spool owner; an
-    /// unfinished OS thread handle can only be completing its epilogue.
-    pub fn shutdown_bounded(mut self, timeout: Duration) -> Result<(), ShutdownError> {
+    pub fn shutdown_until(mut self, deadline: Instant) -> Result<(), ShutdownError> {
+        self.settle_until(deadline).map_err(|reason| ShutdownError { owner: Mutex::new(Some(self)), reason })
+    }
+    pub(crate) fn shutdown_in_place(&mut self) -> Result<(), WorkerSettlementReason> {
         self.stop();
-        let shared = self.shared.clone();
-        let state = shared.state.lock().unwrap_or_else(|error| error.into_inner());
-        let (state, _) = shared
-            .completion
-            .wait_timeout_while(state, timeout, |_| !shared.completed.load(Ordering::Acquire))
-            .unwrap_or_else(|error| error.into_inner());
-        let completed = shared.completed.load(Ordering::Acquire);
-        drop(state);
-        if !completed {
-            return Err(ShutdownError { owner: Mutex::new(Some(self)), panicked: false });
+        if let Some(handle) = self.thread.take()
+            && let Err(panic) = handle.join()
+        {
+            self.panic = Some(panic);
         }
-        if shared.panicked.load(Ordering::Acquire) {
-            return Err(ShutdownError { owner: Mutex::new(Some(self)), panicked: true });
+        self.finish_join_with(None, NativeExitObservation::retire_after_join)
+    }
+    /// OFF UI. One existing completion wait, one borrowed native observation,
+    /// the ORIGINAL deadline, and no production polling. ACK/is_finished alone
+    /// never authorizes join. Every refusal retains the exact original owners.
+    pub fn settle_until(&mut self, deadline: Instant) -> Result<(), WorkerSettlementReason> {
+        self.settle_with(
+            deadline,
+            |observation, handle| observation.query(handle),
+            NativeExitObservation::retire_after_join,
+        )
+    }
+    fn settle_with(
+        &mut self,
+        deadline: Instant,
+        query: impl FnOnce(&NativeExitObservation, &JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), WorkerSettlementReason> {
+        self.stop();
+        if self.thread.is_some() {
+            let shared = &self.shared;
+            let guard = shared.state.lock().unwrap_or_else(|error| error.into_inner());
+            let (guard, _) = shared
+                .completion
+                .wait_timeout_while(guard, deadline.saturating_duration_since(Instant::now()), |_| {
+                    !shared.completed.load(Ordering::Acquire)
+                })
+                .unwrap_or_else(|error| error.into_inner());
+            let completed = shared.completed.load(Ordering::Acquire);
+            drop(guard);
+            if !completed {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+            // Query before consuming anything, even after a cleanup ACK. It also
+            // retains original registration errors and any partial owned right.
+            match query(&shared.native_exit, self.thread.as_ref().expect("original worker handle")) {
+                Ok(NativeExitState::Pending) => return Err(WorkerSettlementReason::ThreadExitPending),
+                Err(error) => return Err(WorkerSettlementReason::NativeObservation(error)),
+                Ok(NativeExitState::Exited) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+            if let Err(panic) = self.thread.take().expect("native-exited original handle").join() {
+                self.panic = Some(panic);
+            }
         }
-        // Acknowledged resource scope is finished. Do not introduce an
-        // unbounded OS-thread join for its remaining runtime epilogue.
-        drop(self.thread.take());
+        // thread=None means the ORIGINAL join already returned, including panic;
+        // it does not imply native-right retirement completed on a prior call.
+        self.finish_join_with(Some(deadline), retire)
+    }
+    fn finish_join_with(
+        &mut self,
+        deadline: Option<Instant>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), WorkerSettlementReason> {
+        self.finish_join_with_clock(deadline, retire, Instant::now)
+    }
+    fn finish_join_with_clock(
+        &mut self,
+        deadline: Option<Instant>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+        mut now: impl FnMut() -> Instant,
+    ) -> Result<(), WorkerSettlementReason> {
+        // Once the right is retired, sticky diagnostics precede deadline-only
+        // no-op retries. No consumed panic payload can turn into fake success.
+        if self.native_retired {
+            if self.panic.is_some() {
+                return Err(WorkerSettlementReason::WorkerPanicked);
+            }
+            if let Some(error) = self.shared.native_exit.registration_error() {
+                return Err(WorkerSettlementReason::NativeObservation(error));
+            }
+            if self.settled {
+                return Ok(());
+            }
+        }
+        if !self.settled && deadline.is_some_and(|deadline| now() >= deadline) {
+            return Err(WorkerSettlementReason::TimedOut);
+        }
+        if !self.native_retired {
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+            retire(&self.shared.native_exit).map_err(WorkerSettlementReason::NativeObservation)?;
+            self.native_retired = true;
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Err(WorkerSettlementReason::TimedOut);
+            }
+        }
+        if self.panic.is_some() {
+            return Err(WorkerSettlementReason::WorkerPanicked);
+        }
+        if let Some(error) = self.shared.native_exit.registration_error() {
+            return Err(WorkerSettlementReason::NativeObservation(error));
+        }
+        self.settled = true;
         Ok(())
+    }
+    /// Scalar-only original native retirement evidence; no native query or I/O.
+    pub fn first_native_retirement_error(&self) -> Option<NativeObservationError> {
+        self.shared.native_exit.first_retirement_error()
+    }
+    pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send + 'static)> {
+        self.panic.as_deref()
+    }
+    /// Compatibility owner transport. Failure preserves the exact worker and
+    /// explicit retirement retry controls; Drop never joins or cleans up UI data.
+    pub fn shutdown_bounded(self, timeout: Duration) -> Result<(), ShutdownError> {
+        let deadline = Instant::now() + timeout;
+        self.shutdown_until(deadline)
     }
 }
 impl Drop for SearchWorker {
     fn drop(&mut self) {
         self.stop();
+        if self.thread.is_some() || !self.settled || self.panic.is_some() {
+            // Misuse quarantine, NOT successful retirement: retain the SAME
+            // shared allocation/source headers/native right and exact handle.
+            // No native I/O, source destruction, new allocation or cleanup thread.
+            std::mem::forget(Arc::clone(&self.shared));
+            std::mem::forget(self.thread.take());
+            std::mem::forget(self.panic.take());
+        }
     }
 }
+
+// Checked declared Rust-value accounting, not compiler/native-stack usage.
+const fn metadata_add(bytes: Option<usize>, extra: usize) -> Option<usize> {
+    match bytes {
+        Some(bytes) => bytes.checked_add(extra),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "worker/bounded_settlement_tests.rs"]
+mod bounded_settlement_tests;
 
 fn validate(request: &SearchRequest) -> Result<(), &'static str> {
     match &request.task {
@@ -1584,23 +1802,39 @@ mod tests {
     use super::*;
     #[test]
     fn bounded_shutdown_refusal_preserves_exact_worker_and_retry_controls() {
-        let shared = Arc::new(Shared::new());
-        let worker = SearchWorker { shared: shared.clone(), thread: None };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = Mutex::new(Some(gate));
+        let worker = SearchWorker::new(move || {
+            if let Some(gate) = gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                gate.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+            }
+        })
+        .unwrap();
+        let shared = Arc::clone(&worker.shared);
+        worker.stop();
+        observed.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
         let error = worker.shutdown_bounded(Duration::ZERO).unwrap_err();
         assert!(error.to_string().contains("owner retained"));
         error.retry_retirement();
         assert!(shared.retirement_due.load(Ordering::Acquire));
-        let worker = error.into_worker();
+        let mut worker = error.into_worker();
         assert!(Arc::ptr_eq(&shared, &worker.shared));
-        shared.completed.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        bounded_settlement_tests::settle(&mut worker, deadline).unwrap();
         worker.shutdown_bounded(Duration::ZERO).unwrap();
     }
     #[test]
     fn bounded_shutdown_reports_panics_without_claiming_cleanup_success() {
-        let shared = Arc::new(Shared::new());
-        shared.completed.store(true, Ordering::Release);
-        shared.panicked.store(true, Ordering::Release);
-        let worker = SearchWorker { shared, thread: None };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut worker = SearchWorker::new(|| std::panic::panic_any(17_u8)).unwrap();
+        worker.stop();
+        assert_eq!(
+            bounded_settlement_tests::settle(&mut worker, deadline),
+            Err(WorkerSettlementReason::WorkerPanicked)
+        );
         let error = worker.shutdown_bounded(Duration::ZERO).unwrap_err();
         assert!(error.to_string().contains("panicked"));
         assert!(error.retry(Duration::ZERO).is_err());
@@ -1994,7 +2228,8 @@ mod tests {
         // The sole producer IS the coordinator: no idle outer loop is allowed
         // to service retry_wake on its behalf while the fifth publish blocks.
         let shared = Arc::new(Shared::new());
-        let worker = SearchWorker { shared: shared.clone(), thread: None };
+        let worker =
+            SearchWorker { shared: shared.clone(), thread: None, panic: None, native_retired: true, settled: true };
         let key = SearchKey { document_id: 0, revision: 0, generation: 21 };
         let page = |first| SearchEvent { key, update: SearchUpdate::Files { first, rows: Vec::new(), results: None } };
         {

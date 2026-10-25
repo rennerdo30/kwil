@@ -190,7 +190,7 @@ mod tests {
         keys: KeymapEngine,
         modal: Host,
         receiver: mpsc::Receiver<Msg>,
-        stopped: mpsc::Receiver<Result<(), String>>,
+        document: DocumentLane,
         root: PathBuf,
     }
     impl Fixture {
@@ -199,21 +199,20 @@ mod tests {
             let mut view = Workspace::new(View::new(None)).unwrap();
             view.set_rows(3);
             let (tx, receiver) = mpsc::channel();
-            let (stop_tx, stopped) = mpsc::sync_channel(1);
-            view.start_document_worker_at(Some(root.join("recovery")), move |result| {
-                if let kwil_view_model::document_worker::DocumentResult::Stopped(result) = &result {
-                    let _ = stop_tx.try_send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
-                }
-                let _ = tx.send(Msg::Document(result));
-            })
-            .unwrap();
+            let budget = AllocationBudget::default();
+            let mut document = DocumentLane::new(&budget).unwrap();
+            document
+                .started(view.start_bounded_document_worker_at(Some(root.join("recovery")), &budget, move || {
+                    tx.send(Msg::DocumentReady).map_err(|_| std::io::Error::other("binary fixture wake closed"))
+                }))
+                .unwrap();
             let mut fixture = Self {
                 view,
                 search: Default::default(),
                 keys: KeymapEngine::new(Preset::VsCode, &[]).unwrap(),
                 modal: Default::default(),
                 receiver,
-                stopped,
+                document,
                 root,
             };
             fixture.until("recovery ready", |f| f.view.recovery_ready());
@@ -226,8 +225,8 @@ mod tests {
                     .receiver
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .unwrap_or_else(|error| panic!("binary TUI stage {stage}: {error}; notice={}", self.view.notice()));
-                let Msg::Document(result) = message else { panic!("document worker wake") };
-                self.search.document_result(&mut self.view, &mut self.keys, result);
+                assert!(matches!(message, Msg::DocumentReady), "document worker wake");
+                self.document.ready(&mut self.view, &mut self.search, &mut self.keys).unwrap();
                 self.modal.sync(&mut self.view, &mut self.keys);
             }
         }
@@ -285,22 +284,33 @@ mod tests {
         fn hold_checked_opened(
             &mut self,
             id: kwil_view_model::SessionDocumentId,
-        ) -> kwil_view_model::document_worker::DocumentResult {
-            use kwil_view_model::document_worker::DocumentResult;
-            // Withhold the real editor-bearing completion on the test host.
-            // Preview publication remains real and FIFO, without file-size
-            // timing assumptions or a sleep between preview and completion.
+        ) -> kwil_view_model::workspace_document::ResultInfo {
+            use kwil_view_model::workspace_document::ResultKind;
+            // The actual completion stays charged in its original worker slot.
+            // Only scalar inspection crosses the frontend boundary.
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 let message = self
                     .receiver
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .expect("bounded checked preview/completion delivery");
-                let Msg::Document(result) = message else { panic!("document worker wake") };
-                if matches!(&result, DocumentResult::CheckedOpened { ticket, .. } if ticket.document() == id) {
-                    return result;
+                assert!(matches!(message, Msg::DocumentReady), "document worker wake");
+                let transport = self.document.transport.as_ref().unwrap();
+                if let Some(info) = transport.result_info()
+                    && info.kind == ResultKind::Opened
+                    && info.document == Some(id)
+                {
+                    let before = transport.status();
+                    assert!(
+                        self.document
+                            .receive(&mut self.view, &mut self.search, &mut self.keys, false)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(self.document.transport.as_ref().unwrap().status(), before);
+                    return info;
                 }
-                self.search.document_result(&mut self.view, &mut self.keys, result);
+                self.document.ready(&mut self.view, &mut self.search, &mut self.keys).unwrap();
                 self.modal.sync(&mut self.view, &mut self.keys);
             }
         }
@@ -333,7 +343,7 @@ mod tests {
         fn finish(self) {
             let root = self.root.clone();
             std::thread::spawn(move || {
-                crate::shutdown_search_workspace(self.view, self.search, self.receiver, self.stopped, true)
+                crate::shutdown_bounded_workspace(self.view, self.search, self.receiver, self.document, None, None)
             })
             .join()
             .unwrap()
@@ -346,7 +356,7 @@ mod tests {
 
     #[test]
     fn binary_offer_terminal_vetted_preview_paints_before_held_completion_without_releasing_input() {
-        use kwil_view_model::document_worker::DocumentResult;
+        use kwil_view_model::workspace_document::ResultKind;
         const TEXT: &[u8] = b"vetted first screen\n";
         for choice in [None, Some(Choice::Text), Some(Choice::Hex), Some(Choice::Cancel)] {
             let mut f = Fixture::new();
@@ -367,16 +377,16 @@ mod tests {
             }
             let completion = f.hold_checked_opened(id);
             assert!(Host::blocked(&f.view), "vetted preview never releases pending ownership");
-            assert!(f.view.editor().is_none(), "real source completion is held outside the Workspace");
+            assert!(f.view.editor().is_none(), "real source completion stays in the original transport slot");
             let painted = f.paint();
             if choice == Some(Choice::Cancel) {
-                assert!(matches!(&completion, DocumentResult::CheckedOpened { result: Ok(None), .. }));
+                assert_eq!(completion.kind, ResultKind::Opened);
                 assert!(!f.view.binary_preview_ready(id));
                 assert!(painted.contains("Preparing file..."));
                 assert!(!painted.contains("header"));
                 assert!(!painted.contains("68 65 61 64 65 72"));
             } else {
-                assert!(matches!(&completion, DocumentResult::CheckedOpened { result: Ok(Some(_)), .. }));
+                assert_eq!(completion.kind, ResultKind::Opened);
                 assert!(f.view.binary_preview_ready(id));
                 let visible = match choice {
                     None => "vetted first screen",
@@ -402,7 +412,8 @@ mod tests {
             assert_eq!(f.paint(), painted, "pending preview consumes keys/paste/IME and body navigation");
             assert!(Host::blocked(&f.view));
             assert!(f.view.editor().is_none());
-            f.search.document_result(&mut f.view, &mut f.keys, completion);
+            assert_eq!(f.document.transport.as_ref().unwrap().result_info(), Some(completion));
+            f.document.transport.as_ref().unwrap().wake_ready();
             f.modal.sync(&mut f.view, &mut f.keys);
             f.settled(id);
             if choice == Some(Choice::Cancel) {

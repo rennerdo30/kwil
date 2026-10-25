@@ -75,3 +75,22 @@ fn close_refusal_restores_original_worker_internal_retry_and_exact_external_owne
     retirement.shutdown_bounded(WAIT).unwrap();
     host.worker.take().unwrap().shutdown_bounded(WAIT).unwrap();
 }
+
+#[test]
+fn stop_keeps_original_worker_for_explicit_off_ui_handoff() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut host = SearchSession::new(|| {}).unwrap();
+    let key = host.source_release_key().unwrap();
+    host.stop();
+    let retained = host.worker.is_some();
+    let worker = host.take_shutdown().unwrap();
+    let receipt = worker.wait_inputs_released(deadline.saturating_duration_since(std::time::Instant::now()));
+    // The explicit unbounded compatibility cleanup is OFF UI in this fixture;
+    // its original handle/right are cleaned BEFORE assertions.
+    let valid = receipt.as_ref().is_ok_and(|receipt| receipt.valid_for(&key));
+    let cleanup = worker.shutdown();
+    assert!(retained, "stop cannot discard the only original shutdown facade");
+    assert!(valid);
+    assert!(cleanup.is_ok());
+    assert!(host.worker.is_none());
+}

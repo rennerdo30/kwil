@@ -88,6 +88,10 @@ impl Editor {
                 Ok(Some(Edit { range: edit.offset..end, insert: Insert::Bytes(Arc::from(edit.new_bytes)) }))
             }),
             prepared,
+            // Inline edits always use the explicit recipe above. The only
+            // retained bulk seed is a SpoolEdits cursor: inline counters plus
+            // a shared spool pin, covered by the existing source/spool budget.
+            Some(0),
         )
     }
 }

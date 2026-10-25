@@ -60,18 +60,33 @@ pub(super) fn input(
             _ => KeyResult::Changed(true),
         },
         Ok(Some(PaletteAction::OpenFile(path))) => {
+            if view.wrap_input_blocked() {
+                view.set_notice("Wrap shutdown is pending; file input was not applied".into());
+                return KeyResult::Changed(true);
+            }
             if let Err(error) = view.open_path(path) {
                 view.set_notice(error.to_string());
             }
             KeyResult::Changed(true)
         }
         Ok(Some(PaletteAction::ActivateTab(id))) => {
+            if view.wrap_input_blocked() {
+                view.set_notice("Wrap shutdown is pending; tab input was not applied".into());
+                return KeyResult::Changed(true);
+            }
             if !view.activate(kwil_view_model::SessionDocumentId(id)) {
                 view.set_notice("Palette tab was closed".into());
             }
             KeyResult::Changed(true)
         }
         Ok(Some(PaletteAction::GoTo { line, column })) => {
+            if view.wrap_input_blocked() || prepared_body(view) {
+                return KeyResult::BodyExecute(
+                    "navigation.goToLine",
+                    CommandArgs { line: Some(line), column: Some(column), ..Default::default() },
+                    1,
+                );
+            }
             match view.execute(
                 "navigation.goToLine",
                 &CommandArgs { line: Some(line), column: Some(column), ..Default::default() },

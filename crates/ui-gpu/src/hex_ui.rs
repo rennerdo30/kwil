@@ -124,12 +124,15 @@ pub(super) struct Paint<'a> {
 /// Apply the hex scroll copy to this body-local retained buffer, then paint
 /// only damaged/exposed rows. ROOT forwards the same copy/dirty rectangles to
 /// the backend present; it must not copy this buffer a second time.
-pub(super) fn draw_damage(
+/// The retained body host can combine borrowed, independently charged damage
+/// without copying either row allocation. Scroll is supplied only once.
+pub(super) fn draw_borrowed(
     session: &Session,
     pixels: &mut [u32],
     stride: usize,
     font: &mut Font,
     paint: Paint<'_>,
+    dirty: impl Fn(usize) -> bool,
 ) -> bool {
     let Paint { current, horizontal, read_only, damage } = paint;
     if !session.is_open() {
@@ -160,7 +163,7 @@ pub(super) fn draw_damage(
     let selection = session.view().selection();
     let selected_bg = theme_ui::rgb(theme_ui::chrome(), UiRole::Selection);
     for index in 0..rows {
-        if !full && !damage.rows.contains(&index) {
+        if !full && !dirty(index) {
             continue;
         }
         let y = index * ch;
@@ -214,7 +217,7 @@ pub(super) fn draw_damage(
                 return true;
             };
             let y = row as usize * ch;
-            if y + ch <= height && column + 2 <= columns && (full || damage.rows.contains(&(row as usize))) {
+            if y + ch <= height && column + 2 <= columns && (full || dirty(row as usize)) {
                 if let Some(high) = view.pending_high_nibble() {
                     let text = format!("{high:X}_");
                     fill(pixels, stride, Rect { x: column * cw, y, w: 2 * cw, h: ch }, bg());

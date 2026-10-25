@@ -32,6 +32,31 @@ pub(super) struct HexFlow {
     pub(super) disposing: bool,
 }
 impl HexFlow {
+    pub(super) fn document_metadata_bytes(&self) -> io::Result<usize> {
+        let entries = self
+            .tabs
+            .capacity()
+            .checked_mul(4)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<(DocumentId, HexTab)>() + 16))
+            .and_then(|n| {
+                self.loans
+                    .capacity()
+                    .checked_mul(4)
+                    .and_then(|count| count.checked_mul(std::mem::size_of::<(DocumentId, Loan)>() + 16))
+                    .and_then(|loans| n.checked_add(loans))
+            })
+            .and_then(|n| {
+                self.seed
+                    .capacity()
+                    .checked_mul(4)
+                    .and_then(|count| count.checked_mul(std::mem::size_of::<DocumentId>() + 16))
+                    .and_then(|seeds| n.checked_add(seeds))
+            })
+            .ok_or_else(|| io::Error::other("hex control metadata overflow"))?;
+        // Bounded page/preview payloads retain the existing hex accounting;
+        // this getter admits no reads or new payload allocation.
+        Ok(entries)
+    }
     pub(super) fn opening(&self) -> bool {
         self.tabs.values().any(|tab| tab.opening.is_some())
     }
@@ -49,6 +74,42 @@ impl HexFlow {
 }
 
 impl Workspace {
+    pub(super) fn queue_bound_hex_continuations(
+        &mut self,
+    ) -> Result<(), super::workspace_document::DocumentShutdownReason> {
+        // Reuse the existing scalar Journal loan and existing file deque. No
+        // new source slot or worker is introduced by this accepted continuation.
+        let ids: Vec<_> = self
+            .hex
+            .loans
+            .iter()
+            .filter_map(|(&id, loan)| {
+                matches!(loan, Loan::Journal { .. }).then_some(id).filter(|id| !self.files.observed.contains_key(id))
+            })
+            .collect();
+        for id in ids {
+            if self.files.queue.len() >= 256 {
+                break;
+            }
+            let Some(Loan::Journal { generation, target }) = self.hex.loans.get(&id) else { continue };
+            let generation = *generation;
+            let target = *target;
+            let rows = self.hex.tabs[&id].session.view().rows();
+            // Allocate the destination before moving an installed source.
+            let mut editor = Box::new(Editor::new(crate::Document::new()));
+            let view = self.views.get_mut(&id).expect("accepted raw reopen target");
+            std::mem::swap(&mut *editor, view.editor.as_mut().expect("journal close retains editor"));
+            view.editor = None;
+            let request = if target == Representation::RawBytes {
+                DocumentRequest::ReopenRaw { document: id, generation, editor, rows }
+            } else {
+                DocumentRequest::ReopenText { document: id, generation, editor }
+            };
+            self.files.queue.push_back(request);
+            *self.hex.loans.get_mut(&id).unwrap() = Loan::Reopen { generation, target };
+        }
+        Ok(())
+    }
     pub(super) fn hex_begin_binary_open(&mut self, id: DocumentId, generation: u64, rows: usize) {
         let mut tab = HexTab::new(rows);
         tab.opening = Some(generation);
@@ -423,6 +484,12 @@ impl Workspace {
         self.files.seeded.remove(&id);
         self.files.durable.remove(&id);
         self.files.journal_failed.remove(&id);
+        // The bound bundle submits this accepted reopen through the private
+        // continuation lane after this exact close receipt. Keep its Journal
+        // loan as the scalar obligation until the request has a destination.
+        if self.files.document_shutdown {
+            return;
+        }
         if let Err(error) = self.start_transport_reopen(id, generation, target) {
             self.views.get_mut(&id).unwrap().set_notice(error.to_string());
         }
@@ -471,21 +538,35 @@ impl Workspace {
         editor: Box<Editor>,
         result: io::Result<OpenOutcome>,
     ) -> Damage {
+        let Some(Loan::Reopen { generation: current, .. }) = self.hex.loans.get(&id) else {
+            panic!("worker must return the admitted transport editor")
+        };
+        assert_eq!(*current, generation);
+        let view = self.views.get_mut(&id).expect("raw loan target cannot close");
+        assert!(view.editor.is_none());
+        // Restore ownership BEFORE resolving UI state, including every refusal.
+        view.editor = Some(*editor);
+        self.hex_reopened_installed(id, generation, result)
+    }
+    pub(super) fn hex_reopened_installed(
+        &mut self,
+        id: DocumentId,
+        generation: u64,
+        result: io::Result<OpenOutcome>,
+    ) -> Damage {
+        let intended_wrap = self.intended_wrap_publication();
         let Some(Loan::Reopen { generation: current, target }) = self.hex.loans.get(&id) else {
             panic!("worker must return the admitted transport editor")
         };
         assert_eq!(*current, generation);
         let target = *target;
-        let mut editor = editor;
+        let view = self.views.get_mut(&id).expect("raw loan target cannot close");
+        let editor = view.editor.as_mut().expect("sealed acceptance restores editor first");
         if let Some(settings) = &self.editor_settings {
             editor.settings = settings.clone();
         }
         let source = editor.document().hex_source(id.0);
-        let view = self.views.get_mut(&id).expect("raw loan target cannot close");
-        assert!(view.editor.is_none());
-        // Restore ownership BEFORE resolving UI state, including every refusal.
         view.file = editor.document().original.clone();
-        view.editor = Some(*editor);
         self.hex.loans.remove(&id);
         self.hex.seed.insert(id);
         self.input_epoch = self.input_epoch.wrapping_add(1);
@@ -497,21 +578,37 @@ impl Workspace {
                     let tab = self.hex.tabs.remove(&id).expect("transport reopen retains its viewport");
                     let rows = tab.session.view().rows();
                     let preview = tab.text_preview.unwrap_or_default();
-                    // Build the first text screen from worker-owned bounded
-                    // bytes while its Editor remains locally held. set_rows
-                    // cannot enter View's mapped/snapshot reload branch.
-                    let mut editor = view.editor.take().unwrap();
-                    let mut text_view = View::new(None);
-                    text_view.editor = None;
-                    text_view.path = editor.document().path().map(PathBuf::from);
-                    text_view.preview = Some(preview);
-                    // The hex Session owns layout while it owns the body;
-                    // View can still carry the zero rows of its open placeholder.
-                    text_view.set_rows(rows);
-                    text_view.file = editor.document().original.clone();
-                    editor.set_viewport(0, rows);
-                    text_view.editor = Some(editor);
-                    *view = text_view;
+                    // Keep the restored Editor installed throughout bounded
+                    // text-cache construction, settings and viewport updates.
+                    // Only preview-backed layout runs before normal policy.
+                    view.path = view.editor().unwrap().document().path().map(PathBuf::from);
+                    view.preview = Some(preview);
+                    view.top = 0;
+                    view.rows = rows;
+                    view.pending_goto = None;
+                    view.first_byte_column = 0;
+                    view.body_policy =
+                        if intended_wrap { ViewBodyPolicy::Prepared } else { ViewBodyPolicy::LogicalLines };
+                    view.editor.as_mut().unwrap().set_viewport(0, rows);
+                    // Layout only worker-prepared bytes. Keeping the Editor in
+                    // its Workspace field prevents a source owner from crossing
+                    // any of these fallible cache allocations.
+                    view.lines.clear();
+                    view.line_offsets.clear();
+                    view.line_sources.clear();
+                    let mut remaining = view.preview.as_deref().unwrap_or_default();
+                    for _ in 0..rows {
+                        let end = remaining.iter().position(|b| matches!(b, b'\r' | b'\n')).unwrap_or(remaining.len());
+                        let stop = crate::grid::boundary(&remaining[..end], end.min(view.line_byte_limit));
+                        view.lines.push(remaining[..stop].to_vec());
+                        view.line_offsets.push(0);
+                        if end == remaining.len() {
+                            break;
+                        }
+                        let width = if remaining[end..].starts_with(b"\r\n") { 2 } else { 1 };
+                        remaining = &remaining[end + width..];
+                    }
+                    super::prepare_view_publication(view, intended_wrap, false);
                 }
                 view.set_notice(String::new());
             }
@@ -554,14 +651,24 @@ impl Workspace {
             matches!(self.hex.loans.get(&id), Some(Loan::Page(current)) if *current == request),
             "worker must return the admitted page editor"
         );
-        let mut editor = editor;
+        let view = self.views.get_mut(&id).expect("page target cannot close");
+        assert!(view.editor.is_none());
+        view.editor = Some(*editor);
+        self.hex_page_installed(id, request, result)
+    }
+    pub(super) fn hex_page_installed(
+        &mut self,
+        id: DocumentId,
+        request: PageRequest,
+        result: io::Result<Page>,
+    ) -> Damage {
+        assert!(matches!(self.hex.loans.get(&id),Some(Loan::Page(current)) if *current==request));
+        let view = self.views.get_mut(&id).expect("page target cannot close");
+        let editor = view.editor.as_mut().expect("sealed acceptance restores editor first");
         if let Some(settings) = &self.editor_settings {
             editor.settings = settings.clone();
         }
         let source = editor.document().hex_source(id.0);
-        let view = self.views.get_mut(&id).expect("page target cannot close");
-        assert!(view.editor.is_none());
-        view.editor = Some(*editor);
         self.hex.loans.remove(&id);
         let tab = self.hex.tabs.get_mut(&id).unwrap();
         tab.session.bind(source);
@@ -585,16 +692,23 @@ impl Workspace {
             matches!(self.hex.loans.get(&id), Some(Loan::Edit { source, operation, input_epoch }) if *source == completion.before && *operation == completion.operation && *input_epoch == completion.input_epoch),
             "worker must return the admitted edit editor"
         );
-        let mut editor = editor;
+        let view = self.views.get_mut(&id).expect("edit target cannot close");
+        assert!(view.editor.is_none());
+        view.editor = Some(*editor);
+        self.hex_edit_installed(id, completion)
+    }
+    pub(super) fn hex_edit_installed(&mut self, id: DocumentId, completion: EditCompletion) -> Damage {
+        assert!(
+            matches!(self.hex.loans.get(&id),Some(Loan::Edit {source,operation,input_epoch}) if *source==completion.before && *operation==completion.operation && *input_epoch==completion.input_epoch)
+        );
+        let view = self.views.get_mut(&id).expect("edit target cannot close");
+        let editor = view.editor.as_mut().expect("sealed acceptance restores editor first");
         if let Some(settings) = &self.editor_settings {
             editor.settings = settings.clone();
         }
         let source = editor.document().hex_source(id.0);
         let sequence = editor.next_edit_sequence().saturating_sub(1);
         let changed = source != completion.before;
-        let view = self.views.get_mut(&id).expect("edit target cannot close");
-        assert!(view.editor.is_none());
-        view.editor = Some(*editor);
         self.hex.loans.remove(&id);
         if changed {
             self.files.replacement_journals.insert(id, sequence);
@@ -645,7 +759,7 @@ impl Workspace {
         }
     }
     pub(super) fn pump_hex(&mut self) {
-        if self.hex.disposing {
+        if self.hex.disposing || self.files.document_shutdown {
             return;
         }
         // At most one request per live tab and one bounded mailbox. Never put

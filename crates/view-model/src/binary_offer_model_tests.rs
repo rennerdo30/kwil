@@ -41,7 +41,7 @@ fn drive(workspace: &mut Workspace, rx: &mpsc::Receiver<DocumentResult>, done: i
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done(workspace) {
         let wait = deadline.checked_duration_since(Instant::now()).expect("bounded binary model deadline");
-        workspace.document_result(rx.recv_timeout(wait).expect("binary model worker wake"));
+        workspace.test_document_result(rx.recv_timeout(wait).expect("binary model worker wake"));
     }
 }
 fn start(fixture: &Fixture, view: View) -> (Workspace, mpsc::Receiver<DocumentResult>) {
@@ -59,7 +59,7 @@ fn stop(mut workspace: Workspace, rx: &mpsc::Receiver<DocumentResult>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !workspace.prepare_hex_shutdown() {
         let wait = deadline.checked_duration_since(Instant::now()).expect("bounded binary shutdown admission");
-        workspace.document_result(rx.recv_timeout(wait).unwrap());
+        workspace.test_document_result(rx.recv_timeout(wait).unwrap());
     }
     drop(workspace);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -133,7 +133,7 @@ fn binary_offer_model_actual_hex_text_cancel_and_late_callbacks() {
             assert_eq!(logical(&workspace, id), BINARY);
             assert_eq!(workspace.hex_owns_document(id), choice == Choice::Hex);
         }
-        workspace.document_result(DocumentResult::BinaryOffer(offer));
+        workspace.test_document_result(DocumentResult::BinaryOffer(offer));
         assert!(workspace.binary_offer().is_none(), "late offer cannot overwrite chosen representation");
         stop(workspace, &rx);
     }
@@ -179,7 +179,7 @@ fn binary_offer_model_close_reopen_retires_owner_and_generation_fences_stale_tic
         workspace.resolve_binary_offer(old.ticket, Choice::Text, 1).unwrap_err().kind(),
         io::ErrorKind::Interrupted
     );
-    workspace.document_result(DocumentResult::CheckedOpened { ticket: old.ticket, result: Ok(None) });
+    workspace.test_document_result(DocumentResult::CheckedOpened { ticket: old.ticket, result: Ok(None) });
     assert_eq!(workspace.binary_offer(), Some(new));
     workspace.resolve_binary_offer(new.ticket, Choice::Cancel, 0).unwrap();
     drive(&mut workspace, &rx, |w| !w.binary_offer_pending(id));
@@ -253,7 +253,7 @@ fn binary_offer_model_refused_choice_restores_offer_and_shutdown_retains_cancel_
         rx.recv_timeout(Duration::from_secs(1)).unwrap(),
         DocumentRequest::ResolveBinary { choice: Choice::Hex, .. }
     ));
-    workspace.document_result(DocumentResult::BinaryRefused {
+    workspace.test_document_result(DocumentResult::BinaryRefused {
         offer,
         error: io::Error::new(io::ErrorKind::WouldBlock, "backing capacity retained"),
     });
@@ -309,7 +309,7 @@ fn binary_offer_model_cancel_returns_to_prior_dirty_tab_without_closed_history_e
     // This is the same scalar success produced after worker-side Cancel drop;
     // the real-worker Cancel and cleanup oracle above covers its producer.
     flight.phase = BinaryPhase::Resolving(Choice::Cancel);
-    workspace.document_result(DocumentResult::CheckedOpened { ticket: offer.ticket, result: Ok(None) });
+    workspace.test_document_result(DocumentResult::CheckedOpened { ticket: offer.ticket, result: Ok(None) });
     assert_eq!(workspace.active_id(), other);
     assert_eq!(logical(&workspace, other), b"keep unsaved");
     assert!(workspace.views[&other].editor().unwrap().document().is_dirty());
@@ -350,7 +350,7 @@ fn binary_offer_model_detection_after_file_prompt_preserves_modal_ticket_and_off
     let prompt = workspace.file_prompt().unwrap();
     let identity = (prompt.generation, prompt.document, prompt.revision);
     let epoch = workspace.input_epoch();
-    workspace.document_result(DocumentResult::BinaryOffer(offer));
+    workspace.test_document_result(DocumentResult::BinaryOffer(offer));
     assert_eq!(workspace.binary_offer(), Some(offer));
     assert_eq!(
         workspace.resolve_binary_offer(offer.ticket, Choice::Hex, 1).unwrap_err().kind(),
@@ -437,17 +437,17 @@ fn binary_offer_model_preview_authority_rejects_unresolved_cancel_stale_and_malf
         ticket,
         preview: DecodedPreview { text: b"vetted text".to_vec(), source: 0..11, complete: true },
     };
-    workspace.document_result(text(offer.ticket));
+    workspace.test_document_result(text(offer.ticket));
     assert!(!workspace.binary_preview_ready(id), "unresolved choice cannot accept text preview");
     workspace.binary.flights.get_mut(&id).unwrap().phase = BinaryPhase::Opening;
-    workspace.document_result(text(Ticket { generation: 2, ..offer.ticket }));
+    workspace.test_document_result(text(Ticket { generation: 2, ..offer.ticket }));
     assert!(!workspace.binary_preview_ready(id));
-    workspace.document_result(text(offer.ticket));
+    workspace.test_document_result(text(offer.ticket));
     assert!(workspace.binary_preview_ready(id));
     assert!(workspace.binary_offer_pending(id));
     // Move to a fresh unresolved flight, then exercise the raw route independently.
     workspace.binary.flights.get_mut(&id).unwrap().phase = BinaryPhase::Opening;
-    workspace.document_result(DocumentResult::BinaryOffer(offer));
+    workspace.test_document_result(DocumentResult::BinaryOffer(offer));
     assert!(!workspace.binary_preview_ready(id));
     workspace.resolve_binary_offer(offer.ticket, Choice::Hex, 1).unwrap();
     let page = Page {
@@ -459,26 +459,26 @@ fn binary_offer_model_preview_authority_rejects_unresolved_cancel_stale_and_malf
         },
         rows: vec![crate::hex::HexRow { offset: 0, bytes: vec![0x80; 16] }],
     };
-    workspace.document_result(DocumentResult::CheckedRawPreview {
+    workspace.test_document_result(DocumentResult::CheckedRawPreview {
         ticket: Ticket { generation: 2, ..offer.ticket },
         page: page.clone(),
     });
     assert!(!workspace.binary_preview_ready(id));
     let mut malformed = page.clone();
     malformed.rows[0].offset = 16;
-    workspace.document_result(DocumentResult::CheckedRawPreview { ticket: offer.ticket, page: malformed });
+    workspace.test_document_result(DocumentResult::CheckedRawPreview { ticket: offer.ticket, page: malformed });
     assert!(!workspace.binary_preview_ready(id), "raw cache must accept the page before paint authority");
-    workspace.document_result(DocumentResult::CheckedRawPreview { ticket: offer.ticket, page: page.clone() });
+    workspace.test_document_result(DocumentResult::CheckedRawPreview { ticket: offer.ticket, page: page.clone() });
     assert!(workspace.binary_preview_ready(id));
-    workspace.document_result(DocumentResult::BinaryRefused {
+    workspace.test_document_result(DocumentResult::BinaryRefused {
         offer,
         error: io::Error::new(io::ErrorKind::WouldBlock, "capacity retained"),
     });
     assert_eq!(workspace.binary_offer(), Some(offer));
     assert!(!workspace.binary_preview_ready(id), "refused admission removes the old preview authority");
     workspace.resolve_binary_offer(offer.ticket, Choice::Cancel, 0).unwrap();
-    workspace.document_result(text(offer.ticket));
-    workspace.document_result(DocumentResult::CheckedRawPreview { ticket: offer.ticket, page });
+    workspace.test_document_result(text(offer.ticket));
+    workspace.test_document_result(DocumentResult::CheckedRawPreview { ticket: offer.ticket, page });
     assert!(!workspace.binary_preview_ready(id), "Cancel never permits preview paint");
     assert!(workspace.binary_offer_pending(id));
 }

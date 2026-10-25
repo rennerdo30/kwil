@@ -8,26 +8,32 @@ use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 
 static HOLD_TEXT_COMPLETION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static HELD_TEXT_COMPLETION: std::sync::Mutex<Option<Box<kwil_view_model::document_worker::DocumentResult>>> =
-    std::sync::Mutex::new(None);
+static HELD_TEXT_COMPLETION: std::sync::Mutex<
+    Option<kwil_view_model::document_worker::result_transport::DocumentDeliveryId>,
+> = std::sync::Mutex::new(None);
 
 pub(super) fn hold_preview_completion(
-    result: Box<kwil_view_model::document_worker::DocumentResult>,
+    info: Option<kwil_view_model::workspace_document::ResultInfo>,
     active: kwil_view_model::SessionDocumentId,
-) -> Option<Box<kwil_view_model::document_worker::DocumentResult>> {
+) -> bool {
+    use kwil_view_model::workspace_document::ResultKind;
     use std::sync::atomic::Ordering;
-    if matches!(&*result, kwil_view_model::document_worker::DocumentResult::CheckedOpened { ticket, .. } if ticket.document() == active)
+    let Some(info) = info else { return false };
+    let mut held = HELD_TEXT_COMPLETION.try_lock().expect("finite harness scalar gate");
+    if held.is_some() {
+        assert_eq!(*held, info.delivery(), "held original slot cannot be replaced");
+        return true;
+    }
+    if info.kind == ResultKind::Opened
+        && info.document == Some(active)
         && HOLD_TEXT_COMPLETION.swap(false, Ordering::AcqRel)
     {
-        let mut held = HELD_TEXT_COMPLETION.try_lock().expect("finite harness completion slot");
-        assert!(held.is_none());
-        *held = Some(result);
-        None
+        *held = Some(info.delivery().expect("original bounded delivery identity"));
+        true
     } else {
-        Some(result)
+        false
     }
 }
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
     MarkdownSplit,
@@ -455,7 +461,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                     .session()
                     .tabs()
                     .iter()
-                    .all(|tab| tab.path.as_ref().is_none_or(|p| p.file_name().unwrap() != "binary-cold.bin"))
+                    .all(|tab| { tab.path.as_ref().is_none_or(|p| p.file_name().unwrap() != "binary-cold.bin") })
             );
             assert!(!app.external_inbox.has_pending());
             if let Some(dir) = &dir {
@@ -473,6 +479,10 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
         Step::BinaryPreviewCheck => {
             assert!(HELD_TEXT_COMPLETION.try_lock().unwrap().is_some());
+            assert_eq!(
+                *HELD_TEXT_COMPLETION.try_lock().unwrap(),
+                app.document.live.transport.as_ref().unwrap().result_info().unwrap().delivery()
+            );
             assert!(app.view.editor().is_none());
             assert!(app.binary_pending());
             assert!(!app.binary_blocks_paint());
@@ -481,8 +491,10 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.render(), "actual GUI render paints while final completion is held");
         }
         Step::BinaryReleasePreview => {
-            let completion = HELD_TEXT_COMPLETION.try_lock().unwrap().take().unwrap();
-            assert!(app.proxy.send_event(UserEvent::Document(completion)).is_ok());
+            let delivery = HELD_TEXT_COMPLETION.try_lock().unwrap().take().unwrap();
+            let transport = app.document.live.transport.as_ref().unwrap();
+            assert_eq!(transport.result_info().unwrap().delivery(), Some(delivery));
+            transport.wake_ready();
         }
         Step::BinaryClose => {
             assert!(app.dispatch_file("file.close"));
@@ -1357,7 +1369,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 app.policy.remote(),
                 app.policy.cursor_blink_allowed()
             );
-            el.exit();
+            if app.force_exit() {
+                el.exit();
+            }
         }
     }
 }

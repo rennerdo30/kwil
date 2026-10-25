@@ -11,6 +11,7 @@ gpu = ["dep:wgpu", "dep:pollster"]
 frame-harness = []
 
 [dependencies]
+kwil-core-runtime = { path = "../core-runtime" }
 kwil-core-markdown = { path = "../core-markdown" }
 kwil-core-syntax = { path = "../core-syntax" }
 kwil-core-text = { path = "../core-text" }

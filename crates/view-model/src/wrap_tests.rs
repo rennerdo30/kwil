@@ -582,7 +582,7 @@ fn wrap_mailbox_refusal_returns_exact_source_and_retirement_is_bounded() {
 }
 
 fn settle(ticket: SettlementTicket) {
-    ticket.settle(Duration::from_secs(2)).unwrap();
+    crate::wrap_session::settle_final(ticket, Duration::from_secs(2)).unwrap();
 }
 
 #[test]
@@ -1124,7 +1124,7 @@ fn wrap_terminal_relative_panic_wakes_once_preserves_fifo_and_settles_exact_owne
         "panic cleanup must not acknowledge an external active permit"
     );
     drop(held_permit);
-    let failure = failure.ticket.settle(Duration::from_secs(2)).unwrap_err();
+    let failure = crate::wrap_session::settle_final(failure.ticket, Duration::from_secs(2)).unwrap_err();
     assert!(matches!(failure.error, WrapError::WorkerPanicked));
     assert!(retained.upgrade().is_none());
     assert!(matches!(woke.try_recv(), Err(mpsc::TryRecvError::Empty)));

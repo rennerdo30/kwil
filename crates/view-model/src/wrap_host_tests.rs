@@ -14,6 +14,19 @@ use std::{
     time::Instant,
 };
 
+fn settle_final(mut ticket: WrapHostSettlementTicket, timeout: Duration) -> Result<(), WrapHostSettlementFailure> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match ticket.settle(deadline.saturating_duration_since(Instant::now())) {
+            Err(failure) if matches!(failure.error, WrapError::ThreadExitPending) && Instant::now() < deadline => {
+                ticket = failure.ticket;
+                thread::park_timeout(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
+            }
+            result => return result,
+        }
+    }
+}
+
 trait ContinueTest<B, C> {
     fn continued(self) -> C;
 }
@@ -229,7 +242,7 @@ impl Fixture {
     fn finish(self) {
         let ticket = self.host.stop();
         // The simulated UI thread never settles document/display owners.
-        thread::spawn(move || ticket.settle(Duration::from_secs(2))).join().unwrap().unwrap();
+        thread::spawn(move || settle_final(ticket, Duration::from_secs(2))).join().unwrap().unwrap();
     }
 }
 
@@ -612,7 +625,7 @@ fn wrap_host_stale_ready_retires_before_two_permits_and_wakes_latest_fill() {
 #[test]
 fn wrap_host_retirement_saturation_keeps_current_ready_until_worker_wake() {
     let Fixture { host, editor, source, context, .. } = Fixture::new("abcdefgh", 4, 2, 0);
-    thread::spawn(move || host.stop().settle(Duration::from_secs(2))).join().unwrap().unwrap();
+    thread::spawn(move || settle_final(host.stop(), Duration::from_secs(2))).join().unwrap().unwrap();
     let (entered, reached) = mpsc::sync_channel(1);
     let gate = Arc::new(ReadGate { entered, released: Mutex::new(false), changed: Condvar::new() });
     let callback_gate = gate.clone();
@@ -663,7 +676,7 @@ fn wrap_host_shutdown_timeout_preserves_exact_display_and_worker_for_retry() {
     );
     assert!(failure.ticket.retained_bytes() <= MAX_SESSION_BYTES);
     gate.release();
-    thread::spawn(move || failure.ticket.settle(Duration::from_secs(2))).join().unwrap().unwrap();
+    thread::spawn(move || settle_final(failure.ticket, Duration::from_secs(2))).join().unwrap().unwrap();
 }
 
 #[test]
@@ -681,7 +694,7 @@ fn wrap_host_terminal_worker_wakes_and_keeps_failed_head_without_retry_launch() 
     assert!(matches!(fixture.host.retry_relative(), Err(WrapError::Closed)));
     assert_eq!(fixture.editor.primary_cursor().head, 0);
     let ticket = fixture.host.stop();
-    let failure = thread::spawn(move || ticket.settle(Duration::from_secs(2))).join().unwrap().unwrap_err();
+    let failure = thread::spawn(move || settle_final(ticket, Duration::from_secs(2))).join().unwrap().unwrap_err();
     assert!(matches!(failure.error, WrapError::WorkerPanicked));
     // Sticky terminal failure is intentionally retained by the model ticket;
     // destroying the UI or dropping this owner is never claimed as success.
