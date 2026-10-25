@@ -6,6 +6,23 @@ use std::{io, ops::Range};
 
 pub(crate) const WINDOW: u64 = 64 << 10;
 
+fn scalar_bytes(s: &Snapshot, range: Range<u64>) -> io::Result<([u8; 4], usize)> {
+    let length = range
+        .end
+        .checked_sub(range.start)
+        .filter(|length| *length <= 4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid scalar window"))? as usize;
+    let mut bytes = [0; 4];
+    let mut written = 0;
+    for chunk in s.chunks(range)? {
+        let chunk = chunk.map_err(io::Error::other)?;
+        bytes[written..written + chunk.len()].copy_from_slice(chunk);
+        written += chunk.len();
+    }
+    debug_assert_eq!(written, length);
+    Ok((bytes, written))
+}
+
 pub(crate) fn read(s: &Snapshot, range: Range<u64>, limit: u64) -> io::Result<Vec<u8>> {
     if range.end.saturating_sub(range.start) > limit {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "operation exceeds bounded text window"));
@@ -28,7 +45,8 @@ pub(crate) fn character(s: &Snapshot, at: u64) -> io::Result<(char, u64)> {
     if at >= s.len() {
         return Ok(('\0', at));
     }
-    let bytes = read(s, at..(at + 4).min(s.len()), 4)?;
+    let (storage, length) = scalar_bytes(s, at..at.saturating_add(4).min(s.len()))?;
+    let bytes = &storage[..length];
     let width = match bytes[0] {
         0..=0x7f => 1,
         0xc2..=0xdf => 2,
@@ -59,7 +77,8 @@ pub(crate) fn previous(s: &Snapshot, at: u64) -> io::Result<u64> {
         return Ok(at - 2);
     }
     let start = at.saturating_sub(4);
-    let bytes = read(s, start..at, 4)?;
+    let (storage, length) = scalar_bytes(s, start..at)?;
+    let bytes = &storage[..length];
     for i in (0..bytes.len()).rev() {
         if bytes[i] & 0xc0 != 0x80 {
             if std::str::from_utf8(&bytes[i..]).is_ok() {
@@ -228,4 +247,26 @@ pub(crate) fn word_range(s: &Snapshot, at: u64, around: bool) -> io::Result<Rang
         }
     }
     Ok(start..end)
+}
+
+#[cfg(test)]
+mod scalar_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_windows_cross_pieces_and_preserve_invalid_bytes_and_crlf() {
+        let mut buffer = kwil_core_text::Buffer::empty();
+        for part in [&[0xf0, 0x9f][..], &[0x98][..], &[0x80, b'\r'][..], &[b'\n', 0xff, b'x'][..]] {
+            buffer.insert(buffer.snapshot().len(), part).unwrap();
+        }
+        let snapshot = buffer.snapshot();
+        assert_eq!(character(&snapshot, 0).unwrap(), ('\u{1f600}', 4));
+        assert_eq!(previous(&snapshot, 4).unwrap(), 0);
+        assert_eq!(next(&snapshot, 4).unwrap(), 6);
+        assert_eq!(previous(&snapshot, 6).unwrap(), 4);
+        assert_eq!(character(&snapshot, 6).unwrap(), ('\u{fffd}', 7));
+        assert_eq!(previous(&snapshot, 7).unwrap(), 6);
+        assert_eq!(character(&snapshot, 8).unwrap(), ('\0', 8));
+        assert!(scalar_bytes(&snapshot, 0..5).is_err());
+    }
 }
