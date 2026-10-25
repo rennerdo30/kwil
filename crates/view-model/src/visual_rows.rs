@@ -88,6 +88,15 @@ impl AllocationBudget {
     pub fn peak_bytes(&self) -> usize {
         self.0.peak.load(Ordering::Acquire)
     }
+    /// Reserve fixed frontend ownership metadata before constructing its cells.
+    /// Keep this move-only token beside those cells through refusal and cleanup.
+    /// Source buffers and allocation growth still require their own admission.
+    pub fn reserve_metadata(&self, bytes: usize) -> WrapResult<MetadataReservation> {
+        let total = bytes
+            .checked_add(size_of::<MetadataReservation>())
+            .ok_or(WrapError::Admission("metadata reservation overflow"))?;
+        Ok(MetadataReservation { charge: self.reserve(total)? })
+    }
     fn available_bytes(&self) -> usize {
         self.0.limit.saturating_sub(self.retained_bytes())
     }
@@ -112,10 +121,24 @@ impl AllocationBudget {
         }
     }
 }
+/// Fixed metadata charge in the same aggregate used by document and wrap lanes.
+/// It neither allocates payload storage nor creates a second allowance. Moving
+/// an owner must move its reservation; only retiring that owner releases it.
+#[must_use = "retain beside the admitted metadata until its owners are retired"]
+pub struct MetadataReservation {
+    charge: AllocationCharge,
+}
+impl MetadataReservation {
+    /// Includes this token's own header, charged before it is constructed.
+    pub fn reserved_bytes(&self) -> usize {
+        self.charge.bytes
+    }
+}
 pub(crate) struct AllocationCharge {
     budget: AllocationBudget,
     bytes: usize,
 }
+
 impl AllocationCharge {
     pub(crate) fn retained_bytes(&self) -> usize {
         self.budget.retained_bytes()
@@ -1392,5 +1415,54 @@ impl LayoutEngine {
         )?;
         let header = self.budget.reserve(size_of::<ResolvedNavigation>())?;
         Ok(ResolvedNavigation { fence, expected, targets, reveal, _header: header })
+    }
+}
+
+#[cfg(test)]
+mod metadata_reservation_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_reservation_moves_with_retained_failure_owner() {
+        let budget = AllocationBudget::new(4096);
+        let before = budget.retained_bytes();
+        let reservation = budget.reserve_metadata(128).unwrap();
+        let charged = 128 + size_of::<MetadataReservation>();
+        assert_eq!(reservation.reserved_bytes(), charged);
+        assert_eq!(budget.retained_bytes(), before + charged);
+        let failure = Err::<(), _>(reservation);
+        assert_eq!(budget.retained_bytes(), before + charged);
+        let retained = match failure {
+            Err(owner) => owner,
+            Ok(()) => panic!("fixture retains the exact metadata owner"),
+        };
+        assert_eq!(retained.reserved_bytes(), charged);
+        drop(retained);
+        assert_eq!(budget.retained_bytes(), before);
+    }
+
+    #[test]
+    fn metadata_refusal_preserves_existing_charge_and_accounts_overlap() {
+        let token = size_of::<MetadataReservation>();
+        let overhead = size_of::<BudgetState>() + 2 * size_of::<usize>();
+        let budget = AllocationBudget::new(overhead + 2 * (64 + token));
+        let first = budget.reserve_metadata(64).unwrap();
+        let second = budget.reserve_metadata(64).unwrap();
+        let full = budget.retained_bytes();
+        assert!(matches!(budget.reserve_metadata(0), Err(WrapError::Admission(_))));
+        assert_eq!(budget.retained_bytes(), full);
+        drop(first);
+        let replacement = budget.reserve_metadata(64).unwrap();
+        assert_eq!(budget.retained_bytes(), full);
+        drop((second, replacement));
+        assert_eq!(budget.retained_bytes(), overhead);
+    }
+
+    #[test]
+    fn metadata_overflow_refuses_without_charging() {
+        let budget = AllocationBudget::default();
+        let before = budget.retained_bytes();
+        assert!(matches!(budget.reserve_metadata(usize::MAX), Err(WrapError::Admission(_))));
+        assert_eq!(budget.retained_bytes(), before);
     }
 }
