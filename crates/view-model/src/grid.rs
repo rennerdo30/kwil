@@ -2,6 +2,62 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Incremental extended-grapheme boundaries. The caller supplies UTF-8 scalar
+/// chunks and, when requested, preceding scalar context. No cluster text is
+/// retained here: even a gigabyte of combining marks has constant state.
+/// `start` must be a known grapheme boundary (line start or an exact wrap
+/// checkpoint). An input-window boundary is never an end-of-line boundary.
+pub struct GraphemeStepper {
+    cursor: unicode_segmentation::GraphemeCursor,
+    start: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphemeStep {
+    Boundary(u64),
+    Scalar(u64),
+    Context(u64),
+    End,
+}
+
+impl GraphemeStepper {
+    pub fn new(start: u64, end: u64) -> Result<Self, &'static str> {
+        let length = end.checked_sub(start).ok_or("reversed grapheme range")?;
+        let length = usize::try_from(length).map_err(|_| "grapheme range exceeds address space")?;
+        Ok(Self { cursor: unicode_segmentation::GraphemeCursor::new(0, length, true), start })
+    }
+
+    pub fn position(&self) -> u64 {
+        self.start + self.cursor.cur_cursor() as u64
+    }
+
+    pub fn step(&mut self, at: u64, scalar: &str) -> Result<GraphemeStep, &'static str> {
+        use unicode_segmentation::GraphemeIncomplete;
+        let local = at.checked_sub(self.start).ok_or("scalar before grapheme stream")?;
+        let local = usize::try_from(local).map_err(|_| "scalar offset exceeds address space")?;
+        if scalar.chars().count() != 1 {
+            return Err("grapheme step requires one complete scalar");
+        }
+        match self.cursor.next_boundary(scalar, local) {
+            Ok(Some(at)) => Ok(GraphemeStep::Boundary(self.start + at as u64)),
+            Ok(None) => Ok(GraphemeStep::End),
+            Err(GraphemeIncomplete::NextChunk) => Ok(GraphemeStep::Scalar(self.position())),
+            Err(GraphemeIncomplete::PreContext(at)) => Ok(GraphemeStep::Context(self.start + at as u64)),
+            Err(_) => Err("invalid grapheme scalar position"),
+        }
+    }
+
+    pub fn provide_context(&mut self, at: u64, scalar: &str) -> Result<(), &'static str> {
+        let local = at.checked_sub(self.start).ok_or("context before grapheme stream")?;
+        let local = usize::try_from(local).map_err(|_| "context offset exceeds address space")?;
+        if scalar.chars().count() != 1 {
+            return Err("grapheme context requires one scalar");
+        }
+        self.cursor.provide_context(scalar, local);
+        Ok(())
+    }
+}
+
 /// Move a byte window edge to the start of a valid UTF-8 scalar crossing it.
 /// Invalid original bytes remain individually visible and editable.
 pub fn boundary(bytes: &[u8], position: usize) -> usize {

@@ -22,6 +22,7 @@ mod replacement;
 use compound::CompoundEdit;
 pub(crate) mod receipts;
 mod save;
+pub mod visual;
 use receipts::{EditKind, ReceiptState, Recipe, Transition};
 
 const MAX_CURSORS: usize = 4096;
@@ -205,6 +206,9 @@ enum Repeat {
 pub struct Editor {
     pub(crate) document: Document,
     cursors: Vec<Cursor>,
+    // A wrap-created cursor allocation remains charged while Editor owns it,
+    // independently of transient visual display state.
+    visual_cursor_charge: Option<crate::visual_rows::AllocationCharge>,
     primary: usize,
     top: u64,
     rows: usize,
@@ -231,6 +235,7 @@ impl Editor {
         Self {
             document,
             cursors: vec![Cursor::caret(0)],
+            visual_cursor_charge: None,
             primary: 0,
             top: 0,
             rows: 0,

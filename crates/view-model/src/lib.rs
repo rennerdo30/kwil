@@ -20,7 +20,12 @@ pub mod search_panel;
 pub mod search_session;
 pub mod settings_panels;
 pub mod settings_session;
+pub mod visual_rows;
 mod workspace;
+pub mod wrap_host;
+pub mod wrap_session;
+#[cfg(test)]
+mod wrap_tests;
 pub use workspace::{
     EditorInputTicket, FilePrompt, FilePromptKind, NativeFilePrompt, TabAction, TabArea, TabGeometry, TabMetrics,
     TabSlot, Workspace,
@@ -32,6 +37,10 @@ mod tests;
 mod text;
 pub use document::{Document, DocumentEncoding, DocumentLineEnding};
 pub use editor::receipts::{ByteReplacement, EditKind, EditObserver, EditReceipt, SnapshotInsert};
+pub use editor::visual::{
+    ChargedDamage, CommitFailure, PrepareFailure, PrepareFault, PreparedVisualCommit, PublishedVisualCursor,
+    RetiredVisualState, VisualEditorState,
+};
 pub use editor::{Clipboard, ClipboardData, CommandArgs, CommandResult, CommandStatus, Cursor, Editor, Motion};
 
 /// A message from a worker thread for the status bar (update notices,
