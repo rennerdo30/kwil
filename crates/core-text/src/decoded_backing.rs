@@ -977,10 +977,198 @@ fn decode_block(
     }
 }
 
-struct AtomSize {
-    raw: usize,
-    logical: usize,
-    kind: AtomKind,
+pub(crate) struct AtomSize {
+    pub(crate) raw: usize,
+    pub(crate) logical: usize,
+    pub(crate) kind: AtomKind,
+}
+
+/// Fixed-size worker replay state. No source owner is cloned here: the source
+/// cursor pins the immutable generation and lends it for each admitted step.
+/// A denied byte visit retains the actual decoder, including pending lead bytes.
+pub(crate) struct ResumeAtom {
+    decoder: encoding_rs::Decoder,
+    encoding: Encoding,
+    consumed: usize,
+    text: [u8; 8],
+}
+impl ResumeAtom {
+    pub(crate) fn new(encoding: Encoding) -> Self {
+        Self { decoder: codec(encoding).new_decoder_without_bom_handling(), encoding, consumed: 0, text: [0; 8] }
+    }
+
+    pub(crate) fn poll(
+        &mut self,
+        raw: &[u8],
+        cancel: &AtomicBool,
+        admit: &mut impl FnMut(usize) -> io::Result<bool>,
+    ) -> Result<Option<AtomSize>, BackingError> {
+        loop {
+            if self.consumed >= raw.len() || self.consumed == 4 {
+                return Err(BackingError::DecoderContract);
+            }
+            cancelled(cancel)?;
+            if !admit(1)? {
+                return Ok(None);
+            }
+            cancelled(cancel)?;
+            let byte = raw[self.consumed];
+            if self.consumed == 0
+                && self.encoding != Encoding::UTF16_LE
+                && self.encoding != Encoding::UTF16_BE
+                && byte < 0x80
+            {
+                self.text[0] = byte;
+                return Ok(Some(AtomSize { raw: 1, logical: 1, kind: AtomKind::Text }));
+            }
+            // The one-byte local input avoids rereading an already charged raw
+            // page. Scratch and decoder storage are included in cursor admission.
+            let mut scratch = [0; 16];
+            let (result, read, written) =
+                self.decoder.decode_to_utf8_without_replacement(&[byte], &mut scratch, self.consumed + 1 == raw.len());
+            self.consumed += read;
+            match result {
+                DecoderResult::Malformed(length, after) => {
+                    let length = length as usize;
+                    if written != 0 || self.consumed != length + after as usize {
+                        return Err(BackingError::DecoderContract);
+                    }
+                    self.text[0] = OPAQUE;
+                    return Ok(Some(AtomSize { raw: length, logical: 1, kind: AtomKind::Opaque }));
+                }
+                _ if written != 0 => {
+                    if written > self.text.len() {
+                        return Err(BackingError::DecoderContract);
+                    }
+                    self.text[..written].copy_from_slice(&scratch[..written]);
+                    return Ok(Some(AtomSize { raw: self.consumed, logical: written, kind: AtomKind::Text }));
+                }
+                DecoderResult::InputEmpty if read != 0 && self.consumed < raw.len() => {}
+                _ => return Err(BackingError::DecoderContract),
+            }
+        }
+    }
+}
+
+/// Caller-admitted bounded native-stream primitive, sharing ResumeAtom's exact
+/// malformed/lookahead protocol. Pass four lookahead bytes, or a shorter slice
+/// ONLY at actual EOF. No source-sized decoder/index or allocation is created.
+/// The caller prepays at most four raw-byte visits and four decoder operations,
+/// plus at most eight logical output bytes, BEFORE calling this primitive.
+/// Fixed decoder output scratch is 16 bytes; malformed output is one typed FF,
+/// and its returned raw length excludes any consumed lookahead for the next atom.
+pub(crate) fn decode_first_atom(
+    encoding: Encoding,
+    raw: &[u8],
+    logical: &mut [u8; 8],
+) -> Result<AtomSize, BackingError> {
+    if raw.is_empty() || raw.len() > 4 {
+        return Err(BackingError::InvalidRange);
+    }
+    let mut atom = ResumeAtom::new(encoding);
+    let size = atom.poll(raw, &AtomicBool::new(false), &mut |_| Ok(true))?.ok_or(BackingError::DecoderContract)?;
+    logical[..size.logical].copy_from_slice(&atom.text[..size.logical]);
+    Ok(size)
+}
+
+/// Resumable logical boundary lookup: binary-search bounds, selected record,
+/// interval endpoint and byte-level atom replay all survive a quota pause.
+pub(crate) struct ResumeBoundary {
+    position: u64,
+    low: usize,
+    high: usize,
+    floor: Option<(usize, u64, u64)>,
+    located: bool,
+    end: Option<u64>,
+    raw: u64,
+    logical: u64,
+    atom: Option<ResumeAtom>,
+}
+impl ResumeBoundary {
+    pub(crate) fn new(origin: &DecodedSnapshot, position: u64) -> Self {
+        Self {
+            position,
+            low: 0,
+            high: origin.checkpoint_count(),
+            floor: None,
+            located: false,
+            end: None,
+            raw: 0,
+            logical: 0,
+            atom: None,
+        }
+    }
+    pub(crate) fn poll(
+        &mut self,
+        origin: &DecodedSnapshot,
+        cancel: &AtomicBool,
+        admit: &mut impl FnMut(usize) -> io::Result<bool>,
+    ) -> Result<Option<Boundary>, BackingError> {
+        cancelled(cancel)?;
+        if self.position > origin.logical_bytes().len() as u64 {
+            return Err(BackingError::InvalidRange);
+        }
+        while self.low < self.high {
+            let mid = self.low + (self.high - self.low) / 2;
+            cancelled(cancel)?;
+            if !admit(RECORD)? {
+                return Ok(None);
+            }
+            cancelled(cancel)?;
+            let (raw, logical) = origin.checkpoint(mid);
+            if logical <= self.position {
+                self.floor = Some((mid, raw, logical));
+                self.low = mid + 1;
+            } else {
+                self.high = mid;
+            }
+        }
+        let (index, first_raw, first_logical) = self.floor.ok_or(BackingError::DecoderContract)?;
+        if !self.located {
+            self.raw = first_raw;
+            self.logical = first_logical;
+            self.located = true;
+        }
+        if self.position == self.logical {
+            return Ok(Some(Boundary::Exact { logical: self.logical, raw: self.raw }));
+        }
+        if self.end.is_none() {
+            if index + 1 >= origin.checkpoint_count() {
+                return Err(BackingError::DecoderContract);
+            }
+            cancelled(cancel)?;
+            if !admit(RECORD)? {
+                return Ok(None);
+            }
+            cancelled(cancel)?;
+            self.end = Some(origin.checkpoint(index + 1).0);
+        }
+        let end = self.end.unwrap();
+        loop {
+            if self.raw >= end {
+                return Err(BackingError::DecoderContract);
+            }
+            let atom = self.atom.get_or_insert_with(|| ResumeAtom::new(origin.interpretation().encoding));
+            let Some(size) = atom.poll(&origin.raw_bytes()[self.raw as usize..end as usize], cancel, admit)? else {
+                return Ok(None);
+            };
+            self.atom = None;
+            let next_raw = self.raw + size.raw as u64;
+            let next_logical = self.logical + size.logical as u64;
+            if self.position < next_logical {
+                return Ok(Some(Boundary::Interior {
+                    logical: self.logical..next_logical,
+                    raw: self.raw..next_raw,
+                    kind: size.kind,
+                }));
+            }
+            self.raw = next_raw;
+            self.logical = next_logical;
+            if self.position == self.logical {
+                return Ok(Some(Boundary::Exact { logical: self.logical, raw: self.raw }));
+            }
+        }
+    }
 }
 /// Replay needs no per-character table. One stateless encoded atom consumes at
 /// most four source bytes and emits at most eight UTF-8 bytes (Big5 expansion).

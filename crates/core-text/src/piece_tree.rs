@@ -28,6 +28,11 @@ pub(crate) fn worker_disk_charge(bytes: u64) -> io::Result<u64> {
 pub(crate) type Tree = Option<Arc<Node>>;
 pub(crate) type OriginalUses = BTreeMap<(u8, usize), (SourceRef, u64)>;
 
+// Separate worker cursor: SourceChunks retains its historical terminal-error
+// semantics for search/save callers, including the KW-53 admission oracles.
+#[path = "worker_source.rs"]
+pub mod worker_source;
+
 /// Persistent directory of physical storage allocations used by one snapshot.
 /// A split changes logical use counts, never the full allocation charge. The
 /// directory does not pin storage independently: its snapshot's root owns it.

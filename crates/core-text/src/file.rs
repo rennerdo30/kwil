@@ -386,6 +386,17 @@ impl TextFile {
         }
     }
 
+    /// Worker capture only, after its caller has admitted the fixed source
+    /// check and temporary handle. Bypass the UI command's read-batch cache:
+    /// it can grow a HashMap and must never retain admission across worker
+    /// quota pauses. The live source check and mapped-read caveat are unchanged.
+    pub(crate) fn worker_bytes(&self) -> Result<&[u8], ReadError> {
+        match self.observe_check(self.check_source_live()).map_err(ReadError::Io)? {
+            FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
+            state => Err(ReadError::Changed(state)),
+        }
+    }
+
     pub fn len(&self) -> u64 {
         self.shared.stamp.len
     }

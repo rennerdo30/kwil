@@ -3,6 +3,7 @@
 //! Mapped originals, sparse indexing and persistent byte-exact editing.
 
 mod buffer;
+pub mod compare_input;
 pub mod decoded_backing;
 mod decoded_piece;
 pub mod encoding;
@@ -22,3 +23,8 @@ pub use piece_tree::Chunks;
 pub use piece_tree::{SourceChunk, SourceChunks, StorageResources};
 pub use piece_tree::{SpillRetirement, SpillRetirementLimits, SpillRetirementReport};
 pub use recovery::{RecoveryAssembler, RecoveryLimits, RecoveryRevision, RecoveryUsage};
+
+pub use piece_tree::worker_source::{
+    WorkerSourceChunk, WorkerSourceCursor, WorkerSourceError, WorkerSourceKind, WorkerSourceStartError,
+    WorkerSourceStep,
+};
