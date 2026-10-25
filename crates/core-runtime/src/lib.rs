@@ -7,3 +7,6 @@
 mod native_exit;
 
 pub use native_exit::{NativeExitQueryError, NativeExitState, native_exit_query_stack_bytes, native_exit_state};
+
+mod observation;
+pub use observation::{NativeExitObservation, NativeObservationError};
