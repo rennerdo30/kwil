@@ -9,9 +9,19 @@ for its published-release requirements and platform dependencies.
 - One binary: a native window when a desktop is available, a terminal UI when not (`--gui` / `--tui` to force).
 - Built for remote desktops: no frame loop, no idle redraws, damage-only drawing and scrolling by copy.
 
-Try the current state: `scriptsun.bat` on Windows or `scripts/run.sh` elsewhere. It builds and opens the README; add `--pull` to update first, `--release` for full speed, `--big` for the 1 GB test log, or `--tui` for the terminal UI.
+Try the current state: `scripts/run.bat` on Windows or `scripts/run.sh` elsewhere. It builds and opens the README; add `--pull` to update first, `--release` for full speed, `--big` for the 1 GB test log, or `--tui` for the terminal UI.
 
 Status: early development (M0 done; see [docs/SPEC.md](docs/SPEC.md) and [docs/decisions](docs/decisions)).
+
+## Screenshots
+
+Historical Windows GUI captures from 24 October 2026, using a development build
+with the frame harness enabled. See the [gallery and provenance](docs/SCREENSHOTS.md)
+for build identity, capture method and limits; these do not validate the current checkout.
+
+[![Kwil showing Markdown source beside its rendered preview](docs/images/windows-markdown-split-20261024.png)](docs/SCREENSHOTS.md#markdown-split-view)
+
+[![Kwil About dialog showing the captured build and renderer](docs/images/windows-about-20261024.png)](docs/SCREENSHOTS.md#build-diagnostics)
 
 ## Known limitations
 
