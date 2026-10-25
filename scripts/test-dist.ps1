@@ -227,6 +227,25 @@ function New-TestPe {
     [IO.File]::WriteAllBytes($Path, $bytes)
 }
 
+function New-TestPeRepeatedImports {
+    param([string]$Path, [int]$Count = 2, [string]$Last = 'KERNEL32.dll', [switch]$WithDelay,
+        [switch]$BadLastRva)
+    New-TestPe $Path -BothImports:$WithDelay
+    $b = [byte[]]::new(8704)
+    [IO.File]::ReadAllBytes($Path).CopyTo($b, 0)
+    # Keep headers and move normal descriptors away from all original names.
+    [BitConverter]::GetBytes([uint32]0x2000).CopyTo($b, 0x190)
+    [BitConverter]::GetBytes([uint32]0x2000).CopyTo($b, 0x198)
+    [BitConverter]::GetBytes([uint32]0x1600).CopyTo($b, 0x110)
+    [BitConverter]::GetBytes([uint32](($Count + 1) * 20)).CopyTo($b, 0x114)
+    [Text.Encoding]::ASCII.GetBytes($Last + [char]0).CopyTo($b, 0x1800)
+    for ($i = 0; $i -lt $Count; $i++) {
+        $nr = if ($i -eq $Count - 1) { if ($BadLastRva) { 0xfffffff } else { 0x2600 } } else { 0x1080 }
+        [BitConverter]::GetBytes([uint32]$nr).CopyTo($b, (0x800 + $i * 20 + 12))
+    }
+    [IO.File]::WriteAllBytes($Path, $b)
+}
+
 $parent = 'E:/Development/_cache/cargo-target'
 if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw "Missing cache parent: $parent" }
 $token = [Guid]::NewGuid().ToString('N')
@@ -284,6 +303,25 @@ try {
     $peInfo = Get-DistPeInfo (Join-Path $bins 'kwil.exe')
     Assert-True ($peInfo.Subsystem -eq 2 -and $peInfo.Imports[0] -ceq 'kernel32.dll') 'normal system import'
     $pePath = Join-Path $root 'pe-fixture.bin'
+    New-TestPeRepeatedImports $pePath
+    $canonical = (Get-DistPeInfo $pePath).GuardImports
+    Assert-True ($canonical.Count -eq 1 -and $canonical[0].load -ceq 'N' -and $canonical[0].dll -ceq 'kernel32.dll') 'case-alias physical descriptors yield exact canonical set'
+    New-TestPeRepeatedImports $pePath -WithDelay
+    $canonical = (Get-DistPeInfo $pePath).GuardImports
+    Assert-True ($canonical.Count -eq 2 -and $canonical[0].load -ceq 'D' -and $canonical[1].load -ceq 'N' -and
+        $canonical[0].dll -ceq 'kernel32.dll' -and $canonical[1].dll -ceq 'kernel32.dll') 'normal and delay remain separate with physical duplicates'
+    New-TestPeRepeatedImports $pePath -Count 128
+    Assert-True ((Get-DistPeInfo $pePath).GuardImports.Count -eq 1) '128 repeated physical descriptors admitted'
+    New-TestPeRepeatedImports $pePath -Count 129
+    Assert-Throws { Get-DistPeInfo $pePath } 'import row limit'
+    New-TestPeRepeatedImports $pePath -Count 128 -WithDelay
+    Assert-Throws { Get-DistPeInfo $pePath } 'import row limit'
+    foreach ($later in 'kernel32.dll/', 'UCRTBASE.dll') {
+        New-TestPeRepeatedImports $pePath -Count 3 -Last $later
+        Assert-Throws { Get-DistPeInfo $pePath } $(if ($later -ceq 'UCRTBASE.dll') { 'Dynamic runtime import' } else { 'Invalid import DLL basename' })
+    }
+    New-TestPeRepeatedImports $pePath -Count 3 -BadLastRva
+    Assert-Throws { Get-DistPeInfo $pePath } 'outside backed section'
     New-TestPe $pePath -Delay -Machine 0xaa64 -Subsystem 3
     Assert-True ((Get-DistPeInfo $pePath).Machine -eq 0xaa64) 'ARM64 delay system import'
     foreach ($dll in 'VCRUNTIME140.dll', 'msvcp140.dll', 'msvcr120.dll', 'ucrtbase.dll', 'api-ms-win-crt-stdio-l1-1-0.dll') {
@@ -631,6 +669,12 @@ try {
     Assert-Throws { Assert-DistInstallerSidecar $fakeMsi $metadata } '.'
     [IO.File]::WriteAllText($sidecarPath, ($sidecar | ConvertTo-Json -Depth 8))
     $null = Assert-DistInstallerSidecar $fakeMsi $metadata
+    $savedImports = $sidecar.guard.imports
+    $duplicateGuard = [ordered]@{ abi = 1; sha256 = $sidecar.guard.sha256; imports = @($savedImports) + @($savedImports[0]) }
+    $sidecar.guard = $duplicateGuard
+    [IO.File]::WriteAllText($sidecarPath, ($sidecar | ConvertTo-Json -Depth 8))
+    Assert-Throws { Assert-DistInstallerSidecar $fakeMsi $metadata } 'array mismatch'
+    $sidecar.guard = $metadata.guard
     $sidecar.inventory[0].size = '999'
     [IO.File]::WriteAllText($sidecarPath, ($sidecar | ConvertTo-Json -Depth 8))
     # Reconstruct independent input: mutating the sidecar object must not mutate authority.

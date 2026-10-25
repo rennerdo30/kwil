@@ -396,6 +396,7 @@ function Get-DistPeInfo {
     $names = [Collections.Generic.List[string]]::new()
     $imports = [Collections.Generic.List[object]]::new()
     $importKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $descriptorCount = 0
     foreach ($directory in 1, 13) {
         $recordSize = if ($directory -eq 1) { 20 } else { 32 }
         $rva = [long](Get-DistPeNumber $data ($optional + 112 + $directory * 8) 4)
@@ -409,6 +410,9 @@ function Get-DistPeInfo {
                 Get-DistPeNumber $data ($offset + $field * 4) 4
             })
             if (@($fields | Where-Object { $_ -ne 0 }).Count -eq 0) { $terminated = $true; break }
+            # Count physical descriptors, including repeated names, before deduplication.
+            if ($descriptorCount -ge 128) { throw 'PE import row limit exceeded.' }
+            $descriptorCount++
             $nameRva = [long]$(if ($directory -eq 1) { $fields[3] } else { $fields[1] })
             if ($directory -eq 13 -and ($fields[0] -band 1) -eq 0) { $nameRva -= $imageBase }
             $dll = [Text.StringBuilder]::new()
@@ -425,10 +429,11 @@ function Get-DistPeInfo {
             if ($name -cnotmatch '^[a-z0-9._-]+[.]dll$' -or $name.Length -gt 128) { throw 'Invalid import DLL basename.' }
             if ($name -match '^(vcruntime|msvcp|msvcr|ucrtbase|api-ms-win-crt-)') { throw "Dynamic runtime import: $name" }
             $load = if ($directory -eq 1) { 'N' } else { 'D' }
-            if (-not $importKeys.Add("${load}:$name")) { throw 'Duplicate PE import pair.' }
-            if ($imports.Count -ge 128) { throw 'PE import row limit exceeded.' }
-            $imports.Add([ordered]@{ load = $load; dll = $name })
-            $names.Add($name)
+            # Every descriptor/name was validated above; the ledger is a canonical set.
+            if ($importKeys.Add("${load}:$name")) {
+                $imports.Add([ordered]@{ load = $load; dll = $name })
+                $names.Add($name)
+            }
         }
         if (-not $terminated) { throw 'Unterminated import directory.' }
     }

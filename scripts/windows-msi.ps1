@@ -414,6 +414,7 @@ function Get-KwilPeImports {
         }
     }
     $imports=[Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::Ordinal)
+    $descriptorCount=0
     foreach($d in @(@(1,20,'N'),@(13,32,'D'))) {
         $rva=[long][BitConverter]::ToUInt32($o,112+$d[0]*8); $size=[long][BitConverter]::ToUInt32($o,116+$d[0]*8)
         if($rva -eq 0 -and $size -eq 0) { continue }
@@ -423,6 +424,8 @@ function Get-KwilPeImports {
             $entry=& $rvaRead ($rva+$p) $d[1]
             $allzero=$true; foreach($v in $entry) { if($v -ne 0){$allzero=$false;break} }
             if($allzero){$terminated=$true;break}
+            Assert-Kwil ($descriptorCount -lt 128) 'too many physical imports'
+            $descriptorCount++
             $nr=[long][BitConverter]::ToUInt32($entry,$(if($d[2] -ceq 'N'){12}else{4}))
             if($d[2] -ceq 'D') {
                 $attrs=[BitConverter]::ToUInt32($entry,0); Assert-Kwil (($attrs -band 4294967294L) -eq 0) 'unsupported delay import attributes'
@@ -431,8 +434,9 @@ function Get-KwilPeImports {
             $dll=(& $readName $nr 128).ToLowerInvariant()
             Assert-Kwil ($dll -cmatch '^[a-z0-9._-]+[.]dll$') 'invalid DLL basename'
             Assert-Kwil ($dll -notmatch '^(vcruntime|msvcp|msvcr|ucrtbase|api-ms-win-crt-)') "dynamic runtime import $dll"
-            Assert-Kwil ($imports.Count -lt 128 -and -not $imports.ContainsKey($d[2]+':'+$dll)) 'duplicate/too many imports'
-            $imports.Add($d[2]+':'+$dll,[ordered]@{load=$d[2];dll=$dll})
+            # Validate every physical entry before emitting the canonical ledger set.
+            $key=$d[2]+':'+$dll
+            if(-not $imports.ContainsKey($key)) { $imports.Add($key,[ordered]@{load=$d[2];dll=$dll}) }
         }
         Assert-Kwil $terminated 'unterminated PE import directory'
     }

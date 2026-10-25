@@ -162,6 +162,23 @@ function New-KwilTestPe {
     return ,$b
 }
 
+function New-KwilTestRepeatedImports {
+    param([int]$Count=2,[string]$Last='KERNEL32.dll',[string]$Delay='', [switch]$BadLastRva,
+        [string]$Architecture='x64')
+    $original=New-KwilTestPe $Architecture 'guard' 'kernel32.dll' $Delay
+    $b=[byte[]]::new(8704); $original.CopyTo($b,0)
+    [BitConverter]::GetBytes([uint32]8192).CopyTo($b,400)
+    [BitConverter]::GetBytes([uint32]8192).CopyTo($b,408)
+    [BitConverter]::GetBytes([uint32]0x1600).CopyTo($b,272)
+    [BitConverter]::GetBytes([uint32](($Count+1)*20)).CopyTo($b,276)
+    [Text.Encoding]::ASCII.GetBytes($Last+[char]0).CopyTo($b,0x1800)
+    for($i=0;$i -lt $Count;$i++) {
+        $nr=if($i -eq $Count-1){if($BadLastRva){0xfffffff}else{0x2600}}else{4352}
+        [BitConverter]::GetBytes([uint32]$nr).CopyTo($b,(0x800+$i*20+12))
+    }
+    return ,$b
+}
+
 function Read-KwilTestImports {
     param([byte[]]$Bytes,[string]$Architecture='x64',[string]$Kind='guard')
     $s=[IO.MemoryStream]::new($Bytes,$false)
@@ -279,10 +296,19 @@ $extra=New-KwilTestMetadata $model;$extra.extra='not permitted';$extra=Read-Kwil
 Test-KwilReject {Assert-KwilMetadata $extra $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'object shape'
 $wrong=New-KwilTestMetadata $model;$wrong.guard.imports=@([ordered]@{load='D';dll='kernel32.dll'});$wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
 Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'normal/delay import mismatch'
+$wrong=New-KwilTestMetadata $model;$wrong.guard.imports=@($wrong.guard.imports[0],$wrong.guard.imports[0]);$wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
+Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'guard import count mismatch'
 $wrong=New-KwilTestMetadata $model;$wrong.schema='1';$wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
 Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'invalid schema'
 
 foreach($architecture in @('x64','arm64')) {
+    $im=Read-KwilTestImports (New-KwilTestRepeatedImports -Architecture $architecture) $architecture
+    Test-KwilEqual $im.Count 1 'physical case aliases yield one canonical pair'
+    Test-KwilEqual ($im[0].load+':'+$im[0].dll) 'N:kernel32.dll' 'exact canonical set'
+    $im=Read-KwilTestImports (New-KwilTestRepeatedImports -Architecture $architecture -Delay 'kernel32.dll') $architecture
+    Test-KwilEqual $im.Count 2 'load classes stay distinct after physical deduplication'
+    Test-KwilEqual ($im[0].load+':'+$im[0].dll) 'D:kernel32.dll' 'delay canonical pair'
+    Test-KwilEqual ($im[1].load+':'+$im[1].dll) 'N:kernel32.dll' 'normal canonical pair'
     $im=Read-KwilTestImports (New-KwilTestPe $architecture) $architecture
     Test-KwilEqual $im.Count 2 'normal and delay both inspected'
     Test-KwilEqual ($im[0].load+':'+$im[0].dll) 'D:user32.dll' 'ordinal import ordering'
@@ -291,6 +317,12 @@ foreach($architecture in @('x64','arm64')) {
     Test-KwilEqual (Read-KwilTestImports (New-KwilTestPe $architecture 'guard' 'kernel32.dll' 'user32.dll' $true) $architecture).Count 2 'delay VA conversion'
     foreach($kind in @('exe','com')){$null=Read-KwilTestImports (New-KwilTestPe $architecture $kind) $architecture $kind;$script:KwilTestCount++}
 }
+Test-KwilEqual (Read-KwilTestImports (New-KwilTestRepeatedImports -Count 128)).Count 1 '128 physical aliases admitted'
+Test-KwilReject {Read-KwilTestImports (New-KwilTestRepeatedImports -Count 129)} 'directory limit|physical imports'
+Test-KwilReject {Read-KwilTestImports (New-KwilTestRepeatedImports -Count 128 -Delay 'kernel32.dll')} 'physical imports'
+Test-KwilReject {Read-KwilTestImports (New-KwilTestRepeatedImports -Count 3 -Last 'kernel32.dll/')} 'invalid DLL basename'
+Test-KwilReject {Read-KwilTestImports (New-KwilTestRepeatedImports -Count 3 -Last 'UCRTBASE.dll')} 'dynamic runtime'
+Test-KwilReject {Read-KwilTestImports (New-KwilTestRepeatedImports -Count 3 -BadLastRva)} 'outside backed'
 foreach($bad in @('vcruntime140.dll','msvcp140.dll','msvcr120.dll','ucrtbase.dll','api-ms-win-crt-runtime-l1-1-0.dll')) {
     Test-KwilReject {Read-KwilTestImports (New-KwilTestPe 'x64' 'guard' $bad)} 'dynamic runtime'
     Test-KwilReject {Read-KwilTestImports (New-KwilTestPe 'x64' 'guard' 'kernel32.dll' $bad)} 'dynamic runtime'

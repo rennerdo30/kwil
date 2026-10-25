@@ -271,12 +271,19 @@ pub fn inspect(input: &mut impl ReadAt, architecture: &str) -> Result<Vec<Import
     for reference in names {
         let text = name(input, &sections, reference.rva, &mut previous)?;
         if let Some(load) = reference.load {
-            imports.push(Import { load: load.to_owned(), dll: text.to_ascii_lowercase() });
+            let import = Import { load: load.to_owned(), dll: text.to_ascii_lowercase() };
+            // Validate EACH physical descriptor's name/runtime policy before
+            // canonical set deduplication. The descriptor cap above is unchanged.
+            validate_imports(std::slice::from_ref(&import))?;
+            imports.push(import);
         } else {
             require(text == "KwilPreflightV1", "invalid-pe", "ABI export name")?;
         }
     }
     imports.sort();
+    // Repeated linker descriptors (including case aliases) are one ledger pair;
+    // normal and delay remain distinct. Metadata validation still rejects duplicates.
+    imports.dedup();
     validate_imports(&imports)?;
     Ok(imports)
 }

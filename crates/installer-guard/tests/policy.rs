@@ -581,6 +581,77 @@ fn pe_normal_delay_imports_machine_static_runtime_and_sole_export_are_checked() 
     assert!(pe::inspect(&mut Bytes(b), "x64").is_err());
 }
 
+fn repeated_import_pe(count: usize, last: Option<&str>, delay: Option<&str>) -> Vec<u8> {
+    let mut b = pe_fixture(delay);
+    b.resize(0x2200, 0);
+    put32(&mut b, 400, 0x2000);
+    put32(&mut b, 408, 0x2000);
+    put32(&mut b, 272, 0x1600);
+    put32(&mut b, 276, ((count + 1) * 20) as u32);
+    b[0x1800..0x180d].copy_from_slice(b"kernel32.dll\0");
+    if let Some(text) = last {
+        b[0x1900..0x1900 + text.len()].copy_from_slice(text.as_bytes());
+    }
+    for i in 0..count {
+        let rva = if i == count - 1 && last.is_some() {
+            0x2700
+        } else if i % 2 == 0 {
+            0x1180 // original uppercase name
+        } else {
+            0x2600 // distinct lowercase spelling and physical name
+        };
+        put32(&mut b, 0x800 + i * 20 + 12, rva);
+    }
+    b
+}
+
+#[test]
+fn pe_physical_case_aliases_form_an_exact_canonical_set() {
+    for (architecture, machine) in [("x64", 0x8664), ("arm64", 0xaa64)] {
+        let mut b = repeated_import_pe(3, None, Some("kernel32.dll"));
+        put16(&mut b, 132, machine);
+        assert_eq!(
+            pe::inspect(&mut Bytes(b), architecture).unwrap(),
+            vec![
+                Import { load: "D".into(), dll: "kernel32.dll".into() },
+                Import { load: "N".into(), dll: "kernel32.dll".into() }
+            ]
+        );
+    }
+    let pair = Import { load: "N".into(), dll: "kernel32.dll".into() };
+    // Only physical PE evidence is normalized; supplied ledger duplicates refuse.
+    assert!(model::validate_imports(&[pair.clone(), pair]).is_err());
+}
+
+#[test]
+fn pe_repeated_descriptors_cannot_bypass_the_physical_cap() {
+    assert_eq!(
+        pe::inspect(&mut Bytes(repeated_import_pe(128, None, None)), "x64").unwrap(),
+        vec![Import { load: "N".into(), dll: "kernel32.dll".into() }]
+    );
+    for (count, delay) in [(129, None), (128, Some("kernel32.dll"))] {
+        let error = pe::inspect(&mut Bytes(repeated_import_pe(count, None, delay)), "x64").unwrap_err();
+        assert_eq!(error.code, "limit");
+        assert_eq!(error.resource, "normal/delay imports");
+    }
+}
+
+#[test]
+fn pe_later_entries_after_duplicates_are_still_validated() {
+    for (text, code, resource) in [
+        ("kernel32.dll/", "invalid-metadata", "guard import"),
+        ("UCRTBASE.dll", "dynamic-runtime", "ucrtbase.dll"),
+        ("api-ms-win-crt-runtime-l1-1-0.dll", "dynamic-runtime", "api-ms-win-crt-runtime-l1-1-0.dll"),
+    ] {
+        let error = pe::inspect(&mut Bytes(repeated_import_pe(3, Some(text), None)), "x64").unwrap_err();
+        assert_eq!(error.code, code, "{text}");
+        assert_eq!(error.resource, resource, "{text}");
+    }
+    let mut b = repeated_import_pe(3, None, None);
+    put32(&mut b, 0x800 + 2 * 20 + 12, 0xfffffff);
+    assert_eq!(pe::inspect(&mut Bytes(b), "x64").unwrap_err().code, "invalid-pe");
+}
+
 type FixtureSchema = (Vec<(String, String)>, Vec<String>);
 
 #[derive(Clone)]
