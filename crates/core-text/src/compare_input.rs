@@ -13,6 +13,10 @@
 mod source;
 mod store;
 
+pub use store::read::{
+    ReadLease, ReadLeaseRetirement, ReadLeaseRetirementStep, ReadLeaseStep, ReadVisits, read_lease_resident_charge,
+};
+
 pub use source::{
     CaptureKind, Captured, DecodedNativeLease, InputIdentity, NativeFileLease, RejectedNative, RejectedSnapshot,
     SnapshotLease, SourceLease,

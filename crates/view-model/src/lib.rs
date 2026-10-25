@@ -665,3 +665,5 @@ mod cursor_cache_tests {
 }
 
 pub mod log_session;
+
+pub mod compare_source;

@@ -955,9 +955,6 @@ impl<A: Admission> InputSource for InputStore<A> {
         if lookup.at > self.logical_len {
             return Step::Failed(InputError::Range);
         }
-        if lookup.at == self.logical_len {
-            return Step::Ready(None);
-        }
         match lookup.identity {
             Some(id) if id != self.identity => return Step::Failed(InputError::QueryChanged),
             None => {
@@ -965,6 +962,9 @@ impl<A: Admission> InputSource for InputStore<A> {
                 lookup.high = self.atom_count;
             }
             _ => {}
+        }
+        if lookup.at == self.logical_len {
+            return Step::Ready(None);
         }
         loop {
             if lookup.low == lookup.high {
@@ -1103,3 +1103,5 @@ pub enum RetirementStep<A: Admission> {
     Cancelled(Retirement<A>),
     Failed { retirement: Retirement<A>, error: InputError },
 }
+
+pub mod read;
