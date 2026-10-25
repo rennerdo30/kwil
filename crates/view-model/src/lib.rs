@@ -60,12 +60,25 @@ pub struct Damage {
     pub status: bool,
 }
 
+/// Selects who owns body layout and its cache. This does not change the
+/// document representation, command semantics or frontend modal ownership.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ViewBodyPolicy {
+    /// View maintains the existing logical-line viewport and byte windows.
+    #[default]
+    LogicalLines,
+    /// An external layout owner supplies prepared rows, including pending/error
+    /// presentation. Legacy line accessors expose no fallback body in this mode.
+    Prepared,
+}
+
 pub struct View {
     input_incarnation: std::sync::Arc<()>,
     file: Option<TextFile>,
     path: Option<PathBuf>,
     top: u64,
     rows: usize,
+    body_policy: ViewBodyPolicy,
     lines: Vec<Vec<u8>>,
     line_offsets: Vec<u64>,
     line_sources: Vec<std::ops::Range<u64>>,
@@ -91,6 +104,7 @@ impl View {
             path,
             top: 0,
             rows: 0,
+            body_policy: ViewBodyPolicy::LogicalLines,
             lines: Vec::new(),
             line_offsets: Vec::new(),
             line_sources: Vec::new(),
@@ -130,6 +144,35 @@ impl View {
         self.rows
     }
 
+    pub fn body_policy(&self) -> ViewBodyPolicy {
+        self.body_policy
+    }
+
+    /// The body owner sets this BEFORE resize, input or refresh. Prepared mode
+    /// discards only legacy paint caches; it never maps a visual anchor through
+    /// Editor's logical viewport. Commands and document metadata remain live.
+    ///
+    /// Switching back explicitly rebuilds current logical rows, even if edits
+    /// produced no legacy damage while prepared. The external owner must still
+    /// settle its own pages, intents and source holders before releasing them.
+    pub fn set_body_policy(&mut self, policy: ViewBodyPolicy) -> Damage {
+        if self.body_policy == policy {
+            return Damage::default();
+        }
+        self.body_policy = policy;
+        self.lines.clear();
+        self.line_offsets.clear();
+        self.line_sources.clear();
+        if policy == ViewBodyPolicy::LogicalLines {
+            self.top = self.editor.as_ref().map_or(self.top, |editor| editor.top()).min(self.max_top());
+            if let Some(editor) = &mut self.editor {
+                editor.set_viewport(self.top, self.rows);
+            }
+            self.reload();
+        }
+        Damage { full: true, status: true, ..Damage::default() }
+    }
+
     /// Lines of the file, once the background index is ready.
     pub fn line_count(&self) -> Option<u64> {
         if let Some(editor) = &self.editor {
@@ -141,19 +184,29 @@ impl View {
         self.file.as_ref()?.index().map(|i| i.line_count())
     }
 
-    /// Text of visible row `row` (without line ending), if there is a line.
+    /// Text of visible logical row `row` (without line ending). Prepared mode
+    /// returns None, including while its external layout is pending or failed.
     pub fn line(&self, row: usize) -> Option<&[u8]> {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return None;
+        }
         self.lines.get(row).map(|l| l.as_slice())
     }
 
     /// Source-byte column of this row's UTF-8-aligned visible window.
     pub fn line_offset(&self, row: usize) -> u64 {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return 0;
+        }
         self.line_offsets.get(row).copied().unwrap_or(0)
     }
 
     /// Cached absolute byte window, computed during viewport reload. Styling
     /// reads no file bytes and performs no line-index lookup on the input path.
     pub fn line_source(&self, row: usize) -> Option<std::ops::Range<u64>> {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return None;
+        }
         self.line_sources.get(row).cloned()
     }
 
@@ -164,6 +217,9 @@ impl View {
 
     pub fn set_rows(&mut self, rows: usize) -> Damage {
         self.rows = rows;
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return Damage { full: true, ..Damage::default() };
+        }
         self.top = self.top.min(self.max_top());
         if let Some(editor) = &mut self.editor {
             editor.set_viewport(self.top, rows);
@@ -184,7 +240,9 @@ impl View {
             match Document::from_indexed_file(path.clone(), file.clone()) {
                 Ok(document) => {
                     let mut editor = Editor::new(document);
-                    editor.set_viewport(self.top, self.rows);
+                    if self.body_policy == ViewBodyPolicy::LogicalLines {
+                        editor.set_viewport(self.top, self.rows);
+                    }
                     self.editor = Some(editor);
                 }
                 Err(error) => {
@@ -198,7 +256,9 @@ impl View {
         {
             match editor.go_to_line(line, column, extend) {
                 Ok(damage) => {
-                    self.top = editor.top();
+                    if self.body_policy == ViewBodyPolicy::LogicalLines {
+                        self.top = editor.top();
+                    }
                     self.reload();
                     return damage;
                 }
@@ -227,6 +287,11 @@ impl View {
     /// Scrolls by `delta` lines (clamped). Before the index is ready the
     /// view stays on the first screen.
     pub fn scroll(&mut self, delta: i64) -> Damage {
+        // Prepared navigation belongs to the external body owner, including
+        // pending pages. Never reinterpret its row delta as logical lines.
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return Damage::default();
+        }
         let new_top = (self.top as i64 + delta).clamp(0, self.max_top() as i64) as u64;
         let d = new_top as i64 - self.top as i64;
         if d == 0 {
@@ -257,6 +322,9 @@ impl View {
     }
 
     fn reload(&mut self) {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return;
+        }
         if let Some(editor) = &self.editor {
             self.preview = None;
             let snapshot = editor.document().snapshot();
@@ -349,6 +417,9 @@ impl View {
     /// Cursor-only damage never changes source bytes. Retain the viewport cache
     /// unless navigation actually moved it; mouse drags must not read every line.
     pub fn refresh_after_cursor(&mut self, damage: Damage) -> Damage {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return damage;
+        }
         let top = self.editor.as_ref().map_or(self.top, |editor| editor.top());
         if self.top != top {
             self.top = top;
@@ -359,7 +430,9 @@ impl View {
 
     pub fn refresh_after_edit(&mut self, damage: Damage) -> Damage {
         if let Some(editor) = &self.editor {
-            self.top = editor.top();
+            if self.body_policy == ViewBodyPolicy::LogicalLines {
+                self.top = editor.top();
+            }
             self.path = editor.document.path.clone();
             self.file = editor.document.original.clone();
         }
@@ -442,6 +515,10 @@ impl View {
         format!("{name}{lines}{notice}")
     }
 }
+
+#[cfg(test)]
+#[path = "prepared_body_tests.rs"]
+mod prepared_body_tests;
 
 #[cfg(test)]
 mod viewer_tests {
