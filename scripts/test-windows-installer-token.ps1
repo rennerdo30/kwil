@@ -13,7 +13,11 @@ profile loading, MSI, editor, network, persistent environment or fallback launch
 Interop reference: cached Windows SDK 10.0.26100.0 winnt.h,
 securitybaseapi.h, processthreadsapi.h; default platform alignment on x64/ARM64.
 No token bytes/handles/privileges or environment dumps go into public receipts.
-Only the bounded public facts enumerated in Facts are serialized.
+Token measurements serialize only the bounded facts enumerated in Facts.
+NativeCommandStartup is a dispatch-only diagnostic alternative, never a worker
+proof: read parent window-station/desktop DACL access, then launch exactly one
+native SystemRoot/System32/cmd.exe /d /q /c "exit /b 73". No PowerShell fallback.
+Parent DACL observations do not prove child attachment, MIC or DLL startup.
 
 90s monotonic internal budget starts BEFORE admission/Add-Type. Cleanup reserves
 one cumulative 10s deadline across all exact-handle reaps (at most 5s per wait),
@@ -29,7 +33,8 @@ param(
     [Parameter(Mandatory)][ValidateSet('x64','arm64')][string]$Architecture,
     [Parameter(Mandatory)][string]$EvidenceDirectory,
     [ValidateSet('Driver','Worker')][string]$Mode = 'Driver',
-    [string]$OwnerNonce = ''
+    [string]$OwnerNonce = '',
+    [ValidateSet('PowerShellProof','NativeCommandStartup',IgnoreCase=$false)][string]$Purpose = 'PowerShellProof'
 )
 
 Set-StrictMode -Version Latest
@@ -40,6 +45,7 @@ $script:CleanupReserveMs = 10000L
 $script:EvidenceReserveMs = 20000L
 $script:Lease = $null
 $script:Cleanup = $null
+$script:ParentAccess = $null
 
 function Assert-TokenCase([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "Token preflight FAIL/design-fork: $Message" }
@@ -70,6 +76,9 @@ function Assert-HostedTokenContext {
     $native = if ($Architecture -ceq 'x64') { 'X64' } else { 'Arm64' }
     Assert-TokenCase ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ceq $native) 'OS architecture mismatch'
     Assert-TokenCase ([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -ceq $native) 'native PowerShell required'
+    if ($Purpose -ceq 'NativeCommandStartup') {
+        Assert-TokenCase ($Mode -ceq 'Driver' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch') 'native diagnostic requires explicit driver workflow dispatch'
+    }
     Assert-TokenCase ($env:GITHUB_WORKSPACE -and [IO.Path]::IsPathFullyQualified($env:GITHUB_WORKSPACE)) 'absolute workspace required'
     Assert-TokenCase ([IO.Path]::IsPathFullyQualified($EvidenceDirectory)) 'absolute evidence path required'
     $root = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
@@ -175,6 +184,40 @@ function Write-EvidenceManifest($Identity, [string]$Status) {
     Write-BoundedJson 'evidence-manifest.json' ([ordered]@{schema=1;identity=$Identity;status=$Status;artifacts=@($rows);selfHash='excluded';installerQualification='not-run'})
 }
 
+function Write-NativeEvidenceManifest($Identity, [string]$Status) {
+    $rows = @('parent-access.json','owned-process.json','worker-proof.json','worker-result.json','driver-result.json') | ForEach-Object {
+        $path = Join-Path $EvidenceDirectory $_
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Assert-PlainPath $path
+            $length = (Get-Item -LiteralPath $path).Length
+            Assert-TokenCase ($length -le 32768) 'diagnostic artifact exceeds cap'
+            [ordered]@{name=$_;bytes=$length;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+        } else { [ordered]@{name=$_;state='absent'} }
+    }
+    Write-BoundedJson 'evidence-manifest.json' ([ordered]@{schema=2;kind='native-command-startup-diagnostic';purpose=$Purpose
+        identity=$Identity;status=$Status;artifacts=@($rows);selfHash='excluded';tokenPreflight='not-run';installerQualification='not-run'})
+}
+
+function Assert-NativeCommandImage([string]$Path) {
+    # Bounded PE reads only. Native parent/OS agreement is already an admission
+    # gate; this independently rejects an unexpected System32 image machine.
+    $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $dos = [byte[]]::new(64)
+        Assert-TokenCase ($stream.Read($dos,0,$dos.Length) -eq $dos.Length) 'native command short DOS header'
+        Assert-TokenCase ($dos[0] -eq 0x4d -and $dos[1] -eq 0x5a) 'native command DOS signature'
+        $offset = [BitConverter]::ToInt32($dos,60)
+        Assert-TokenCase ($offset -ge 64 -and $offset -le 1048576 -and [long]$offset + 26 -le $stream.Length) 'native command PE offset bound'
+        $null = $stream.Seek($offset,[IO.SeekOrigin]::Begin)
+        $pe = [byte[]]::new(26)
+        Assert-TokenCase ($stream.Read($pe,0,$pe.Length) -eq $pe.Length) 'native command short PE header'
+        $machine = [BitConverter]::ToUInt16($pe,4)
+        $expected = if ($Architecture -ceq 'x64') { 0x8664 } else { 0xaa64 }
+        Assert-TokenCase ([BitConverter]::ToUInt32($pe,0) -eq 0x4550 -and $machine -eq $expected -and [BitConverter]::ToUInt16($pe,20) -ge 2 -and [BitConverter]::ToUInt16($pe,24) -eq 0x20b) ('native command PE architecture/PE32+ mismatch; machine=0x{0:x4} expected=0x{1:x4}' -f $machine,$expected)
+        [uint16]$machine
+    } finally { $stream.Dispose() }
+}
+
 function Invoke-OwnedProof([scriptblock]$Create, [scriptblock]$Receipt, [scriptblock]$Work, [scriptblock]$Close) {
     # Same exception/cleanup seam for the real child and source-authored mocks.
     # Create returns only after native ownership + timer are armed. No receipt IO
@@ -205,6 +248,18 @@ $identity = Get-SourceIdentity
 $report = [ordered]@{schema=1;kind='same-sid-token-preflight';status='FAIL/design-fork';identity=$identity
     mode=$Mode;processPid=$PID;installerQualification='not-run';uacPolicy='not-inspected';budgetMilliseconds=$script:BudgetMs
     baseline=$null;selection=$null;suspended=$null;actual=$null;cleanup=$null;oracles=$null;error=$null}
+if ($Purpose -ceq 'NativeCommandStartup') {
+    $report.schema = 2
+    $report.kind = 'native-command-startup-diagnostic'
+    $report['purpose'] = $Purpose
+    $report['tokenPreflight'] = 'not-run'
+    $report['workerProof'] = 'not-observed'
+    $report['workerResult'] = 'not-observed'
+    $report['parentAccess'] = $null
+    $report['nativeCommand'] = [ordered]@{image='SystemRoot/System32/cmd.exe';commandId='cmd-d-q-c-exit-b-73'
+        expectedExitCode=73;exitCode=$null;reached=$false;machine=$null;childAttachment='not-observed'
+        startupDesktop='null';creationFlags='0x08000404';environmentValues='private';environmentNames=$null;environmentUtf16Bytes=$null}
+}
 $primaryError = $null
 $current = $null
 $candidate = $null
@@ -725,6 +780,304 @@ public static class KwilTokenProof {
     public static Lease Launch(Token token,string app,string command,string environment,string cwd,int lifetimeMs,int cleanupMs) {
         return Lease.Start(token,app,command,environment,cwd,lifetimeMs,cleanupMs);
     }
+
+    // Diagnostic-only interop. No Set*, OpenDesktop, profile or impersonation
+    // attachment API. Get*Desktop/WindowStation handles are borrowed, never closed.
+    [StructLayout(LayoutKind.Sequential)] struct GenericMapping {
+        public uint Read, Write, Execute, All;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct AccessLuidAttributes { public Luid Id; public uint Attributes; }
+    [StructLayout(LayoutKind.Sequential)] struct PrivilegeSetOne { public uint Count, Control; public AccessLuidAttributes First; }
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll",SetLastError=true)] static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll",SetLastError=true)] static extern IntPtr GetThreadDesktop(uint thread);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetUserObjectSecurity(IntPtr handle,ref uint requested,[Out] byte[] descriptor,uint length,out uint needed);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool GetUserObjectInformationW(IntPtr handle,int index,[Out] byte[] data,uint length,out uint needed);
+    [DllImport("advapi32.dll",SetLastError=true)] static extern bool AccessCheck([In] byte[] descriptor,IntPtr token,uint desired,ref GenericMapping mapping,[Out] byte[] privileges,ref uint privilegeBytes,out uint granted,out bool access);
+    const uint MaximumAllowed=0x02000000;
+    const int MaxDescriptorBytes=65536, MaxNameBytes=512, MaxPrivilegeBytes=65536;
+    const int MaxAclEntries=4096, MaxAccessPrivileges=256;
+    // SDK winnt.h GENERIC_MAPPING (16 bytes, DWORD offsets 0/4/8/12),
+    // PRIVILEGE_SET header 8 + N*12 LUID_AND_ATTRIBUTES bytes. No pointer fields.
+    // Cached SDK winnt.h: LUID_AND_ATTRIBUTES 10283, SID 10336, ACL 11059,
+    // ACE_HEADER 11089, SECURITY_DESCRIPTOR_RELATIVE 11570, PRIVILEGE_SET 11721.
+    // Object mappings: MS Learn desktop/window-station security access-rights
+    // tables; WinUser.h 1372..1380 / 1552..1564, winnt.h 10220..10230.
+    // https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights
+    // https://learn.microsoft.com/en-us/windows/win32/winstation/window-station-security-and-access-rights
+    // AccessCheck API success and AccessStatus are separate; only a failed API
+    // makes last-error meaningful. DACL results do not include MIC or establish
+    // which desktop the child later attaches to with startup.desktop == null.
+    static GenericMapping ObjectMapping(bool station) {
+        return station ? new GenericMapping { Read=0x00020303,Write=0x0002001c,Execute=0x00020060,All=0x000f037f }
+            : new GenericMapping { Read=0x00020041,Write=0x000200be,Execute=0x00020100,All=0x000f01ff };
+    }
+    interface AccessCalls {
+        bool Duplicate(IntPtr primary,out IntPtr owned,out int error);
+        IntPtr Borrow(bool station);
+        bool Read(IntPtr borrowed,bool name,byte[] data,uint capacity,out uint needed,out int error);
+        bool Check(byte[] descriptor,IntPtr token,uint desired,ref GenericMapping mapping,byte[] privileges,ref uint bytes,out uint granted,out bool access,out int error);
+        void Close(ref IntPtr owned);
+    }
+    sealed class NativeAccessCalls : AccessCalls {
+        public bool Duplicate(IntPtr primary,out IntPtr owned,out int error) {
+            // Only TOKEN_QUERY on the new SecurityImpersonation impersonation
+            // token. No TOKEN_IMPERSONATE, ASSIGN_PRIMARY or thread attachment.
+            IntPtr created;
+            bool ok=DuplicateTokenEx(primary,QUERY,IntPtr.Zero,2,2,out created);
+            error=ok?0:Marshal.GetLastWin32Error();
+            owned=ok?created:IntPtr.Zero; // A failed API's undefined output is not an ownership grant.
+            return ok;
+        }
+        public IntPtr Borrow(bool station) {
+            IntPtr handle=station?GetProcessWindowStation():GetThreadDesktop(GetCurrentThreadId());
+            if(handle==IntPtr.Zero) throw Error(station?"GetProcessWindowStation":"GetThreadDesktop parent");
+            return handle;
+        }
+        public bool Read(IntPtr borrowed,bool name,byte[] data,uint capacity,out uint needed,out int error) {
+            uint requested=7; // OWNER | GROUP | DACL, never SACL or label requests.
+            bool ok=name?GetUserObjectInformationW(borrowed,2,data,capacity,out needed)
+                :GetUserObjectSecurity(borrowed,ref requested,data,capacity,out needed);
+            error=ok?0:Marshal.GetLastWin32Error(); return ok;
+        }
+        public bool Check(byte[] descriptor,IntPtr token,uint desired,ref GenericMapping mapping,byte[] privileges,ref uint bytes,out uint granted,out bool access,out int error) {
+            bool ok=AccessCheck(descriptor,token,desired,ref mapping,privileges,ref bytes,out granted,out access);
+            error=ok?0:Marshal.GetLastWin32Error(); return ok;
+        }
+        public void Close(ref IntPtr owned) { KwilTokenProof.Close(ref owned); }
+    }
+    static byte[] ReadObject(AccessCalls calls,IntPtr borrowed,bool name) {
+        uint needed; int error; string api=name?"GetUserObjectInformationW name":"GetUserObjectSecurity";
+        bool ok=calls.Read(borrowed,name,null,0,out needed,out error);
+        Require(!ok,api+" sizing unexpectedly succeeded");
+        if(error!=122) throw Error(api+" size",error);
+        int cap=name?MaxNameBytes:MaxDescriptorBytes, minimum=name?2:20;
+        Require(needed>=minimum && needed<=cap && (!name || needed%2==0),api+" sizing bound");
+        byte[] data=new byte[checked((int)needed)]; uint returned;
+        if(!calls.Read(borrowed,name,data,needed,out returned,out error)) throw Error(api+" read",error);
+        Require(returned==needed,api+" changed/short read; no retry");
+        return data;
+    }
+    static string ObjectName(byte[] data) {
+        Require(data.Length>=2 && data.Length<=MaxNameBytes && data.Length%2==0 &&
+            data[data.Length-2]==0 && data[data.Length-1]==0,"object name terminator/bound");
+        string name=new UnicodeEncoding(false,false,true).GetString(data,0,data.Length-2);
+        Require(name.Length>0 && name.Length<=255,"object name character bound");
+        foreach(char c in name) Require(!char.IsControl(c),"object name control/embedded terminator");
+        return name;
+    }
+    static void DescriptorSid(byte[] data,uint offset) {
+        Require(offset>=20 && offset%4==0 && (long)offset+8<=data.Length,"descriptor SID header offset");
+        int at=checked((int)offset); int count=data[at+1];
+        Require(data[at]==1 && count<=15 && (long)at+8+4L*count<=data.Length,"descriptor SID extent");
+    }
+    static void DescriptorBounds(byte[] data) {
+        Require(data.Length>=20 && data.Length<=MaxDescriptorBytes && data[0]==1,"descriptor header bound/revision");
+        ushort control=BitConverter.ToUInt16(data,2);
+        Require((control&0x8000)!=0 && BitConverter.ToUInt32(data,12)==0,"descriptor must be self-relative without SACL");
+        DescriptorSid(data,BitConverter.ToUInt32(data,4)); DescriptorSid(data,BitConverter.ToUInt32(data,8));
+        uint dacl=BitConverter.ToUInt32(data,16);
+        if(dacl==0) return; // A null/absent DACL is an observation, not rewritten.
+        Require((control&4)!=0 && dacl>=20 && dacl%4==0 && (long)dacl+8<=data.Length,"descriptor DACL header offset");
+        int start=checked((int)dacl), size=BitConverter.ToUInt16(data,start+2), count=BitConverter.ToUInt16(data,start+4);
+        Require((data[start]==2 || data[start]==4) && size>=8 && (long)start+size<=data.Length &&
+            count<=MaxAclEntries && count<=(size-8)/4,"descriptor ACL size/count bound");
+        int at=start+8, end=start+size;
+        for(int i=0;i<count;i++) {
+            Require((long)at+4<=end,"descriptor ACE header bound");
+            int bytes=BitConverter.ToUInt16(data,at+2);
+            Require(bytes>=4 && bytes%4==0 && (long)at+bytes<=end,"descriptor ACE extent"); at+=bytes;
+        }
+    }
+    public sealed class AccessOutcome {
+        public uint RequestedAccess=MaximumAllowed;
+        public bool ApiSucceeded;
+        public int? LastError;
+        public bool? AccessStatus;
+        public uint? GrantedAccess;
+    }
+    public sealed class ObjectAccess {
+        public string Label, Name;
+        public AccessOutcome Baseline, Candidate;
+    }
+    static AccessOutcome CheckAccess(AccessCalls calls,byte[] descriptor,IntPtr token,bool station) {
+        var mapping=ObjectMapping(station); byte[] privileges=new byte[MaxPrivilegeBytes];
+        uint bytes=MaxPrivilegeBytes, granted; bool access; int error;
+        bool ok=calls.Check(descriptor,token,MaximumAllowed,ref mapping,privileges,ref bytes,out granted,out access,out error);
+        var result=new AccessOutcome { ApiSucceeded=ok,LastError=ok?(int?)null:error };
+        if(!ok) return result; // AccessStatus/GrantedAccess/length are undefined on API failure.
+        Require(bytes>=8 && bytes<=MaxPrivilegeBytes,"AccessCheck privilege-set length bound");
+        uint count=BitConverter.ToUInt32(privileges,0);
+        Require(count<=MaxAccessPrivileges && 8L+12L*count<=bytes,"AccessCheck privilege-set extent");
+        Require((BitConverter.ToUInt32(privileges,4)&~1U)==0,"AccessCheck privilege-set control");
+        result.AccessStatus=access;
+        if(access) {
+            Require((granted&~ObjectMapping(station).All)==0,"AccessCheck returned unmapped/unknown rights");
+            result.GrantedAccess=granted;
+        }
+        return result;
+    }
+    public sealed class ParentAccess {
+        readonly AccessCalls calls;
+        IntPtr baselineCopy, candidateCopy; bool started;
+        public string Scope="parent-context-DACL-only-not-child-attachment-or-MIC";
+        public ObjectAccess[] Objects={new ObjectAccess { Label="parent-window-station" },new ObjectAccess { Label="parent-thread-desktop" }};
+        public string CleanupOutcome="not-started";
+        public bool BaselineTokenClosed { get { return baselineCopy==IntPtr.Zero; } }
+        public bool CandidateTokenClosed { get { return candidateCopy==IntPtr.Zero; } }
+        public bool TokensClosed { get { return baselineCopy==IntPtr.Zero && candidateCopy==IntPtr.Zero; } }
+        public ParentAccess() { calls=new NativeAccessCalls(); }
+        ParentAccess(AccessCalls injected) { calls=injected; }
+        public void Measure(Token baseline,Token candidate) { MeasureHandles(baseline.Handle,candidate.Handle); }
+        void MeasureHandles(IntPtr baseline,IntPtr candidate) {
+            Require(!started,"parent access observation cannot retry"); started=true;
+            int error;
+            // Successful acquisitions go directly to their owner; a failed
+            // second duplicate leaves the first reachable for exact cleanup.
+            // Public receipts cannot serialize these private fields.
+            if(!calls.Duplicate(baseline,out baselineCopy,out error)) throw Error("DuplicateTokenEx baseline AccessCheck",error);
+            Require(baselineCopy!=IntPtr.Zero,"null baseline AccessCheck token");
+            if(!calls.Duplicate(candidate,out candidateCopy,out error)) throw Error("DuplicateTokenEx candidate AccessCheck",error);
+            Require(candidateCopy!=IntPtr.Zero,"null candidate AccessCheck token");
+            for(int i=0;i<2;i++) {
+                bool station=i==0; IntPtr borrowed=calls.Borrow(station);
+                Require(borrowed!=IntPtr.Zero,"null borrowed user object");
+                Objects[i].Name=ObjectName(ReadObject(calls,borrowed,true));
+                byte[] descriptor=ReadObject(calls,borrowed,false); DescriptorBounds(descriptor);
+                Objects[i].Baseline=CheckAccess(calls,descriptor,baselineCopy,station);
+                if(!Objects[i].Baseline.ApiSucceeded) throw Error("AccessCheck baseline",Objects[i].Baseline.LastError.Value);
+                Objects[i].Candidate=CheckAccess(calls,descriptor,candidateCopy,station);
+                if(!Objects[i].Candidate.ApiSucceeded) throw Error("AccessCheck candidate",Objects[i].Candidate.LastError.Value);
+            }
+        }
+        public void Close() {
+            Exception first=null;
+            try { if(baselineCopy!=IntPtr.Zero) calls.Close(ref baselineCopy); } catch(Exception e) { first=e; }
+            try { if(candidateCopy!=IntPtr.Zero) calls.Close(ref candidateCopy); } catch(Exception e) { if(first==null) first=e; }
+            CleanupOutcome=TokensClosed?"closed":"unresolved-owned-token";
+            if(first!=null) throw first; // Both owned handles were attempted; never touch borrowed handles.
+        }
+        sealed class MockAccessCalls : AccessCalls {
+            internal int Duplicates, Acquired, Closed, Reads, Checks, FailDuplicate, FailRead;
+            internal bool ProbeSuccess, ReadSuccess=true, AccessSuccess=true, AccessAllowed=true, FailClose;
+            internal uint ProbeLength=40, ReturnLength=40, PrivilegeLength=8, PrivilegeCount, PrivilegeControl;
+            internal uint? GrantedOverride;
+            internal uint NameProbeLength=10, NameReturnLength=10;
+            internal int ProbeError=122, ReadError=5, AccessError=5;
+            public bool Duplicate(IntPtr primary,out IntPtr owned,out int error) {
+                Duplicates++; Require(primary==new IntPtr(Duplicates),"mock changed input token");
+                bool ok=Duplicates!=FailDuplicate;
+                owned=ok?new IntPtr(300+Duplicates):IntPtr.Zero;
+                if(owned!=IntPtr.Zero) Acquired++; error=5; return ok;
+            }
+            public IntPtr Borrow(bool station) { return new IntPtr(station?401:402); }
+            public bool Read(IntPtr borrowed,bool name,byte[] data,uint capacity,out uint needed,out int error) {
+                Require(borrowed==new IntPtr(401) || borrowed==new IntPtr(402),"mock borrowed object changed"); Reads++;
+                if(Reads==FailRead) { needed=0; error=ReadError; return false; }
+                if(capacity==0) { Require(data==null,"mock sizing pointer"); needed=name?NameProbeLength:ProbeLength; error=ProbeError; return ProbeSuccess; }
+                Require(data!=null && data.Length==capacity && capacity<=(name?MaxNameBytes:MaxDescriptorBytes),"mock read capacity");
+                needed=name?NameReturnLength:ReturnLength; error=ReadError;
+                if(!ReadSuccess) return false;
+                byte[] source=name?Encoding.Unicode.GetBytes("mock\0"):MockDescriptor();
+                Array.Copy(source,data,Math.Min(source.Length,data.Length)); return true;
+            }
+            public bool Check(byte[] descriptor,IntPtr token,uint desired,ref GenericMapping mapping,byte[] privileges,ref uint bytes,out uint granted,out bool access,out int error) {
+                Require(token==new IntPtr(301) || token==new IntPtr(302),"mock access token changed");
+                Require(desired==0x02000000 && bytes==65536 && privileges.Length==65536,"mock access request/capacity");
+                bool station=Checks<2; Checks++;
+                Require(mapping.Read==(station?0x20303U:0x20041U) && mapping.Write==(station?0x2001cU:0x200beU) &&
+                    mapping.Execute==(station?0x20060U:0x20100U) && mapping.All==(station?0xf037fU:0xf01ffU),"mock object mapping changed");
+                bytes=PrivilegeLength; Array.Copy(BitConverter.GetBytes(PrivilegeCount),privileges,4);
+                Array.Copy(BitConverter.GetBytes(PrivilegeControl),0,privileges,4,4);
+                granted=GrantedOverride.HasValue?GrantedOverride.Value:mapping.Read;
+                access=AccessAllowed; error=AccessError; return AccessSuccess;
+            }
+            public void Close(ref IntPtr owned) {
+                Require(owned==new IntPtr(301) || owned==new IntPtr(302),"borrowed/foreign handle close");
+                if(FailClose && owned==new IntPtr(301)) throw Error("mock owned token close",6);
+                Closed++; owned=IntPtr.Zero;
+            }
+        }
+        static byte[] MockDescriptor() {
+            var data=new byte[40]; data[0]=1; data[2]=4; data[3]=0x80;
+            Array.Copy(BitConverter.GetBytes(20U),0,data,4,4); Array.Copy(BitConverter.GetBytes(20U),0,data,8,4);
+            Array.Copy(BitConverter.GetBytes(32U),0,data,16,4); data[20]=1; data[21]=1; data[27]=5;
+            data[32]=2; data[34]=8; return data;
+        }
+        static void Refuse(MockAccessCalls mock,int error,int reads,int acquired) {
+            var owner=new ParentAccess(mock); bool refused=false;
+            try { owner.MeasureHandles(new IntPtr(1),new IntPtr(2)); }
+            catch(Win32Exception e) { Require(e.NativeErrorCode==error,"access oracle lost Win32 error"); refused=true; }
+            catch(InvalidOperationException) { Require(error<0,"access oracle replaced Win32 error"); refused=true; }
+            finally { owner.Close(); }
+            Require(refused && mock.Reads==reads && mock.Acquired==acquired && mock.Closed==acquired && owner.TokensClosed,
+                "access failure retry/leak or unexpected read count");
+        }
+        public static void CheckOracles() {
+            Require(IntPtr.Size==8 && Marshal.SizeOf(typeof(GenericMapping))==16 &&
+                Marshal.OffsetOf(typeof(GenericMapping),"Read").ToInt32()==0 && Marshal.OffsetOf(typeof(GenericMapping),"Write").ToInt32()==4 &&
+                Marshal.OffsetOf(typeof(GenericMapping),"Execute").ToInt32()==8 && Marshal.OffsetOf(typeof(GenericMapping),"All").ToInt32()==12,
+                "AccessCheck x64/ARM64 mapping ABI");
+            Require(Marshal.SizeOf(typeof(AccessLuidAttributes))==12 && Marshal.OffsetOf(typeof(AccessLuidAttributes),"Attributes").ToInt32()==8 &&
+                Marshal.SizeOf(typeof(PrivilegeSetOne))==20 && Marshal.OffsetOf(typeof(PrivilegeSetOne),"First").ToInt32()==8,
+                "AccessCheck privilege-set ABI");
+            foreach(bool allowed in new bool[] { true,false }) {
+                var mock=new MockAccessCalls { AccessAllowed=allowed }; var owner=new ParentAccess(mock);
+                try {
+                    owner.MeasureHandles(new IntPtr(1),new IntPtr(2));
+                    Require(mock.Reads==8 && mock.Checks==4 && owner.Objects[1].Candidate.ApiSucceeded &&
+                        owner.Objects[1].Candidate.LastError==null && owner.Objects[1].Candidate.AccessStatus==allowed &&
+                        owner.Objects[1].Candidate.GrantedAccess==(allowed?(uint?)0x20041:null),"API success/stale error/access denial conflated");
+                } finally { owner.Close(); }
+                owner.Close(); Require(mock.Closed==2 && owner.TokensClosed,"access close not idempotent");
+            }
+            Refuse(new MockAccessCalls { FailDuplicate=1 },5,0,0);
+            Refuse(new MockAccessCalls { FailDuplicate=2 },5,0,1);
+            Refuse(new MockAccessCalls { FailRead=1 },5,1,2);
+            Refuse(new MockAccessCalls { FailRead=3 },5,3,2);
+            Refuse(new MockAccessCalls { FailRead=4 },5,4,2);
+            Refuse(new MockAccessCalls { ProbeError=24 },24,1,2);
+            Refuse(new MockAccessCalls { ProbeSuccess=true },-1,1,2);
+            Refuse(new MockAccessCalls { ReadSuccess=false },5,2,2);
+            Refuse(new MockAccessCalls { NameProbeLength=0 },-1,1,2);
+            Refuse(new MockAccessCalls { NameProbeLength=3 },-1,1,2);
+            Refuse(new MockAccessCalls { NameProbeLength=514 },-1,1,2);
+            Refuse(new MockAccessCalls { NameReturnLength=12 },-1,2,2);
+            Refuse(new MockAccessCalls { ProbeLength=19 },-1,3,2);
+            Refuse(new MockAccessCalls { ProbeLength=65537 },-1,3,2);
+            Refuse(new MockAccessCalls { ReturnLength=39 },-1,4,2);
+            Refuse(new MockAccessCalls { ReturnLength=41 },-1,4,2);
+            Refuse(new MockAccessCalls { AccessSuccess=false },5,4,2);
+            Refuse(new MockAccessCalls { PrivilegeLength=7 },-1,4,2);
+            Refuse(new MockAccessCalls { PrivilegeLength=65537 },-1,4,2);
+            Refuse(new MockAccessCalls { PrivilegeCount=1 },-1,4,2);
+            Refuse(new MockAccessCalls { PrivilegeCount=257,PrivilegeLength=65536 },-1,4,2);
+            Refuse(new MockAccessCalls { PrivilegeControl=2 },-1,4,2);
+            Refuse(new MockAccessCalls { GrantedOverride=0x80000000 },-1,4,2);
+            var privilegeMock=new MockAccessCalls { PrivilegeLength=20,PrivilegeCount=1 };
+            var privilegeOwner=new ParentAccess(privilegeMock);
+            try { privilegeOwner.MeasureHandles(new IntPtr(1),new IntPtr(2)); }
+            finally { privilegeOwner.Close(); }
+            Require(privilegeMock.Checks==4 && privilegeMock.Closed==2,"valid privilege-set stride refused or leaked");
+            var capMock=new MockAccessCalls { ProbeLength=65536,ReturnLength=65536 };
+            var capOwner=new ParentAccess(capMock);
+            try { capOwner.MeasureHandles(new IntPtr(1),new IntPtr(2)); }
+            finally { capOwner.Close(); }
+            Require(capMock.Checks==4 && capMock.Closed==2,"maximum descriptor capacity refused or leaked");
+            var broken=MockDescriptor(); Array.Copy(BitConverter.GetBytes(65532U),0,broken,16,4);
+            bool rejected=false; try { DescriptorBounds(broken); } catch(InvalidOperationException) { rejected=true; }
+            Require(rejected,"descriptor offset escaped bounds");
+            rejected=false; try { ObjectName(Encoding.Unicode.GetBytes("bad\0name\0")); } catch(InvalidOperationException) { rejected=true; }
+            Require(rejected,"embedded object name terminator accepted");
+            Require(ObjectName(Encoding.Unicode.GetBytes(new string('x',255)+"\0")).Length==255,"maximum name capacity refused");
+            var closeMock=new MockAccessCalls { FailClose=true }; var closeOwner=new ParentAccess(closeMock);
+            closeOwner.MeasureHandles(new IntPtr(1),new IntPtr(2)); rejected=false;
+            try { closeOwner.Close(); } catch(Win32Exception e) { rejected=e.NativeErrorCode==6; }
+            Require(rejected && closeMock.Closed==1 && !closeOwner.TokensClosed && closeOwner.baselineCopy==new IntPtr(301) &&
+                closeOwner.candidateCopy==IntPtr.Zero,"partial token close lost ownership or skipped other token");
+            closeMock.FailClose=false; closeOwner.Close(); Require(closeMock.Closed==2 && closeOwner.TokensClosed,"retained mock ownership not closable");
+        }
+    }
 }
 '@
 
@@ -818,6 +1171,32 @@ public static class KwilTokenProof {
             Assert-TokenCase ($arg -notmatch '["\x00-\x1f]' -and -not $arg.EndsWith('\')) 'unsafe command argument'
         }
         $command = '"{0}" -NoLogo -NoProfile -NonInteractive -File "{1}" -Mode Worker -Architecture {2} -EvidenceDirectory "{3}" -OwnerNonce {4}' -f $pwsh,$PSCommandPath,$Architecture,$EvidenceDirectory,$nonce
+        $application = $pwsh
+        if ($Purpose -ceq 'NativeCommandStartup') {
+            [KwilTokenProof+ParentAccess]::CheckOracles()
+            $oracles.Add('parent-access-bounded-reads-mappings-errors-and-exact-partial-ownership')
+            $report.oracles = $oracles.ToArray()
+            Assert-TokenCase ($env:SystemRoot -and [IO.Path]::IsPathFullyQualified($env:SystemRoot)) 'absolute SystemRoot required for native command'
+            $application = Join-Path $env:SystemRoot 'System32/cmd.exe'
+            Assert-TokenCase ([IO.Path]::IsPathFullyQualified($application) -and (Test-Path -LiteralPath $application -PathType Leaf)) 'absolute existing native system command required'
+            Assert-PlainPath $application
+            Assert-TokenCase ($application -notmatch '["\x00-\x1f]' -and -not $application.EndsWith('\')) 'unsafe native command path'
+            $report.nativeCommand.machine = Assert-NativeCommandImage $application
+            $command = '"{0}" /d /q /c "exit /b 73"' -f $application
+            $script:ParentAccess = [KwilTokenProof+ParentAccess]::new()
+            $report.parentAccess = $script:ParentAccess
+            # Reuse the existing finally/primary-error seam; the owner is public
+            # facts plus private duplicate handles, not a second process lease.
+            $null = Invoke-OwnedProof { $script:ParentAccess } { param($owner) } {
+                param($owner)
+                $owner.Measure($current,$candidate)
+            } {
+                param($owner)
+                $owner.Close()
+            }
+            Write-BoundedJson 'parent-access.json' ([ordered]@{schema=2;purpose=$Purpose;identity=$identity
+                observations=$report.parentAccess;interpretation='parent-DACL-only; not child attachment, MIC, DLL attribution or worker qualification'})
+        }
         $environment = [ordered]@{
             GITHUB_ACTIONS='true';RUNNER_ENVIRONMENT='github-hosted';RUNNER_OS='Windows';RUNNER_ARCH=$env:RUNNER_ARCH
             GITHUB_REPOSITORY=$env:GITHUB_REPOSITORY;GITHUB_RUN_ID=$env:GITHUB_RUN_ID;GITHUB_RUN_ATTEMPT=$env:GITHUB_RUN_ATTEMPT;GITHUB_SHA=$env:GITHUB_SHA
@@ -828,16 +1207,22 @@ public static class KwilTokenProof {
         }
         foreach ($entry in $environment.GetEnumerator()) { Assert-TokenCase ($entry.Value -and [string]$entry.Value -notmatch "[\x00\r\n]") 'invalid private environment entry' }
         $block = (@($environment.Keys | Sort-Object | ForEach-Object { "$_=$($environment[$_])" }) -join [char]0) + [char]0 + [char]0
+        if ($Purpose -ceq 'NativeCommandStartup') {
+            $report.nativeCommand.environmentNames = @($environment.Keys | Sort-Object)
+            $report.nativeCommand.environmentUtf16Bytes = [Text.Encoding]::Unicode.GetByteCount($block)
+        }
         # Recheck admission AFTER candidate/env/path work, immediately before API.
         $proof = Invoke-OwnedProof {
             $lifetime = Get-LaunchAdmission ($script:BudgetMs - $script:Clock.ElapsedMilliseconds)
-            $script:Lease = [KwilTokenProof]::Launch($candidate,$pwsh,$command,$block,$EvidenceDirectory,$lifetime,[int]$script:CleanupReserveMs)
+            $script:Lease = [KwilTokenProof]::Launch($candidate,$application,$command,$block,$EvidenceDirectory,$lifetime,[int]$script:CleanupReserveMs)
             $script:Lease
         } {
             param($lease)
-            Write-BoundedJson 'owned-process.json' ([ordered]@{identity=$identity;nonce=$nonce;driverPid=$PID
+            $ownedReceipt = [ordered]@{identity=$identity;nonce=$nonce;driverPid=$PID
                 childPid=$lease.Pid;childThreadId=$lease.ThreadId;lifetimeMilliseconds=$lease.LifetimeMilliseconds
-                suspended=$true;watchdogArmedBeforeReceipt=$true;baseline=$report.baseline;selection=$report.selection})
+                suspended=$true;watchdogArmedBeforeReceipt=$true;baseline=$report.baseline;selection=$report.selection}
+            if ($Purpose -ceq 'NativeCommandStartup') { $ownedReceipt['schema']=2; $ownedReceipt['purpose']=$Purpose }
+            Write-BoundedJson 'owned-process.json' $ownedReceipt
         } {
             param($lease)
             $report.suspended = $lease.InspectSuspended()
@@ -845,6 +1230,12 @@ public static class KwilTokenProof {
             [KwilTokenProof]::Standard($report.suspended)
             Assert-TokenFactsAgree $report.selection.CandidateFacts $report.suspended 'candidate/suspended'
             $lease.Resume()
+            if ($Purpose -ceq 'NativeCommandStartup') {
+                $report.nativeCommand.exitCode = $lease.Wait()
+                $report.nativeCommand.reached = $report.nativeCommand.exitCode -eq 73
+                Assert-TokenCase $report.nativeCommand.reached 'native command sentinel not reached; no second launch or fallback'
+                return # No worker-proof read and no worker acceptance path.
+            }
             Assert-TokenCase ($lease.Wait() -eq 0) 'worker returned failure; no elevated/credential retry'
             $path = Join-Path $EvidenceDirectory 'worker-proof.json'
             $actual = Read-BoundedProof $path
@@ -861,8 +1252,14 @@ public static class KwilTokenProof {
             Assert-TokenCase $script:Cleanup.Success 'exact owned process/handles not cleanly reaped/closed'
             Assert-TokenCase (-not $script:Cleanup.DeadlineExpired) 'worker watchdog deadline expired'
         }
-        $report.actual = $proof
-        $report.status = 'PASS'
+        if ($Purpose -ceq 'NativeCommandStartup') {
+            Assert-TokenCase (-not (Test-Path -LiteralPath (Join-Path $EvidenceDirectory 'worker-proof.json'))) 'unexpected worker proof in native-only diagnostic'
+            Assert-TokenCase (-not (Test-Path -LiteralPath (Join-Path $EvidenceDirectory 'worker-result.json'))) 'unexpected worker result in native-only diagnostic'
+            $report.status = 'DIAGNOSTIC-COMPLETE'
+        } else {
+            $report.actual = $proof
+            $report.status = 'PASS'
+        }
     }
 } catch {
     $primaryError = $_
@@ -884,6 +1281,18 @@ finally {
             if (-not $script:Cleanup.Success) { $cleanupErrors.Add('unresolved exact child ownership') }
         } catch { $cleanupErrors.Add($_.Exception.Message) }
     }
+    if ($script:ParentAccess) {
+        try { $script:ParentAccess.Close() } catch { $cleanupErrors.Add($_.Exception.Message) }
+    }
+    if ($Purpose -ceq 'NativeCommandStartup') {
+        foreach ($artifact in @(@{field='workerProof';name='worker-proof.json'},@{field='workerResult';name='worker-result.json'})) {
+            try {
+                $present = Test-Path -LiteralPath (Join-Path $EvidenceDirectory $artifact.name)
+                $report.($artifact.field) = if ($present) { 'unexpected-present' } else { 'absent' }
+                if ($present) { $cleanupErrors.Add('unexpected worker artifact in native diagnostic') }
+            } catch { $cleanupErrors.Add($_.Exception.Message) }
+        }
+    }
     foreach ($token in @($candidate,$current)) {
         if ($null -ne $token) { try { $token.Dispose() } catch { $cleanupErrors.Add($_.Exception.Message) } }
     }
@@ -898,7 +1307,10 @@ finally {
     if ($primaryError) { $report.error=Get-PublicFailure $primaryError }
     try {
         Write-BoundedJson "$($Mode.ToLowerInvariant())-result.json" $report
-        if ($Mode -ceq 'Driver') { Write-EvidenceManifest $identity $report.status }
+        if ($Mode -ceq 'Driver') {
+            if ($Purpose -ceq 'NativeCommandStartup') { Write-NativeEvidenceManifest $identity $report.status }
+            else { Write-EvidenceManifest $identity $report.status }
+        }
     }
     catch {
         if ($primaryError) { $primaryError.Exception.Data['finalReceiptFailure']=$_.Exception.Message }
@@ -911,4 +1323,8 @@ if ($primaryError) {
     foreach ($diagnostic in $failure.diagnostics) { [Console]::Error.WriteLine($diagnostic) }
     throw $primaryError
 }
-[Console]::WriteLine("commit=$($identity.commit) mode=$Mode token-preflight=PASS installer-qualification=NOT-RUN")
+if ($Purpose -ceq 'NativeCommandStartup') {
+    [Console]::WriteLine("commit=$($identity.commit) purpose=NativeCommandStartup diagnostic=COMPLETE native-command-reached=true token-preflight=NOT-RUN worker-proof=ABSENT installer-qualification=NOT-RUN")
+} else {
+    [Console]::WriteLine("commit=$($identity.commit) mode=$Mode token-preflight=PASS installer-qualification=NOT-RUN")
+}
