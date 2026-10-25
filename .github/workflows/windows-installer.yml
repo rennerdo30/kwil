@@ -1,0 +1,63 @@
+name: Windows MSI lifecycle
+
+# Disposable hosted machines only. Never route installation to a self-hosted runner.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-installer.yml'
+      - 'scripts/*windows*'
+      - 'scripts/dist.ps1'
+      - 'scripts/check-static-runtime.py'
+      - 'dist.bat'
+      - 'crates/**'
+      - 'assets/logo/kwil.ico'
+      - 'docs/decisions/0004-windows-installer.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/config.toml'
+      - 'LICENSE'
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: MSI lifecycle (${{ matrix.architecture }})
+    # Labels already used by install.yml/release.yml; availability is checked by
+    # GitHub when scheduling. OS AND process architecture are asserted in-script.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, architecture: x64 }
+          - { os: windows-11-arm, architecture: arm64 }
+    runs-on: ${{ matrix.os }}
+    # Driver: prep600 + dist1440 + task940 + final cleanup80 = 3060s (51m).
+    # Checkout1m + driver51m + artifact5m = 57m, leaving3m orchestration slack.
+    # The54m run-step ceiling is a last-resort fence, not the driver budget.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+      - name: Build actual dist and exercise isolated current-user MSI lifecycle
+        timeout-minutes: 54
+        shell: pwsh
+        run: |
+          ./scripts/test-windows-installer-lifecycle.ps1 -Architecture '${{ matrix.architecture }}' -EvidenceDirectory (Join-Path $env:RUNNER_TEMP 'kwil-installer-evidence')
+      - name: Keep original MSI, sidecar, dist checksums and all failure logs
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer-${{ matrix.architecture }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/kwil-installer-evidence
+            ${{ github.workspace }}/dist
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
