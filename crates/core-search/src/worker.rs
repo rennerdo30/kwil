@@ -494,7 +494,12 @@ impl std::fmt::Display for ShutdownError {
             WorkerSettlementReason::NativeObservation(error) => {
                 write!(out, "Search native observation failed: {error}; exact owner retained")
             }
-            _ => out.write_str("Search shutdown deadline reached; exact cleanup owner retained for explicit retry"),
+            WorkerSettlementReason::ThreadExitPending => {
+                out.write_str("Search native thread exit pending; exact cleanup owner retained for explicit retry")
+            }
+            WorkerSettlementReason::TimedOut => {
+                out.write_str("Search shutdown deadline reached; exact cleanup owner retained for explicit retry")
+            }
         }
     }
 }

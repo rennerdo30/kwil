@@ -5,6 +5,20 @@ use std::sync::mpsc::{self, Receiver};
 
 const WAIT: Duration = Duration::from_secs(5);
 
+fn finish_shutdown(worker: SearchWorker) -> Result<(), ShutdownError> {
+    let deadline = Instant::now() + WAIT;
+    let mut result = worker.shutdown_until(deadline);
+    loop {
+        match result {
+            Err(error) if error.reason() == WorkerSettlementReason::ThreadExitPending && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
+                result = error.retry_until(deadline);
+            }
+            terminal => return terminal,
+        }
+    }
+}
+
 fn request(generation: u64, text: &[u8]) -> SearchRequest {
     let mut buffer = kwil_core_text::Buffer::empty();
     buffer.insert(0, text).unwrap();
@@ -146,7 +160,7 @@ fn accepted_snapshot_releases_off_ui_before_externally_pinned_spool() {
     assert_eq!(worker.shared.state.lock().unwrap().live_spools, 1, "document recipe can still pin search spool");
     assert!(!worker.shared.completed.load(Ordering::Acquire), "source ACK is earlier than final retirement");
     drop(spool);
-    worker.shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(worker).unwrap();
     assert!(source.lock().unwrap().is_none());
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(parent).unwrap();
@@ -189,12 +203,12 @@ fn later_closing_owner_invalidates_before_move_and_cannot_reopen_drained_slots()
     assert!(receipt.valid_for(&current), "refusal cannot invalidate an acknowledged generation");
     let retirement = SearchWorker::new(|| {}).unwrap();
     retirement.close_with_requests(duplicate.internal, duplicate.external).continue_value().unwrap();
-    retirement.shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(retirement).unwrap();
     let retirement = SearchWorker::new(|| {}).unwrap();
     retirement.close_with(Some(*ordinary.request)).continue_value().unwrap();
-    retirement.shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(retirement).unwrap();
     drop(spool);
-    worker.shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(worker).unwrap();
 }
 
 #[test]
@@ -234,7 +248,7 @@ fn closing_input_caps_refuse_both_exact_owners_before_any_admission() {
     assert_eq!(doc.snapshot.len(), 8);
     doc.ranges.truncate(1); // Keep the exact source owner, repair only fixture metadata.
     worker.close_with_requests(refused.internal, Some(external)).continue_value().unwrap();
-    worker.shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(worker).unwrap();
 }
 
 #[test]
@@ -251,7 +265,7 @@ fn input_timeout_preserves_exact_worker_until_the_real_release_event() {
     gate.release.send(()).unwrap();
     let receipt = worker.wait_inputs_released(WAIT).unwrap();
     assert!(receipt.valid_for(&key), "retry awaits the same worker and real source-release event");
-    worker.shutdown_bounded(WAIT).unwrap();
+    finish_shutdown(worker).unwrap();
 }
 
 #[test]
