@@ -1,6 +1,5 @@
 //! Worker-owned Snapshot adapter for visual_rows::task::CooperativeSource.
-//! ROOT owns registration/reexports. No legacy WrapSource, Snapshot, index or
-//! worker implementation is replaced here. Source storage stays in ROOT's
+//! Concrete query types serve the sole cooperative layout engine. Source storage stays in ROOT's
 //! existing document loan; all adapter/query/scratch admission uses its SAME
 //! AllocationBudget. There is no fallback allowance or source-sized copy.
 use crate::visual_rows::task::{
@@ -16,7 +15,10 @@ use std::{
     marker::PhantomData,
     mem::size_of,
     rc::Rc,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 // This nonce identifies the actual adapter owner, not its cached document
@@ -25,8 +27,8 @@ use std::{
 static NEXT_READ_OWNER: AtomicU64 = AtomicU64::new(1);
 
 #[must_use]
-pub struct SnapshotLayoutSource {
-    snapshot: Snapshot,
+pub struct SnapshotLayoutSource<O = Snapshot> {
+    owner: O,
     identity: SourceIdentity,
     read_owner: u64,
     budget: AllocationBudget,
@@ -38,49 +40,93 @@ pub struct SnapshotLayoutRefusal {
     pub snapshot: Snapshot,
     pub error: WrapError,
 }
+/// Cached access only. The owner is moved, never cloned by this adapter.
+pub trait SnapshotOwner {
+    fn snapshot(&self) -> &Snapshot;
+}
+impl SnapshotOwner for Snapshot {
+    fn snapshot(&self) -> &Snapshot {
+        self
+    }
+}
+impl<T: SnapshotOwner> SnapshotOwner for Arc<T> {
+    fn snapshot(&self) -> &Snapshot {
+        T::snapshot(self.as_ref())
+    }
+}
+impl<T: SnapshotOwner + ?Sized> SnapshotOwner for &T {
+    fn snapshot(&self) -> &Snapshot {
+        T::snapshot(*self)
+    }
+}
+#[must_use]
+pub struct SnapshotOwnerRefusal<O> {
+    pub owner: O,
+    pub error: WrapError,
+}
 impl SnapshotLayoutSource {
     pub fn try_new(
         snapshot: Snapshot,
         identity: SourceIdentity,
         budget: &AllocationBudget,
     ) -> Result<Self, SnapshotLayoutRefusal> {
-        // Caller query state may overlap the previous/new query during a move.
-        // Header admission precedes construction and all additional scratch is
-        // admitted by SnapshotReadQuery before asking the allocator for storage.
-        let bytes = 3
-            * (size_of::<Self>()
-                + size_of::<LayoutLineQuery>()
-                + size_of::<LayoutRankQuery>()
-                + size_of::<LayoutProvenanceQuery>()
-                + size_of::<SnapshotReadQuery>())
-            + LayoutReadQuery::extra_resident_bytes()
-            + size_of::<AtomicU64>();
-        let metadata = match budget.reserve_metadata(bytes) {
-            Ok(metadata) => metadata,
-            Err(error) => return Err(SnapshotLayoutRefusal { snapshot, error }),
-        };
-        let read_owner =
-            match NEXT_READ_OWNER.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1)) {
-                Ok(owner) => owner,
-                Err(_) => {
-                    return Err(SnapshotLayoutRefusal {
-                        snapshot,
-                        error: WrapError::Admission("Snapshot read owner key exhausted"),
-                    });
-                }
-            };
-        Ok(Self { snapshot, identity, read_owner, budget: budget.clone(), _metadata: metadata, _worker: PhantomData })
+        Self::try_with_owner(snapshot, identity, budget)
+            .map_err(|refused| SnapshotLayoutRefusal { snapshot: refused.owner, error: refused.error })
     }
     pub fn into_snapshot(self) -> Snapshot {
-        self.snapshot
+        self.into_owner()
     }
-    /// Existing Original access may open one temporary check handle; these
-    /// handles never overlap inside this one worker operation or survive Pending.
+}
+impl<O: SnapshotOwner> SnapshotLayoutSource<O> {
+    pub fn try_with_owner(
+        owner: O,
+        identity: SourceIdentity,
+        budget: &AllocationBudget,
+    ) -> Result<Self, SnapshotOwnerRefusal<O>> {
+        // Actual GENERIC adapter and return/refusal overlap. Query payloads
+        // retain separate admission, all against this SAME host aggregate.
+        let bytes = size_of::<Self>()
+            .checked_add(size_of::<LayoutLineQuery>())
+            .and_then(|n| n.checked_add(size_of::<LayoutRankQuery>()))
+            .and_then(|n| n.checked_add(size_of::<LayoutProvenanceQuery>()))
+            .and_then(|n| n.checked_add(size_of::<SnapshotReadQuery>()))
+            .and_then(|n| n.checked_mul(3))
+            .and_then(|n| n.checked_add(size_of::<SnapshotOwnerRefusal<O>>()))
+            .and_then(|n| n.checked_add(LayoutReadQuery::extra_resident_bytes()))
+            .and_then(|n| n.checked_add(size_of::<AtomicU64>()));
+        let Some(bytes) = bytes else {
+            return Err(SnapshotOwnerRefusal {
+                owner,
+                error: WrapError::Admission("Snapshot owner metadata overflow"),
+            });
+        };
+        let metadata = match budget.reserve_metadata(bytes) {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(SnapshotOwnerRefusal { owner, error }),
+        };
+        let read_owner = match NEXT_READ_OWNER.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+            Ok(nonce) => nonce,
+            Err(_) => {
+                return Err(SnapshotOwnerRefusal {
+                    owner,
+                    error: WrapError::Admission("Snapshot read owner key exhausted"),
+                });
+            }
+        };
+        Ok(Self { owner, identity, read_owner, budget: budget.clone(), _metadata: metadata, _worker: PhantomData })
+    }
+    pub fn into_owner(self) -> O {
+        self.owner
+    }
+    /// A scoped borrow for typed adapter composition; never a new owner slot.
+    pub fn owner(&self) -> &O {
+        &self.owner
+    }
+    /// No temporary check handle survives Pending.
     pub fn temporary_handles() -> usize {
         LayoutReadQuery::temporary_handles()
     }
 }
-
 pub struct SnapshotReadQuery {
     read_owner: u64,
     core: LayoutReadQuery,
@@ -91,13 +137,17 @@ pub struct SnapshotReadQuery {
     credit: WorkCredit,
     _metadata: MetadataReservation,
 }
-impl CooperativeSource for SnapshotLayoutSource {
+impl<O: SnapshotOwner> CooperativeSource for SnapshotLayoutSource<O> {
     type LineQuery = LayoutLineQuery;
     type RankQuery = LayoutRankQuery;
     type ReadQuery = SnapshotReadQuery;
     type ProvenanceQuery = LayoutProvenanceQuery;
     fn metadata(&self) -> SourceMetadata {
-        SourceMetadata { identity: self.identity, len: self.snapshot.len(), line_count: self.snapshot.line_count() }
+        SourceMetadata {
+            identity: self.identity,
+            len: self.owner.snapshot().len(),
+            line_count: self.owner.snapshot().line_count(),
+        }
     }
     fn new_line_query(&self, line: u64) -> Self::LineQuery {
         LayoutLineQuery::new(line)
@@ -133,10 +183,10 @@ impl CooperativeSource for SnapshotLayoutSource {
         LayoutProvenanceQuery::new(at)
     }
     fn poll_line(&self, query: &mut Self::LineQuery, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<LineSpan> {
-        query.poll(&self.snapshot, work, cancel).into()
+        query.poll(self.owner.snapshot(), work, cancel).into()
     }
     fn poll_rank(&self, query: &mut Self::RankQuery, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<Rank> {
-        query.poll(&self.snapshot, work, cancel).into()
+        query.poll(self.owner.snapshot(), work, cancel).into()
     }
     fn poll_read(
         &self,
@@ -160,7 +210,7 @@ impl CooperativeSource for SnapshotLayoutSource {
             return TaskPoll::Failed(TaskError::Layout(WrapError::Invalid("changed Snapshot read output")));
         }
         if query.returned.is_none() {
-            match query.core.poll(&self.snapshot, &mut query.logical, &mut query.original, work, cancel) {
+            match query.core.poll(self.owner.snapshot(), &mut query.logical, &mut query.original, work, cancel) {
                 Step::Ready(chunk) => query.returned = Some(chunk.map_or(0, |chunk| chunk.logical_len)),
                 Step::Pending => return TaskPoll::Pending,
                 Step::Cancelled => return TaskPoll::Cancelled,
@@ -183,7 +233,7 @@ impl CooperativeSource for SnapshotLayoutSource {
         work: &mut ReadWork,
         cancel: &AtomicBool,
     ) -> TaskPoll<Provenance> {
-        match query.poll(&self.snapshot, work, cancel) {
+        match query.poll(self.owner.snapshot(), work, cancel) {
             Step::Ready(span) => TaskPoll::Ready(Provenance { source: span.source, opaque: span.opaque }),
             Step::Pending => TaskPoll::Pending,
             Step::Cancelled => TaskPoll::Cancelled,

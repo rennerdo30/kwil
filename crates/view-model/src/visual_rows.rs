@@ -6,17 +6,26 @@
 #[path = "visual_task.rs"]
 pub mod task;
 
+#[cfg(test)]
 use crate::grid::{GraphemeStep, GraphemeStepper};
 use kwil_core_text::Snapshot;
+// Public source-contract types let frontend fixtures implement concrete query
+// adapters without adding a core-text dependency or altering manifests.
+pub use kwil_core_text::compare_input::{InputError, LineSpan, Rank, ReadWork, Terminator};
 use std::{
     fmt, io,
     mem::size_of,
-    ops::{Deref, Range},
+    ops::{ControlFlow, Deref, Range},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
+pub use task::{
+    CooperativeSource, Provenance, SourceMetadata, TaskBytes, TaskError, TaskOutput, TaskPoll, TaskRequest, TaskStep,
+    VisualTask, WorkCredit,
+};
+#[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
 pub const MAX_COLUMNS: usize = 4096;
@@ -38,6 +47,8 @@ pub enum WrapError {
     Admission(&'static str),
     Invalid(&'static str),
     Io(io::Error),
+    /// Preserve the original typed source failure and its I/O payload.
+    Source(InputError),
     Cancelled,
     Stale,
     Busy,
@@ -54,6 +65,14 @@ impl std::error::Error for WrapError {}
 impl From<io::Error> for WrapError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+impl From<TaskError> for WrapError {
+    fn from(error: TaskError) -> Self {
+        match error {
+            TaskError::Layout(error) => error,
+            TaskError::Source(error) => Self::Source(error),
+        }
     }
 }
 pub type WrapResult<T> = Result<T, WrapError>;
@@ -575,17 +594,139 @@ impl LayoutPage {
     }
 }
 
-/// Metadata methods must be cached/immutable. `read` is called on the worker
-/// only and may return short reads, but must not write beyond `output`.
+/// Cached immutable transport metadata. run_layout consumes the EXACT Arc on
+/// the existing worker and recovers it in WorkerExit, without cloning it.
+/// Source-specific query types remain concrete inside VisualTask<S>.
 pub trait WrapSource: Send + Sync + 'static {
     fn identity(&self) -> SourceIdentity;
     fn len(&self) -> u64;
     fn line_count(&self) -> u64;
+    fn source_metadata(&self) -> SourceMetadata {
+        SourceMetadata { identity: self.identity(), len: self.len(), line_count: self.line_count() }
+    }
+    fn run_layout(
+        self: Arc<Self>,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        driver: &mut dyn TaskDriver,
+    ) -> WorkerExit;
+    #[cfg(test)]
+    fn run_test(
+        &self,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        control: &dyn LayoutControl,
+    ) -> (LayoutEngine, WrapResult<TaskOutput>) {
+        fixtures::drive(fixtures::Source::ordinary(self), engine, request, control)
+    }
+    // Independent reference oracle ONLY. Production has no synchronous source
+    // operation and cannot dispatch through these fixture methods.
+    #[cfg(test)]
     fn line_start(&self, line: u64) -> io::Result<Option<u64>>;
+    #[cfg(test)]
     fn line_of(&self, byte: u64) -> io::Result<u64>;
+    #[cfg(test)]
     fn read(&self, at: u64, output: &mut [u8]) -> io::Result<usize>;
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Borrowed erasure only: no query/task Box and no source-owning erased slot.
+pub trait TaskStepper {
+    fn step(&mut self, work: ReadWork, cancel: &AtomicBool) -> TaskStep;
+    fn read_bytes(&self) -> u64;
+}
+impl<S: CooperativeSource> TaskStepper for VisualTask<S> {
+    fn step(&mut self, work: ReadWork, cancel: &AtomicBool) -> TaskStep {
+        VisualTask::step(self, work, cancel)
+    }
+    fn read_bytes(&self) -> u64 {
+        VisualTask::read_bytes(self)
+    }
+}
+pub trait TaskDriver {
+    /// Only active, finite-work computation is resumed. Pending is work-credit
+    /// exhaustion, never external readiness, a timer, or an idle event poll.
+    fn drive(&mut self, task: &mut dyn TaskStepper) -> TaskEnd;
+}
+pub enum TaskEnd {
+    Ready,
+    Cancelled,
+    Failed(TaskError),
+}
+pub enum WorkerEnd {
+    Refused(WrapError),
+    Finished(TaskEnd),
+}
+#[must_use]
+pub struct WorkerExit {
+    pub engine: LayoutEngine,
+    pub source: Arc<dyn WrapSource>,
+    pub request: Option<TaskRequest>,
+    pub output: Option<TaskOutput>,
+    pub end: WorkerEnd,
+}
+pub trait SessionSource: CooperativeSource {
+    fn into_transport(self) -> Arc<dyn WrapSource>;
+}
+/// Caller pre-admits driver/return-carrier construction overlap (WrapSession's
+/// fixed allocation). Task/query storage is admitted by begin_task in the SAME
+/// aggregate. All paths below, including refusal, execute on that worker.
+pub fn run_cooperative<S: SessionSource>(
+    source: S,
+    engine: LayoutEngine,
+    request: TaskRequest,
+    driver: &mut dyn TaskDriver,
+) -> WorkerExit {
+    let mut task = match engine.begin_task(source, request) {
+        ControlFlow::Break(refused) => {
+            return WorkerExit {
+                engine: refused.engine,
+                source: refused.source.into_transport(),
+                request: Some(refused.request),
+                output: None,
+                end: WorkerEnd::Refused(refused.error),
+            };
+        }
+        ControlFlow::Continue(task) => task,
+    };
+    let end = driver.drive(&mut task);
+    // into_parts destroys ALL continuation/query owners before returning. No
+    // query or borrowed snapshot may escape with the transport Arc to the UI.
+    let (engine, source, request, output) = task.into_parts();
+    WorkerExit { engine, source: source.into_transport(), request, output, end: WorkerEnd::Finished(end) }
+}
+
+/// Snapshot transport helper. The existing Arc moves INTO the worker-only
+/// adapter and back out. No Snapshot clone, Arc clone, unwrap or downcast.
+pub fn run_snapshot<T: WrapSource + crate::snapshot_layout_source::SnapshotOwner>(
+    owner: Arc<T>,
+    engine: LayoutEngine,
+    request: TaskRequest,
+    driver: &mut dyn TaskDriver,
+) -> WorkerExit {
+    let identity = owner.identity();
+    let source =
+        match crate::snapshot_layout_source::SnapshotLayoutSource::try_with_owner(owner, identity, engine.budget()) {
+            Ok(source) => source,
+            Err(refused) => {
+                return WorkerExit {
+                    engine,
+                    source: refused.owner,
+                    request: Some(request),
+                    output: None,
+                    end: WorkerEnd::Refused(refused.error),
+                };
+            }
+        };
+    run_cooperative(source, engine, request, driver)
+}
+impl<T: WrapSource + crate::snapshot_layout_source::SnapshotOwner> SessionSource
+    for crate::snapshot_layout_source::SnapshotLayoutSource<Arc<T>>
+{
+    fn into_transport(self) -> Arc<dyn WrapSource> {
+        self.into_owner()
     }
 }
 pub struct SnapshotSource {
@@ -607,9 +748,32 @@ impl WrapSource for SnapshotSource {
     fn line_count(&self) -> u64 {
         self.snapshot.line_count()
     }
+    fn run_layout(
+        self: Arc<Self>,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        driver: &mut dyn TaskDriver,
+    ) -> WorkerExit {
+        run_snapshot(self, engine, request, driver)
+    }
+    #[cfg(test)]
+    fn run_test(
+        &self,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        control: &dyn LayoutControl,
+    ) -> (LayoutEngine, WrapResult<TaskOutput>) {
+        match crate::snapshot_layout_source::SnapshotLayoutSource::try_with_owner(self, self.identity, engine.budget())
+        {
+            Ok(source) => fixtures::drive(source, engine, request, control),
+            Err(refused) => (engine, Err(refused.error)),
+        }
+    }
+    #[cfg(test)]
     fn line_start(&self, line: u64) -> io::Result<Option<u64>> {
         self.snapshot.line_start(line).map_err(io::Error::other)
     }
+    #[cfg(test)]
     fn line_of(&self, byte: u64) -> io::Result<u64> {
         self.snapshot
             .offset_to_line_col(byte)
@@ -617,6 +781,7 @@ impl WrapSource for SnapshotSource {
             .map(|p| p.0)
             .ok_or_else(|| io::Error::other("wrap offset outside snapshot"))
     }
+    #[cfg(test)]
     fn read(&self, at: u64, output: &mut [u8]) -> io::Result<usize> {
         if output.len() > SOURCE_WINDOW {
             return Err(io::Error::other("wrap read exceeds source window"));
@@ -632,6 +797,11 @@ impl WrapSource for SnapshotSource {
         Ok(copied)
     }
 }
+impl crate::snapshot_layout_source::SnapshotOwner for SnapshotSource {
+    fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+}
 
 pub trait LayoutControl {
     fn cancelled(&self) -> bool;
@@ -645,6 +815,7 @@ impl LayoutControl for NoCancellation {
     fn progress(&self, _: u64, _: u64) {}
 }
 
+#[cfg(test)]
 struct Reader<'a> {
     source: &'a dyn WrapSource,
     control: &'a dyn LayoutControl,
@@ -655,6 +826,7 @@ struct Reader<'a> {
     read_bytes: u64,
     line_cache: Option<(u64, u64, u64)>,
 }
+#[cfg(test)]
 impl<'a> Reader<'a> {
     fn new(source: &'a dyn WrapSource, control: &'a dyn LayoutControl, chunk_limit: usize) -> Self {
         Self {
@@ -739,23 +911,27 @@ impl<'a> Reader<'a> {
         Ok((bytes, length as u16))
     }
 }
+#[cfg(test)]
 struct Scalar {
     bytes: [u8; 4],
     length: usize,
     valid: bool,
 }
+#[cfg(test)]
 impl Scalar {
     fn text(&self) -> &str {
         std::str::from_utf8(&self.bytes[..self.length]).expect("validated scalar")
     }
 }
 
+#[cfg(test)]
 struct ClusterStream {
     next: u64,
     end: u64,
     context_start: u64,
     stepper: GraphemeStepper,
 }
+#[cfg(test)]
 impl ClusterStream {
     fn new(start: u64, end: u64) -> WrapResult<Self> {
         Ok(Self {
@@ -841,7 +1017,7 @@ impl LayoutEngine {
         if !(1..=MAX_CHECKPOINTS).contains(&checkpoint_capacity) {
             return Err(WrapError::Invalid("invalid checkpoint capacity"));
         }
-        let scratch = budget.reserve(size_of::<Reader<'static>>() + DISPLAY_BYTES + size_of::<Self>())?;
+        let scratch = budget.reserve(size_of::<Self>())?;
         Ok(Self {
             checkpoints: AccountedVec::new(&budget, MAX_CHECKPOINTS, MAX_CHECKPOINT_BYTES)?,
             budget,
@@ -861,6 +1037,7 @@ impl LayoutEngine {
     pub fn budget(&self) -> &AllocationBudget {
         &self.budget
     }
+    #[cfg(test)]
     fn prepare(&mut self, key: LayoutKey, source: &dyn WrapSource) -> WrapResult<()> {
         key.validate()?;
         if key.source != source.identity() || source.line_count() == 0 {
@@ -881,6 +1058,7 @@ impl LayoutEngine {
         }
         self.checkpoints.push(cp)
     }
+    #[cfg(test)]
     fn line_bounds(reader: &mut Reader<'_>, logical: u64) -> WrapResult<Range<u64>> {
         reader.check()?;
         if let Some((cached, start, end)) = reader.line_cache
@@ -902,6 +1080,7 @@ impl LayoutEngine {
         reader.line_cache = Some((logical, start, end));
         Ok(start..end)
     }
+    #[cfg(test)]
     fn atom(
         reader: &mut Reader<'_>,
         range: Range<u64>,
@@ -956,6 +1135,7 @@ impl LayoutEngine {
             byte_exact,
         })
     }
+    #[cfg(test)]
     fn row(&mut self, reader: &mut Reader<'_>, cp: Checkpoint) -> WrapResult<BuiltRow> {
         let geometry = self.key.expect("prepared key").geometry;
         let line = Self::line_bounds(reader, cp.logical_line)?;
@@ -1007,6 +1187,7 @@ impl LayoutEngine {
         self.remember(cp)?;
         Ok(BuiltRow { row, atoms })
     }
+    #[cfg(test)]
     fn next_checkpoint(reader: &Reader<'_>, row: &VisualRow) -> Option<Checkpoint> {
         if row.hard_line_end {
             (row.logical_line + 1 < reader.source.line_count()).then(|| Checkpoint {
@@ -1022,6 +1203,7 @@ impl LayoutEngine {
             })
         }
     }
+    #[cfg(test)]
     fn next_row(&mut self, reader: &mut Reader<'_>, row: &VisualRow) -> WrapResult<Option<BuiltRow>> {
         let Some(mut cp) = Self::next_checkpoint(reader, row) else { return Ok(None) };
         if row.hard_line_end {
@@ -1029,6 +1211,7 @@ impl LayoutEngine {
         }
         self.row(reader, cp).map(Some)
     }
+    #[cfg(test)]
     fn locate(&mut self, reader: &mut Reader<'_>, point: SourcePoint) -> WrapResult<BuiltRow> {
         if point.byte > reader.source.len() {
             return Err(WrapError::Invalid("source point outside document"));
@@ -1057,6 +1240,7 @@ impl LayoutEngine {
             row = self.next_row(reader, &row.row)?.ok_or(WrapError::Invalid("missing continuation"))?;
         }
     }
+    #[cfg(test)]
     fn previous_row(&mut self, reader: &mut Reader<'_>, row: &VisualRow) -> WrapResult<Option<BuiltRow>> {
         if row.source_coverage.start == 0 {
             return Ok(None);
@@ -1072,7 +1256,8 @@ impl LayoutEngine {
         let previous = Self::line_bounds(reader, row.logical_line - 1)?;
         self.locate(reader, SourcePoint { byte: previous.end, affinity: CaretAffinity::Upstream }).map(Some)
     }
-    pub fn fill(
+    #[cfg(test)]
+    pub fn reference_fill(
         &mut self,
         key: LayoutKey,
         source: &dyn WrapSource,
@@ -1091,6 +1276,7 @@ impl LayoutEngine {
         self.page_allocation = None;
         result
     }
+    #[cfg(test)]
     fn fill_admitted(
         &mut self,
         key: LayoutKey,
@@ -1173,7 +1359,8 @@ impl LayoutEngine {
         }
         Ok(page)
     }
-    pub fn scroll(
+    #[cfg(test)]
+    pub fn reference_scroll(
         &mut self,
         key: LayoutKey,
         source: &dyn WrapSource,
@@ -1183,7 +1370,7 @@ impl LayoutEngine {
     ) -> WrapResult<LayoutPage> {
         self.prepare(key, source)?;
         if key.geometry.is_empty() {
-            return self.fill(key, source, anchor, control);
+            return self.reference_fill(key, source, anchor, control);
         }
         let anchor = {
             let mut reader = Reader::new(source, control, self.chunk_limit);
@@ -1207,7 +1394,7 @@ impl LayoutEngine {
                 intra_row_offset: anchor.intra_row_offset,
             }
         };
-        self.fill(key, source, anchor, control)
+        self.reference_fill(key, source, anchor, control)
     }
 }
 struct BuiltRow {
@@ -1339,8 +1526,9 @@ impl fmt::Debug for ResolvedNavigation {
         f.debug_struct("ResolvedNavigation").field("fence", &self.fence).field("targets", &self.targets).finish()
     }
 }
+#[cfg(test)]
 impl LayoutEngine {
-    pub fn navigate(
+    pub fn reference_navigate(
         &mut self,
         fence: NavigationFence,
         source: &dyn WrapSource,
@@ -1410,7 +1598,7 @@ impl LayoutEngine {
         }
         let targets = targets.normalized(&self.budget)?;
         let primary = targets.cursors[targets.primary];
-        let reveal = self.fill(
+        let reveal = self.reference_fill(
             fence.key,
             source,
             TopAnchor { source_byte: primary.head, affinity: primary.head_affinity, intra_row_offset: 0 },
@@ -1418,6 +1606,550 @@ impl LayoutEngine {
         )?;
         let header = self.budget.reserve(size_of::<ResolvedNavigation>())?;
         Ok(ResolvedNavigation { fence, expected, targets, reveal, _header: header })
+    }
+}
+
+/// Deterministic fixture bridge ONLY. Its old source operations are bounded
+/// table/arithmetic or tiny immutable fixture operations, not production I/O.
+/// There is deliberately no production blanket synchronous source adapter.
+#[cfg(test)]
+pub mod fixtures {
+    use super::*;
+    use kwil_core_text::compare_input::{LineSpan, Rank, Terminator};
+    use std::{
+        ops::Deref,
+        sync::Mutex,
+        thread::{self, ThreadId},
+    };
+    use task::{Provenance, TaskBytes, TaskPoll, WorkCredit};
+
+    #[derive(Default)]
+    pub struct Probe {
+        pub created: AtomicUsize,
+        pub polls: AtomicUsize,
+        pub provenance: AtomicUsize,
+        pub dropped: AtomicUsize,
+        pub max_owners: AtomicUsize,
+        pub drop_thread: Mutex<Option<ThreadId>>,
+        pub mixed_drop_threads: AtomicBool,
+    }
+    pub trait Owner: Deref
+    where
+        Self::Target: WrapSource,
+    {
+        fn owner_count(&self) -> usize;
+    }
+    impl<T: WrapSource> Owner for Arc<T> {
+        fn owner_count(&self) -> usize {
+            Arc::strong_count(self)
+        }
+    }
+    impl<T: WrapSource + ?Sized> Owner for &T {
+        fn owner_count(&self) -> usize {
+            0
+        }
+    }
+    pub struct Source<O> {
+        owner: O,
+        probe: Option<Arc<Probe>>,
+    }
+    pub struct Query {
+        at: u64,
+        length: usize,
+        credit: WorkCredit,
+        staging: Option<TaskBytes>,
+        returned: Option<usize>,
+        probe: Option<Arc<Probe>>,
+    }
+    impl Drop for Query {
+        fn drop(&mut self) {
+            if let Some(probe) = &self.probe {
+                probe.dropped.fetch_add(1, Ordering::Relaxed);
+                let current = thread::current().id();
+                let mut previous = probe.drop_thread.lock().unwrap();
+                if previous.is_some_and(|previous| previous != current) {
+                    probe.mixed_drop_threads.store(true, Ordering::Relaxed);
+                }
+                *previous = Some(current);
+            }
+        }
+    }
+    impl<O: Owner> Source<O>
+    where
+        O::Target: WrapSource,
+    {
+        pub fn ordinary(owner: O) -> Self {
+            Self { owner, probe: None }
+        }
+        fn query(&self, at: u64, length: usize, staging: Option<TaskBytes>) -> Query {
+            if let Some(probe) = &self.probe {
+                probe.created.fetch_add(1, Ordering::Relaxed);
+                probe.max_owners.fetch_max(self.owner.owner_count(), Ordering::Relaxed);
+            }
+            Query { at, length, credit: WorkCredit::default(), staging, returned: None, probe: self.probe.clone() }
+        }
+        fn access(&self) {
+            if let Some(probe) = &self.probe {
+                probe.polls.fetch_add(1, Ordering::Relaxed);
+                probe.max_owners.fetch_max(self.owner.owner_count(), Ordering::Relaxed);
+            }
+        }
+    }
+    macro_rules! paid {
+        ($value:expr) => {
+            match $value {
+                TaskPoll::Ready(value) => value,
+                TaskPoll::Pending => return TaskPoll::Pending,
+                TaskPoll::Cancelled => return TaskPoll::Cancelled,
+                TaskPoll::Failed(error) => return TaskPoll::Failed(error),
+            }
+        };
+    }
+    fn io<T>(result: std::io::Result<T>) -> TaskPoll<T> {
+        match result {
+            Ok(value) => TaskPoll::Ready(value),
+            Err(error) => TaskPoll::Failed(TaskError::Source(InputError::Io(error))),
+        }
+    }
+    impl<O: Owner> CooperativeSource for Source<O>
+    where
+        O::Target: WrapSource,
+    {
+        type LineQuery = Query;
+        type RankQuery = Query;
+        type ReadQuery = Query;
+        type ProvenanceQuery = Query;
+        fn metadata(&self) -> SourceMetadata {
+            WrapSource::source_metadata(&*self.owner)
+        }
+        fn new_line_query(&self, at: u64) -> Query {
+            self.query(at, 0, None)
+        }
+        fn new_rank_query(&self, at: u64) -> Query {
+            self.query(at, 0, None)
+        }
+        fn new_provenance_query(&self, at: u64) -> Query {
+            self.query(at, 0, None)
+        }
+        fn new_read_query(&self, at: u64, length: usize, budget: &AllocationBudget) -> WrapResult<Query> {
+            Ok(self.query(at, length, Some(TaskBytes::try_new(budget, length)?)))
+        }
+        fn poll_line(&self, q: &mut Query, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<LineSpan> {
+            self.access();
+            paid!(q.credit.poll(ReadWork::new(size_of::<LineSpan>() as u64 + 2, 4), work, cancel));
+            let start = match paid!(io(self.owner.line_start(q.at))) {
+                Some(start) => start,
+                None => return TaskPoll::Failed(InputError::Range.into()),
+            };
+            let next = paid!(io(self.owner.line_start(q.at + 1)));
+            let end = next.unwrap_or(self.owner.len());
+            let mut terminator = Terminator::None;
+            let mut content_end = end;
+            if next.is_some() {
+                content_end = end - 1;
+                terminator = Terminator::Lf;
+                if content_end > start {
+                    let mut byte = [0];
+                    let n = paid!(io(self.owner.read(content_end - 1, &mut byte)));
+                    if n == 1 && byte[0] == b'\r' {
+                        content_end -= 1;
+                        terminator = Terminator::CrLf;
+                    }
+                }
+            }
+            TaskPoll::Ready(LineSpan { start, end, content_end, terminator })
+        }
+        fn poll_rank(&self, q: &mut Query, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<Rank> {
+            self.access();
+            paid!(q.credit.poll(ReadWork::new(16, 2), work, cancel));
+            let line = paid!(io(self.owner.line_of(q.at)));
+            let start = match paid!(io(self.owner.line_start(line))) {
+                Some(start) => start,
+                None => return TaskPoll::Failed(InputError::Range.into()),
+            };
+            TaskPoll::Ready(Rank { line, column: q.at - start })
+        }
+        fn poll_read(
+            &self,
+            q: &mut Query,
+            output: &mut [u8],
+            work: &mut ReadWork,
+            cancel: &AtomicBool,
+        ) -> TaskPoll<usize> {
+            self.access();
+            if q.length != output.len() {
+                return TaskPoll::Failed(InputError::QueryChanged.into());
+            }
+            if q.returned.is_none() {
+                paid!(q.credit.poll(ReadWork::new(q.length as u64, 1), work, cancel));
+                let n = paid!(io(self.owner.read(q.at, q.staging.as_mut().unwrap())));
+                if n > q.length {
+                    return TaskPoll::Failed(InputError::SourceContract.into());
+                }
+                q.returned = Some(n);
+            }
+            let n = q.returned.unwrap();
+            paid!(q.credit.poll(ReadWork::new(n as u64, 1), work, cancel));
+            output[..n].copy_from_slice(&q.staging.as_ref().unwrap()[..n]);
+            TaskPoll::Ready(n)
+        }
+        fn poll_provenance(&self, q: &mut Query, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<Provenance> {
+            self.access();
+            paid!(q.credit.poll(ReadWork::new(1, 1), work, cancel));
+            if let Some(probe) = &self.probe {
+                probe.provenance.fetch_add(1, Ordering::Relaxed);
+            }
+            // All sources opting into this FIXTURE helper declare ordinary
+            // bytes. This is explicit fixture provenance, never marker sniffing.
+            if q.at >= self.owner.len() {
+                return TaskPoll::Failed(InputError::Range.into());
+            }
+            TaskPoll::Ready(Provenance { source: 0..self.owner.len(), opaque: false })
+        }
+    }
+    impl<T: WrapSource> SessionSource for Source<Arc<T>> {
+        fn into_transport(self) -> Arc<dyn WrapSource> {
+            self.owner
+        }
+    }
+    pub fn run<T: WrapSource>(
+        owner: Arc<T>,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        driver: &mut dyn TaskDriver,
+    ) -> WorkerExit {
+        run_with_probe(owner, None, engine, request, driver)
+    }
+    struct Concrete<T>(Arc<T>);
+    impl<T: WrapSource + CooperativeSource> CooperativeSource for Concrete<T> {
+        type LineQuery = T::LineQuery;
+        type RankQuery = T::RankQuery;
+        type ReadQuery = T::ReadQuery;
+        type ProvenanceQuery = T::ProvenanceQuery;
+        fn metadata(&self) -> SourceMetadata {
+            CooperativeSource::metadata(self.0.as_ref())
+        }
+        fn new_line_query(&self, line: u64) -> Self::LineQuery {
+            self.0.new_line_query(line)
+        }
+        fn new_rank_query(&self, at: u64) -> Self::RankQuery {
+            self.0.new_rank_query(at)
+        }
+        fn new_read_query(&self, at: u64, length: usize, budget: &AllocationBudget) -> WrapResult<Self::ReadQuery> {
+            self.0.new_read_query(at, length, budget)
+        }
+        fn new_provenance_query(&self, at: u64) -> Self::ProvenanceQuery {
+            self.0.new_provenance_query(at)
+        }
+        fn poll_line(
+            &self,
+            query: &mut Self::LineQuery,
+            work: &mut ReadWork,
+            cancel: &AtomicBool,
+        ) -> TaskPoll<LineSpan> {
+            self.0.poll_line(query, work, cancel)
+        }
+        fn poll_rank(&self, query: &mut Self::RankQuery, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<Rank> {
+            self.0.poll_rank(query, work, cancel)
+        }
+        fn poll_read(
+            &self,
+            query: &mut Self::ReadQuery,
+            output: &mut [u8],
+            work: &mut ReadWork,
+            cancel: &AtomicBool,
+        ) -> TaskPoll<usize> {
+            self.0.poll_read(query, output, work, cancel)
+        }
+        fn poll_provenance(
+            &self,
+            query: &mut Self::ProvenanceQuery,
+            work: &mut ReadWork,
+            cancel: &AtomicBool,
+        ) -> TaskPoll<Provenance> {
+            self.0.poll_provenance(query, work, cancel)
+        }
+    }
+    impl<T: WrapSource + CooperativeSource> SessionSource for Concrete<T> {
+        fn into_transport(self) -> Arc<dyn WrapSource> {
+            self.0
+        }
+    }
+    pub fn run_concrete<T: WrapSource + CooperativeSource>(
+        owner: Arc<T>,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        driver: &mut dyn TaskDriver,
+    ) -> WorkerExit {
+        run_cooperative(Concrete(owner), engine, request, driver)
+    }
+    pub fn run_with_probe<T: WrapSource>(
+        owner: Arc<T>,
+        probe: Option<Arc<Probe>>,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        driver: &mut dyn TaskDriver,
+    ) -> WorkerExit {
+        run_cooperative(Source { owner, probe }, engine, request, driver)
+    }
+    /// Snapshot-backed fixture hooks execute at REAL production query access.
+    /// No synchronous line/index/read operation substitutes for a core query.
+    pub trait SnapshotHooks: WrapSource + crate::snapshot_layout_source::SnapshotOwner {
+        fn before_snapshot_query(&self) {}
+        fn before_snapshot_read(&self, length: usize) -> io::Result<()>;
+    }
+    struct Observed<Q> {
+        core: Q,
+        probe: Option<Arc<Probe>>,
+        read_hooked: bool,
+    }
+    impl<Q> Drop for Observed<Q> {
+        fn drop(&mut self) {
+            if let Some(probe) = &self.probe {
+                probe.dropped.fetch_add(1, Ordering::Relaxed);
+                let current = thread::current().id();
+                let mut previous = probe.drop_thread.lock().unwrap();
+                if previous.is_some_and(|previous| previous != current) {
+                    probe.mixed_drop_threads.store(true, Ordering::Relaxed);
+                }
+                *previous = Some(current);
+            }
+        }
+    }
+    type SnapshotAdapter<T> = crate::snapshot_layout_source::SnapshotLayoutSource<Arc<T>>;
+    struct ObservedSnapshot<T> {
+        inner: SnapshotAdapter<T>,
+        probe: Option<Arc<Probe>>,
+    }
+    impl<T: SnapshotHooks> ObservedSnapshot<T> {
+        fn query<Q>(&self, core: Q) -> Observed<Q> {
+            if let Some(probe) = &self.probe {
+                probe.created.fetch_add(1, Ordering::Relaxed);
+                probe.max_owners.fetch_max(Arc::strong_count(self.inner.owner()), Ordering::Relaxed);
+            }
+            Observed { core, probe: self.probe.clone(), read_hooked: false }
+        }
+        fn access(&self) {
+            self.inner.owner().before_snapshot_query();
+            if let Some(probe) = &self.probe {
+                probe.polls.fetch_add(1, Ordering::Relaxed);
+                probe.max_owners.fetch_max(Arc::strong_count(self.inner.owner()), Ordering::Relaxed);
+            }
+        }
+    }
+    impl<T: SnapshotHooks> CooperativeSource for ObservedSnapshot<T> {
+        type LineQuery = Observed<<SnapshotAdapter<T> as CooperativeSource>::LineQuery>;
+        type RankQuery = Observed<<SnapshotAdapter<T> as CooperativeSource>::RankQuery>;
+        type ReadQuery = Observed<<SnapshotAdapter<T> as CooperativeSource>::ReadQuery>;
+        type ProvenanceQuery = Observed<<SnapshotAdapter<T> as CooperativeSource>::ProvenanceQuery>;
+        fn metadata(&self) -> SourceMetadata {
+            self.inner.metadata()
+        }
+        fn new_line_query(&self, line: u64) -> Self::LineQuery {
+            self.query(self.inner.new_line_query(line))
+        }
+        fn new_rank_query(&self, at: u64) -> Self::RankQuery {
+            self.query(self.inner.new_rank_query(at))
+        }
+        fn new_read_query(&self, at: u64, length: usize, budget: &AllocationBudget) -> WrapResult<Self::ReadQuery> {
+            Ok(self.query(self.inner.new_read_query(at, length, budget)?))
+        }
+        fn new_provenance_query(&self, at: u64) -> Self::ProvenanceQuery {
+            self.query(self.inner.new_provenance_query(at))
+        }
+        fn poll_line(&self, q: &mut Self::LineQuery, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<LineSpan> {
+            self.access();
+            self.inner.poll_line(&mut q.core, work, cancel)
+        }
+        fn poll_rank(&self, q: &mut Self::RankQuery, work: &mut ReadWork, cancel: &AtomicBool) -> TaskPoll<Rank> {
+            self.access();
+            self.inner.poll_rank(&mut q.core, work, cancel)
+        }
+        fn poll_read(
+            &self,
+            q: &mut Self::ReadQuery,
+            output: &mut [u8],
+            work: &mut ReadWork,
+            cancel: &AtomicBool,
+        ) -> TaskPoll<usize> {
+            self.access();
+            if !q.read_hooked {
+                if let Err(error) = self.inner.owner().before_snapshot_read(output.len()) {
+                    return TaskPoll::Failed(InputError::Io(error).into());
+                }
+                q.read_hooked = true;
+            }
+            self.inner.poll_read(&mut q.core, output, work, cancel)
+        }
+        fn poll_provenance(
+            &self,
+            q: &mut Self::ProvenanceQuery,
+            work: &mut ReadWork,
+            cancel: &AtomicBool,
+        ) -> TaskPoll<Provenance> {
+            self.access();
+            let result = self.inner.poll_provenance(&mut q.core, work, cancel);
+            if matches!(&result, TaskPoll::Ready(_))
+                && let Some(probe) = &self.probe
+            {
+                probe.provenance.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
+    }
+    impl<T: SnapshotHooks> SessionSource for ObservedSnapshot<T> {
+        fn into_transport(self) -> Arc<dyn WrapSource> {
+            self.inner.into_owner()
+        }
+    }
+    pub fn run_snapshot<T: SnapshotHooks>(
+        owner: Arc<T>,
+        probe: Option<Arc<Probe>>,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        driver: &mut dyn TaskDriver,
+    ) -> WorkerExit {
+        let identity = owner.identity();
+        match SnapshotAdapter::try_with_owner(owner, identity, engine.budget()) {
+            Ok(inner) => run_cooperative(ObservedSnapshot { inner, probe }, engine, request, driver),
+            Err(refused) => WorkerExit {
+                engine,
+                source: refused.owner,
+                request: Some(request),
+                output: None,
+                end: WorkerEnd::Refused(refused.error),
+            },
+        }
+    }
+    struct Driver<'a> {
+        control: &'a dyn LayoutControl,
+        total: u64,
+    }
+    impl TaskDriver for Driver<'_> {
+        fn drive(&mut self, task: &mut dyn TaskStepper) -> TaskEnd {
+            let cancel = AtomicBool::new(false);
+            loop {
+                cancel.store(self.control.cancelled(), Ordering::Release);
+                if cancel.load(Ordering::Acquire) {
+                    return TaskEnd::Cancelled;
+                }
+                let step = task.step(ReadWork::new(SOURCE_WINDOW as u64, SOURCE_WINDOW as u64), &cancel);
+                if self.control.cancelled() {
+                    return TaskEnd::Cancelled;
+                }
+                self.control.progress(task.read_bytes(), self.total);
+                match step {
+                    TaskStep::Pending => {}
+                    TaskStep::Ready => return TaskEnd::Ready,
+                    TaskStep::Cancelled => return TaskEnd::Cancelled,
+                    TaskStep::Failed(error) => return TaskEnd::Failed(error),
+                }
+            }
+        }
+    }
+    pub fn drive<S: CooperativeSource>(
+        source: S,
+        engine: LayoutEngine,
+        request: TaskRequest,
+        control: &dyn LayoutControl,
+    ) -> (LayoutEngine, WrapResult<TaskOutput>) {
+        let total = source.metadata().len;
+        let mut task = match engine.begin_task(source, request) {
+            ControlFlow::Continue(task) => task,
+            ControlFlow::Break(refused) => return (refused.engine, Err(refused.error)),
+        };
+        let end = Driver { control, total }.drive(&mut task);
+        let (engine, source, request, output) = task.into_parts();
+        drop((source, request));
+        let result = match end {
+            TaskEnd::Ready => output.ok_or(WrapError::Invalid("ready fixture without output")),
+            TaskEnd::Cancelled => {
+                drop(output);
+                Err(WrapError::Cancelled)
+            }
+            TaskEnd::Failed(error) => {
+                drop(output);
+                Err(error.into())
+            }
+        };
+        (engine, result)
+    }
+    pub(super) fn borrowed(
+        engine: &mut LayoutEngine,
+        source: &dyn WrapSource,
+        request: TaskRequest,
+        control: &dyn LayoutControl,
+    ) -> WrapResult<TaskOutput> {
+        // Actual temporary engine header, never an uncharged dummy allowance.
+        let charge = engine.budget.reserve(size_of::<LayoutEngine>())?;
+        let replacement = LayoutEngine {
+            budget: engine.budget.clone(),
+            key: None,
+            checkpoints: AccountedVec::new(&engine.budget, MAX_CHECKPOINTS, MAX_CHECKPOINT_BYTES)?,
+            chunk_limit: engine.chunk_limit,
+            checkpoint_capacity: engine.checkpoint_capacity,
+            page_allocation: None,
+            _scratch: charge,
+        };
+        let owned = std::mem::replace(engine, replacement);
+        let (recovered, result) = source.run_test(owned, request, control);
+        *engine = recovered;
+        result
+    }
+}
+
+// Test-only convenience calls execute the cooperative engine; the separately
+// named reference_* methods above remain an independent differential oracle.
+#[cfg(test)]
+impl LayoutEngine {
+    pub fn fill(
+        &mut self,
+        key: LayoutKey,
+        source: &dyn WrapSource,
+        anchor: TopAnchor,
+        control: &dyn LayoutControl,
+    ) -> WrapResult<LayoutPage> {
+        match fixtures::borrowed(self, source, TaskRequest::Fill { key, anchor }, control)?.into_page() {
+            ControlFlow::Continue(page) => Ok(page),
+            ControlFlow::Break(owner) => {
+                drop(owner);
+                Err(WrapError::Invalid("fixture page tag"))
+            }
+        }
+    }
+    pub fn scroll(
+        &mut self,
+        key: LayoutKey,
+        source: &dyn WrapSource,
+        anchor: TopAnchor,
+        delta: i64,
+        control: &dyn LayoutControl,
+    ) -> WrapResult<LayoutPage> {
+        match fixtures::borrowed(self, source, TaskRequest::Scroll { key, anchor, delta }, control)?.into_page() {
+            ControlFlow::Continue(page) => Ok(page),
+            ControlFlow::Break(owner) => {
+                drop(owner);
+                Err(WrapError::Invalid("fixture page tag"))
+            }
+        }
+    }
+    pub fn navigate(
+        &mut self,
+        fence: NavigationFence,
+        source: &dyn WrapSource,
+        expected: CursorSet,
+        command: NavigationCommand,
+        control: &dyn LayoutControl,
+    ) -> WrapResult<ResolvedNavigation> {
+        match fixtures::borrowed(self, source, TaskRequest::Navigate { fence, expected, command }, control)?
+            .into_navigation()
+        {
+            ControlFlow::Continue(navigation) => Ok(navigation),
+            ControlFlow::Break(owner) => {
+                drop(owner);
+                Err(WrapError::Invalid("fixture navigation tag"))
+            }
+        }
     }
 }
 
@@ -1467,5 +2199,27 @@ mod metadata_reservation_tests {
         let before = budget.retained_bytes();
         assert!(matches!(budget.reserve_metadata(usize::MAX), Err(WrapError::Admission(_))));
         assert_eq!(budget.retained_bytes(), before);
+    }
+    #[test]
+    fn task_failure_mapping_preserves_typed_source_and_original_io_payload() {
+        let error = WrapError::from(TaskError::Source(InputError::Io(io::Error::from_raw_os_error(123))));
+        match error {
+            WrapError::Source(InputError::Io(error)) => assert_eq!(error.raw_os_error(), Some(123)),
+            other => panic!("source error erased: {other:?}"),
+        }
+        let error = WrapError::from(TaskError::Source(InputError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "actual OS error",
+        ))));
+        assert!(matches!(error, WrapError::Source(InputError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        assert!(matches!(
+            WrapError::from(TaskError::Source(InputError::QueryChanged)),
+            WrapError::Source(InputError::QueryChanged)
+        ));
+        assert!(matches!(
+            WrapError::from(TaskError::Source(InputError::SourceChanged)),
+            WrapError::Source(InputError::SourceChanged)
+        ));
+        assert!(matches!(WrapError::from(TaskError::Layout(WrapError::Busy)), WrapError::Busy));
     }
 }

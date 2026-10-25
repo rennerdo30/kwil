@@ -30,7 +30,7 @@ fn snapshot_adapter_one_byte_quanta_match_existing_engine_and_preserve_owner() {
     let snapshot = snapshot(text.as_bytes());
     let reference = SnapshotSource::new(key.source, snapshot.clone());
     let mut engine = LayoutEngine::with_chunk_limit(AllocationBudget::default(), 1).unwrap();
-    let expected = engine.fill(key, &reference, TopAnchor::default(), &NoCancellation).unwrap();
+    let expected = engine.reference_fill(key, &reference, TopAnchor::default(), &NoCancellation).unwrap();
     let budget = AllocationBudget::default();
     let source =
         SnapshotLayoutSource::try_new(snapshot, key.source, &budget).unwrap_or_else(|error| panic!("{}", error.error));
@@ -182,4 +182,42 @@ fn snapshot_read_is_bound_when_created_before_any_core_poll() {
     ));
     assert_eq!(output, [77]);
     assert!(query.returned.is_none());
+}
+
+#[test]
+fn generic_snapshot_owner_refusal_and_success_move_the_exact_sole_arc() {
+    use std::sync::Arc;
+    let identity = key().source;
+    let owner = Arc::new(SnapshotSource::new(identity, snapshot(b"exact owner")));
+    let pointer = Arc::as_ptr(&owner);
+    assert_eq!(Arc::strong_count(&owner), 1);
+    let refusal = match SnapshotLayoutSource::try_with_owner(owner, identity, &AllocationBudget::new(0)) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("generic owner was constructed without admission"),
+    };
+    assert!(matches!(refusal.error, WrapError::Admission(_)));
+    assert_eq!(Arc::as_ptr(&refusal.owner), pointer);
+    assert_eq!(Arc::strong_count(&refusal.owner), 1);
+    let budget = AllocationBudget::default();
+    let before = budget.retained_bytes();
+    let source = SnapshotLayoutSource::try_with_owner(refusal.owner, identity, &budget)
+        .unwrap_or_else(|refused| panic!("{}", refused.error));
+    let charged = budget.retained_bytes() - before;
+    type Adapter = SnapshotLayoutSource<Arc<SnapshotSource>>;
+    let expected = 3
+        * (std::mem::size_of::<Adapter>()
+            + std::mem::size_of::<LayoutLineQuery>()
+            + std::mem::size_of::<LayoutRankQuery>()
+            + std::mem::size_of::<LayoutProvenanceQuery>()
+            + std::mem::size_of::<SnapshotReadQuery>())
+        + std::mem::size_of::<SnapshotOwnerRefusal<Arc<SnapshotSource>>>()
+        + LayoutReadQuery::extra_resident_bytes()
+        + std::mem::size_of::<AtomicU64>()
+        + std::mem::size_of::<MetadataReservation>();
+    assert_eq!(charged, expected, "generic owner/return headers must use their actual concrete size");
+    let owner = source.into_owner();
+    assert_eq!(Arc::as_ptr(&owner), pointer);
+    assert_eq!(Arc::strong_count(&owner), 1);
+    assert_eq!(budget.retained_bytes(), before);
+    drop(owner);
 }

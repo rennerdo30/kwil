@@ -178,6 +178,14 @@ impl CooperativeSource for Bytes {
     }
 }
 impl WrapSource for Bytes {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run_concrete(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.metadata().identity
     }
@@ -244,7 +252,7 @@ fn one_byte_quanta_and_short_reads_match_existing_layout() {
     let text = "one two\t界e\u{301}👩‍💻\r\n\nlast";
     let reference = Bytes::new(key, text.as_bytes(), 2);
     let mut engine = LayoutEngine::with_chunk_limit(AllocationBudget::default(), 3).unwrap();
-    let expected = engine.fill(key, &reference, TopAnchor::default(), &NoCancellation).unwrap();
+    let expected = engine.reference_fill(key, &reference, TopAnchor::default(), &NoCancellation).unwrap();
     let source = Bytes::new(key, text.as_bytes(), 2);
     let owner = source.owner.clone();
     let task = begin(source, TaskRequest::Fill { key, anchor: TopAnchor::default() }, AllocationBudget::default(), 3);
@@ -289,7 +297,7 @@ fn deep_locate_and_backward_context_resume_without_restarting() {
     let anchor =
         TopAnchor { source_byte: text.len() as u64 - 3, affinity: CaretAffinity::Upstream, intra_row_offset: 0 };
     let mut engine = LayoutEngine::with_limits(AllocationBudget::default(), 1, 2).unwrap();
-    let expected = engine.scroll(key, &reference, anchor, -3, &NoCancellation).unwrap();
+    let expected = engine.reference_scroll(key, &reference, anchor, -3, &NoCancellation).unwrap();
     let task = begin(
         Bytes::new(key, text.as_bytes(), 1),
         TaskRequest::Scroll { key, anchor, delta: -3 },
@@ -351,7 +359,7 @@ fn full_ordered_navigation_matches_affinity_goals_and_primary() {
             let reference = Bytes::new(key, text, 1);
             let mut engine = LayoutEngine::with_chunk_limit(AllocationBudget::default(), 1).unwrap();
             let expected = CursorSet::new(engine.budget(), &cursors, 1).unwrap();
-            let reference = engine.navigate(fence, &reference, expected, command, &NoCancellation).unwrap();
+            let reference = engine.reference_navigate(fence, &reference, expected, command, &NoCancellation).unwrap();
             let budget = AllocationBudget::default();
             let expected = CursorSet::new(&budget, &cursors, 1).unwrap();
             let task = begin(Bytes::new(key, text, 1), TaskRequest::Navigate { fence, expected, command }, budget, 1);

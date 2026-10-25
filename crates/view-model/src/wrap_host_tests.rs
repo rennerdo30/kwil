@@ -73,6 +73,14 @@ impl CheckedSource {
     }
 }
 impl WrapSource for CheckedSource {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run_snapshot(self, None, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.inner.identity()
     }
@@ -91,6 +99,20 @@ impl WrapSource for CheckedSource {
         self.inner.line_of(byte)
     }
     fn read(&self, at: u64, output: &mut [u8]) -> io::Result<usize> {
+        crate::visual_rows::fixtures::SnapshotHooks::before_snapshot_read(self, output.len())?;
+        self.inner.read(at, output)
+    }
+}
+impl crate::snapshot_layout_source::SnapshotOwner for CheckedSource {
+    fn snapshot(&self) -> &kwil_core_text::Snapshot {
+        crate::snapshot_layout_source::SnapshotOwner::snapshot(&self.inner)
+    }
+}
+impl crate::visual_rows::fixtures::SnapshotHooks for CheckedSource {
+    fn before_snapshot_query(&self) {
+        self.worker_only();
+    }
+    fn before_snapshot_read(&self, length: usize) -> io::Result<()> {
         self.worker_only();
         assert!(!self.panic_next.swap(false, Ordering::AcqRel), "injected terminal read panic");
         let gate = self.gate.lock().unwrap().take();
@@ -98,8 +120,8 @@ impl WrapSource for CheckedSource {
             gate.wait();
         }
         self.reads.fetch_add(1, Ordering::AcqRel);
-        self.largest.fetch_max(output.len(), Ordering::AcqRel);
-        self.inner.read(at, output)
+        self.largest.fetch_max(length, Ordering::AcqRel);
+        Ok(())
     }
 }
 

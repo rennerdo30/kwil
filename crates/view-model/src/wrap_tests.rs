@@ -75,6 +75,14 @@ impl Bytes {
     }
 }
 impl WrapSource for Bytes {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.identity
     }
@@ -281,6 +289,14 @@ struct VirtualLine {
     largest: AtomicUsize,
 }
 impl WrapSource for VirtualLine {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.identity
     }
@@ -343,7 +359,13 @@ fn wrap_zero_geometry_and_admission_do_not_read_or_omit_visible_rows() {
     let page = engine.fill(key, &source, TopAnchor::default(), &NoCancellation).unwrap();
     assert!(page.rows().is_empty());
     assert_eq!(source.reads.load(Ordering::Acquire), 0);
-    assert!(LayoutEngine::new(AllocationBudget::new(1024)).is_err());
+    // The engine no longer reserves a nonexistent synchronous Reader. Preserve
+    // the 1024-byte refusal control at actual cooperative scratch admission.
+    assert!(
+        LayoutEngine::new(AllocationBudget::new(1024))
+            .and_then(|mut engine| engine.fill(key, &source, TopAnchor::default(), &NoCancellation))
+            .is_err()
+    );
     let invalid = LayoutGeometry { columns: 4097, ..key.geometry };
     assert!(invalid.validate().is_err());
 }
@@ -502,6 +524,14 @@ struct GatedSource {
     gate: Arc<Gate>,
 }
 impl WrapSource for GatedSource {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.bytes.identity()
     }
@@ -817,6 +847,14 @@ struct DroppingSource {
     worker: std::thread::ThreadId,
 }
 impl WrapSource for DroppingSource {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.bytes.identity()
     }
@@ -868,6 +906,14 @@ struct FailOnceSource {
     failures: AtomicUsize,
 }
 impl WrapSource for FailOnceSource {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.bytes.identity()
     }
@@ -912,7 +958,7 @@ fn wrap_relative_io_failure_retains_head_and_exact_source_for_explicit_retry() {
         .unwrap();
     let mut seen = 0;
     let failed = update(&mut session, current, &wakes, &mut seen);
-    assert!(matches!(failed.result, Err(WrapError::Io(_))));
+    assert!(matches!(failed.result, Err(WrapError::Source(kwil_core_text::compare_input::InputError::Io(_)))));
     assert_eq!(failed.relative_id, Some(id));
     assert!(Arc::ptr_eq(&failed.source, &source));
     assert_eq!(session.relative.head().unwrap().id, id);
@@ -977,6 +1023,14 @@ struct PanickingSource {
     gate: Arc<Gate>,
 }
 impl WrapSource for PanickingSource {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.bytes.identity()
     }
@@ -1195,7 +1249,7 @@ fn wrap_atomic_intake_keeps_relative_failure_retry_and_publication_ack_bookkeepi
     wakes.next(&mut seen);
     let (failed, source_permit, publication_permit) =
         atomic_update(&mut session, Some(current), None, &wakes, &mut seen);
-    assert!(matches!(failed.result, Err(WrapError::Io(_))));
+    assert!(matches!(failed.result, Err(WrapError::Source(kwil_core_text::compare_input::InputError::Io(_)))));
     assert_eq!(failed.relative_id, Some(id));
     assert!(Arc::ptr_eq(&failed.source, &source));
     assert_eq!(session.relative.mutation_gate(), MutationGate::RefusedFailed);
@@ -1233,6 +1287,14 @@ struct CancelCleanupSource {
     caller: std::thread::ThreadId,
 }
 impl WrapSource for CancelCleanupSource {
+    fn run_layout(
+        self: Arc<Self>,
+        engine: crate::visual_rows::LayoutEngine,
+        request: crate::visual_rows::task::TaskRequest,
+        driver: &mut dyn crate::visual_rows::TaskDriver,
+    ) -> crate::visual_rows::WorkerExit {
+        crate::visual_rows::fixtures::run(self, engine, request, driver)
+    }
     fn identity(&self) -> SourceIdentity {
         self.bytes.identity()
     }

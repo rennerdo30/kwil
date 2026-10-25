@@ -3,7 +3,9 @@
 //! ROOT must call `stop`, retain its ticket on failure, and settle it on the
 //! existing off-UI shutdown lane BEFORE the document cleanup lane. Dropping a
 //! session/ticket is never an acknowledgement of successful cleanup.
+use crate::visual_rows::task::{TaskRequest, TaskStep};
 use crate::visual_rows::*;
+use kwil_core_text::compare_input::ReadWork;
 use std::{
     cell::Cell,
     fmt,
@@ -283,6 +285,8 @@ struct Shared {
     completion_gate: Mutex<Option<Arc<tests::CompletionGate>>>,
     #[cfg(test)]
     settlement_waiting: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    #[cfg(test)]
+    work_quantum: Mutex<ReadWork>,
 }
 struct AcceptedRelative {
     id: u64,
@@ -295,6 +299,7 @@ struct WorkerControl<'a> {
     relative: bool,
     generation: u64,
     fence: NavigationFence,
+    target: u64,
     last_progress: Cell<Instant>,
 }
 impl LayoutControl for WorkerControl<'_> {
@@ -319,6 +324,34 @@ impl LayoutControl for WorkerControl<'_> {
         (self.shared.wake)();
     }
 }
+impl TaskDriver for WorkerControl<'_> {
+    fn drive(&mut self, task: &mut dyn TaskStepper) -> TaskEnd {
+        let cancel = AtomicBool::new(false);
+        loop {
+            cancel.store(self.cancelled(), Ordering::Release);
+            if cancel.load(Ordering::Acquire) {
+                return TaskEnd::Cancelled;
+            }
+            // A finite active-computation quantum, using the existing source
+            // window bound for bytes and operations. No idle readiness retry.
+            #[cfg(not(test))]
+            let quantum = ReadWork::new(SOURCE_WINDOW as u64, SOURCE_WINDOW as u64);
+            #[cfg(test)]
+            let quantum = *self.shared.work_quantum.lock().unwrap();
+            let step = task.step(quantum, &cancel);
+            if self.cancelled() {
+                return TaskEnd::Cancelled;
+            }
+            self.progress(task.read_bytes(), self.target);
+            match step {
+                TaskStep::Pending => {}
+                TaskStep::Ready => return TaskEnd::Ready,
+                TaskStep::Cancelled => return TaskEnd::Cancelled,
+                TaskStep::Failed(error) => return TaskEnd::Failed(error),
+            }
+        }
+    }
+}
 
 pub struct WrapSession {
     shared: Arc<Shared>,
@@ -341,6 +374,19 @@ impl WrapSession {
                         + size_of::<WrapRequest>()
                         + 2 * size_of::<RetiredOwner>()
                         + 2 * size_of::<RetirementPermit>(),
+                )
+            })
+            // Source factory -> generic helper -> return/destructure overlap,
+            // plus the borrowed driver and its finite-quantum scalar state.
+            .and_then(|v| {
+                v.checked_add(
+                    3 * size_of::<WorkerExit>()
+                        + 2 * size_of::<TaskRequest>()
+                        + 2 * size_of::<TaskEnd>()
+                        + size_of::<WorkerControl<'static>>()
+                        + 2 * size_of::<ReadWork>()
+                        + size_of::<AtomicBool>()
+                        + 2 * size_of::<&mut dyn TaskStepper>(),
                 )
             })
             .and_then(|v| v.checked_add(5 * (size_of::<SnapshotSource>() + 2 * size_of::<usize>())))
@@ -378,6 +424,8 @@ impl WrapSession {
             completion_gate: Mutex::new(None),
             #[cfg(test)]
             settlement_waiting: Mutex::new(None),
+            #[cfg(test)]
+            work_quantum: Mutex::new(ReadWork::new(SOURCE_WINDOW as u64, SOURCE_WINDOW as u64)),
         });
         let worker_shared = shared.clone();
         let worker_budget = budget.clone();
@@ -828,36 +876,63 @@ fn worker_loop(shared: &Arc<Shared>, budget: AllocationBudget) -> WrapResult<()>
         drop(state);
         let relative = job.relative_id.is_some();
         let WrapRequest { fence, source, anchor, intent } = job.request;
-        let control = WorkerControl {
+        let mut control = WorkerControl {
             shared,
             relative,
             generation: job.generation,
             fence,
+            target: source.len(),
             last_progress: Cell::new(Instant::now()),
         };
-        let result = match intent {
-            LayoutIntent::Fill => engine
-                .fill(fence.key, source.as_ref(), anchor, &control)
-                .and_then(|page| boxed_transfer(&budget, page))
-                .map(LayoutPayload::Page),
-            LayoutIntent::Reveal(point) => engine
-                .fill(
-                    fence.key,
-                    source.as_ref(),
-                    TopAnchor { source_byte: point.byte, affinity: point.affinity, intra_row_offset: 0 },
-                    &control,
-                )
-                .and_then(|page| boxed_transfer(&budget, page))
-                .map(LayoutPayload::Page),
-            LayoutIntent::ScrollRows(delta) => engine
-                .scroll(fence.key, source.as_ref(), anchor, delta, &control)
-                .and_then(|page| boxed_transfer(&budget, page))
-                .map(LayoutPayload::Page),
-            LayoutIntent::MoveCursors { cursors, motion, count, extend } => engine
-                .navigate(fence, source.as_ref(), cursors, NavigationCommand { motion, count, extend }, &control)
-                .and_then(|navigation| boxed_transfer(&budget, navigation))
-                .map(LayoutPayload::Navigation),
+        let navigation = matches!(&intent, LayoutIntent::MoveCursors { .. });
+        let request = match intent {
+            LayoutIntent::Fill => TaskRequest::Fill { key: fence.key, anchor },
+            LayoutIntent::Reveal(point) => TaskRequest::Fill {
+                key: fence.key,
+                anchor: TopAnchor { source_byte: point.byte, affinity: point.affinity, intra_row_offset: 0 },
+            },
+            LayoutIntent::ScrollRows(delta) => TaskRequest::Scroll { key: fence.key, anchor, delta },
+            LayoutIntent::MoveCursors { cursors, motion, count, extend } => {
+                TaskRequest::Navigate { fence, expected: cursors, command: NavigationCommand { motion, count, extend } }
+            }
         };
+        let WorkerExit { engine: recovered, source, request, output, end } =
+            source.run_layout(engine, request, &mut control);
+        engine = recovered;
+        let result = match (end, output) {
+            (WorkerEnd::Refused(error), output) => {
+                drop(output);
+                Err(error)
+            }
+            (WorkerEnd::Finished(TaskEnd::Cancelled), output) => {
+                drop(output);
+                Err(WrapError::Cancelled)
+            }
+            (WorkerEnd::Finished(TaskEnd::Failed(error)), output) => {
+                drop(output);
+                Err(error.into())
+            }
+            (WorkerEnd::Finished(TaskEnd::Ready), output) => match output {
+                Some(output) if navigation => match output.into_navigation() {
+                    ControlFlow::Continue(value) => boxed_transfer(&budget, value).map(LayoutPayload::Navigation),
+                    ControlFlow::Break(owner) => {
+                        drop(owner);
+                        Err(WrapError::Invalid("task returned page for navigation"))
+                    }
+                },
+                Some(output) => match output.into_page() {
+                    ControlFlow::Continue(value) => boxed_transfer(&budget, value).map(LayoutPayload::Page),
+                    ControlFlow::Break(owner) => {
+                        drop(owner);
+                        Err(WrapError::Invalid("task returned navigation for page"))
+                    }
+                },
+                None => Err(WrapError::Invalid("ready task without output")),
+            },
+        };
+        // Unconsumed request/cursor ownership is destroyed HERE on the worker.
+        // processing remains true through this and cancelled update destruction.
+        drop(request);
         let cancelled = control.cancelled();
         let update = LayoutUpdate { fence, relative_id: job.relative_id, result, source, generation: job.generation };
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1339,5 +1414,143 @@ mod tests {
         // The deliberately failed owner remains retained, not acknowledged or
         // detached-as-success. This tiny fake host owns no filesystem artifact.
         std::mem::forget(next);
+    }
+
+    struct ProbedFixture {
+        inner: SnapshotSource,
+        probe: Arc<crate::visual_rows::fixtures::Probe>,
+        ui: thread::ThreadId,
+    }
+    impl WrapSource for ProbedFixture {
+        fn identity(&self) -> SourceIdentity {
+            self.inner.identity()
+        }
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+        fn line_count(&self) -> u64 {
+            self.inner.line_count()
+        }
+        fn run_layout(
+            self: Arc<Self>,
+            engine: LayoutEngine,
+            request: TaskRequest,
+            driver: &mut dyn TaskDriver,
+        ) -> WorkerExit {
+            let probe = self.probe.clone(); // instrumentation, never a source Arc
+            crate::visual_rows::fixtures::run_snapshot(self, Some(probe), engine, request, driver)
+        }
+        fn line_start(&self, line: u64) -> std::io::Result<Option<u64>> {
+            assert_ne!(thread::current().id(), self.ui);
+            self.inner.line_start(line)
+        }
+        fn line_of(&self, byte: u64) -> std::io::Result<u64> {
+            assert_ne!(thread::current().id(), self.ui);
+            self.inner.line_of(byte)
+        }
+        fn read(&self, at: u64, out: &mut [u8]) -> std::io::Result<usize> {
+            assert_ne!(thread::current().id(), self.ui);
+            self.inner.read(at, out)
+        }
+    }
+
+    impl crate::snapshot_layout_source::SnapshotOwner for ProbedFixture {
+        fn snapshot(&self) -> &kwil_core_text::Snapshot {
+            crate::snapshot_layout_source::SnapshotOwner::snapshot(&self.inner)
+        }
+    }
+    impl crate::visual_rows::fixtures::SnapshotHooks for ProbedFixture {
+        fn before_snapshot_query(&self) {
+            assert_ne!(thread::current().id(), self.ui);
+        }
+        fn before_snapshot_read(&self, _: usize) -> std::io::Result<()> {
+            assert_ne!(thread::current().id(), self.ui);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wrap_all_intents_use_concrete_queries_resume_and_recover_one_arc_off_ui() {
+        // Fail-first mutations: restore synchronous dispatch; recreate a query
+        // on Pending; retain an Arc clone in run_cooperative; skip provenance;
+        // or transfer query destruction to the receiving thread. Each violates
+        // an assertion below or the bounded event deadline. NOT RUN here.
+        for lane in 0..4 {
+            let ui = thread::current().id();
+            let key = LayoutKey {
+                geometry: LayoutGeometry { columns: 3, rows: 2, tab_size: 4, ..LayoutGeometry::default() },
+                ..LayoutKey::default()
+            };
+            let mut buffer = Buffer::empty();
+            buffer.insert(0, b"abc def\nXYZ").unwrap();
+            let probe = Arc::new(crate::visual_rows::fixtures::Probe::default());
+            let source: Arc<dyn WrapSource> = Arc::new(ProbedFixture {
+                inner: SnapshotSource::new(key.source, buffer.snapshot()),
+                probe: probe.clone(),
+                ui,
+            });
+            let pointer = Arc::as_ptr(&source);
+            assert_eq!(Arc::strong_count(&source), 1);
+            let (wake, ready) = std::sync::mpsc::sync_channel(2);
+            let mut session = WrapSession::new(move || {
+                let _ = wake.try_send(());
+            })
+            .unwrap();
+            *session.shared.work_quantum.lock().unwrap() = ReadWork::new(1, 1);
+            let fence = NavigationFence { key, cursor_set_generation: 1, intent_generation: 1 };
+            let intent = match lane {
+                0 => LayoutIntent::Fill,
+                1 => LayoutIntent::Reveal(SourcePoint { byte: 4, affinity: CaretAffinity::Downstream }),
+                2 => {
+                    session.relative.enqueue(RelativeInput { key, kind: RelativeKind::Scroll(1) }).unwrap();
+                    session.relative.begin(key).unwrap();
+                    LayoutIntent::ScrollRows(1)
+                }
+                _ => {
+                    let motion = VisualMotion::Down;
+                    session
+                        .relative
+                        .enqueue(RelativeInput { key, kind: RelativeKind::Move { motion, count: 1, extend: false } })
+                        .unwrap();
+                    session.relative.begin(key).unwrap();
+                    LayoutIntent::MoveCursors {
+                        cursors: CursorSet::new(session.budget(), &[VisualCursor::default()], 0).unwrap(),
+                        motion,
+                        count: 1,
+                        extend: false,
+                    }
+                }
+            };
+            assert!(matches!(
+                session.submit(WrapRequest { fence, source, anchor: TopAnchor::default(), intent }),
+                ControlFlow::Continue(())
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let update = loop {
+                ready.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+                if let Some(update) = session.take_update(fence) {
+                    break update;
+                }
+                assert!(Instant::now() < deadline, "no matching cooperative result");
+            };
+            assert!(update.result.is_ok(), "cooperative fixture failed: {:?}", update.result);
+            assert!(std::ptr::addr_eq(pointer, Arc::as_ptr(&update.source)));
+            assert_eq!(Arc::strong_count(&update.source), 1);
+            assert!(probe.created.load(Ordering::Relaxed) > 0, "synchronous dispatch bypassed query creation");
+            assert!(
+                probe.polls.load(Ordering::Relaxed) > probe.created.load(Ordering::Relaxed),
+                "one-byte Pending was bypassed"
+            );
+            assert!(probe.provenance.load(Ordering::Relaxed) > 0, "provenance query bypassed");
+            assert_eq!(probe.created.load(Ordering::Relaxed), probe.dropped.load(Ordering::Relaxed));
+            assert_eq!(probe.max_owners.load(Ordering::Relaxed), 1, "source Arc cloned during task");
+            assert_ne!(*probe.drop_thread.lock().unwrap(), Some(ui), "query destruction reached UI");
+            assert!(!probe.mixed_drop_threads.load(Ordering::Relaxed));
+            if let Some(id) = update.relative_id {
+                session.published_relative(id, fence).unwrap();
+            }
+            assert!(matches!(session.retire_owner(RetiredOwner::Update(update)), ControlFlow::Continue(())));
+            session.stop().settle(Duration::from_secs(2)).unwrap();
+        }
     }
 }

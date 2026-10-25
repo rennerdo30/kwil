@@ -753,10 +753,21 @@ mod tests {
     }
 
     fn prepared_page(view: &Workspace, current: WrapHostContext, anchor: TopAnchor) -> LayoutPage {
-        use crate::visual_rows::{AllocationBudget, LayoutEngine, MAX_SESSION_BYTES, NoCancellation, SnapshotSource};
-        let source = SnapshotSource::new(current.key.source, view.editor().unwrap().document().snapshot());
-        let mut engine = LayoutEngine::new(AllocationBudget::new(MAX_SESSION_BYTES)).unwrap();
-        engine.fill(current.key, &source, anchor, &NoCancellation).unwrap()
+        use crate::{
+            snapshot_layout_source::SnapshotLayoutSource,
+            visual_rows::{AllocationBudget, LayoutEngine, MAX_SESSION_BYTES, NoCancellation, TaskRequest, fixtures},
+        };
+        let budget = AllocationBudget::new(MAX_SESSION_BYTES);
+        let source =
+            SnapshotLayoutSource::try_new(view.editor().unwrap().document().snapshot(), current.key.source, &budget)
+                .unwrap_or_else(|refused| panic!("{}", refused.error));
+        let engine = LayoutEngine::new(budget).unwrap();
+        let (_, output) =
+            fixtures::drive(source, engine, TaskRequest::Fill { key: current.key, anchor }, &NoCancellation);
+        match output.unwrap().into_page() {
+            std::ops::ControlFlow::Continue(page) => page,
+            std::ops::ControlFlow::Break(_) => panic!("prepared fixture returned navigation"),
+        }
     }
 
     fn drain_prepared(
