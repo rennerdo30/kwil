@@ -1,5 +1,6 @@
 //! Read-only schema-1 MSI preflight. No application dependency or package-specific
 //! build input belongs here: Binary.KwilPreflight is itself a BuildID input.
+#![cfg(any(windows, test))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod identity;
