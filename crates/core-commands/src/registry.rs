@@ -73,6 +73,7 @@ commands! {
     "View" => {
         "view.commandPalette" => "Command Palette", "view.fileFinder" => "Find File",
         "view.toggleHex" => "Toggle Hex View", "view.toggleWordWrap" => "Toggle Word Wrap",
+        "view.retryWrap" => "Retry Wrapped View",
         "view.toggleWhitespace" => "Toggle Whitespace", "view.zoomIn" => "Zoom In",
         "view.zoomOut" => "Zoom Out", "view.zoomReset" => "Reset Zoom",
         "view.logFilters" => "Filter Log Levels and Time",
