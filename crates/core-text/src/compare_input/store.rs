@@ -762,6 +762,10 @@ impl<A: Admission> InputStore<A> {
     pub fn atom_count(&self) -> u64 {
         self.atom_count
     }
+    /// Cached payload-query state only; no I/O, mutation or allocation.
+    pub fn has_pending_payload_read(&self) -> bool {
+        self.payload_read.is_some()
+    }
     pub fn abandon_payload_read(&mut self) {
         self.payload_read = None;
     }

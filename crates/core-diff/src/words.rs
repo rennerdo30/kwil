@@ -1,9 +1,11 @@
-//! Visible word-refinement contract. The external token solver is a separate
-//! ROOT-owned implementation round. BackendRequired is an explicit unfinished
-//! result, including for giant lines; it is never an empty complete refinement.
+//! Row-scoped worker refinement. `request` remains a source-free capability
+//! probe; executable work starts at `begin` with exact comparison ownership.
+mod tokens;
+mod worker;
 use crate::{Kind, stream::AlignedRow};
 use kwil_core_text::compare_input::InputError;
 use std::ops::Range;
+pub use worker::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coverage {
@@ -92,3 +94,7 @@ pub fn request(row: AlignedRow, left: Range<u64>, right: Range<u64>) -> Refineme
         error: None,
     }
 }
+
+#[cfg(test)]
+#[path = "words/tests.rs"]
+mod tests;

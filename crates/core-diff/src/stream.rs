@@ -4,6 +4,7 @@
 //! fixed-width disk records. Scratch disk is O(N+M), resident state is fixed.
 //! Worst-case comparison work remains O((N+M)D), plus streaming line equality.
 //! This worker path leaves the existing bounded imara/similar kernel untouched.
+use crate::sequence::{self, Event, Layout, Rect, Sequence, SequencePair};
 use crate::store::{self, AlignmentAdmission, AlignmentRetirement, Records, attempt, gate};
 use crate::{Kind, Whitespace};
 use kwil_core_text::compare_input::{
@@ -300,205 +301,28 @@ impl Equality {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Rect {
-    a: u64,
-    b: u64,
-    c: u64,
-    d: u64,
+/// Borrowed line adapter; equality and its source query protocol are unchanged.
+struct LinePair<'a, L, R> {
+    left: &'a mut L,
+    right: &'a mut R,
+    options: StreamOptions,
 }
-impl Rect {
-    fn n(self) -> u64 {
-        self.b - self.a
+impl<L: InputSource, R: InputSource> SequencePair for LinePair<'_, L, R> {
+    type Equality = Equality;
+    fn lengths(&self) -> [u64; 2] {
+        [self.left.line_count(), self.right.line_count()]
     }
-    fn m(self) -> u64 {
-        self.d - self.c
+    fn begin_equal(&self, a: u64, b: u64) -> Equality {
+        Equality::new(a, b)
     }
-    fn words(self, equal: bool) -> [u64; 8] {
-        [self.a, self.b, self.c, self.d, u64::from(equal), 0, 0, 0]
-    }
-    fn decode(w: [u64; 8]) -> Result<(Self, bool), InputError> {
-        if w[0] > w[1] || w[2] > w[3] || w[4] > 1 {
-            return Err(InputError::CorruptStore);
-        }
-        Ok((Self { a: w[0], b: w[1], c: w[2], d: w[3] }, w[4] == 1))
-    }
-}
-
-/// One depth uses opposite-parity slots from the preceding depth. No file
-/// clearing pass and no stale frontier reads: depth/parity bounds gate access.
-struct Bisect {
-    rect: Rect,
-    limit: u64,
-    depth: u64,
-    k: i128,
-    reverse: bool,
-    stage: u8,
-    candidates: [Option<u64>; 2],
-    x: u64,
-    y: u64,
-    equality: Option<Equality>,
-}
-impl Bisect {
-    fn new(rect: Rect) -> Result<Self, InputError> {
-        let total = rect.n().checked_add(rect.m()).ok_or(InputError::Overflow)?;
-        Ok(Self {
-            rect,
-            limit: total / 2 + total % 2,
-            depth: 0,
-            k: 0,
-            reverse: false,
-            stage: 0,
-            candidates: [None; 2],
-            x: 0,
-            y: 0,
-            equality: None,
-        })
-    }
-    fn index(&self, k: i128) -> Result<u64, InputError> {
-        u64::try_from(k + i128::from(self.limit)).map_err(|_| InputError::Overflow)
-    }
-    fn valid_k(k: i128, depth: u64) -> bool {
-        k.abs() <= i128::from(depth) && (k + i128::from(depth)) % 2 == 0
-    }
-    fn candidate(&self, x: u64, k: i128) -> Option<u64> {
-        let y = i128::from(x) - k;
-        (x <= self.rect.n() && y >= 0 && y <= i128::from(self.rect.m())).then_some(x)
-    }
-    fn step<A: Admission>(
+    fn equal<A: Admission>(
         &mut self,
-        records: &mut Records<A>,
-        left: &mut impl InputSource,
-        right: &mut impl InputSource,
-        options: StreamOptions,
+        state: &mut Equality,
+        _records: &mut Records<A>,
         work: &mut ReadWork,
         cancel: &AtomicBool,
-    ) -> Step<(u64, u64)> {
-        loop {
-            gate!(work.debit(0, 0, cancel));
-            let file = if self.reverse { store::REVERSE } else { store::FORWARD };
-            match self.stage {
-                0 => {
-                    self.candidates = [None; 2];
-                    if self.depth == 0 {
-                        self.x = 0;
-                        self.y = 0;
-                        self.stage = 3;
-                        continue;
-                    }
-                    self.stage = 1;
-                }
-                1 => {
-                    if self.k < i128::from(self.depth) {
-                        let w = gate!(records.read(file, attempt!(self.index(self.k + 1)), work, cancel));
-                        if w[1] == 1 {
-                            self.candidates[0] = self.candidate(w[0], self.k);
-                        }
-                    }
-                    self.stage = 2;
-                }
-                2 => {
-                    if self.k > -i128::from(self.depth) {
-                        let w = gate!(records.read(file, attempt!(self.index(self.k - 1)), work, cancel));
-                        if w[1] == 1 {
-                            self.candidates[1] = w[0].checked_add(1).and_then(|x| self.candidate(x, self.k));
-                        }
-                    }
-                    if let Some(x) = self.candidates.into_iter().flatten().max() {
-                        self.x = x;
-                        self.y = (i128::from(x) - self.k) as u64;
-                        self.stage = 3;
-                    } else {
-                        self.stage = 6;
-                    }
-                }
-                3 => {
-                    if self.x == self.rect.n() || self.y == self.rect.m() {
-                        self.stage = 4;
-                        continue;
-                    }
-                    let (a, b) = if self.reverse {
-                        (self.rect.b - self.x - 1, self.rect.d - self.y - 1)
-                    } else {
-                        (self.rect.a + self.x, self.rect.c + self.y)
-                    };
-                    let equal = gate!(
-                        self.equality
-                            .get_or_insert_with(|| Equality::new(a, b))
-                            .step(left, right, options, work, cancel)
-                    );
-                    self.equality = None;
-                    if equal {
-                        self.x += 1;
-                        self.y += 1;
-                    } else {
-                        self.stage = 4;
-                    }
-                }
-                4 => {
-                    gate!(records.write(
-                        file,
-                        attempt!(self.index(self.k)),
-                        [self.x, 1, 0, 0, 0, 0, 0, 0],
-                        work,
-                        cancel
-                    ));
-                    self.stage = 5;
-                }
-                5 => {
-                    let delta = i128::from(self.rect.n()) - i128::from(self.rect.m());
-                    let odd = delta % 2 != 0;
-                    let other_depth = if !self.reverse && odd {
-                        self.depth.checked_sub(1)
-                    } else if self.reverse && !odd {
-                        Some(self.depth)
-                    } else {
-                        None
-                    };
-                    if let Some(depth) = other_depth {
-                        let other_k = delta - self.k;
-                        if Self::valid_k(other_k, depth) {
-                            let opposite = if self.reverse { store::FORWARD } else { store::REVERSE };
-                            let w = gate!(records.read(opposite, attempt!(self.index(other_k)), work, cancel));
-                            if w[1] == 1 && w[0] > self.rect.n() {
-                                return Step::Failed(InputError::CorruptStore);
-                            }
-                            if w[1] == 1 && self.x >= self.rect.n() - w[0] {
-                                let x = if self.reverse { w[0] } else { self.x };
-                                let k = if self.reverse { other_k } else { self.k };
-                                let y = (i128::from(x) - k) as u64;
-                                if (x == 0 && y == 0) || (x == self.rect.n() && y == self.rect.m()) {
-                                    return Step::Failed(InputError::CorruptStore);
-                                }
-                                return Step::Ready((self.rect.a + x, self.rect.c + y));
-                            }
-                        }
-                    }
-                    self.stage = 7;
-                }
-                6 => {
-                    gate!(records.write(file, attempt!(self.index(self.k)), [0; 8], work, cancel));
-                    self.stage = 7;
-                }
-                _ => {
-                    gate!(work.debit(1, 0, cancel));
-                    if self.k < i128::from(self.depth) {
-                        self.k += 2;
-                    } else if !self.reverse {
-                        self.reverse = true;
-                        self.k = -i128::from(self.depth);
-                    } else {
-                        if self.depth == self.limit {
-                            return Step::Failed(InputError::CorruptStore);
-                        }
-                        self.depth += 1;
-                        self.reverse = false;
-                        self.k = -i128::from(self.depth);
-                    }
-                    self.stage = 0;
-                }
-            }
-        }
+    ) -> Step<bool> {
+        state.step(self.left, self.right, self.options, work, cancel)
     }
 }
 
@@ -546,15 +370,7 @@ pub struct DiskHunk {
 #[derive(Clone, Copy)]
 enum BuildPhase {
     Open,
-    Pop,
-    Prefix,
-    PrefixEmit,
-    Suffix,
-    QueueSuffix,
-    Residual,
-    Bisect,
-    QueueRight,
-    QueueLeft,
+    Aligning,
     Finish,
 }
 
@@ -567,15 +383,7 @@ pub struct AlignmentBuild<L: InputSource, R: InputSource, A: Admission> {
     identities: [InputIdentity; 2],
     nonce: u64,
     phase: BuildPhase,
-    stack: u64,
-    rect: Rect,
-    untrimmed: Rect,
-    prefix: u64,
-    suffix: u64,
-    equal_task: bool,
-    equality: Option<Equality>,
-    bisect: Option<Bisect>,
-    split: (u64, u64),
+    sequence: Sequence<Equality>,
     emitted: [u64; 2],
     rows: u64,
     runs: u64,
@@ -664,6 +472,7 @@ pub fn resident_charge<L: InputSource, R: InputSource, A: Admission>(paths: &sto
         .checked_add(size_of::<PageQuery>().checked_mul(3)?)?
         .checked_add(size_of::<Page>().checked_mul(3)?)?
         .checked_add(size_of::<crate::words::Refinement>().checked_mul(3)?)?
+        .checked_add(sequence::transient_charge::<Equality>()?)?
         .checked_add(size_of::<store::RetirementStep<A>>())
 }
 pub fn begin<L: InputSource, R: InputSource, A: Admission>(
@@ -687,7 +496,7 @@ pub fn begin<L: InputSource, R: InputSource, A: Admission>(
         }
     };
     let identities = [left.identity(), right.identity()];
-    let rect = Rect { a: 0, b: left.line_count(), c: 0, d: right.line_count() };
+    let sequence = Sequence::new([left.line_count(), right.line_count()], Layout::default());
     ControlFlow::Continue(AlignmentBuild {
         left: ManuallyDrop::new(left),
         right: ManuallyDrop::new(right),
@@ -696,15 +505,7 @@ pub fn begin<L: InputSource, R: InputSource, A: Admission>(
         identities,
         nonce,
         phase: BuildPhase::Open,
-        stack: 0,
-        rect,
-        untrimmed: rect,
-        prefix: 0,
-        suffix: 0,
-        equal_task: false,
-        equality: None,
-        bisect: None,
-        split: (0, 0),
+        sequence,
         emitted: [0; 2],
         rows: 0,
         runs: 0,
@@ -771,25 +572,6 @@ impl<L: InputSource, R: InputSource, A: Admission> AlignmentBuild<L, R, A> {
         }
     }
 
-    fn equal(&mut self, a: u64, b: u64, work: &mut ReadWork, cancel: &AtomicBool) -> Step<bool> {
-        let result = self.equality.get_or_insert_with(|| Equality::new(a, b)).step(
-            &mut *self.left,
-            &mut *self.right,
-            self.options,
-            work,
-            cancel,
-        );
-        if matches!(result, Step::Ready(_)) {
-            self.equality = None;
-        }
-        result
-    }
-    fn push_task(&mut self, rect: Rect, equal: bool, work: &mut ReadWork, cancel: &AtomicBool) -> Step<()> {
-        let next = attempt!(self.stack.checked_add(1).ok_or(InputError::Overflow));
-        gate!(self.records.write(store::STACK, self.stack, rect.words(equal), work, cancel));
-        self.stack = next;
-        Step::Ready(())
-    }
     fn write_run(&mut self, run: AlignedRun, work: &mut ReadWork, cancel: &AtomicBool) -> Step<()> {
         let next_rows = attempt!(self.rows.checked_add(run.length).ok_or(InputError::Overflow));
         let next_runs = attempt!(self.runs.checked_add(1).ok_or(InputError::Overflow));
@@ -888,115 +670,34 @@ impl<L: InputSource, R: InputSource, A: Admission> AlignmentBuild<L, R, A> {
         match self.phase {
             BuildPhase::Open => {
                 gate!(self.records.open(work, cancel));
-                gate!(self.push_task(self.rect, false, work, cancel));
-                self.phase = BuildPhase::Pop;
+                self.phase = BuildPhase::Aligning;
             }
-            BuildPhase::Pop => {
-                if self.stack == 0 {
+            BuildPhase::Aligning => {
+                let mut pair = LinePair { left: &mut *self.left, right: &mut *self.right, options: self.options };
+                let Some(event) = gate!(self.sequence.next(&mut pair, &mut self.records, work, cancel)) else {
                     self.phase = BuildPhase::Finish;
                     return Step::Ready(false);
+                };
+                if self.identities != [self.left.identity(), self.right.identity()] {
+                    return Step::Failed(InputError::SourceChanged);
                 }
-                let w = gate!(self.records.read(store::STACK, self.stack - 1, work, cancel));
-                let (rect, equal) = attempt!(Rect::decode(w));
-                if rect.b > self.left.line_count() || rect.d > self.right.line_count() || equal && rect.n() != rect.m()
-                {
-                    return Step::Failed(InputError::CorruptStore);
-                }
-                self.stack -= 1;
-                self.rect = rect;
-                self.untrimmed = rect;
-                self.equal_task = equal;
-                self.prefix = 0;
-                self.suffix = 0;
-                self.phase = if equal { BuildPhase::PrefixEmit } else { BuildPhase::Prefix };
-            }
-            BuildPhase::Prefix => {
-                if self.rect.a == self.rect.b || self.rect.c == self.rect.d {
-                    self.phase = BuildPhase::PrefixEmit;
-                } else if gate!(self.equal(self.rect.a, self.rect.c, work, cancel)) {
-                    self.rect.a += 1;
-                    self.rect.c += 1;
-                    self.prefix += 1;
-                } else {
-                    self.phase = BuildPhase::PrefixEmit;
-                }
-            }
-            BuildPhase::PrefixEmit => {
-                let length = if self.equal_task { self.rect.n() } else { self.prefix };
-                gate!(self.emit_equal(self.untrimmed.a, self.untrimmed.c, length, work, cancel));
-                self.phase = if self.equal_task { BuildPhase::Pop } else { BuildPhase::Suffix };
-            }
-            BuildPhase::Suffix => {
-                if self.rect.a == self.rect.b || self.rect.c == self.rect.d {
-                    self.phase = BuildPhase::QueueSuffix;
-                } else if gate!(self.equal(self.rect.b - 1, self.rect.d - 1, work, cancel)) {
-                    self.rect.b -= 1;
-                    self.rect.d -= 1;
-                    self.suffix += 1;
-                } else {
-                    self.phase = BuildPhase::QueueSuffix;
-                }
-            }
-            BuildPhase::QueueSuffix => {
-                if self.suffix > 0 {
-                    gate!(self.push_task(
-                        Rect { a: self.rect.b, b: self.untrimmed.b, c: self.rect.d, d: self.untrimmed.d },
-                        true,
-                        work,
-                        cancel
-                    ));
-                }
-                self.phase = BuildPhase::Residual;
-            }
-            BuildPhase::Residual => {
-                if self.rect.n() == 0 || self.rect.m() == 0 {
-                    gate!(work.debit(1, 0, cancel));
-                    if self.rect.n() > 0 || self.rect.m() > 0 {
+                match event {
+                    Event::Equal(rect) => {
+                        gate!(self.emit_equal(rect.a, rect.c, rect.n(), work, cancel));
+                    }
+                    Event::Changed(rect) => {
                         if let Some(prev) = &mut self.pending_change {
-                            if prev.b != self.rect.a || prev.d != self.rect.c {
+                            if prev.b != rect.a || prev.d != rect.c {
                                 return Step::Failed(InputError::CorruptStore);
                             }
-                            prev.b = self.rect.b;
-                            prev.d = self.rect.d;
+                            prev.b = rect.b;
+                            prev.d = rect.d;
                         } else {
-                            self.pending_change = Some(self.rect);
+                            self.pending_change = Some(rect);
                         }
                     }
-                    self.phase = BuildPhase::Pop;
-                } else {
-                    self.bisect = Some(attempt!(Bisect::new(self.rect)));
-                    self.phase = BuildPhase::Bisect;
                 }
-            }
-            BuildPhase::Bisect => {
-                self.split = gate!(self.bisect.as_mut().unwrap().step(
-                    &mut self.records,
-                    &mut *self.left,
-                    &mut *self.right,
-                    self.options,
-                    work,
-                    cancel
-                ));
-                self.bisect = None;
-                self.phase = BuildPhase::QueueRight;
-            }
-            BuildPhase::QueueRight => {
-                gate!(self.push_task(
-                    Rect { a: self.split.0, b: self.rect.b, c: self.split.1, d: self.rect.d },
-                    false,
-                    work,
-                    cancel
-                ));
-                self.phase = BuildPhase::QueueLeft;
-            }
-            BuildPhase::QueueLeft => {
-                gate!(self.push_task(
-                    Rect { a: self.rect.a, b: self.split.0, c: self.rect.c, d: self.split.1 },
-                    false,
-                    work,
-                    cancel
-                ));
-                self.phase = BuildPhase::Pop;
+                attempt!(self.sequence.acknowledge(event));
             }
             BuildPhase::Finish => {
                 gate!(self.flush_change(work, cancel));
@@ -1093,6 +794,15 @@ pub struct DiskComparison<L: InputSource, R: InputSource, A: Admission> {
     nonce: u64,
 }
 impl<L: InputSource, R: InputSource, A: Admission> DiskComparison<L, R, A> {
+    /// Word refinement must refuse a foreign comparison query before consuming
+    /// its comparison owner. This does not abandon or modify that query.
+    pub(crate) fn has_active_query(&self) -> bool {
+        self.query.is_some()
+    }
+    pub(crate) fn comparison_nonce(&self) -> u64 {
+        self.nonce
+    }
+
     pub fn row_count(&self) -> u64 {
         self.rows
     }
