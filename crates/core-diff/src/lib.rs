@@ -392,3 +392,7 @@ mod tests {
         }
     }
 }
+
+pub mod store;
+pub mod stream;
+pub mod words;

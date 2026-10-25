@@ -1922,6 +1922,7 @@ name = "kwil-core-diff"
 version = "0.1.0"
 dependencies = [
  "imara-diff",
+ "kwil-core-text",
  "similar",
 ]
 

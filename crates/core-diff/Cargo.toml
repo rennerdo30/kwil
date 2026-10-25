@@ -8,3 +8,5 @@ publish = false
 [dependencies]
 imara-diff = "0.2.0"
 similar = { version = "3.2.0", default-features = false, features = ["text", "bytes"] }
+
+kwil-core-text = { path = "../core-text" }
