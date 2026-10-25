@@ -9,10 +9,10 @@ use kwil_core_text::Snapshot;
 use std::{
     collections::VecDeque,
     io,
-    ops::Range,
+    ops::{ControlFlow, Range},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -153,6 +153,87 @@ pub struct SearchRequest {
     pub key: SearchKey,
     pub task: SearchTask,
 }
+/// Scalar-only identity: upgrading a token never acquires a Shared/source owner.
+/// Epoch zero is reserved for "not released"; the first close uses epoch one.
+#[derive(Debug)]
+struct SourceReleaseIdentity {
+    generation: AtomicU64,
+    released: AtomicU64,
+}
+/// Bind to the original worker BEFORE transferring the session's closing inputs.
+/// This token retains neither that worker nor its source/spool owners.
+#[derive(Debug)]
+pub struct SearchSourceReleaseKey {
+    identity: Weak<SourceReleaseIdentity>,
+    generation: u64,
+}
+/// Proof of input destruction, independent of spool retirement/thread exit.
+/// Only the coordinator's explicit source-free phase can construct this receipt.
+#[derive(Debug)]
+pub struct SearchInputsReleased {
+    identity: Weak<SourceReleaseIdentity>,
+    generation: u64,
+}
+impl SearchInputsReleased {
+    /// Metadata only. Old receipt/key pairs are invalid after another closing
+    /// owner is admitted, even if the old pair still matches itself.
+    pub fn valid_for(&self, key: &SearchSourceReleaseKey) -> bool {
+        if self.generation != key.generation || !self.identity.ptr_eq(&key.identity) {
+            return false;
+        }
+        let Some(identity) = self.identity.upgrade() else { return false };
+        identity.released.load(Ordering::Acquire) == self.generation
+            && identity.generation.load(Ordering::Acquire) == self.generation
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchInputsReleaseError {
+    NotStopped,
+    TimedOut,
+    GenerationChanged,
+    WorkerPanicked,
+    WorkerStoppedWithoutRelease,
+}
+/// Refusal preserves BOTH exact owners; no allocation or source destruction is
+/// needed to report closing pressure, invalid input or a completed worker.
+pub struct SearchCloseError {
+    pub internal: Option<SearchRequest>,
+    pub external: Option<SearchRequest>,
+    pub reason: &'static str,
+}
+impl std::fmt::Debug for SearchCloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchCloseError").field("reason", &self.reason).finish_non_exhaustive()
+    }
+}
+#[derive(Default)]
+struct SourceReleaseControl {
+    // Draining does not reopen these lifetime reservations. An arbitrary or
+    // stale SearchKey cannot manufacture another closing slot.
+    closing_used: [bool; 2],
+    closing_finished: bool,
+}
+// Arc's counter header and data alignment, including its final allocation pad.
+#[repr(C)]
+struct SourceReleaseAllocation {
+    strong: AtomicUsize,
+    weak: AtomicUsize,
+    identity: SourceReleaseIdentity,
+}
+const fn padded(bytes: usize, alignment: usize) -> usize {
+    bytes.div_ceil(alignment) * alignment
+}
+/// Additional fixed metadata charge per search worker, prepaid by the frontend's
+/// SAME aggregate budget before construction. Includes the aligned scalar Arc,
+/// its Shared header, inline controls rounded to container alignment, key/receipt
+/// transfer overlap (two headers each), and full close/wait refusal headers.
+/// Request payloads and all existing search/spool accounting remain unchanged.
+pub const SEARCH_SOURCE_RELEASE_METADATA_BYTES: usize = std::mem::size_of::<SourceReleaseAllocation>()
+    + padded(std::mem::size_of::<Arc<SourceReleaseIdentity>>(), std::mem::align_of::<Shared>())
+    + padded(std::mem::size_of::<SourceReleaseControl>(), std::mem::align_of::<State>())
+    + 2 * (std::mem::size_of::<SearchSourceReleaseKey>() + std::mem::size_of::<SearchInputsReleased>())
+    + std::mem::size_of::<SearchCloseError>()
+    + std::mem::size_of::<SearchInputsReleaseError>();
 /// Ownership is returned on rejection: never drop a last snapshot on input.
 pub struct SubmitError {
     pub request: Box<SearchRequest>,
@@ -276,12 +357,14 @@ struct State {
     events: VecDeque<SearchEvent>,
     active: Option<Cancellation>,
     closing: [Option<SearchRequest>; 2],
+    source_release: SourceReleaseControl,
     live_spools: usize,
     retirement_errors: Vec<SpoolDiagnostic>,
     results_session: Option<SearchKey>,
 }
 struct Shared {
     state: Mutex<State>,
+    source_identity: Arc<SourceReleaseIdentity>,
     space: PublisherWake,
     stopped: AtomicBool,
     retirement_due: AtomicBool,
@@ -326,9 +409,14 @@ impl Shared {
                 events: VecDeque::with_capacity(EVENTS),
                 active: None,
                 closing: [None, None],
+                source_release: SourceReleaseControl::default(),
                 live_spools: 0,
                 retirement_errors: Vec::new(),
                 results_session: None,
+            }),
+            source_identity: Arc::new(SourceReleaseIdentity {
+                generation: AtomicU64::new(1),
+                released: AtomicU64::new(0),
             }),
             space: PublisherWake::default(),
             stopped: AtomicBool::new(false),
@@ -426,7 +514,7 @@ impl SearchWorker {
                     state.live_spools = spools.live();
                     state.retirement_errors = spools.diagnostics().to_vec();
                 }
-                let (job, retired, closing, stopped) = {
+                let (job, retired, closing, stopped, source_generation) = {
                     let mut state = worker.state.lock().unwrap();
                     if state.pending.is_none()
                         && state.retired.iter().all(Option::is_none)
@@ -448,6 +536,7 @@ impl SearchWorker {
                         std::mem::replace(&mut state.retired, [const { None }; RETIRED]),
                         std::mem::take(&mut state.closing),
                         stopped,
+                        worker.source_identity.generation.load(Ordering::Acquire),
                     )
                 };
                 let retired_any = retired.iter().any(Option::is_some);
@@ -455,15 +544,61 @@ impl SearchWorker {
                 drop(closing);
                 if stopped {
                     drop(job);
-                    let _ = spools.retire();
+                    // All local input owners and queued events have now been
+                    // destroyed OFF UI. A later close may have installed a new
+                    // owner while these drops ran: never acknowledge that epoch.
                     {
+                        let mut state = worker.state.lock().unwrap();
+                        state.active = None;
+                        if worker.source_identity.generation.load(Ordering::Acquire) != source_generation
+                            || state.pending.is_some()
+                            || state.retired.iter().any(Option::is_some)
+                            || state.closing.iter().any(Option::is_some)
+                            || !state.events.is_empty()
+                        {
+                            continue;
+                        }
+                        worker.source_identity.released.store(source_generation, Ordering::Release);
+                        worker.completion.notify_all();
+                    }
+                    // Source-independent recipe pins may keep this worker
+                    // parked until Document finishes its journals. They cannot
+                    // delay the already published INPUTS RELEASED barrier.
+                    let _ = spools.retire();
+                    let finished = {
                         let mut state = worker.state.lock().unwrap();
                         state.live_spools = spools.live();
                         state.retirement_errors = spools.diagnostics().to_vec();
-                    }
+                        if worker.source_identity.generation.load(Ordering::Acquire) != source_generation {
+                            continue;
+                        }
+                        let finished = spools.live() == 0;
+                        // Fence transfers under the same lock that admits them,
+                        // BEFORE leaving the coordinator's last iteration.
+                        state.source_release.closing_finished = finished;
+                        finished
+                    };
                     wake();
-                    if spools.live() == 0 {
+                    if finished {
                         break;
+                    }
+                    // Host wake code can itself consume this thread's park
+                    // token (for example while waiting on a channel). A close
+                    // admitted during wake() therefore cannot rely on unpark
+                    // alone. Recheck its durable epoch/owners AFTER the callback
+                    // and immediately before parking, with no callback between.
+                    {
+                        let state = worker.state.lock().unwrap();
+                        if worker.source_identity.generation.load(Ordering::Acquire) != source_generation
+                            || state.pending.is_some()
+                            || state.retired.iter().any(Option::is_some)
+                            || state.closing.iter().any(Option::is_some)
+                            || !state.events.is_empty()
+                            || worker.retirement_due.load(Ordering::Acquire)
+                            || worker.retry_wake.load(Ordering::Acquire)
+                        {
+                            continue;
+                        }
                     }
                     // Pins wake us on release. Failed cleanup stays owned here;
                     // retry_retirement explicitly retries without an idle timer.
@@ -595,21 +730,74 @@ impl SearchWorker {
     /// Nonblocking close; coordinator retires its own sources. For orderly
     /// app shutdown use shutdown on an app-owned shutdown worker and join it.
     pub fn stop(&self) {
-        self.close_with(None);
+        // Empty refusal has no source owner, including after completion/poison.
+        let _ = self.close_with(None);
     }
     /// Reserved shutdown slot for the host's one rejected request. Call once
     /// while the worker is live; shutdown never disposes that source on input.
-    pub fn close_with(&self, rejected: Option<SearchRequest>) {
-        self.close_with_requests(rejected, None);
+    pub fn close_with(&self, rejected: Option<SearchRequest>) -> ControlFlow<SearchCloseError, ()> {
+        self.close_with_requests(rejected, None)
     }
     /// The host's internal retry and ONE panel-owned request have independent
     /// reserved slots. No rejected source is destroyed on the input thread.
-    pub fn close_with_requests(&self, internal: Option<SearchRequest>, external: Option<SearchRequest>) {
-        let mut state = self.shared.state.lock().unwrap();
-        for (slot, request) in state.closing.iter_mut().zip([internal, external]) {
-            assert!(slot.is_none() || request.is_none(), "duplicate search close request");
+    /// Break returns both exact owners; Continue confirms their admission.
+    pub fn close_with_requests(
+        &self,
+        internal: Option<SearchRequest>,
+        external: Option<SearchRequest>,
+    ) -> ControlFlow<SearchCloseError, ()> {
+        // Preparation borrows both owners; every refusal precedes mutation.
+        let invalid = internal
+            .as_ref()
+            .and_then(|request| validate(request).err())
+            .or_else(|| external.as_ref().and_then(|request| validate(request).err()));
+        if let Some(reason) = invalid {
+            return ControlFlow::Break(SearchCloseError { internal, external, reason });
+        }
+        let Ok(mut state) = self.shared.state.lock() else {
+            return ControlFlow::Break(SearchCloseError { internal, external, reason: "search mailbox poisoned" });
+        };
+        let has_inputs = internal.is_some() || external.is_some();
+        if has_inputs {
+            if state.source_release.closing_finished || self.shared.completed.load(Ordering::Acquire) {
+                return ControlFlow::Break(SearchCloseError {
+                    internal,
+                    external,
+                    reason: "search input retirement finished",
+                });
+            }
+            if state
+                .source_release
+                .closing_used
+                .iter()
+                .zip(state.closing.iter())
+                .zip([&internal, &external])
+                .any(|((used, slot), input)| (*used || slot.is_some()) && input.is_some())
+            {
+                return ControlFlow::Break(SearchCloseError {
+                    internal,
+                    external,
+                    reason: "duplicate search close request",
+                });
+            }
+            if self.shared.stopped.load(Ordering::Acquire) {
+                let Some(next) = self.shared.source_identity.generation.load(Ordering::Acquire).checked_add(1) else {
+                    return ControlFlow::Break(SearchCloseError {
+                        internal,
+                        external,
+                        reason: "search source generation exhausted",
+                    });
+                };
+                // Invalidate proof BEFORE moving even one new source owner.
+                self.shared.source_identity.released.store(0, Ordering::Release);
+                self.shared.source_identity.generation.store(next, Ordering::Release);
+                self.shared.completion.notify_all();
+            }
+        }
+        for (index, request) in [internal, external].into_iter().enumerate() {
             if request.is_some() {
-                *slot = request;
+                state.source_release.closing_used[index] = true;
+                state.closing[index] = request;
             }
         }
         self.shared.stopped.store(true, Ordering::Release);
@@ -622,6 +810,47 @@ impl SearchWorker {
         drop(state);
         self.shared.space.notify_all();
         self.shared.notify();
+        ControlFlow::Continue(())
+    }
+    /// Owner-free identity capture; bind this key before the first stop/close.
+    pub fn source_release_key(&self) -> SearchSourceReleaseKey {
+        SearchSourceReleaseKey {
+            identity: Arc::downgrade(&self.shared.source_identity),
+            generation: self.shared.source_identity.generation.load(Ordering::Acquire),
+        }
+    }
+    /// OFF UI. One bounded event wait on the existing completion condition;
+    /// never a polling loop, source read, snapshot, full shutdown or OS join.
+    /// Pass only the time remaining on the bundle's original absolute deadline.
+    pub fn wait_inputs_released(&self, timeout: Duration) -> Result<SearchInputsReleased, SearchInputsReleaseError> {
+        let started = Instant::now();
+        let shared = &self.shared;
+        let generation = shared.source_identity.generation.load(Ordering::Acquire);
+        let state = shared.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !shared.stopped.load(Ordering::Acquire) {
+            return Err(SearchInputsReleaseError::NotStopped);
+        }
+        let (state, _) = shared
+            .completion
+            .wait_timeout_while(state, timeout.saturating_sub(started.elapsed()), |_| {
+                shared.source_identity.released.load(Ordering::Acquire) != generation
+                    && shared.source_identity.generation.load(Ordering::Acquire) == generation
+                    && !shared.completed.load(Ordering::Acquire)
+            })
+            .unwrap_or_else(|error| error.into_inner());
+        let result = if shared.source_identity.generation.load(Ordering::Acquire) != generation {
+            Err(SearchInputsReleaseError::GenerationChanged)
+        } else if shared.source_identity.released.load(Ordering::Acquire) == generation {
+            Ok(SearchInputsReleased { identity: Arc::downgrade(&shared.source_identity), generation })
+        } else if shared.panicked.load(Ordering::Acquire) {
+            Err(SearchInputsReleaseError::WorkerPanicked)
+        } else if shared.completed.load(Ordering::Acquire) {
+            Err(SearchInputsReleaseError::WorkerStoppedWithoutRelease)
+        } else {
+            Err(SearchInputsReleaseError::TimedOut)
+        };
+        drop(state);
+        result
     }
     pub fn retry_retirement(&self) {
         self.shared.retirement_due.store(true, Ordering::Release);
@@ -1347,6 +1576,10 @@ fn run_files(
 }
 
 #[cfg(test)]
+#[path = "source_release_tests.rs"]
+mod source_release_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -1716,7 +1949,7 @@ mod tests {
         }
         let external = worker.retire(requests.pop().unwrap()).unwrap_err();
         let internal = requests.pop().unwrap();
-        worker.close_with_requests(Some(internal), Some(*external));
+        worker.close_with_requests(Some(internal), Some(*external)).continue_value().unwrap();
         let retained_before_release = try_close_sources(&sources);
         release_tx.send(()).unwrap();
         let retired_on = retired_rx.recv_timeout(Duration::from_secs(5));

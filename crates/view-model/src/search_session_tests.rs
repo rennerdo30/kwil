@@ -197,7 +197,7 @@ fn repeated_shutdown_returns_external_owner_and_retirement_is_explicit() {
     // Caller retains the owner and can transfer it to a distinct live retirement
     // lane; no stopped-session helper silently drops it on the input thread.
     let retirement = SearchWorker::new(|| {}).unwrap();
-    retirement.close_with_requests(None, Some(*retained));
+    retirement.close_with_requests(None, Some(*retained)).continue_value().unwrap();
     retirement.shutdown().unwrap();
     worker.shutdown().unwrap();
 }

@@ -5,12 +5,17 @@ use crate::{Editor, SessionDocumentId};
 pub use kwil_core_search::FileEvent;
 pub use kwil_core_search::worker::{
     DocumentMatches, DocumentSearch, FileResults, INPUT_BYTES, Navigation, PAGE_HITS, Page, Query, REPLACE_BYTES,
-    REPLACE_EDITS, ReplaceRecipe, ReplaceTarget, Replacement, ReplacementEdits, ReplacementIter, SIGNAL_BINS,
-    SearchEvent, SearchKey, SearchRequest, SearchTask, SearchUpdate, SearchWorker, SeedCursor, SeedRequest, SeedResult,
-    SubmitError,
+    REPLACE_EDITS, ReplaceRecipe, ReplaceTarget, Replacement, ReplacementEdits, ReplacementIter,
+    SEARCH_SOURCE_RELEASE_METADATA_BYTES, SIGNAL_BINS, SearchCloseError, SearchEvent, SearchInputsReleaseError,
+    SearchInputsReleased, SearchKey, SearchRequest, SearchSourceReleaseKey, SearchTask, SearchUpdate, SearchWorker,
+    SeedCursor, SeedRequest, SeedResult, SubmitError,
 };
 use kwil_core_search::{FileSearch, FileSearchSummary, Match};
-use std::{io, ops::Range, path::PathBuf};
+use std::{
+    io,
+    ops::{ControlFlow, Range},
+    path::PathBuf,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchStatus {
@@ -423,8 +428,14 @@ impl SearchSession {
     }
     /// Retain this ticket on the app shutdown lane if cleanup diagnostics or
     /// explicit retry are needed. Join only after releasing recipe/result pins.
+    /// A document shutdown bundle must bind source_release_key BEFORE taking it.
     pub fn take_shutdown(&mut self) -> Option<SearchWorker> {
         self.take_shutdown_with(None).ok()
+    }
+    /// Metadata only: capture the original worker identity before taking its
+    /// shutdown owner. No sync, fresh snapshot or source-bearing completion.
+    pub fn source_release_key(&self) -> Option<SearchSourceReleaseKey> {
+        self.worker.as_ref().map(SearchWorker::source_release_key)
     }
     /// Transfer the host retry slot AND one panel-owned source before close.
     /// If already stopped, return the complete external owner intact.
@@ -432,13 +443,18 @@ impl SearchSession {
         &mut self,
         external: Option<SearchRequest>,
     ) -> Result<SearchWorker, Option<Box<SearchRequest>>> {
-        let Some(worker) = self.worker.take() else {
+        let Some(worker) = self.worker.as_ref() else {
             return Err(external.map(Box::new));
         };
+        if let ControlFlow::Break(error) = worker.close_with_requests(self.rejected.take(), external) {
+            // Keep the original facade and exact internal retry owner together;
+            // the existing public refusal returns the exact external owner.
+            self.rejected = error.internal;
+            return Err(error.external.map(Box::new));
+        }
         self.state.file_results = None;
         self.replacement = None;
-        worker.close_with_requests(self.rejected.take(), external);
-        Ok(worker)
+        Ok(self.worker.take().expect("search worker retained through close admission"))
     }
 }
 impl Drop for SearchSession {
@@ -450,3 +466,7 @@ impl Drop for SearchSession {
 #[cfg(test)]
 #[path = "search_session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "focusedsearch_source_release_tests.rs"]
+mod source_release_tests;
