@@ -248,7 +248,9 @@ impl Failure {
             .or_else(|| self.search_worker.as_ref().and_then(|worker| worker.panic_payload()))
     }
     #[cfg(test)]
-    pub(super) fn document_state_for_test(&self) -> (
+    pub(super) fn document_state_for_test(
+        &self,
+    ) -> (
         bool,
         Option<kwil_view_model::document_worker::DocumentResultTransportStatus>,
         Option<kwil_view_model::workspace_document::ResultInfo>,
