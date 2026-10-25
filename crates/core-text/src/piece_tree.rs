@@ -30,10 +30,10 @@ pub(crate) type OriginalUses = BTreeMap<(u8, usize), (SourceRef, u64)>;
 
 // Separate worker cursor: SourceChunks retains its historical terminal-error
 // semantics for search/save callers, including the KW-53 admission oracles.
-#[path = "worker_source.rs"]
-pub mod worker_source;
 #[path = "worker_layout.rs"]
 pub mod worker_layout;
+#[path = "worker_source.rs"]
+pub mod worker_source;
 
 /// Persistent directory of physical storage allocations used by one snapshot.
 /// A split changes logical use counts, never the full allocation charge. The
