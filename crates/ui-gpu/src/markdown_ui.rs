@@ -1,4 +1,4 @@
-//! Bounded native Markdown host. One worker, one admitted snapshot, no UI reads.
+//! Bounded native Markdown host. One worker, one rejection owner, no UI reads.
 use super::*;
 use kwil_core_markdown::{BlockKind, InlineKind, ListMarker, Model, Span};
 use kwil_core_runtime::{NativeExitObservation, NativeExitState, NativeObservationError};
@@ -48,7 +48,59 @@ pub(super) struct Key {
 struct Work {
     key: Key,
     snapshot: kwil_core_text::Snapshot,
-    path: Option<std::path::PathBuf>,
+    path: Option<AdmittedPath>,
+}
+// Field order matters: capacity credit outlives the allocation it funds.
+struct AdmittedPath {
+    value: std::path::PathBuf,
+    _charge: kwil_view_model::visual_rows::MetadataReservation,
+}
+impl AdmittedPath {
+    fn copy(
+        source: &std::path::Path,
+        budget: &kwil_view_model::visual_rows::AllocationBudget,
+    ) -> kwil_view_model::visual_rows::WrapResult<Self> {
+        use kwil_view_model::visual_rows::WrapError;
+        // Fresh capacity is admitted while the old cache/request stays live.
+        // Inspect allocator surplus; retain the whole admitted envelope.
+        let bytes = source.as_os_str().len().checked_mul(2).ok_or(WrapError::Admission("Markdown path overflow"))?;
+        let charge = budget.reserve_metadata(bytes)?;
+        let mut value = std::path::PathBuf::new();
+        value
+            .try_reserve_exact(source.as_os_str().len())
+            .map_err(|_| WrapError::Admission("Markdown path allocation"))?;
+        if value.capacity() > bytes {
+            return Err(WrapError::Admission("Markdown path capacity exceeded admission"));
+        }
+        value.push(source);
+        if value.capacity() > bytes {
+            return Err(WrapError::Admission("Markdown path capacity exceeded admission"));
+        }
+        Ok(Self { value, _charge: charge })
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rejection {
+    Full,
+    Disconnected,
+}
+impl Rejection {
+    fn notice(self) -> &'static str {
+        match self {
+            Self::Full => "Preview could not accept this request. Restart Kwil to retry.",
+            Self::Disconnected => "Preview stopped. Restart Kwil to retry.",
+        }
+    }
+}
+struct RejectedWork {
+    reason: Rejection,
+    work: Work,
+}
+fn arc_allocation_bytes<T>() -> Option<usize> {
+    std::alloc::Layout::new::<(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize)>()
+        .extend(std::alloc::Layout::new::<T>())
+        .ok()
+        .map(|(layout, _)| layout.pad_to_align().size())
 }
 pub(super) struct Completion {
     key: Key,
@@ -90,7 +142,8 @@ pub(super) struct Host {
     modes: std::collections::HashMap<kwil_view_model::SessionDocumentId, Mode>,
     lane: Option<Lane>,
     terminal: Option<Arc<Terminal>>,
-    _terminal_charge: Option<kwil_view_model::visual_rows::MetadataReservation>,
+    rejected: Option<RejectedWork>,
+    budget: Option<kwil_view_model::visual_rows::AllocationBudget>,
     panic: Option<Box<dyn std::any::Any + Send>>,
     deadline: Option<std::time::Instant>,
     native_error: Option<NativeObservationError>,
@@ -98,7 +151,7 @@ pub(super) struct Host {
     busy: bool,
     desired: Option<Key>,
     current: Option<Key>,
-    base_path: Option<std::path::PathBuf>,
+    base_path: Option<AdmittedPath>,
     path_generation: u64,
     model: Option<Model>,
     images: markdown_images::Images,
@@ -106,30 +159,132 @@ pub(super) struct Host {
     layouts: DiagramLayouts,
     highlights: CodeHighlights,
     error: Option<String>,
+    admission_notice: Option<&'static str>,
     scroll: usize,
     #[cfg(feature = "frame-harness")]
     probe_target: Option<u64>,
+    // Last: source/path owners must be destroyed before fixed metadata credit.
+    _terminal_charge: Option<kwil_view_model::visual_rows::MetadataReservation>,
 }
 impl Host {
+    fn metadata_bytes() -> Option<usize> {
+        // Declared Rust headers/transfer overlap only. This does not bound
+        // std channel internals, native stacks, parser heaps or source storage.
+        let sizes = [
+            std::mem::size_of::<Self>().checked_mul(2)?,
+            arc_allocation_bytes::<Terminal>()?,
+            arc_allocation_bytes::<AtomicBool>()?,
+            std::mem::size_of::<ExitGuard>().checked_mul(2)?,
+            std::mem::size_of::<Lane>().checked_mul(2)?,
+            std::mem::size_of::<Work>().checked_mul(2)?,
+            std::mem::size_of::<mpsc::TrySendError<Work>>(),
+            std::mem::size_of::<Result<(), mpsc::TrySendError<Work>>>(),
+            std::mem::size_of::<Option<RejectedWork>>(),
+            std::mem::size_of::<Option<AdmittedPath>>().checked_mul(2)?,
+            std::mem::size_of::<kwil_view_model::visual_rows::WrapResult<(Option<AdmittedPath>, Option<AdmittedPath>)>>(
+            ),
+            std::mem::size_of::<kwil_view_model::visual_rows::WrapResult<AdmittedPath>>().checked_mul(2)?,
+            std::mem::size_of::<Result<(), SettlementReason>>().checked_mul(2)?,
+            NativeExitObservation::operation_stack_bytes()?,
+        ];
+        sizes.into_iter().try_fold(0usize, usize::checked_add)
+    }
     pub fn with_budget(
         budget: &kwil_view_model::visual_rows::AllocationBudget,
     ) -> kwil_view_model::visual_rows::WrapResult<Self> {
-        // Full Terminal includes its inline observation/right. All widened
-        // owner/return and native operation overlap is admitted before startup.
-        let bytes = std::mem::size_of::<Self>()
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(std::mem::size_of::<Terminal>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<usize>().checked_mul(2)?))
-            .and_then(|n| n.checked_add(std::mem::size_of::<ExitGuard>().checked_mul(2)?))
-            .and_then(|n| n.checked_add(std::mem::size_of::<Lane>().checked_mul(2)?))
-            .and_then(|n| n.checked_add(std::mem::size_of::<Work>().checked_mul(2)?))
-            .and_then(|n| n.checked_add(std::mem::size_of::<AtomicBool>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<usize>().checked_mul(2)?))
-            .and_then(|n| n.checked_add(std::mem::size_of::<Result<(), SettlementReason>>().checked_mul(2)?))
-            .and_then(|n| n.checked_add(NativeExitObservation::operation_stack_bytes()?))
+        let bytes = Self::metadata_bytes()
             .ok_or(kwil_view_model::visual_rows::WrapError::Admission("Markdown native-exit metadata overflow"))?;
         let charge = budget.reserve_metadata(bytes)?;
-        Ok(Self { terminal: Some(Arc::new(Terminal::default())), _terminal_charge: Some(charge), ..Self::default() })
+        Ok(Self {
+            terminal: Some(Arc::new(Terminal::default())),
+            budget: Some(budget.clone()),
+            _terminal_charge: Some(charge),
+            ..Self::default()
+        })
+    }
+    fn capture_blocked(&self) -> bool {
+        self.rejected.is_some() || self.deadline.is_some() || self.stop.load(Ordering::Acquire)
+    }
+    fn notice(&self) -> Option<&str> {
+        self.rejected
+            .as_ref()
+            .map(|rejected| rejected.reason.notice())
+            .or(self.admission_notice)
+            .or(self.error.as_deref())
+    }
+    /// The only source-capturing submit entry. No Work exists on the occupied,
+    /// closed-sender or allocation-refusal paths. All preparation precedes capture.
+    fn submit_with(
+        &mut self,
+        mut key: Key,
+        path: Option<&std::path::Path>,
+        capture: impl FnOnce() -> kwil_core_text::Snapshot,
+    ) {
+        if self.capture_blocked() {
+            return;
+        }
+        if self.lane.as_ref().and_then(|lane| lane.tx.as_ref()).is_none() {
+            self.admission_notice = Some("Preview unavailable: worker sender is closed.");
+            return;
+        }
+        let changed = path != self.base_path.as_ref().map(|path| path.value.as_path());
+        if changed {
+            let Some(generation) = self.path_generation.checked_add(1) else {
+                self.admission_notice = Some("Preview path generation exhausted; reopen the application");
+                return;
+            };
+            key.base = generation;
+        } else {
+            key.base = self.path_generation;
+        }
+        let needs_work = !self.busy && (self.desired != Some(key) || self.current != Some(key));
+        let Some(budget) = &self.budget else {
+            self.admission_notice = Some("Preview unavailable: request metadata was not admitted before startup.");
+            return;
+        };
+        // Hold both fresh allocations AND the old cache until BOTH admissions
+        // succeed. A refusal preserves its allocation, generation and desired key.
+        let prepared = (|| {
+            let cache = if changed { path.map(|path| AdmittedPath::copy(path, budget)).transpose()? } else { None };
+            let request =
+                if needs_work { path.map(|path| AdmittedPath::copy(path, budget)).transpose()? } else { None };
+            Ok::<_, kwil_view_model::visual_rows::WrapError>((cache, request))
+        })();
+        let (cache, request) = match prepared {
+            Ok(paths) => paths,
+            Err(_) => {
+                self.admission_notice = Some("Preview unavailable: path metadata admission refused.");
+                return;
+            }
+        };
+        if changed {
+            self.base_path = cache;
+            self.path_generation = key.base;
+        }
+        self.admission_notice = None;
+        if self.desired != Some(key) {
+            if self.desired.is_none_or(|old| old.document != key.document) {
+                self.scroll = 0;
+            }
+            self.desired = Some(key);
+            self.current = None;
+            self.model = None;
+            self.error = None;
+        }
+        if !needs_work {
+            return;
+        }
+        // No callbacks or fallible preparation between the empty-slot gate,
+        // capture and ownership transfer. The sender was checked before capture.
+        let tx = self.lane.as_ref().unwrap().tx.as_ref().unwrap();
+        let work = Work { key, snapshot: capture(), path: request };
+        match tx.try_send(work) {
+            Ok(()) => self.busy = true,
+            Err(mpsc::TrySendError::Full(work)) => self.rejected = Some(RejectedWork { reason: Rejection::Full, work }),
+            Err(mpsc::TrySendError::Disconnected(work)) => {
+                self.rejected = Some(RejectedWork { reason: Rejection::Disconnected, work });
+            }
+        }
     }
     pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.panic.as_deref()
@@ -141,22 +296,34 @@ impl Host {
     }
     /// OFF UI; borrow the original host through timeout, panic and retry.
     pub fn settle_until(&mut self, deadline: std::time::Instant) -> Result<(), SettlementReason> {
+        self.settle_with(
+            deadline,
+            |terminal, thread| terminal.native.query(thread),
+            NativeExitObservation::retire_after_join,
+        )
+    }
+    fn settle_with(
+        &mut self,
+        deadline: std::time::Instant,
+        mut query: impl FnMut(&Terminal, &std::thread::JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+        mut retire: impl FnMut(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), SettlementReason> {
         let deadline = self.deadline.map_or(deadline, |stored| stored.min(deadline));
         self.deadline = Some(deadline);
         self.stop.store(true, Ordering::Release);
         if let Some(lane) = &mut self.lane {
             drop(lane.tx.take());
         }
-        self.retire_native(deadline)?;
+        self.retire_native_with(deadline, &mut retire)?;
         if self.panic.is_some() {
             return Err(SettlementReason::WorkerPanicked);
         }
         if self.lane.is_none() {
-            return Ok(());
+            return self.retire_rejected(deadline);
         }
         Self::check_deadline(deadline)?;
         if self.lane.as_ref().unwrap().thread.is_none() {
-            return Ok(());
+            return self.retire_rejected(deadline);
         }
         {
             let terminal = self.terminal.as_ref().expect("admitted before worker startup");
@@ -170,8 +337,7 @@ impl Host {
             }
         }
         Self::check_deadline(deadline)?;
-        let observed =
-            self.terminal.as_ref().unwrap().native.query(self.lane.as_ref().unwrap().thread.as_ref().unwrap());
+        let observed = query(self.terminal.as_ref().unwrap(), self.lane.as_ref().unwrap().thread.as_ref().unwrap());
         let observed = match observed {
             Err(error) => return Err(self.retain_native_error(error)),
             Ok(state) => state,
@@ -185,9 +351,34 @@ impl Host {
             self.panic = Some(panic);
         }
         lane.retirement_pending = true;
-        self.retire_native(deadline)?;
+        self.retire_native_with(deadline, &mut retire)?;
         if self.panic.is_some() {
             return Err(SettlementReason::WorkerPanicked);
+        }
+        self.retire_rejected(deadline)
+    }
+    fn retire_rejected(&mut self, deadline: std::time::Instant) -> Result<(), SettlementReason> {
+        self.retire_rejected_with(deadline, std::time::Instant::now)
+    }
+    fn retire_rejected_with(
+        &mut self,
+        deadline: std::time::Instant,
+        mut now: impl FnMut() -> std::time::Instant,
+    ) -> Result<(), SettlementReason> {
+        if self.rejected.is_some() {
+            if now() >= deadline {
+                return Err(SettlementReason::TimedOut);
+            }
+            // OFF UI, after EVERY native/sticky-panic gate. Work drops its
+            // source and path before path credit; Host retains fixed credit.
+            // Destruction is not interruptible and ignored unlink errors are
+            // unchanged. An overrun reports failure, not a renewed deadline.
+            if let Some(RejectedWork { work, .. }) = self.rejected.take() {
+                drop(work);
+            }
+            if now() >= deadline {
+                return Err(SettlementReason::TimedOut);
+            }
         }
         Ok(())
     }
@@ -196,9 +387,6 @@ impl Host {
     }
     fn retain_native_error(&mut self, error: NativeObservationError) -> SettlementReason {
         SettlementReason::Native(*self.native_error.get_or_insert(error))
-    }
-    fn retire_native(&mut self, deadline: std::time::Instant) -> Result<(), SettlementReason> {
-        self.retire_native_with(deadline, NativeExitObservation::retire_after_join)
     }
     fn retire_native_with(
         &mut self,
@@ -217,13 +405,18 @@ impl Host {
     }
     #[cfg(feature = "frame-harness")]
     pub fn ready(&self) -> bool {
-        self.model.as_ref().is_some_and(|model| !model.blocks.is_empty()) && self.current == self.desired
+        !self.capture_blocked()
+            && self.model.as_ref().is_some_and(|model| !model.blocks.is_empty())
+            && self.current == self.desired
     }
 
     fn mode(&self, id: kwil_view_model::SessionDocumentId) -> Mode {
         self.modes.get(&id).copied().unwrap_or_default()
     }
     fn receive(&mut self, completion: Completion) {
+        if self.capture_blocked() {
+            return;
+        }
         self.busy = false;
         if self.desired != Some(completion.key) {
             return;
@@ -393,6 +586,10 @@ impl App {
         self.apply(Damage { full: true, status: true, ..Default::default() });
     }
     pub(super) fn sync_markdown(&mut self) {
+        // This precedes even Text-mode desired clearing and path comparison.
+        if self.markdown.capture_blocked() {
+            return;
+        }
         if self.markdown_mode() == Mode::Text {
             self.markdown.desired = None;
             return;
@@ -404,33 +601,12 @@ impl App {
         let Some(editor) = self.view.editor() else {
             return;
         };
-        let path = editor.document().path().map(std::path::Path::to_path_buf);
-        if path != self.markdown.base_path {
-            let Some(generation) = self.markdown.path_generation.checked_add(1) else {
-                self.markdown.error = Some("Preview path generation exhausted; reopen the application".into());
-                return;
-            };
-            self.markdown.path_generation = generation;
-            self.markdown.base_path = path;
-        }
         let key = Key {
             document: self.view.active_id(),
             revision: editor.document().revision(),
             epoch: self.view.input_epoch(),
             base: self.markdown.path_generation,
         };
-        if self.markdown.desired != Some(key) {
-            if self.markdown.desired.is_none_or(|old| old.document != key.document) {
-                self.markdown.scroll = 0;
-            }
-            self.markdown.desired = Some(key);
-            self.markdown.current = None;
-            self.markdown.model = None;
-            self.markdown.error = None;
-        }
-        if self.markdown.busy || self.markdown.current == Some(key) {
-            return;
-        }
         if self.markdown.lane.is_none() {
             let Some(terminal) = self.markdown.terminal.clone() else {
                 self.markdown.error = Some("Markdown shutdown metadata was not admitted before startup".into());
@@ -461,7 +637,13 @@ impl App {
                         let result = parse(&work.snapshot, &stop);
                         let images = result.as_ref().map_or_else(
                             |_| Default::default(),
-                            |model| markdown_images::load_images(model, work.path.as_deref(), &stop),
+                            |model| {
+                                markdown_images::load_images(
+                                    model,
+                                    work.path.as_ref().map(|path| path.value.as_path()),
+                                    &stop,
+                                )
+                            },
                         );
                         let diagrams = result.as_ref().map(diagrams).unwrap_or_default();
                         let highlights = result.as_ref().map(|model| code_highlights(model, &stop)).unwrap_or_default();
@@ -495,18 +677,7 @@ impl App {
             self.markdown.busy = false;
             return;
         }
-        let work = Work {
-            key,
-            snapshot: editor.document().snapshot(),
-            path: editor.document().path().map(|p| p.to_path_buf()),
-        };
-        match self.markdown.lane.as_ref().unwrap().tx.as_ref().expect("live sender").try_send(work) {
-            Ok(()) => self.markdown.busy = true,
-            Err(error) => {
-                self.markdown.error = Some(format!("Preview worker unavailable: {error}"));
-                self.markdown.current = Some(key);
-            }
-        }
+        self.markdown.submit_with(key, editor.document().path(), || editor.document().snapshot());
     }
     pub(super) fn markdown_ready(&mut self, completion: Completion) {
         self.markdown.receive(completion);
@@ -1018,7 +1189,11 @@ pub(super) fn draw(
             flow.paint = false;
         }
     }
-    if let Some(model) = &host.model {
+    if host.rejected.is_some() || host.admission_notice.is_some() {
+        // A latched notice belongs to the pane, independent of model scrolling.
+        flow.skip = 0;
+        flow.text(host.notice().unwrap(), &Default::default(), false);
+    } else if let Some(model) = &host.model {
         let anchor = if mode == Mode::Split { top as usize } else { 0 };
         for (index, block) in model.blocks.iter().enumerate() {
             if block.source_lines.end <= anchor {
@@ -1159,13 +1334,483 @@ pub(super) fn draw(
             }
         }
     } else {
-        flow.text(host.error.as_deref().unwrap_or("Preparing Markdown preview…"), &Default::default(), false);
+        flow.text(host.notice().unwrap_or("Preparing Markdown preview…"), &Default::default(), false);
     }
     Some(area)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kwil_view_model::visual_rows::{AllocationBudget, MetadataReservation};
+    use std::{
+        cell::Cell,
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    fn request_key() -> Key {
+        Key { document: kwil_view_model::SessionDocumentId(71), revision: 1, epoch: 1, base: 0 }
+    }
+    // A real channel, held without a consumer, makes Full independent of
+    // scheduling. Disconnected is established before any source capture.
+    fn request_lane(host: &mut Host, full: bool) -> Option<mpsc::Receiver<Work>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        if full {
+            assert!(tx.try_send(Work { key: request_key(), snapshot: Default::default(), path: None }).is_ok());
+        }
+        host.lane = Some(Lane { tx: Some(tx), thread: None, retirement_pending: false });
+        if full {
+            Some(rx)
+        } else {
+            drop(rx);
+            None
+        }
+    }
+    fn rejected_address(host: &Host) -> *const Work {
+        &host.rejected.as_ref().expect("the exact failed request must remain owned").work
+    }
+    fn empty_completion(key: Key) -> Completion {
+        Completion {
+            key,
+            result: Err("late result".into()),
+            images: Default::default(),
+            diagrams: Default::default(),
+            highlights: Default::default(),
+        }
+    }
+    fn decoded_source()
+    -> (kwil_core_text::decoded_backing::DecodedBacking, kwil_core_text::Snapshot, std::path::PathBuf) {
+        // Only public source APIs; no protected lifetime/allocator seam needed.
+        // All fixture storage creation and original-buffer destruction are OFF UI.
+        std::thread::spawn(|| {
+            use kwil_core_text::{
+                Buffer,
+                decoded_backing::{DecodedBacking, Interpretation},
+                encoding::Encoding,
+            };
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "kwil-markdown-rejected-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let source = b"# retained source\n";
+            let backing = DecodedBacking::prepare_from_reader(
+                &mut &source[..],
+                source.len() as u64,
+                Interpretation::new(Encoding::UTF8, 0).unwrap(),
+                &root,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let buffer = Buffer::from_decoded(backing.snapshot());
+            let snapshot = buffer.snapshot();
+            drop(buffer);
+            (backing, snapshot, root)
+        })
+        .join()
+        .unwrap()
+    }
+    #[test]
+    fn full_and_disconnected_keep_exact_source_and_path_credit_until_off_ui_settlement() {
+        use kwil_core_text::decoded_backing::RetirementError;
+        for full in [true, false] {
+            let (backing, snapshot, root) = decoded_source();
+            let budget = AllocationBudget::default();
+            let baseline = budget.retained_bytes();
+            let mut host = std::mem::ManuallyDrop::new(Host::with_budget(&budget).unwrap());
+            let fixed = budget.retained_bytes();
+            let rx = request_lane(&mut host, full);
+            let mut source = Some(snapshot);
+            let captures = Cell::new(0);
+            let path = Path::new("retained-preview.md");
+            host.submit_with(request_key(), Some(path), || {
+                captures.set(captures.get() + 1);
+                source.take().unwrap()
+            });
+            let rejected = host.rejected.as_ref().expect("base defect loses this source owner");
+            assert_eq!(rejected.reason, if full { Rejection::Full } else { Rejection::Disconnected });
+            assert_eq!(rejected.work.key, host.desired.unwrap());
+            assert_eq!(rejected.work.snapshot.len(), b"# retained source\n".len() as u64);
+            let request_path = rejected.work.path.as_ref().unwrap();
+            let request_credit = request_path._charge.reserved_bytes();
+            let cache_credit = host.base_path.as_ref().unwrap()._charge.reserved_bytes();
+            assert!(request_path.value.capacity() + std::mem::size_of::<MetadataReservation>() <= request_credit);
+            assert_eq!(request_path.value, path);
+            assert_eq!(budget.retained_bytes(), fixed + request_credit + cache_credit);
+            let address = rejected_address(&host);
+            let path_address = request_path.value.as_os_str().as_encoded_bytes().as_ptr();
+            let desired = host.desired;
+            let generation = host.path_generation;
+            let charged = budget.retained_bytes();
+            for key in [
+                Key { revision: 2, ..request_key() },
+                Key { document: kwil_view_model::SessionDocumentId(72), epoch: 3, ..request_key() },
+            ] {
+                host.submit_with(key, Some(Path::new("different/save-as.md")), || {
+                    captures.set(captures.get() + 1);
+                    panic!("occupied slot must gate capture")
+                });
+                host.receive(empty_completion(key));
+            }
+            host.receive(empty_completion(desired.unwrap()));
+            assert_eq!(captures.get(), 1);
+            assert_eq!(host.desired, desired);
+            assert_eq!(host.path_generation, generation);
+            assert_eq!(rejected_address(&host), address);
+            assert_eq!(
+                host.rejected
+                    .as_ref()
+                    .unwrap()
+                    .work
+                    .path
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .as_ptr(),
+                path_address
+            );
+            assert_eq!(
+                host.notice(),
+                Some(if full { Rejection::Full.notice() } else { Rejection::Disconnected.notice() })
+            );
+            assert_eq!(budget.retained_bytes(), charged);
+            let host = std::mem::ManuallyDrop::into_inner(host);
+            let observer = budget.clone();
+            let (pinned, settled, after_source, final_bytes, retired) = std::thread::spawn(move || {
+                let backing = match backing.try_retire() {
+                    Err(RetirementError::LiveSnapshots(owner)) => owner,
+                    _ => panic!("rejected request must still pin the original backing"),
+                };
+                // Drains only the fixture's prefilled empty request, OFF UI.
+                drop(rx);
+                let mut host = host;
+                let settled = host.settle_until(Instant::now() + Duration::from_secs(5));
+                let after_source = observer.retained_bytes();
+                let retired = backing.try_retire().is_ok();
+                drop(host);
+                let final_bytes = observer.retained_bytes();
+                std::fs::remove_dir(root).unwrap();
+                (true, settled, after_source, final_bytes, retired)
+            })
+            .join()
+            .unwrap();
+            assert!(pinned);
+            assert_eq!(settled, Ok(()));
+            assert_eq!(after_source, fixed + cache_credit, "only retired request capacity releases its credit");
+            assert_eq!(final_bytes, baseline);
+            assert!(retired, "source retirement precedes host/header credit release");
+        }
+    }
+    #[test]
+    fn rejected_app_sync_preserves_latch_even_in_text_mode() {
+        let (app, events) = crate::search_ui::host_dispatch_tests::host("original");
+        let mut app = std::mem::ManuallyDrop::new(app);
+        request_lane(&mut app.markdown, false);
+        app.markdown.submit_with(request_key(), None, Default::default);
+        let original = app.markdown.desired;
+        let address = rejected_address(&app.markdown);
+        let notice = app.markdown.notice().unwrap().to_owned();
+        for mode in [Mode::Text, Mode::Split, Mode::Preview, Mode::Text] {
+            let document = app.view.active_id();
+            app.markdown.modes.insert(document, mode);
+            app.sync_markdown();
+            app.markdown.receive(empty_completion(original.unwrap()));
+            assert_eq!(app.markdown.desired, original, "gate precedes Text-mode desired clearing");
+            assert_eq!(rejected_address(&app.markdown), address);
+            assert_eq!(app.markdown.notice(), Some(notice.as_str()));
+        }
+        let App {
+            document: mut failure,
+            view,
+            wrap,
+            markdown,
+            logs,
+            highlighting,
+            search_panel,
+            search,
+            external_inbox,
+            external_open,
+            ..
+        } = std::mem::ManuallyDrop::into_inner(app);
+        failure.attach(shutdown::Owners {
+            view,
+            wrap,
+            markdown,
+            logs,
+            highlighting,
+            search_panel,
+            search,
+            external_inbox,
+            external_open,
+        });
+        std::thread::spawn(move || {
+            assert_eq!(
+                failure.markdown.as_mut().unwrap().settle_until(Instant::now() + Duration::from_secs(5)),
+                Ok(())
+            );
+            drop(failure);
+        })
+        .join()
+        .unwrap();
+        drop(events);
+    }
+    #[test]
+    fn both_path_admissions_precede_capture_and_refusal_preserves_old_cache() {
+        const LIMIT: usize = 64 * 1024;
+        let budget = AllocationBudget::new(LIMIT);
+        let baseline = budget.retained_bytes();
+        let mut host = std::mem::ManuallyDrop::new(Host::with_budget(&budget).unwrap());
+        let (tx, rx) = mpsc::sync_channel(1);
+        host.lane = Some(Lane { tx: Some(tx), thread: None, retirement_pending: false });
+        host.submit_with(request_key(), Some(Path::new("old.md")), Default::default);
+        let first = rx.try_recv().expect("first request accepted");
+        host.busy = false;
+        host.current = host.desired;
+        let old_key = host.desired;
+        let old_generation = host.path_generation;
+        let old_address = host.base_path.as_ref().unwrap().value.as_os_str().as_encoded_bytes().as_ptr();
+        let target = Path::new("longer/new-preview-path.md");
+        let one_copy = target.as_os_str().len() * 2 + std::mem::size_of::<MetadataReservation>();
+        // One candidate fits; the second does not. The old cache AND accepted
+        // request still own their allocations during this attempted growth.
+        let filler = budget
+            .reserve_metadata(
+                LIMIT - budget.retained_bytes() - (2 * one_copy - 1) - std::mem::size_of::<MetadataReservation>(),
+            )
+            .unwrap();
+        let charged = budget.retained_bytes();
+        let captures = Cell::new(0);
+        host.submit_with(Key { revision: 2, ..request_key() }, Some(target), || {
+            captures.set(captures.get() + 1);
+            Default::default()
+        });
+        assert_eq!(captures.get(), 0);
+        assert_eq!(host.desired, old_key);
+        assert_eq!(host.path_generation, old_generation);
+        assert_eq!(host.base_path.as_ref().unwrap().value.as_os_str().as_encoded_bytes().as_ptr(), old_address);
+        assert_eq!(budget.retained_bytes(), charged, "failed candidates return their credit");
+        assert!(budget.peak_bytes() >= charged + one_copy, "first candidate was live when second admission refused");
+        assert!(rx.try_recv().is_err());
+        drop(filler);
+        host.submit_with(Key { revision: 2, ..request_key() }, Some(target), || {
+            captures.set(captures.get() + 1);
+            Default::default()
+        });
+        let second = rx.try_recv().expect("retry after capacity release is accepted");
+        assert_eq!(captures.get(), 1);
+        assert_eq!(host.path_generation, old_generation + 1);
+        assert_eq!(host.base_path.as_ref().unwrap().value, target);
+        let request_path = second.path.as_ref().unwrap();
+        assert!(
+            request_path.value.capacity() + std::mem::size_of::<MetadataReservation>()
+                <= request_path._charge.reserved_bytes()
+        );
+        let host = std::mem::ManuallyDrop::into_inner(host);
+        std::thread::spawn(move || drop((first, second, rx, host))).join().unwrap();
+        assert_eq!(budget.retained_bytes(), baseline);
+    }
+    #[test]
+    fn fixed_header_admission_and_aligned_arc_layout_are_not_source_admission() {
+        #[repr(align(64))]
+        struct Aligned;
+        assert_eq!(arc_allocation_bytes::<Aligned>(), Some(64));
+        let bytes = Host::metadata_bytes().unwrap() + std::mem::size_of::<MetadataReservation>();
+        let probe = AllocationBudget::new(64 * 1024);
+        let baseline = probe.retained_bytes();
+        let budget = AllocationBudget::new(baseline + bytes - 1);
+        assert!(Host::with_budget(&budget).is_err());
+        assert_eq!(budget.retained_bytes(), baseline, "refusal occurs before Terminal/stop allocations");
+    }
+    #[test]
+    fn no_lane_timeout_retains_owner_and_original_deadline_on_retry() {
+        let budget = AllocationBudget::default();
+        let mut host = std::mem::ManuallyDrop::new(Host::with_budget(&budget).unwrap());
+        request_lane(&mut host, false);
+        host.submit_with(request_key(), Some(Path::new("retained.md")), Default::default);
+        drop(host.lane.take());
+        let address = rejected_address(&host);
+        let charged = budget.retained_bytes();
+        let deadline = Instant::now();
+        assert_eq!(host.settle_until(deadline), Err(SettlementReason::TimedOut));
+        assert_eq!(host.settle_until(deadline + Duration::from_secs(5)), Err(SettlementReason::TimedOut));
+        assert_eq!(host.deadline, Some(deadline));
+        assert_eq!(rejected_address(&host), address);
+        assert_eq!(budget.retained_bytes(), charged);
+        let host = std::mem::ManuallyDrop::into_inner(host);
+        // Explicit test cleanup of a failed owner, never a renewed settlement.
+        std::thread::spawn(move || drop(host)).join().unwrap();
+    }
+    #[test]
+    fn no_lane_success_and_destructor_overrun_use_the_original_deadline() {
+        for overrun in [false, true] {
+            let budget = AllocationBudget::default();
+            let mut host = Host::with_budget(&budget).unwrap();
+            request_lane(&mut host, false);
+            host.submit_with(request_key(), Some(Path::new("retained.md")), Default::default);
+            drop(host.lane.take());
+            let charged = budget.retained_bytes();
+            let request_credit = host.rejected.as_ref().unwrap().work.path.as_ref().unwrap()._charge.reserved_bytes();
+            let observer = budget.clone();
+            let (result, bytes, empty, stored) = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let result = if overrun {
+                    host.deadline = Some(deadline);
+                    let calls = Cell::new(0);
+                    host.retire_rejected_with(deadline, || {
+                        let before = calls.get();
+                        calls.set(before + 1);
+                        if before == 0 { deadline - Duration::from_millis(1) } else { deadline }
+                    })
+                } else {
+                    host.settle_until(deadline)
+                };
+                (result, observer.retained_bytes(), host.rejected.is_none(), host.deadline)
+            })
+            .join()
+            .unwrap();
+            assert_eq!(result, if overrun { Err(SettlementReason::TimedOut) } else { Ok(()) });
+            assert_eq!(bytes, charged - request_credit);
+            assert!(empty, "an overrun cannot reconstruct an already destroyed request");
+            assert!(stored.is_some());
+        }
+    }
+    #[test]
+    fn pending_query_and_retirement_failures_quarantine_rejection_before_sticky_panic() {
+        for panic_worker in [false, true] {
+            let budget = AllocationBudget::default();
+            let mut host = std::mem::ManuallyDrop::new(Host::with_budget(&budget).unwrap());
+            request_lane(&mut host, false);
+            host.submit_with(request_key(), Some(Path::new("native-pending.md")), Default::default);
+            let request_credit = host.rejected.as_ref().unwrap().work.path.as_ref().unwrap()._charge.reserved_bytes();
+            let charged = budget.retained_bytes();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (entered, entered_rx) = mpsc::sync_channel(1);
+            let (release, release_rx) = mpsc::sync_channel(1);
+            let terminal = host.terminal.as_ref().unwrap().clone();
+            let thread = std::thread::spawn(move || {
+                let exit = ExitGuard(terminal);
+                let registration = exit.0.native.register_current();
+                let _ = entered.send(registration);
+                let _ = release_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+                if panic_worker {
+                    panic!("original rejected-request worker panic");
+                }
+            });
+            let original = thread.thread().id();
+            host.lane.as_mut().unwrap().thread = Some(thread);
+            let registration = entered_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            // Script terminal acknowledgement independently of native exit;
+            // injected Pending/error MUST NOT consume the still-gated handle.
+            *host.terminal.as_ref().unwrap().done.lock().unwrap() = true;
+            let query_error = NativeObservationError::MachRetire { code: 61 };
+            let pending = host.settle_with(deadline, |_, _| Ok(NativeExitState::Pending), |_| panic!("not joined"));
+            let failed = host.settle_with(deadline, |_, _| Err(query_error), |_| panic!("not joined"));
+            let retained_thread = host.lane.as_ref().unwrap().thread.as_ref().map(|thread| thread.thread().id());
+            let retained = host.rejected.is_some();
+            let retained_bytes = budget.retained_bytes();
+            // Release and ORIGINAL fixture join precede all assertions. This
+            // explicit fixture join is not production native-exit acceptance.
+            let released = release.send(());
+            let host = std::mem::ManuallyDrop::into_inner(host);
+            let observer = budget.clone();
+            let (retirement_failed, second, held_after_failure, empty, final_bytes, sticky, stored, first_native) =
+                std::thread::spawn(move || {
+                    let mut host = std::mem::ManuallyDrop::new(host);
+                    if let Err(payload) = host.lane.as_mut().unwrap().thread.take().unwrap().join() {
+                        host.panic = Some(payload);
+                    }
+                    host.lane.as_mut().unwrap().retirement_pending = true;
+                    let payload = host.panic.as_deref().map(std::ptr::from_ref);
+                    let retirement_failed = host.settle_with(
+                        deadline,
+                        |_, _| panic!("already joined"),
+                        |_| Err(NativeObservationError::MachRetire { code: 73 }),
+                    );
+                    let held_after_failure = (
+                        host.rejected.is_some(),
+                        observer.retained_bytes(),
+                        host.lane.as_ref().unwrap().retirement_pending,
+                    );
+                    let second = host.settle_with(
+                        deadline,
+                        |_, _| panic!("already joined"),
+                        NativeExitObservation::retire_after_join,
+                    );
+                    let sticky = payload
+                        .zip(host.panic.as_deref().map(std::ptr::from_ref))
+                        .is_some_and(|(before, after)| std::ptr::eq(before, after));
+                    let empty = host.rejected.is_none();
+                    let stored = host.deadline;
+                    let first_native = host.native_error;
+                    let final_bytes = observer.retained_bytes();
+                    // Off-UI cleanup of the sticky failure is fixture-owned;
+                    // production retains it in the original Failure quarantine.
+                    drop(std::mem::ManuallyDrop::into_inner(host));
+                    (retirement_failed, second, held_after_failure, empty, final_bytes, sticky, stored, first_native)
+                })
+                .join()
+                .unwrap();
+            assert!(matches!(registration, Ok(Ok(()))));
+            assert!(released.is_ok());
+            assert_eq!(pending, Err(SettlementReason::ThreadExitPending));
+            assert_eq!(failed, Err(SettlementReason::Native(query_error)));
+            assert_eq!(retained_thread, Some(original));
+            assert!(retained);
+            assert_eq!(retained_bytes, charged);
+            assert_eq!(retirement_failed, Err(SettlementReason::Native(query_error)), "retain the first native error");
+            assert_eq!(held_after_failure, (true, charged, true));
+            assert_eq!(second, if panic_worker { Err(SettlementReason::WorkerPanicked) } else { Ok(()) });
+            assert_eq!(empty, !panic_worker);
+            assert_eq!(final_bytes, if panic_worker { charged } else { charged - request_credit });
+            assert_eq!(sticky, panic_worker, "the exact joined panic survives native retirement and retry");
+            assert_eq!(stored, Some(deadline));
+            assert_eq!(first_native, Some(query_error));
+        }
+    }
+    #[test]
+    fn successful_join_path_retires_rejection_only_after_native_right() {
+        let budget = AllocationBudget::default();
+        let mut host = Host::with_budget(&budget).unwrap();
+        request_lane(&mut host, false);
+        host.submit_with(request_key(), Some(Path::new("join-order.md")), Default::default);
+        let terminal = host.terminal.as_ref().unwrap().clone();
+        host.lane.as_mut().unwrap().thread = Some(std::thread::spawn(move || {
+            let exit = ExitGuard(terminal);
+            exit.0.native.register_current().unwrap();
+        }));
+        let charged = budget.retained_bytes();
+        let request_credit = host.rejected.as_ref().unwrap().work.path.as_ref().unwrap()._charge.reserved_bytes();
+        let observer = budget.clone();
+        let (result, retired, empty, after, repeated) = std::thread::spawn(move || {
+            let calls = Cell::new(0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // Scripted Exited tests owner ordering only. Existing real native
+            // TLS controls remain the authority for actual exit observation.
+            let result = host.settle_with(
+                deadline,
+                |_, _| Ok(NativeExitState::Exited),
+                |native| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(observer.retained_bytes(), charged, "request credit survives through right retirement");
+                    native.retire_after_join()
+                },
+            );
+            let after = observer.retained_bytes();
+            let repeated = host.settle_until(deadline);
+            (result, calls.get(), host.rejected.is_none(), after, repeated)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(retired, 1);
+        assert!(empty);
+        assert_eq!(after, charged - request_credit);
+        assert_eq!(repeated, Ok(()));
+    }
     #[test]
     fn joined_markdown_panic_retries_right_retirement_before_sticky_failure() {
         let budget = kwil_view_model::visual_rows::AllocationBudget::default();
@@ -1227,6 +1872,53 @@ mod tests {
             &kwil_core_commands::theme::Theme::builtin(kwil_core_commands::theme::Scheme::Dark),
         );
         pixels
+    }
+    #[test]
+    fn latched_notices_paint_at_pane_origin_without_changing_model_scroll() {
+        let ui = chrome::Metrics::new(1.0);
+        let mut font = font::UiFont::load(ui.text_px()).expect("test needs the platform UI font");
+        let theme = kwil_core_commands::theme::Theme::builtin(kwil_core_commands::theme::Scheme::Dark);
+        let bg = theme_ui::rgb(&theme, kwil_core_commands::theme::UiRole::PanelBackground);
+        let area = Rect { x: 24, y: 32, w: 720, h: 240 };
+        let (width, height) = (800, 320);
+        for reason in [Some(Rejection::Full), Some(Rejection::Disconnected), None] {
+            for mode in [Mode::Preview, Mode::Split] {
+                let mut unscrolled = None;
+                for scroll in [0, 1024] {
+                    let mut host = Host {
+                        // A retained model must not take priority or have its
+                        // scroll corrected just to make the notice visible.
+                        model: Some(kwil_core_markdown::parse("# Retained model\n").unwrap()),
+                        scroll,
+                        rejected: reason.map(|reason| RejectedWork {
+                            reason,
+                            work: Work { key: request_key(), snapshot: Default::default(), path: None },
+                        }),
+                        admission_notice: Some("Preview unavailable: path metadata admission refused."),
+                        ..Default::default()
+                    };
+                    let mut pixels = vec![0x123456; width * height];
+                    draw(&mut host, mode, true, 0, &mut pixels, (width, height), area, &mut font, &ui, &theme);
+                    assert_eq!(host.scroll, scroll, "notice painting must preserve ordinary model scroll");
+                    let pane_x = area.x + if mode == Mode::Split { area.w / 2 } else { 0 };
+                    let pane_w = if mode == Mode::Split { area.w - area.w / 2 } else { area.w };
+                    let pad = ui.dip(24.0).min(pane_w / 8);
+                    assert!(
+                        (area.y + pad..area.y + pad + ui.dip(25.0)).any(|y| {
+                            pixels[y * width + pane_x + pad..y * width + pane_x + pane_w - pad]
+                                .iter()
+                                .any(|pixel| *pixel != bg)
+                        }),
+                        "{reason:?} notice must paint glyph pixels at the pane origin at scroll {scroll}"
+                    );
+                    if let Some(expected) = &unscrolled {
+                        assert_eq!(&pixels, expected, "{reason:?} notice pixels must be independent of model scroll");
+                    } else {
+                        unscrolled = Some(pixels);
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn checked_and_unchecked_tasks_have_distinct_native_markers() {
