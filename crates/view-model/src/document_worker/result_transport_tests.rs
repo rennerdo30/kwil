@@ -357,6 +357,40 @@ pub(super) fn hold_publication(shared: &Shared) {
     }
 }
 
+/// Pause the SAME producer with the actual completed residual in its stack,
+/// after the shared slot is emptied and transfer_active is set. No source
+/// owner enters either channel; observations contain scalar identities only.
+pub(super) struct RetirementDisposalGate {
+    entered: mpsc::SyncSender<RetirementDisposalObservation>,
+    release: mpsc::Receiver<()>,
+    deadline: Instant,
+}
+#[derive(Debug)]
+pub(super) struct RetirementDisposalObservation {
+    producer: std::thread::ThreadId,
+    delivery: DocumentDeliveryId,
+    residual_box: usize,
+}
+pub(super) fn hold_retirement_disposal(shared: &Shared, residual: Option<&DocumentSlot>) {
+    if let Some(gate) = lock(&shared.retirement_disposal_gate).as_ref() {
+        let commit = residual.and_then(DocumentSlot::partial).expect("actual guarded completed residual");
+        assert!(commit.is_complete());
+        let Some(DocumentResult::Indexed { result: Ok(document), .. }) = commit.pending() else {
+            panic!("this narrow disposal control retains its original indexed Box")
+        };
+        gate.entered
+            .try_send(RetirementDisposalObservation {
+                producer: std::thread::current().id(),
+                delivery: commit.info().delivery().unwrap(),
+                residual_box: &**document as *const Document as usize,
+            })
+            .expect("bounded disposal phase observation");
+        gate.release
+            .recv_timeout(gate.deadline.saturating_duration_since(Instant::now()))
+            .expect("same absolute disposal control deadline");
+    }
+}
+
 fn harness(
     wake: impl Fn() -> io::Result<()> + Send + Sync + 'static,
     run: impl FnOnce(Arc<Shared>, mpsc::Receiver<DocumentRequest>) + Send + 'static,
@@ -630,6 +664,291 @@ fn result_transport_live_capacity_event_survives_transfer_and_is_consumed_only_o
     assert!(receiver.take_capacity_event());
     assert!(!receiver.take_capacity_event(), "repeated empty receive cannot drive another continuation");
     finish(receiver.stop(worker).unwrap(), |_| ControlFlow::Continue(()));
+}
+
+#[test]
+fn result_transport_successful_live_retirement_fence_returns_exact_full_but_failures_stay_closed() {
+    let budget = AllocationBudget::new(crate::visual_rows::MAX_SESSION_BYTES);
+    let baseline = budget.retained_bytes();
+    let (shared, receiver) = Shared::new(&budget, || Ok(())).unwrap();
+    let (sender, inbox) = mpsc::sync_channel(16);
+    let worker = DocumentWorker {
+        tx: RequestSender::new(sender, Some(&shared)),
+        journal_capacity: Arc::new(AtomicUsize::new(16)),
+        journal_controls: Arc::new(super::super::JournalControlCredits::new()),
+        save_destinations: Default::default(),
+    };
+    // A genuine successful transfer closes ordinary admission until the SAME
+    // producer retires its residual. No thread/timing race synthesizes Full.
+    {
+        let mut state = lock(&shared.state);
+        state.slot = Some(DocumentSlot::new(DocumentResult::CapacityAvailable));
+        state.in_flight = true;
+        state.transfer_active = true;
+        let value = state.slot.take();
+        drop(state);
+        DocumentTransferGuard {
+            shared: shared.clone(),
+            value,
+            delivery: DocumentDeliveryId { worker: shared.worker_id, delivery: 0 },
+        }
+        .restore(true);
+    }
+    let path = std::env::temp_dir().join("kwil-exact-retained-open-raw");
+    let path_identity = path.as_os_str().as_encoded_bytes().as_ptr();
+    let charged = budget.retained_bytes();
+    let attempts = budget.allocation_attempts();
+    let request =
+        DocumentRequest::OpenRaw { document: super::super::DocumentId(7), revision: 0, path, rows: 3, generation: 19 };
+    let Err(TrySendError::Full(request)) = worker.try_submit(request) else {
+        panic!("successful Live residual retirement must retain the exact request as Full")
+    };
+    let DocumentRequest::OpenRaw { path, generation, .. } = &*request else { panic!("same OpenRaw request") };
+    assert_eq!(path.as_os_str().as_encoded_bytes().as_ptr(), path_identity);
+    assert_eq!(*generation, 19);
+    assert!(matches!(inbox.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert_eq!(budget.retained_bytes(), charged);
+    assert_eq!(budget.allocation_attempts(), attempts, "Full needs no new transport reservation");
+
+    // A retained original consumer refusal is NOT successful retirement.
+    lock(&shared.state).retire_requested = false;
+    lock(&shared.state).commit_error =
+        Some(crate::workspace::workspace_document::WorkspaceDocumentAcceptError::Identity);
+    let Err(TrySendError::Disconnected(request)) = worker.try_submit(*request) else {
+        panic!("original consumer refusal must retain closed admission")
+    };
+    assert!(matches!(
+        lock(&shared.state).commit_error.as_ref(),
+        Some(crate::workspace::workspace_document::WorkspaceDocumentAcceptError::Identity)
+    ));
+    lock(&shared.state).commit_error = None;
+    lock(&shared.state).delivery_failure = Some(DocumentDeliveryFailure::Wake(io::Error::other("exact terminal wake")));
+    let Err(TrySendError::Disconnected(request)) = worker.try_submit(*request) else {
+        panic!("terminal failure must not become temporary Full")
+    };
+    assert!(matches!(lock(&shared.state).delivery_failure.as_ref(), Some(DocumentDeliveryFailure::Wake(_))));
+    lock(&shared.state).delivery_failure = None;
+    lock(&shared.requests).phase = ShutdownPhase::Drain;
+    let Err(TrySendError::Disconnected(request)) = worker.try_submit(*request) else {
+        panic!("ordinary sender cannot enter the private shutdown lane")
+    };
+    lock(&shared.requests).phase = ShutdownPhase::SourcesReleased;
+    let Err(TrySendError::Disconnected(request)) = worker.try_submit(*request) else {
+        panic!("released sources cannot regain ordinary admission")
+    };
+    shared.close_requests();
+    let Err(TrySendError::Disconnected(request)) = worker.try_submit(*request) else {
+        panic!("actual closure remains Disconnected")
+    };
+    let DocumentRequest::OpenRaw { path, generation, .. } = &*request else { panic!("same refused OpenRaw") };
+    assert_eq!(path.as_os_str().as_encoded_bytes().as_ptr(), path_identity);
+    assert_eq!(*generation, 19);
+    // Test-only, OFF-UI disposal of the original unstarted carrier. No runtime
+    // failure ACK/retry or shutdown permission is invented by this control.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let mut state = lock(&shared.state);
+                state.slot = None;
+                state.in_flight = false;
+                state.retire_requested = false;
+                drop(state);
+                drop((request, inbox, worker, receiver, shared));
+            })
+            .join()
+            .unwrap()
+    });
+    assert_eq!(budget.retained_bytes(), baseline);
+}
+
+#[test]
+fn result_transport_complete_disposal_keeps_exact_full_through_old_first_error_retirement() {
+    use crate::workspace::workspace_document::WorkspaceDocumentAcceptError;
+    for earlier_refusal in [false, true] {
+        let deadline = Instant::now() + LIMIT;
+        let await_phase = |shared: &Shared, predicate: fn(&State) -> bool| {
+            let state = lock(&shared.state);
+            let (state, _) = shared
+                .changed
+                .wait_timeout_while(state, deadline.saturating_duration_since(Instant::now()), |state| {
+                    !predicate(state)
+                })
+                .unwrap();
+            assert!(predicate(&state), "same absolute disposal control deadline expired");
+        };
+        let budget = AllocationBudget::new(crate::visual_rows::MAX_SESSION_BYTES);
+        let mut document = Box::new(Document::new());
+        document.buffer.insert(0, b"original source").unwrap();
+        let source_epoch = document.source_epoch;
+        let residual_box = &*document as *const Document as usize;
+        let (start, started) = mpsc::sync_channel(1);
+        let (entered, disposing) = mpsc::sync_channel(1);
+        let (release, held) = mpsc::sync_channel(1);
+        let (observed, delivered) = mpsc::sync_channel(1);
+        let progressed = Arc::new(AtomicUsize::new(0));
+        let progress = progressed.clone();
+        let (worker, mut receiver, shared) = harness_with_budget(
+            &budget,
+            || Ok(()),
+            move |shared, inbox| {
+                started.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+                shared.publish(DocumentResult::Indexed {
+                    document: super::super::DocumentId(1),
+                    revision: 0,
+                    result: Ok(document),
+                });
+                progress.fetch_add(1, Ordering::SeqCst);
+                let DocumentRequest::OpenRaw { document, revision, path, rows, generation } =
+                    inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap()
+                else {
+                    panic!("the same worker must receive the exact retained OpenRaw after retirement")
+                };
+                observed
+                    .try_send((
+                        document,
+                        revision,
+                        path.as_os_str().as_encoded_bytes().as_ptr() as usize,
+                        rows,
+                        generation,
+                    ))
+                    .unwrap();
+                assert!(matches!(
+                    inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                    Err(mpsc::RecvTimeoutError::Disconnected)
+                ));
+                shared.publish(DocumentResult::Stopped(Ok(())));
+            },
+        );
+        let producer = lock(&shared.worker).as_ref().unwrap().thread().id();
+        let worker_identity = Arc::as_ptr(&shared);
+        *lock(&shared.retirement_disposal_gate) = Some(RetirementDisposalGate { entered, release: held, deadline });
+        let mut view = crate::View::new(None);
+        view.editor = None;
+        let mut workspace = crate::Workspace::new(view).unwrap();
+        assert!(workspace.replace_document_worker_for_transport_test(Some(worker)).is_none());
+        start.try_send(()).unwrap();
+        await_phase(&shared, |state| state.slot.is_some());
+        let delivery = receiver.info().unwrap().delivery().unwrap();
+        let first_error = if earlier_refusal {
+            let mut foreign = crate::Workspace::new(crate::View::new(None)).unwrap();
+            assert!(matches!(
+                receiver.accept_workspace(&mut foreign, &budget, true),
+                Err(DocumentResultSettlementReason::ConsumerRefused)
+            ));
+            let state = lock(&shared.state);
+            assert!(!state.retire_requested, "a real unaccepted refusal has no successful retirement proof");
+            assert!(matches!(state.commit_error.as_ref(), Some(WorkspaceDocumentAcceptError::ForeignWorkspace)));
+            Some(state.commit_error.as_ref().unwrap() as *const DocumentCommitError as usize)
+        } else {
+            None
+        };
+        let update = receiver.accept_workspace(&mut workspace, &budget, true).unwrap().unwrap();
+        drop(update);
+        let observation = disposing.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+        assert_eq!(observation.producer, producer);
+        assert_ne!(observation.producer, std::thread::current().id());
+        assert_eq!(observation.delivery, delivery);
+        assert_eq!(observation.residual_box, residual_box, "the original result Box stays in producer-owned disposal");
+        assert_eq!(Arc::as_ptr(&shared), worker_identity);
+        assert_eq!(workspace.editor().unwrap().document().source_epoch, source_epoch);
+        let mut bytes = Vec::new();
+        workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original source");
+        {
+            let state = lock(&shared.state);
+            assert!(state.in_flight && state.retire_requested && state.transfer_active);
+            assert!(state.slot.is_none(), "the owner is on the original producer, not in a second slot");
+            assert_eq!(
+                state.commit_error.as_ref().map(|error| error as *const DocumentCommitError as usize),
+                first_error
+            );
+        }
+        let worker = workspace.replace_document_worker_for_transport_test(None).unwrap();
+        assert!(matches!(&worker.tx, RequestSender::Bounded(original) if Arc::ptr_eq(original, &shared)));
+        let path = std::env::temp_dir().join("kwil-full-through-actual-disposal");
+        let path_identity = path.as_os_str().as_encoded_bytes().as_ptr() as usize;
+        let charged = budget.retained_bytes();
+        let attempts = budget.allocation_attempts();
+        let Err(TrySendError::Full(mut request)) = worker.try_submit(DocumentRequest::OpenRaw {
+            document: super::super::DocumentId(9),
+            revision: 0,
+            path,
+            rows: 3,
+            generation: 41,
+        }) else {
+            panic!("actual successful producer disposal must return exact Full even with an earlier first error")
+        };
+        assert_eq!(progressed.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.retained_bytes(), charged);
+        assert_eq!(budget.allocation_attempts(), attempts);
+        let closed = |request: Box<DocumentRequest>| match worker.try_submit(*request) {
+            Err(TrySendError::Disconnected(request)) => request,
+            _ => panic!("failure/retry/private phase must remain closed during completed disposal"),
+        };
+        for phase in [ShutdownPhase::Drain, ShutdownPhase::SourcesReleased] {
+            lock(&shared.requests).phase = phase;
+            request = closed(request);
+        }
+        lock(&shared.requests).phase = ShutdownPhase::Live;
+        lock(&shared.requests).failed = true;
+        request = closed(request);
+        lock(&shared.requests).failed = false;
+        lock(&shared.state).closed = true;
+        request = closed(request);
+        lock(&shared.state).closed = false;
+        lock(&shared.state).delivery_failure =
+            Some(DocumentDeliveryFailure::Wake(io::Error::other("retained terminal wake")));
+        request = closed(request);
+        lock(&shared.state).delivery_failure = None;
+        lock(&shared.state).retry_running = true;
+        request = closed(request);
+        lock(&shared.state).retry_running = false;
+        let retry = RetryControl {
+            deadline,
+            delivery,
+            generation: 1,
+            action: DocumentProducerAction::RetryWrap,
+            failure: None,
+        };
+        lock(&shared.state).retry = Some(retry);
+        request = closed(request);
+        lock(&shared.state).retry = None;
+        lock(&shared.state).retry_acknowledgement_required = Some(retry);
+        request = closed(request);
+        lock(&shared.state).retry_acknowledgement_required = None;
+        let Err(TrySendError::Full(request)) = worker.try_submit(*request) else {
+            panic!("the original healthy completed retirement remains Full after the negative phase controls")
+        };
+        let DocumentRequest::OpenRaw { path, generation, .. } = &*request else { panic!("original request retained") };
+        assert_eq!(path.as_os_str().as_encoded_bytes().as_ptr() as usize, path_identity);
+        assert_eq!(*generation, 41);
+        assert_eq!(
+            lock(&shared.state).commit_error.as_ref().map(|error| error as *const DocumentCommitError as usize),
+            first_error
+        );
+        assert!(!receiver.take_capacity_event(), "active disposal is not reusable capacity");
+        release.try_send(()).unwrap();
+        await_phase(&shared, |state| !state.in_flight);
+        *lock(&shared.retirement_disposal_gate) = None;
+        assert!(
+            lock(&shared.state).commit_error.is_none(),
+            "only the original producer retirement ACKs the earlier error"
+        );
+        assert!(receiver.take_capacity_event());
+        assert!(!receiver.take_capacity_event());
+        assert!(worker.try_submit(*request).is_ok());
+        assert_eq!(
+            delivered.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap(),
+            (super::super::DocumentId(9), 0, path_identity, 3, 41)
+        );
+        assert_eq!(progressed.load(Ordering::SeqCst), 1);
+        finish(receiver.stop(worker).unwrap(), |result| {
+            assert!(matches!(result, DocumentResult::Stopped(Ok(()))));
+            ControlFlow::Continue(())
+        });
+        assert_eq!(workspace.editor().unwrap().document().source_epoch, source_epoch);
+        assert!(budget.peak_bytes() <= crate::visual_rows::MAX_SESSION_BYTES);
+    }
 }
 
 fn stale_save_on_original_producer() -> (crate::Workspace, DocumentResultReceiver, Arc<Shared>, std::path::PathBuf) {

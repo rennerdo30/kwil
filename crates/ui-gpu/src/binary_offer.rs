@@ -308,6 +308,18 @@ mod tests {
         }
         panic!("binary GUI finite receipt count");
     }
+    fn document_admission_ready(app: &App) -> bool {
+        app.document.live.update.is_none()
+            && app.document.live.transport.as_ref().is_some_and(|transport| {
+                let status = transport.status();
+                !status.occupied
+                    && !status.closed
+                    && !status.worker_done
+                    && status.failure.is_none()
+                    && !status.retry_pending
+                    && !status.retry_acknowledgement_required
+            })
+    }
     fn host() -> (App, Receiver<UserEvent>, PathBuf, PathBuf, kwil_view_model::SessionDocumentId) {
         let (mut app, rx) = search_ui::host_dispatch_tests::host("prior editor");
         app.opts.hidden = true;
@@ -317,7 +329,7 @@ mod tests {
         std::fs::write(&path, BYTES).unwrap();
         app.start_document_at(Some(root.join("state")));
         assert!(app.document.live.transport.is_some());
-        until(&mut app, &rx, |a| a.view.recovery_ready());
+        until(&mut app, &rx, |a| a.view.recovery_ready() && document_admission_ready(a));
         (app, rx, root, path, prior)
     }
     fn open(app: &mut App, rx: &Receiver<UserEvent>, path: PathBuf) -> Offer {
@@ -325,7 +337,7 @@ mod tests {
         app.sync_file_ui();
         assert!(app.binary_pending());
         assert!(app.view.editor().is_none());
-        until(app, rx, |a| a.view.binary_offer().is_some());
+        until(app, rx, |a| a.view.binary_offer().is_some() && document_admission_ready(a));
         app.view.binary_offer().unwrap()
     }
     fn press(app: &mut App, key: Key) {

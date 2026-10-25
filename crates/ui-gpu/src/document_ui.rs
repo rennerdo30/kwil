@@ -785,7 +785,12 @@ pub(crate) mod fixtures {
                         Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
                     );
                 }
-                Err(reason) => panic!("retained original shutdown owner: {reason:?}"),
+                Err(reason) => {
+                    let scalars = failure.document_state_for_test();
+                    let inspection = failure.retained_document_error();
+                    let original = inspection.as_ref().and_then(|inspection| inspection.retained_commit_error());
+                    panic!("retained original shutdown owner: {reason:?}; scalars={scalars:?}; original={original:?}");
+                }
             }
         }
     }

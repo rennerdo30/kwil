@@ -14,6 +14,8 @@ mod hex_runtime;
 pub mod result_transport;
 #[cfg(test)]
 mod scheduler_tests;
+#[cfg(test)]
+mod source_barrier_flush_tests;
 pub(crate) use encoding_runtime::document_policy;
 pub mod provenance;
 pub mod retirement;
@@ -548,14 +550,39 @@ impl SourceBarrierTracker {
         // A barrier is a real flush trigger, not a new readiness timer. Later
         // receipts do not expand this target, so a younger Finish cannot form
         // a wait cycle with acknowledgement of this marker.
-        if !journal.failed && journal.barrier_durable_sequence.is_none_or(|durable| durable < target.sequence) {
-            journal.needs_flush = true;
-            journal.flush_due = std::time::Instant::now();
+        if !journal.failed {
+            let durable = journal.barrier_durable_sequence.is_some_and(|durable| durable >= target.sequence);
+            let flushing_target = journal.flush.as_ref().is_some_and(|(sequence, _)| *sequence >= target.sequence);
+            if !durable && !flushing_target {
+                journal.needs_flush = true;
+            }
+            // Drain an existing need immediately, including a redundant flush
+            // whose target was already durable. An adequate outstanding flush
+            // alone must not manufacture a second successor flush.
+            if journal.needs_flush {
+                journal.flush_due = std::time::Instant::now();
+            }
         }
     }
     fn record(&mut self, document: DocumentId, storage: Option<&mut Storage>) {
         if let Some(journal) = storage.and_then(|storage| storage.journals.get_mut(&document)) {
             self.record_journal(document, journal);
+        }
+    }
+    fn expedite_pending_flush(&self, document: DocumentId, storage: Option<&mut Storage>) {
+        if let Some(journal) = storage.and_then(|storage| storage.journals.get_mut(&document))
+            && !journal.failed
+            && journal.needs_flush
+            && self
+                .targets
+                .iter()
+                .flatten()
+                .any(|target| target.document == document && target.generation == journal.generation)
+        {
+            // Accepted younger work may create a need after marker capture.
+            // Advance only that existing need; never expand the fixed target,
+            // replace its receiver, or manufacture a successor obligation.
+            journal.flush_due = std::time::Instant::now();
         }
     }
     fn ready(&self, storage: Option<&Storage>) -> bool {
@@ -565,7 +592,9 @@ impl SourceBarrierTracker {
                     journal.failed
                         || journal.generation != target.generation
                         || (journal.ready
-                            && journal.barrier_durable_sequence.is_some_and(|sequence| sequence >= target.sequence))
+                            && journal.barrier_durable_sequence.is_some_and(|sequence| sequence >= target.sequence)
+                            && journal.flush.is_none()
+                            && !journal.needs_flush)
                 })
             })
     }
@@ -693,14 +722,11 @@ impl DocumentWorker {
             let request =
                 DocumentRequest::Journal { document, receipt, path: path.clone(), first_sequence, generation, policy };
             let gate = sender.lock_sender();
-            let delivered = match gate.get() {
-                Some(sender) => sender.try_send(request),
-                None => Err(TrySendError::Disconnected(request)),
-            };
+            let delivered = gate.try_send(request);
             drop(gate);
             match delivered {
-                Ok(()) => Ok(()),
-                Err(
+                std::ops::ControlFlow::Continue(()) => Ok(()),
+                std::ops::ControlFlow::Break(
                     TrySendError::Full(DocumentRequest::Journal { receipt, .. })
                     | TrySendError::Disconnected(DocumentRequest::Journal { receipt, .. }),
                 ) => {
@@ -1154,7 +1180,11 @@ impl DocumentWorker {
                         }
                         DocumentRequest::SessionTimer => {
                             if session_due.is_none() {
-                                session_due = Some(std::time::Instant::now() + Duration::from_secs(2));
+                                let now = std::time::Instant::now();
+                                // A pending marker drains accepted checkpoint work;
+                                // younger requests must not restart its debounce.
+                                session_due =
+                                    Some(if source_barrier.is_some() { now } else { now + Duration::from_secs(2) });
                             }
                         }
                         DocumentRequest::Recover { tab } => {
@@ -1396,6 +1426,11 @@ impl DocumentWorker {
                                         policy,
                                     )
                                 });
+                            if result.is_ok()
+                                && let Some(barrier) = &source_barrier
+                            {
+                                barrier.expedite_pending_flush(document, storage.as_mut());
+                            }
                             capacity.fetch_add(1, std::sync::atomic::Ordering::Release);
                             complete(DocumentResult::JournalQueued { document, revision, sequence, result });
                         }
@@ -1549,12 +1584,13 @@ impl DocumentWorker {
             return Err(TrySendError::Full(Box::new(request)));
         }
         let gate = self.tx.lock_sender();
-        let delivered = match gate.get() {
-            Some(sender) => sender.try_send(request),
-            None => Err(TrySendError::Disconnected(request)),
-        };
+        let delivered = gate.try_send(request);
         drop(gate);
-        delivered.map_err(|error| match error {
+        let error = match delivered {
+            std::ops::ControlFlow::Continue(()) => return Ok(()),
+            std::ops::ControlFlow::Break(error) => error,
+        };
+        Err(match error {
             TrySendError::Full(request) => {
                 if receipt_credit {
                     self.journal_capacity.fetch_add(1, std::sync::atomic::Ordering::Release);

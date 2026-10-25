@@ -1025,6 +1025,16 @@ impl Workspace {
             self.pump_files();
             self.pump_hex();
         }
+        if !self.files.document_shutdown
+            && matches!(commit.info.kind, ResultKind::RawReopened | ResultKind::HexPage | ResultKind::HexEdited)
+        {
+            // These specialized finishers restored the exact Editor above.
+            // Retry the latest viewport, not the completed/stale page, through
+            // the existing live lane. Checkpoint policy stays with its original
+            // owners; bound shutdown uses only its private continuation permit.
+            self.pump_files();
+            self.pump_hex();
+        }
         // The update keeps the actual bounded row allocation and its charge;
         // preserve copy/exposed-row semantics instead of widening damage.
         if commit.damage.rows.capacity() > 8192 {

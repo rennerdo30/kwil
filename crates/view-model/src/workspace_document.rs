@@ -969,6 +969,14 @@ impl WorkspaceDocumentTransport {
             return Ok(None);
         }
         let damage = workspace.flush_receipts();
+        if !workspace.files.document_shutdown {
+            // Only the consumed producer capacity generation authorizes this
+            // bounded retry. An empty receive alone never pumps model work.
+            // Existing live metadata includes bounded map growth/loan controls;
+            // no additional request/result cell or source owner is introduced.
+            workspace.pump_files();
+            workspace.pump_hex();
+        }
         Ok(Some(WorkspaceDocumentUpdate { damage, replacement: None, barrier: None, _charge: charge }))
     }
     /// A scalar harness inspection never takes the result out of its slot.

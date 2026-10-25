@@ -247,6 +247,21 @@ impl Failure {
             .or_else(|| self.logs.as_ref().and_then(|host| host.panic_payload()))
             .or_else(|| self.search_worker.as_ref().and_then(|worker| worker.panic_payload()))
     }
+    #[cfg(test)]
+    pub(super) fn document_state_for_test(&self) -> (
+        bool,
+        Option<kwil_view_model::document_worker::DocumentResultTransportStatus>,
+        Option<kwil_view_model::workspace_document::ResultInfo>,
+    ) {
+        let (status, info) = if let Some(bundle) = &self.bound {
+            (Some(bundle.status()), bundle.result_info())
+        } else if let Some(transport) = &self.live.transport {
+            (Some(transport.status()), transport.result_info())
+        } else {
+            (None, None)
+        };
+        (self.document_complete, status, info)
+    }
     pub fn retained_document_error(
         &self,
     ) -> Option<kwil_view_model::document_worker::result_transport::DocumentResultInspection<'_>> {

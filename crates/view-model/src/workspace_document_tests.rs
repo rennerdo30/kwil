@@ -60,6 +60,266 @@ fn setup(
         .unwrap();
     (transport, ready)
 }
+
+// Test-only synchronous interleave: the ORIGINAL worker pauses in its real
+// owner-free wake, outside transport locks. Both result and retirement-capacity
+// wakes are acknowledged explicitly under ONE existing LIMIT deadline.
+struct HeldLiveLane {
+    transport: WorkspaceDocumentTransport,
+    ready: Receiver<()>,
+    resume: mpsc::SyncSender<()>,
+    held: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Instant,
+    last_result: Option<ResultInfo>,
+}
+impl HeldLiveLane {
+    fn start(workspace: &mut Workspace, budget: &AllocationBudget, root: PathBuf) -> Self {
+        let deadline = Instant::now() + LIMIT;
+        let (wake, ready) = mpsc::sync_channel(8);
+        let (resume, paused) = mpsc::sync_channel(1);
+        let paused = std::sync::Mutex::new(paused);
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hold = held.clone();
+        let transport = workspace
+            .start_bounded_document_worker_at(Some(root), budget, move || {
+                match wake.try_send(()) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+                    Err(error @ mpsc::TrySendError::Disconnected(())) => return Err(io::Error::other(error)),
+                }
+                if hold.load(Ordering::Acquire) {
+                    paused
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .map_err(io::Error::other)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        Self { transport, ready, resume, held, deadline, last_result: None }
+    }
+    fn receive(&mut self, workspace: &mut Workspace, stage: &'static str) -> Option<ResultInfo> {
+        self.ready
+            .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                let id = workspace.active_id();
+                let session = workspace.hex_session().map(|session| {
+                    (session.source(), session.input_epoch(), session.view().top(), session.view().cursor(), session.busy())
+                });
+                panic!(
+                    "held-live stage={stage} original result/capacity wake under the shared deadline: {error:?}; last_result={:?} current_result={:?} transport={:?} active={id:?} document_busy={} editor_present={} observer_present={} seeded={} durable={:?} queue_len={} session(source,input_epoch,top,cursor,busy)={session:?}",
+                    self.last_result,
+                    self.transport.result_info(),
+                    self.transport.status(),
+                    workspace.document_busy(id),
+                    workspace.editor().is_some(),
+                    workspace.files.observed.contains_key(&id),
+                    workspace.files.seeded.contains(&id),
+                    workspace.files.durable.get(&id),
+                    workspace.files.queue.len(),
+                )
+            });
+        let info = self.transport.result_info();
+        if info.is_some() {
+            self.last_result = info;
+        }
+        let update = self.transport.receive(workspace, true).expect("actual sealed live acceptance");
+        if let Some(update) = update {
+            std::hint::black_box(update.damage());
+        }
+        info
+    }
+    fn resume(&self) {
+        self.resume.try_send(()).expect("one acknowledgement of the held real wake");
+    }
+    fn until(
+        &mut self,
+        workspace: &mut Workspace,
+        stage: &'static str,
+        done: impl Fn(&Workspace, Option<ResultInfo>, &Self) -> bool,
+    ) {
+        for _ in 0..512 {
+            let info = self.receive(workspace, stage);
+            if done(workspace, info, self) {
+                return; // Keep this exact wake held for the caller's assertions.
+            }
+            self.resume();
+        }
+        panic!(
+            "held-live stage={stage} finite actual sealed result/capacity sequence; last_result={:?}",
+            self.last_result
+        );
+    }
+    fn flush_after_indexed(&mut self, workspace: &mut Workspace, id: DocumentId, stage: &'static str) {
+        self.until(workspace, stage, |workspace, info, _| {
+            info.is_some_and(|info| info.kind == ResultKind::Indexed && info.document == Some(id))
+                && workspace.editor().is_some()
+                && workspace.files.observed.contains_key(&id)
+        });
+        assert_eq!(workspace.active_id(), id);
+        assert_eq!(
+            workspace.editor().unwrap().document().hex_source(id.0),
+            workspace.hex_session().unwrap().source().unwrap(),
+            "the addressed original raw source is installed before flushing its seed"
+        );
+        assert!(workspace.files.seeded.contains(&id));
+        // Initial seeding normally schedules its flush two seconds AFTER this
+        // fixture's two-second absolute deadline has already started. Submit
+        // ONE explicit flush behind the existing SeedJournal, preserving the
+        // real durability receipt and the original final readiness predicate.
+        workspace.files.queue.push_back(DocumentRequest::FlushJournals);
+        workspace.pump_files();
+        self.resume();
+    }
+    fn finish(self, workspace: Workspace) {
+        self.held.store(false, Ordering::Release);
+        self.resume();
+        finish_saved_workspace_until(workspace, self.transport, self.deadline);
+    }
+}
+
+#[test]
+fn workspace_document_live_fence_retains_open_raw_until_real_capacity_and_empty_receive_cannot_pump() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("retained.bin");
+    let original = b"physical\0bytes\x01\n";
+    std::fs::write(&path, original).unwrap();
+    let budget = AllocationBudget::new(crate::visual_rows::MAX_SESSION_BYTES);
+    let mut workspace = workspace();
+    let mut lane = HeldLiveLane::start(&mut workspace, &budget, scratch.0.join("recovery"));
+    lane.until(&mut workspace, "retained-open/prepare", |workspace, info, _| {
+        workspace.recovery_ready() && info.is_some_and(|info| info.kind == ResultKind::Prepared)
+    });
+    assert!(lane.transport.status().occupied, "Prepared residual is still owned by the held producer");
+    let (id, _) = workspace.open_hex_path(path.clone(), 3).unwrap();
+    let request_path = workspace
+        .files
+        .queue
+        .iter()
+        .find_map(|request| match request {
+            DocumentRequest::OpenRaw { document, path, .. } if *document == id => Some(path),
+            _ => None,
+        })
+        .expect("temporary Live Full must retain OpenRaw, not drop it as disconnected");
+    let identity = request_path.as_os_str().as_encoded_bytes().as_ptr();
+    assert_eq!(request_path, &path);
+    assert!(workspace.document_busy(id));
+    assert!(workspace.editor().is_none());
+    assert!(!workspace.notice().contains("disconnected"));
+    assert!(lane.transport.receive(&mut workspace, true).unwrap().is_none());
+    assert!(workspace.files.queue.iter().any(|request| matches!(request,
+        DocumentRequest::OpenRaw { document, path, .. }
+            if *document == id && path.as_os_str().as_encoded_bytes().as_ptr() == identity)));
+    lane.resume();
+    assert!(
+        lane.receive(&mut workspace, "retained-open/retirement-capacity").is_none(),
+        "next real wake is successful producer retirement capacity"
+    );
+    assert!(
+        !workspace.files.queue.iter().any(|request| matches!(request,
+        DocumentRequest::OpenRaw { document, .. } if *document == id)),
+        "capacity must admit the retained open"
+    );
+
+    // This new scalar marker has no capacity generation of its own. Repeated
+    // empty receives must leave it in the ORIGINAL queue without pumping.
+    workspace.files.queue.push_back(DocumentRequest::ReleaseReopen { document: id, generation: u64::MAX });
+    let queued = workspace.files.queue.len();
+    let charged = budget.retained_bytes();
+    for _ in 0..2 {
+        assert!(lane.transport.receive(&mut workspace, true).unwrap().is_none());
+        assert_eq!(workspace.files.queue.len(), queued);
+        assert!(matches!(
+            workspace.files.queue.back(),
+            Some(DocumentRequest::ReleaseReopen { generation: u64::MAX, .. })
+        ));
+        assert_eq!(budget.retained_bytes(), charged);
+    }
+    assert!(matches!(
+        workspace.files.queue.pop_back(),
+        Some(DocumentRequest::ReleaseReopen { generation: u64::MAX, .. })
+    ));
+    lane.resume();
+    lane.flush_after_indexed(&mut workspace, id, "retained-open/addressed-index-and-seed");
+    lane.until(&mut workspace, "retained-open/page-and-explicit-durability", |workspace, _, lane| {
+        !lane.transport.status().occupied
+            && !workspace.document_busy(id)
+            && workspace.recovery_notice().is_none()
+            && workspace.hex_session().is_some_and(|session| session.row(workspace.hex_source(), 0).is_some())
+    });
+    let mut bytes = Vec::new();
+    workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+    assert_eq!(bytes, original);
+    assert_eq!(std::fs::read(path).unwrap(), original);
+    assert!(budget.peak_bytes() <= crate::visual_rows::MAX_SESSION_BYTES);
+    lane.finish(workspace);
+}
+
+#[test]
+fn workspace_document_sealed_stale_hex_page_queues_latest_without_cursor_selection_or_source_rewind() {
+    use crate::hex_session::Input;
+    let scratch = Scratch::new();
+    let path = scratch.0.join("latest-page.bin");
+    let mut original = vec![b'x'; 1024];
+    original[2] = 0;
+    std::fs::write(&path, &original).unwrap();
+    let budget = AllocationBudget::new(crate::visual_rows::MAX_SESSION_BYTES);
+    let mut workspace = workspace();
+    let mut lane = HeldLiveLane::start(&mut workspace, &budget, scratch.0.join("recovery"));
+    lane.until(&mut workspace, "latest-page/prepare-retirement", |workspace, _, lane| {
+        workspace.recovery_ready() && !lane.transport.status().occupied
+    });
+    let (id, _) = workspace.open_hex_path(path.clone(), 3).unwrap();
+    lane.resume();
+    lane.flush_after_indexed(&mut workspace, id, "latest-page/addressed-index-and-seed");
+    lane.until(&mut workspace, "latest-page/open-page-and-explicit-durability", |workspace, _, lane| {
+        !lane.transport.status().occupied
+            && !workspace.document_busy(id)
+            && workspace.recovery_notice().is_none()
+            && workspace.hex_session().is_some_and(|session| session.row(workspace.hex_source(), 0).is_some())
+    });
+    let source = workspace.hex_source().unwrap();
+    for input in
+        [Input::Move { bytes: 33, extend: false }, Input::Scroll(1), Input::End { document: true, extend: true }]
+    {
+        let epoch = workspace.hex_session().unwrap().input_epoch();
+        workspace.hex_input(source, epoch, input).unwrap();
+    }
+    assert!(workspace.document_busy(id));
+    let latest = workspace.hex_session().unwrap().page_request().unwrap();
+    assert_eq!(workspace.hex_session().unwrap().view().cursor(), 1024);
+    assert_eq!(workspace.hex_session().unwrap().view().selection(), 33..1024);
+    lane.resume();
+    lane.until(&mut workspace, "latest-page/stale-completion", |_, info, _| {
+        info.is_some_and(|info| info.kind == ResultKind::HexPage)
+    });
+    assert_eq!(workspace.hex_source(), Some(source));
+    let session = workspace.hex_session().unwrap();
+    assert_eq!(session.page_request(), Some(latest));
+    assert_eq!(session.view().cursor(), 1024, "stale completion cannot rewind scalar navigation");
+    assert_eq!(session.view().selection(), 33..1024);
+    assert!(workspace.document_busy(id), "sealed FollowUp must submit the latest page after restoring the old loan");
+    assert!(workspace.editor().is_none(), "only the original Editor is lent to the latest page");
+    lane.resume();
+    lane.until(&mut workspace, "latest-page/latest-completion-and-retirement", |workspace, _, lane| {
+        !lane.transport.status().occupied
+            && !workspace.document_busy(id)
+            && workspace.recovery_notice().is_none()
+            && workspace.hex_session().is_some_and(|session| session.rows(workspace.hex_source()).len() == latest.rows)
+    });
+    let session = workspace.hex_session().unwrap();
+    assert_eq!(workspace.hex_source(), Some(source));
+    assert_eq!(session.view().cursor(), 1024);
+    assert_eq!(session.view().selection(), 33..1024);
+    assert_eq!(session.row(Some(source), 0).unwrap().offset, latest.top * 16);
+    let mut bytes = Vec::new();
+    workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+    assert_eq!(bytes, original);
+    assert_eq!(std::fs::read(path).unwrap(), original);
+    assert!(budget.peak_bytes() <= crate::visual_rows::MAX_SESSION_BYTES);
+    lane.finish(workspace);
+}
+
 fn receive(transport: &mut WorkspaceDocumentTransport, ready: &Receiver<()>) -> DocumentResult {
     // An owner-free wake is emitted AFTER the sole slot has been filled.
     ready.recv_timeout(LIMIT).expect("bounded document wake");

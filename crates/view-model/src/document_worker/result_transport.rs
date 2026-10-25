@@ -829,7 +829,25 @@ impl RequestSender {
     pub(super) fn lock_sender(&self) -> SenderGuard<'_> {
         match self {
             Self::Legacy(sender) => SenderGuard(SenderGuardInner::Legacy(sender)),
-            Self::Bounded(shared) => SenderGuard(SenderGuardInner::Bounded(lock(&shared.requests))),
+            Self::Bounded(shared) => {
+                // Follow the transport's state -> requests lock order. Only a
+                // successfully accepted residual awaiting producer retirement
+                // is temporary Full. Live accept sets retire_requested only
+                // after verifying Partial::Complete; refusal/unwind/reset leave
+                // it false. This proof survives producer-owned disposal and
+                // retirement of an earlier first error, while transfer_active
+                // is true and the residual no longer occupies the shared slot.
+                let state = lock(&shared.state);
+                let gate = lock(&shared.requests);
+                let retirement_pending = state.retire_requested
+                    && state.in_flight
+                    && state.failure().is_none()
+                    && !state.closed
+                    && !state.retry_running
+                    && state.retry.is_none()
+                    && state.retry_acknowledgement_required.is_none();
+                SenderGuard(SenderGuardInner::Bounded { gate, retirement_pending })
+            }
         }
     }
     pub(super) fn close_bounded(&self) {
@@ -842,13 +860,40 @@ impl RequestSender {
 pub(super) struct SenderGuard<'a>(SenderGuardInner<'a>);
 enum SenderGuardInner<'a> {
     Legacy(&'a SyncSender<DocumentRequest>),
-    Bounded(MutexGuard<'a, RequestGate>),
+    // Stack-only classification; Shared::new accounts the actual guard size.
+    Bounded { gate: MutexGuard<'a, RequestGate>, retirement_pending: bool },
 }
 impl SenderGuard<'_> {
-    pub(super) fn get(&self) -> Option<&SyncSender<DocumentRequest>> {
+    pub(super) fn try_send(&self, request: DocumentRequest) -> ControlFlow<TrySendError<DocumentRequest>, ()> {
+        // Keep the existing unboxed carrier/return overlap: this is a checked
+        // representation change, without a new owner cell or reservation.
+        const {
+            assert!(
+                size_of::<ControlFlow<TrySendError<DocumentRequest>, ()>>()
+                    == size_of::<Result<(), TrySendError<DocumentRequest>>>()
+            );
+        }
         match &self.0 {
-            SenderGuardInner::Legacy(sender) => Some(sender),
-            SenderGuardInner::Bounded(gate) => gate.sender.as_ref().filter(|_| gate.accepting),
+            SenderGuardInner::Legacy(sender) => match sender.try_send(request) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(error) => ControlFlow::Break(error),
+            },
+            SenderGuardInner::Bounded { gate, retirement_pending } => {
+                if let Some(sender) = gate.sender.as_ref().filter(|_| gate.accepting) {
+                    match sender.try_send(request) {
+                        Ok(()) => ControlFlow::Continue(()),
+                        Err(error) => ControlFlow::Break(error),
+                    }
+                } else if *retirement_pending
+                    && gate.phase == ShutdownPhase::Live
+                    && gate.sender.is_some()
+                    && !gate.failed
+                {
+                    ControlFlow::Break(TrySendError::Full(request))
+                } else {
+                    ControlFlow::Break(TrySendError::Disconnected(request))
+                }
+            }
         }
     }
 }
@@ -1117,6 +1162,8 @@ pub(super) struct Shared {
     wake_failure_gate: Mutex<Option<tests::WakeFailureGate>>,
     #[cfg(test)]
     publication_gate: Mutex<Option<tests::PublicationGate>>,
+    #[cfg(test)]
+    retirement_disposal_gate: Mutex<Option<tests::RetirementDisposalGate>>,
     _charge: AllocationCharge,
     budget: AllocationBudget,
     worker_id: u64,
@@ -1236,6 +1283,8 @@ impl Shared {
             wake_failure_gate: Mutex::new(None),
             #[cfg(test)]
             publication_gate: Mutex::new(None),
+            #[cfg(test)]
+            retirement_disposal_gate: Mutex::new(None),
             _charge: charge,
             budget: budget.clone(),
             worker_id,
@@ -1481,6 +1530,8 @@ impl Shared {
                 let residual = state.slot.take();
                 state.transfer_active = true;
                 drop(state);
+                #[cfg(test)]
+                tests::hold_retirement_disposal(self, residual.as_ref());
                 // The source owner never passes to a UI destructor. This is
                 // the original producer retiring its own completed residual.
                 drop(residual);
