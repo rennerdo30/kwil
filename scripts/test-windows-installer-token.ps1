@@ -256,7 +256,8 @@ public static class KwilTokenProof {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr process,uint code);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
 
-    static Exception Error(string api) { int e=Marshal.GetLastWin32Error();
+    static Exception Error(string api) { return Error(api,Marshal.GetLastWin32Error()); }
+    static Exception Error(string api,int e) {
         return new Win32Exception(e,api+" error="+e+(e==1314?"; FAIL/design-fork: privilege not held, no retry":"; refusal, no retry")); }
     static void Require(bool value,string reason) { if(!value) throw new InvalidOperationException("FAIL/design-fork: "+reason); }
     static void Close(ref IntPtr handle) { if(handle!=IntPtr.Zero) {
@@ -271,18 +272,130 @@ public static class KwilTokenProof {
         internal Token(IntPtr handle) { Require(handle!=IntPtr.Zero,"null token handle"); Handle=handle; }
         public void Dispose() { Close(ref Handle); }
     }
+    internal delegate bool InfoQuery(IntPtr token,int kind,IntPtr data,uint bytes,out uint needed,out int error);
+    static bool NativeInfoQuery(IntPtr token,int kind,IntPtr data,uint bytes,out uint needed,out int error) {
+        bool ok=GetTokenInformation(token,kind,data,bytes,out needed);
+        error=Marshal.GetLastWin32Error(); // Capture before allocation, validation or disposal.
+        return ok;
+    }
+    static uint FixedInfoBytes(int kind) {
+        // Cached SDK 10.0.26100.0 winnt.h: TOKEN_ELEVATION is one DWORD;
+        // TOKEN_ELEVATION_TYPE and TokenSessionId are 4 bytes, STATISTICS is
+        // 56 bytes, LINKED_TOKEN is one HANDLE (8 on the admitted x64/ARM64 ABI).
+        // USER / GROUPS / MANDATORY_LABEL / LOGON_SID include variable SID data.
+        switch(kind) {
+            case 10: return 56;
+            case 12: case 18: case 20: return 4;
+            case 19: return 8;
+            case 1: case 2: case 25: case 28: return 0;
+            default: throw new InvalidOperationException("unsupported token information class="+kind);
+        }
+    }
     sealed class Info : IDisposable {
         internal IntPtr Data; internal uint Length;
-        internal Info(IntPtr token,int kind) {
-            uint n; bool ok=GetTokenInformation(token,kind,IntPtr.Zero,0,out n); int error=Marshal.GetLastWin32Error();
-            Require(!ok && error==122 && n>0 && n<=MaxTokenBytes,"GetTokenInformation size class="+kind+" error="+error);
+        internal Info(IntPtr token,int kind) : this(token,kind,NativeInfoQuery) { }
+        internal Info(IntPtr token,int kind,InfoQuery query) {
+            uint n=FixedInfoBytes(kind);
+            if(n==0) {
+                // ROOT's hosted run 40183935867 failed class 20's zero-size
+                // probe with ERROR_BAD_LENGTH (24), before any worker launch.
+                // ROOT reference: MS Learn GetTokenInformation, recorded in
+                // kwil-token-preflight-native-r1/FAILURE.md (required length,
+                // not a universal promise of ERROR_INSUFFICIENT_BUFFER).
+                // GetTokenInformation does not promise universal error 122:
+                // fixed classes bypass probing, not validation. Variable
+                // classes retain the strict expected sizing-error contract.
+                int error; bool ok=query(token,kind,IntPtr.Zero,0,out n,out error);
+                Require(!ok,"GetTokenInformation probe unexpectedly succeeded class="+kind+" length="+n);
+                uint minimum=(kind==1 || kind==25)?16U:4U;
+                if(error!=122 || n<minimum || n>MaxTokenBytes)
+                    throw Error("GetTokenInformation size class="+kind+" length="+n,error);
+            }
             Data=Marshal.AllocHGlobal(checked((int)n));
-            try { if(!GetTokenInformation(token,kind,Data,n,out Length)) throw Error("GetTokenInformation class="+kind);
-                Require(Length>0 && Length<=n,"token information size changed"); }
+            try {
+                int error;
+                if(!query(token,kind,Data,n,out Length,out error))
+                    throw Error("GetTokenInformation class="+kind+" capacity="+n+" length="+Length,error);
+                Require(Length>0 && Length<=n,"token information size changed");
+                Require(Length==n,"GetTokenInformation inconsistent/short return class="+kind+" expected="+n+" length="+Length);
+            }
             catch { Dispose(); throw; }
         }
         internal void AtLeast(int bytes) { Require(Length>=bytes,"short token information"); }
         public void Dispose() { if(Data!=IntPtr.Zero) { Marshal.FreeHGlobal(Data); Data=IntPtr.Zero; } }
+    }
+    sealed class MockInfoQuery {
+        internal int Kind, Calls, Probes, Reads, ProbeError=122, ReadError;
+        internal uint ProbeLength=64, ReadLength=64, Capacity;
+        internal bool ProbeSuccess, ReadSuccess=true;
+        internal bool Query(IntPtr token,int kind,IntPtr data,uint bytes,out uint needed,out int error) {
+            Require(token==new IntPtr(101) && kind==Kind,"mock token information identity changed");
+            Calls++;
+            if(bytes==0) {
+                Require(data==IntPtr.Zero,"mock non-null zero-size probe"); Probes++;
+                needed=ProbeLength; error=ProbeError; return ProbeSuccess;
+            }
+            Require(data!=IntPtr.Zero && bytes<=MaxTokenBytes,"mock read allocation/capacity bound");
+            Reads++; Capacity=bytes; needed=ReadLength; error=ReadError; return ReadSuccess;
+        }
+    }
+    static void RefuseInfo(MockInfoQuery mock,int nativeError,int probes,int reads) {
+        bool refused=false;
+        try { using(var info=new Info(new IntPtr(101),mock.Kind,mock.Query)) { } }
+        catch(Win32Exception e) { Require(nativeError>=0 && e.NativeErrorCode==nativeError,"mock lost original Win32 error"); refused=true; }
+        catch(InvalidOperationException) { Require(nativeError<0,"mock substituted a policy error for the original Win32 error"); refused=true; }
+        Require(refused && mock.Probes==probes && mock.Reads==reads && mock.Calls==probes+reads,
+            "mock buffer failure accepted or retried");
+    }
+    public static void CheckInfoBufferOracles() {
+        // Injected calls only: no token/native APIs. A zero-size fixed-class
+        // probe returns the observed error 24; every fixed read must bypass it.
+        var badLengthProbe=new MockInfoQuery { Kind=20,ProbeError=24,ProbeLength=4 };
+        uint needed; int error;
+        Require(!badLengthProbe.Query(new IntPtr(101),20,IntPtr.Zero,0,out needed,out error) && needed==4 && error==24,
+            "fixed zero-size probe fixture did not reproduce the hosted error");
+        // SDK expectations are independent of the production size selector.
+        int[,] fixedCases={ {10,56},{12,4},{18,4},{19,8},{20,4} };
+        for(int row=0;row<fixedCases.GetLength(0);row++) {
+            int kind=fixedCases[row,0]; uint size=checked((uint)fixedCases[row,1]);
+            var fixedRead=new MockInfoQuery { Kind=kind,ProbeError=24,ProbeLength=size,ReadLength=size,ReadError=5 };
+            using(var info=new Info(new IntPtr(101),kind,fixedRead.Query)) {
+                Require(info.Length==size && fixedRead.Calls==1 && fixedRead.Probes==0 && fixedRead.Reads==1 && fixedRead.Capacity==size,
+                    "fixed ABI read was not exactly one correctly sized call");
+            }
+            // Last-error is meaningful only on API failure; a successful read
+            // above deliberately leaves stale error 5. Failed reads preserve it.
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadSuccess=false,ReadLength=size,ReadError=24 },24,0,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadSuccess=false,ReadLength=size,ReadError=5 },5,0,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadLength=0 },-1,0,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadLength=size-1 },-1,0,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadLength=size+1 },-1,0,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadLength=65537 },-1,0,1);
+        }
+        foreach(int kind in new int[] { 1,2,25,28 }) {
+            var variable=new MockInfoQuery { Kind=kind };
+            using(var info=new Info(new IntPtr(101),kind,variable.Query)) {
+                Require(info.Length==64 && variable.Probes==1 && variable.Reads==1 && variable.Calls==2 && variable.Capacity==64,
+                    "variable information did not use one bounded probe and read");
+            }
+            RefuseInfo(new MockInfoQuery { Kind=kind,ProbeError=24 },24,1,0);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ProbeError=5 },5,1,0);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ProbeSuccess=true },-1,1,0);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ProbeLength=0 },122,1,0);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ProbeLength=65537 },122,1,0);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ProbeLength=3 },122,1,0);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadLength=0 },-1,1,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadLength=63 },-1,1,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadLength=65 },-1,1,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadSuccess=false,ReadError=5 },5,1,1);
+            RefuseInfo(new MockInfoQuery { Kind=kind,ReadSuccess=false,ReadLength=128,ReadError=122 },122,1,1);
+        }
+        var cap=new MockInfoQuery { Kind=2,ProbeLength=65536,ReadLength=65536 };
+        using(var info=new Info(new IntPtr(101),2,cap.Query)) {
+            Require(info.Length==65536 && cap.Capacity==65536 && cap.Calls==2,"64KiB variable information bound changed");
+        }
+        RefuseInfo(new MockInfoQuery { Kind=1,ProbeLength=15 },122,1,0);
+        RefuseInfo(new MockInfoQuery { Kind=25,ProbeLength=15 },122,1,0);
     }
     static uint U32(IntPtr token,int kind) { using(var p=new Info(token,kind)) { p.AtLeast(4); return unchecked((uint)Marshal.ReadInt32(p.Data)); } }
     static string Sid(IntPtr pointer) {
@@ -616,6 +729,7 @@ public static class KwilTokenProof {
 '@
 
     [KwilTokenProof]::CheckLayout()
+    if ($Mode -ceq 'Driver') { [KwilTokenProof]::CheckInfoBufferOracles() }
     $current = [KwilTokenProof]::Current($Mode -ceq 'Driver')
     $report.baseline = [KwilTokenProof]::Measure($current)
     if ($Mode -ceq 'Worker') {
@@ -631,6 +745,7 @@ public static class KwilTokenProof {
         # Focused pure/mocked oracles are authored here, NOT claimed executed by
         # the source-only implementation job. They run only after hosted admission.
         $oracles = [Collections.Generic.List[string]]::new()
+        $oracles.Add('fixed-ABI-one-call-and-bounded-variable-info-buffers')
         Assert-TokenCase ((Get-LaunchAdmission 32000) -eq 2000) 'late admission did not cap to 2s'
         $refused = $false
         try { $null = Get-LaunchAdmission 30000 } catch { $refused = $true }
