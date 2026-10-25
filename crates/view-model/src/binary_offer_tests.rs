@@ -329,3 +329,5 @@ fn binary_offer_worker_duplicate_open_refusal_retains_the_original_offer_owner()
     assert!(file.try_close().is_ok(), "refused duplicate must not replace or leak the retained source");
     finish(worker, &rx);
 }
+
+include!("utf32_binary_offer_tests.rs");

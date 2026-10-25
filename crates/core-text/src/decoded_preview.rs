@@ -22,12 +22,12 @@ pub fn decode_preview(
     check_source(source)?;
     let bytes = source.bytes()?;
     let start = interpretation.bom_len as usize;
-    if start > bytes.len() || (start != 0 && !bytes.starts_with(bom(interpretation.encoding))) {
+    if start > bytes.len() || (start != 0 && !bytes.starts_with(interpretation.encoding.bom_bytes())) {
         return Err(BackingError::InvalidDescriptor);
     }
     let end = block_end(bytes, start, interpretation.encoding)?;
     let raw = &bytes[start..end];
-    let mut decoder = codec(interpretation.encoding).new_decoder_without_bom_handling();
+    let mut decoder = interpretation.encoding.decoder();
     let mut scratch = [0; SCRATCH];
     let mut at = 0;
     let mut text = Vec::with_capacity(raw.len());

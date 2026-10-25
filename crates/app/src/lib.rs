@@ -590,19 +590,37 @@ mod isolation_tests {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
-        std::fs::write(&path, [0, 0, 0xfe, 0xff, 0x41]).unwrap();
+        std::fs::write(&path, [0, 1, 0xfe, 0xff, 0x41]).unwrap();
         let mut view = initial_view(&path).expect("binary startup reaches the checked document worker");
         assert_eq!(view.file().unwrap().kind().unwrap(), kwil_core_text::FileKind::Binary);
-        assert!(
-            kwil_core_text::encoding::EncodedFile::new(view.file().unwrap().clone()).is_err(),
-            "fixture witnesses the old eager text-detection refusal"
-        );
+        assert_eq!(view.file().unwrap().bytes().unwrap(), [0, 1, 0xfe, 0xff, 0x41]);
         view.set_rows(2);
         assert!(view.editor().is_none());
         assert!(
             view.line(0).unwrap_or_default().is_empty(),
             "unclassified physical bytes cannot reach the paintable preview"
         );
+        drop(view);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cold_start_utf32_keeps_text_detection_and_worker_owned_decoding() {
+        let path = std::env::temp_dir().join(format!(
+            "kwil-startup-utf32-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, [0, 0, 0xfe, 0xff, 0, 0, 0, 0x41]).unwrap();
+        let mut view = initial_view(&path).expect("UTF-32 startup retains the checked worker input");
+        view.set_rows(2);
+        assert_eq!(view.file().unwrap().kind().unwrap(), kwil_core_text::FileKind::Text);
+        let detected = kwil_core_text::encoding::EncodedFile::new(view.file().unwrap().clone()).unwrap();
+        assert_eq!(detected.detection().encoding, kwil_core_text::encoding::Encoding::UTF32_BE);
+        assert_eq!(detected.detection().bom_len, 4);
+        assert!(view.editor().is_none());
+        assert!(view.line(0).unwrap_or_default().is_empty(), "startup cannot publish undecoded physical bytes");
+        drop(detected);
         drop(view);
         std::fs::remove_file(path).unwrap();
     }

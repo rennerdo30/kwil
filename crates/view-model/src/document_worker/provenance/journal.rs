@@ -130,7 +130,7 @@ impl RecoveryPolicy {
         {
             return Err(invalid("raw recovery policy forbids text/container transformations"));
         }
-        if self.bom && ![Encoding::UTF8, Encoding::UTF16_LE, Encoding::UTF16_BE].contains(&self.encoding) {
+        if self.bom && self.encoding.bom_bytes().is_empty() {
             return Err(invalid("BOM policy is invalid for recovery encoding"));
         }
         Ok(())
@@ -1887,4 +1887,5 @@ mod tests {
         state.abandon().unwrap();
         assert_eq!(fixture.count(), 0);
     }
+    include!("utf32_journal_tests.rs");
 }

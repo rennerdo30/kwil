@@ -882,10 +882,6 @@ pub(crate) fn validate_recovery_preserved(
     {
         return Err(invalid());
     }
-    let codec = encoding_rs::Encoding::for_label_no_replacement(encoding.name().as_bytes()).ok_or_else(invalid)?;
-    if codec == encoding_rs::ISO_2022_JP || codec == encoding_rs::REPLACEMENT {
-        return Err(invalid());
-    }
     let mut first = 0;
     while first < bytes.len() {
         check()?;
@@ -910,7 +906,7 @@ pub(crate) fn validate_recovery_preserved(
             return Err(invalid());
         }
         let atom_raw = &raw[start - base..end - base];
-        let mut decoder = codec.new_decoder_without_bom_handling();
+        let mut decoder = encoding.decoder();
         let mut scratch = [0u8; 16];
         for (i, byte) in atom_raw.iter().enumerate() {
             check()?;
@@ -1112,7 +1108,7 @@ struct ImportBuilder<'a> {
     raw: Vec<u8>,
     offsets: Vec<u8>,
     opaque_atoms: usize,
-    encoder: encoding_rs::Encoder,
+    encoder: crate::encoding::Encoder,
     tree: Tree,
     allocation: Option<&'a mut WorkerAllocation>,
     worker_cancel: Option<&'a std::sync::atomic::AtomicBool>,
@@ -1127,9 +1123,7 @@ impl<'a> ImportBuilder<'a> {
             raw: Vec::with_capacity(ADD_BLOCK),
             offsets: Vec::with_capacity(ADD_BLOCK),
             opaque_atoms: 0,
-            encoder: encoding_rs::Encoding::for_label_no_replacement(encoding.name().as_bytes())
-                .expect("validated stateless encoding")
-                .new_encoder(),
+            encoder: encoding.encoder(),
             tree: None,
             admission: None,
             allocation: None,
@@ -1203,17 +1197,8 @@ impl<'a> ImportBuilder<'a> {
     /// its existing add-byte accounting; comparison uses fixed scalar scratch.
     fn original_text(&mut self, text: &str, raw: &[u8]) -> io::Result<()> {
         let mut scratch = [0u8; 32];
-        let utf16 = self.encoding == Encoding::UTF16_LE || self.encoding == Encoding::UTF16_BE;
-        let canonical = if self.encoding == Encoding::UTF8 || text.is_ascii() && !utf16 {
+        let canonical = if self.encoding == Encoding::UTF8 || text.is_ascii() && self.encoding.ascii_compatible() {
             text.as_bytes() == raw
-        } else if utf16 {
-            let mut used = 0;
-            for unit in text.encode_utf16() {
-                let bytes = if self.encoding == Encoding::UTF16_LE { unit.to_le_bytes() } else { unit.to_be_bytes() };
-                scratch[used..used + 2].copy_from_slice(&bytes);
-                used += 2;
-            }
-            &scratch[..used] == raw
         } else {
             let (result, read, written) = self.encoder.encode_from_utf8_without_replacement(text, &mut scratch, false);
             matches!(result, encoding_rs::EncoderResult::InputEmpty) && read == text.len() && &scratch[..written] == raw
@@ -1528,6 +1513,15 @@ pub(crate) enum WorkerFault {
 impl WorkerAllocation {
     pub(crate) fn new(plan: crate::worker_edit::WorkerEditPlan) -> io::Result<Self> {
         use crate::worker_edit::{capacity, overflow};
+        // The existing fixed 1024-byte scratch reservation includes codec
+        // construction/move overlap and import headers. Keep that envelope
+        // honest as Encoding/Decoder gain inline variants; never raise the cap.
+        const _: () = assert!(
+            2 * std::mem::size_of::<ImportBuilder<'static>>()
+                + 2 * std::mem::size_of::<crate::encoding::Decoder>()
+                + 64
+                <= 1024
+        );
         let paths = plan.max_path_bytes.checked_mul(2).ok_or_else(overflow)?;
         let descriptor = (std::mem::size_of::<Storage>() + ARC_HEADER + std::mem::size_of::<Arc<Storage>>())
             .checked_add(paths)
@@ -3085,4 +3079,5 @@ mod spill_tests {
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists());
     }
+    include!("encoding/utf32_import_tests.rs");
 }

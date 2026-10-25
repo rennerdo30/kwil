@@ -175,17 +175,23 @@ mod tests {
     fn decoded_open_explicit_interpretation_recovers_ambiguous_bom() {
         let fixture = Fixture::new();
         let (path, file) = fixture.file(b"\xff\xfe\0\0");
-        assert!(
-            prepare_decoded_document(
-                path.clone(),
-                file.clone(),
-                None,
-                &fixture.0,
-                &AtomicBool::new(false),
-                |_| panic!("unsupported auto encoding must not paint editable data")
-            )
-            .is_err()
-        );
+        let automatic = prepare_decoded_document(
+            path.clone(),
+            file.clone(),
+            None,
+            &fixture.0,
+            &AtomicBool::new(false),
+            |preview| {
+                assert!(preview.text.is_empty());
+                assert_eq!(preview.source, 4..4);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(automatic.document.save_plan().encoding, Encoding::UTF32_LE);
+        assert_eq!(automatic.document.snapshot().len(), 0);
+        drop(automatic.document);
+        assert!(automatic.backing.try_retire().is_ok());
         let prepared = prepare_decoded_document(
             path,
             file,
@@ -229,4 +235,5 @@ mod tests {
         assert_eq!(checks.get(), 2, "cancelled index must stop at its first rejection");
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1, "all private backing files must retire");
     }
+    include!("utf32_decoded_tests.rs");
 }

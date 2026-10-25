@@ -702,4 +702,5 @@ mod tests {
         drop(logical_pin);
         assert!(pending.retry().is_ok());
     }
+    include!("utf32_compressed_tests.rs");
 }

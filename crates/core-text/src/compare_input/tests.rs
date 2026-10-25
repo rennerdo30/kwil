@@ -866,3 +866,5 @@ fn source_os_error_code_is_not_wrapped_or_converted_to_work_pending() {
         _ => panic!("original OS error must be returned as an error"),
     }
 }
+
+include!("../encoding/utf32_compare_tests.rs");

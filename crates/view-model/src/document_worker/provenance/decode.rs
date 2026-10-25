@@ -722,4 +722,5 @@ mod tests {
             assert!(sink.origins.is_empty());
         }
     }
+    include!("utf32_decode_tests.rs");
 }

@@ -1693,4 +1693,5 @@ mod tests {
         state.abandon().unwrap();
         fixture.assert_empty();
     }
+    include!("utf32_replay_tests.rs");
 }

@@ -462,7 +462,16 @@ impl TextFile {
 }
 
 fn detect_kind(bytes: &[u8]) -> FileKind {
-    if bytes.starts_with(b"\xef\xbb\xbf") || bytes.starts_with(b"\xff\xfe") || bytes.starts_with(b"\xfe\xff") {
+    if [
+        crate::encoding::Encoding::UTF32_LE,
+        crate::encoding::Encoding::UTF32_BE,
+        crate::encoding::Encoding::UTF8,
+        crate::encoding::Encoding::UTF16_LE,
+        crate::encoding::Encoding::UTF16_BE,
+    ]
+    .iter()
+    .any(|encoding| bytes.starts_with(encoding.bom_bytes()))
+    {
         return FileKind::Text;
     }
     const SAMPLE: usize = 64 << 10;

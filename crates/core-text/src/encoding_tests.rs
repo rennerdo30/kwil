@@ -28,7 +28,7 @@ impl Drop for TempDir {
 fn encode(text: &str, encoding: Encoding, bom: bool) -> Vec<u8> {
     let mut out = Vec::new();
     if bom {
-        out.extend_from_slice(encoding.bom());
+        out.extend_from_slice(encoding.bom_bytes());
     }
     if encoding.utf16() {
         for unit in text.encode_utf16() {
@@ -39,7 +39,8 @@ fn encode(text: &str, encoding: Encoding, bom: bool) -> Vec<u8> {
             });
         }
     } else {
-        let (bytes, _, errors) = encoding.0.encode(text);
+        let Codec::Rs(codec) = encoding.0 else { panic!("encoding_rs fixture oracle only") };
+        let (bytes, _, errors) = codec.encode(text);
         assert!(!errors);
         out.extend_from_slice(&bytes);
     }
@@ -75,7 +76,7 @@ fn roundtrip(label: &str, bom: bool, invalid: bool) {
     let detected = EncodedFile::new(file.clone()).unwrap();
     let encoded = if invalid { detected.reinterpret(Encoding::UTF8).unwrap() } else { detected };
     assert_eq!(encoded.detection.encoding, encoding);
-    assert_eq!(encoded.detection.bom_len, if bom { encoding.bom().len() } else { 0 });
+    assert_eq!(encoded.detection.bom_len, if bom { encoding.bom_bytes().len() } else { 0 });
     assert_eq!(encoded.detection.endings.style(), EndingStyle::Mixed);
     encoded.index_in_background(|r| r.unwrap()).join().unwrap();
     assert_eq!(encoded.progress().scanned, bytes.len() as u64);
@@ -191,8 +192,8 @@ fn checkpoints_and_split_multibyte_ranges() {
             let end = (at + 37).min(bytes.len());
             let decoded = source.decode_range(at as u64..end as u64).unwrap();
             assert!(!decoded.had_errors, "{label} checkpoint {at}");
-            let expected = encoding
-                .0
+            let Codec::Rs(codec) = encoding.0 else { panic!("encoding_rs fixture oracle only") };
+            let expected = codec
                 .decode_without_bom_handling_and_without_replacement(
                     &bytes[decoded.source.start as usize..decoded.source.end as usize],
                 )
@@ -414,7 +415,9 @@ fn review_explicit_override_recovers_ambiguous_utf32_detection() {
     let bytes = encode("\0Hello\r\n", Encoding::UTF16_LE, true);
     assert!(bytes.starts_with(b"\xff\xfe\0\0"));
     let file = dir.open("utf16-leading-nul", &bytes);
-    assert!(matches!(EncodedFile::new(file.clone()), Err(EncodingError::UnsupportedEncoding(_))));
+    let automatic = EncodedFile::new(file.clone()).unwrap();
+    assert_eq!(automatic.detection().encoding, Encoding::UTF32_LE);
+    assert_eq!(automatic.detection().bom_len, 4);
     let source = EncodedFile::new_with_encoding(file.clone(), Encoding::UTF16_LE).unwrap();
     assert_eq!(source.detection().encoding, Encoding::UTF16_LE);
     assert_eq!(source.detection().bom_len, 2);

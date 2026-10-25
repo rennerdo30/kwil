@@ -20,7 +20,7 @@
 //! A crash journal must durably copy/adopt all three private files and descriptor
 //! before acknowledging recovery; merely serializing a pathname is insufficient.
 
-use crate::encoding::{Encoding, EncodingError};
+use crate::encoding::{Decoder, Encoding, EncodingError};
 use crate::{FileState, ReadError, TextFile};
 use encoding_rs::DecoderResult;
 #[path = "decoded_preview.rs"]
@@ -33,6 +33,10 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+#[path = "encoding/utf32_backing_tests.rs"]
+mod utf32_tests;
 
 /// Maximum raw distance between complete-atom checkpoints, including alignment.
 pub const CHECKPOINT_RAW_BYTES: usize = 64 << 10;
@@ -131,7 +135,7 @@ pub struct Interpretation {
 }
 impl Interpretation {
     pub fn new(encoding: Encoding, bom_len: usize) -> Result<Self, BackingError> {
-        let expected = bom(encoding);
+        let expected = encoding.bom_bytes();
         if bom_len != 0 && (expected.is_empty() || bom_len != expected.len()) {
             return Err(BackingError::InvalidDescriptor);
         }
@@ -380,9 +384,8 @@ impl DecodedBacking {
     /// Input is streamed into a private raw snapshot even when TextFile mapped
     /// it; externally mutable pages never become the immutable origin.
     /// Source checks remain enabled and run before/after the bounded copy.
-    /// An explicit interpretation can recover an automatic UTF-32 sniff error,
-    /// matching EncodedFile::new_with_encoding. Encoding itself rejects UTF-32
-    /// and ISO-2022-JP labels; this API adds no unsupported decoder.
+    /// Interpretation is explicit and immutable, including UTF-32 endianness.
+    /// ISO-2022-JP remains unsupported; no stateful replay is introduced.
     pub fn prepare(
         source: &TextFile,
         interpretation: Interpretation,
@@ -468,7 +471,7 @@ impl DecodedBacking {
         let raw = map(&raw_file)?;
         let raw_bytes = mapped(&raw);
         let skip = interpretation.bom_len as usize;
-        if skip > raw_bytes.len() || (skip != 0 && !raw_bytes.starts_with(bom(interpretation.encoding))) {
+        if skip > raw_bytes.len() || (skip != 0 && !raw_bytes.starts_with(interpretation.encoding.bom_bytes())) {
             return Err(BackingError::InvalidDescriptor);
         }
         let mut logical_file = private_file(&paths.logical)?;
@@ -854,19 +857,9 @@ fn write_chunks(bytes: &[u8], writer: &mut impl Write, cancel: &AtomicBool) -> R
     }
     Ok(())
 }
-fn bom(encoding: Encoding) -> &'static [u8] {
-    if encoding == Encoding::UTF8 {
-        b"\xef\xbb\xbf"
-    } else if encoding == Encoding::UTF16_LE {
-        b"\xff\xfe"
-    } else if encoding == Encoding::UTF16_BE {
-        b"\xfe\xff"
-    } else {
-        b""
-    }
-}
+#[cfg(test)]
 fn codec(encoding: Encoding) -> &'static encoding_rs::Encoding {
-    // Encoding admits precisely the stateless, non-replacement encodings.
+    // Independent oracle for the existing encoding_rs family fixtures only.
     encoding_rs::Encoding::for_label_no_replacement(encoding.name().as_bytes()).unwrap()
 }
 
@@ -885,6 +878,9 @@ fn block_end(raw: &[u8], start: usize, encoding: Encoding) -> Result<usize, Back
         return Ok(raw.len());
     }
     let mut end = start + CHECKPOINT_RAW_BYTES;
+    if encoding.fixed_width() == 4 {
+        return Ok(end - (end - start) % 4);
+    }
     if encoding == Encoding::UTF16_LE || encoding == Encoding::UTF16_BE {
         end -= (end - start) % 2;
         let pair = [raw[end - 2], raw[end - 1]];
@@ -894,7 +890,7 @@ fn block_end(raw: &[u8], start: usize, encoding: Encoding) -> Result<usize, Back
         }
         return Ok(end);
     }
-    let mut decoder = codec(encoding).new_decoder_without_bom_handling();
+    let mut decoder = encoding.decoder();
     let mut scratch = [0; SCRATCH];
     let mut at = start;
     let mut restart = start;
@@ -908,7 +904,7 @@ fn block_end(raw: &[u8], start: usize, encoding: Encoding) -> Result<usize, Back
                 restart = at - after as usize;
             }
             DecoderResult::InputEmpty | DecoderResult::OutputFull => {
-                if decoder.latin1_byte_compatible_up_to(b"").is_some() {
+                if decoder.is_neutral() {
                     restart = at;
                 }
                 if result == DecoderResult::InputEmpty {
@@ -956,7 +952,7 @@ fn decode_block(
     writer: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<u64, BackingError> {
-    let mut decoder = codec(encoding).new_decoder_without_bom_handling();
+    let mut decoder = encoding.decoder();
     let mut scratch = [0; SCRATCH];
     let mut at = 0;
     let mut logical = 0;
@@ -987,14 +983,14 @@ pub(crate) struct AtomSize {
 /// cursor pins the immutable generation and lends it for each admitted step.
 /// A denied byte visit retains the actual decoder, including pending lead bytes.
 pub(crate) struct ResumeAtom {
-    decoder: encoding_rs::Decoder,
+    decoder: Decoder,
     encoding: Encoding,
     consumed: usize,
     text: [u8; 8],
 }
 impl ResumeAtom {
     pub(crate) fn new(encoding: Encoding) -> Self {
-        Self { decoder: codec(encoding).new_decoder_without_bom_handling(), encoding, consumed: 0, text: [0; 8] }
+        Self { decoder: encoding.decoder(), encoding, consumed: 0, text: [0; 8] }
     }
 
     pub(crate) fn poll(
@@ -1013,11 +1009,7 @@ impl ResumeAtom {
             }
             cancelled(cancel)?;
             let byte = raw[self.consumed];
-            if self.consumed == 0
-                && self.encoding != Encoding::UTF16_LE
-                && self.encoding != Encoding::UTF16_BE
-                && byte < 0x80
-            {
+            if self.consumed == 0 && self.encoding.ascii_compatible() && byte < 0x80 {
                 self.text[0] = byte;
                 return Ok(Some(AtomSize { raw: 1, logical: 1, kind: AtomKind::Text }));
             }
@@ -1177,10 +1169,10 @@ fn next_atom(encoding: Encoding, raw: &[u8]) -> Result<AtomSize, BackingError> {
     if raw.is_empty() {
         return Err(BackingError::InvalidRange);
     }
-    if encoding != Encoding::UTF16_LE && encoding != Encoding::UTF16_BE && raw[0] < 0x80 {
+    if encoding.ascii_compatible() && raw[0] < 0x80 {
         return Ok(AtomSize { raw: 1, logical: 1, kind: AtomKind::Text });
     }
-    let mut decoder = codec(encoding).new_decoder_without_bom_handling();
+    let mut decoder = encoding.decoder();
     let mut scratch = [0; 16];
     let mut consumed = 0;
     loop {
@@ -1232,13 +1224,10 @@ fn next_atom_admitted(
     if raw.is_empty() {
         return Err(BackingError::InvalidRange);
     }
-    if encoding != Encoding::UTF16_LE
-        && encoding != Encoding::UTF16_BE
-        && read_admitted(1, cancel, admit, || raw[0])? < 0x80
-    {
+    if encoding.ascii_compatible() && read_admitted(1, cancel, admit, || raw[0])? < 0x80 {
         return Ok(AtomSize { raw: 1, logical: 1, kind: AtomKind::Text });
     }
-    let mut decoder = codec(encoding).new_decoder_without_bom_handling();
+    let mut decoder = encoding.decoder();
     let mut scratch = [0; 16];
     let mut consumed = 0;
     loop {
@@ -1600,7 +1589,7 @@ mod tests {
     #[test]
     fn utf16_endianness_bom_surrogates_and_odd_tail_are_lossless() {
         for encoding in [Encoding::UTF16_LE, Encoding::UTF16_BE] {
-            let mut raw = bom(encoding).to_vec();
+            let mut raw = encoding.bom_bytes().to_vec();
             for unit in [0x0041u16, 0xd83d, 0xde00, 0x000d, 0x000a, 0xd800, 0x005a, 0xfffd] {
                 raw.extend_from_slice(&if encoding == Encoding::UTF16_LE {
                     unit.to_le_bytes()
@@ -1974,9 +1963,11 @@ mod tests {
         ));
         assert_eq!(fs::read_dir(&fixture.directory).unwrap().count(), 1);
         assert_eq!(fs::read(&fixture.source).unwrap(), b"changed source length");
-        for label in ["iso-2022-jp", "utf-32", "utf-32le", "utf-32be", "replacement"] {
+        for label in ["iso-2022-jp", "utf-32", "replacement"] {
             assert!(Encoding::for_label(label).is_err(), "{label}");
         }
+        assert_eq!(Encoding::for_label("utf-32le").unwrap(), Encoding::UTF32_LE);
+        assert_eq!(Encoding::for_label("utf-32be").unwrap(), Encoding::UTF32_BE);
         assert!(Interpretation::new(Encoding::for_label("windows-1252").unwrap(), 3).is_err());
     }
 

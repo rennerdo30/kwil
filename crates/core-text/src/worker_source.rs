@@ -1026,4 +1026,5 @@ mod tests {
         drop(buffer);
         std::fs::remove_file(path).unwrap();
     }
+    include!("encoding/utf32_worker_source_tests.rs");
 }

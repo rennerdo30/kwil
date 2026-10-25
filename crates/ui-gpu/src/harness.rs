@@ -444,11 +444,11 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
         Step::BinaryColdCheck => {
             let row = app.view.hex_session().unwrap().row(app.view.hex_source(), 0).unwrap();
-            assert_eq!(row.bytes, [0, 0, 0xfe, 0xff, 0x41]);
+            assert_eq!(row.bytes, [0, 1, 0xfe, 0xff, 0x41]);
             if let Some(dir) = &dir {
                 std::fs::write(
                     dir.join("binary-cold-result.txt"),
-                    "PASS: cold-start UTF-32 prefix reaches offer and opens exact physical bytes as Hex",
+                    "PASS: cold-start binary bytes reach offer and opens exact physical bytes as Hex",
                 )
                 .unwrap();
             }

@@ -2069,4 +2069,5 @@ mod tests {
             assert!(owner.try_retire().is_ok());
         }
     }
+    include!("provenance/utf32_serialization_tests.rs");
 }

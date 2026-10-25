@@ -1,7 +1,7 @@
 //! Bounded encoding detection, viewport decode and byte-preserving streaming saves.
 //!
 //! All positions are **original byte offsets**, including the BOM. Added pieces
-//! contain UTF-8. Never use the byte-oriented `Snapshot` line metrics for UTF-16:
+//! contain UTF-8. Never use the byte-oriented `Snapshot` line metrics for UTF-16/32:
 //! `DecodeIndex` counts LF/CR code units (and CRLF as one break), with line rank
 //! and the current line start at decoder checkpoints every 64 KiB. Build it on a worker and wake
 //! the frontend with `index_in_background`'s callback. No UI timer is needed.
@@ -13,20 +13,27 @@
 //!
 //! V1 supports all stateless encoding_rs encodings. ISO-2022-JP returns an
 //! explicit `UnsupportedEncoding`: its shifted state needs a future checkpoint
-//! representation (known limitation KW-45). UTF-32 is also explicitly unsupported. Neither case is
-//! silently reinterpreted or replayed from the beginning of a file.
+//! representation (known limitation KW-45). UTF-32 LE/BE use the same bounded
+//! codec, backing and provenance contracts; no encoding replays the whole file.
 
 use crate::{IndexProgress, ReadError, Snapshot, SourceChunk, TextFile};
-use encoding_rs::{CoderResult, Decoder, DecoderResult, EncoderResult};
+use encoding_rs::{DecoderResult, EncoderResult};
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+mod codec;
+pub(crate) use codec::{Decoder, Encoder};
+
 #[cfg(test)]
 #[path = "encoding_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "encoding/utf32_tests.rs"]
+pub(crate) mod utf32_tests;
 
 #[path = "encoded_snapshot.rs"]
 mod snapshot_save;
@@ -40,17 +47,33 @@ const SCRATCH: usize = 16 << 10;
 pub const MAX_VIEWPORT_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Encoding(&'static encoding_rs::Encoding);
+pub struct Encoding(Codec);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Codec {
+    Rs(&'static encoding_rs::Encoding),
+    Utf32Le,
+    Utf32Be,
+}
 
 impl Encoding {
-    pub const UTF8: Self = Self(encoding_rs::UTF_8);
-    pub const UTF16_LE: Self = Self(encoding_rs::UTF_16LE);
-    pub const UTF16_BE: Self = Self(encoding_rs::UTF_16BE);
+    pub const UTF8: Self = Self(Codec::Rs(encoding_rs::UTF_8));
+    pub const UTF16_LE: Self = Self(Codec::Rs(encoding_rs::UTF_16LE));
+    pub const UTF16_BE: Self = Self(Codec::Rs(encoding_rs::UTF_16BE));
+    pub const UTF32_LE: Self = Self(Codec::Utf32Le);
+    pub const UTF32_BE: Self = Self(Codec::Utf32Be);
 
     /// WHATWG labels, including Windows-1252, Shift_JIS, EUC-JP, GB18030,
     /// GBK, Big5 and KOI8-R. Stateful ISO-2022-JP requires a different checkpoint
     /// representation and is explicitly refused rather than replaying a file.
     pub fn for_label(label: &str) -> Result<Self, EncodingError> {
+        let trimmed = label.trim_matches(&['\t', '\n', '\x0c', '\r', ' '][..]);
+        if trimmed.eq_ignore_ascii_case("utf-32le") {
+            return Ok(Self::UTF32_LE);
+        }
+        if trimmed.eq_ignore_ascii_case("utf-32be") {
+            return Ok(Self::UTF32_BE);
+        }
         let encoding = encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
             .ok_or_else(|| EncodingError::UnsupportedEncoding(label.to_owned()))?;
         Self::checked(encoding)
@@ -60,37 +83,80 @@ impl Encoding {
         if encoding == encoding_rs::ISO_2022_JP || encoding == encoding_rs::REPLACEMENT {
             Err(EncodingError::UnsupportedEncoding(encoding.name().to_owned()))
         } else {
-            Ok(Self(encoding))
+            Ok(Self(Codec::Rs(encoding)))
         }
     }
 
     pub fn name(self) -> &'static str {
-        self.0.name()
+        match self.0 {
+            Codec::Rs(encoding) => encoding.name(),
+            Codec::Utf32Le => "UTF-32LE",
+            Codec::Utf32Be => "UTF-32BE",
+        }
     }
 
     fn utf16(self) -> bool {
         self == Self::UTF16_LE || self == Self::UTF16_BE
     }
 
-    fn bom(self) -> &'static [u8] {
+    /// The canonical BOM, or an empty slice for encodings without one.
+    /// Interpretation decides whether an initial BOM is metadata or text.
+    pub fn bom_bytes(self) -> &'static [u8] {
         if self == Self::UTF8 {
             b"\xef\xbb\xbf"
         } else if self == Self::UTF16_LE {
             b"\xff\xfe"
         } else if self == Self::UTF16_BE {
             b"\xfe\xff"
+        } else if self == Self::UTF32_LE {
+            b"\xff\xfe\0\0"
+        } else if self == Self::UTF32_BE {
+            b"\0\0\xfe\xff"
         } else {
             b""
         }
     }
 
-    fn unit(self, bytes: &[u8], at: usize) -> Option<u16> {
-        let pair = bytes.get(at..at + 2)?;
-        Some(if self == Self::UTF16_LE {
-            u16::from_le_bytes([pair[0], pair[1]])
+    pub(crate) fn fixed_width(self) -> usize {
+        if self.utf16() {
+            2
+        } else if self.utf32() {
+            4
         } else {
-            u16::from_be_bytes([pair[0], pair[1]])
+            1
+        }
+    }
+
+    fn utf32(self) -> bool {
+        matches!(self.0, Codec::Utf32Le | Codec::Utf32Be)
+    }
+
+    pub(crate) fn ascii_compatible(self) -> bool {
+        self.fixed_width() == 1
+    }
+
+    pub(crate) fn unit(self, bytes: &[u8], at: usize) -> Option<u32> {
+        let width = self.fixed_width();
+        let unit = bytes.get(at..at.checked_add(width)?)?;
+        Some(match width {
+            4 if self == Self::UTF32_LE => u32::from_le_bytes(unit.try_into().unwrap()),
+            4 => u32::from_be_bytes(unit.try_into().unwrap()),
+            2 if self == Self::UTF16_LE => u16::from_le_bytes(unit.try_into().unwrap()) as u32,
+            2 => u16::from_be_bytes(unit.try_into().unwrap()) as u32,
+            _ => unit[0] as u32,
         })
+    }
+
+    pub(crate) fn decoder(self) -> Decoder {
+        Decoder::new(self)
+    }
+
+    pub(crate) fn encoder(self) -> Encoder {
+        Encoder::new(self)
+    }
+
+    fn is_single_byte(self) -> bool {
+        matches!(self.0, Codec::Rs(encoding) if encoding.is_single_byte())
     }
 }
 
@@ -237,16 +303,19 @@ fn sample_utf8(bytes: &[u8], range: Range<usize>) -> bool {
 }
 
 fn detect_bytes(bytes: &[u8], chosen: Option<Encoding>) -> Result<Detection, EncodingError> {
-    if chosen.is_none() && (bytes.starts_with(b"\xff\xfe\0\0") || bytes.starts_with(b"\0\0\xfe\xff")) {
-        return Err(EncodingError::UnsupportedEncoding("UTF-32".to_owned()));
-    }
     let ranges = samples(bytes);
     let sample_is_utf8 = ranges.iter().all(|r| sample_utf8(bytes, r.clone()));
-    let bom = encoding_rs::Encoding::for_bom(bytes);
+    let bom = if bytes.starts_with(Encoding::UTF32_LE.bom_bytes()) {
+        Some(Encoding::UTF32_LE)
+    } else if bytes.starts_with(Encoding::UTF32_BE.bom_bytes()) {
+        Some(Encoding::UTF32_BE)
+    } else {
+        encoding_rs::Encoding::for_bom(bytes).map(|(encoding, _)| Encoding(Codec::Rs(encoding)))
+    };
     let encoding = if let Some(chosen) = chosen {
         chosen
-    } else if let Some((encoding, _)) = bom {
-        Encoding::checked(encoding)?
+    } else if let Some(encoding) = bom {
+        encoding
     } else if looks_utf16(bytes, &ranges, true) {
         Encoding::UTF16_LE
     } else if looks_utf16(bytes, &ranges, false) {
@@ -269,24 +338,21 @@ fn detect_bytes(bytes: &[u8], chosen: Option<Encoding>) -> Result<Detection, Enc
             if sample_is_utf8 { chardetng::Utf8Detection::Allow } else { chardetng::Utf8Detection::Deny },
         ))?
     };
-    let bom_len = bom.filter(|(e, _)| *e == encoding.0).map_or(0, |(_, n)| n);
+    // An explicit UTF-16 override of FF FE 00 00 still strips just two bytes.
+    let marker = encoding.bom_bytes();
+    let bom_len = if !marker.is_empty() && bytes.starts_with(marker) { marker.len() } else { 0 };
     let mut endings = EndingCounts::default();
     for range in &ranges {
-        let width = if encoding.utf16() { 2 } else { 1 };
+        let width = encoding.fixed_width();
         let mut start = range.start.max(bom_len);
-        if encoding.utf16() {
-            start += start % 2;
-        }
-        let mut end = range.end;
-        if encoding.utf16() {
-            end -= end % 2;
-        }
+        start += (width - start % width) % width;
+        let mut end = range.end - range.end % width;
         if start >= end {
             continue;
         }
         // Artificial sample edges are not real line endings. Do not peek
         // outside either bounded sample to resolve a clipped CRLF.
-        let unit = |at| if encoding.utf16() { encoding.unit(bytes, at) } else { bytes.get(at).map(|&b| b as u16) };
+        let unit = |at| encoding.unit(bytes, at);
         if range.start > 0 && unit(start) == Some(10) {
             start += width;
         }
@@ -328,8 +394,8 @@ fn for_breaks(bytes: &[u8], start: usize, end: usize, encoding: Encoding, mut em
     if start >= end {
         return;
     }
-    let width = if encoding.utf16() { 2 } else { 1 };
-    let unit = |at: usize| if encoding.utf16() { encoding.unit(bytes, at) } else { bytes.get(at).map(|&b| b as u16) };
+    let width = encoding.fixed_width();
+    let unit = |at: usize| encoding.unit(bytes, at);
     let visit = |at: usize, emit: &mut dyn FnMut(usize, LineEnding)| match unit(at) {
         Some(13) => {
             if unit(at + width) == Some(10) {
@@ -341,8 +407,8 @@ fn for_breaks(bytes: &[u8], start: usize, end: usize, encoding: Encoding, mut em
         Some(10) if at < width || unit(at - width) != Some(13) => emit(at + width, LineEnding::Lf),
         _ => {}
     };
-    if encoding.utf16() {
-        for at in ((start + start % 2)..end).step_by(2) {
+    if width != 1 {
+        for at in ((start + (width - start % width) % width)..end).step_by(width) {
             visit(at, &mut emit);
         }
     } else {
@@ -476,7 +542,7 @@ impl EncodedFile {
             return Ok(index);
         }
         let encoding = self.detection.encoding;
-        let mut decoder = encoding.0.new_decoder_without_bom_handling();
+        let mut decoder = encoding.decoder();
         let mut checkpoints = vec![Checkpoint {
             offset: self.detection.bom_len as u64,
             line: 0,
@@ -491,26 +557,28 @@ impl EncodedFile {
             let mut end = (at + STRIDE).min(bytes.len());
             if encoding.utf16() {
                 end = utf16_boundary(bytes, end, encoding);
+            } else if encoding.utf32() {
+                // Complete units are restartable even when malformed. Only the
+                // real EOF may end with a 1..3 byte opaque tail.
+                if end < bytes.len() {
+                    end -= end % 4;
+                }
             } else {
                 discard(&mut decoder, &bytes[at..end]);
                 // At most 3 continuation bytes for supported encodings. EOF
                 // pending/malformed bytes need no following checkpoint.
-                while end < bytes.len() && decoder.latin1_byte_compatible_up_to(b"").is_none() {
+                while end < bytes.len() && !decoder.is_neutral() {
                     discard(&mut decoder, &bytes[end..end + 1]);
                     end += 1;
                 }
             }
             // Keep CRLF together in both the line and byte checkpoints.
-            let width = if encoding.utf16() { 2 } else { 1 };
-            let cr = if encoding.utf16() {
-                encoding.unit(bytes, end.saturating_sub(width)) == Some(13)
-            } else {
-                end > 0 && bytes[end - 1] == b'\r'
-            };
+            let width = encoding.fixed_width();
+            let cr = end >= width && end.is_multiple_of(width) && encoding.unit(bytes, end - width) == Some(13);
             if cr && end + width <= bytes.len() {
-                let lf = if encoding.utf16() { encoding.unit(bytes, end) == Some(10) } else { bytes[end] == b'\n' };
+                let lf = encoding.unit(bytes, end) == Some(10);
                 if lf {
-                    if !encoding.utf16() {
+                    if width == 1 {
                         discard(&mut decoder, &bytes[end..end + width]);
                     }
                     end += width;
@@ -593,8 +661,37 @@ impl EncodedFile {
         if self.detection.encoding == Encoding::UTF8 {
             had_errors = simdutf8::basic::from_utf8(raw).is_err();
             utf8_segments(raw, |segment| segments.push(segment));
+        } else if self.detection.encoding.utf32() {
+            let mut text = String::new();
+            let mut at = 0;
+            let mut errors = false;
+            let mut decoder = self.detection.encoding.decoder();
+            let mut scratch = [0; SCRATCH];
+            loop {
+                let (result, read, written) =
+                    decoder.decode_to_utf8_without_replacement(&raw[at..], &mut scratch, true);
+                at += read;
+                text.push_str(std::str::from_utf8(&scratch[..written]).unwrap());
+                match result {
+                    DecoderResult::Malformed(length, after) => {
+                        if !text.is_empty() {
+                            segments.push(DisplaySegment::Text(Cow::Owned(std::mem::take(&mut text))));
+                        }
+                        let finish = at - after as usize;
+                        segments.push(DisplaySegment::Invalid(&raw[finish - length as usize..finish]));
+                        errors = true;
+                    }
+                    DecoderResult::InputEmpty => break,
+                    DecoderResult::OutputFull => {}
+                }
+            }
+            if !text.is_empty() {
+                segments.push(DisplaySegment::Text(Cow::Owned(text)));
+            }
+            had_errors = errors;
         } else {
-            let (text, errors) = self.detection.encoding.0.decode_without_bom_handling(raw);
+            let Codec::Rs(codec) = self.detection.encoding.0 else { unreachable!() };
+            let (text, errors) = codec.decode_without_bom_handling(raw);
             had_errors = errors;
             if !text.is_empty() {
                 segments.push(DisplaySegment::Text(text));
@@ -612,6 +709,11 @@ impl EncodedFile {
             return Ok(range);
         }
         let encoding = self.detection.encoding;
+        if encoding.utf32() {
+            let start = range.start - range.start % 4;
+            let end = range.end.saturating_add((4 - range.end % 4) % 4).min(bytes.len());
+            return Ok(start..end);
+        }
         if encoding.utf16() {
             let mut start = range.start & !1;
             if matches!(encoding.unit(bytes, start), Some(0xdc00..=0xdfff))
@@ -622,7 +724,7 @@ impl EncodedFile {
             }
             return Ok(start..utf16_boundary(bytes, range.end, encoding));
         }
-        if encoding.0.is_single_byte() {
+        if encoding.is_single_byte() {
             return Ok(range);
         }
         let base = if range.start <= STRIDE + self.detection.bom_len {
@@ -630,22 +732,22 @@ impl EncodedFile {
         } else {
             self.index().ok_or(EncodingError::IndexNotReady)?.before(range.start.saturating_sub(8) as u64)
         };
-        let mut decoder = encoding.0.new_decoder_without_bom_handling();
+        let mut decoder = encoding.decoder();
         let prefix_end = base.max(range.start.saturating_sub(8));
         discard(&mut decoder, &bytes[base..prefix_end]);
         let mut last = base;
-        if decoder.latin1_byte_compatible_up_to(b"").is_some() {
+        if decoder.is_neutral() {
             last = prefix_end;
         }
         for at in prefix_end..range.start {
             discard(&mut decoder, &bytes[at..at + 1]);
-            if decoder.latin1_byte_compatible_up_to(b"").is_some() {
+            if decoder.is_neutral() {
                 last = at + 1;
             }
         }
         discard(&mut decoder, &bytes[range.start..range.end]);
         let mut end = range.end;
-        while end < bytes.len() && decoder.latin1_byte_compatible_up_to(b"").is_none() {
+        while end < bytes.len() && !decoder.is_neutral() {
             discard(&mut decoder, &bytes[end..end + 1]);
             end += 1;
         }
@@ -676,9 +778,9 @@ fn utf16_boundary(bytes: &[u8], end: usize, encoding: Encoding) -> usize {
 fn discard(decoder: &mut Decoder, mut bytes: &[u8]) {
     let mut scratch = [0u8; SCRATCH];
     loop {
-        let (result, read, _, _) = decoder.decode_to_utf8(bytes, &mut scratch, false);
+        let (result, read, _) = decoder.decode_to_utf8_without_replacement(bytes, &mut scratch, false);
         bytes = &bytes[read..];
-        if result == CoderResult::InputEmpty {
+        if result == DecoderResult::InputEmpty {
             break;
         }
     }
@@ -733,7 +835,7 @@ impl<F: FnMut(LineEndingEdit) -> Result<(), EncodingError>> EndingPlanner<F> {
         }
         Ok(())
     }
-    fn newline(&mut self, range: Range<u64>, unit: u16) -> Result<(), EncodingError> {
+    fn newline(&mut self, range: Range<u64>, unit: u32) -> Result<(), EncodingError> {
         if let Some(cr) = self.pending_cr.take() {
             if unit == 10 && cr.end == range.start {
                 return self.emit(cr.start..range.end, LineEnding::CrLf);
@@ -778,16 +880,17 @@ impl EncodedFile {
                     return Err(EncodingError::WrongSource);
                 }
             };
-            if encoding.utf16() {
-                for at in (0..bytes.len().saturating_sub(1)).step_by(2) {
+            let width = encoding.fixed_width();
+            if width != 1 {
+                for at in (0..bytes.len().saturating_sub(width - 1)).step_by(width) {
                     let unit = encoding.unit(bytes, at).unwrap();
                     if unit == 10 || unit == 13 {
-                        planner.newline(offset + at as u64..offset + at as u64 + 2, unit)?;
+                        planner.newline(offset + at as u64..offset + at as u64 + width as u64, unit)?;
                     }
                 }
             } else {
                 for at in memchr::memchr2_iter(b'\r', b'\n', bytes) {
-                    planner.newline(offset + at as u64..offset + at as u64 + 1, bytes[at] as u16)?;
+                    planner.newline(offset + at as u64..offset + at as u64 + 1, bytes[at] as u32)?;
                 }
             }
             offset += bytes.len() as u64;
@@ -817,13 +920,13 @@ impl EncodedFile {
     }
 
     fn stream_save(&self, snapshot: &Snapshot, plan: SavePlan, writer: &mut impl Write) -> Result<(), EncodingError> {
-        if plan.bom && plan.encoding.bom().is_empty() {
+        if plan.bom && plan.encoding.bom_bytes().is_empty() {
             return Err(EncodingError::UnsupportedEncoding(format!("BOM for {}", plan.encoding.name())));
         }
         let original = self.file.bytes()?;
         let preserve = plan.encoding == self.detection.encoding && plan.line_ending.is_none();
         if plan.bom {
-            writer.write_all(plan.encoding.bom())?;
+            writer.write_all(plan.encoding.bom_bytes())?;
         }
         let mut output = TextOutput::new(plan, writer);
         let mut added = Utf8Input::default();
@@ -851,8 +954,7 @@ impl EncodedFile {
                     } else if plan.encoding == self.detection.encoding {
                         output.copy_raw(bytes, self.detection.encoding)?;
                     } else {
-                        let decoder = source_decoder
-                            .get_or_insert_with(|| self.detection.encoding.0.new_decoder_without_bom_handling());
+                        let decoder = source_decoder.get_or_insert_with(|| self.detection.encoding.decoder());
                         transcode(decoder, bytes, false, &mut output)?;
                     }
                 }
@@ -959,14 +1061,14 @@ fn transcode(
 
 struct TextOutput<'a, W> {
     plan: SavePlan,
-    encoder: encoding_rs::Encoder,
+    encoder: Encoder,
     writer: &'a mut W,
     pending_cr: bool,
 }
 
 impl<'a, W: Write> TextOutput<'a, W> {
     fn new(plan: SavePlan, writer: &'a mut W) -> Self {
-        Self { plan, encoder: plan.encoding.0.new_encoder(), writer, pending_cr: false }
+        Self { plan, encoder: plan.encoding.encoder(), writer, pending_cr: false }
     }
     fn feed(&mut self, text: &str) -> Result<(), EncodingError> {
         let Some(ending) = self.plan.line_ending else {
@@ -999,9 +1101,9 @@ impl<'a, W: Write> TextOutput<'a, W> {
     // This retains malformed sequences and legacy aliases byte for byte.
     fn copy_raw(&mut self, bytes: &[u8], encoding: Encoding) -> Result<(), EncodingError> {
         let ending = self.plan.line_ending.unwrap();
-        let width = if encoding.utf16() { 2 } else { 1 };
+        let width = encoding.fixed_width();
         let mut start = 0;
-        let mut visit = |at: usize, unit: u16| -> Result<(), EncodingError> {
+        let mut visit = |at: usize, unit: u32| -> Result<(), EncodingError> {
             if unit != 10 && unit != 13 {
                 return Ok(());
             }
@@ -1028,13 +1130,13 @@ impl<'a, W: Write> TextOutput<'a, W> {
             start = at + width;
             Ok(())
         };
-        if encoding.utf16() {
-            for at in (0..bytes.len().saturating_sub(1)).step_by(2) {
+        if width != 1 {
+            for at in (0..bytes.len().saturating_sub(width - 1)).step_by(width) {
                 visit(at, encoding.unit(bytes, at).unwrap())?;
             }
         } else {
             for at in memchr::memchr2_iter(b'\r', b'\n', bytes) {
-                visit(at, bytes[at] as u16)?;
+                visit(at, bytes[at] as u32)?;
             }
         }
         if start < bytes.len() {
@@ -1048,21 +1150,6 @@ impl<'a, W: Write> TextOutput<'a, W> {
     }
     fn encode(&mut self, mut text: &str) -> Result<(), EncodingError> {
         let mut scratch = [0u8; SCRATCH];
-        if self.plan.encoding.utf16() {
-            let mut used = 0;
-            for unit in text.encode_utf16() {
-                let bytes =
-                    if self.plan.encoding == Encoding::UTF16_LE { unit.to_le_bytes() } else { unit.to_be_bytes() };
-                scratch[used..used + 2].copy_from_slice(&bytes);
-                used += 2;
-                if used == scratch.len() {
-                    self.writer.write_all(&scratch)?;
-                    used = 0;
-                }
-            }
-            self.writer.write_all(&scratch[..used])?;
-            return Ok(());
-        }
         loop {
             let (result, read, written) = self.encoder.encode_from_utf8_without_replacement(text, &mut scratch, false);
             self.writer.write_all(&scratch[..written])?;

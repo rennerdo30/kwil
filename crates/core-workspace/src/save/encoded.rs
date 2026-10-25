@@ -2,8 +2,10 @@
 //! separate from the actual destination file. No file-sized payload or edit list.
 use super::*;
 use kwil_core_text::decoded_backing::{BackingError, DecodedBacking, Interpretation};
+#[cfg(test)]
+use kwil_core_text::encoding::Encoding;
 use kwil_core_text::encoding::{
-    Encoding, EncodingError, SavePlan, validate_snapshot_save_cancellable, write_snapshot_cancellable,
+    EncodingError, SavePlan, validate_snapshot_save_cancellable, write_snapshot_cancellable,
 };
 use std::io::{BufWriter, Write};
 use std::sync::atomic::AtomicBool;
@@ -97,13 +99,7 @@ impl<W: Write> Write for Cancellable<'_, W> {
 }
 
 pub(super) fn bom_len(plan: SavePlan) -> usize {
-    if !plan.bom {
-        0
-    } else if plan.encoding == Encoding::UTF8 {
-        3
-    } else {
-        2
-    }
+    if plan.bom { plan.encoding.bom_bytes().len() } else { 0 }
 }
 
 pub(super) fn same_logical(snapshot: &Snapshot, bytes: &[u8], cancel: &AtomicBool) -> io::Result<bool> {
@@ -855,4 +851,5 @@ mod tests {
         assert!(writer.written <= 19);
         assert!(!f.path().exists());
     }
+    include!("utf32_encoded_tests.rs");
 }

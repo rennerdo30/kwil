@@ -208,11 +208,11 @@ fn stream(
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(), EncodingError> {
     poll(cancelled)?;
-    if plan.bom && plan.encoding.bom().is_empty() {
+    if plan.bom && plan.encoding.bom_bytes().is_empty() {
         return Err(EncodingError::UnsupportedEncoding(format!("BOM for {}", plan.encoding.name())));
     }
     if plan.bom {
-        writer.write_all(plan.encoding.bom())?;
+        writer.write_all(plan.encoding.bom_bytes())?;
     }
     let mut output = TextOutput::new(plan, writer);
     let mut input = Utf8Input::default();
@@ -314,7 +314,8 @@ mod tests {
                 .flat_map(|u| if encoding == Encoding::UTF16_LE { u.to_le_bytes() } else { u.to_be_bytes() })
                 .collect()
         } else {
-            let (bytes, _, errors) = encoding.0.encode(text);
+            let crate::encoding::Codec::Rs(codec) = encoding.0 else { panic!("encoding_rs fixture oracle only") };
+            let (bytes, _, errors) = codec.encode(text);
             assert!(!errors);
             bytes.into_owned()
         }
@@ -1143,4 +1144,5 @@ mod tests {
         write_snapshot(&buffer.snapshot(), plan(Encoding::UTF16_LE, false), &mut writer).unwrap();
         assert_eq!(writer.bytes, encoded.len() + 2);
     }
+    include!("encoding/utf32_snapshot_tests.rs");
 }

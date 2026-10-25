@@ -1,6 +1,6 @@
 # KW-10 encoding verification
 
-Implementation `45c20bb`; integrated main `4198232` in `c98304f`.
+Historical KW-10 implementation `45c20bb`; integrated main `4198232` in `c98304f`.
 Starting base: `778e875098a04badc3c4e3d14afefecd5cf5301c`.
 
 ## API contract
@@ -49,8 +49,26 @@ Starting base: `778e875098a04badc3c4e3d14afefecd5cf5301c`.
 - **Known v1 limitation (KW-45): ISO-2022-JP is unsupported.** Opening a detected
   ISO-2022-JP file or choosing its label returns
   `ISO-2022-JP is not supported yet (known limitation, KW-45)`. The fixture test
-  asserts this rather than accepting garbled ASCII/UTF-8. UTF-32 is optional
-  in the brief and also returns an explicit unsupported error.
+  asserts this rather than accepting garbled ASCII/UTF-8.
+
+## KW-64 UTF-32 candidate
+
+UTF-32LE and UTF-32BE now share the bounded decoder, import, save and provenance
+paths. Four-byte BOMs take precedence over UTF-16 detection; an explicit UTF-16
+choice still strips only its two-byte BOM. Explicit endian labels support
+BOM-less files; bare `utf-32` remains ambiguous and is refused.
+
+Invalid complete units retain their four raw bytes as opaque atoms; an incomplete
+final unit retains its one to three bytes. Artificial read boundaries retain
+pending input. Matching-encoding saves preserve those raw bytes. Cross-encoding
+conversion refuses malformed input before writing. Atomic and gzip saves,
+compare inputs, capsules and authenticated journals use the same codec identity.
+
+ROOT's frozen R4/R5 receipts record 34 focused UTF-32 tests, 26 existing encoding
+tests, and all-target strict checks for core-text, core-workspace and view-model
+passing. Independent review and integration are pending. These results do not
+qualify all-size resident indexes, encoding/EOL commands, native frontends,
+performance, or full v1. Earlier measurements below remain historical evidence.
 
 ## Verification
 

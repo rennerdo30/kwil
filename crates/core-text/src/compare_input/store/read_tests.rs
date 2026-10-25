@@ -589,3 +589,5 @@ fn input_store_rejects_foreign_pending_atom_lookup_even_at_eof_without_io() {
     close_store(store_a, &budget_a);
     close_store(store_b, &budget_b);
 }
+
+include!("../../encoding/utf32_read_tests.rs");

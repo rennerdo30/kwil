@@ -444,6 +444,8 @@ fn codec_key(encoding: Encoding) -> Option<u64> {
         "windows-874" => 36,
         "x-mac-cyrillic" => 37,
         "x-user-defined" => 38,
+        "UTF-32LE" => 39,
+        "UTF-32BE" => 40,
         _ => return None,
     })
 }
@@ -617,15 +619,7 @@ impl<A: Admission> SourceLease for DecodedNativeLease<A> {
                     // Descriptor validates the BOM length; check actual bytes
                     // only when explicitly selected, never strip a literal FEFF.
                     let encoding = self.interpretation.encoding;
-                    let bom = if encoding == Encoding::UTF8 {
-                        b"\xef\xbb\xbf".as_slice()
-                    } else if encoding == Encoding::UTF16_LE {
-                        b"\xff\xfe".as_slice()
-                    } else if encoding == Encoding::UTF16_BE {
-                        b"\xfe\xff".as_slice()
-                    } else {
-                        b"".as_slice()
-                    };
+                    let bom = encoding.bom_bytes();
                     let n = self.interpretation.bom_len as usize;
                     if n != 0 {
                         match self.credit.admit(self.carry_len, work, cancel) {
