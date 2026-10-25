@@ -11,6 +11,27 @@ use tree_sitter::{
 
 const CHUNK: usize = 16 * 1024;
 
+/// Borrowed coordinates over one admitted source window. Even grammar
+/// predicates and parser lookahead see EOF at this window's exact boundary.
+struct WindowSource<'a> {
+    source: &'a dyn TextSource,
+    range: Range<usize>,
+}
+impl TextSource for WindowSource<'_> {
+    fn len(&self) -> usize {
+        self.range.len()
+    }
+    fn chunk(&self, offset: usize, max_len: usize) -> std::io::Result<Cow<'_, [u8]>> {
+        if offset > self.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "fragment offset past EOF"));
+        }
+        if offset == self.len() || max_len == 0 {
+            return Ok(Cow::Borrowed(b""));
+        }
+        self.source.chunk(self.range.start + offset, max_len.min(self.len() - offset))
+    }
+}
+
 /// Optional, one-shot instrumentation; compiled out without the `measure` feature.
 #[cfg(feature = "measure")]
 #[derive(Debug, Default, Clone)]
@@ -129,6 +150,64 @@ impl Engine {
         self.parser.reset();
     }
 
+    /// A caller-admitted window with an explicit context allowance. Unlike the
+    /// document parser, this path never reads outside `queried`, including for
+    /// predicates or edit coordinates. Grammar queries parse a local fragment
+    /// and rebase spans; large documents retain the existing lexical policy.
+    /// This request does not change the configured legacy margin/parse policy.
+    pub fn highlight_window(
+        &mut self,
+        source: &dyn TextSource,
+        language: Language,
+        revision: u64,
+        requested: Range<usize>,
+        margin_bytes: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Highlights, Error> {
+        self.reset_document();
+        if requested.start > requested.end
+            || requested.end > source.len()
+            || margin_bytes > self.config.max_window_bytes / 2
+        {
+            return Err(Error::InvalidRange);
+        }
+        let queried =
+            requested.start.saturating_sub(margin_bytes)..source.len().min(requested.end.saturating_add(margin_bytes));
+        if queried.len() > self.config.max_window_bytes {
+            return Err(Error::InvalidRange);
+        }
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let fragment = WindowSource { source, range: queried.clone() };
+        let local = requested.start - queried.start..requested.end - queried.start;
+        let result = self.highlight_inner(
+            &fragment,
+            language,
+            revision,
+            None,
+            None,
+            local,
+            margin_bytes,
+            source.len() <= self.config.parse_limit,
+            cancelled,
+        );
+        // A fragment tree must never become the incremental tree of the full
+        // document or of another disjoint fragment with the same revision.
+        self.reset_document();
+        let mut highlights = result?;
+        for span in &mut highlights.spans {
+            span.range.start = span.range.start.checked_add(queried.start).ok_or(Error::InvalidRange)?;
+            span.range.end = span.range.end.checked_add(queried.start).ok_or(Error::InvalidRange)?;
+            if span.range.start < requested.start || span.range.end > requested.end {
+                return Err(Error::InvalidRange);
+            }
+        }
+        highlights.requested = requested;
+        highlights.queried = queried;
+        Ok(highlights)
+    }
+
     /// Stream exact, sequential edits on the owning worker before ONE parse.
     /// No edit vector or whole-document envelope is needed. A failed producer
     /// invalidates the partially edited tree; a missing base never visits it.
@@ -170,7 +249,17 @@ impl Engine {
         requested: Range<usize>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Highlights, Error> {
-        let result = self.highlight_inner(source, language, revision, previous_revision, edit, requested, cancelled);
+        let result = self.highlight_inner(
+            source,
+            language,
+            revision,
+            previous_revision,
+            edit,
+            requested,
+            self.config.margin_bytes,
+            true,
+            cancelled,
+        );
         if result.is_err() {
             self.reset_document();
         }
@@ -186,6 +275,8 @@ impl Engine {
         previous_revision: Option<u64>,
         edit: Option<&InputEdit>,
         requested: Range<usize>,
+        margin_bytes: usize,
+        allow_parse: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Highlights, Error> {
         #[cfg(feature = "measure")]
@@ -195,8 +286,8 @@ impl Engine {
         if requested.start > requested.end || requested.end > source.len() {
             return Err(Error::InvalidRange);
         }
-        let queried = requested.start.saturating_sub(self.config.margin_bytes)
-            ..source.len().min(requested.end.saturating_add(self.config.margin_bytes));
+        let queried =
+            requested.start.saturating_sub(margin_bytes)..source.len().min(requested.end.saturating_add(margin_bytes));
         if queried.len() > self.config.max_window_bytes {
             return Err(Error::InvalidRange);
         }
@@ -206,7 +297,8 @@ impl Engine {
         let mut incremental = false;
         let mut mode = Mode::Lexical;
         // Tree-sitter offsets are u32. Huge sources never enter its parser.
-        let parse = !matches!(language, Language::Generic | Language::Log)
+        let parse = allow_parse
+            && !matches!(language, Language::Generic | Language::Log)
             && source.len() <= self.config.parse_limit
             && source.len() < u32::MAX as usize;
         if parse && self.language != Some(language) {
@@ -426,6 +518,86 @@ fn flatten(raw: Vec<(Span, usize)>) -> Vec<Span> {
         previous = at;
     }
     out
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Fenced {
+        bytes: Vec<u8>,
+        allowed: Range<usize>,
+        reads: Mutex<Vec<Range<usize>>>,
+    }
+    impl TextSource for Fenced {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+        fn chunk(&self, offset: usize, max: usize) -> std::io::Result<Cow<'_, [u8]>> {
+            let range = offset..offset + max;
+            assert!(range.start >= self.allowed.start && range.end <= self.allowed.end, "unadmitted read: {range:?}");
+            self.reads.lock().unwrap().push(range.clone());
+            Ok(Cow::Borrowed(&self.bytes[range]))
+        }
+    }
+
+    #[test]
+    fn prepared_zero_margin_and_explicit_context_preserve_legacy_4096_margin() {
+        let mut bytes = vec![b' '; 20_000];
+        bytes[10_000..10_002].copy_from_slice(b"42");
+        let exact = Fenced { bytes: bytes.clone(), allowed: 10_000..10_002, reads: Mutex::new(Vec::new()) };
+        let mut engine = Engine::new(Config::default()).unwrap();
+        let result = engine.highlight_window(&exact, Language::Generic, 7, 10_000..10_002, 0, &|| false).unwrap();
+        assert_eq!(result.queried, 10_000..10_002);
+        assert_eq!(result.spans, vec![Span { range: 10_000..10_002, class: Class::Number }]);
+        assert!(!exact.reads.lock().unwrap().is_empty());
+        let with_context = Fenced { bytes: bytes.clone(), allowed: 9_984..10_018, reads: Mutex::new(Vec::new()) };
+        let result =
+            engine.highlight_window(&with_context, Language::Generic, 7, 10_000..10_002, 16, &|| false).unwrap();
+        assert_eq!(result.queried, 9_984..10_018);
+        let legacy = engine.highlight(&bytes, Language::Generic, 7, None, None, 10_000..10_002, &|| false).unwrap();
+        assert_eq!(legacy.queried, 5_904..14_098);
+        assert_eq!(engine.config.margin_bytes, 4096);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-rust")]
+    fn prepared_fragment_grammar_queries_rebase_and_cannot_read_gaps_or_predicates_outside() {
+        let code = b"fn main() { let number = 42; }";
+        let start = 80_000;
+        let mut bytes = vec![b'x'; start + code.len() + 100];
+        bytes[start..start + code.len()].copy_from_slice(code);
+        let source = Fenced { bytes, allowed: start..start + code.len(), reads: Mutex::new(Vec::new()) };
+        let mut engine = Engine::new(Config::default()).unwrap();
+        let result = engine.highlight_window(&source, Language::Rust, 1, source.allowed.clone(), 0, &|| false).unwrap();
+        assert_eq!(result.mode, Mode::TreeSitter, "bounded admission must retain grammar queries");
+        assert!(result.spans.iter().any(|span| span.class == Class::Number && span.range == (start + 25..start + 27)));
+        assert!(result.spans.iter().all(|span| span.range.start >= start && span.range.end <= source.allowed.end));
+        assert!(engine.tree.is_none(), "fragment tree must not masquerade as the full-document tree");
+        // Same revision, different local contents: no tree reuse across gaps.
+        let comment = b"/*42*/".to_vec();
+        let result = engine.highlight_window(&comment, Language::Rust, 1, 0..comment.len(), 0, &|| false).unwrap();
+        assert!(!result.incremental);
+        assert_eq!(result.spans, vec![Span { range: 0..6, class: Class::Comment }]);
+    }
+
+    #[test]
+    fn prepared_empty_cancelled_and_overbudget_requests_do_not_read() {
+        let source = Fenced { bytes: vec![b'x'; 16], allowed: 0..0, reads: Mutex::new(Vec::new()) };
+        let mut engine = Engine::new(Config::default()).unwrap();
+        assert!(engine.highlight_window(&source, Language::Generic, 1, 8..8, 0, &|| false).unwrap().spans.is_empty());
+        assert!(matches!(
+            engine.highlight_window(&source, Language::Rust, 1, 0..16, 0, &|| true),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            engine.highlight_window(&source, Language::Rust, 1, 0..16, MAX_MARGIN, &|| false),
+            Err(Error::InvalidRange)
+        ));
+        assert!(source.reads.lock().unwrap().is_empty());
+    }
+    const MAX_MARGIN: usize = 256 * 1024;
 }
 
 #[cfg(all(test, feature = "lang-rust"))]

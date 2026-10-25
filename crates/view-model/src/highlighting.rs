@@ -42,7 +42,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -226,6 +226,31 @@ impl std::fmt::Debug for HighlightSubmitError {
 struct Job {
     generation: u64,
     request: HighlightRequest,
+    // None preserves the configured document parser and 4096-byte default.
+    // Some admits only a bounded fragment plus this explicit allowance.
+    context_margin: Option<usize>,
+}
+
+// No strong source owner: viewport changes reuse the immutable source, while
+// the weak allocation identity prevents address reuse from matching old data.
+struct DetectionCache {
+    source: Weak<dyn TextSource>,
+    document: DocumentId,
+    revision: u64,
+    path: Arc<PathBuf>,
+    mappings: Arc<[LanguageMapping]>,
+    choice: LanguageChoice,
+    detection: Detection,
+}
+impl DetectionCache {
+    fn matches(&self, request: &HighlightRequest) -> bool {
+        self.source.ptr_eq(&Arc::downgrade(&request.source))
+            && self.document == request.key.document_id
+            && self.revision == request.key.revision
+            && self.path == request.path
+            && self.mappings == request.mappings
+            && self.choice == request.choice
+    }
 }
 struct State {
     pending: Option<Job>,
@@ -295,6 +320,7 @@ impl HighlightWorker {
                 let mut settings: Option<Arc<[LanguageMapping]>> = None;
                 let mut detector = None;
                 let mut previous: Option<Arc<SnapshotTextSource>> = None;
+                let mut detection_cache: Option<DetectionCache> = None;
                 loop {
                     let (job, retired, sources, stopped) = {
                         let mut state = worker.state.lock().unwrap();
@@ -333,7 +359,12 @@ impl HighlightWorker {
                     let result = (|| {
                         // Reset independently of revision. Tab A rev 0 and tab B rev
                         // 0 are unrelated snapshots, even with identical languages.
-                        if document != Some(key.document_id) {
+                        if document != Some(key.document_id)
+                            || detection_cache.as_ref().is_some_and(|cached| {
+                                cached.revision == key.revision
+                                    && !cached.source.ptr_eq(&Arc::downgrade(&request.source))
+                            })
+                        {
                             engine.reset_document();
                             previous = None;
                             document = Some(key.document_id);
@@ -343,13 +374,31 @@ impl HighlightWorker {
                             detector = Some(compiled);
                             settings = Some(Arc::clone(&request.mappings));
                         }
-                        let detection = detector.as_ref().unwrap().detect(
-                            &request.path,
-                            request.choice.language(),
-                            request.source.as_ref(),
-                            &cancelled,
-                        )?;
-                        if let Some(snapshot) = &request.snapshot {
+                        let detection = if let Some(cached) = &detection_cache
+                            && cached.matches(request)
+                        {
+                            cached.detection
+                        } else {
+                            let detection = detector.as_ref().unwrap().detect(
+                                &request.path,
+                                request.choice.language(),
+                                request.source.as_ref(),
+                                &cancelled,
+                            )?;
+                            detection_cache = Some(DetectionCache {
+                                source: Arc::downgrade(&request.source),
+                                document: key.document_id,
+                                revision: key.revision,
+                                path: request.path.clone(),
+                                mappings: request.mappings.clone(),
+                                choice: request.choice,
+                                detection,
+                            });
+                            detection
+                        };
+                        if job.context_margin.is_none()
+                            && let Some(snapshot) = &request.snapshot
+                        {
                             match (&previous, &snapshot.edit) {
                                 (Some(old), _) if old.sequence == snapshot.sequence && old.revision == key.revision => {
                                 }
@@ -374,15 +423,26 @@ impl HighlightWorker {
                                 _ => engine.reset_document(),
                             }
                         }
-                        let highlights = engine.highlight(
-                            request.source.as_ref(),
-                            detection.language,
-                            key.revision,
-                            request.previous_revision,
-                            request.edit.as_ref(),
-                            request.visible.clone(),
-                            &cancelled,
-                        )?;
+                        let highlights = if let Some(margin) = job.context_margin {
+                            engine.highlight_window(
+                                request.source.as_ref(),
+                                detection.language,
+                                key.revision,
+                                request.visible.clone(),
+                                margin,
+                                &cancelled,
+                            )?
+                        } else {
+                            engine.highlight(
+                                request.source.as_ref(),
+                                detection.language,
+                                key.revision,
+                                request.previous_revision,
+                                request.edit.as_ref(),
+                                request.visible.clone(),
+                                &cancelled,
+                            )?
+                        };
                         if highlights.spans.len() > MAX_RESULT_SPANS {
                             return Err(Error::QueryLimit);
                         }
@@ -417,6 +477,35 @@ impl HighlightWorker {
     /// Constant mailbox work, no source access, glob compilation or destruction
     /// of superseded requests. Saturation returns ownership for later retry.
     pub fn submit(&self, request: HighlightRequest) -> Result<u64, Box<HighlightSubmitError>> {
+        self.submit_policy(request, None)
+    }
+
+    /// Admit a bounded per-request context policy on this SAME worker. This
+    /// never changes defaults or permits parsing outside the fragment. On refusal the
+    /// caller retains its request and retries with the same explicit policy.
+    pub fn submit_with_context_margin(
+        &self,
+        request: HighlightRequest,
+        margin_bytes: usize,
+    ) -> Result<u64, Box<HighlightSubmitError>> {
+        if margin_bytes > MAX_WINDOW_BYTES / 2
+            || request.visible.start > request.visible.end
+            || request
+                .visible
+                .len()
+                .checked_add(margin_bytes.saturating_mul(2))
+                .is_none_or(|bytes| bytes > MAX_WINDOW_BYTES)
+        {
+            return Err(Box::new(HighlightSubmitError { request, error: Error::InvalidRange }));
+        }
+        self.submit_policy(request, Some(margin_bytes))
+    }
+
+    fn submit_policy(
+        &self,
+        request: HighlightRequest,
+        context_margin: Option<usize>,
+    ) -> Result<u64, Box<HighlightSubmitError>> {
         let mut state = self.shared.state.lock().unwrap();
         if state.stopped {
             return Err(Box::new(HighlightSubmitError { request, error: Error::Closed }));
@@ -428,7 +517,7 @@ impl HighlightWorker {
             state.retired[index] = state.pending.take();
         }
         let generation = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        state.pending = Some(Job { generation, request });
+        state.pending = Some(Job { generation, request, context_margin });
         self.shared.ready.notify_one();
         Ok(generation)
     }
@@ -648,6 +737,147 @@ mod tests {
     }
     fn wait(events: &mpsc::Receiver<()>) {
         events.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn prepared_worker_context_is_per_request_and_opaque_gap_bytes_are_never_read() {
+        struct Gapped {
+            ui: thread::ThreadId,
+            ranges: [Range<usize>; 2],
+            reads: Mutex<Vec<Range<usize>>>,
+        }
+        impl TextSource for Gapped {
+            fn len(&self) -> usize {
+                1_000_000_100
+            }
+            fn chunk(&self, offset: usize, max: usize) -> io::Result<Cow<'_, [u8]>> {
+                assert_ne!(thread::current().id(), self.ui, "source I/O on the submitter");
+                assert_eq!(thread::current().name(), Some("kwil-highlighting"));
+                let range = offset..offset + max;
+                assert!(
+                    self.ranges.iter().any(|allowed| range.start >= allowed.start && range.end <= allowed.end),
+                    "opaque/gap read {range:?}"
+                );
+                self.reads.lock().unwrap().push(range);
+                Ok(Cow::Borrowed(&b"42"[..max]))
+            }
+        }
+        let source = Arc::new(Gapped {
+            ui: thread::current().id(),
+            ranges: [10..12, 1_000_000_000..1_000_000_002],
+            reads: Mutex::new(Vec::new()),
+        });
+        let (worker, events) = worker(Config::default());
+        for (index, range) in source.ranges.iter().enumerate() {
+            let current = key(1, 1, index as u64 + 1);
+            let mut next = request(current, source.clone());
+            next.choice = LanguageChoice::Explicit(Language::Rust);
+            next.visible = range.clone();
+            worker.submit_with_context_margin(next, 0).unwrap();
+            wait(&events);
+            let result = worker.take_update(current).unwrap().unwrap();
+            assert_eq!(result.highlights.requested, *range);
+            assert_eq!(result.highlights.queried, *range);
+            assert_eq!(result.highlights.mode, Mode::Lexical, "large-source fallback policy is unchanged");
+            assert!(result.highlights.spans.iter().any(|span| span.class == Class::Number && span.range == *range));
+        }
+        let source: Arc<dyn TextSource> = Arc::new(vec![b' '; 20_000]);
+        let mut next = request(key(1, 1, 3), source);
+        next.visible = 10_000..10_001;
+        worker.submit(next).unwrap();
+        wait(&events);
+        assert_eq!(worker.take_update(key(1, 1, 3)).unwrap().unwrap().highlights.queried, 5_904..14_097);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn prepared_detection_cache_tracks_source_and_policy_but_not_viewport() {
+        use std::sync::atomic::AtomicUsize;
+        struct Counted {
+            bytes: Vec<u8>,
+            prefixes: AtomicUsize,
+        }
+        impl TextSource for Counted {
+            fn len(&self) -> usize {
+                self.bytes.len()
+            }
+            fn chunk(&self, offset: usize, max: usize) -> io::Result<Cow<'_, [u8]>> {
+                if offset == 0 {
+                    self.prefixes.fetch_add(1, Ordering::Relaxed);
+                }
+                assert_eq!(thread::current().name(), Some("kwil-highlighting"));
+                Ok(Cow::Borrowed(&self.bytes[offset..offset + max]))
+            }
+        }
+        let mut bytes = vec![b' '; 100_000];
+        bytes[..9].copy_from_slice(b"ordinary\n");
+        bytes[80_000..80_005].copy_from_slice(b"42 43");
+        let source = Arc::new(Counted { bytes, prefixes: AtomicUsize::new(0) });
+        let (worker, events) = worker(Config::default());
+        for generation in 1..=4 {
+            let current = key(1, 1, generation);
+            let mut next = request(current, source.clone());
+            next.choice = LanguageChoice::Automatic;
+            next.path = Arc::new(if generation < 3 { "file.rs".into() } else { "renamed.py".into() });
+            next.visible = if generation == 1 { 80_000..80_002 } else { 80_003..80_005 };
+            if generation == 4 {
+                next.mappings = Arc::from([LanguageMapping { pattern: "py".into(), language: Language::Log }]);
+            }
+            worker.submit_with_context_margin(next, 0).unwrap();
+            wait(&events);
+            let result = worker.take_update(current).unwrap().unwrap();
+            let expected = match generation {
+                1 | 2 => Language::Rust,
+                3 => Language::Python,
+                _ => Language::Log,
+            };
+            assert_eq!(result.detection.language, expected);
+            assert_eq!(
+                source.prefixes.load(Ordering::Relaxed),
+                if generation < 3 { 1 } else { 2 },
+                "viewport reissue must not redetect"
+            );
+        }
+        // Remove the mapping without replacing the immutable source.
+        let mut next = request(key(1, 1, 5), source.clone());
+        next.choice = LanguageChoice::Automatic;
+        next.path = Arc::new("renamed.py".into());
+        next.visible = 80_000..80_002;
+        worker.submit_with_context_margin(next, 0).unwrap();
+        wait(&events);
+        assert_eq!(worker.take_update(key(1, 1, 5)).unwrap().unwrap().detection.language, Language::Python);
+        assert_eq!(source.prefixes.load(Ordering::Relaxed), 3);
+        // Identical document/revision/path/policy, but a new immutable owner
+        // with a Ruby shebang. A source-blind cache would return Python.
+        let replacement: Arc<dyn TextSource> = Arc::new(b"#!/usr/bin/ruby\n42".to_vec());
+        let mut next = request(key(1, 1, 6), replacement.clone());
+        next.choice = LanguageChoice::Automatic;
+        next.path = Arc::new("renamed.py".into());
+        next.visible = replacement.len() - 2..replacement.len();
+        worker.submit_with_context_margin(next, 0).unwrap();
+        wait(&events);
+        assert_eq!(worker.take_update(key(1, 1, 6)).unwrap().unwrap().detection.language, Language::Ruby);
+        let mut next = request(key(1, 1, 7), replacement.clone());
+        next.path = Arc::new("renamed.py".into());
+        next.visible = replacement.len() - 2..replacement.len();
+        worker.submit_with_context_margin(next, 0).unwrap();
+        wait(&events);
+        assert_eq!(worker.take_update(key(1, 1, 7)).unwrap().unwrap().detection.language, Language::Generic);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn prepared_context_refusal_returns_exact_source_without_reading_or_cancelling() {
+        let (worker, events) = worker(Config::default());
+        let source: Arc<dyn TextSource> = Arc::new(b"42".to_vec());
+        let rejected =
+            worker.submit_with_context_margin(request(key(1, 1, 1), source.clone()), MAX_WINDOW_BYTES).unwrap_err();
+        assert!(matches!(rejected.error, Error::InvalidRange));
+        assert!(Arc::ptr_eq(&rejected.request.source, &source));
+        worker.submit(request(key(1, 1, 2), source)).unwrap();
+        wait(&events);
+        assert!(worker.take_update(key(1, 1, 2)).unwrap().is_ok());
+        worker.shutdown().unwrap();
     }
 
     #[test]
