@@ -2,14 +2,19 @@
 <#
 Tiny isolated source/fixture checks, for ROOT to run explicitly:
   pwsh -NoLogo -NoProfile -File .\scripts\test-dist.ps1
-No Git, Cargo, compiler, application, backend or subprocess is launched.
+Focused archive regression (mock only by default; opt in to tiny real Git):
+  pwsh -NoLogo -NoProfile -File .\scripts\test-dist.ps1 -ArchiveOnly -RunGitArchiveFixture
+Without -RunGitArchiveFixture no subprocess is launched. The opt-in fixture
+uses only a disposable repository, child-only Git settings and bounded Git
+processes with exact PID receipts. No Cargo, compiler, app or backend runs.
 Synthetic PE images are fixtures only, never represented as a real release build.
 All output is below one GUID-owned directory in the approved kwil-dist cache.
+Real Git fixture artifacts and PID receipts are retained there for ROOT review.
 The empty-environment regression cases require .NET 9 or later; they never skip
 or normalize an empty entry to an absent entry on an older runtime.
 #>
 [CmdletBinding()]
-param()
+param([switch]$ArchiveOnly, [switch]$RunGitArchiveFixture)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ([Environment]::Version.Major -lt 9) { throw 'Exact empty-environment fixtures require .NET 9 or later; no fixture environment was changed.' }
@@ -46,6 +51,136 @@ function Assert-TestNonInstallingRustupArguments {
     Assert-True ($Arguments.Count -ge 3 -and $Arguments[0] -ceq 'run' -and
         $Arguments[1] -ceq '1.99.1' -and $Arguments[2] -cin @('cargo', 'rustc')) 'supported rustup run TOOLCHAIN COMMAND grammar'
     Assert-True ('--install' -cnotin $Arguments -and '--no-auto-install' -cnotin $Arguments) 'no installing or unsupported rustup option'
+}
+
+function Test-DistArchiveBoundary {
+    param([string]$Root)
+    $originalProcess = (Get-Item Function:Invoke-DistProcess).ScriptBlock
+    $calls = [Collections.Generic.List[object]]::new()
+    $repository = Join-Path $Root 'repo with spaces & (fixture)'
+    $archivePath = Join-Path $Root 'source with spaces & (fixture).zip'
+    $sourceCommit = '0123456789abcdef0123456789abcdef01234567'
+    try {
+        function Invoke-DistProcess {
+            param($FilePath, $Arguments, $WorkingDirectory, $TimeoutSeconds, $LogDirectory, $Label)
+            $calls.Add([pscustomobject]@{ File = $FilePath; Args = @($Arguments); Cwd = $WorkingDirectory;
+                Timeout = $TimeoutSeconds; Logs = $LogDirectory; Label = $Label })
+            if ($calls.Count -eq 2) { throw 'mock archive failure' }
+        }
+        Export-DistSourceArchive 'git fixture.exe' $repository $sourceCommit $archivePath $Root $Root
+        Assert-Throws {
+            Export-DistSourceArchive 'git fixture.exe' $repository $sourceCommit $archivePath $Root $Root
+        } 'mock archive failure'
+        Assert-True ($calls.Count -eq 2) 'one archive attempt per call, no retry after failure'
+        $expected = @('-C', $repository, '-c', 'core.autocrlf=false', '-c', 'core.eol=lf',
+            'archive', '--format=zip', "--output=$archivePath", $sourceCommit)
+        foreach ($call in $calls) {
+            Assert-True ($call.File -ceq 'git fixture.exe' -and $call.Args.Count -eq $expected.Count) 'exact archive executable and argv count'
+            for ($i = 0; $i -lt $expected.Count; $i++) {
+                Assert-True ($call.Args[$i] -ceq $expected[$i]) "literal command-scoped archive argument $i"
+            }
+            Assert-True ($call.Cwd -ceq $Root -and $call.Timeout -eq 60 -and
+                $call.Logs -ceq $Root -and $call.Label -ceq 'archive') 'archive retains bounded process boundary and receipts'
+        }
+    } finally { Set-Item Function:Invoke-DistProcess -Value $originalProcess }
+    $driverCalls = @((Get-Item Function:Invoke-KwilDist).ScriptBlock.Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Export-DistSourceArchive'
+    }, $true))
+    Assert-True ($driverCalls.Count -eq 1) 'production snapshot uses the tested archive boundary'
+}
+
+function Test-DistRealGitArchive {
+    param([string]$Root)
+    $git = (Get-Command git.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $repository = Join-Path $Root 'tiny repository with spaces & (fixture)'
+    $logs = Join-Path $Root 'git-archive-logs'
+    $template = Join-Path $Root 'empty-git-template'
+    $globalConfig = Join-Path $Root 'empty-git-config'
+    foreach ($directory in $repository, $logs, $template) { $null = New-Item -ItemType Directory -Path $directory }
+    [IO.File]::WriteAllBytes($globalConfig, [byte[]]::new(0))
+    $originalInfo = (Get-Item Function:New-DistProcessInfo).ScriptBlock
+    try {
+        # Only child ProcessStartInfo is changed. Inherited Git overrides cannot
+        # redirect fixture writes into the owner's index/repository or read their
+        # config/attributes. No process/user/machine environment or Git config is set.
+        function New-DistProcessInfo {
+            param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory)
+            $info = & $originalInfo $FilePath $Arguments $WorkingDirectory
+            foreach ($name in @($info.Environment.Keys)) {
+                if ($name.StartsWith('GIT_', [StringComparison]::OrdinalIgnoreCase)) { $null = $info.Environment.Remove($name) }
+            }
+            $info.Environment['GIT_CONFIG_NOSYSTEM'] = '1'
+            $info.Environment['GIT_CONFIG_GLOBAL'] = $globalConfig
+            $info.Environment['GIT_ATTR_NOSYSTEM'] = '1'
+            $info.Environment['GIT_CONFIG_COUNT'] = '3'
+            $info.Environment['GIT_CONFIG_KEY_0'] = 'core.autocrlf'
+            $info.Environment['GIT_CONFIG_VALUE_0'] = 'true'
+            $info.Environment['GIT_CONFIG_KEY_1'] = 'core.eol'
+            $info.Environment['GIT_CONFIG_VALUE_1'] = 'crlf'
+            $info.Environment['GIT_CONFIG_KEY_2'] = 'core.attributesfile'
+            $info.Environment['GIT_CONFIG_VALUE_2'] = $globalConfig
+            foreach ($role in 'AUTHOR', 'COMMITTER') {
+                $info.Environment["GIT_${role}_NAME"] = 'rennerdo30'
+                $info.Environment["GIT_${role}_EMAIL"] = '9086097+rennerdo30@users.noreply.github.com'
+            }
+            return $info
+        }
+        $null = Invoke-DistProcess $git @('-C', $repository, 'init', '--quiet', '--object-format=sha1',
+            "--template=$template") $Root 10 $logs 'fixture-init'
+        foreach ($directory in 'scripts', 'docs/decisions', 'crates/installer-guard/src') {
+            $null = New-Item -ItemType Directory -Path (Join-Path $repository $directory)
+        }
+        # Use the actual reviewed LF JSON and mixed-ending document, not
+        # normalized text copies. The other installer inputs are inert dummies.
+        foreach ($relative in 'scripts/windows-installer-contract.json', 'docs/decisions/0004-windows-installer.md') {
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot "../$relative") -Destination (Join-Path $repository $relative)
+        }
+        foreach ($relative in 'scripts/windows-msi.ps1', 'crates/installer-guard/Cargo.toml', 'crates/installer-guard/src/lib.rs') {
+            [IO.File]::WriteAllText((Join-Path $repository $relative), "inert fixture`n")
+        }
+        [IO.File]::WriteAllText((Join-Path $repository 'lf.txt'), "first`nsecond`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $repository 'crlf.txt'), "first`r`nsecond`r`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $repository 'mixed.txt'), "first`r`nsecond`nthird`r`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllBytes((Join-Path $repository 'binary.bin'), [byte[]]@(0, 10, 13, 10, 255))
+        $expected = @{}
+        foreach ($relative in 'scripts/windows-installer-contract.json', 'docs/decisions/0004-windows-installer.md',
+            'scripts/windows-msi.ps1', 'crates/installer-guard/Cargo.toml', 'crates/installer-guard/src/lib.rs',
+            'lf.txt', 'crlf.txt', 'mixed.txt', 'binary.bin') {
+            $expected[$relative] = (Get-FileHash -LiteralPath (Join-Path $repository $relative) -Algorithm SHA256).Hash
+        }
+        $null = Invoke-DistProcess $git @('-C', $repository, '-c', 'core.autocrlf=false', '-c', 'core.eol=lf',
+            'add', '--', 'scripts', 'docs', 'crates', 'lf.txt', 'crlf.txt', 'mixed.txt', 'binary.bin') $Root 10 $logs 'fixture-add'
+        $treeLog = Invoke-DistProcess $git @('-C', $repository, 'write-tree') $Root 10 $logs 'fixture-tree'
+        $tree = [IO.File]::ReadAllText($treeLog.FullName).Trim()
+        Assert-True ($tree -cmatch '^[0-9a-f]{40}$') 'fixture tree is exact SHA-1'
+        # Plumbing creates an unreferenced disposable commit, without hooks,
+        # signing, branch updates or writes to identity/config settings.
+        $commitLog = Invoke-DistProcess $git @('-C', $repository, 'commit-tree', $tree, '-m', 'Tiny archive regression fixture') $Root 10 $logs 'fixture-commit'
+        $sourceCommit = [IO.File]::ReadAllText($commitLog.FullName).Trim()
+        Assert-True ($sourceCommit -cmatch '^[0-9a-f]{40}$') 'fixture commit is exact SHA-1'
+        $configPath = Join-Path $repository '.git/config'
+        $configBefore = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+        [IO.File]::WriteAllText((Join-Path $repository 'lf.txt'), 'dirty working text must not ship')
+        [IO.File]::WriteAllText((Join-Path $repository 'untracked.txt'), 'untracked text must not ship')
+        $legacyZip = Join-Path $Root 'legacy-source.zip'
+        $null = Invoke-DistProcess $git @('-C', $repository, 'archive', '--format=zip', "--output=$legacyZip", $sourceCommit) $Root 60 $logs 'fixture-legacy-archive'
+        $legacySnapshot = Join-Path $Root 'legacy-snapshot'
+        [IO.Compression.ZipFile]::ExtractToDirectory($legacyZip, $legacySnapshot)
+        Assert-True ((Get-FileHash -LiteralPath (Join-Path $legacySnapshot 'lf.txt')).Hash -cne $expected['lf.txt']) 'broken archive control converts LF under hostile autocrlf'
+        Assert-Throws { Assert-DistInstallerSources $legacySnapshot } 'Frozen installer contract mismatch'
+        $fixedZip = Join-Path $Root 'fixed-source.zip'
+        Export-DistSourceArchive $git $repository $sourceCommit $fixedZip $Root $logs
+        $fixedSnapshot = Join-Path $Root 'fixed-snapshot'
+        [IO.Compression.ZipFile]::ExtractToDirectory($fixedZip, $fixedSnapshot)
+        Assert-True (@(Get-ChildItem -LiteralPath $fixedSnapshot -File -Recurse).Count -eq $expected.Count) 'archive has only committed fixture files'
+        foreach ($relative in $expected.Keys) {
+            Assert-True ((Get-FileHash -LiteralPath (Join-Path $fixedSnapshot $relative)).Hash -ceq $expected[$relative]) "byte-exact archived fixture: $relative"
+        }
+        Assert-DistInstallerSources $fixedSnapshot
+        Assert-True ((Get-FileHash -LiteralPath $configPath).Hash -ceq $configBefore) 'archive commands leave disposable repository config unchanged'
+    } finally { Set-Item Function:New-DistProcessInfo -Value $originalInfo }
 }
 
 function New-TestPe {
@@ -97,8 +232,16 @@ if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw "Missing 
 $token = [Guid]::NewGuid().ToString('N')
 $root = New-DistOwnedDirectory $parent "kwil-dist-tests-$token" $token
 $passed = $false
-Write-Host "Fixture reader PID=$PID; no child processes; isolated root=$root"
+$script:DistUnreapedProcess = $false
+Write-Host "Fixture reader PID=$PID; real Git opt-in=$RunGitArchiveFixture; isolated root=$root"
 try {
+    Test-DistArchiveBoundary $root
+    if ($RunGitArchiveFixture) { Test-DistRealGitArchive $root }
+    if ($ArchiveOnly) {
+        $passed = $true
+        Write-Host 'PASS: focused archive regression; real Git ran only if explicitly selected.'
+        return
+    }
     $commit = '0123456789abcdef0123456789abcdef01234567'
     $target = 'x86_64-pc-windows-msvc'
     $names = Get-DistNames '0.1.0' $commit $target
@@ -633,8 +776,8 @@ try {
         else { $script:DistUnreapedProcess = $previousOwnershipValue }
     }
     $passed = $true
-    Write-Host 'PASS: tiny dist fixtures and mocked build boundary; no real build, MSI or app run.'
+    Write-Host 'PASS: tiny dist fixtures and mocked build boundary; no real build, MSI or app run. Real Git ran only if explicitly selected.'
 } finally {
-    if ($passed) { Remove-DistOwnedDirectory $parent $root $token }
-    else { Write-Warning "Failed fixture artifacts retained: $root" }
+    if ($passed -and -not $RunGitArchiveFixture -and -not $script:DistUnreapedProcess) { Remove-DistOwnedDirectory $parent $root $token }
+    else { Write-Warning "Fixture artifacts retained for ROOT inspection: $root" }
 }

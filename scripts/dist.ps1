@@ -222,6 +222,18 @@ function Get-DistNames {
     return [pscustomobject]@{ Namespace = $stem; Msi = "$stem.msi"; Zip = "$stem-portable.zip" }
 }
 
+function Export-DistSourceArchive {
+    param([string]$Git, [string]$Repository, [string]$Commit, [string]$Archive,
+        [string]$WorkingDirectory, [string]$Logs)
+    # Snapshot bytes must not depend on the runner's checkout defaults. Disable
+    # implicit LF/CRLF conversion for this command only; committed attributes
+    # still apply. In particular, preserve mixed endings rather than rewriting
+    # extracted files or relaxing the frozen-source hashes after extraction.
+    $null = Invoke-DistProcess $Git @('-C', $Repository, '-c', 'core.autocrlf=false',
+        '-c', 'core.eol=lf', 'archive', '--format=zip', "--output=$Archive", $Commit) `
+        $WorkingDirectory 60 $Logs 'archive'
+}
+
 function Get-DistRustupRunArguments {
     param([string]$Toolchain, [string[]]$Command)
     # Installed CLI: rustup run [OPTIONS] <TOOLCHAIN> <COMMAND>...
@@ -1065,7 +1077,7 @@ function Invoke-KwilDist {
         Write-Host "Building committed HEAD $commit. Dirty and untracked working code is explicitly ignored."
         [IO.File]::WriteAllText((Join-Path $logs 'source-commit.txt'), $commit + "`n")
         $archive = Join-Path $work 'source.zip'
-        $null = Invoke-DistProcess $tools['git.exe'] @('-C', $Repository, 'archive', '--format=zip', "--output=$archive", $commit) $work 60 $logs 'archive'
+        Export-DistSourceArchive $tools['git.exe'] $Repository $commit $archive $work $logs
         $snapshot = Join-Path $work 'snapshot'
         [IO.Compression.ZipFile]::ExtractToDirectory($archive, $snapshot)
         Assert-DistPlainPath $snapshot
