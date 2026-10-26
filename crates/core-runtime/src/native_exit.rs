@@ -69,6 +69,33 @@ pub fn native_exit_state<T>(thread: &JoinHandle<T>) -> Result<NativeExitState, N
     }
 }
 
+/// Internal Windows deadline adapter for the registered observation. Native
+/// ownership stays in std's original JoinHandle throughout every finite wait.
+#[cfg(windows)]
+pub(crate) fn wait_until<T>(thread: &JoinHandle<T>, deadline: std::time::Instant) -> QueryResult {
+    use std::os::windows::io::AsRawHandle;
+    windows::wait_until_with(
+        thread.as_raw_handle(),
+        deadline,
+        &mut windows::SystemQuery,
+        std::time::Instant::now,
+        std::thread::sleep,
+    )
+}
+
+#[cfg(windows)]
+pub(crate) const fn wait_stack_bytes() -> Option<usize> {
+    let n = std::mem::size_of::<&JoinHandle<()>>().checked_add(std::mem::size_of::<std::time::Instant>());
+    let n = match n {
+        Some(n) => n.checked_add(std::mem::size_of::<QueryResult>()),
+        None => None,
+    };
+    match (n, windows::wait_scratch_bytes()) {
+        (Some(n), Some(scratch)) => n.checked_add(scratch),
+        _ => None,
+    }
+}
+
 /// Checked declared Rust-value admission, in BYTES, for one query: the borrowed
 /// JoinHandle reference, two query-result headers which can overlap on return,
 /// and, on Windows, the actual scalar scratch record + adapter reference.

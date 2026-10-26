@@ -13,6 +13,7 @@ use std::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{self, JoinHandle, ThreadId},
+    time::{Duration, Instant},
 };
 
 #[cfg(any(target_os = "linux", test))]
@@ -160,6 +161,27 @@ impl NativeExitObservation {
     pub fn query<T>(&self, handle: &JoinHandle<T>) -> Result<NativeExitState, NativeObservationError> {
         self.query_with(handle.thread().id(), std::process::id(), |witness| query_native(witness, handle))
     }
+    /// OFF UI, after terminal acknowledgement. Borrow the ORIGINAL handle and
+    /// wait only until the caller's ORIGINAL absolute deadline. Never joins,
+    /// transfers, duplicates or retires it. Pending means the deadline expired;
+    /// fresh native errors retain their original evidence even if returned late.
+    /// Exited only authorizes the owner's existing deadline check and join.
+    pub fn wait_until<T>(
+        &self,
+        handle: &JoinHandle<T>,
+        deadline: Instant,
+    ) -> Result<NativeExitState, NativeObservationError> {
+        if Instant::now() >= deadline {
+            return Ok(NativeExitState::Pending);
+        }
+        self.query_with(handle.thread().id(), std::process::id(), |witness| {
+            #[cfg(windows)]
+            if matches!(witness, Witness::Windows) {
+                return crate::native_exit::wait_until(handle, deadline).map_err(NativeObservationError::WindowsQuery);
+            }
+            wait_until_with(deadline, Instant::now, || query_native(witness, handle), thread::sleep)
+        })
+    }
     /// OFF UI, only AFTER the original owner successfully joined its original
     /// handle. This API cannot itself prove that external join; the owner must
     /// enforce that precondition. Partial failed registration is still retired.
@@ -178,7 +200,7 @@ impl NativeExitObservation {
     }
 
     /// Checked declared Rust-value scratch + return overlap, BYTES. This is
-    /// intentionally conservative across registration/query/retirement, not a
+    /// intentionally conservative across registration/query/wait/retirement, not a
     /// compiler stack-frame/native stack bound or a heap allocation estimate.
     pub const fn operation_stack_bytes() -> Option<usize> {
         let n = Some(std::mem::size_of::<Attempt>());
@@ -191,8 +213,29 @@ impl NativeExitObservation {
         let n = add(n, std::mem::size_of::<Result<NativeExitState, NativeObservationError>>());
         let n = add(n, std::mem::size_of::<Result<(), NativeObservationError>>());
         let n = add(n, std::mem::size_of::<Result<(), NativeObservationError>>());
+        // wait_until -> claimed witness closure -> passive wait: by-value
+        // deadline arguments, closure captures (&handle, &deadline), query
+        // captures (&witness, &handle), scratch, and result return overlap.
+        // These are declared Rust values, never arbitrary stack-frame padding.
+        let n = add(n, std::mem::size_of::<&Self>()); // public wait receiver
+        let n = add(n, std::mem::size_of::<&JoinHandle<()>>()); // borrowed wait argument
+        let n = add(n, std::mem::size_of::<Instant>());
+        let n = add(n, std::mem::size_of::<(&JoinHandle<()>, &Instant)>());
+        let n = add(n, std::mem::size_of::<(&Witness, &JoinHandle<()>)>());
+        let n = add(n, std::mem::size_of::<Instant>());
+        let n = add(n, std::mem::size_of::<DeadlineScratch>());
+        let n = add(n, std::mem::size_of::<Duration>()); // sleep argument copy
+        let n = add(n, std::mem::size_of::<Duration>()); // min return overlap
+        let n = add(n, std::mem::size_of::<Instant>()); // clock return overlap
+        let n = add(n, std::mem::size_of::<Result<NativeExitState, NativeObservationError>>());
+        let n = add(n, std::mem::size_of::<Result<NativeExitState, NativeObservationError>>());
         #[cfg(windows)]
         let n = match crate::native_exit_query_stack_bytes() {
+            Some(bytes) => add(n, bytes),
+            None => None,
+        };
+        #[cfg(windows)]
+        let n = match crate::native_exit::wait_stack_bytes() {
             Some(bytes) => add(n, bytes),
             None => None,
         };
@@ -293,6 +336,41 @@ impl NativeExitObservation {
         }
     }
 }
+
+// Stack-only carrier shared with private fake clock/query/sleep controls. The
+// claim remains held across the wait, excluding concurrent right retirement.
+struct DeadlineScratch {
+    deadline: Instant,
+    sampled: Instant,
+    remaining: Duration,
+    result: Result<NativeExitState, NativeObservationError>,
+}
+fn wait_until_with(
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut query: impl FnMut() -> Result<NativeExitState, NativeObservationError>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<NativeExitState, NativeObservationError> {
+    let mut scratch =
+        DeadlineScratch { deadline, sampled: now(), remaining: Duration::ZERO, result: Ok(NativeExitState::Pending) };
+    loop {
+        // Preflight EVERY query, including after a sleep/late scheduler wake.
+        if scratch.sampled >= scratch.deadline {
+            return Ok(NativeExitState::Pending);
+        }
+        scratch.result = query();
+        scratch.sampled = now(); // Check after EVERY result, including errors.
+        match scratch.result {
+            Err(error) => return Err(error),
+            Ok(_) if scratch.sampled >= scratch.deadline => return Ok(NativeExitState::Pending),
+            Ok(NativeExitState::Exited) => return scratch.result,
+            Ok(NativeExitState::Pending) => {}
+        }
+        scratch.remaining = scratch.deadline.saturating_duration_since(scratch.sampled);
+        sleep(scratch.remaining.min(Duration::from_millis(1)));
+        scratch.sampled = now();
+    }
+}
 fn check_available(state: u8) -> Result<(), NativeObservationError> {
     match state {
         UNREGISTERED => Err(NativeObservationError::Unregistered),
@@ -356,5 +434,7 @@ fn retire_native(witness: &Witness) -> Result<(), NativeObservationError> {
     Ok(())
 }
 
+#[cfg(test)]
+mod deadline_tests;
 #[cfg(test)]
 mod tests;

@@ -194,6 +194,13 @@ impl<T: Send + 'static> StartupFont<T> {
                 )
             })
             .and_then(|n| n.checked_add(NativeExitObservation::operation_stack_bytes()?))
+            // take_ready's wrapper -> shared body -> synchronous effect:
+            // wrapper deadline/receiver, effect deadline/borrowed arguments,
+            // and the added helper return overlap. All are stack-only values.
+            .and_then(|n| n.checked_add(std::mem::size_of::<std::time::Instant>().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<&mut Self>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<(&NativeExitObservation, &std::thread::JoinHandle<()>)>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Result<Option<T>, FontSettlementReason>>()))
             .ok_or(kwil_view_model::visual_rows::WrapError::Admission("font native-exit metadata overflow"))?;
         let metadata = budget.reserve_metadata(bytes)?;
         Ok(Self {
@@ -330,7 +337,19 @@ impl<T: Send + 'static> StartupFont<T> {
     }
     /// OFF UI: successful native join is followed by explicit right retirement.
     /// ROOT's startup caller must use the existing off-UI executor as shutdown does.
+    #[cfg(test)]
     pub fn take_ready(&mut self, deadline: std::time::Instant) -> Result<Option<T>, FontSettlementReason> {
+        self.take_ready_with(deadline, |native, handle, _| native.query(handle))
+    }
+    fn take_ready_with(
+        &mut self,
+        deadline: std::time::Instant,
+        query: impl FnOnce(
+            &NativeExitObservation,
+            &std::thread::JoinHandle<()>,
+            std::time::Instant,
+        ) -> Result<NativeExitState, NativeObservationError>,
+    ) -> Result<Option<T>, FontSettlementReason> {
         let deadline = self.deadline.map_or(deadline, |stored| stored.min(deadline));
         self.deadline = Some(deadline);
         // A previous join can have left a counted right and a font/panic owner.
@@ -360,7 +379,7 @@ impl<T: Send + 'static> StartupFont<T> {
         }
         drop(state);
         self.check_deadline(deadline)?;
-        let observed = match self.terminal.native.query(self.thread.as_ref().unwrap()) {
+        let observed = match query(&self.terminal.native, self.thread.as_ref().unwrap(), deadline) {
             Err(error) => return Err(self.retain_native_error(error)),
             Ok(state) => state,
         };
@@ -424,7 +443,7 @@ impl<T: Send + 'static> StartupFont<T> {
         Ok(())
     }
     pub fn settle_until(&mut self, deadline: std::time::Instant) -> Result<(), FontSettlementReason> {
-        drop(self.take_ready(deadline)?);
+        drop(self.take_ready_with(deadline, NativeExitObservation::wait_until)?);
         Ok(())
     }
 }

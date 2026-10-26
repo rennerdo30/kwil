@@ -346,7 +346,7 @@ impl HighlightWorker {
         let bytes = metadata_add(bytes, std::mem::size_of::<HighlightShutdownError>());
         let bytes = metadata_add(bytes, std::mem::size_of::<Result<(), HighlightShutdownError>>());
         match NativeExitObservation::operation_stack_bytes() {
-            Some(scratch) => metadata_add(bytes, scratch),
+            Some(scratch) => metadata_add(metadata_add(bytes, scratch), std::mem::size_of::<&Instant>()),
             None => None,
         }
     }
@@ -682,13 +682,13 @@ impl HighlightWorker {
         }
         self.finish_join_with(None, NativeExitObservation::retire_after_join)
     }
-    /// OFF UI. One existing completion wait, one borrowed native observation,
-    /// the ORIGINAL deadline, and no production polling. ACK/is_finished alone
+    /// OFF UI. Existing completion ACK, then one shared native deadline wait,
+    /// using the ORIGINAL deadline. ACK/is_finished alone
     /// never authorizes join. Every refusal retains the exact original owners.
     pub fn settle_until(&mut self, deadline: Instant) -> Result<(), WorkerSettlementReason> {
         self.settle_with(
             deadline,
-            |observation, handle| observation.query(handle),
+            |observation, handle| observation.wait_until(handle, deadline),
             NativeExitObservation::retire_after_join,
         )
     }

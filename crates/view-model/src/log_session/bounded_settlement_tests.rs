@@ -79,12 +79,16 @@ fn cleanup_ack_retains_exact_log_thread_and_status_until_successful_join() {
     observed.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
     assert!(original.completed.load(Ordering::Acquire));
     assert!(!session.worker.as_ref().unwrap().is_finished());
-    assert_eq!(session.settle_until(deadline), Err(LogSettlementReason::ThreadExitPending));
+    assert_eq!(
+        session.settle_with(deadline, NativeExitObservation::query, NativeExitObservation::retire_after_join),
+        Err(LogSettlementReason::ThreadExitPending)
+    );
     assert_eq!(session.worker.as_ref().unwrap().thread().id(), id);
     assert!(Arc::ptr_eq(&session.shared, &original));
     assert!(Arc::ptr_eq(&status.0, &original));
     release.send(()).unwrap();
-    assert_eq!(settle(&mut session, deadline), Ok(()));
+    assert_eq!(session.settle_until(deadline), Ok(()));
+    assert!(Instant::now() < deadline, "public settlement must complete under the original deadline");
     assert!(session.worker.is_none());
     assert_eq!(session.settle_until(deadline), Ok(()));
     assert!(status.result().is_ok());
@@ -447,13 +451,14 @@ fn native_tls_pending_preserves_original_owner_then_explicit_retry_joins_and_ret
         thread::park_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(1)));
     }
     let rust_finished = worker.worker.as_ref().unwrap().is_finished();
-    let pending = worker.settle_until(deadline);
+    // Inspect held TLS once; the public settlement wait runs only after release.
+    let pending = worker.settle_with(deadline, NativeExitObservation::query, NativeExitObservation::retire_after_join);
     let retained = worker.worker.as_ref().map(|handle| handle.thread().id());
     let same_shared = Arc::ptr_eq(&worker.shared, &original);
     let released = release.send(());
-    // Only this native-exit fixture uses passive readiness backoff; ONE 2s
-    // deadline covers registration, the gate, retries, join and retirement.
-    let result = settle(&mut worker, deadline);
+    // The public wait, original join and retirement use the SAME 2s deadline.
+    let result = worker.settle_until(deadline);
+    let returned = Instant::now();
     // Release and original compatibility cleanup BEFORE assertions, even when
     // an observation failed. No gate or original handle is abandoned on panic.
     let cleanup = worker.shutdown_in_place();
@@ -467,6 +472,7 @@ fn native_tls_pending_preserves_original_owner_then_explicit_retry_joins_and_ret
     assert!(same_shared);
     assert!(released.is_ok());
     assert_eq!(result, Ok(()));
+    assert!(returned < deadline, "public settlement must complete under the original deadline");
     assert_eq!(cleanup, Ok(()));
     assert!(worker.worker.is_none());
     assert!(worker.native_retired);

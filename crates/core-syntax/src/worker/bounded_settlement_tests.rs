@@ -58,11 +58,15 @@ fn completion_ack_does_not_consume_original_thread_in_held_epilogue() {
     observed.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
     assert!(original.completed.load(Ordering::Acquire));
     assert!(!worker.thread.as_ref().unwrap().is_finished());
-    assert_eq!(worker.settle_until(deadline), Err(WorkerSettlementReason::ThreadExitPending));
+    assert_eq!(
+        worker.settle_with(deadline, NativeExitObservation::query, NativeExitObservation::retire_after_join),
+        Err(WorkerSettlementReason::ThreadExitPending)
+    );
     assert_eq!(worker.thread.as_ref().unwrap().thread().id(), id);
     assert!(Arc::ptr_eq(&worker.shared, &original));
     release.send(()).unwrap();
-    assert_eq!(settle(&mut worker, deadline), Ok(()));
+    assert_eq!(worker.settle_until(deadline), Ok(()));
+    assert!(Instant::now() < deadline, "public settlement must complete under the original deadline");
     assert!(worker.thread.is_none());
     assert_eq!(worker.settle_until(deadline), Ok(()));
 }
@@ -191,17 +195,14 @@ fn native_tls_pending_preserves_original_owner_then_explicit_retry_joins_and_ret
         thread::park_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(1)));
     }
     let rust_finished = worker.thread.as_ref().unwrap().is_finished();
-    let pending = worker.settle_until(deadline);
+    // Inspect held TLS once; the public settlement wait runs only after release.
+    let pending = worker.settle_with(deadline, NativeExitObservation::query, NativeExitObservation::retire_after_join);
     let retained = worker.thread.as_ref().map(|handle| handle.thread().id());
     let same_shared = Arc::ptr_eq(&worker.shared, &original);
     let released = release.send(());
-    // Only this native-exit fixture uses passive readiness backoff; ONE 2s
-    // deadline covers registration, the gate, retries, join and retirement.
-    let mut result = worker.settle_until(deadline);
-    while result == Err(WorkerSettlementReason::ThreadExitPending) && Instant::now() < deadline {
-        thread::park_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(1)));
-        result = worker.settle_until(deadline);
-    }
+    // The public wait, original join and retirement use the SAME 2s deadline.
+    let result = worker.settle_until(deadline);
+    let returned = Instant::now();
     // Release and original compatibility cleanup BEFORE assertions, even when
     // an observation failed. No gate or original handle is abandoned on panic.
     let cleanup = worker.shutdown_in_place();
@@ -215,10 +216,74 @@ fn native_tls_pending_preserves_original_owner_then_explicit_retry_joins_and_ret
     assert!(same_shared);
     assert!(released.is_ok());
     assert_eq!(result, Ok(()));
+    assert!(returned < deadline, "public settlement must complete under the original deadline");
     assert_eq!(cleanup, Ok(()));
     assert!(worker.thread.is_none());
     assert!(worker.native_retired);
     assert_eq!(worker.settle_until(deadline), Ok(()));
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn public_settlement_waits_for_held_native_tls_release_under_original_deadline() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let shared = shared();
+    let original = Arc::clone(&shared);
+    let (entered, observed) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let _completion = Completion(&shared);
+        shared.native_exit.register_current().unwrap();
+        NATIVE_EPILOGUE.with(|slot| *slot.borrow_mut() = Some(NativeEpilogue { entered, release: gate, deadline }));
+    });
+    let id = handle.thread().id();
+    let worker = Worker {
+        shared: Arc::clone(&original),
+        thread: Some(handle),
+        panic: None,
+        native_retired: false,
+        settled: false,
+        previous: None,
+    };
+    let entered = observed.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let acknowledged = original.completed.load(Ordering::Acquire);
+    let (starting, started) = mpsc::sync_channel(1);
+    let (finished, completion) = mpsc::sync_channel(1);
+    let observer = thread::spawn(move || {
+        let mut worker = worker;
+        let retained_id = worker.thread.as_ref().unwrap().thread().id();
+        let _ = starting.send(());
+        let result = worker.settle_until(deadline); // actual public production wait
+        let returned = Instant::now();
+        let _ = finished.send(());
+        (result, returned, retained_id, worker)
+    });
+    let started = started.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    // A single nonblocking Pending implementation returns here while TLS is
+    // held. A proper public wait stays pending until the gate is released.
+    let early =
+        completion.recv_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)));
+    let released = release.send(());
+    let (result, returned, retained_id, mut worker) = observer.join().unwrap();
+    let retained = Arc::ptr_eq(&worker.shared, &original);
+    // Release and original-owner cleanup precede every assertion, including
+    // failure of the single-query mutant. No new cleanup deadline is formed.
+    let cleanup = worker.shutdown_in_place();
+    assert!(entered.is_ok());
+    assert!(acknowledged);
+    assert!(started.is_ok());
+    assert!(
+        matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+        "public settlement returned while native TLS was held"
+    );
+    assert!(released.is_ok());
+    assert_eq!(result, Ok(()));
+    assert!(returned < deadline);
+    assert_eq!(retained_id, id);
+    assert!(retained);
+    assert_eq!(cleanup, Ok(()));
+    assert!(worker.thread.is_none(), "only the original native-exited handle may be joined: {id:?}");
+    assert!(worker.native_retired);
 }
 
 #[test]

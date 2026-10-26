@@ -401,6 +401,7 @@ impl WrapSession {
             // Shared/Self already include the inline observation and retained
             // panic headers. Admit native scratch and typed return overlap too.
             .and_then(|v| v.checked_add(NativeExitObservation::operation_stack_bytes()?))
+            .and_then(|v| v.checked_add(size_of::<Instant>())) // effective deadline argument to wait effect
             .and_then(|v| v.checked_add(2 * size_of::<Result<(), SettlementFailure>>()))
             .and_then(|v| v.checked_add(2 * size_of::<Result<(), WrapError>>()))
             .and_then(|v| v.checked_add(size_of::<std::thread::Result<()>>()))
@@ -1109,14 +1110,27 @@ impl SettlementTicket {
     /// OFF UI only. Timeout returns every owner unchanged. A terminal worker
     /// panic remains failed on subsequent attempts; it is not timeout success.
     pub fn settle(self, timeout: Duration) -> Result<(), SettlementFailure> {
-        self.settle_with(timeout, NativeExitObservation::query, NativeExitObservation::retire_after_join)
+        self.settle_deadline_with(timeout, NativeExitObservation::wait_until, NativeExitObservation::retire_after_join)
     }
     // Private synchronous effects: no production slot, timer or replacement
     // worker. Tests can refuse retirement AFTER the real join without native I/O.
+    #[cfg(test)]
     fn settle_with(
-        mut self,
+        self,
         timeout: Duration,
         query: impl FnOnce(&NativeExitObservation, &JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+        retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), SettlementFailure> {
+        self.settle_deadline_with(timeout, |observation, handle, _| query(observation, handle), retire)
+    }
+    fn settle_deadline_with(
+        mut self,
+        timeout: Duration,
+        query: impl FnOnce(
+            &NativeExitObservation,
+            &JoinHandle<()>,
+            Instant,
+        ) -> Result<NativeExitState, NativeObservationError>,
         retire: impl FnOnce(&NativeExitObservation) -> Result<(), NativeObservationError>,
     ) -> Result<(), SettlementFailure> {
         let started = Instant::now();
@@ -1146,7 +1160,7 @@ impl SettlementTicket {
             if Instant::now() >= deadline {
                 return Err(SettlementFailure { ticket: self, error: WrapError::TimedOut });
             }
-            match query(&self.shared.native_exit, worker) {
+            match query(&self.shared.native_exit, worker, deadline) {
                 Ok(NativeExitState::Pending) => {
                     return Err(SettlementFailure { ticket: self, error: WrapError::ThreadExitPending });
                 }

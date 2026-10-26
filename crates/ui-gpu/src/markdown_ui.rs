@@ -186,6 +186,7 @@ impl Host {
             std::mem::size_of::<kwil_view_model::visual_rows::WrapResult<AdmittedPath>>().checked_mul(2)?,
             std::mem::size_of::<Result<(), SettlementReason>>().checked_mul(2)?,
             NativeExitObservation::operation_stack_bytes()?,
+            std::mem::size_of::<std::time::Instant>(), // effective deadline passed into wait closure
         ];
         sizes.into_iter().try_fold(0usize, usize::checked_add)
     }
@@ -296,16 +297,29 @@ impl Host {
     }
     /// OFF UI; borrow the original host through timeout, panic and retry.
     pub fn settle_until(&mut self, deadline: std::time::Instant) -> Result<(), SettlementReason> {
-        self.settle_with(
+        self.settle_deadline_with(
             deadline,
-            |terminal, thread| terminal.native.query(thread),
+            |terminal, thread, deadline| terminal.native.wait_until(thread, deadline),
             NativeExitObservation::retire_after_join,
         )
     }
+    #[cfg(test)]
     fn settle_with(
         &mut self,
         deadline: std::time::Instant,
         mut query: impl FnMut(&Terminal, &std::thread::JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+        retire: impl FnMut(&NativeExitObservation) -> Result<(), NativeObservationError>,
+    ) -> Result<(), SettlementReason> {
+        self.settle_deadline_with(deadline, |terminal, thread, _| query(terminal, thread), retire)
+    }
+    fn settle_deadline_with(
+        &mut self,
+        deadline: std::time::Instant,
+        mut query: impl FnMut(
+            &Terminal,
+            &std::thread::JoinHandle<()>,
+            std::time::Instant,
+        ) -> Result<NativeExitState, NativeObservationError>,
         mut retire: impl FnMut(&NativeExitObservation) -> Result<(), NativeObservationError>,
     ) -> Result<(), SettlementReason> {
         let deadline = self.deadline.map_or(deadline, |stored| stored.min(deadline));
@@ -337,7 +351,8 @@ impl Host {
             }
         }
         Self::check_deadline(deadline)?;
-        let observed = query(self.terminal.as_ref().unwrap(), self.lane.as_ref().unwrap().thread.as_ref().unwrap());
+        let observed =
+            query(self.terminal.as_ref().unwrap(), self.lane.as_ref().unwrap().thread.as_ref().unwrap(), deadline);
         let observed = match observed {
             Err(error) => return Err(self.retain_native_error(error)),
             Ok(state) => state,

@@ -118,6 +118,55 @@ fn join_with_retirement_refusal(shared: &Shared, deadline: Instant, error: Nativ
     }
 }
 
+// This module is cfg(test). Borrow the exact bound receiver and original
+// producer; consume its real Stopped slot with finish_until's ACK sequence,
+// then use the EXISTING one-query seam. No replacement handle or join policy.
+impl BoundDocumentTicket {
+    fn finish_held_until_with_query(
+        &mut self,
+        deadline: Instant,
+        query: impl FnOnce(&NativeExitObservation, &JoinHandle<()>) -> Result<NativeExitState, NativeObservationError>,
+    ) -> Result<(), DocumentResultSettlementReason> {
+        let shared = &self.receiver.shared;
+        if lock(&shared.requests).phase != ShutdownPhase::Closed {
+            return Err(DocumentResultSettlementReason::SourceBarrierRequired);
+        }
+        let mut state = lock(&shared.state);
+        loop {
+            if let Some(reason) = state.failure() {
+                return Err(reason);
+            }
+            if Instant::now() >= deadline {
+                return Err(DocumentResultSettlementReason::TimedOut);
+            }
+            if state.slot.is_some() && !state.retire_requested && !state.transfer_active {
+                if !matches!(state.whole(), Some(DocumentResult::Stopped(Ok(())))) {
+                    return Err(DocumentResultSettlementReason::ConsumerRefused);
+                }
+                state.stopped_acknowledged |= matches!(state.whole(), Some(DocumentResult::Stopped(Ok(()))));
+                let retired = state.slot.take();
+                state.in_flight = false;
+                drop(state);
+                drop(retired);
+                shared.changed.notify_all();
+                state = lock(&shared.state);
+                continue;
+            }
+            if state.worker_done {
+                let acknowledged = state.stopped_acknowledged;
+                drop(state);
+                shared.settle_native_until_with(deadline, query, NativeExitObservation::retire_after_join)?;
+                return if acknowledged { Ok(()) } else { Err(DocumentResultSettlementReason::MissingStoppedReceipt) };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DocumentResultSettlementReason::TimedOut);
+            }
+            state = shared.changed.wait_timeout(state, remaining).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+    }
+}
+
 #[test]
 fn result_transport_bound_native_tls_keeps_exact_handle_and_queries_once_per_attempt() {
     let deadline = Instant::now() + LIMIT;
@@ -145,7 +194,7 @@ fn result_transport_bound_native_tls_keeps_exact_handle_and_queries_once_per_att
     };
     permit.seal_sources(&receipt).unwrap();
     bound.close_after_source_release(&permit).unwrap();
-    let pending = bound.finish_until(deadline);
+    let pending = bound.finish_held_until_with_query(deadline, NativeExitObservation::query);
     let native_thread = reached.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let queries = AtomicUsize::new(0);
     let observed = shared.settle_native_until_with(
@@ -156,14 +205,28 @@ fn result_transport_bound_native_tls_keeps_exact_handle_and_queries_once_per_att
         },
         |_| panic!("Pending TLS cannot retire"),
     );
+    let fresh_error = NativeObservationError::LinuxQuery { errno: 73 };
+    let error_queries = AtomicUsize::new(0);
+    let fatal = bound.finish_held_until_with_query(deadline, |_, _| {
+        error_queries.fetch_add(1, Ordering::Relaxed);
+        Err(fresh_error)
+    });
     release.try_send(()).unwrap();
     assert_eq!(pending, Err(DocumentResultSettlementReason::ThreadExitPending));
     assert_eq!(native_thread.unwrap(), original);
     assert_eq!(observed, Err(DocumentResultSettlementReason::ThreadExitPending));
     assert_eq!(queries.load(Ordering::Relaxed), 1);
+    assert_eq!(fatal, Err(DocumentResultSettlementReason::NativeExit(fresh_error)));
+    assert_eq!(error_queries.load(Ordering::Relaxed), 1, "fresh native errors must not retry");
     assert_eq!(lock(&shared.worker).as_ref().unwrap().thread().id(), original);
     assert_eq!(Arc::as_ptr(&bound.receiver.shared), identity);
     assert!(lock(&shared.state).stopped_acknowledged);
+    assert!(!lock(&shared.state).worker_joined);
+    assert!(!lock(&shared.state).native_retired);
+    let finished = bound.finish_until(deadline);
+    let returned = Instant::now();
+    assert_eq!(finished, Ok(()), "public finish must wait for the original native exit without outer retries");
+    assert!(returned < deadline);
     crate::cleanup_test_support::cleanup_until(
         &mut bound,
         deadline,

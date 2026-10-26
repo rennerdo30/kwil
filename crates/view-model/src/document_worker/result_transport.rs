@@ -1225,6 +1225,7 @@ impl Shared {
             // headers; native operations and typed call/return overlap also
             // belong to this SAME preconstruction 32 MiB aggregate admission.
             .and_then(|n| n.checked_add(NativeExitObservation::operation_stack_bytes()?))
+            .and_then(|n| n.checked_add(size_of::<&Instant>())) // settlement closure's original deadline capture
             .and_then(|n| n.checked_add(2 * size_of::<Result<(), DocumentResultSettlementReason>>()))
             .and_then(|n| n.checked_add(2 * size_of::<Result<(), DocumentResultSettlementFailure>>()))
             .and_then(|n| n.checked_add(size_of::<std::thread::Result<()>>()))
@@ -1323,7 +1324,7 @@ impl Shared {
     }
 
     // Synchronous effect seam, no production slot/channel/thread. The only
-    // actual join follows ONE native query and the ORIGINAL deadline check.
+    // actual join follows the shared native wait and ORIGINAL deadline check.
     fn settle_native_until_with(
         &self,
         deadline: Instant,
@@ -1366,7 +1367,11 @@ impl Shared {
     }
 
     fn settle_native_until(&self, deadline: Instant) -> Result<(), DocumentResultSettlementReason> {
-        self.settle_native_until_with(deadline, NativeExitObservation::query, NativeExitObservation::retire_after_join)
+        self.settle_native_until_with(
+            deadline,
+            |observation, handle| observation.wait_until(handle, deadline),
+            NativeExitObservation::retire_after_join,
+        )
     }
 
     fn retire_if_joined(&self) -> Result<(), DocumentResultSettlementReason> {
