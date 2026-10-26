@@ -1,6 +1,6 @@
 #requires -Version 7.2
 <#
-Schema-1 MSI authoring backend. The six-argument CLI is deliberately parsed
+Schema-2 MSI authoring backend. The six-argument CLI is deliberately parsed
 without PowerShell's parameter abbreviation/common-parameter binder. Dot source
 without arguments ONLY to load helpers for test-windows-msi.ps1; it performs no
 native initialization, filesystem writes or packaging in that mode.
@@ -14,9 +14,18 @@ function Assert-Kwil {
     if (-not $Condition) { throw "Kwil MSI: $Reason" }
 }
 
+function Get-KwilReleaseIdentity {
+    param([string]$ReleaseVersion)
+    if ($ReleaseVersion -ceq '0.1.0') { return [ordered]@{releaseVersion=$ReleaseVersion;channel='stable';msiVersion='0.1.0';productName='Kwil 0.1.0'} }
+    Assert-Kwil ($ReleaseVersion -cmatch '\A0[.]1[.]0-beta[.]([1-9][0-9]{0,4})\z') 'noncanonical or unsupported ReleaseVersion'
+    $ordinal = [uint32]$Matches[1]
+    Assert-Kwil ($ordinal -le 65535) 'ReleaseVersion beta ordinal exceeds MSI range'
+    return [ordered]@{releaseVersion=$ReleaseVersion;channel='beta';msiVersion=('0.0.'+$ordinal.ToString([Globalization.CultureInfo]::InvariantCulture));productName=('Kwil Beta '+$ReleaseVersion)}
+}
+
 function Get-KwilArguments {
     param([object[]]$Tokens)
-    $names = @('PayloadDirectory','OutputPath','Version','Architecture','Commit','IconPath')
+    $names = @('PayloadDirectory','OutputPath','ReleaseVersion','Architecture','Commit','IconPath')
     Assert-Kwil ($Tokens.Count -eq 12) 'exactly six full named scalar arguments are required'
     $result = [ordered]@{}
     for ($i = 0; $i -lt 12; $i += 2) {
@@ -30,9 +39,7 @@ function Get-KwilArguments {
     }
     Assert-Kwil ($result.Architecture -cmatch '\A(x64|arm64)\z') 'Architecture must be x64 or arm64'
     Assert-Kwil ($result.Commit -cmatch '\A[0-9a-f]{40}\z') 'Commit must be 40 lowercase hex characters'
-    Assert-Kwil ($result.Version -cmatch '\A(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,4})\z') 'noncanonical Version'
-    $v = $result.Version.Split('.')
-    Assert-Kwil ([int]$v[0] -le 255 -and [int]$v[1] -le 255 -and [int]$v[2] -le 65535) 'Version exceeds MSI range'
+    $null = Get-KwilReleaseIdentity $result.ReleaseVersion
     return $result
 }
 
@@ -171,10 +178,12 @@ function Get-KwilInventoryBytes {
 
 function Get-KwilBuildId {
     param($Metadata,[byte[]]$Inventory)
+    $release = Get-KwilReleaseIdentity $Metadata.releaseVersion
+    Assert-Kwil ($Metadata.channel -ceq $release.channel -and $Metadata.msiVersion -ceq $release.msiVersion) 'release/channel/MSI mapping mismatch'
     $s=[IO.MemoryStream]::new(); $w=[IO.BinaryWriter]::new($s,[Text.Encoding]::UTF8,$true)
     try {
-        $w.Write([Text.Encoding]::ASCII.GetBytes('KWB1'))
-        foreach ($v in @('1','1',$Metadata.familyGuid,$Metadata.architecture,$Metadata.version,$Metadata.commit,$Metadata.target,'1',$Metadata.guard.sha256)) { Write-KwilLP $w $v }
+        $w.Write([Text.Encoding]::ASCII.GetBytes('KWB2'))
+        foreach ($v in @('2','1',$Metadata.familyGuid,$Metadata.architecture,$Metadata.releaseVersion,$Metadata.channel,$Metadata.msiVersion,$Metadata.commit,$Metadata.target,'2',$Metadata.guard.sha256)) { Write-KwilLP $w $v }
         $w.Write([uint32]$Metadata.guard.imports.Count)
         foreach ($im in $Metadata.guard.imports) { Write-KwilLP $w $im.load; Write-KwilLP $w $im.dll }
         $w.Write([uint32]$Inventory.Length); $w.Write($Inventory)
@@ -239,12 +248,14 @@ function Assert-KwilMembers {
 
 function Assert-KwilMetadata {
     param($Metadata,$Arguments,$Model,[string]$GuardHash,[object[]]$Imports)
-    Assert-KwilMembers $Metadata @('schema','componentSchema','familyGuid','version','commit','architecture','target','guard','inventory')
-    foreach ($k in @('schema','componentSchema')) { Assert-Kwil ($Metadata[$k] -is [long] -and $Metadata[$k] -eq 1) "invalid $k" }
-    $fixed=@{familyGuid='{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';version=$Arguments.Version;commit=$Arguments.Commit;architecture=$Arguments.Architecture;target=$(if($Arguments.Architecture -ceq 'x64'){'x86_64-pc-windows-msvc'}else{'aarch64-pc-windows-msvc'})}
+    Assert-KwilMembers $Metadata @('schema','componentSchema','familyGuid','releaseVersion','channel','msiVersion','commit','architecture','target','guard','inventory')
+    Assert-Kwil ($Metadata.schema -is [long] -and $Metadata.schema -eq 2) 'invalid schema'
+    Assert-Kwil ($Metadata.componentSchema -is [long] -and $Metadata.componentSchema -eq 1) 'invalid componentSchema'
+    $release = Get-KwilReleaseIdentity $Arguments.ReleaseVersion
+    $fixed=@{familyGuid='{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';releaseVersion=$Arguments.ReleaseVersion;channel=$release.channel;msiVersion=$release.msiVersion;commit=$Arguments.Commit;architecture=$Arguments.Architecture;target=$(if($Arguments.Architecture -ceq 'x64'){'x86_64-pc-windows-msvc'}else{'aarch64-pc-windows-msvc'})}
     foreach ($k in $fixed.Keys) { Assert-Kwil ($Metadata[$k] -is [string] -and $Metadata[$k] -ceq $fixed[$k]) "metadata $k mismatch" }
     Assert-KwilMembers $Metadata.guard @('abi','sha256','imports')
-    Assert-Kwil ($Metadata.guard.abi -is [long] -and $Metadata.guard.abi -eq 1 -and $Metadata.guard.sha256 -is [string] -and $Metadata.guard.sha256 -ceq $GuardHash) 'guard ABI/hash mismatch'
+    Assert-Kwil ($Metadata.guard.abi -is [long] -and $Metadata.guard.abi -eq 2 -and $Metadata.guard.sha256 -is [string] -and $Metadata.guard.sha256 -ceq $GuardHash) 'guard ABI/hash mismatch'
     Assert-Kwil ($Metadata.guard.imports -is [object[]] -and $Metadata.guard.imports.Count -eq $Imports.Count) 'guard import count mismatch'
     for ($i=0;$i -lt $Imports.Count;$i++) {
         $r=$Metadata.guard.imports[$i]; Assert-KwilMembers $r @('load','dll')
@@ -448,10 +459,11 @@ function Get-KwilPeImports {
         Assert-Kwil ($er -gt 0 -and $es -ge 40) 'guard export directory missing'
         $e=& $rvaRead $er 40; $nf=[BitConverter]::ToUInt32($e,20); $nn=[BitConverter]::ToUInt32($e,24)
         Assert-Kwil ($nf -gt 0 -and $nf -le 128 -and $nn -gt 0 -and $nn -le 128) 'guard export count limit'
+        Assert-Kwil ($nf -eq 1 -and $nn -eq 1) 'schema-2 guard requires the sole ABI2 export'
         $found=0
         for($i=0;$i -lt $nn;$i++) {
             $ptr=& $rvaRead ([long][BitConverter]::ToUInt32($e,32)+4*$i) 4
-            if((& $readName ([BitConverter]::ToUInt32($ptr,0)) 128) -ceq 'KwilPreflightV1') {
+            if((& $readName ([BitConverter]::ToUInt32($ptr,0)) 128) -ceq 'KwilPreflightV2') {
                 $ord=& $rvaRead ([long][BitConverter]::ToUInt32($e,36)+2*$i) 2; $index=[BitConverter]::ToUInt16($ord,0)
                 Assert-Kwil ($index -lt $nf) 'guard export ordinal invalid'
                 $ptr=& $rvaRead ([long][BitConverter]::ToUInt32($e,28)+4*$index) 4; $fn=[long][BitConverter]::ToUInt32($ptr,0)
@@ -486,7 +498,7 @@ function Get-KwilTableSpecs {
         Upgrade=@('UpgradeCode:s38','VersionMin:S20','VersionMax:S20','Language:S255','Attributes:i4','Remove:S255','ActionProperty:s72')
         Error=@('Error:i2','Message:S0')
         LaunchCondition=@('Condition:s255','Description:s255')
-        KwilPackage=@('Id:i2','Schema:i2','ComponentSchema:i2','Family:s38','Architecture:s5','Version:s20','Commit:s40','Target:s32','GuardAbi:i2','GuardSha256:s64','InventorySha256:s64','BuildId:s64','ProductCode:s38','PackageCode:s38','ResourceCount:i4')
+        KwilPackage=@('Id:i2','Schema:i2','ComponentSchema:i2','Family:s38','Architecture:s5','ReleaseVersion:s18','Channel:s6','MsiVersion:s20','Commit:s40','Target:s32','GuardAbi:i2','GuardSha256:s64','InventorySha256:s64','BuildId:s64','ProductCode:s38','PackageCode:s38','ResourceCount:i4')
         KwilResource=@('Id:s32','Kind:s1','Root:s1','Relative:s240','Name:s130','Data:s0','Size:s20','Sha256:s64','Component_:s72','Source:s1','File_:s72','Registry_:s72','ValueType:i2')
         KwilGuardImport=@('Load:s1','Dll:s128')
         _Validation=@('Table:s32','Column:s32','Nullable:s4','MinValue:I4','MaxValue:I4','KeyTable:S255','KeyColumn:I2','Category:S32','Set:S255','Description:S255')
@@ -519,7 +531,9 @@ function Get-KwilShortName {
 function New-KwilTables {
     param($Metadata,$Model,[string]$BuildId,[string]$InventoryHash,[string]$ProductCode,[string]$PackageCode,[string]$GuardPath,[string]$IconPath)
     $t=Get-KwilTableSpecs
-    $props=[ordered]@{ProductName='Kwil';Manufacturer='rennerdo30';ProductLanguage='1033';UpgradeCode=$Metadata.familyGuid;ProductCode=$ProductCode;ProductVersion=$Metadata.version;MSIINSTALLPERUSER='1';ARPNOMODIFY='1';ARPNOREPAIR='1';ARPPRODUCTICON='KwilIcon';ARPINSTALLLOCATION='[INSTALLDIR]';MSIRESTARTMANAGERCONTROL='Disable';REBOOT='ReallySuppress';KWIL_SCHEMA='1';KWIL_COMPONENT_SCHEMA='1';KWIL_GUARD_ABI='1';KWIL_FAMILY=$Metadata.familyGuid;KWIL_ARCH=$Metadata.architecture;KWIL_BUILD_ID=$BuildId;SecureCustomProperties='KWIL_OLDER;KWIL_EQUAL;KWIL_NEWER'}
+    $release=Get-KwilReleaseIdentity $Metadata.releaseVersion
+    Assert-Kwil ($Metadata.channel -ceq $release.channel -and $Metadata.msiVersion -ceq $release.msiVersion) 'release/channel/MSI mapping mismatch'
+    $props=[ordered]@{ProductName=$release.productName;Manufacturer='rennerdo30';ProductLanguage='1033';UpgradeCode=$Metadata.familyGuid;ProductCode=$ProductCode;ProductVersion=$Metadata.msiVersion;MSIINSTALLPERUSER='1';ARPNOMODIFY='1';ARPNOREPAIR='1';ARPPRODUCTICON='KwilIcon';ARPINSTALLLOCATION='[INSTALLDIR]';MSIRESTARTMANAGERCONTROL='Disable';REBOOT='ReallySuppress';KWIL_SCHEMA='2';KWIL_COMPONENT_SCHEMA='1';KWIL_GUARD_ABI='2';KWIL_RELEASE_VERSION=$Metadata.releaseVersion;KWIL_CHANNEL=$Metadata.channel;KWIL_FAMILY=$Metadata.familyGuid;KWIL_ARCH=$Metadata.architecture;KWIL_BUILD_ID=$BuildId;SecureCustomProperties='KWIL_OLDER;KWIL_EQUAL;KWIL_NEWER'}
     foreach($p in $props.Keys){Add-KwilRow $t Property @($p,$props[$p])}
     Add-KwilRow $t Directory @('TARGETDIR',$null,'SourceDir')
     Add-KwilRow $t Directory @('LocalAppDataFolder','TARGETDIR','.')
@@ -572,17 +586,17 @@ function New-KwilTables {
     Add-KwilRow $t Media @(1,8,$null,'#kwil.cab',$null,$null)
     Add-KwilRow $t Binary @('KwilPreflight',$GuardPath)
     Add-KwilRow $t Icon @('KwilIcon',$IconPath)
-    Add-KwilRow $t CustomAction @('KwilPreflight',1,'KwilPreflight','KwilPreflightV1')
+    Add-KwilRow $t CustomAction @('KwilPreflight',1,'KwilPreflight','KwilPreflightV2')
     Add-KwilRow $t CustomAction @('SetKwilArpLocation',51,'ARPINSTALLLOCATION','[INSTALLDIR]')
     $actions=[ordered]@{FindRelatedProducts=25;CostInitialize=800;FileCost=900;CostFinalize=1000;SetKwilArpLocation=1010;MigrateFeatureStates=1200;InstallValidate=1400;KwilPreflight=1490;InstallInitialize=1500;RemoveExistingProducts=1501;ProcessComponents=1600;UnpublishFeatures=1800;RemoveRegistryValues=2600;RemoveFiles=3500;InstallFiles=4000;WriteRegistryValues=5000;RegisterUser=6000;RegisterProduct=6100;PublishFeatures=6300;PublishProduct=6400;InstallFinalize=6600}
     foreach($a in $actions.Keys){$condition=if($a -cin @('KwilPreflight','SetKwilArpLocation')){'1'}else{$null}; Add-KwilRow $t InstallExecuteSequence @($a,$condition,$actions[$a])}
     Add-KwilRow $t InstallExecuteSequence @('LaunchConditions',$null,100)
     Add-KwilRow $t LaunchCondition @('NOT RollbackDisabled AND NOT DISABLEROLLBACK','Kwil requires Windows Installer rollback. Enable rollback and retry.')
-    Add-KwilRow $t Upgrade @($Metadata.familyGuid,$null,$Metadata.version,$null,1,'ALL','KWIL_OLDER')
-    Add-KwilRow $t Upgrade @($Metadata.familyGuid,$Metadata.version,$Metadata.version,$null,770,$null,'KWIL_EQUAL')
-    Add-KwilRow $t Upgrade @($Metadata.familyGuid,$Metadata.version,$null,$null,2,$null,'KWIL_NEWER')
+    Add-KwilRow $t Upgrade @($Metadata.familyGuid,$null,$Metadata.msiVersion,$null,1,'ALL','KWIL_OLDER')
+    Add-KwilRow $t Upgrade @($Metadata.familyGuid,$Metadata.msiVersion,$Metadata.msiVersion,$null,770,$null,'KWIL_EQUAL')
+    Add-KwilRow $t Upgrade @($Metadata.familyGuid,$Metadata.msiVersion,$null,$null,2,$null,'KWIL_NEWER')
     Add-KwilRow $t Error @(25001,'Kwil installer preflight: [2]. [3]')
-    Add-KwilRow $t KwilPackage @(1,1,1,$Metadata.familyGuid,$Metadata.architecture,$Metadata.version,$Metadata.commit,$Metadata.target,1,$Metadata.guard.sha256,$InventoryHash,$BuildId,$ProductCode,$PackageCode,29)
+    Add-KwilRow $t KwilPackage @(1,2,1,$Metadata.familyGuid,$Metadata.architecture,$Metadata.releaseVersion,$Metadata.channel,$Metadata.msiVersion,$Metadata.commit,$Metadata.target,2,$Metadata.guard.sha256,$InventoryHash,$BuildId,$ProductCode,$PackageCode,29)
     foreach($im in $Metadata.guard.imports){Add-KwilRow $t KwilGuardImport @($im.load,$im.dll)}
     foreach($table in $t.Keys) {
         foreach($c in $t[$table].Columns) {
@@ -757,16 +771,16 @@ function Assert-KwilDatabase {
             }
         }finally{Release-KwilCom $summary}
         # Reconstruct identity from actual typed rows, independently of table serialization.
-        $pr=Read-KwilQuery $db 'SELECT `Family`,`Architecture`,`Version`,`Commit`,`Target`,`GuardSha256`,`InventorySha256`,`BuildId`,`ProductCode` FROM `KwilPackage`' @($false,$false,$false,$false,$false,$false,$false,$false,$false) 1
+        $pr=Read-KwilQuery $db 'SELECT `Family`,`Architecture`,`ReleaseVersion`,`Channel`,`MsiVersion`,`Commit`,`Target`,`GuardSha256`,`InventorySha256`,`BuildId`,`ProductCode` FROM `KwilPackage`' (@($false)*11) 1
         $rr=Read-KwilQuery $db 'SELECT `Id`,`Kind`,`Root`,`Relative`,`Name`,`Data`,`Size`,`Sha256`,`Component_`,`Source`,`File_`,`Registry_`,`ValueType` FROM `KwilResource` ORDER BY `Id`' (@($false)*12+@($true)) 29
         $fields=@('id','kind','root','relative','name','data','size','sha256','component','source','fileKey','registryKey','valueType')
         $resource=@(foreach($row in $rr){$r=[ordered]@{};for($i=0;$i -lt 13;$i++){$r[$fields[$i]]=[string]$row[$i]};$r})
         $ii=Read-KwilQuery $db 'SELECT `Load`,`Dll` FROM `KwilGuardImport` ORDER BY `Load`,`Dll`' @($false,$false) 128
         $im=@(foreach($row in $ii){[ordered]@{load=$row[0];dll=$row[1]}})
-        $m=[ordered]@{familyGuid=$pr[0][0];architecture=$pr[0][1];version=$pr[0][2];commit=$pr[0][3];target=$pr[0][4];guard=[ordered]@{sha256=$pr[0][5];imports=$im}}
+        $m=[ordered]@{familyGuid=$pr[0][0];architecture=$pr[0][1];releaseVersion=$pr[0][2];channel=$pr[0][3];msiVersion=$pr[0][4];commit=$pr[0][5];target=$pr[0][6];guard=[ordered]@{sha256=$pr[0][7];imports=$im}}
         $inventory=Get-KwilInventoryBytes $resource; $build=Get-KwilBuildId $m $inventory
-        $product=New-KwilUuid5 '{918F53A7-7A40-5E54-96EB-E2FD9B0C605B}' (New-KwilEncoding 'KWP1' @($m.architecture,$m.version,$build))
-        Assert-Kwil ((Get-KwilHash $inventory) -ceq $pr[0][6] -and $build -ceq $pr[0][7] -and $product -ceq $pr[0][8]) 'MSI readback identity reconstruction mismatch'
+        $product=New-KwilUuid5 '{918F53A7-7A40-5E54-96EB-E2FD9B0C605B}' (New-KwilEncoding 'KWP2' @($m.architecture,$m.releaseVersion,$m.channel,$m.msiVersion,$build))
+        Assert-Kwil ((Get-KwilHash $inventory) -ceq $pr[0][8] -and $build -ceq $pr[0][9] -and $product -ceq $pr[0][10]) 'MSI readback identity reconstruction mismatch'
     }finally{Release-KwilCom $db}
 }
 
@@ -1009,10 +1023,10 @@ function Invoke-KwilMsiBackend {
         # contract/backend/wrapper/guard review, never automatic compatibility.
         $contract=Open-KwilInput ([IO.Path]::Combine($PSScriptRoot,'windows-installer-contract.json')) 1048576
         $inputs.Add($contract)
-        Assert-Kwil ($contract.Sha256 -ceq '5b2b2d1e21ee545552f2270ce3c5bd923fec65dcd6e86dd0ef1ac1ed88f54d44') 'frozen corrected JSON contract changed; ask ROOT'
+        Assert-Kwil ($contract.Sha256 -ceq 'a08a1392c0b81dadb950df7ac16ebeaf98676bdaa68fc20e7c3ca884b04b5cc5') 'frozen corrected JSON contract changed; ask ROOT'
         $decision=Open-KwilInput ([IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot,'..','docs','decisions','0004-windows-installer.md'))) 1048576
         $inputs.Add($decision)
-        Assert-Kwil ($decision.Sha256 -ceq 'fb92572c9090294869fdc52b8d573de4e5bd8b116b28b6a9291ca213947e483c') 'frozen corrected decision changed; ask ROOT'
+        Assert-Kwil ($decision.Sha256 -ceq '3b196d7fb9810ea498b332a46507ac0ecad5cfc405143520a08c8de9ff2966b8') 'frozen corrected decision changed; ask ROOT'
         $files=[ordered]@{};[long]$total=868
         foreach($name in @('kwil.exe','kwil.com','kwil.ico','LICENSE','LICENSES.md','LICENSES.txt','kwil.no-update')) {
             $f=Open-KwilInput ([IO.Path]::Combine($payload,$name)) 536870912
@@ -1031,7 +1045,7 @@ function Invoke-KwilMsiBackend {
         Assert-KwilMetadata $metadata $a $model $guard.Sha256 $imports
         $inventory=Get-KwilInventoryBytes $model.Rows;$inventoryHash=Get-KwilHash $inventory
         $build=Get-KwilBuildId $metadata $inventory
-        $product=New-KwilUuid5 '{918F53A7-7A40-5E54-96EB-E2FD9B0C605B}' (New-KwilEncoding 'KWP1' @($a.Architecture,$a.Version,$build))
+        $product=New-KwilUuid5 '{918F53A7-7A40-5E54-96EB-E2FD9B0C605B}' (New-KwilEncoding 'KWP2' @($a.Architecture,$metadata.releaseVersion,$metadata.channel,$metadata.msiVersion,$build))
         $package=[Guid]::NewGuid().ToString('B').ToUpperInvariant()
         $work=[IO.Path]::Combine($parent,'.kwil-msi-'+$PID+'-'+[Guid]::NewGuid().ToString('N'))
         $null=Assert-KwilLocalPath $work $true
@@ -1083,7 +1097,7 @@ function Invoke-KwilMsiBackend {
         [IO.File]::Move($msi,$output,$false)
         $published=Open-KwilInput $output 1124073472
         try{Assert-Kwil ($published.Size -eq $msiSize -and $published.Sha256 -ceq $msiHash) 'published MSI differs from inspected MSI'}finally{$published.Stream.Dispose()}
-        $manifest=[ordered]@{schema=1;familyGuid=$metadata.familyGuid;componentSchema=1;architecture=$a.Architecture;target=$metadata.target;version=$a.Version;commit=$a.Commit;buildId=$build;inventorySha256=$inventoryHash;productCode=$product;packageCode=$package;guard=$metadata.guard;inventory=$model.Rows;msi=[ordered]@{fileName=[IO.Path]::GetFileName($output);size=[string]$msiSize;sha256=$msiHash};inspection=[ordered]@{database='passed';cabinet='passed';staticImports='passed'};signed=$false;nativeLifecycle='not-run'}
+        $manifest=[ordered]@{schema=2;familyGuid=$metadata.familyGuid;componentSchema=1;architecture=$a.Architecture;target=$metadata.target;releaseVersion=$metadata.releaseVersion;channel=$metadata.channel;msiVersion=$metadata.msiVersion;commit=$a.Commit;buildId=$build;inventorySha256=$inventoryHash;productCode=$product;packageCode=$package;guard=$metadata.guard;inventory=$model.Rows;msi=[ordered]@{fileName=[IO.Path]::GetFileName($output);size=[string]$msiSize;sha256=$msiHash};inspection=[ordered]@{database='passed';cabinet='passed';staticImports='passed'};signed=$false;nativeLifecycle='not-run'}
         $manifestBytes=[Text.UTF8Encoding]::new($false,$true).GetBytes(($manifest | ConvertTo-Json -Depth 8 -Compress)+"`n")
         Assert-Kwil ($manifestBytes.Length -le 1048576) 'sidecar byte limit'
         Write-KwilNewBytes $sidecar $manifestBytes

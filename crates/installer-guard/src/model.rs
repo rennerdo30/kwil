@@ -89,7 +89,9 @@ pub fn validate_imports(imports: &[Import]) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct Package {
     pub architecture: String,
-    pub version: String,
+    pub msi_version: String,
+    /// None is an exact legacy schema-1 identity, with no invented channel.
+    pub release: Option<ReleaseIdentity>,
     pub commit: String,
     pub target: String,
     pub guard_hash: String,
@@ -130,15 +132,64 @@ pub fn inventory_bytes(rows: &[Resource]) -> Result<Vec<u8>> {
 }
 
 impl Package {
+    pub fn guard_export(&self) -> &'static str {
+        if self.release.is_some() { "KwilPreflightV2" } else { "KwilPreflightV1" }
+    }
+    pub fn product_name(&self) -> String {
+        match &self.release {
+            Some(identity) if identity.channel == "beta" => format!("Kwil Beta {}", identity.release_version),
+            Some(identity) => format!("Kwil {}", identity.release_version),
+            None => "Kwil".into(),
+        }
+    }
+    pub fn expected_product(&self) -> Result<String> {
+        match &self.release {
+            Some(identity) => product_release(&self.architecture, identity, &self.build_id),
+            None => product(&self.architecture, &self.msi_version, &self.build_id),
+        }
+    }
     pub fn version_numbers(&self) -> Result<[u32; 3]> {
-        version(&self.version)
+        version(&self.msi_version)
     }
     pub fn build_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = b"KWB1".to_vec();
-        for s in
-            ["1", "1", FAMILY, &self.architecture, &self.version, &self.commit, &self.target, "1", &self.guard_hash]
-        {
-            lp(&mut bytes, s)?;
+        let mut bytes;
+        if let Some(identity) = &self.release {
+            require(
+                release_identity(&identity.release_version)? == *identity && self.msi_version == identity.msi_version,
+                "invalid-metadata",
+                "release/channel/MSI mapping",
+            )?;
+            bytes = b"KWB2".to_vec();
+            for value in [
+                "2",
+                "1",
+                FAMILY,
+                &self.architecture,
+                &identity.release_version,
+                &identity.channel,
+                &self.msi_version,
+                &self.commit,
+                &self.target,
+                "2",
+                &self.guard_hash,
+            ] {
+                lp(&mut bytes, value)?;
+            }
+        } else {
+            bytes = b"KWB1".to_vec();
+            for value in [
+                "1",
+                "1",
+                FAMILY,
+                &self.architecture,
+                &self.msi_version,
+                &self.commit,
+                &self.target,
+                "1",
+                &self.guard_hash,
+            ] {
+                lp(&mut bytes, value)?;
+            }
         }
         bytes.extend_from_slice(&(self.imports.len() as u32).to_le_bytes());
         for import in &self.imports {
@@ -177,11 +228,7 @@ impl Package {
         require(self.resources == expected, "invalid-inventory", "schema-1 resource model/identities/components")?;
         require(sha256(&inventory_bytes(&self.resources)?) == self.inventory_hash, "hash-mismatch", "inventory")?;
         require(sha256(&self.build_bytes()?) == self.build_id, "hash-mismatch", "BuildID")?;
-        require(
-            product(&self.architecture, &self.version, &self.build_id)? == self.product_code,
-            "hash-mismatch",
-            "ProductCode",
-        )
+        require(self.expected_product()? == self.product_code, "hash-mismatch", "ProductCode")
     }
 }
 

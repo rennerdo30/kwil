@@ -50,9 +50,17 @@ There is no advertised/automatic repair. A present changed installer-authored
 file, shortcut or registry value blocks repair, upgrade and uninstall; it is
 not overwritten or deleted. Preserve modifications and restore the original
 resource before retrying. A repacked MSI with a different PackageCode cannot
-substitute for the retained original. Upgrades require a strictly higher numeric
-version; equal-version different builds, downgrades and architecture switching
-in place are refused.
+substitute for the retained original. Schema-2 packaging accepts only exact `0.1.0-beta.N` (N 1..65535,
+no leading zero) or stable `0.1.0`. Beta keeps its full identity in the
+filename, manifests and Apps & Features name `Kwil Beta 0.1.0-beta.N`;
+Windows Installer's technical ProductVersion is `0.0.N`. Stable is visibly
+`Kwil 0.1.0` with numeric version `0.1.0`. Beta.9 precedes beta.10 and
+all betas precede stable. Other versions are refused until the contract changes.
+Upgrades require a strictly higher mapped numeric version; equal-version
+builds, downgrades and architecture switching in place are refused. The family
+and destination are shared, so beta and stable do not coexist. Legacy numeric
+0.1.0 cannot be replaced by a beta or equal schema-2 stable: use its retained
+original MSI to uninstall first. Exact original PackageCode remains mandatory.
 
 For portable use, extract the ZIP into a new writable folder and keep `kwil.exe`
 and `kwil.com` together. Run `kwil.exe` for the GUI or `kwil.com --tui` for explicit
@@ -62,7 +70,10 @@ omits it and uses the normal user settings location. Both payloads contain
 rebuilding/reinstalling or replacing the portable distribution. The ZIP adds no
 Start Menu or Explorer registration.
 
-Installer/guard integration and native lifecycle qualification remain pending.
+The schema-2 identity migration is source preparation only. It is not compiled,
+packaged or qualified by this change. Host worker admission and all five native
+lifecycle gaps remain held; no new diagnostic run is authorized. Installer/guard
+integration and native lifecycle qualification remain pending.
 These instructions describe the source contract, not a passed install, repair,
 upgrade or uninstall run, nor v1 completion. See [decision 0004](decisions/0004-windows-installer.md)
 and its normative [machine-readable contract](../scripts/windows-installer-contract.json).

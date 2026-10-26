@@ -28,9 +28,13 @@ to start without that successful run. A prerelease version such as
 Review the notes for the specific prerelease before tagging. Only the owner
 publishes the resulting draft.
 
-Beta assets are the raw executables described below, installed and replaced
-manually. The combined local MSI/portable ZIP driver requires a numeric MSI
-version and is not the beta packaging path. Prereleases do not enter the stable
+The existing beta.1 draft assets remain raw executables, installed and replaced
+manually. Source-only schema-2 MSI/portable preparation now maps exact full
+`0.1.0-beta.N` identity to numeric MSI `0.0.N`, while stable `0.1.0`
+maps to `0.1.0`. Visible beta identity is retained; suffix stripping is forbidden.
+This prepares a future beta.2 setup path, not available or qualified setup assets.
+The release workflow still stages raw binaries; setup/publish wiring is excluded
+until exact artifacts and worker/lifecycle gates are qualified. Prereleases do not enter the stable
 updater or download installers; prerelease copies also do not auto-advance to a
 stable version. See [beta gates and limitations](BETA.md).
 
@@ -52,7 +56,10 @@ stable version. See [beta gates and limitations](BETA.md).
 ## Local Windows distribution (not a release)
 
 `dist.bat` invokes `scripts/dist.ps1` to prepare a native x64 or ARM64 MSI and
-portable ZIP offline from committed HEAD. See [local installation](INSTALL.md#local-windows-distribution)
+portable ZIP offline from committed HEAD. Schema/input/sidecar/outer manifest
+version is 2; component schema remains 1. The six backend arguments include
+`-ReleaseVersion`, replacing `-Version`. CargoVersion stays the exact full
+archived release version; Channel and MsiVersion are separately derived. See [local installation](INSTALL.md#local-windows-distribution)
 for prerequisites, the existing CLI options, installation/Explorer integration
 and the exact retained-original repair command. All intended backend, isolated
 guard and Cargo/lockfile integration must be committed first; dirty/untracked
@@ -62,7 +69,7 @@ Successful output is an immutable
 `dist/kwil-<version>-<12-hex-commit>-<target>/` directory containing the MSI,
 portable ZIP, `<full-msi-filename>.manifest.json` sidecar, `INSTALL.txt`, outer
 `manifest.json` and `SHA256SUMS`. Retain the original MSI and sidecar together.
-The sidecar records package identity/inventory and inspection evidence;
+The sidecar records full ReleaseVersion/channel/mapped numeric version, package identity/inventory and inspection evidence;
 `nativeLifecycle: not-run` is not native acceptance. Checksums cover the MSI,
 sidecar, ZIP, instructions and outer manifest, not themselves. Neither manifest
 nor checksums authenticate the publisher.

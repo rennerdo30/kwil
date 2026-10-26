@@ -101,7 +101,7 @@ impl<'a> Db<'a> {
         check(unsafe { MsiViewGetColumnInfo(view, kind, &mut record) }, "column info")?;
         let record = Msi::new(record)?;
         let count = unsafe { MsiRecordGetFieldCount(record.0) };
-        require(count > 0 && count <= 15, "invalid-database", "column count")?;
+        require(count > 0 && count <= 17, "invalid-database", "column count")?;
         (1..=count).map(|i| record_string(self.deadline, record.0, i)).collect()
     }
     fn blob(&self, table: &str, key: &str, cap: u64) -> Result<Blob<'_, 'a>> {
@@ -312,9 +312,13 @@ impl Database for Db<'_> {
         require(count == blob.size, "unstable-evidence", "MSI stream length")?;
         Ok((count, hex(&hash.finalize())))
     }
-    fn guard_evidence(&self, architecture: &str) -> Result<Vec<Import>> {
+    fn guard_evidence(&self, architecture: &str, abi: u32) -> Result<Vec<Import>> {
         let mut stream = stream::Window::new(self.blob("Binary", "KwilPreflight", 16_777_216)?)?;
-        pe::inspect(&mut stream, architecture)
+        match abi {
+            1 => pe::inspect(&mut stream, architecture),
+            2 => pe::inspect_v2(&mut stream, architecture),
+            _ => Err(Refusal::new("schema-unsupported", "guard ABI")),
+        }
     }
 }
 

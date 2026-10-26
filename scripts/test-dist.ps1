@@ -467,10 +467,25 @@ try {
             if ($fixtureRestoreErrors.Count -ne 0) { throw "Fixture process environment restoration failed for: $($fixtureRestoreErrors -join ', ')" }
         }
     }
-    # Frozen schema-1 extension fixtures. Authored source only until ROOT runs
+    # Independent schema-2 vector authoring; no production code ran in the
+    # source-only package. The empty resource set is an encoding primitive only.
+    $vectorMetadata=[ordered]@{schema=2;componentSchema=1;familyGuid='{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';architecture='x64';releaseVersion='0.1.0-beta.10';channel='beta';msiVersion='0.0.10';commit=('a'*40);target='x86_64-pc-windows-msvc';guard=[ordered]@{abi=2;sha256=('b'*64);imports=@([ordered]@{load='N';dll='kernel32.dll'})};inventory=@()}
+    $vectorIdentity=Get-DistInstallerIdentity $vectorMetadata
+    Assert-True ($vectorIdentity.BuildId -ceq 'cb271f49ebab129086e7586a18105aa74f59b9f270f2391412a7a607b3162324' -and $vectorIdentity.ProductCode -ceq '{BCAF26CE-222B-5CFC-841D-1DAD00D90B20}') 'independent fixed KWB2/KWP2 vectors'
+    foreach ($field in 'channel','msiVersion') {
+        $saved=$vectorMetadata[$field];$vectorMetadata[$field]='wrong'
+        Assert-Throws {Get-DistInstallerIdentity $vectorMetadata} 'mapping mismatch'
+        $vectorMetadata[$field]=$saved
+    }
+    foreach ($pair in @(@('0.1.0-beta.1','0.0.1'),@('0.1.0-beta.9','0.0.9'),@('0.1.0-beta.10','0.0.10'),@('0.1.0-beta.65535','0.0.65535'),@('0.1.0','0.1.0'))) {
+        Assert-True ((Get-DistReleaseIdentity $pair[0]).msiVersion -ceq $pair[1]) 'exact release mapping'
+    }
+    Assert-True ([version](Get-DistReleaseIdentity '0.1.0-beta.9').msiVersion -lt [version](Get-DistReleaseIdentity '0.1.0-beta.10').msiVersion) 'beta9 precedes beta10 numerically'
+    Assert-True ([version](Get-DistReleaseIdentity '0.1.0-beta.65535').msiVersion -lt [version](Get-DistReleaseIdentity '0.1.0').msiVersion) 'all betas precede stable'
+    # Schema-2 identity migration fixtures; component-schema-1 resources remain fixed. Authored source only until ROOT runs
     # this file. The MSI bytes below are deliberately fake; no MSI API is called.
-    foreach ($version in '0.0.0', '255.255.65535') { Assert-DistInstallerVersion $version }
-    foreach ($version in '01.0.0', '0.01.0', '0.0.01', '256.0.0', '0.256.0', '0.0.65536', '1.2.3-beta', '1.2.3+meta') {
+    foreach ($version in '0.1.0', '0.1.0-beta.1', '0.1.0-beta.9', '0.1.0-beta.10', '0.1.0-beta.65535') { Assert-DistInstallerVersion $version }
+    foreach ($version in '01.0.0', '0.01.0', '0.0.01', '256.0.0', '0.256.0', '0.0.65536', '1.2.3-beta', '1.2.3+meta', '0.0.1', '0.1.0-beta.0', '0.1.0-beta.01', '0.1.0-beta.65536', '0.1.0-rc.1', '0.1.1', '0.1.0-beta.1+meta', '0.1.0+meta', '0.1.0-beta.١', "0.1.0-beta.1`n", "0.1.0`r`n", ' 0.1.0', '0.1.0 ') {
         Assert-Throws { Assert-DistInstallerVersion $version } 'MSI'
     }
     Assert-True ((Get-DistUuidV5 '{6BA7B810-9DAD-11D1-80B4-00C04FD430C8}' ([Text.Encoding]::ASCII.GetBytes('www.widgets.com'))) -ceq
@@ -660,8 +675,8 @@ try {
 
     $fakeMsi = Join-Path $root 'synthetic.msi'
     [IO.File]::WriteAllText($fakeMsi, 'FAKE MSI - fixture only, never install')
-    $sidecar = [ordered]@{ schema = 1; familyGuid = $metadata.familyGuid; componentSchema = 1; architecture = 'x64'; target = $target;
-        version = '0.1.0'; commit = $commit; buildId = $identity.BuildId; inventorySha256 = $identity.InventorySha256;
+    $sidecar = [ordered]@{ schema = 2; familyGuid = $metadata.familyGuid; componentSchema = 1; architecture = 'x64'; target = $target;
+        releaseVersion = '0.1.0'; channel = 'stable'; msiVersion = '0.1.0'; commit = $commit; buildId = $identity.BuildId; inventorySha256 = $identity.InventorySha256;
         productCode = $identity.ProductCode; packageCode = '{12345678-1234-4234-8234-123456789ABC}'; guard = $metadata.guard; inventory = $metadata.inventory;
         msi = [ordered]@{ fileName = 'synthetic.msi'; size = (Get-Item -LiteralPath $fakeMsi).Length.ToString(); sha256 = (Get-FileHash -LiteralPath $fakeMsi).Hash.ToLowerInvariant() };
         inspection = [ordered]@{ database = 'passed'; cabinet = 'passed'; staticImports = 'passed' }; signed = $false; nativeLifecycle = 'not-run' }
@@ -670,7 +685,7 @@ try {
     [IO.File]::WriteAllText($sidecarPath, ($sidecar | ConvertTo-Json -Depth 8))
     $null = Assert-DistInstallerSidecar $fakeMsi $metadata
     $savedImports = $sidecar.guard.imports
-    $duplicateGuard = [ordered]@{ abi = 1; sha256 = $sidecar.guard.sha256; imports = @($savedImports) + @($savedImports[0]) }
+    $duplicateGuard = [ordered]@{ abi = 2; sha256 = $sidecar.guard.sha256; imports = @($savedImports) + @($savedImports[0]) }
     $sidecar.guard = $duplicateGuard
     [IO.File]::WriteAllText($sidecarPath, ($sidecar | ConvertTo-Json -Depth 8))
     Assert-Throws { Assert-DistInstallerSidecar $fakeMsi $metadata } 'array mismatch'
@@ -707,7 +722,33 @@ try {
     [IO.File]::WriteAllText($sidecarPath, ($sidecar | ConvertTo-Json -Depth 8))
     [IO.File]::AppendAllText($fakeMsi, 'changed')
     Assert-Throws { Assert-DistInstallerSidecar $fakeMsi $freshMetadata } 'mismatch'
-    foreach ($json in '{"schema":1,"schema":1}', '{"schema":1.0}', '{"schema":1} trailing', '{"x":"\u0000"}', '{"x":true}') {
+    # Literal raw tokens preserve decimal/exponent spellings. Each case owns a
+    # fresh file so a previous sidecar mutation cannot supply the refusal.
+    foreach ($numericCase in @(
+        @{ member = 'schema'; expected = [long]2; valid = '{"schema":2}'; invalid = @(
+            '{"schema":"2"}', '{"schema":"wrong"}', '{"schema":false}', '{"schema":{}}', '{"schema":[]}',
+            '{"schema":true}', '{"schema":null}', '{"schema":1}', '{"schema":2.0}', '{"schema":2e0}') },
+        @{ member = 'abi'; expected = [long]2; valid = '{"abi":2}'; invalid = @(
+            '{"abi":"2"}', '{"abi":"wrong"}', '{"abi":false}', '{"abi":{}}', '{"abi":[]}',
+            '{"abi":true}', '{"abi":null}', '{"abi":1}', '{"abi":2.0}', '{"abi":2e0}') },
+        @{ member = 'componentSchema'; expected = [long]1; valid = '{"componentSchema":1}'; invalid = @(
+            '{"componentSchema":"1"}', '{"componentSchema":"wrong"}', '{"componentSchema":false}', '{"componentSchema":{}}', '{"componentSchema":[]}',
+            '{"componentSchema":true}', '{"componentSchema":null}', '{"componentSchema":2}', '{"componentSchema":1.0}', '{"componentSchema":1e0}') }
+    )) {
+        $numericIndex = 0
+        foreach ($rawJson in $numericCase.invalid) {
+            $numericPath = Join-Path $root ("numeric-member-$($numericCase.member)-$numericIndex.json")
+            [IO.File]::WriteAllText($numericPath, $rawJson, [Text.UTF8Encoding]::new($false))
+            Assert-Throws { Read-DistInstallerJson $numericPath } 'JSON integer|JSON primitive|JSON number'
+            $numericIndex++
+        }
+        $numericPath = Join-Path $root ("numeric-member-$($numericCase.member)-valid.json")
+        [IO.File]::WriteAllText($numericPath, $numericCase.valid, [Text.UTF8Encoding]::new($false))
+        $numericParsed = Read-DistInstallerJson $numericPath
+        Assert-True ($numericParsed[$numericCase.member] -is [long] -and
+            $numericParsed[$numericCase.member] -eq $numericCase.expected) 'reserved member preserves exact integer value and Int64 type'
+    }
+    foreach ($json in '{"schema":2,"schema":2}', '{"schema":2.0}', '{"schema":1}', '{"schema":"2"}', '{"abi":1}', '{"componentSchema":2}', '{"schema":2} trailing', '{"x":"\u0000"}', '{"x":true}') {
         [IO.File]::WriteAllText($sidecarPath, $json)
         Assert-Throws { Read-DistInstallerJson $sidecarPath } '.'
     }

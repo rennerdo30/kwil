@@ -168,7 +168,14 @@ fn export_name_reference(input: &mut impl ReadAt, sections: &[Section], optional
     Ok(NameReference { raw: offset(sections, rva, 1, input.len())?, rva, load: None })
 }
 
+/// Exact legacy ABI evidence, used only for cached schema-1 packages.
 pub fn inspect(input: &mut impl ReadAt, architecture: &str) -> Result<Vec<Import>> {
+    inspect_expected(input, architecture, "KwilPreflightV1")
+}
+pub fn inspect_v2(input: &mut impl ReadAt, architecture: &str) -> Result<Vec<Import>> {
+    inspect_expected(input, architecture, "KwilPreflightV2")
+}
+fn inspect_expected(input: &mut impl ReadAt, architecture: &str, expected_export: &str) -> Result<Vec<Import>> {
     require(input.len() > 0 && input.len() <= 16_777_216, "limit", "guard Binary size")?;
     let dos = read::<64>(input, 0)?;
     require(&dos[..2] == b"MZ", "invalid-pe", "DOS signature")?;
@@ -277,7 +284,7 @@ pub fn inspect(input: &mut impl ReadAt, architecture: &str) -> Result<Vec<Import
             validate_imports(std::slice::from_ref(&import))?;
             imports.push(import);
         } else {
-            require(text == "KwilPreflightV1", "invalid-pe", "ABI export name")?;
+            require(text == expected_export, "invalid-pe", "ABI export name")?;
         }
     }
     imports.sort();

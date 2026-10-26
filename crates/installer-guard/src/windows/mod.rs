@@ -220,7 +220,7 @@ pub fn preflight(handle: u32) -> Result<()> {
             "cached original file type/hardlink",
         )?;
         let database = db::Db::cached(&reg.cache, &deadline)?;
-        let original = tables::read(&database)?;
+        let original = tables::read_cached(&database)?;
         registration::agrees(reg, &original, &context.install)?;
         require(original.architecture == active.architecture, "architecture-conflict", "registered original")?;
         evidence.finish(&deadline)?;

@@ -483,12 +483,12 @@ function Assert-Registration($Package, [bool]$Absent = $false) {
     $cache = Get-Registration $Package.productCode
     if ($Absent) { Assert-Case (-not $cache) 'product registration remains'; return }
     Assert-Case ($cache -and (Test-Path -LiteralPath $cache -PathType Leaf)) 'cached original MSI absent'
-    Assert-Case ($script:Installer.ProductInfo($Package.productCode, 'VersionString') -ceq $Package.version) 'registered version mismatch'
+    Assert-Case ($script:Installer.ProductInfo($Package.productCode, 'VersionString') -ceq $Package.msiVersion) 'registered version mismatch'
     Assert-Case ($script:Installer.ProductInfo($Package.productCode, 'PackageCode') -ceq $Package.packageCode) 'registered PackageCode mismatch'
     Assert-Case ([IO.Path]::GetFullPath($script:Installer.ProductInfo($Package.productCode, 'InstallLocation')).TrimEnd('\') -ieq $script:InstallRoot.TrimEnd('\')) 'Apps & Features location mismatch'
     $arp = Open-Hkcu ('Software\Microsoft\Windows\CurrentVersion\Uninstall\' + $Package.productCode)
     try {
-        Assert-Case ($arp -and $arp.GetValue('DisplayName') -ceq 'Kwil' -and $arp.GetValue('DisplayVersion') -ceq $Package.version) 'per-user Apps & Features entry mismatch'
+        Assert-Case ($arp -and $arp.GetValue('DisplayName') -ceq (Get-DistReleaseIdentity $Package.releaseVersion).productName -and $arp.GetValue('DisplayVersion') -ceq $Package.msiVersion) 'per-user Apps & Features entry mismatch'
         Assert-Case ([int]$arp.GetValue('WindowsInstaller') -eq 1) 'Apps & Features is not MSI registration'
         Assert-Case ([int]$arp.GetValue('NoModify') -eq 1 -and [int]$arp.GetValue('NoRepair') -eq 1) 'advertised maintenance UI is not suppressed'
     } finally { if ($arp) { $arp.Dispose() } }
@@ -532,15 +532,15 @@ function Invoke-Msi {
 }
 
 function Read-Package([string]$Path) {
-    $side = Get-Content -LiteralPath ($Path + '.manifest.json') -Raw | ConvertFrom-Json
-    Assert-Case ($side.schema -eq 1 -and $side.familyGuid -ceq $Family -and $side.architecture -ceq $Architecture) 'sidecar protocol mismatch'
-    Assert-Case ($side.inventory.Count -eq 29 -and $side.signed -eq $false -and $side.nativeLifecycle -ceq 'not-run') 'invalid schema-1 sidecar'
+    $side = Read-DistInstallerJson ($Path + '.manifest.json')
+    Assert-Case ($side.schema -is [long] -and $side.schema -eq 2 -and $side.familyGuid -ceq $Family -and $side.architecture -ceq $Architecture) 'sidecar protocol mismatch'
+    Assert-Case ($side.inventory.Count -eq 29 -and $side.signed -eq $false -and $side.nativeLifecycle -ceq 'not-run') 'invalid schema-2 sidecar'
     Assert-Case ($side.msi.sha256 -ceq (Get-Hash $Path) -and [long]$side.msi.size -eq (Get-Item -LiteralPath $Path).Length) 'MSI sidecar hash/size mismatch'
     Assert-Case ($side.inspection.database -ceq 'passed' -and $side.inspection.cabinet -ceq 'passed' -and $side.inspection.staticImports -ceq 'passed') 'backend inspection missing'
     return $side
 }
 
-function New-FixturePackage([string]$Name, [string]$Version, [string]$Commit, [switch]$ChangedNotice) {
+function New-FixturePackage([string]$Name, [string]$ReleaseVersion, [string]$Commit, [switch]$ChangedNotice) {
     $payload = Join-Path $EvidenceDirectory "payload-$Name"
     $null = [IO.Directory]::CreateDirectory($payload)
     foreach ($row in $script:Original.inventory | Where-Object { $_.kind -ceq 'F' -and $_.root -ceq 'I' }) {
@@ -551,14 +551,14 @@ function New-FixturePackage([string]$Name, [string]$Version, [string]$Commit, [s
         # fixture statement, and keep the same logical resource/component. Do
         # not modify signed/shipped inputs or add an unsupported schema-1 file.
         $notice = Join-Path $payload 'LICENSES.txt'
-        [IO.File]::AppendAllText($notice,"`nHosted MSI replacement fixture: $Name version $Version.`n",[Text.UTF8Encoding]::new($false))
+        [IO.File]::AppendAllText($notice,"`nHosted MSI replacement fixture: $Name release $ReleaseVersion.`n",[Text.UTF8Encoding]::new($false))
         Assert-Case ((Get-Hash $notice) -cne (Get-Hash (Join-Path $script:Portable 'LICENSES.txt'))) 'higher fixture did not change payload bytes'
     }
     # Existing real wrapper independently reconstructs model/import evidence.
-    $metadata = Initialize-DistInstallerInput $payload $script:Guard $Architecture $Version $Commit $script:Original.target
+    $metadata = Initialize-DistInstallerInput $payload $script:Guard $Architecture $ReleaseVersion $Commit $script:Original.target
     $receipt = @(Get-DistInstallerInputRecords $payload)
     $path = Join-Path $EvidenceDirectory "$Name.msi"
-    Invoke-Checked (Join-Path $PSHOME 'pwsh.exe') @('-NoLogo','-NoProfile','-File',(Join-Path $PSScriptRoot 'windows-msi.ps1'),'-PayloadDirectory',$payload,'-OutputPath',$path,'-Version',$Version,'-Architecture',$Architecture,'-Commit',$Commit,'-IconPath',(Join-Path $payload 'kwil.ico')) "backend-$Name" 120 -SelfManagedBackend
+    Invoke-Checked (Join-Path $PSHOME 'pwsh.exe') @('-NoLogo','-NoProfile','-File',(Join-Path $PSScriptRoot 'windows-msi.ps1'),'-PayloadDirectory',$payload,'-OutputPath',$path,'-ReleaseVersion',$ReleaseVersion,'-Architecture',$Architecture,'-Commit',$Commit,'-IconPath',(Join-Path $payload 'kwil.ico')) "backend-$Name" 120 -SelfManagedBackend
     Assert-DistInstallerInputUnchanged $payload $receipt
     $null = Assert-DistInstallerSidecar $path $metadata
     return [pscustomobject]@{Path=$path;Package=(Read-Package $path)}
@@ -639,21 +639,22 @@ function Invoke-Worker {
     Assert-Case ((Get-Hash $script:Guard) -ceq $script:Original.guard.sha256) 'actual dist guard mismatch'
     # Preserve the original unchanged. Fixture versions affect only newly authored
     # metadata/MSIs, never Cargo.toml, compiled provenance or the release channel.
-    $parts = @($script:Original.version.Split('.') | ForEach-Object { [int]$_ })
-    if ($parts[2] -lt 65535) { $parts[2]++ }
-    elseif ($parts[1] -lt 255) { $parts[1]++; $parts[2]=0 }
-    elseif ($parts[0] -lt 255) { $parts[0]++; $parts[1]=0; $parts[2]=0 }
-    else { throw 'No higher MSI numeric version is representable' }
-    $higher = New-FixturePackage 'higher-version' ($parts -join '.') $script:Original.commit -ChangedNotice
+    $identity = Get-DistReleaseIdentity $script:Original.releaseVersion
+    Assert-Case ($identity.msiVersion -ceq $script:Original.msiVersion -and $identity.channel -ceq $script:Original.channel) 'original release mapping mismatch'
+    if ($identity.channel -ceq 'beta') {
+        $ordinal = [uint32]$script:Original.releaseVersion.Substring('0.1.0-beta.'.Length)
+        $higherRelease = if ($ordinal -lt 65535) { '0.1.0-beta.' + ($ordinal+1).ToString([Globalization.CultureInfo]::InvariantCulture) } else { '0.1.0' }
+    } else { throw 'No higher supported ReleaseVersion; coordinated contract update required' }
+    $higher = New-FixturePackage 'higher-version' $higherRelease $script:Original.commit -ChangedNotice
     $oldNotice = @($script:Original.inventory | Where-Object { $_.kind -ceq 'F' -and $_.root -ceq 'I' -and $_.relative -ceq 'LICENSES.txt' })[0]
     $newNotice = @($higher.Package.inventory | Where-Object { $_.kind -ceq 'F' -and $_.root -ceq 'I' -and $_.relative -ceq 'LICENSES.txt' })[0]
     Assert-Case ($oldNotice.component -ceq $newNotice.component -and $oldNotice.id -ceq $newNotice.id -and $oldNotice.fileKey -ceq $newNotice.fileKey) 'replacement fixture changed logical component identity'
     Assert-Case ($oldNotice.sha256 -cne $newNotice.sha256 -and [long]$newNotice.size -gt [long]$oldNotice.size) 'replacement fixture has no observable byte change'
     Write-Json (Join-Path $EvidenceDirectory 'upgrade-replacement-oracle.json') @{relative='LICENSES.txt';component=$oldNotice.component;oldSha256=$oldNotice.sha256;newSha256=$newNotice.sha256;oldSize=$oldNotice.size;newSize=$newNotice.size;fixtureOnly=$true}
-    $repack = New-FixturePackage 'same-product-repack' $script:Original.version $script:Original.commit
+    $repack = New-FixturePackage 'same-product-repack' $script:Original.releaseVersion $script:Original.commit
     Assert-Case ($repack.Package.productCode -ceq $script:Original.productCode -and $repack.Package.packageCode -cne $script:Original.packageCode) 'repack fixture identity'
     $differentCommit = if ($script:Original.commit[0] -ceq '0') { '1' + $script:Original.commit.Substring(1) } else { '0' + $script:Original.commit.Substring(1) }
-    $equal = New-FixturePackage 'same-version-distinct-build' $script:Original.version $differentCommit
+    $equal = New-FixturePackage 'same-version-distinct-build' $script:Original.releaseVersion $differentCommit
     Assert-Case ($equal.Package.productCode -cne $script:Original.productCode) 'distinct build fixture identity'
 
     # Each collision is a resource owned by this fixture, removed EXACTLY after

@@ -53,7 +53,11 @@ pub fn operation(active: &Package, original: Option<&Package>, s: &Session) -> R
         )?;
         if let Some(original) = original {
             require(active.architecture == original.architecture, "architecture-conflict", &original.product_code)?;
-            require(active.version_numbers()? > original.version_numbers()?, "version-conflict", &original.version)?;
+            require(
+                active.version_numbers()? > original.version_numbers()?,
+                "version-conflict",
+                &original.msi_version,
+            )?;
             Operation::Upgrade
         } else {
             Operation::Install

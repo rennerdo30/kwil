@@ -32,6 +32,21 @@ V1 remains the full scope in [SPEC.md](SPEC.md).
 The release remains unpublished. Only the owner publishes, after reviewing the
 concrete draft and final packaged checks. See [release notes](BETA_RELEASE_NOTES.md).
 
+## Setup preparation remains unqualified
+
+A private source-only schema-2 installer candidate is being prepared for a future
+beta.2. It retains the full beta identity, maps beta.N to Windows Installer's
+numeric 0.0.N, and retains the existing Programs/Kwil family/path and manual
+update policy. This changes neither the immutable beta.1 tag/raw assets nor the
+current draft's publication state. No new setup build, native acceptance or
+release/publish wiring is established by this source work.
+
+Explicit-parent-desktop diagnostic run 40312316490 at 908515e failed on x64 and
+ARM64 with 0xC0000142, absent sentinel and complete cleanup. No further diagnostic
+run is approved. High-IL restricted-token evidence is not ordinary Medium-IL
+standard-user qualification. All five lifecycle gaps remain open; KW-66 native
+exit fixes are separate and excluded from this package.
+
 ## Historical evaluation snapshot
 
 A Windows x64 portable evaluation snapshot has been prepared from commit `e74f1b890c2b5128dd61569f0999a3dce74eab13` (binary version `0.1.0`). It is not a published beta release or a tagged prerelease. It excludes later committed cooperative-worker changes and uncommitted integration candidates.

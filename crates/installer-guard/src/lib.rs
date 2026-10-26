@@ -1,4 +1,4 @@
-//! Read-only schema-1 MSI preflight. No application dependency or package-specific
+//! Read-only schema-2 MSI preflight. No application dependency or package-specific
 //! build input belongs here: Binary.KwilPreflight is itself a BuildID input.
 #![cfg(any(windows, test))]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -72,7 +72,7 @@ impl Deadline {
 /// is u32 on both supported architectures and is never closed by this function.
 #[cfg(windows)]
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn KwilPreflightV1(session: u32) -> u32 {
+pub unsafe extern "system" fn KwilPreflightV2(session: u32) -> u32 {
     // Expected errors are Results. catch_unwind also prevents an accidental
     // unwind in an unwind-enabled diagnostic build crossing the system ABI.
     // ROOT must still build the production DLL with abort + static CRT.

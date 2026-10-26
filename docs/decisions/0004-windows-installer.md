@@ -1,22 +1,21 @@
-# 0004: Windows installer protocol, schema 1
+# 0004: Windows installer protocol, schema 2
 
-Status: source-frozen corrected design, 2026-10-25. No implementation, ICE,
+Status: source-only coordinated schema-2 candidate, 2026-10-26. No ICE,
 compiler, MSI, CAB, native installation or lifecycle acceptance is claimed.
 The machine-readable companion is `scripts/windows-installer-contract.json`.
 Both files are normative: a contradiction is a build/acceptance failure, never
 permission to choose one interpretation. Changes to this frozen pair require
 coordinated backend, wrapper and guard review; incompatible encodings require
-a new schema/ABI. No backend or guard implementation belongs to this change.
+a new schema/ABI. The coordinated source migration includes backend, wrapper,
+guard and their fixtures; execution and qualification remain separate gates.
 
-The source base is main `fbcddabbe4b188b3d72198aabd8d9ce2fdc83f29` in
+The schema-2 source base is `908515ebae3b6e144798d20c7fbdd966bc3d7c51` in
 `E:/Development/kwil`, with shared dirty wrap/test/dist work preserved. Reads
 included both shared rule files, repository AGENTS/CLAUDE, the full SPEC,
 `E:/Development/templates/brief-footer.md`, INSTALL and RELEASING. The brief's
-source-only/no-network/no-Git-mutation/two-file ownership overrides the footer's
-fetch/commit/push defaults and broad lifecycle bookkeeping. The earlier design
-and independent review task_status calls returned `task_not_found` with a
-parent-thread ownership error; the complete correction brief supplied the
-requirements instead. This is not a claim that those reviews were read.
+source-only/no-network/no-Git-mutation/private-snapshot ownership overrides the
+footer's fetch/commit/push defaults and broad lifecycle bookkeeping. The reviewed
+schema-2 contract and explicit file lease govern this source preparation.
 
 ## Decision and ownership
 
@@ -39,13 +38,18 @@ still need the owner; local checksums are not publisher authentication.
 
 The family/UpgradeCode is permanently
 `{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}`. Product and component UUIDv5 namespaces
-are distinct fixed values in the companion. Schema, component schema and guard
-ABI are all 1. Both architectures share the destination and family; side-by-side
+are distinct fixed values in the companion. New packages use schema 2 and guard ABI 2; component schema stays 1. Both architectures share the destination and family; side-by-side
 x64/ARM64 registration is refused. Architecture switching needs explicit
-uninstall first. Version is exactly three unsigned decimal components without
-leading zeros (except zero itself), prerelease or build suffix, within MSI's
-255.255.65535 range. Equal version with a different BuildID is refused; a higher
-numeric version is required to replace a build. Exact same ProductCode/PackageCode
+uninstall first. ReleaseVersion is exact ASCII `0.1.0-beta.N`, N=1..65535 without leading
+zeros, or exact stable `0.1.0`. Full-string matching rejects whitespace,
+build metadata, other prereleases/series and numeric `0.0.N` writer inputs.
+Beta derives channel `beta`, MSI version `0.0.N`, and ProductName
+`Kwil Beta 0.1.0-beta.N`; stable derives `stable`, `0.1.0`, and
+`Kwil 0.1.0`. Compare three numeric MSI components: beta.9 < beta.10,
+all betas < stable. No stripping, clamping or wrapping. Future versions require
+this contract to be updated. Equal mapped version with a different BuildID
+refuses; replacement requires a strictly higher mapped numeric version.
+Exact same ProductCode/PackageCode
 can enter explicit repair or uninstall. A repack with a fresh PackageCode must
 not masquerade as that registered original.
 
@@ -54,7 +58,7 @@ not masquerade as that registered original.
 Invoke `pwsh -NoLogo -NoProfile -File scripts/windows-msi.ps1` with exactly six
 named arguments, each mandatory and scalar, as listed in the companion. Unknown,
 repeated, abbreviated or positional parameters fail. Architecture is lowercase
-`x64` or `arm64`, Commit lowercase 40-hex, and Version follows the numeric grammar
+`x64` or `arm64`, Commit lowercase 40-hex, and ReleaseVersion follows the exact reviewed release grammar
 above. The three path arguments are absolute local filesystem paths. Payload
 and icon must exist; IconPath must identify the payload's installed `kwil.ico`.
 OutputPath and `OutputPath.manifest.json` must both be absent. Symlink/reparse
@@ -102,10 +106,11 @@ Exact top-level members and types:
 
 | Member | Type and meaning |
 | --- | --- |
-| `schema`, `componentSchema` | JSON integer, exactly 1 |
+| `schema` | JSON integer, exactly 2 |
+| `componentSchema` | JSON integer, exactly 1 |
 | `familyGuid` | fixed uppercase braced family GUID |
-| `version`, `commit`, `architecture`, `target` | strings; match all arguments and target mapping |
-| `guard` | object with exactly `abi` (integer 1), `sha256` (lowercase hex), `imports` (array) |
+| `releaseVersion`, `channel`, `msiVersion`, `commit`, `architecture`, `target` | strings; match all arguments and target mapping |
+| `guard` | object with exactly `abi` (integer 2), `sha256` (lowercase hex), `imports` (array) |
 | `inventory` | complete sorted array of resource objects described below |
 
 Each imports element has exactly `load` and `dll`, both strings. Load is `N` or
@@ -180,12 +185,12 @@ Numeric metadata fields and resource `valueType` are canonical decimal strings
 inside LP; row/import counts and binary lengths are raw u32le. All additions and
 conversions use checked arithmetic and the limits are checked before allocation.
 No UTF-16 BOM, JSON, locale sorting, newline, timestamp, absolute staging path,
-MSI filename, BuildID field, ProductCode or PackageCode enters the KWB1 hash.
+MSI filename, BuildID field, ProductCode or PackageCode enters the KWB2 hash.
 
 Inventory bytes are KWR1 plus count plus all 13 LP fields of every sorted row.
-InventorySha256 is their SHA-256. BuildID hashes KWB1 metadata, independently
+InventorySha256 is their SHA-256. BuildID hashes KWB2 metadata, independently
 built guard SHA-256/import evidence and those inventory bytes. ProductCode is
-UUIDv5 in the product namespace over KWP1 plus LP architecture/version/BuildID.
+UUIDv5 in the product namespace over KWP2 plus LP architecture/releaseVersion/channel/msiVersion/BuildID.
 PackageCode is a fresh UUIDv4 for each packaging call, even a byte-identical
 repack. Component UUIDv5 uses KWC1 plus LP architecture/resourceKind/normalized
 key identity/componentSchema. Helper R/K marker rows use the F component, as
@@ -341,7 +346,7 @@ x64/ARM64 before acceptance; this design alone is not proof of shell behavior.
 ## Guard ABI, dependencies, messages and sequencing
 
 `crates/installer-guard` is an isolated cdylib. Its sole MSI entrypoint is
-`KwilPreflightV1`, `unsafe extern "system" fn(u32) -> u32` on both targets.
+`KwilPreflightV2`, `unsafe extern "system" fn(u32) -> u32` on both targets.
 No unwind crosses FFI. All expected failures are Results mapped to 1603, not
 panics. ROOT chooses a compatible abort/static-CRT build configuration; an abort
 is a defect, never success evidence. DllMain has no resource scans, allocations
@@ -352,7 +357,7 @@ static-runtime policy, not just the application pair.
 
 Binary row `KwilPreflight` embeds the matching-architecture guard. CustomAction
 is exactly Action=KwilPreflight, Type=1, Source=KwilPreflight,
-Target=KwilPreflightV1. Type 1 is a synchronous immediate DLL action with checked
+Target=KwilPreflightV2. Type 1 is a synchronous immediate DLL action with checked
 return status. No scheduling, impersonation/no-impersonation, async, continue,
 deferred or rollback bits. It runs in InstallExecuteSequence at 1490, condition
 `1`, after InstallValidate=1400 and before InstallInitialize=1500. It runs even
@@ -428,7 +433,7 @@ No properties-only ownership or in-use decision is permitted.
    or install API. Reject missing/corrupt/unsupported cached packages.
 4. Independently validate that cached original's complete schema/table/BuildID/
    ProductCode/PackageCode/family/architecture and expected resource model using
-   the same parser. Require registration ProductCode, PackageCode, numeric
+   its own exact schema1/ABI1 or schema2/ABI2 reader. Require registration ProductCode, PackageCode, numeric
    version and canonical destination to match that original. Compare registered
    PACKAGECODE to its Summary revision and KwilPackage.PackageCode. Never use a
    user-supplied sidecar or installed settings as ownership authority. With
@@ -532,8 +537,8 @@ rollback handles later ordinary failures; rollback correctness needs testing.
 
 ## Sidecar interface
 
-`OutputPath.manifest.json` is UTF-8/no-BOM JSON with exactly `schema` (integer 1),
-`familyGuid`, `componentSchema` (integer 1), `architecture`, `target`, `version`,
+`OutputPath.manifest.json` is UTF-8/no-BOM JSON with exactly `schema` (integer 2),
+`familyGuid`, `componentSchema` (integer 1), `architecture`, `target`, `releaseVersion`, `channel`, `msiVersion`,
 `commit`, `buildId`, `inventorySha256`, `productCode`, `packageCode`, `guard`
 (same exact shape as input), `inventory` (same complete rows), `msi` (object
 with exactly `fileName`, `size`, `sha256`, all strings), `inspection` (object
@@ -577,11 +582,11 @@ The companion lists the required hosted cases. Their acceptance includes:
   PageCount/WordCount, valid short|long names, component attributes/keypaths,
   cabinet member mapping and exact schema1 encoding are independently inspected.
 
-No product-policy question remains open in this frozen interface. Implementation
-and evidence remain open: ROOT must integrate/build the isolated guard, wrapper
-must adopt metadata + sidecar retention, backend must implement the standard and
-custom tables and canonical LNK, and independent review plus disposable hosted
-tests must validate Windows behavior. If Windows emits behavior incompatible
+No product-policy question remains open in this frozen interface. Integration
+and evidence remain open: ROOT must review and compile the coordinated source,
+validate metadata/sidecar retention, standard/custom tables and canonical LNK,
+and obtain independent review plus disposable hosted lifecycle evidence.
+If Windows emits behavior incompatible
 with these fail-closed rules (including the env-target LNK or rollback/cache
 registration timing), return a concrete failing case to ROOT for a coordinated
 contract revision; do not weaken a guard or silently choose another protocol.
@@ -606,3 +611,109 @@ The R-data literal-brace prohibition has one exact exception: the fixed braced
 family GUID in the schema-1 file Owner value
 (familyGuid|architecture|1|file-normalizedIdentity). This is literal data, not
 a formatting token. No other dollar/braces expansion is admitted.
+
+## Schema-2 release identity and strict historical readers
+
+The six backend arguments are exactly PayloadDirectory, OutputPath,
+ReleaseVersion, Architecture, Commit and IconPath; -Version is no longer accepted.
+The archived workspace CargoVersion and application package version must equal
+full ReleaseVersion. Wrapper, backend and guard independently derive the mapping.
+Typed KwilPackage has exactly 17 columns; its old Version cell becomes
+ReleaseVersion, Channel, MsiVersion, in that order. KWIL_RELEASE_VERSION,
+KWIL_CHANNEL, ProductName, ProductVersion, schema/ABI and typed identity are bound
+to actual database and effective session properties. Recomputing a hash cannot
+make a mismapped identity valid. Display names never grant ownership.
+
+KWB2 fields are LP schema, componentSchema, family, architecture, releaseVersion,
+channel, msiVersion, commit, target, guardAbi, guardSha256, followed by the existing
+raw import count and LP load/DLL pairs, then raw inventory length and KWR1 bytes.
+KWP2 fields are LP architecture, releaseVersion, channel, msiVersion and BuildID.
+PackageCode remains a fresh UUIDv4 excluded from BuildID. KWR1, KWC1, component
+schema/namespace, family GUID, all 29 resources/11 components, Owner bytes,
+shortcut bytes, shell values and canonical Programs/Kwil destination are unchanged.
+There is one installed family, no beta/stable coexistence. kwil.no-update/manual
+updates remain mandatory. The outer manifest is SchemaVersion 2 and records
+CargoVersion, ReleaseVersion, Channel and MsiVersion separately.
+
+Active packages accept ONLY exact schema2/component1/ABI2 with V2 export.
+Cached originals route by exact typed layout to a separate schema1/component1/ABI1
+reader (15 columns, sole KwilPreflightV1) or schema2/component1/ABI2 reader
+(17 columns, sole KwilPreflightV2). Legacy KWB1 is LP 1,1,family,architecture,
+numeric Version,commit,target,1,guardSha256 then the existing imports/inventory;
+legacy KWP1 is LP architecture,numeric Version,BuildID. Legacy has no invented
+channel or semantic release version. Each reader retains exact standard-table,
+canonical hash, resource and export checks. New active packages never fall back
+to legacy decoding. Existing original V1 guards still run for their own nested
+uninstall. Registration must agree with the cached original's ProductCode,
+PackageCode, numeric MSI version and canonical current-user destination.
+
+A legacy numeric 0.1.0 installation refuses every beta downgrade and the new
+stable equal 0.1.0; explicitly uninstall using its retained original first.
+Exact original-package repair/uninstall and same-architecture strictly-higher
+replacement remain the only paths. A repack's fresh PackageCode does not grant
+maintenance authority. No resource, rollback, path, token, in-use or preservation
+check is weakened by this identity migration.
+
+## Qualification remains held
+
+This is source preparation for a future beta.2 setup, not an installer build or
+acceptance. The existing beta.1 raw tag at 904e5d5 is immutable. Release/publish
+workflow wiring, updater changes, dependencies and KW-66 native fixes are outside
+this package. NativeCommandStartup run 40312316490 at 908515e failed on both
+architectures with 0xC0000142, no sentinel and complete cleanup. No further native
+experiment is authorized here. A High-IL restricted candidate cannot establish
+ordinary Medium-IL user acceptance. Retain all five lifecycle gaps and the
+harness's unconditional qualification failure. Only the owner publishes.
+
+Authored controls must cover exact release boundaries/order, independently
+encoded KWB2/KWP2 vectors, mapping/display/session tampering even after rehash,
+strict schema/ABI/export disagreement, unchanged component/Owner bytes, strict
+legacy cache maintenance/equal/downgrade/architecture/package identity and every
+existing guard safety control. ROOT owns fail-first and focused execution;
+no authored control is claimed run by this source package.
+
+## Canonical API and fixture migration map
+
+- Wrapper Get-DistReleaseIdentity and backend Get-KwilReleaseIdentity return
+  full releaseVersion, channel, mapped msiVersion and visible productName.
+  Get-DistNames uses the full release version. Initialize-DistInstallerInput
+  accepts ReleaseVersion and emits exact schema2/component1/ABI2 metadata.
+  Get-DistInstallerIdentity/Get-KwilBuildId write KWB2; product names use KWP2.
+- Guard release_identity returns ReleaseIdentity. Package keeps numeric
+  msi_version and optional ReleaseIdentity; None means exact legacy identity,
+  never an invented stable channel. expected_product/build_bytes select the
+  exact historical encoding. read is active schema2 only; read_cached selects
+  an exact layout; read_legacy_cached is the strict historical schema1 reader.
+  The adapter's field-count ceiling is 17 solely because KwilPackage grew by
+  two typed cells. Every table still requires its exact schema/order/types.
+- test-windows-msi.ps1 moves its writer fixture from numeric 1.2.3 to full
+  0.1.0-beta.2 with numeric 0.0.2. Guard export fixture bytes change V1 to V2,
+  keeping length and all PE safety mutations. Original negative CLI spellings,
+  integer/duplicate JSON, CAB/schema, timeout/receipt and resource controls stay.
+  The independent List-of-bytes reference now encodes every KWB2 field.
+- test-dist.ps1 replaces writer numeric-domain positives with stable/beta
+  canonical boundaries; the legacy numeric parser's full range remains covered
+  in the guard fixtures. Existing invalid numeric inputs remain invalid writer
+  versions. Schema/ABI expectations become 2; component/resource expectations
+  stay 1/29/11. Integer-representation symmetry remains exact-value checked;
+  the actual JSON reader accepts only schema=2/abi=2/componentSchema=1 by member.
+- The lifecycle script's migration is mechanical: strict schema2 sidecar read,
+  new argument/field names, derived full ProductName and mapped registration
+  version. Its higher fixture increments the accepted beta ordinal, or selects
+  stable after beta.65535; stable has no supported higher release and refuses.
+  This remains a metadata/changed-LICENSES fixture, not a new compiled release
+  identity or permission to alter Cargo/application provenance. Its five gap
+  strings and unconditional full-qualification failure remain exact.
+- Rust legacy package/database fixtures need only the explicit optional legacy
+  identity, numeric field name, ABI-aware evidence interface and historical
+  reader entry point. Their original numeric 1.2.3/1.2.4 comparisons and guard
+  resource/PE safety inputs remain legacy controls. Added schema2 fixtures cover
+  current mapping, active-versus-cached isolation, rehash resistance, display and
+  effective-session binding, unchanged Owner/components and original authority.
+  Stream fixtures retain their exact legacy PE path and all bounds oracles.
+
+The companion's schema2-beta10 empty-inventory vector fixes the complete KWB2
+and KWP2 bytes independently of production encoders; it is not an installable
+resource set. Its proposed BuildID is `cb271f49ebab129086e7586a18105aa74f59b9f270f2391412a7a607b3162324`
+and ProductCode `{BCAF26CE-222B-5CFC-841D-1DAD00D90B20}`. These are authored
+controls only. No test, compiler, interop method, MSI or hosted run was executed.

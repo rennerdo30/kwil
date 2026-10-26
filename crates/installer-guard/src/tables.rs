@@ -11,16 +11,35 @@ pub trait Database {
     fn custom_schema(&self, table: &str, columns: &[(&str, &str)], keys: &[&str]) -> Result<()>;
     fn summary(&self, property: u32) -> Result<String>;
     fn stream_hash(&self, table: &str, key: &str, cap: u64) -> Result<(u64, String)>;
-    fn guard_evidence(&self, architecture: &str) -> Result<Vec<Import>>;
+    fn guard_evidence(&self, architecture: &str, abi: u32) -> Result<Vec<Import>>;
 }
 
-pub const PACKAGE_COLUMNS: [(&str, &str); 15] = [
+pub const LEGACY_PACKAGE_COLUMNS: [(&str, &str); 15] = [
     ("Id", "i2"),
     ("Schema", "i2"),
     ("ComponentSchema", "i2"),
     ("Family", "s38"),
     ("Architecture", "s5"),
     ("Version", "s20"),
+    ("Commit", "s40"),
+    ("Target", "s32"),
+    ("GuardAbi", "i2"),
+    ("GuardSha256", "s64"),
+    ("InventorySha256", "s64"),
+    ("BuildId", "s64"),
+    ("ProductCode", "s38"),
+    ("PackageCode", "s38"),
+    ("ResourceCount", "i4"),
+];
+pub const PACKAGE_COLUMNS: [(&str, &str); 17] = [
+    ("Id", "i2"),
+    ("Schema", "i2"),
+    ("ComponentSchema", "i2"),
+    ("Family", "s38"),
+    ("Architecture", "s5"),
+    ("ReleaseVersion", "s18"),
+    ("Channel", "s6"),
+    ("MsiVersion", "s20"),
     ("Commit", "s40"),
     ("Target", "s32"),
     ("GuardAbi", "i2"),
@@ -106,6 +125,81 @@ pub fn read(db: &impl Database) -> Result<Package> {
         db.custom_schema(name, columns, keys)?;
     }
     let package_names: Vec<_> = PACKAGE_COLUMNS.iter().map(|(n, _)| *n).collect();
+    let packages = strings(db.rows("KwilPackage", &package_names, 1)?, 17)?;
+    require(packages.len() == 1, "invalid-database", "one KwilPackage row")?;
+    let p = &packages[0];
+    require(
+        p[0] == "1" && p[1] == "2" && p[2] == "1" && p[3] == FAMILY && p[10] == "2",
+        "schema-unsupported",
+        "family/schema/component-schema/guard-ABI",
+    )?;
+    require(decimal(&p[16], 512)? == 29, "invalid-inventory", "resource count")?;
+    let resource_names: Vec<_> = RESOURCE_COLUMNS.iter().map(|(n, _)| *n).collect();
+    let resources = strings(db.rows("KwilResource", &resource_names, 512)?, 13)?
+        .into_iter()
+        .map(|r| {
+            let fields: [String; 13] = r.try_into().map_err(|_| Refusal::new("invalid-database", "resource width"))?;
+            Ok(Resource(fields))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // SQL row order has no identity. Canonical inventory order is reconstructed.
+    let mut resources = resources;
+    resources.sort_by_key(|r| (r.identity(), r.id().to_owned()));
+    let imports = strings(db.rows("KwilGuardImport", &["Load", "Dll"], 128)?, 2)?
+        .into_iter()
+        .map(|r| Import { load: r[0].clone(), dll: r[1].clone() })
+        .collect::<Vec<_>>();
+    let mut imports = imports;
+    imports.sort();
+    let package = Package {
+        architecture: p[4].clone(),
+        msi_version: p[7].clone(),
+        release: Some(ReleaseIdentity {
+            release_version: p[5].clone(),
+            channel: p[6].clone(),
+            msi_version: p[7].clone(),
+        }),
+        commit: p[8].clone(),
+        target: p[9].clone(),
+        guard_hash: p[11].clone(),
+        inventory_hash: p[12].clone(),
+        build_id: p[13].clone(),
+        product_code: p[14].clone(),
+        package_code: p[15].clone(),
+        imports,
+        resources,
+    };
+    package.validate()?;
+    let template = if package.architecture == "x64" { "x64;1033" } else { "Arm64;1033" };
+    for (id, expected) in [(7, template), (9, package.package_code.as_str()), (14, "500"), (15, "10")] {
+        require(db.summary(id)? == expected, "summary-mismatch", format!("SummaryInformation {id}"))?;
+    }
+    let (size, hash) = db.stream_hash("Binary", "KwilPreflight", 16_777_216)?;
+    require(size > 0 && hash == package.guard_hash, "hash-mismatch", "Binary.KwilPreflight")?;
+    require(
+        db.guard_evidence(&package.architecture, 2)? == package.imports,
+        "import-mismatch",
+        "Binary.KwilPreflight normal/delay imports",
+    )?;
+    standard(db, &package, &tables)?;
+    Ok(package)
+}
+
+pub fn read_legacy_cached(db: &impl Database) -> Result<Package> {
+    let tables = db.tables()?;
+    require(
+        tables.len() <= ALLOWED_TABLES.len() && tables.iter().all(|t| ALLOWED_TABLES.contains(&t.as_str())),
+        "unsupported-table",
+        "authored table allowlist",
+    )?;
+    for (name, columns, keys) in [
+        ("KwilPackage", LEGACY_PACKAGE_COLUMNS.as_slice(), &["Id"][..]),
+        ("KwilResource", RESOURCE_COLUMNS.as_slice(), &["Id"][..]),
+        ("KwilGuardImport", IMPORT_COLUMNS.as_slice(), &["Load", "Dll"][..]),
+    ] {
+        db.custom_schema(name, columns, keys)?;
+    }
+    let package_names: Vec<_> = LEGACY_PACKAGE_COLUMNS.iter().map(|(n, _)| *n).collect();
     let packages = strings(db.rows("KwilPackage", &package_names, 1)?, 15)?;
     require(packages.len() == 1, "invalid-database", "one KwilPackage row")?;
     let p = &packages[0];
@@ -134,7 +228,8 @@ pub fn read(db: &impl Database) -> Result<Package> {
     imports.sort();
     let package = Package {
         architecture: p[4].clone(),
-        version: p[5].clone(),
+        msi_version: p[5].clone(),
+        release: None,
         commit: p[6].clone(),
         target: p[7].clone(),
         guard_hash: p[9].clone(),
@@ -153,7 +248,7 @@ pub fn read(db: &impl Database) -> Result<Package> {
     let (size, hash) = db.stream_hash("Binary", "KwilPreflight", 16_777_216)?;
     require(size > 0 && hash == package.guard_hash, "hash-mismatch", "Binary.KwilPreflight")?;
     require(
-        db.guard_evidence(&package.architecture)? == package.imports,
+        db.guard_evidence(&package.architecture, 1)? == package.imports,
         "import-mismatch",
         "Binary.KwilPreflight normal/delay imports",
     )?;
@@ -161,14 +256,29 @@ pub fn read(db: &impl Database) -> Result<Package> {
     Ok(package)
 }
 
+/// The cached original selects an exact historical layout; active packages never
+/// enter this router. Each reader independently checks its own schema/ABI tuple.
+pub fn read_cached(db: &impl Database) -> Result<Package> {
+    let names = db.column_info("KwilPackage")?;
+    if names.iter().map(|(name, _)| name.as_str()).eq(LEGACY_PACKAGE_COLUMNS.iter().map(|(name, _)| *name)) {
+        read_legacy_cached(db)
+    } else if names.iter().map(|(name, _)| name.as_str()).eq(PACKAGE_COLUMNS.iter().map(|(name, _)| *name)) {
+        read(db)
+    } else {
+        Err(Refusal::new("schema-unsupported", "cached package layout"))
+    }
+}
+
 pub fn properties(p: &Package) -> Vec<(&'static str, String)> {
-    [
-        ("ProductName", "Kwil"),
+    let product_name = p.product_name();
+    let schema = if p.release.is_some() { "2" } else { "1" };
+    let mut properties: Vec<_> = [
+        ("ProductName", product_name.as_str()),
         ("Manufacturer", "rennerdo30"),
         ("ProductLanguage", "1033"),
         ("UpgradeCode", FAMILY),
         ("ProductCode", &p.product_code),
-        ("ProductVersion", &p.version),
+        ("ProductVersion", &p.msi_version),
         ("MSIINSTALLPERUSER", "1"),
         ("ARPNOMODIFY", "1"),
         ("ARPNOREPAIR", "1"),
@@ -176,9 +286,9 @@ pub fn properties(p: &Package) -> Vec<(&'static str, String)> {
         ("ARPINSTALLLOCATION", "[INSTALLDIR]"),
         ("MSIRESTARTMANAGERCONTROL", "Disable"),
         ("REBOOT", "ReallySuppress"),
-        ("KWIL_SCHEMA", "1"),
+        ("KWIL_SCHEMA", schema),
         ("KWIL_COMPONENT_SCHEMA", "1"),
-        ("KWIL_GUARD_ABI", "1"),
+        ("KWIL_GUARD_ABI", schema),
         ("KWIL_FAMILY", FAMILY),
         ("KWIL_ARCH", &p.architecture),
         ("KWIL_BUILD_ID", &p.build_id),
@@ -186,7 +296,12 @@ pub fn properties(p: &Package) -> Vec<(&'static str, String)> {
     ]
     .into_iter()
     .map(|(k, v)| (k, v.to_owned()))
-    .collect()
+    .collect();
+    if let Some(identity) = &p.release {
+        properties.push(("KWIL_RELEASE_VERSION", identity.release_version.clone()));
+        properties.push(("KWIL_CHANNEL", identity.channel.clone()));
+    }
+    properties
 }
 pub const EMPTY_PROPERTIES: &[&str] = &[
     "ALLUSERS",
@@ -369,7 +484,7 @@ fn standard(db: &impl Database, p: &Package, tables: &[String]) -> Result<()> {
         "CustomAction",
         &["Action", "Type", "Source", "Target"],
         vec![
-            row(&[Some("KwilPreflight"), Some("1"), Some("KwilPreflight"), Some("KwilPreflightV1")]),
+            row(&[Some("KwilPreflight"), Some("1"), Some("KwilPreflight"), Some(p.guard_export())]),
             row(&[Some("SetKwilArpLocation"), Some("51"), Some("ARPINSTALLLOCATION"), Some("[INSTALLDIR]")]),
         ],
     )?;
@@ -378,9 +493,17 @@ fn standard(db: &impl Database, p: &Package, tables: &[String]) -> Result<()> {
         "Upgrade",
         &["UpgradeCode", "VersionMin", "VersionMax", "Language", "Attributes", "Remove", "ActionProperty"],
         vec![
-            row(&[Some(FAMILY), None, Some(&p.version), None, Some("1"), Some("ALL"), Some("KWIL_OLDER")]),
-            row(&[Some(FAMILY), Some(&p.version), Some(&p.version), None, Some("770"), None, Some("KWIL_EQUAL")]),
-            row(&[Some(FAMILY), Some(&p.version), None, None, Some("2"), None, Some("KWIL_NEWER")]),
+            row(&[Some(FAMILY), None, Some(&p.msi_version), None, Some("1"), Some("ALL"), Some("KWIL_OLDER")]),
+            row(&[
+                Some(FAMILY),
+                Some(&p.msi_version),
+                Some(&p.msi_version),
+                None,
+                Some("770"),
+                None,
+                Some("KWIL_EQUAL"),
+            ]),
+            row(&[Some(FAMILY), Some(&p.msi_version), None, None, Some("2"), None, Some("KWIL_NEWER")]),
         ],
     )?;
     exact(db, "Error", &["Error", "Message"], vec![row(&[Some("25001"), Some("Kwil installer preflight: [2]. [3]")])])?;

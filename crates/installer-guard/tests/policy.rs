@@ -166,7 +166,8 @@ fn package(ver: &str) -> Package {
     let imports = pe::inspect(&mut Bytes(pe.clone()), "x64").unwrap();
     let mut p = Package {
         architecture: "x64".into(),
-        version: ver.into(),
+        msi_version: ver.into(),
+        release: None,
         commit: "a".repeat(40),
         target: "x86_64-pc-windows-msvc".into(),
         guard_hash: sha256(&pe),
@@ -178,7 +179,7 @@ fn package(ver: &str) -> Package {
         resources,
     };
     p.build_id = sha256(&p.build_bytes().unwrap());
-    p.product_code = product(&p.architecture, &p.version, &p.build_id).unwrap();
+    p.product_code = product(&p.architecture, &p.msi_version, &p.build_id).unwrap();
     p
 }
 fn install_session() -> Session {
@@ -236,7 +237,7 @@ fn exact_marker_and_shortcut_are_not_arbitrary_payload_hashes() {
         // Rehashing the inventory cannot legitimize a different fixed resource.
         broken.inventory_hash = sha256(&inventory_bytes(&broken.resources).unwrap());
         broken.build_id = sha256(&broken.build_bytes().unwrap());
-        broken.product_code = product("x64", &broken.version, &broken.build_id).unwrap();
+        broken.product_code = product("x64", &broken.msi_version, &broken.build_id).unwrap();
         assert!(broken.validate().is_err());
     }
     let link = shortcut();
@@ -703,26 +704,38 @@ impl Database for DbFixture {
         require(evidence.0 <= cap, "limit", "fixture stream")?;
         Ok(evidence)
     }
-    fn guard_evidence(&self, arch: &str) -> Result<Vec<Import>> {
-        pe::inspect(&mut Bytes(self.guard.clone()), arch)
+    fn guard_evidence(&self, arch: &str, abi: u32) -> Result<Vec<Import>> {
+        match abi {
+            1 => pe::inspect(&mut Bytes(self.guard.clone()), arch),
+            2 => pe::inspect_v2(&mut Bytes(self.guard.clone()), arch),
+            _ => Err(Refusal::new("schema-unsupported", "fixture ABI")),
+        }
     }
 }
 fn sql(values: &[Option<&str>]) -> Row {
     values.iter().map(|s| s.map(str::to_owned)).collect()
 }
 fn database(p: &Package) -> DbFixture {
+    let package_columns: &[(&str, &str)] =
+        if p.release.is_some() { &tables::PACKAGE_COLUMNS } else { &tables::LEGACY_PACKAGE_COLUMNS };
     let mut db = DbFixture {
         rows: BTreeMap::new(),
         schema: BTreeMap::new(),
         summary: [(7, "x64;1033".into()), (9, p.package_code.clone()), (14, "500".into()), (15, "10".into())].into(),
-        guard: pe_fixture(None),
+        guard: {
+            let mut image = pe_fixture(None);
+            if p.release.is_some() {
+                image[0x4ae] = b'2';
+            }
+            image
+        },
         icon: {
             let r = p.resources.iter().find(|r| r.relative() == "kwil.ico").unwrap();
             (decimal(r.size(), 536870912).unwrap(), r.hash().into())
         },
     };
     for (table, columns, keys) in [
-        ("KwilPackage", tables::PACKAGE_COLUMNS.as_slice(), &["Id"][..]),
+        ("KwilPackage", package_columns, &["Id"][..]),
         ("KwilResource", tables::RESOURCE_COLUMNS.as_slice(), &["Id"][..]),
         ("KwilGuardImport", tables::IMPORT_COLUMNS.as_slice(), &["Load", "Dll"][..]),
         ("Binary", &[("Name", "s72"), ("Data", "v0")][..], &["Name"][..]),
@@ -739,27 +752,24 @@ fn database(p: &Package) -> DbFixture {
     let mut add = |table: &str, columns: &[&str], rows: Vec<Row>| {
         db.rows.insert(table.into(), (columns.iter().map(|s| s.to_string()).collect(), rows));
     };
-    add(
-        "KwilPackage",
-        &tables::PACKAGE_COLUMNS.map(|(n, _)| n),
-        vec![sql(&[
-            Some("1"),
-            Some("1"),
-            Some("1"),
-            Some(FAMILY),
-            Some(&p.architecture),
-            Some(&p.version),
-            Some(&p.commit),
-            Some(&p.target),
-            Some("1"),
-            Some(&p.guard_hash),
-            Some(&p.inventory_hash),
-            Some(&p.build_id),
-            Some(&p.product_code),
-            Some(&p.package_code),
-            Some("29"),
-        ])],
-    );
+    let schema = if p.release.is_some() { "2" } else { "1" };
+    let mut package_values = vec![Some("1"), Some(schema), Some("1"), Some(FAMILY), Some(p.architecture.as_str())];
+    if let Some(identity) = &p.release {
+        package_values.extend([Some(identity.release_version.as_str()), Some(identity.channel.as_str())]);
+    }
+    package_values.extend([
+        Some(p.msi_version.as_str()),
+        Some(p.commit.as_str()),
+        Some(p.target.as_str()),
+        Some(schema),
+        Some(p.guard_hash.as_str()),
+        Some(p.inventory_hash.as_str()),
+        Some(p.build_id.as_str()),
+        Some(p.product_code.as_str()),
+        Some(p.package_code.as_str()),
+        Some("29"),
+    ]);
+    add("KwilPackage", &package_columns.iter().map(|(name, _)| *name).collect::<Vec<_>>(), vec![sql(&package_values)]);
     add(
         "KwilResource",
         &tables::RESOURCE_COLUMNS.map(|(n, _)| n),
@@ -881,7 +891,7 @@ fn database(p: &Package) -> DbFixture {
         "CustomAction",
         &["Action", "Type", "Source", "Target"],
         vec![
-            sql(&[Some("KwilPreflight"), Some("1"), Some("KwilPreflight"), Some("KwilPreflightV1")]),
+            sql(&[Some("KwilPreflight"), Some("1"), Some("KwilPreflight"), Some(p.guard_export())]),
             sql(&[Some("SetKwilArpLocation"), Some("51"), Some("ARPINSTALLLOCATION"), Some("[INSTALLDIR]")]),
         ],
     );
@@ -889,9 +899,17 @@ fn database(p: &Package) -> DbFixture {
         "Upgrade",
         &["UpgradeCode", "VersionMin", "VersionMax", "Language", "Attributes", "Remove", "ActionProperty"],
         vec![
-            sql(&[Some(FAMILY), None, Some(&p.version), None, Some("1"), Some("ALL"), Some("KWIL_OLDER")]),
-            sql(&[Some(FAMILY), Some(&p.version), Some(&p.version), None, Some("770"), None, Some("KWIL_EQUAL")]),
-            sql(&[Some(FAMILY), Some(&p.version), None, None, Some("2"), None, Some("KWIL_NEWER")]),
+            sql(&[Some(FAMILY), None, Some(&p.msi_version), None, Some("1"), Some("ALL"), Some("KWIL_OLDER")]),
+            sql(&[
+                Some(FAMILY),
+                Some(&p.msi_version),
+                Some(&p.msi_version),
+                None,
+                Some("770"),
+                None,
+                Some("KWIL_EQUAL"),
+            ]),
+            sql(&[Some(FAMILY), Some(&p.msi_version), None, None, Some("2"), None, Some("KWIL_NEWER")]),
         ],
     );
     add("Error", &["Error", "Message"], vec![sql(&[Some("25001"), Some("Kwil installer preflight: [2]. [3]")])]);
@@ -973,7 +991,7 @@ fn database(p: &Package) -> DbFixture {
 fn typed_database_stream_summary_and_standard_table_tampering_refuse() {
     let p = package("1.2.3");
     let clean = database(&p);
-    tables::read(&clean).unwrap();
+    tables::read_legacy_cached(&clean).unwrap();
     for (table, column, value) in [
         ("Component", 3, "4"),
         ("Component", 5, "F000001"),
@@ -989,31 +1007,203 @@ fn typed_database_stream_summary_and_standard_table_tampering_refuse() {
     ] {
         let mut broken = clean.clone();
         broken.rows.get_mut(table).unwrap().1[0][column] = Some(value.into());
-        assert!(tables::read(&broken).is_err(), "{table} {column}");
+        assert!(tables::read_legacy_cached(&broken).is_err(), "{table} {column}");
     }
     let mut broken = clean.clone();
     broken.summary.insert(9, "{AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE}".into());
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
     let mut broken = clean.clone();
     broken.guard[0x500] ^= 1;
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
     let mut broken = clean.clone();
     broken.schema.get_mut("KwilResource").unwrap().0[5].1 = "S0".into();
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
     let mut broken = clean.clone();
     broken.rows.insert("KwilOther".into(), (vec![], vec![]));
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
     let mut broken = clean.clone();
     broken.rows.insert("Environment".into(), (vec![], vec![]));
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
     let mut broken = clean.clone();
     broken.rows.get_mut("_Validation").unwrap().1.pop();
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
     let mut broken = clean.clone();
     broken.rows.get_mut("InstallExecuteSequence").unwrap().1.push(sql(&[Some("DisableRollback"), None, Some("1401")]));
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
     let mut broken = clean.clone();
     let rows = &mut broken.rows.get_mut("InstallExecuteSequence").unwrap().1;
     rows.iter_mut().find(|r| r[0].as_deref() == Some("KwilPreflight")).unwrap()[1] = Some("NOT Installed".into());
-    assert!(tables::read(&broken).is_err());
+    assert!(tables::read_legacy_cached(&broken).is_err());
+}
+
+// Schema-2 controls are authored source only; ROOT owns fail-first execution.
+fn release_package(input: &str) -> Package {
+    let identity = release_identity(input).unwrap();
+    let mut p = package("0.0.1");
+    p.msi_version = identity.msi_version.clone();
+    p.release = Some(identity);
+    let mut guard = pe_fixture(None);
+    guard[0x4ae] = b'2';
+    p.guard_hash = sha256(&guard);
+    p.build_id = sha256(&p.build_bytes().unwrap());
+    p.product_code = p.expected_product().unwrap();
+    p
+}
+#[test]
+fn schema2_release_boundaries_numeric_order_and_exact_ascii() {
+    for (input, numeric) in [
+        ("0.1.0-beta.1", "0.0.1"),
+        ("0.1.0-beta.9", "0.0.9"),
+        ("0.1.0-beta.10", "0.0.10"),
+        ("0.1.0-beta.65535", "0.0.65535"),
+        ("0.1.0", "0.1.0"),
+    ] {
+        assert_eq!(release_identity(input).unwrap().msi_version, numeric);
+    }
+    for input in [
+        "",
+        "0.0.1",
+        "0.1.1",
+        "0.1.0-beta.0",
+        "0.1.0-beta.01",
+        "0.1.0-beta.65536",
+        "0.1.0-rc.1",
+        "0.1.0-beta.1+meta",
+        "0.1.0+meta",
+        "0.1.0-beta.١",
+        "0.1.0-beta.1\n",
+        "0.1.0\r\n",
+        " 0.1.0",
+        "0.1.0 ",
+    ] {
+        assert!(release_identity(input).is_err(), "{input:?}");
+    }
+    assert!(
+        release_package("0.1.0-beta.9").version_numbers().unwrap()
+            < release_package("0.1.0-beta.10").version_numbers().unwrap()
+    );
+    assert!(
+        release_package("0.1.0-beta.65535").version_numbers().unwrap()
+            < release_package("0.1.0").version_numbers().unwrap()
+    );
+}
+#[test]
+fn schema2_fixed_canonical_vectors_are_independent_of_production_encoders() {
+    let mut p = release_package("0.1.0-beta.10");
+    p.guard_hash = "b".repeat(64);
+    p.resources.clear(); // canonical primitive, not an installable package
+    p.build_id = sha256(&p.build_bytes().unwrap());
+    assert_eq!(
+        hex(&p.build_bytes().unwrap()),
+        "4b57423201000000320100000031260000007b33443943324336462d374335392d344435342d393242342d3042413145433630333437417d030000007836340d000000302e312e302d626574612e3130040000006265746106000000302e302e31302800000061616161616161616161616161616161616161616161616161616161616161616161616161616161160000007838365f36342d70632d77696e646f77732d6d7376630100000032400000006262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626201000000010000004e0c0000006b65726e656c33322e646c6c080000004b57523100000000"
+    );
+    assert_eq!(p.build_id, "cb271f49ebab129086e7586a18105aa74f59b9f270f2391412a7a607b3162324");
+    assert_eq!(p.expected_product().unwrap(), "{BCAF26CE-222B-5CFC-841D-1DAD00D90B20}");
+}
+#[test]
+fn schema2_component_owner_and_shortcut_bytes_remain_legacy_exact() {
+    let legacy = package("0.1.0");
+    for input in ["0.1.0-beta.1", "0.1.0-beta.65535", "0.1.0"] {
+        let active = release_package(input);
+        assert_eq!(active.resources, legacy.resources);
+        assert_eq!(inventory_bytes(&active.resources).unwrap(), inventory_bytes(&legacy.resources).unwrap());
+    }
+}
+#[test]
+fn schema2_active_and_cached_readers_are_strict_and_mappings_survive_rehash() {
+    let legacy = package("0.1.0");
+    assert!(tables::read(&database(&legacy)).is_err());
+    tables::read_legacy_cached(&database(&legacy)).unwrap();
+    tables::read_cached(&database(&legacy)).unwrap();
+    let active = release_package("0.1.0-beta.2");
+    tables::read(&database(&active)).unwrap();
+    tables::read_cached(&database(&active)).unwrap();
+    assert!(tables::read_legacy_cached(&database(&active)).is_err());
+    for (column, value) in [(1, "1"), (2, "2"), (10, "1"), (5, "0.0.2"), (6, "stable"), (7, "0.1.0")] {
+        let mut db = database(&active);
+        db.rows.get_mut("KwilPackage").unwrap().1[0][column] = Some(value.into());
+        assert!(tables::read(&db).is_err(), "column {column}");
+    }
+    let mut bad = active.clone();
+    bad.release.as_mut().unwrap().channel = "stable".into();
+    assert!(bad.build_bytes().is_err()); // even a caller attempting to recompute canonical hashes must refuse
+    let mut bad = active.clone();
+    bad.msi_version = "0.1.0".into();
+    bad.release.as_mut().unwrap().msi_version = "0.1.0".into();
+    assert!(bad.build_bytes().is_err()); // consistent duplicate cells cannot override the derived mapping
+    // Recompute every identity from the wrong export's bytes. The ABI reader,
+    // rather than an incidental stale hash, must still reject the V1 image.
+    let mut wrong_guard = active.clone();
+    wrong_guard.guard_hash = sha256(&pe_fixture(None));
+    wrong_guard.build_id = sha256(&wrong_guard.build_bytes().unwrap());
+    wrong_guard.product_code = wrong_guard.expected_product().unwrap();
+    let mut wrong_export = database(&wrong_guard);
+    wrong_export.guard[0x4ae] = b'1';
+    let refusal = tables::read(&wrong_export).unwrap_err();
+    assert_eq!(refusal.code, "invalid-pe");
+    assert_eq!(refusal.resource, "ABI export name");
+    let mut legacy_wrong_guard = legacy.clone();
+    let mut image = pe_fixture(None);
+    image[0x4ae] = b'2';
+    legacy_wrong_guard.guard_hash = sha256(&image);
+    legacy_wrong_guard.build_id = sha256(&legacy_wrong_guard.build_bytes().unwrap());
+    legacy_wrong_guard.product_code = legacy_wrong_guard.expected_product().unwrap();
+    let mut wrong_export = database(&legacy_wrong_guard);
+    wrong_export.guard[0x4ae] = b'2';
+    let refusal = tables::read_cached(&wrong_export).unwrap_err();
+    assert_eq!(refusal.code, "invalid-pe");
+    assert_eq!(refusal.resource, "ABI export name");
+    for (name, value) in [
+        ("ProductName", "Kwil"),
+        ("ProductVersion", "0.1.0"),
+        ("KWIL_RELEASE_VERSION", "0.1.0"),
+        ("KWIL_CHANNEL", "stable"),
+        ("KWIL_SCHEMA", "1"),
+        ("KWIL_GUARD_ABI", "1"),
+    ] {
+        let mut db = database(&active);
+        let property =
+            db.rows.get_mut("Property").unwrap().1.iter_mut().find(|row| row[0].as_deref() == Some(name)).unwrap();
+        property[1] = Some(value.into());
+        assert!(tables::read(&db).is_err(), "{name}");
+        let expected = tables::properties(&active).into_iter().collect::<BTreeMap<_, _>>();
+        assert!(
+            tables::effective_properties(&active, |key| Ok(if key == name {
+                value.into()
+            } else {
+                expected.get(key).cloned().unwrap_or_default()
+            }))
+            .is_err(),
+            "session {name}"
+        );
+    }
+}
+#[test]
+fn schema2_legacy_numeric_maintenance_and_replacement_authority_are_unchanged() {
+    let legacy = package("0.1.0");
+    for input in ["0.1.0-beta.1", "0.1.0-beta.65535", "0.1.0"] {
+        assert_eq!(
+            operation(&release_package(input), Some(&legacy), &install_session()).unwrap_err().code,
+            "version-conflict"
+        );
+    }
+    assert_eq!(operation(&legacy, Some(&legacy), &repair_session()).unwrap(), Operation::Repair);
+    assert_eq!(operation(&legacy, Some(&legacy), &uninstall_session()).unwrap(), Operation::Uninstall);
+    let mut repack = legacy.clone();
+    repack.package_code = "{22222222-2222-4333-8444-555555555555}".into();
+    assert_eq!(operation(&repack, Some(&legacy), &repair_session()).unwrap_err().code, "package-mismatch");
+    let before = release_package("0.1.0-beta.9");
+    let after = release_package("0.1.0-beta.10");
+    assert_eq!(operation(&before, Some(&before), &repair_session()).unwrap(), Operation::Repair);
+    assert_eq!(operation(&before, Some(&before), &uninstall_session()).unwrap(), Operation::Uninstall);
+    let mut repack = before.clone();
+    repack.package_code = "{22222222-2222-4333-8444-555555555555}".into();
+    for session in [repair_session(), uninstall_session()] {
+        assert_eq!(operation(&repack, Some(&before), &session).unwrap_err().code, "package-mismatch");
+    }
+    assert_eq!(operation(&after, Some(&before), &install_session()).unwrap(), Operation::Upgrade);
+    assert_eq!(operation(&before, Some(&after), &install_session()).unwrap_err().code, "version-conflict");
+    let mut other_arch = after.clone();
+    other_arch.architecture = "arm64".into();
+    assert_eq!(operation(&other_arch, Some(&before), &install_session()).unwrap_err().code, "architecture-conflict");
 }

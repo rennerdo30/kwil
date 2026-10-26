@@ -41,6 +41,38 @@ pub fn version(s: &str) -> Result<[u32; 3]> {
     require(parts.next().is_none(), "invalid-metadata", "version component count")?;
     Ok(out)
 }
+/// Only the reviewed initial release series is writable. Legacy numeric versions
+/// are decoded exclusively by the cached schema-1 reader, never this mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseIdentity {
+    pub release_version: String,
+    pub channel: String,
+    pub msi_version: String,
+}
+pub fn release_identity(input: &str) -> Result<ReleaseIdentity> {
+    require(input.is_ascii() && input.len() <= 18, "invalid-metadata", "release version")?;
+    if input == "0.1.0" {
+        return Ok(ReleaseIdentity {
+            release_version: input.into(),
+            channel: "stable".into(),
+            msi_version: "0.1.0".into(),
+        });
+    }
+    let ordinal = input
+        .strip_prefix("0.1.0-beta.")
+        .ok_or_else(|| Refusal::new("invalid-metadata", "unsupported release series"))?;
+    let number = decimal(ordinal, 65535)?;
+    require(number > 0, "invalid-metadata", "beta ordinal must be positive")?;
+    Ok(ReleaseIdentity { release_version: input.into(), channel: "beta".into(), msi_version: format!("0.0.{number}") })
+}
+pub fn product_release(arch: &str, identity: &ReleaseIdentity, build: &str) -> Result<String> {
+    require(release_identity(&identity.release_version)? == *identity, "invalid-metadata", "release mapping")?;
+    let mut bytes = b"KWP2".to_vec();
+    for value in [arch, &identity.release_version, &identity.channel, &identity.msi_version, build] {
+        lp(&mut bytes, value)?;
+    }
+    uuid5(PRODUCT_NS, &bytes)
+}
 pub fn lp(out: &mut Vec<u8>, s: &str) -> Result<()> {
     let new_len = out
         .len()

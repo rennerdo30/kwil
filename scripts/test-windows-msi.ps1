@@ -157,7 +157,7 @@ function New-KwilTestPe {
         [BitConverter]::GetBytes([uint32]4760).CopyTo($b,1060)
         [BitConverter]::GetBytes([uint32]7936).CopyTo($b,1152)
         [BitConverter]::GetBytes([uint32]4768).CopyTo($b,1168)
-        [Text.Encoding]::ASCII.GetBytes('KwilPreflightV1').CopyTo($b,1184)
+        [Text.Encoding]::ASCII.GetBytes('KwilPreflightV2').CopyTo($b,1184)
     }
     return ,$b
 }
@@ -195,7 +195,7 @@ function New-KwilTestFiles {
 
 function New-KwilTestMetadata {
     param($Model,[string]$Architecture='x64',[string]$GuardHash=('a'*64),[object[]]$Imports=@([ordered]@{load='N';dll='kernel32.dll'}))
-    return [ordered]@{schema=1;componentSchema=1;familyGuid='{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';version='1.2.3';commit=('b'*40);architecture=$Architecture;target=$(if($Architecture -ceq 'x64'){'x86_64-pc-windows-msvc'}else{'aarch64-pc-windows-msvc'});guard=[ordered]@{abi=1;sha256=$GuardHash;imports=$Imports};inventory=$Model.Rows}
+    return [ordered]@{schema=2;componentSchema=1;familyGuid='{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';releaseVersion='0.1.0-beta.2';channel='beta';msiVersion='0.0.2';commit=('b'*40);architecture=$Architecture;target=$(if($Architecture -ceq 'x64'){'x86_64-pc-windows-msvc'}else{'aarch64-pc-windows-msvc'});guard=[ordered]@{abi=2;sha256=$GuardHash;imports=$Imports};inventory=$Model.Rows}
 }
 
 function ConvertTo-KwilTestJson {
@@ -220,8 +220,8 @@ function New-KwilReferenceInventory {
 function New-KwilReferenceBuild {
     param($Metadata,[byte[]]$Inventory)
     $bytes=[Collections.Generic.List[byte]]::new()
-    $bytes.AddRange([Text.Encoding]::ASCII.GetBytes('KWB1'))
-    foreach($v in @('1','1',$Metadata.familyGuid,$Metadata.architecture,$Metadata.version,$Metadata.commit,$Metadata.target,'1',$Metadata.guard.sha256)) {
+    $bytes.AddRange([Text.Encoding]::ASCII.GetBytes('KWB2'))
+    foreach($v in @('2','1',$Metadata.familyGuid,$Metadata.architecture,$Metadata.releaseVersion,$Metadata.channel,$Metadata.msiVersion,$Metadata.commit,$Metadata.target,'2',$Metadata.guard.sha256)) {
         $s=[Text.Encoding]::UTF8.GetBytes($v);$bytes.AddRange([BitConverter]::GetBytes([uint32]$s.Length));$bytes.AddRange($s)
     }
     $bytes.AddRange([BitConverter]::GetBytes([uint32]$Metadata.guard.imports.Count))
@@ -232,13 +232,40 @@ function New-KwilReferenceBuild {
     return ,$bytes.ToArray()
 }
 
+# Schema-2 mapping and independent, fixed canonical identity vectors. Source
+# authored only: this work package does not execute these controls.
+foreach ($pair in @(@('0.1.0-beta.1','0.0.1'),@('0.1.0-beta.9','0.0.9'),@('0.1.0-beta.10','0.0.10'),@('0.1.0-beta.65535','0.0.65535'),@('0.1.0','0.1.0'))) {
+    $mapped=Get-KwilReleaseIdentity $pair[0]
+    Test-KwilEqual $mapped.msiVersion $pair[1] 'exact release-to-MSI mapping'
+    Test-KwilEqual $mapped.productName $(if($pair[0] -ceq '0.1.0'){'Kwil 0.1.0'}else{'Kwil Beta '+$pair[0]}) 'full visible release identity'
+}
+foreach ($invalidRelease in @('', '0.0.1','0.1.1','0.1.0-beta.0','0.1.0-beta.01','0.1.0-beta.65536','0.1.0-rc.1','0.1.0-beta.1+meta','0.1.0+meta','0.1.0-beta.١',"0.1.0-beta.1`n","0.1.0`r`n",' 0.1.0','0.1.0 ')) {
+    Test-KwilReject {Get-KwilReleaseIdentity $invalidRelease} 'ReleaseVersion'
+}
+Assert-Kwil ([version](Get-KwilReleaseIdentity '0.1.0-beta.9').msiVersion -lt [version](Get-KwilReleaseIdentity '0.1.0-beta.10').msiVersion) 'numeric beta9/beta10 ordering'
+Assert-Kwil ([version](Get-KwilReleaseIdentity '0.1.0-beta.65535').msiVersion -lt [version](Get-KwilReleaseIdentity '0.1.0').msiVersion) 'all betas precede stable'
+# Empty KWR1 is a canonical-encoding primitive, not an installable resource set.
+$vectorMetadata=[ordered]@{schema=2;componentSchema=1;familyGuid='{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';architecture='x64';releaseVersion='0.1.0-beta.10';channel='beta';msiVersion='0.0.10';commit=('a'*40);target='x86_64-pc-windows-msvc';guard=[ordered]@{abi=2;sha256=('b'*64);imports=@([ordered]@{load='N';dll='kernel32.dll'})};inventory=@()}
+$vectorInventory=[Convert]::FromHexString('4B57523100000000')
+$vectorBytes=[Convert]::FromHexString('4B57423201000000320100000031260000007B33443943324336462D374335392D344435342D393242342D3042413145433630333437417D030000007836340D000000302E312E302D626574612E3130040000006265746106000000302E302E31302800000061616161616161616161616161616161616161616161616161616161616161616161616161616161160000007838365F36342D70632D77696E646F77732D6D7376630100000032400000006262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626201000000010000004E0C0000006B65726E656C33322E646C6C080000004B57523100000000')
+Test-KwilEqual ([Convert]::ToHexString((New-KwilReferenceBuild $vectorMetadata $vectorInventory))) ([Convert]::ToHexString($vectorBytes)) 'independent KWB2 complete byte vector'
+Test-KwilEqual (Get-KwilBuildId $vectorMetadata $vectorInventory) 'cb271f49ebab129086e7586a18105aa74f59b9f270f2391412a7a607b3162324' 'KWB2 SHA256 fixed vector'
+$vectorProduct=New-KwilEncoding 'KWP2' @('x64','0.1.0-beta.10','beta','0.0.10','cb271f49ebab129086e7586a18105aa74f59b9f270f2391412a7a607b3162324')
+Test-KwilEqual ([Convert]::ToHexString($vectorProduct)) '4B575032030000007836340D000000302E312E302D626574612E3130040000006265746106000000302E302E31304000000063623237316634396562616231323930383665373538366131383130356161373466353962396632373066323339313431326137613630376233313632333234' 'KWP2 complete byte vector'
+Test-KwilEqual (New-KwilUuid5 '{918F53A7-7A40-5E54-96EB-E2FD9B0C605B}' $vectorProduct) '{BCAF26CE-222B-5CFC-841D-1DAD00D90B20}' 'KWP2 UUIDv5 fixed vector'
+foreach ($field in 'channel','msiVersion') {
+    $saved=$vectorMetadata[$field];$vectorMetadata[$field]='wrong'
+    Test-KwilReject {Get-KwilBuildId $vectorMetadata $vectorInventory} 'mapping mismatch'
+    $vectorMetadata[$field]=$saved
+}
+
 Test-KwilQueryOutputShape
 Test-KwilReceiptFailureCleanup
 Test-KwilReject {Test-KwilEqual ([object[]]@(0,1)) 0 'polluted backend result'} 'scalar.*pipeline array'
 
 # Full CLI tokens only: no binder aliases, positional, repeated or extra input.
-$valid=@('-PayloadDirectory','E:\input','-OutputPath','E:\out\kwil.msi','-Version','1.2.3','-Architecture','x64','-Commit',('b'*40),'-IconPath','E:\input\kwil.ico')
-Test-KwilEqual (Get-KwilArguments $valid).Version '1.2.3' 'CLI success'
+$valid=@('-PayloadDirectory','E:\input','-OutputPath','E:\out\kwil.msi','-ReleaseVersion','0.1.0-beta.2','-Architecture','x64','-Commit',('b'*40),'-IconPath','E:\input\kwil.ico')
+Test-KwilEqual (Get-KwilArguments $valid).ReleaseVersion '0.1.0-beta.2' 'CLI success'
 foreach($case in @(@(4,'-V'),@(4,'-version'),@(4,'-PayloadDirectory'),@(5,'01.2.3'),@(5,'256.0.0'),@(5,'1.2.65536'),@(5,'1.2.3-beta'),@(7,'X64'),@(9,('B'*40)),@(5,"1.2.3`n"),@(7,"x64`n"),@(9,(('b'*40)+"`n")))) {
     $tokens=[object[]]$valid.Clone();$tokens[$case[0]]=$case[1]
     Test-KwilReject {Get-KwilArguments $tokens} 'argument|Version|Architecture|Commit'
@@ -280,7 +307,7 @@ $a=Get-KwilArguments $valid
 Assert-KwilMetadata $typed $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})
 $script:KwilTestCount++
 $inv=Get-KwilInventoryBytes $model.Rows;$build=Get-KwilBuildId $typed $inv
-Test-KwilEqual $build (Get-KwilHash (New-KwilReferenceBuild $typed $inv)) 'independent full KWB1 field order/counts'
+Test-KwilEqual $build (Get-KwilHash (New-KwilReferenceBuild $typed $inv)) 'independent full KWB2 field order/counts'
 Assert-Kwil ((Get-KwilBuildId (New-KwilTestMetadata $other) (Get-KwilInventoryBytes $other.Rows)) -cne $build) 'fixture changed installed bytes must change BuildID'
 $pretty=[Text.Encoding]::UTF8.GetBytes(($metadata|ConvertTo-Json -Depth 8))
 Test-KwilEqual (Get-KwilBuildId (Read-KwilJson $pretty) $inv) $build 'JSON whitespace is not identity'
@@ -298,6 +325,18 @@ $wrong=New-KwilTestMetadata $model;$wrong.guard.imports=@([ordered]@{load='D';dl
 Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'normal/delay import mismatch'
 $wrong=New-KwilTestMetadata $model;$wrong.guard.imports=@($wrong.guard.imports[0],$wrong.guard.imports[0]);$wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
 Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'guard import count mismatch'
+foreach ($identityField in 'releaseVersion','channel','msiVersion') {
+    $wrong=New-KwilTestMetadata $model;$wrong[$identityField]='wrong';$wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
+    Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'metadata .* mismatch'
+}
+foreach ($badSchema in @(1, '2', 2.0)) {
+    $wrong=New-KwilTestMetadata $model;$wrong.schema=$badSchema
+    if ($badSchema -is [double]) { Test-KwilReject {Read-KwilJson ([Text.Encoding]::UTF8.GetBytes('{"schema":2.0}'))} 'integer'; continue }
+    $wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
+    Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'invalid schema'
+}
+$wrong=New-KwilTestMetadata $model;$wrong.guard.abi=1;$wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
+Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'guard ABI/hash mismatch'
 $wrong=New-KwilTestMetadata $model;$wrong.schema='1';$wrong=Read-KwilJson (ConvertTo-KwilTestJson $wrong)
 Test-KwilReject {Assert-KwilMetadata $wrong $a $model ('a'*64) @([ordered]@{load='N';dll='kernel32.dll'})} 'invalid schema'
 
@@ -427,13 +466,13 @@ if($PSBoundParameters.ContainsKey('PackagingRoot')) {
         $md=New-KwilTestMetadata $mo $architecture (Get-KwilHash $gb) $im
         Write-KwilNewBytes ([IO.Path]::Combine($metaDir,'input.json')) (ConvertTo-KwilTestJson $md)
         $out=[IO.Path]::Combine($root,$architecture+'.msi')
-        $tokens=@('-PayloadDirectory',$payload,'-OutputPath',$out,'-Version','1.2.3','-Architecture',$architecture,'-Commit',('b'*40),'-IconPath',([IO.Path]::Combine($payload,'kwil.ico')))
+        $tokens=@('-PayloadDirectory',$payload,'-OutputPath',$out,'-ReleaseVersion','0.1.0-beta.2','-Architecture',$architecture,'-Commit',('b'*40),'-IconPath',([IO.Path]::Combine($payload,'kwil.ico')))
         Test-KwilEqual (Invoke-KwilMsiBackend $tokens) 0 'fixture MSI/CAB readback success'
         $manifest=Get-Content -Raw -LiteralPath ($out+'.manifest.json')|ConvertFrom-Json -AsHashtable
         Test-KwilEqual $manifest.nativeLifecycle 'not-run' 'no lifecycle claim'
         Test-KwilEqual $manifest.inspection.cabinet 'passed' 'embedded CAB readback'
         Test-KwilEqual $manifest.signed $false 'unsigned fixture'
-        Assert-KwilMembers $manifest @('schema','familyGuid','componentSchema','architecture','target','version','commit','buildId','inventorySha256','productCode','packageCode','guard','inventory','msi','inspection','signed','nativeLifecycle')
+        Assert-KwilMembers $manifest @('schema','familyGuid','componentSchema','architecture','target','releaseVersion','channel','msiVersion','commit','buildId','inventorySha256','productCode','packageCode','guard','inventory','msi','inspection','signed','nativeLifecycle')
         Test-KwilEqual (Invoke-KwilMsiBackend $tokens) 1 'preexisting output refuses without overwrite'
         $unchanged=Open-KwilInput $out 16777216;try{Test-KwilEqual $unchanged.Sha256 $manifest.msi.sha256 'refused output remains byte-identical'}finally{$unchanged.Stream.Dispose()}
         $blocked=[object[]]$tokens.Clone();$blocked[3]=[IO.Path]::Combine($root,$architecture+'-blocked.msi')

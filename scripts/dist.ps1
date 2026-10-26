@@ -8,7 +8,7 @@ Requires installed Git, PowerShell 7, rustup, the pinned Rust toolchain/native M
 target, cached locked dependencies, Windows SDK/linker prerequisites and makecab.
 Nothing is downloaded or installed. The MSI backend must be committed at
 scripts/windows-msi.ps1, with this interface:
-  -PayloadDirectory -OutputPath -Version -Architecture -Commit -IconPath
+  -PayloadDirectory -OutputPath -ReleaseVersion -Architecture -Commit -IconPath
 Architecture is x64 or arm64. OutputPath is an absolute new .msi file path.
 The backend must create a per-user MSI with an Explorer verb; no installation,
 registry mutation, default association, PATH/profile changes or application launch
@@ -214,11 +214,11 @@ function Invoke-DistProcess {
 }
 
 function Get-DistNames {
-    param([string]$Version, [string]$Commit, [string]$Target)
-    Assert-DistInstallerVersion $Version
+    param([string]$ReleaseVersion, [string]$Commit, [string]$Target)
+    Assert-DistInstallerVersion $ReleaseVersion
     if ($Commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Expected an exact lowercase 40-hex source commit.' }
     if ($Target -notin 'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc') { throw 'Unsupported native MSVC target.' }
-    $stem = "kwil-$Version-$($Commit.Substring(0, 12))-$Target"
+    $stem = "kwil-$ReleaseVersion-$($Commit.Substring(0, 12))-$Target"
     return [pscustomobject]@{ Namespace = $stem; Msi = "$stem.msi"; Zip = "$stem-portable.zip" }
 }
 
@@ -464,11 +464,18 @@ function Get-DistFileSha256 {
     } finally { $hash.Dispose(); $stream.Dispose() }
 }
 
+function Get-DistReleaseIdentity {
+    param([string]$ReleaseVersion)
+    if ($ReleaseVersion -ceq '0.1.0') { return [ordered]@{releaseVersion=$ReleaseVersion;channel='stable';msiVersion='0.1.0';productName='Kwil 0.1.0'} }
+    if ($ReleaseVersion -cnotmatch '\A0[.]1[.]0-beta[.]([1-9][0-9]{0,4})\z') { throw 'Invalid Cargo version for MSI: unsupported ReleaseVersion.' }
+    $ordinal = [uint32]$Matches[1]
+    if ($ordinal -gt 65535) { throw 'Cargo version beta ordinal exceeds MSI numeric range.' }
+    return [ordered]@{releaseVersion=$ReleaseVersion;channel='beta';msiVersion=('0.0.'+$ordinal.ToString([Globalization.CultureInfo]::InvariantCulture));productName=('Kwil Beta '+$ReleaseVersion)}
+}
+
 function Assert-DistInstallerVersion {
-    param([string]$Version)
-    if ($Version -cnotmatch '^(0|[1-9][0-9]{0,2})[.](0|[1-9][0-9]{0,2})[.](0|[1-9][0-9]{0,4})$') { throw 'Invalid Cargo version for MSI: canonical major.minor.build required.' }
-    $parts = $Version.Split('.')
-    if ([int]$parts[0] -gt 255 -or [int]$parts[1] -gt 255 -or [int]$parts[2] -gt 65535) { throw 'Cargo version exceeds MSI numeric ranges.' }
+    param([string]$ReleaseVersion)
+    $null = Get-DistReleaseIdentity $ReleaseVersion
 }
 
 function Assert-DistInstallerSources {
@@ -483,8 +490,8 @@ function Assert-DistInstallerSources {
     # and directory rows are exact. Backend/guard enforce session/database rules;
     # this wrapper pins their jointly reviewed normative pair before compilation.
     $frozen = @{
-        'scripts/windows-installer-contract.json' = '5b2b2d1e21ee545552f2270ce3c5bd923fec65dcd6e86dd0ef1ac1ed88f54d44'
-        'docs/decisions/0004-windows-installer.md' = 'fb92572c9090294869fdc52b8d573de4e5bd8b116b28b6a9291ca213947e483c'
+        'scripts/windows-installer-contract.json' = 'a08a1392c0b81dadb950df7ac16ebeaf98676bdaa68fc20e7c3ca884b04b5cc5'
+        'docs/decisions/0004-windows-installer.md' = '3b196d7fb9810ea498b332a46507ac0ecad5cfc405143520a08c8de9ff2966b8'
     }
     foreach ($relative in $frozen.Keys) {
         if ((Get-FileHash -LiteralPath (Join-Path $Snapshot $relative) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $frozen[$relative]) {
@@ -697,12 +704,17 @@ function Get-DistInventoryBytes {
 
 function Get-DistInstallerIdentity {
     param($InputMetadata)
+    $release = Get-DistReleaseIdentity $InputMetadata.releaseVersion
+    if (($InputMetadata.schema -isnot [int] -and $InputMetadata.schema -isnot [long]) -or $InputMetadata.schema -ne 2 -or
+        ($InputMetadata.componentSchema -isnot [int] -and $InputMetadata.componentSchema -isnot [long]) -or $InputMetadata.componentSchema -ne 1 -or
+        ($InputMetadata.guard.abi -isnot [int] -and $InputMetadata.guard.abi -isnot [long]) -or $InputMetadata.guard.abi -ne 2 -or
+        $InputMetadata.channel -cne $release.channel -or $InputMetadata.msiVersion -cne $release.msiVersion) { throw 'Installer schema/ABI/release mapping mismatch.' }
     $inventory = Get-DistInventoryBytes $InputMetadata.inventory
     $stream = [IO.MemoryStream]::new(); $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([Text.Encoding]::ASCII.GetBytes('KWB1'))
-        foreach ($value in '1', '1', $InputMetadata.familyGuid, $InputMetadata.architecture, $InputMetadata.version,
-            $InputMetadata.commit, $InputMetadata.target, '1', $InputMetadata.guard.sha256) { Write-DistLp $writer $value }
+        $writer.Write([Text.Encoding]::ASCII.GetBytes('KWB2'))
+        foreach ($value in '2', '1', $InputMetadata.familyGuid, $InputMetadata.architecture, $InputMetadata.releaseVersion, $InputMetadata.channel, $InputMetadata.msiVersion,
+            $InputMetadata.commit, $InputMetadata.target, '2', $InputMetadata.guard.sha256) { Write-DistLp $writer $value }
         $writer.Write([uint32]$InputMetadata.guard.imports.Count)
         foreach ($import in $InputMetadata.guard.imports) { Write-DistLp $writer $import.load; Write-DistLp $writer $import.dll }
         if ($stream.Length + 4L + $inventory.Length -gt 1048576) { throw 'Build encoding limit exceeded.' }
@@ -711,25 +723,25 @@ function Get-DistInstallerIdentity {
     } finally { $writer.Dispose(); $stream.Dispose() }
     $stream = [IO.MemoryStream]::new(); $writer = [IO.BinaryWriter]::new($stream)
     try {
-        $writer.Write([Text.Encoding]::ASCII.GetBytes('KWP1'))
-        foreach ($value in $InputMetadata.architecture, $InputMetadata.version, $buildId) { Write-DistLp $writer $value }
+        $writer.Write([Text.Encoding]::ASCII.GetBytes('KWP2'))
+        foreach ($value in $InputMetadata.architecture, $InputMetadata.releaseVersion, $InputMetadata.channel, $InputMetadata.msiVersion, $buildId) { Write-DistLp $writer $value }
         $product = Get-DistUuidV5 '{918F53A7-7A40-5E54-96EB-E2FD9B0C605B}' $stream.ToArray()
         return [pscustomobject]@{ BuildId = $buildId; InventorySha256 = Get-DistBytesHash $inventory; ProductCode = $product }
     } finally { $writer.Dispose(); $stream.Dispose() }
 }
 
 function Initialize-DistInstallerInput {
-    param([string]$Payload, [string]$GuardPath, [string]$Architecture, [string]$Version, [string]$Commit, [string]$Target)
-    Assert-DistInstallerVersion $Version
+    param([string]$Payload, [string]$GuardPath, [string]$Architecture, [string]$ReleaseVersion, [string]$Commit, [string]$Target)
+    $release = Get-DistReleaseIdentity $ReleaseVersion
     $mapping = @{ x64 = 'x86_64-pc-windows-msvc'; arm64 = 'aarch64-pc-windows-msvc' }
     if ($Architecture -cnotin @('x64', 'arm64') -or $Target -cne $mapping[$Architecture] -or $Commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Invalid installer identity arguments.' }
     $inventory = @(Get-DistInstallerInventory $Payload $Architecture)
     $guard = Get-DistPeInfo $GuardPath 16777216
     $machine = if ($Architecture -ceq 'x64') { 0x8664 } else { 0xaa64 }
     if ($guard.Machine -ne $machine -or -not $guard.IsDll) { throw 'Guard architecture/DLL mismatch.' }
-    $metadata = [ordered]@{ schema = 1; componentSchema = 1; familyGuid = '{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';
-        version = $Version; commit = $Commit; architecture = $Architecture; target = $Target;
-        guard = [ordered]@{ abi = 1; sha256 = $guard.Sha256; imports = @($guard.GuardImports) }; inventory = $inventory }
+    $metadata = [ordered]@{ schema = 2; componentSchema = 1; familyGuid = '{3D9C2C6F-7C59-4D54-92B4-0BA1EC60347A}';
+        releaseVersion = $ReleaseVersion; channel = $release.channel; msiVersion = $release.msiVersion; commit = $Commit; architecture = $Architecture; target = $Target;
+        guard = [ordered]@{ abi = 2; sha256 = $guard.Sha256; imports = @($guard.GuardImports) }; inventory = $inventory }
     $directory = Join-Path $Payload '.installer'
     if (Test-Path -LiteralPath $directory) { throw 'Refusing existing installer input directory.' }
     $null = New-Item -ItemType Directory -Path $directory
@@ -794,6 +806,10 @@ function Copy-DistPayload {
 
 function Assert-DistJsonElement {
     param([System.Text.Json.JsonElement]$Element, [string]$MemberName = '')
+    if (($MemberName -cin @('schema', 'abi', 'componentSchema')) -and
+        ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Number)) {
+        throw 'Installer identity member must be a JSON integer.'
+    }
     switch ($Element.ValueKind.ToString()) {
         'Object' {
             $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -813,7 +829,10 @@ function Assert-DistJsonElement {
             if ($value.Length -gt 32767) { throw 'Installer JSON string limit exceeded.' }
             $null = Get-DistUtf8Bytes $value
         }
-        'Number' { if ($Element.GetRawText() -cne '1') { throw 'Unexpected JSON number; schema integers must be exactly 1.' } }
+        'Number' {
+            $expected = switch -CaseSensitive ($MemberName) { 'schema' { '2' } 'abi' { '2' } 'componentSchema' { '1' } default { throw 'Unexpected numeric JSON member.' } }
+            if ($Element.GetRawText() -cne $expected) { throw 'Unexpected JSON number; exact schema-2 integer required.' }
+        }
         'False' { }
         default { throw 'Unexpected JSON primitive.' }
     }
@@ -861,7 +880,7 @@ function Assert-DistJsonEqual {
     } elseif ($Expected -is [bool]) {
         if ($Actual -isnot [bool] -or $Actual -ne $Expected) { throw 'Installer JSON boolean mismatch.' }
     } elseif ($Expected -is [int] -or $Expected -is [long]) {
-        # JSON parsing produces Int64 even for schema/ABI 1; literals authored
+        # JSON parsing produces Int64 for schema/ABI integers; literals authored
         # above are Int32. Accept those two integer representations symmetrically
         # while retaining exact value comparison and rejecting every other type.
         if (($Actual -isnot [int] -and $Actual -isnot [long]) -or $Actual -ne $Expected) { throw 'Installer JSON integer mismatch.' }
@@ -875,8 +894,8 @@ function Assert-DistInstallerSidecar {
     $sidecar = Read-DistInstallerJson ($MsiPath + '.manifest.json')
     $identity = Get-DistInstallerIdentity $InputMetadata
     if ($sidecar.packageCode -isnot [string] -or $sidecar.packageCode -cnotmatch '^\{[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}\}$') { throw 'Sidecar PackageCode must be a canonical UUIDv4.' }
-    $expected = [ordered]@{ schema = 1; familyGuid = $InputMetadata.familyGuid; componentSchema = 1;
-        architecture = $InputMetadata.architecture; target = $InputMetadata.target; version = $InputMetadata.version;
+    $expected = [ordered]@{ schema = 2; familyGuid = $InputMetadata.familyGuid; componentSchema = 1;
+        architecture = $InputMetadata.architecture; target = $InputMetadata.target; releaseVersion = $InputMetadata.releaseVersion; channel = $InputMetadata.channel; msiVersion = $InputMetadata.msiVersion;
         commit = $InputMetadata.commit; buildId = $identity.BuildId; inventorySha256 = $identity.InventorySha256;
         productCode = $identity.ProductCode; packageCode = $sidecar.packageCode; guard = $InputMetadata.guard;
         inventory = $InputMetadata.inventory;
@@ -1150,7 +1169,7 @@ function Invoke-KwilDist {
             $portableRecords = @(Get-DistPortableRecords $portablePayload)
             $msiPath = Join-Path $staging $names.Msi
             $null = Invoke-DistProcess $tools['pwsh.exe'] @('-NoLogo', '-NoProfile', '-File', $backend,
-                '-PayloadDirectory', $msiPayload, '-OutputPath', $msiPath, '-Version', $cargoVersion,
+                '-PayloadDirectory', $msiPayload, '-OutputPath', $msiPath, '-ReleaseVersion', $cargoVersion,
                 '-Architecture', $architecture, '-Commit', $commit, '-IconPath', (Join-Path $msiPayload 'kwil.ico')) $snapshot ([Math]::Min($PackageTimeout, 120)) $logs 'msi-package'
             Assert-DistInstallerInputUnchanged $msiPayload $msiRecords
             $installerIdentity = Assert-DistInstallerSidecar $msiPath $installerInput
@@ -1172,7 +1191,8 @@ SHA256SUMS covers the MSI, MSI sidecar, ZIP, this file and manifest.json; it is 
 "@
             [IO.File]::WriteAllText((Join-Path $staging 'INSTALL.txt'), $instructions + "`n")
             $manifest = [ordered]@{
-                SchemaVersion = 1; SourceCommit = $commit; CargoVersion = $cargoVersion
+                SchemaVersion = 2; SourceCommit = $commit; CargoVersion = $cargoVersion
+                ReleaseVersion = $cargoVersion; Channel = $installerInput.channel; MsiVersion = $installerInput.msiVersion
                 Target = $target; Architecture = $architecture; Toolchain = $toolchain; RustcVersion = $rustcVersion
                 SourceMode = 'git-archive-committed-HEAD'; WorkingTreeCodeIncluded = $false
                 DriverSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()

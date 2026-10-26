@@ -177,7 +177,7 @@ pub fn agrees(registration: &Registration, package: &crate::model::Package, inst
     require(
         registration.product == package.product_code
             && registration.package == package.package_code
-            && registration.version == package.version,
+            && registration.version == package.msi_version,
         "package-mismatch",
         "registration/cached original identity",
     )?;
