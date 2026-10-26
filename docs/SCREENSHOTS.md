@@ -1,6 +1,6 @@
 # Screenshots
 
-These are historical captures of Kwil's production GUI on Windows, taken on
+The GUI images below are historical captures of Kwil's production GUI on Windows, taken on
 24 October 2026 with a debug build and the `kwil-ui-gpu/frame-harness` feature.
 They show sample content in the real application, rather than a mockup or spike
 renderer. The two retained PNGs were copied unchanged into this repository.
@@ -71,3 +71,46 @@ recaptured, cropped, redacted, rescaled or re-encoded for this documentation.
 The receipts describe that historical run only. This documentation change ran no
 build, test or native application. Fresh captures and acceptance for later source
 belong to a separately authorized validation run.
+
+## Terminal beta captures
+
+![Beta terminal editor with Rust highlighting](images/tui-editor-beta1-20261026.png)
+
+![Beta terminal search with four matches](images/tui-search-beta1-20261026.png)
+
+These are actual `0.1.0-beta.1` TUI sessions, captured on Windows on 26 October
+2026 through an invisible ConPTY and rendered from the recorded VT output.
+The executable is the downloaded release asset, not a test backend or a mockup.
+The editor frame shows the supplied `notes.rs`; the search frame follows one
+Ctrl+F and the query `feature`, with four matches reported by the real application.
+
+- Tag: `v0.1.0-beta.1`, commit `904e5d586f18291ea5a0a0f2451d689b119e2f27`.
+- Original asset: `kwil-x86_64-pc-windows-msvc.com`, renamed `kwil.com` next to
+  its matching `kwil.exe` in a private portable directory.
+- Executable SHA-256: `ED02E6BE017860FD71B9B5898F1E702147C47F4190100D039A5118A343E63143`.
+- Terminal: 120 columns × 32 rows, rendered at 1440 × 832 pixels.
+- Font: the installed Windows Consolas, 20 pixels, on a 12 × 26 pixel cell grid;
+  no font file is redistributed. The underline cursor shape is a renderer choice;
+  its position and visibility come from the stream.
+- Replay preserves recorded cursor movement, cell colours, erasure and search
+  highlights. Default terminal colours are supplied by the renderer: foreground
+  RGB `214,228,240`, background RGB `11,16,27`. Application RGB colours come from
+  the stream. No UI cells were added, removed or retouched.
+- The process had its own workspace, profile and fixture. No desktop window,
+  focus change or global keyboard injection was used.
+
+| Image | PNG SHA-256 | Source VT SHA-256 |
+| --- | --- | --- |
+| `tui-editor-beta1-20261026.png` | `5FD3F7AC9B181BF9B0130E456DA8EF3CE0EDA1CB908E8F3558719A5C212A7F24` | `4A2C4422F5F28D5AED0AEFD6C8EBF9B7CC29D46EDEAB55DF3B93EA6F7CE614A8` |
+| `tui-search-beta1-20261026.png` | `C7A0B6575FC3A8AD15B5EE9F4350F57487370B7D436414C280B14B572A3A500F` | `A8F2F2B7A94D9DE1B46964CBA6B308BBE0F85237D4958AEA390969923165F962` |
+
+The maintainer retains the complete stream, capture/replay scripts, text-cell
+exports and process receipts as `kwil-beta1-tui-capture-r3`. Both final PNGs were
+visually inspected. This is a rendering of recorded terminal cells, not a
+photograph or desktop-terminal screenshot; it does not establish another
+terminal emulator's font metrics, accessibility, performance or platform parity.
+
+**The session did not pass normal-exit qualification.** After these captures,
+quit retained `WrapThreadExitPending`; the controller terminated and reaped its
+exact owned process (PID 28656). That failure is preserved separately from the
+images and is not presented as a successful packaged smoke test.

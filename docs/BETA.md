@@ -1,31 +1,36 @@
 # Beta candidate
 
-The next public milestone being prepared is **0.1.0-beta.1**, an early beta,
-not an RC. V1 remains the full scope in [SPEC.md](SPEC.md); this checkpoint does
-not reduce it. No beta tag or published release exists yet.
+**0.1.0-beta.1** is prepared as an unpublished prerelease draft, not an RC.
+V1 remains the full scope in [SPEC.md](SPEC.md).
 
-## Current preparation
+## Current candidate
 
-- Guarded document delivery, cooperative layout, retained worker shutdown and
-  UTF-32 support are committed. The obsolete save-test adapter is being migrated
-  to the guarded lifecycle; incomplete metadata work is excluded.
-- `2e565ef` commits the reviewed terminal fixture cleanup and readiness repairs.
-  Focused cleanup, binary, search, wrap and hex checks pass, as do strict Clippy
-  and formatting on the immutable candidate. These do not replace hosted CI.
-- [CI 40241478518](https://github.com/rennerdo30/kwil/actions/runs/40241478518)
-  for the earlier `cb53e01` commit failed. Green CI on the final beta commit is
-  required before tagging; the release workflow enforces this prerequisite.
-- The planned draft contains eight raw executables for six targets and
-  `SHA256SUMS`. It is explicitly marked prerelease and excluded from latest.
-  It contains no qualified MSI or portable ZIP; the combined MSI/ZIP driver
-  accepts numeric installer versions and is not used for this prerelease.
-- Beta installation and replacement are manual. The stable updater and
-  download installers do not select beta releases; a beta copy does not
-  automatically advance to stable.
+- Tag `v0.1.0-beta.1` points to
+  `904e5d586f18291ea5a0a0f2451d689b119e2f27`.
+- [Hosted CI 40297828466](https://github.com/rennerdo30/kwil/actions/runs/40297828466)
+  passed on Windows, macOS and Linux, including full workspace tests, strict
+  checks, formatting and the configured smoke checks.
+- [Release workflow 40299088884](https://github.com/rennerdo30/kwil/actions/runs/40299088884)
+  built all six targets and created the draft with eight raw executables and
+  `SHA256SUMS`. It is marked prerelease and excluded from latest.
+- All eight checksum entries match the uploaded asset digests. The downloaded
+  Windows x64 executable pair was independently hashed against that file.
+- Guarded save/quit fixtures and model cleanup migrations are committed and
+  included in the green candidate CI. Incomplete metadata work is excluded.
+- Packaged native checks are not clear. The Windows x64 GUI driver exercised
+  edit/save/undo/redo against exact disk bytes, but normal quit exited with code
+  1. Earlier driver failures are preserved; correcting its key-message ordering
+  exposed this separate exit failure. Reopen qualification was not reached.
+- An actual ConPTY TUI session displayed the editor and live search, but quit
+  retained `WrapThreadExitPending` and required owned-process cleanup. These are
+  failed native exit gates, despite green hosted CI. The draft must remain
+  unpublished pending diagnosis and disposition.
+- The draft contains no qualified MSI, ZIP installer, signatures or notarization.
+  Beta installation/replacement is manual. Stable installers/updater do not
+  select betas; beta copies do not automatically advance to stable.
 
-The exact beta commit, artifact hashes and packaged smoke-test results must be
-recorded before publication. Draft text is in
-[BETA_RELEASE_NOTES.md](BETA_RELEASE_NOTES.md).
+The release remains unpublished. Only the owner publishes, after reviewing the
+concrete draft and final packaged checks. See [release notes](BETA_RELEASE_NOTES.md).
 
 ## Historical evaluation snapshot
 
@@ -57,7 +62,7 @@ The source contains backend work and other candidates for several of these areas
 1. Freeze the exact candidate commit and publish its tested-feature and known-limitations checklist.
 2. Verify actual GUI open/edit/save/undo/reopen and terminal operation against the packaged binaries; retain failure evidence.
 3. Keep installer qualification separate from portable packaging. Do not call static MSI inspection an installation pass.
-4. Set and validate the prerelease version across package metadata, artifacts and update policy. No beta tag has been created yet.
+4. Set and validate the prerelease version across package metadata, artifacts and update policy. The beta tag is frozen; do not retag a published candidate.
 5. Obtain the owner's publication approval. Agents may prepare the candidate; only the owner publishes.
 
 An RC is appropriate only after the complete v1 feature and acceptance checklist is closed, leaving release-level regression testing rather than major implementation gaps.
