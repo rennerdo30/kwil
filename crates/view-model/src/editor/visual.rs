@@ -527,7 +527,7 @@ mod tests {
         }
     }
     fn settle(ticket: crate::wrap_session::SettlementTicket) {
-        ticket.settle(Duration::from_secs(2)).unwrap();
+        crate::wrap_session::settle_final(ticket, Duration::from_secs(2)).unwrap();
     }
 
     #[test]

@@ -114,6 +114,58 @@ fn accepted<B, T>(flow: ControlFlow<B, T>) -> T {
     }
 }
 
+// Return only an on-time successful retry, with its callback still held for
+// the original BeforeWait/retirement ordering control below.
+fn successful_retry(
+    transport: &mut WorkspaceDocumentTransport,
+    token: DocumentWrapRetryToken,
+    release_wake: &ReleaseWake,
+    callbacks: (&Receiver<std::thread::ThreadId>, &Receiver<std::thread::ThreadId>),
+    producer: std::thread::ThreadId,
+    deadline: Instant,
+) -> (DocumentWrapRetryToken, std::thread::ThreadId) {
+    crate::cleanup_test_support::cleanup_until(
+        Some(token),
+        deadline,
+        |token, deadline| {
+            let token = match token {
+                Some(token) => token,
+                None => match transport.request_wrap_retry(remaining(deadline)) {
+                    Ok(token) => token,
+                    Err(reason) => return ControlFlow::Break((None, reason)),
+                },
+            };
+            let entered = callbacks.0.recv_timeout(remaining(deadline)).unwrap();
+            assert_eq!(entered, producer, "the exact original document producer published the retry");
+            let status = transport.status();
+            match status.failure {
+                Some(DocumentResultSettlementReason::WrapThreadExitPending) => {
+                    assert!(status.occupied, "Pending retains the original producer slot");
+                    assert!(!status.retry_acknowledgement_required, "Pending has no ACK authority");
+                    let returned = advance_wake(&release_wake.pulse, callbacks.1, deadline);
+                    assert_eq!(returned, producer);
+                    // This scalar attempt alone retires. No failed attempt ACK
+                    // can release or reconstruct the original source ticket.
+                    drop(token);
+                    ControlFlow::Break((None, DocumentResultSettlementReason::WrapThreadExitPending))
+                }
+                None => {
+                    assert!(status.retry_acknowledgement_required);
+                    assert!(transport.result_info().is_some_and(|info| info.kind == ResultKind::Wrap));
+                    ControlFlow::Continue((token, entered))
+                }
+                Some(reason) => {
+                    let returned = advance_wake(&release_wake.pulse, callbacks.1, deadline);
+                    assert_eq!(returned, producer);
+                    ControlFlow::Break((Some(token), reason))
+                }
+            }
+        },
+        |reason| matches!(reason, DocumentResultSettlementReason::WrapThreadExitPending),
+    )
+    .unwrap()
+}
+
 fn run_control(receive_live: bool) {
     let root = std::env::temp_dir().join(format!(
         "kwil-document-retry-ack-{}-{}",
@@ -207,9 +259,10 @@ fn run_control(receive_live: bool) {
     }
     let token = transport.request_wrap_retry(remaining(deadline)).unwrap();
     release_source.0.try_send(()).unwrap();
-    let entered = entering.recv_timeout(remaining(deadline)).unwrap();
-    // This callback intentionally stays blocked until the test controller
-    // observes BeforeWait OR the mutant's premature returned status.
+    let (token, entered) =
+        successful_retry(&mut transport, token, &release_wake, (&entering, &returning), producer, deadline);
+    // This successful callback intentionally stays blocked until the test
+    // controller observes BeforeWait OR the mutant's premature returned status.
     let live_outcome = if receive_live { transport.receive(&mut workspace, true) } else { Ok(None) };
     let mut bundle = accepted(workspace.into_document_shutdown(transport));
     bundle.bind_search_sources(DocumentSearchBinding::NoSearchWorker).unwrap();
@@ -239,23 +292,25 @@ fn run_control(receive_live: bool) {
             // require Stopped(Ok)+actual exit and retain only ThreadExitPending.
             let mut workspace = bundle.workspace.take().unwrap();
             let worker = workspace.files.worker.take().unwrap();
-            let mut ticket = WorkspaceDocumentSettlementTicket {
+            let ticket = WorkspaceDocumentSettlementTicket {
                 ticket: bundle.ticket.take().unwrap().into_legacy_for_test(worker),
                 charge: AdapterCharge(bundle.charge.0.take()),
                 live_charge: workspace.files.live_document_metadata.take(),
             };
-            loop {
-                let left = remaining(deadline);
-                assert!(!left.is_zero());
-                match ticket.settle(left, |result| workspace.document_result(result).map_continue(|_| ())) {
-                    Ok(()) => break,
-                    Err(failure) => {
-                        assert_eq!(failure.reason, DocumentResultSettlementReason::ThreadExitPending);
-                        ticket = failure.ticket;
-                        std::thread::park_timeout(Duration::from_millis(1).min(left));
-                    }
-                }
-            }
+            crate::cleanup_test_support::cleanup_until(
+                ticket,
+                deadline,
+                |ticket, deadline| {
+                    let left = remaining(deadline);
+                    assert!(!left.is_zero());
+                    ticket.settle(left, |result| workspace.document_result(result).map_continue(|_| ())).map_or_else(
+                        |failure| ControlFlow::Break((failure.ticket, failure.reason)),
+                        ControlFlow::Continue,
+                    )
+                },
+                |reason| matches!(reason, DocumentResultSettlementReason::ThreadExitPending),
+            )
+            .unwrap();
             bundle.phase = ShutdownPhase::Complete;
             (outcome, occupied_on_return)
         });

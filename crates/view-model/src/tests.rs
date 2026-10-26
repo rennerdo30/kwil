@@ -932,6 +932,17 @@ fn receipts_backpressure_retains_save_completion_and_stale_save_settles() {
     assert!(!e.document().is_dirty());
     e.undo().unwrap();
     e.redo().unwrap();
+    assert!(e.has_completed_save_completion());
+    assert_eq!(
+        e.save_request(None).err().expect("completed residual must refuse another save").kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let mut retired_completion = None;
+    e.take_completed_save_completion(&mut retired_completion).unwrap();
+    assert!(retired_completion.is_some());
+    // This standalone Editor fixture already runs on the non-UI test worker.
+    drop(retired_completion);
+    assert!(!e.has_completed_save_completion());
     // Concurrent ordinary/stale-trim completions never publish phantom edits.
     let request = e.save_request(None).unwrap();
     type_text(&mut e, "  ", 1000);

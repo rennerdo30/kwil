@@ -31,72 +31,74 @@ fn native_backoff(deadline: Instant) {
 // native Pending. A completed attempt is not a receipt, nor native-exit proof.
 fn complete_wrap_retry(
     receiver: &mut DocumentResultReceiver,
-    mut token: DocumentWrapRetryToken,
+    token: DocumentWrapRetryToken,
     deadline: Instant,
 ) -> DocumentWrapRetryToken {
     let shared = receiver.shared.clone();
     let original = lock(&shared.worker).as_ref().unwrap().thread().id();
-    loop {
-        let state = lock(&shared.state);
-        let (state, _) = shared
-            .changed
-            .wait_timeout_while(state, deadline.saturating_duration_since(Instant::now()), |state| {
-                state.retry.is_some() || state.retry_running
-            })
-            .unwrap();
-        assert!(!state.retry_running && state.retry.is_none(), "original retry deadline expired");
-        assert_eq!(state.retry_generation, token.0.control.generation);
-        assert_eq!(state.delivery, token.0.control.delivery.delivery);
-        match state.failure() {
-            None => {
-                assert!(matches!(state.whole(), Some(DocumentResult::WrapSettled(Ok(_)))));
-                assert!(
-                    state.retry_acknowledgement_required.is_some_and(|control| control.same_identity(&token.0.control))
-                );
-                return token;
+    crate::cleanup_test_support::cleanup_until(
+        Some(token), deadline,
+        |token, deadline| {
+            let token = match token {
+                Some(token) => token,
+                None => match receiver.request_wrap_retry(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(token) => token,
+                    Err(reason) => return ControlFlow::Break((None, reason)),
+                },
+            };
+            let state = lock(&shared.state);
+            let (state, _) = shared.changed.wait_timeout_while(
+                state, deadline.saturating_duration_since(Instant::now()),
+                |state| state.retry.is_some() || state.retry_running,
+            ).unwrap();
+            assert!(!state.retry_running && state.retry.is_none(), "original retry deadline expired");
+            assert_eq!(state.retry_generation, token.0.control.generation);
+            assert_eq!(state.delivery, token.0.control.delivery.delivery);
+            match state.failure() {
+                None => {
+                    assert!(matches!(state.whole(), Some(DocumentResult::WrapSettled(Ok(_)))));
+                    assert!(state.retry_acknowledgement_required.is_some_and(|control| control.same_identity(&token.0.control)));
+                    ControlFlow::Continue(token)
+                }
+                Some(DocumentResultSettlementReason::WrapThreadExitPending) => {
+                    assert!(state.in_flight);
+                    assert!(state.retry_acknowledgement_required.is_none(), "Pending has no ACK authority");
+                    assert!(matches!(state.whole(), Some(DocumentResult::WrapSettled(Err(failure))) if matches!(failure.error, WrapError::ThreadExitPending)));
+                    drop(state);
+                    assert!(!lock(&shared.requests).accepting);
+                    assert_eq!(lock(&shared.worker).as_ref().unwrap().thread().id(), original);
+                    // Only this completed scalar attempt retires, without ACK.
+                    // The exact wrap ticket stays in the original producer slot.
+                    drop(token);
+                    ControlFlow::Break((None, DocumentResultSettlementReason::WrapThreadExitPending))
+                }
+                Some(reason) => ControlFlow::Break((Some(token), reason)),
             }
-            Some(DocumentResultSettlementReason::WrapThreadExitPending) => {
-                assert!(state.in_flight);
-                assert!(state.retry_acknowledgement_required.is_none(), "Pending has no ACK authority");
-                assert!(
-                    matches!(state.whole(), Some(DocumentResult::WrapSettled(Err(failure))) if matches!(failure.error, WrapError::ThreadExitPending))
-                );
-            }
-            reason => panic!("non-Pending retry failure must remain explicit: {reason:?}"),
-        }
-        drop(state);
-        assert!(!lock(&shared.requests).accepting);
-        assert_eq!(lock(&shared.worker).as_ref().unwrap().thread().id(), original);
-        // Only the completed scalar attempt token retires; the original wrap
-        // ticket/source/handle stays in the SAME producer slot, without ACK.
-        drop(token);
-        native_backoff(deadline);
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "original retry deadline expired");
-        token = receiver.request_wrap_retry(remaining).unwrap();
-    }
+        },
+        |reason| matches!(reason, DocumentResultSettlementReason::WrapThreadExitPending),
+    ).unwrap()
 }
 
 fn retry_wrap_off_ui(ticket: &mut DocumentResultSettlementTicket, deadline: Instant) {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "original off-UI retry deadline expired");
-        match ticket.retry_pending_wrap(remaining) {
-            Ok(retried) => {
-                assert!(retried);
-                return;
+    crate::cleanup_test_support::cleanup_until(
+        ticket, deadline,
+        |ticket, deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "original off-UI retry deadline expired");
+            match ticket.retry_pending_wrap(remaining) {
+                Ok(retried) => { assert!(retried); ControlFlow::Continue(()) }
+                Err(reason) => {
+                    if matches!(reason, DocumentResultSettlementReason::WrapThreadExitPending) {
+                        let inspection = ticket.inspect();
+                        assert!(matches!(inspection.pending(), Some(DocumentResult::WrapSettled(Err(failure))) if matches!(failure.error, WrapError::ThreadExitPending)));
+                        drop(inspection);
+                    }
+                    ControlFlow::Break((ticket, reason))
+                }
             }
-            Err(DocumentResultSettlementReason::WrapThreadExitPending) => {
-                let inspection = ticket.inspect();
-                assert!(
-                    matches!(inspection.pending(), Some(DocumentResult::WrapSettled(Err(failure))) if matches!(failure.error, WrapError::ThreadExitPending))
-                );
-                drop(inspection);
-                native_backoff(deadline);
-            }
-            reason => panic!("non-Pending off-UI retry must not repeat: {reason:?}"),
-        }
-    }
+        },
+        |reason| matches!(reason, DocumentResultSettlementReason::WrapThreadExitPending),
+    ).unwrap();
 }
 
 fn successful_wrap_retry(shared: &Shared) -> bool {
@@ -162,15 +164,17 @@ fn result_transport_bound_native_tls_keeps_exact_handle_and_queries_once_per_att
     assert_eq!(lock(&shared.worker).as_ref().unwrap().thread().id(), original);
     assert_eq!(Arc::as_ptr(&bound.receiver.shared), identity);
     assert!(lock(&shared.state).stopped_acknowledged);
-    loop {
-        match bound.finish_until(deadline) {
-            Err(DocumentResultSettlementReason::ThreadExitPending) => native_backoff(deadline),
-            result => {
-                result.unwrap();
-                break;
-            }
-        }
-    }
+    crate::cleanup_test_support::cleanup_until(
+        &mut bound,
+        deadline,
+        |bound, deadline| {
+            bound
+                .finish_until(deadline)
+                .map_or_else(|reason| ControlFlow::Break((bound, reason)), ControlFlow::Continue)
+        },
+        |reason| matches!(reason, DocumentResultSettlementReason::ThreadExitPending),
+    )
+    .unwrap();
     assert!(lock(&shared.worker).is_none());
     assert!(lock(&shared.state).native_retired);
 }
@@ -427,22 +431,24 @@ fn wait(shared: &Shared, predicate: impl Fn(&State) -> bool) {
     assert!(!timeout.timed_out() || predicate(&state), "bounded event-driven harness wait expired");
 }
 
-// Test-only final-exit barrier: production returns ThreadExitPending rather
-// than polling. Joining this already-done harness proves exit before ONE retry.
+// Test-only cleanup retains the original ticket under one bounded deadline.
+// Only fresh native Pending repeats; no raw join bypasses the deadline.
 fn finish(
     ticket: DocumentResultSettlementTicket,
     mut accept: impl FnMut(DocumentResult) -> ControlFlow<DocumentResult, ()>,
 ) {
-    match ticket.settle(LIMIT, &mut accept) {
-        Ok(()) => {}
-        Err(failure) => {
-            assert_eq!(failure.reason, DocumentResultSettlementReason::ThreadExitPending);
-            let worker = lock(&failure.ticket.receiver.shared.worker).take().unwrap();
-            worker.join().unwrap();
-            lock(&failure.ticket.receiver.shared.state).worker_joined = true;
-            failure.ticket.settle(LIMIT, accept).unwrap();
-        }
-    }
+    let deadline = Instant::now() + LIMIT;
+    crate::cleanup_test_support::cleanup_until(
+        ticket,
+        deadline,
+        |ticket, deadline| {
+            ticket
+                .settle(deadline.saturating_duration_since(Instant::now()), &mut accept)
+                .map_or_else(|failure| ControlFlow::Break((failure.ticket, failure.reason)), ControlFlow::Continue)
+        },
+        |reason| matches!(reason, DocumentResultSettlementReason::ThreadExitPending),
+    )
+    .unwrap();
 }
 
 #[derive(Debug)]

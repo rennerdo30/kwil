@@ -24,6 +24,8 @@ pub mod visual_rows;
 mod workspace;
 pub use workspace::workspace_document;
 pub use workspace::workspace_wrap;
+#[cfg(test)]
+mod cleanup_test_support;
 pub mod wrap_host;
 pub mod wrap_session;
 #[cfg(test)]

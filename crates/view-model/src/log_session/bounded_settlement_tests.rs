@@ -2,11 +2,24 @@ use super::*;
 use std::time::Duration;
 
 fn settle(session: &mut LogSession, deadline: Instant) -> Result<(), LogSettlementReason> {
-    loop {
-        match session.settle_until(deadline) {
-            Err(LogSettlementReason::ThreadExitPending) if Instant::now() < deadline => thread::yield_now(),
-            result => return result,
-        }
+    match crate::cleanup_test_support::cleanup_until(
+        session,
+        deadline,
+        |owner, deadline| {
+            owner
+                .settle_until(deadline)
+                .map_or_else(|error| std::ops::ControlFlow::Break((owner, error)), std::ops::ControlFlow::Continue)
+        },
+        |error| matches!(error, LogSettlementReason::ThreadExitPending),
+    )
+    .into_flow()
+    {
+        std::ops::ControlFlow::Continue(value) => Ok(value),
+        std::ops::ControlFlow::Break(crate::cleanup_test_support::CleanupFailure::Failed { error, .. }) => Err(error),
+        std::ops::ControlFlow::Break(
+            crate::cleanup_test_support::CleanupFailure::Expired { .. }
+            | crate::cleanup_test_support::CleanupFailure::CompletedLate { .. },
+        ) => Err(LogSettlementReason::TimedOut),
     }
 }
 fn shared() -> Arc<Shared> {
@@ -440,11 +453,7 @@ fn native_tls_pending_preserves_original_owner_then_explicit_retry_joins_and_ret
     let released = release.send(());
     // Only this native-exit fixture uses passive readiness backoff; ONE 2s
     // deadline covers registration, the gate, retries, join and retirement.
-    let mut result = worker.settle_until(deadline);
-    while result == Err(LogSettlementReason::ThreadExitPending) && Instant::now() < deadline {
-        thread::park_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(1)));
-        result = worker.settle_until(deadline);
-    }
+    let result = settle(&mut worker, deadline);
     // Release and original compatibility cleanup BEFORE assertions, even when
     // an observation failed. No gate or original handle is abandoned on panic.
     let cleanup = worker.shutdown_in_place();

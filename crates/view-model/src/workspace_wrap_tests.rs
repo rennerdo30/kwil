@@ -10,20 +10,19 @@ fn accepted<B, T>(flow: ControlFlow<B, T>) -> T {
     }
 }
 pub(crate) fn settle_until(
-    mut ticket: WorkspaceWrapSettlementTicket,
+    ticket: WorkspaceWrapSettlementTicket,
     deadline: Instant,
-) -> Result<WorkspaceWrapSettled, WorkspaceWrapSettlementFailure> {
-    loop {
-        match ticket.settle(deadline.saturating_duration_since(Instant::now())) {
-            Err(failure) if matches!(failure.error, WrapError::ThreadExitPending) && Instant::now() < deadline => {
-                ticket = *failure.ticket;
-                std::thread::park_timeout(
-                    Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            result => return result,
-        }
-    }
+) -> crate::cleanup_test_support::CleanupOutcome<WorkspaceWrapSettlementTicket, WorkspaceWrapSettled, WrapError> {
+    crate::cleanup_test_support::cleanup_until(
+        ticket,
+        deadline,
+        |ticket, deadline| {
+            ticket
+                .settle(deadline.saturating_duration_since(Instant::now()))
+                .map_or_else(|failure| ControlFlow::Break((*failure.ticket, failure.error)), ControlFlow::Continue)
+        },
+        |error| matches!(error, WrapError::ThreadExitPending),
+    )
 }
 fn geometry() -> LayoutGeometry {
     LayoutGeometry { columns: 3, rows: 2, tab_size: 4, ..Default::default() }

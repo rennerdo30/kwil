@@ -1736,24 +1736,25 @@ mod tests {
         let worker = session.take_shutdown().unwrap();
         drop(session);
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut cleanup = worker.shutdown_until(deadline);
-        loop {
-            match cleanup {
-                Err(error)
-                    if error.reason() == kwil_core_search::worker::WorkerSettlementReason::ThreadExitPending
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(
-                        Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                    cleanup = error.retry_until(deadline);
-                }
-                terminal => {
-                    terminal.unwrap();
-                    break;
-                }
-            }
-        }
+        crate::cleanup_test_support::cleanup_until(
+            Ok(worker),
+            deadline,
+            |owner: Result<_, kwil_core_search::worker::ShutdownError>, deadline| {
+                let result = match owner {
+                    Ok(worker) => worker.shutdown_until(deadline),
+                    Err(error) => error.retry_until(deadline),
+                };
+                result.map_or_else(
+                    |error| {
+                        let reason = error.reason();
+                        std::ops::ControlFlow::Break((Err(error), reason))
+                    },
+                    std::ops::ControlFlow::Continue,
+                )
+            },
+            |reason| matches!(reason, kwil_core_search::worker::WorkerSettlementReason::ThreadExitPending),
+        )
+        .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

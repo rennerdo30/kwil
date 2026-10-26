@@ -1124,7 +1124,12 @@ fn wrap_terminal_relative_panic_wakes_once_preserves_fifo_and_settles_exact_owne
         "panic cleanup must not acknowledge an external active permit"
     );
     drop(held_permit);
-    let failure = crate::wrap_session::settle_final(failure.ticket, Duration::from_secs(2)).unwrap_err();
+    let failure = match crate::wrap_session::settle_final(failure.ticket, Duration::from_secs(2)).unwrap_err() {
+        crate::cleanup_test_support::CleanupFailure::Failed { owner, error } => {
+            crate::wrap_session::SettlementFailure { ticket: owner, error }
+        }
+        other => panic!("expected original fatal settlement failure: {other:?}"),
+    };
     assert!(matches!(failure.error, WrapError::WorkerPanicked));
     assert!(retained.upgrade().is_none());
     assert!(matches!(woke.try_recv(), Err(mpsc::TryRecvError::Empty)));

@@ -7,23 +7,32 @@ use std::{
 
 const WAIT: Duration = Duration::from_secs(5);
 
-fn finish_shutdown(worker: SearchWorker) -> Result<(), kwil_core_search::worker::ShutdownError> {
+fn finish_shutdown(
+    worker: SearchWorker,
+) -> crate::cleanup_test_support::CleanupOutcome<
+    Result<SearchWorker, kwil_core_search::worker::ShutdownError>,
+    (),
+    kwil_core_search::worker::WorkerSettlementReason,
+> {
     let deadline = std::time::Instant::now() + WAIT;
-    let mut result = worker.shutdown_until(deadline);
-    loop {
-        match result {
-            Err(error)
-                if error.reason() == kwil_core_search::worker::WorkerSettlementReason::ThreadExitPending
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(
-                    Duration::from_millis(1).min(deadline.saturating_duration_since(std::time::Instant::now())),
-                );
-                result = error.retry_until(deadline);
-            }
-            terminal => return terminal,
-        }
-    }
+    crate::cleanup_test_support::cleanup_until(
+        Ok(worker),
+        deadline,
+        |owner: Result<SearchWorker, kwil_core_search::worker::ShutdownError>, deadline| {
+            let result = match owner {
+                Ok(worker) => worker.shutdown_until(deadline),
+                Err(error) => error.retry_until(deadline),
+            };
+            result.map_or_else(
+                |error| {
+                    let reason = error.reason();
+                    std::ops::ControlFlow::Break((Err(error), reason))
+                },
+                std::ops::ControlFlow::Continue,
+            )
+        },
+        |reason| matches!(reason, kwil_core_search::worker::WorkerSettlementReason::ThreadExitPending),
+    )
 }
 
 fn request(generation: u64) -> SearchRequest {

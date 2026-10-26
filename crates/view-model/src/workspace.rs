@@ -3260,6 +3260,8 @@ mod tests {
             revision: 0,
             result: Ok(Box::new(document)),
         });
+        // This fixture now supplies the unwrapped normal-text paint owner.
+        workspace.set_body_policy(crate::ViewBodyPolicy::LogicalLines);
         assert!(workspace.view(first).unwrap().path.is_none());
         assert!(workspace.session.tab_mut(first).unwrap().path.is_none());
         assert_eq!(workspace.session.tab_mut(first).unwrap().recovery_path.as_ref(), Some(&path));
@@ -3323,7 +3325,11 @@ mod tests {
         let std::ops::ControlFlow::Continue(ticket) = owner.stop(host) else {
             panic!("publication fixture lost its host binding")
         };
-        let receipt = ticket.settle(std::time::Duration::from_secs(2)).unwrap();
+        let receipt = workspace_wrap::settle_until_for_test(
+            ticket,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
         assert!(workspace.acknowledge_wrap_settled(receipt).is_continue());
     }
 

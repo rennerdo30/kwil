@@ -337,22 +337,24 @@ fn finish(ticket: WorkspaceDocumentSettlementTicket, workspace: &mut Workspace) 
     finish_until(ticket, workspace, Instant::now() + LIMIT);
 }
 
-fn finish_until(mut ticket: WorkspaceDocumentSettlementTicket, workspace: &mut Workspace, deadline: Instant) {
+fn finish_until(ticket: WorkspaceDocumentSettlementTicket, workspace: &mut Workspace, deadline: Instant) {
     std::thread::scope(|scope| {
         scope
             .spawn(move || {
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    assert!(!remaining.is_zero(), "actual document worker exit exceeded the shared deadline");
-                    match ticket.settle(remaining, |result| accept(workspace, result)) {
-                        Ok(()) => break,
-                        Err(failure) => {
-                            assert_eq!(failure.reason, DocumentResultSettlementReason::ThreadExitPending);
-                            ticket = failure.ticket;
-                            std::thread::park_timeout(Duration::from_millis(1).min(remaining));
-                        }
-                    }
-                }
+                crate::cleanup_test_support::cleanup_until(
+                    ticket,
+                    deadline,
+                    |ticket, deadline| {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        assert!(!remaining.is_zero(), "actual document worker exit exceeded the shared deadline");
+                        ticket.settle(remaining, |result| accept(workspace, result)).map_or_else(
+                            |failure| ControlFlow::Break((failure.ticket, failure.reason)),
+                            ControlFlow::Continue,
+                        )
+                    },
+                    |reason| matches!(reason, DocumentResultSettlementReason::ThreadExitPending),
+                )
+                .unwrap();
             })
             .join()
             .unwrap();

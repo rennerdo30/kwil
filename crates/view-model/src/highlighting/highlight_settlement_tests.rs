@@ -2,11 +2,24 @@ use super::*;
 use std::{sync::mpsc, time::Duration};
 
 fn settle(worker: &mut HighlightWorker, deadline: Instant) -> Result<(), WorkerSettlementReason> {
-    loop {
-        match worker.settle_until(deadline) {
-            Err(WorkerSettlementReason::ThreadExitPending) if Instant::now() < deadline => thread::yield_now(),
-            result => return result,
-        }
+    match crate::cleanup_test_support::cleanup_until(
+        worker,
+        deadline,
+        |owner, deadline| {
+            owner
+                .settle_until(deadline)
+                .map_or_else(|error| std::ops::ControlFlow::Break((owner, error)), std::ops::ControlFlow::Continue)
+        },
+        |error| matches!(error, WorkerSettlementReason::ThreadExitPending),
+    )
+    .into_flow()
+    {
+        std::ops::ControlFlow::Continue(value) => Ok(value),
+        std::ops::ControlFlow::Break(crate::cleanup_test_support::CleanupFailure::Failed { error, .. }) => Err(error),
+        std::ops::ControlFlow::Break(
+            crate::cleanup_test_support::CleanupFailure::Expired { .. }
+            | crate::cleanup_test_support::CleanupFailure::CompletedLate { .. },
+        ) => Err(WorkerSettlementReason::TimedOut),
     }
 }
 fn shared() -> Arc<Shared> {
@@ -159,11 +172,7 @@ fn native_tls_pending_preserves_original_owner_then_explicit_retry_joins_and_ret
     let released = release.send(());
     // Only this native-exit fixture uses passive readiness backoff; ONE 2s
     // deadline covers registration, the gate, retries, join and retirement.
-    let mut result = worker.settle_until(deadline);
-    while result == Err(WorkerSettlementReason::ThreadExitPending) && Instant::now() < deadline {
-        thread::park_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(1)));
-        result = worker.settle_until(deadline);
-    }
+    let result = settle(&mut worker, deadline);
     // Release and original compatibility cleanup BEFORE assertions, even when
     // an observation failed. No gate or original handle is abandoned on panic.
     let cleanup = worker.shutdown_in_place();

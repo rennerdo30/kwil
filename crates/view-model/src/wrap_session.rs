@@ -1285,7 +1285,12 @@ mod tests {
         assert!(matches!(refused.error, WrapError::WorkerPanicked));
         assert!(Arc::ptr_eq(&refused.request.source, &source));
         drop(refused);
-        let failure = settle_final(session.stop(), Duration::from_secs(2)).unwrap_err();
+        let failure = match settle_final(session.stop(), Duration::from_secs(2)).unwrap_err() {
+            crate::cleanup_test_support::CleanupFailure::Failed { owner, error } => {
+                SettlementFailure { ticket: owner, error }
+            }
+            other => panic!("expected original fatal settlement failure: {other:?}"),
+        };
         assert!(matches!(failure.error, WrapError::WorkerPanicked));
         let identity = Arc::as_ptr(&failure.ticket.shared);
         let again = failure.ticket.settle(Duration::ZERO).unwrap_err();
@@ -1317,18 +1322,22 @@ mod tests {
 
     // Test-only readiness backoff. One original deadline; only explicit native
     // Pending retries. Production settlement itself never polls or schedules.
-    pub(crate) fn settle_final(mut ticket: SettlementTicket, timeout: Duration) -> Result<(), SettlementFailure> {
+    pub(crate) fn settle_final(
+        ticket: SettlementTicket,
+        timeout: Duration,
+    ) -> crate::cleanup_test_support::CleanupOutcome<SettlementTicket, (), WrapError> {
         let deadline = Instant::now().checked_add(timeout).expect("bounded test deadline");
-        loop {
-            match ticket.settle(deadline.saturating_duration_since(Instant::now())) {
-                Err(failure) if matches!(failure.error, WrapError::ThreadExitPending) => {
-                    ticket = failure.ticket;
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    thread::park_timeout(remaining.min(Duration::from_millis(1)));
-                }
-                result => return result,
-            }
-        }
+        crate::cleanup_test_support::cleanup_until(
+            ticket,
+            deadline,
+            |ticket, deadline| {
+                ticket.settle(deadline.saturating_duration_since(Instant::now())).map_or_else(
+                    |failure| std::ops::ControlFlow::Break((failure.ticket, failure.error)),
+                    std::ops::ControlFlow::Continue,
+                )
+            },
+            |error| matches!(error, WrapError::ThreadExitPending),
+        )
     }
     impl CompletionGate {
         pub(super) fn wait(&self) {
@@ -1543,7 +1552,12 @@ mod tests {
         assert_eq!(session.relative.len(), 1);
         assert_eq!(session.relative.mutation_gate(), MutationGate::RefusedPending);
         drop(refused);
-        let failure = settle_final(session.stop(), Duration::from_secs(2)).unwrap_err();
+        let failure = match settle_final(session.stop(), Duration::from_secs(2)).unwrap_err() {
+            crate::cleanup_test_support::CleanupFailure::Failed { owner, error } => {
+                SettlementFailure { ticket: owner, error }
+            }
+            other => panic!("expected original fatal settlement failure: {other:?}"),
+        };
         assert!(
             matches!(failure.error, WrapError::WorkerPanicked),
             "exhausted cancellation is a sticky terminal failure"
@@ -1609,9 +1623,12 @@ mod tests {
         };
         assert!(matches!(session.submit(request), ControlFlow::Continue(())));
         wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let first = match settle_final(session.stop(), Duration::from_secs(2)) {
-            Err(failure) => failure,
-            Ok(()) => panic!("worker failure became success"),
+        let first = match settle_final(session.stop(), Duration::from_secs(2)).into_flow() {
+            ControlFlow::Break(crate::cleanup_test_support::CleanupFailure::Failed { owner, error }) => {
+                SettlementFailure { ticket: owner, error }
+            }
+            ControlFlow::Break(other) => panic!("expected original fatal settlement failure: {other:?}"),
+            ControlFlow::Continue(()) => panic!("worker failure became success"),
         };
         assert!(matches!(first.error, WrapError::WorkerPanicked));
         let identity = Arc::as_ptr(&first.ticket.shared);

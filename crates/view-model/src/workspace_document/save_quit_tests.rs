@@ -201,16 +201,35 @@ impl Fixture {
             };
             bundle.bind_search_sources(DocumentSearchBinding::NoSearchWorker).unwrap();
             loop {
-                match bundle.settle_until(deadline) {
-                    Ok(DocumentShutdownStatus::SourcesReleased) => {
+                match crate::cleanup_test_support::cleanup_until(
+                    &mut bundle,
+                    deadline,
+                    |owner, deadline| {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        assert!(!remaining.is_zero(), "original cleanup deadline; exact bundle retained");
+                        owner
+                            .settle_until(deadline)
+                            .map_or_else(|error| ControlFlow::Break((owner, error)), ControlFlow::Continue)
+                    },
+                    |error| {
+                        matches!(
+                            error,
+                            DocumentShutdownReason::Transport(DocumentResultSettlementReason::ThreadExitPending)
+                        )
+                    },
+                )
+                .into_flow()
+                {
+                    ControlFlow::Continue(DocumentShutdownStatus::SourcesReleased) => {
                         assert!(bundle.workspace.as_ref().unwrap().views.is_empty());
                         assert!(bundle.workspace.as_ref().unwrap().closed_views.is_empty());
                     }
-                    Ok(DocumentShutdownStatus::Complete) => break,
-                    Err(DocumentShutdownReason::Transport(DocumentResultSettlementReason::ThreadExitPending)) => {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        assert!(!remaining.is_zero(), "original cleanup deadline; exact bundle retained");
-                        std::thread::park_timeout(Duration::from_millis(1).min(remaining));
+                    ControlFlow::Continue(DocumentShutdownStatus::Complete) => break,
+                    ControlFlow::Break(
+                        crate::cleanup_test_support::CleanupFailure::Expired { .. }
+                        | crate::cleanup_test_support::CleanupFailure::CompletedLate { .. },
+                    ) => {
+                        panic!("original cleanup deadline; exact bundle retained");
                     }
                     other => panic!("save fixture cleanup retained its exact bundle: {other:?}"),
                 }

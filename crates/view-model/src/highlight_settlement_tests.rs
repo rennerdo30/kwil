@@ -9,11 +9,24 @@ use std::{
 };
 
 fn settle(host: &mut HighlightSession, deadline: Instant) -> Result<(), WorkerSettlementReason> {
-    loop {
-        match host.settle_until(deadline) {
-            Err(WorkerSettlementReason::ThreadExitPending) if Instant::now() < deadline => thread::yield_now(),
-            result => return result,
-        }
+    match crate::cleanup_test_support::cleanup_until(
+        host,
+        deadline,
+        |owner, deadline| {
+            owner
+                .settle_until(deadline)
+                .map_or_else(|error| std::ops::ControlFlow::Break((owner, error)), std::ops::ControlFlow::Continue)
+        },
+        |error| matches!(error, WorkerSettlementReason::ThreadExitPending),
+    )
+    .into_flow()
+    {
+        std::ops::ControlFlow::Continue(value) => Ok(value),
+        std::ops::ControlFlow::Break(crate::cleanup_test_support::CleanupFailure::Failed { error, .. }) => Err(error),
+        std::ops::ControlFlow::Break(
+            crate::cleanup_test_support::CleanupFailure::Expired { .. }
+            | crate::cleanup_test_support::CleanupFailure::CompletedLate { .. },
+        ) => Err(WorkerSettlementReason::TimedOut),
     }
 }
 struct Source {

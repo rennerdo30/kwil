@@ -14,17 +14,22 @@ use std::{
     time::Instant,
 };
 
-fn settle_final(mut ticket: WrapHostSettlementTicket, timeout: Duration) -> Result<(), WrapHostSettlementFailure> {
+fn settle_final(
+    ticket: WrapHostSettlementTicket,
+    timeout: Duration,
+) -> crate::cleanup_test_support::CleanupOutcome<WrapHostSettlementTicket, (), WrapError> {
     let deadline = Instant::now() + timeout;
-    loop {
-        match ticket.settle(deadline.saturating_duration_since(Instant::now())) {
-            Err(failure) if matches!(failure.error, WrapError::ThreadExitPending) && Instant::now() < deadline => {
-                ticket = failure.ticket;
-                thread::park_timeout(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
-            }
-            result => return result,
-        }
-    }
+    crate::cleanup_test_support::cleanup_until(
+        ticket,
+        deadline,
+        |ticket, deadline| {
+            ticket.settle(deadline.saturating_duration_since(Instant::now())).map_or_else(
+                |failure| std::ops::ControlFlow::Break((failure.ticket, failure.error)),
+                std::ops::ControlFlow::Continue,
+            )
+        },
+        |error| matches!(error, WrapError::ThreadExitPending),
+    )
 }
 
 trait ContinueTest<B, C> {
@@ -694,7 +699,13 @@ fn wrap_host_terminal_worker_wakes_and_keeps_failed_head_without_retry_launch() 
     assert!(matches!(fixture.host.retry_relative(), Err(WrapError::Closed)));
     assert_eq!(fixture.editor.primary_cursor().head, 0);
     let ticket = fixture.host.stop();
-    let failure = thread::spawn(move || settle_final(ticket, Duration::from_secs(2))).join().unwrap().unwrap_err();
+    let failure = match thread::spawn(move || settle_final(ticket, Duration::from_secs(2))).join().unwrap().unwrap_err()
+    {
+        crate::cleanup_test_support::CleanupFailure::Failed { owner, error } => {
+            WrapHostSettlementFailure { ticket: owner, error }
+        }
+        other => panic!("expected original fatal settlement failure: {other:?}"),
+    };
     assert!(matches!(failure.error, WrapError::WorkerPanicked));
     // Sticky terminal failure is intentionally retained by the model ticket;
     // destroying the UI or dropping this owner is never claimed as success.

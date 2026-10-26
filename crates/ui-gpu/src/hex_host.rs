@@ -123,7 +123,17 @@ mod tests {
         (app, rx, root, path)
     }
     fn idle(app: &mut App, rx: &Receiver<UserEvent>, stage: &'static str) {
-        until(app, rx, stage, |a| !a.view.document_busy(a.view.active_id()) && a.view.recovery_notice().is_none());
+        until(app, rx, stage, |a| {
+            let status = a.document.live.transport.as_ref().unwrap().status();
+            !status.closed
+                && !status.worker_done
+                && status.failure.is_none()
+                && !status.occupied
+                && !status.retry_pending
+                && !status.retry_acknowledgement_required
+                && !a.view.document_busy(a.view.active_id())
+                && a.view.recovery_notice().is_none()
+        });
     }
     fn press(app: &mut App, digit: &str) {
         app.mods = ModifiersState::empty();
