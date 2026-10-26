@@ -18,6 +18,10 @@ NativeCommandStartup is a dispatch-only diagnostic alternative, never a worker
 proof: read parent window-station/desktop DACL access, then launch exactly one
 native SystemRoot/System32/cmd.exe /d /q /c "exit /b 73". No PowerShell fallback.
 Parent DACL observations do not prove child attachment, MIC or DLL startup.
+ExplicitParentDesktop opts this trusted sentinel into WinSta0\Default only after
+the observed parent names and both tokens' full DACL grants agree. Inherited
+keeps the original NULL desktop. This is not a general launcher policy or proof
+that the High-IL restricted candidate represents an ordinary Medium-IL user.
 
 90s monotonic internal budget starts BEFORE admission/Add-Type. Cleanup reserves
 one cumulative 10s deadline across all exact-handle reaps (at most 5s per wait),
@@ -34,7 +38,8 @@ param(
     [Parameter(Mandatory)][string]$EvidenceDirectory,
     [ValidateSet('Driver','Worker')][string]$Mode = 'Driver',
     [string]$OwnerNonce = '',
-    [ValidateSet('PowerShellProof','NativeCommandStartup',IgnoreCase=$false)][string]$Purpose = 'PowerShellProof'
+    [ValidateSet('PowerShellProof','NativeCommandStartup',IgnoreCase=$false)][string]$Purpose = 'PowerShellProof',
+    [switch]$ExplicitParentDesktop
 )
 
 Set-StrictMode -Version Latest
@@ -49,6 +54,61 @@ $script:ParentAccess = $null
 
 function Assert-TokenCase([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "Token preflight FAIL/design-fork: $Message" }
+}
+
+function Resolve-DiagnosticStartupDesktop([bool]$Explicit, [string]$SelectedPurpose, [string]$SelectedMode, [string]$EventName) {
+    if (-not $Explicit) { return $null }
+    Assert-TokenCase ($SelectedPurpose -ceq 'NativeCommandStartup' -and $SelectedMode -ceq 'Driver' -and $EventName -ceq 'workflow_dispatch') 'ExplicitParentDesktop requires NativeCommandStartup/Driver/workflow_dispatch; diagnostic only, not worker proof'
+    return 'WinSta0\Default'
+}
+
+function Assert-ExplicitParentDesktopAccess($Observation) {
+    Assert-TokenCase ($null -ne $Observation -and @($Observation.Objects).Count -eq 2) 'explicit desktop requires exactly two bounded parent observations'
+    $labels = @('parent-window-station','parent-thread-desktop')
+    $names = @('WinSta0','Default')
+    $fullAccess = @(0x000f037f,0x000f01ff)
+    for ($index=0; $index -lt 2; $index++) {
+        $object = $Observation.Objects[$index]
+        Assert-TokenCase ($object.Label -ceq $labels[$index] -and $object.Name -ceq $names[$index]) 'explicit desktop parent name/label mismatch; no child or fallback'
+        foreach ($side in 'Baseline','Candidate') {
+            $access = $object.$side
+            Assert-TokenCase ($null -ne $access -and $access.ApiSucceeded -eq $true -and $access.AccessStatus -eq $true -and $access.RequestedAccess -eq 0x02000000 -and $access.GrantedAccess -eq $fullAccess[$index]) "explicit desktop requires existing full $side DACL grant; no ACL change or fallback"
+        }
+    }
+}
+
+function Assert-DiagnosticDesktopOracles {
+    # Pure source-authored oracles only; no native calls or launches. NOT RUN by
+    # source-only authoring. The later admitted diagnostic invokes them here.
+    Assert-TokenCase ($null -eq (Resolve-DiagnosticStartupDesktop $false 'PowerShellProof' 'Worker' 'push')) 'inherited desktop default changed'
+    Assert-TokenCase ((Resolve-DiagnosticStartupDesktop $true 'NativeCommandStartup' 'Driver' 'workflow_dispatch') -ceq 'WinSta0\Default') 'explicit desktop opt-in changed'
+    foreach ($combination in @(@('PowerShellProof','Driver','workflow_dispatch'),@('NativeCommandStartup','Worker','workflow_dispatch'),@('NativeCommandStartup','Driver','push'))) {
+        $refused = $false
+        try { $null = Resolve-DiagnosticStartupDesktop $true $combination[0] $combination[1] $combination[2] } catch { $refused=$true }
+        Assert-TokenCase $refused 'explicit desktop purpose/mode/event mismatch admitted'
+    }
+    $objects = @(for ($index=0; $index -lt 2; $index++) {
+        $grant = [pscustomobject]@{ApiSucceeded=$true;AccessStatus=$true;RequestedAccess=0x02000000;GrantedAccess=@(0x000f037f,0x000f01ff)[$index]}
+        [pscustomobject]@{Label=@('parent-window-station','parent-thread-desktop')[$index];Name=@('WinSta0','Default')[$index];Baseline=$grant;Candidate=$grant}
+    })
+    $observation = [pscustomobject]@{Objects=$objects}
+    Assert-ExplicitParentDesktopAccess $observation
+    for ($index=0; $index -lt 2; $index++) {
+        $originalName = $objects[$index].Name
+        $objects[$index].Name = 'unexpected-parent'
+        $refused = $false
+        try { Assert-ExplicitParentDesktopAccess $observation } catch { $refused=$true }
+        finally { $objects[$index].Name=$originalName }
+        Assert-TokenCase $refused 'explicit desktop mismatched parent admitted'
+    }
+    foreach ($side in 'Baseline','Candidate') {
+        $originalGrant = $objects[0].$side
+        $objects[0].$side = [pscustomobject]@{ApiSucceeded=$true;AccessStatus=$true;RequestedAccess=0x02000000;GrantedAccess=0x00020303}
+        $refused = $false
+        try { Assert-ExplicitParentDesktopAccess $observation } catch { $refused=$true }
+        finally { $objects[0].$side=$originalGrant }
+        Assert-TokenCase $refused 'explicit desktop incomplete parent grant admitted'
+    }
 }
 
 function Assert-PlainPath([string]$Path) {
@@ -195,7 +255,9 @@ function Write-NativeEvidenceManifest($Identity, [string]$Status) {
         } else { [ordered]@{name=$_;state='absent'} }
     }
     Write-BoundedJson 'evidence-manifest.json' ([ordered]@{schema=2;kind='native-command-startup-diagnostic';purpose=$Purpose
-        identity=$Identity;status=$Status;artifacts=@($rows);selfHash='excluded';tokenPreflight='not-run';installerQualification='not-run'})
+        identity=$Identity;status=$Status;artifacts=@($rows);selfHash='excluded';tokenPreflight='not-run';installerQualification='not-run'
+        startupDesktopChoice=$script:StartupDesktopChoice;startupDesktop=$script:StartupDesktopLabel;workerProof='not-run'
+        candidateCoverage='diagnostic-comparison-only; not ordinary Medium-IL standard-user acceptance'})
 }
 
 function Assert-NativeCommandImage([string]$Path) {
@@ -241,6 +303,11 @@ function Invoke-OwnedProof([scriptblock]$Create, [scriptblock]$Receipt, [scriptb
     return $result
 }
 
+# Pure option admission precedes every filesystem write, Add-Type and native
+# observation. An invalid explicit choice cannot enter either launch path.
+$script:StartupDesktop = Resolve-DiagnosticStartupDesktop $ExplicitParentDesktop.IsPresent $Purpose $Mode $env:GITHUB_EVENT_NAME
+$script:StartupDesktopChoice = if ($ExplicitParentDesktop) { 'ExplicitParent' } else { 'Inherited' }
+$script:StartupDesktopLabel = if ($null -eq $script:StartupDesktop) { 'null' } else { $script:StartupDesktop }
 Assert-HostedTokenContext
 if ($Mode -ceq 'Driver') { $null = [IO.Directory]::CreateDirectory($EvidenceDirectory) }
 
@@ -252,13 +319,17 @@ if ($Purpose -ceq 'NativeCommandStartup') {
     $report.schema = 2
     $report.kind = 'native-command-startup-diagnostic'
     $report['purpose'] = $Purpose
+    $report['startupDesktopChoice'] = $script:StartupDesktopChoice
+    $report['startupDesktop'] = $script:StartupDesktopLabel
+    $report['candidateCoverage'] = 'diagnostic-comparison-only; not ordinary Medium-IL standard-user acceptance'
     $report['tokenPreflight'] = 'not-run'
     $report['workerProof'] = 'not-observed'
     $report['workerResult'] = 'not-observed'
     $report['parentAccess'] = $null
     $report['nativeCommand'] = [ordered]@{image='SystemRoot/System32/cmd.exe';commandId='cmd-d-q-c-exit-b-73'
         expectedExitCode=73;exitCode=$null;reached=$false;machine=$null;childAttachment='not-observed'
-        startupDesktop='null';creationFlags='0x08000404';environmentValues='private';environmentNames=$null;environmentUtf16Bytes=$null}
+        startupDesktop=$script:StartupDesktopLabel;startupDesktopChoice=$script:StartupDesktopChoice
+        creationFlags='0x08000404';environmentValues='private';environmentNames=$null;environmentUtf16Bytes=$null}
 }
 $primaryError = $null
 $current = $null
@@ -748,16 +819,19 @@ public static class KwilTokenProof {
             Require(early.Now==11000 && early.Waited+250L*early.Terminations==10000 && early.Closes==0,
                 "early cleanup failure renewed its cumulative deadline");
         }
-        internal static Lease Start(Token token,string app,string command,string environment,string cwd,int lifetimeMs,int cleanupMs) {
+        internal static Lease Start(Token token,string app,string command,string environment,string cwd,int lifetimeMs,int cleanupMs,bool explicitParentDesktop) {
             Require(lifetimeMs>0 && lifetimeMs<=20000,"child lifetime invalid");
             var watch=Stopwatch.StartNew(); var lease=new Lease(() => watch.ElapsedMilliseconds,lifetimeMs,cleanupMs,new NativeProcessCalls());
-            IntPtr block=IntPtr.Zero;
+            IntPtr block=IntPtr.Zero, desktop=IntPtr.Zero;
             try {
                 block=Marshal.StringToHGlobalUni(environment);
-                var startup=new SI { cb=checked((uint)Marshal.SizeOf(typeof(SI))),flags=1,show=0 };
+                // Fixed 15 UTF-16 code units plus NUL (32 bytes); no caller text.
+                if(explicitParentDesktop) desktop=Marshal.StringToHGlobalUni(@"WinSta0\Default");
+                var startup=new SI { cb=checked((uint)Marshal.SizeOf(typeof(SI))),flags=1,show=0,desktop=desktop };
                 PI process;
                 // SUSPENDED | UNICODE_ENVIRONMENT | CREATE_NO_WINDOW.
-                // No desktop override, handle inheritance, stdio pipes or shell.
+                // Only the opt-in trusted native diagnostic names a desktop.
+                // No handle inheritance, stdio pipes or shell launch fallback.
                 if(!CreateProcessAsUserW(token.Handle,app,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08000404,block,cwd,ref startup,out process)) throw Error("CreateProcessAsUserW");
                 // No allocations/receipt IO between returned handles and adoption.
                 lease.Adopt(process);
@@ -774,11 +848,16 @@ public static class KwilTokenProof {
                     catch(Exception cleanup) { original.Data["launchCleanup"]=cleanup.Message; }
                 }
                 throw;
-            } finally { if(block!=IntPtr.Zero) Marshal.FreeHGlobal(block); }
+            } finally {
+                // Startup info is consumed by CreateProcessAsUserW before this
+                // cleanup, including launch/arming failure; receipts run later.
+                try { if(desktop!=IntPtr.Zero) Marshal.FreeHGlobal(desktop); }
+                finally { if(block!=IntPtr.Zero) Marshal.FreeHGlobal(block); }
+            }
         }
     }
-    public static Lease Launch(Token token,string app,string command,string environment,string cwd,int lifetimeMs,int cleanupMs) {
-        return Lease.Start(token,app,command,environment,cwd,lifetimeMs,cleanupMs);
+    public static Lease Launch(Token token,string app,string command,string environment,string cwd,int lifetimeMs,int cleanupMs,bool explicitParentDesktop) {
+        return Lease.Start(token,app,command,environment,cwd,lifetimeMs,cleanupMs,explicitParentDesktop);
     }
 
     // Diagnostic-only interop. No Set*, OpenDesktop, profile or impersonation
@@ -1173,6 +1252,8 @@ public static class KwilTokenProof {
         $command = '"{0}" -NoLogo -NoProfile -NonInteractive -File "{1}" -Mode Worker -Architecture {2} -EvidenceDirectory "{3}" -OwnerNonce {4}' -f $pwsh,$PSCommandPath,$Architecture,$EvidenceDirectory,$nonce
         $application = $pwsh
         if ($Purpose -ceq 'NativeCommandStartup') {
+            Assert-DiagnosticDesktopOracles
+            $oracles.Add('desktop-opt-in-purpose-mode-event-parent-grants-and-inherited-default')
             [KwilTokenProof+ParentAccess]::CheckOracles()
             $oracles.Add('parent-access-bounded-reads-mappings-errors-and-exact-partial-ownership')
             $report.oracles = $oracles.ToArray()
@@ -1195,7 +1276,10 @@ public static class KwilTokenProof {
                 $owner.Close()
             }
             Write-BoundedJson 'parent-access.json' ([ordered]@{schema=2;purpose=$Purpose;identity=$identity
+                startupDesktopChoice=$script:StartupDesktopChoice;startupDesktop=$script:StartupDesktopLabel;tokenPreflight='not-run';workerProof='not-run'
+                candidateCoverage='diagnostic-comparison-only; not ordinary Medium-IL standard-user acceptance'
                 observations=$report.parentAccess;interpretation='parent-DACL-only; not child attachment, MIC, DLL attribution or worker qualification'})
+            if ($ExplicitParentDesktop) { Assert-ExplicitParentDesktopAccess $report.parentAccess }
         }
         $environment = [ordered]@{
             GITHUB_ACTIONS='true';RUNNER_ENVIRONMENT='github-hosted';RUNNER_OS='Windows';RUNNER_ARCH=$env:RUNNER_ARCH
@@ -1214,14 +1298,19 @@ public static class KwilTokenProof {
         # Recheck admission AFTER candidate/env/path work, immediately before API.
         $proof = Invoke-OwnedProof {
             $lifetime = Get-LaunchAdmission ($script:BudgetMs - $script:Clock.ElapsedMilliseconds)
-            $script:Lease = [KwilTokenProof]::Launch($candidate,$application,$command,$block,$EvidenceDirectory,$lifetime,[int]$script:CleanupReserveMs)
+            $script:Lease = [KwilTokenProof]::Launch($candidate,$application,$command,$block,$EvidenceDirectory,$lifetime,[int]$script:CleanupReserveMs,$ExplicitParentDesktop.IsPresent)
             $script:Lease
         } {
             param($lease)
             $ownedReceipt = [ordered]@{identity=$identity;nonce=$nonce;driverPid=$PID
                 childPid=$lease.Pid;childThreadId=$lease.ThreadId;lifetimeMilliseconds=$lease.LifetimeMilliseconds
                 suspended=$true;watchdogArmedBeforeReceipt=$true;baseline=$report.baseline;selection=$report.selection}
-            if ($Purpose -ceq 'NativeCommandStartup') { $ownedReceipt['schema']=2; $ownedReceipt['purpose']=$Purpose }
+            if ($Purpose -ceq 'NativeCommandStartup') {
+                $ownedReceipt['schema']=2; $ownedReceipt['purpose']=$Purpose
+                $ownedReceipt['startupDesktopChoice']=$script:StartupDesktopChoice; $ownedReceipt['startupDesktop']=$script:StartupDesktopLabel
+                $ownedReceipt['tokenPreflight']='not-run'; $ownedReceipt['workerProof']='not-run'; $ownedReceipt['installerQualification']='not-run'
+                $ownedReceipt['candidateCoverage']='diagnostic-comparison-only; not ordinary Medium-IL standard-user acceptance'
+            }
             Write-BoundedJson 'owned-process.json' $ownedReceipt
         } {
             param($lease)
@@ -1319,12 +1408,15 @@ finally {
 }
 if ($primaryError) {
     $failure = Get-PublicFailure $primaryError
+    if ($Purpose -ceq 'NativeCommandStartup') {
+        [Console]::Error.WriteLine("purpose=NativeCommandStartup startupDesktopChoice=$($script:StartupDesktopChoice) startupDesktop=$($script:StartupDesktopLabel) diagnostic-only=true token-preflight=NOT-RUN worker-proof=$($report.workerProof) installer-qualification=NOT-RUN candidate-coverage=NOT-ORDINARY-MEDIUM-IL")
+    }
     [Console]::Error.WriteLine("commit=$($identity.commit) mode=$Mode status=FAIL/design-fork $($failure.message)")
     foreach ($diagnostic in $failure.diagnostics) { [Console]::Error.WriteLine($diagnostic) }
     throw $primaryError
 }
 if ($Purpose -ceq 'NativeCommandStartup') {
-    [Console]::WriteLine("commit=$($identity.commit) purpose=NativeCommandStartup diagnostic=COMPLETE native-command-reached=true token-preflight=NOT-RUN worker-proof=ABSENT installer-qualification=NOT-RUN")
+    [Console]::WriteLine("commit=$($identity.commit) purpose=NativeCommandStartup startupDesktopChoice=$($script:StartupDesktopChoice) startupDesktop=$($script:StartupDesktopLabel) diagnostic=COMPLETE native-command-reached=true token-preflight=NOT-RUN worker-proof=ABSENT installer-qualification=NOT-RUN candidate-coverage=NOT-ORDINARY-MEDIUM-IL")
 } else {
     [Console]::WriteLine("commit=$($identity.commit) mode=$Mode token-preflight=PASS installer-qualification=NOT-RUN")
 }

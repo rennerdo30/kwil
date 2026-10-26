@@ -14,6 +14,14 @@ on:
         options:
           - PowerShellProof
           - NativeCommandStartup
+      desktop:
+        description: Native sentinel only; explicit parent desktop is diagnostic, not worker proof
+        type: choice
+        required: true
+        default: Inherited
+        options:
+          - Inherited
+          - ExplicitParent
   push:
     branches: [main]
     paths:
@@ -33,7 +41,7 @@ jobs:
           - { os: windows-latest, architecture: x64 }
           - { os: windows-11-arm, architecture: arm64 }
     runs-on: ${{ matrix.os }}
-    # 60s checkout + 120s script fence + 60s upload + 60s slack = 300s.
+    # 60s checkout + 60s choice gate + 120s script fence + 60s upload = 300s.
     # The script's monotonic 90s includes admission, compilation of its interop,
     # candidate/launch, one cumulative 10s cleanup reserve across every reap, and
     # evidence. This is an internal test budget, not installer qualification.
@@ -43,6 +51,16 @@ jobs:
         timeout-minutes: 1
         with:
           persist-credentials: false
+      - name: Reject invalid desktop selection before either child path
+        if: github.event_name == 'workflow_dispatch'
+        timeout-minutes: 1
+        shell: pwsh
+        env:
+          KWIL_DIAGNOSTIC_PURPOSE: ${{ inputs.purpose }}
+          KWIL_DIAGNOSTIC_DESKTOP: ${{ inputs.desktop || 'Inherited' }}
+        run: |
+          if ($env:KWIL_DIAGNOSTIC_DESKTOP -cnotin @('Inherited','ExplicitParent')) { throw 'Unknown diagnostic desktop choice; no child launch.' }
+          if ($env:KWIL_DIAGNOSTIC_DESKTOP -ceq 'ExplicitParent' -and $env:KWIL_DIAGNOSTIC_PURPOSE -cne 'NativeCommandStartup') { throw 'ExplicitParent requires NativeCommandStartup; no worker proof or fallback.' }
       - name: Measure and prove one actual same-user standard-token worker
         if: github.event_name != 'workflow_dispatch' || inputs.purpose == 'PowerShellProof'
         timeout-minutes: 2
@@ -59,8 +77,11 @@ jobs:
         shell: pwsh
         env:
           KWIL_INSTALLER_TOKEN_DISPOSABLE: ${{ github.run_id }}:${{ github.run_attempt }}
+          KWIL_DIAGNOSTIC_DESKTOP: ${{ inputs.desktop || 'Inherited' }}
         run: |
-          ./scripts/test-windows-installer-token.ps1 -Architecture '${{ matrix.architecture }}' -EvidenceDirectory (Join-Path $env:GITHUB_WORKSPACE '.token-preflight') -Purpose NativeCommandStartup
+          $desktopArguments = @{}
+          if ($env:KWIL_DIAGNOSTIC_DESKTOP -ceq 'ExplicitParent') { $desktopArguments.ExplicitParentDesktop = $true }
+          ./scripts/test-windows-installer-token.ps1 -Architecture '${{ matrix.architecture }}' -EvidenceDirectory (Join-Path $env:GITHUB_WORKSPACE '.token-preflight') -Purpose NativeCommandStartup @desktopArguments
       - name: Keep bounded token facts, exact PID ownership and failure evidence
         if: always()
         timeout-minutes: 1
