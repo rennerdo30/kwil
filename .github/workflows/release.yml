@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +18,21 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  candidate-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful CI for the exact tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main&status=success&per_page=1" --jq '.workflow_runs | length')
+          if [ "$count" != "1" ]; then
+            echo "The tagged commit must pass CI before release artifacts are built." >&2
+            exit 1
+          fi
+
   build:
+    needs: candidate-ci
     name: build (${{ matrix.target }})
     env:
       RUSTC_WRAPPER: sccache
@@ -95,6 +110,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -106,8 +122,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          flags=(--draft)
+          notes=(--generate-notes)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+            notes=(--notes-file docs/BETA_RELEASE_NOTES.md)
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --draft \
+            "${flags[@]}" \
             --title "Kwil $GITHUB_REF_NAME" \
-            --generate-notes
+            "${notes[@]}"

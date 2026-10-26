@@ -21,6 +21,19 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 4. The owner reviews the draft and publishes it.
 5. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once. Local MSI/portable distributions contain that marker and require explicit updates instead.
 
+The exact tagged commit must first pass the `CI` workflow. Release builds refuse
+to start without that successful run. A prerelease version such as
+`0.1.0-beta.1` uses the matching tag `v0.1.0-beta.1`; the workflow creates a
+**draft prerelease**, sets `latest=false` and uses `docs/BETA_RELEASE_NOTES.md`.
+Review the notes for the specific prerelease before tagging. Only the owner
+publishes the resulting draft.
+
+Beta assets are the raw executables described below, installed and replaced
+manually. The combined local MSI/portable ZIP driver requires a numeric MSI
+version and is not the beta packaging path. Prereleases do not enter the stable
+updater or download installers; prerelease copies also do not auto-advance to a
+stable version. See [beta gates and limitations](BETA.md).
+
 ## Asset contract (do not change without updating `crates/update`)
 
 - Unix: one raw executable per target, named `kwil-<target triple>`.

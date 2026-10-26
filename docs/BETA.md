@@ -1,10 +1,37 @@
 # Beta candidate
 
-The next proposed public milestone is an early beta, not an RC. V1 remains the full scope in [SPEC.md](SPEC.md); this checkpoint does not reduce it.
+The next public milestone being prepared is **0.1.0-beta.1**, an early beta,
+not an RC. V1 remains the full scope in [SPEC.md](SPEC.md); this checkpoint does
+not reduce it. No beta tag or published release exists yet.
+
+## Current preparation
+
+- Guarded document delivery, cooperative layout, retained worker shutdown and
+  UTF-32 support are committed. The obsolete save-test adapter is being migrated
+  to the guarded lifecycle; incomplete metadata work is excluded.
+- `2e565ef` commits the reviewed terminal fixture cleanup and readiness repairs.
+  Focused cleanup, binary, search, wrap and hex checks pass, as do strict Clippy
+  and formatting on the immutable candidate. These do not replace hosted CI.
+- [CI 40241478518](https://github.com/rennerdo30/kwil/actions/runs/40241478518)
+  for the earlier `cb53e01` commit failed. Green CI on the final beta commit is
+  required before tagging; the release workflow enforces this prerequisite.
+- The planned draft contains eight raw executables for six targets and
+  `SHA256SUMS`. It is explicitly marked prerelease and excluded from latest.
+  It contains no qualified MSI or portable ZIP; the combined MSI/ZIP driver
+  accepts numeric installer versions and is not used for this prerelease.
+- Beta installation and replacement are manual. The stable updater and
+  download installers do not select beta releases; a beta copy does not
+  automatically advance to stable.
+
+The exact beta commit, artifact hashes and packaged smoke-test results must be
+recorded before publication. Draft text is in
+[BETA_RELEASE_NOTES.md](BETA_RELEASE_NOTES.md).
+
+## Historical evaluation snapshot
 
 A Windows x64 portable evaluation snapshot has been prepared from commit `e74f1b890c2b5128dd61569f0999a3dce74eab13` (binary version `0.1.0`). It is not a published beta release or a tagged prerelease. It excludes later committed cooperative-worker changes and uncommitted integration candidates.
 
-## Evidence for this snapshot
+### Evidence for the historical snapshot
 
 - [Hosted CI 40196643705](https://github.com/rennerdo30/kwil/actions/runs/40196643705) passed formatting, full workspace tests and Clippy on Windows, macOS and Linux, plus the workflow's configured smoke checks.
 - The portable ZIP and all eight entries were checked against the committed-source distribution manifest, including names, sizes and SHA-256 values.
@@ -19,7 +46,7 @@ Extract the portable ZIP into a new user-writable folder and run `kwil.exe`. Use
 - Comparison session/panes, unchanged-region collapse and final word-refinement qualification.
 - Complete any-size opening/indexing and regex/long-line paths, and folder replacement.
 - Formatter, log-watcher, custom theme and TUI integration.
-- Guarded save/retirement integration and complete metadata pre-growth admission.
+- Further save/recovery qualification and complete metadata pre-growth admission.
 - Accessibility, remaining platform behavior, native/remote performance and enforcing budget gates.
 - Installer lifecycle, signing and release/update trust qualification. The MSI is not offered as a qualified beta installer.
 
