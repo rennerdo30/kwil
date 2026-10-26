@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(queued_external(&mut app, &rx), 1, "release reuses the normal event queue");
         app.external_open_event();
         assert!(!app.external_inbox.has_pending());
-        until(&mut app, &rx, |a| a.view.binary_offer().is_some());
+        until(&mut app, &rx, |a| a.view.binary_offer().is_some() && document_admission_ready(a));
         let offer = app.view.binary_offer().unwrap();
         let text_path = root.join("after.txt");
         std::fs::write(&text_path, b"external text").unwrap();
