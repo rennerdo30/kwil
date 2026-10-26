@@ -109,6 +109,18 @@ pub(super) struct Completion {
     diagrams: Diagrams,
     highlights: CodeHighlights,
 }
+#[cfg(test)]
+pub(super) fn notification_fixture_completion(document: kwil_view_model::SessionDocumentId) -> Completion {
+    // A completed value with no Snapshot/worker capability, as after run's
+    // existing explicit Snapshot drop. No source extraction is used by tests.
+    Completion {
+        key: Key { document, revision: 0, epoch: 0, base: 0 },
+        result: Err("original computed completion".into()),
+        images: Default::default(),
+        diagrams: Default::default(),
+        highlights: Default::default(),
+    }
+}
 type CodeHighlights = std::collections::HashMap<usize, Vec<kwil_core_syntax::Span>>;
 type Diagrams = std::collections::HashMap<usize, Result<kwil_core_markdown::diagram::Diagram, String>>;
 type DiagramLayouts = std::collections::HashMap<usize, ((usize, u64, u64), Result<markdown_diagram::Layout, String>)>;
@@ -665,13 +677,16 @@ impl App {
                         // Snapshot and its file/spill leases retire on this worker.
                         drop(work.snapshot);
                         if proxy
-                            .send_event(UserEvent::MarkdownReady(Box::new(Completion {
-                                key: work.key,
-                                result,
-                                images,
-                                diagrams,
-                                highlights,
-                            })))
+                            .send_computed_value(
+                                UserEvent::MarkdownReady(Box::new(Completion {
+                                    key: work.key,
+                                    result,
+                                    images,
+                                    diagrams,
+                                    highlights,
+                                })),
+                                drop,
+                            )
                             .is_err()
                         {
                             break;

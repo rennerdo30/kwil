@@ -1151,6 +1151,9 @@ impl State {
 
 pub(super) struct Shared {
     native_exit: NativeExitObservation,
+    // Low bit is terminal GUI-wake handoff; the remaining bits count callbacks.
+    // Claims/finalization and the condvar predicate share `state`'s mutex.
+    wake_activity: AtomicU64,
     state: Mutex<State>,
     changed: Condvar,
     // There is ONE actual sender, including all edit observers. Closing this
@@ -1158,6 +1161,8 @@ pub(super) struct Shared {
     requests: Mutex<RequestGate>,
     worker: Mutex<Option<JoinHandle<()>>>,
     wake: Box<dyn Fn() -> io::Result<()> + Send + Sync>,
+    #[cfg(test)]
+    wake_handoff_probe: Mutex<Option<wake_handoff_controls::Probe>>,
     #[cfg(test)]
     wake_failure_gate: Mutex<Option<tests::WakeFailureGate>>,
     #[cfg(test)]
@@ -1229,6 +1234,7 @@ impl Shared {
             .and_then(|n| n.checked_add(2 * size_of::<Result<(), DocumentResultSettlementReason>>()))
             .and_then(|n| n.checked_add(2 * size_of::<Result<(), DocumentResultSettlementFailure>>()))
             .and_then(|n| n.checked_add(size_of::<std::thread::Result<()>>()))
+            .and_then(|n| n.checked_add(Self::wake_operation_bytes()?))
             .ok_or_else(|| io::Error::other("document result transport metadata overflow"))?;
         let charge = budget.reserve(bytes).map_err(io::Error::other)?;
         let worker_id = NEXT_WORKER_ID
@@ -1236,6 +1242,7 @@ impl Shared {
             .map_err(|_| io::Error::other("document worker identity exhausted"))?;
         let shared = Arc::new(Self {
             native_exit: NativeExitObservation::new(),
+            wake_activity: AtomicU64::new(0),
             state: Mutex::new(State {
                 slot: None,
                 capacity_generation: 0,
@@ -1280,6 +1287,8 @@ impl Shared {
             }),
             worker: Mutex::new(None),
             wake: Box::new(wake),
+            #[cfg(test)]
+            wake_handoff_probe: Mutex::new(None),
             #[cfg(test)]
             wake_failure_gate: Mutex::new(None),
             #[cfg(test)]
@@ -1435,14 +1444,72 @@ impl Shared {
         lock(&self.requests).accepting = false;
     }
 
+    fn wake_operation_bytes() -> Option<usize> {
+        size_of::<MutexGuard<'_, State>>()
+            .checked_mul(2)?
+            .checked_add(size_of::<MutexGuard<'_, RequestGate>>())?
+            .checked_add(size_of::<(MutexGuard<'_, State>, std::sync::WaitTimeoutResult)>())?
+            .checked_add(2 * size_of::<Instant>() + size_of::<Duration>())?
+            .checked_add(2 * size_of::<u64>())?
+            .checked_add(2 * size_of::<Result<u64, DocumentResultSettlementReason>>())?
+            .checked_add(size_of::<Result<io::Result<()>, Box<dyn Any + Send>>>())?
+            .checked_add(size_of::<Option<DocumentDeliveryFailure>>())
+    }
+
+    fn request_wake_handoff(&self) {
+        let _state = lock(&self.state);
+        self.wake_activity.fetch_or(1, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    fn wait_wake_handoff_until(&self, deadline: Instant) -> Result<u64, DocumentResultSettlementReason> {
+        let mut state = lock(&self.state);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DocumentResultSettlementReason::TimedOut);
+            }
+            if self.wake_activity.load(Ordering::Acquire) == 1 {
+                if let Some(reason) = state.failure() {
+                    return Err(reason);
+                }
+                return if Instant::now() < deadline {
+                    Ok(self.worker_id)
+                } else {
+                    Err(DocumentResultSettlementReason::TimedOut)
+                };
+            }
+            #[cfg(test)]
+            wake_handoff_controls::before_wait(self);
+            state = self.changed.wait_timeout(state, remaining).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+    }
+
     fn wake(&self) {
+        {
+            let mut state = lock(&self.state);
+            let activity = self.wake_activity.load(Ordering::Acquire);
+            if activity & 1 != 0 {
+                self.changed.notify_all();
+                return;
+            }
+            if activity.checked_add(2).is_none() {
+                state.counter_exhausted = true;
+                let mut requests = lock(&self.requests);
+                requests.failed = true;
+                requests.accepting = false;
+                self.changed.notify_all();
+                return;
+            }
+            self.wake_activity.fetch_add(2, Ordering::AcqRel);
+        }
         // Only the owner-free callback is caught. Its result-slot owner never
         // leaves Shared, and this SAME worker stays alive on unwind. Abort-mode
         // panics are not recoverable; no panic hook or release policy changes.
         let failure = match catch_unwind(AssertUnwindSafe(|| (self.wake)())) {
-            Ok(Ok(())) => return,
-            Ok(Err(error)) => DocumentDeliveryFailure::Wake(error),
-            Err(payload) => DocumentDeliveryFailure::WakePanicked(payload),
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(DocumentDeliveryFailure::Wake(error)),
+            Err(payload) => Some(DocumentDeliveryFailure::WakePanicked(payload)),
         };
         {
             let mut state = lock(&self.state);
@@ -1450,17 +1517,24 @@ impl Shared {
             // fence and sticky failure indivisible: otherwise ACK could
             // reopen admission between these two publications. Retain the
             // sole sender; only explicit close may disconnect the inbox.
-            let mut gate = lock(&self.requests);
-            gate.accepting = false;
-            gate.failed = true;
-            #[cfg(test)]
-            tests::hold_wake_failure(self);
-            if state.delivery_failure.is_none() {
-                state.delivery_failure = Some(failure);
+            if let Some(failure) = failure {
+                let mut gate = lock(&self.requests);
+                gate.accepting = false;
+                gate.failed = true;
+                #[cfg(test)]
+                tests::hold_wake_failure(self);
+                if state.delivery_failure.is_none() {
+                    state.delivery_failure = Some(failure);
+                }
+                state.closed = true;
             }
-            state.closed = true;
+            // RMW preserves a racing terminal request. Notify under the SAME
+            // mutex the handoff waiter checks before atomically waiting.
+            #[cfg(test)]
+            wake_handoff_controls::before_clear(self);
+            self.wake_activity.fetch_sub(2, Ordering::Release);
+            self.changed.notify_all();
         }
-        self.changed.notify_all();
     }
 
     pub(super) fn publish(self: &Arc<Self>, result: DocumentResult) {
@@ -1754,6 +1828,15 @@ pub struct DocumentResultReceiver {
     observed_capacity: u64,
 }
 impl DocumentResultReceiver {
+    pub(crate) fn request_wake_handoff(&self) {
+        self.shared.request_wake_handoff();
+    }
+    pub(crate) fn wait_wake_handoff_until(&self, deadline: Instant) -> Result<u64, DocumentResultSettlementReason> {
+        self.shared.wait_wake_handoff_until(deadline)
+    }
+    pub(crate) fn wake_handoff_matches(&self, worker: u64) -> bool {
+        self.shared.worker_id == worker && self.shared.wake_activity.load(Ordering::Acquire) == 1
+    }
     /// Borrow the FIRST retained refusal; it may precede the current stale tag.
     pub fn retained_commit_error(&self) -> DocumentResultInspection<'_> {
         DocumentResultInspection { state: lock(&self.shared.state) }
@@ -2518,3 +2601,111 @@ impl Drop for SettlementActive {
 #[cfg(test)]
 #[path = "result_transport_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod wake_handoff_controls {
+    use super::*;
+    use std::sync::mpsc;
+    pub(super) struct Probe {
+        checked: mpsc::SyncSender<()>,
+        continue_wait: Option<mpsc::Receiver<()>>,
+        cleared_under_state: mpsc::SyncSender<bool>,
+        deadline: Instant,
+    }
+    pub(super) fn before_wait(shared: &Shared) {
+        let action = lock(&shared.wake_handoff_probe)
+            .as_mut()
+            .and_then(|probe| probe.continue_wait.take().map(|resume| (probe.checked.clone(), resume, probe.deadline)));
+        if let Some((checked, resume, deadline)) = action {
+            checked.send(()).unwrap();
+            resume.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+        }
+    }
+    pub(super) fn before_clear(shared: &Shared) {
+        if let Some(probe) = &*lock(&shared.wake_handoff_probe) {
+            probe
+                .cleared_under_state
+                .send(matches!(shared.state.try_lock(), Err(std::sync::TryLockError::WouldBlock)))
+                .unwrap();
+        }
+    }
+    fn check_race(fail: bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let budget = AllocationBudget::default();
+        let (entered, callback_entered) = mpsc::sync_channel(1);
+        let (release, held) = mpsc::sync_channel(1);
+        let held = Mutex::new(held);
+        let (shared, mut receiver) = Shared::new(&budget, move || {
+            entered.send(()).unwrap();
+            lock(&held).recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+            if fail { Err(io::Error::from_raw_os_error(123)) } else { Ok(()) }
+        })
+        .unwrap();
+        let callback_shared = shared.clone();
+        let callback = std::thread::spawn(move || callback_shared.wake());
+        callback_entered.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+        shared.request_wake_handoff();
+        let (checked, predicate_checked) = mpsc::sync_channel(1);
+        let (resume, continue_wait) = mpsc::sync_channel(1);
+        let (cleared_under_state, cleared) = mpsc::sync_channel(1);
+        *lock(&shared.wake_handoff_probe) =
+            Some(Probe { checked, continue_wait: Some(continue_wait), cleared_under_state, deadline });
+        let waiter_shared = shared.clone();
+        let waiter = std::thread::spawn(move || waiter_shared.wait_wake_handoff_until(deadline));
+        predicate_checked.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+        // The predicate has been checked while holding Shared.state. Make the
+        // original callback finish in precisely this check-to-wait interval.
+        release.send(()).unwrap();
+        resume.send(()).unwrap();
+        let result = waiter.join().unwrap();
+        callback.join().unwrap();
+        let mutex_held_at_clear = cleared.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+        *lock(&shared.wake_handoff_probe) = None;
+        receiver.close();
+        let activity = shared.wake_activity.load(Ordering::Acquire);
+        let original_code = match lock(&shared.state).delivery_failure.as_ref() {
+            Some(DocumentDeliveryFailure::Wake(error)) => error.raw_os_error(),
+            _ => None,
+        };
+        let fenced = lock(&shared.requests).failed;
+        drop(receiver); // all original test actors are joined before assertions
+        assert!(mutex_held_at_clear, "success AND failure clear/notify under the waiter mutex");
+        assert_eq!(activity, 1, "terminal request survives finalization");
+        if fail {
+            assert_eq!(result, Err(DocumentResultSettlementReason::WakeFailed));
+            assert_eq!(original_code, Some(123));
+            assert!(fenced, "exact failure and request fence precede active clear");
+        } else {
+            assert_eq!(result, Ok(shared.worker_id));
+            assert!(!fenced);
+        }
+        assert!(Instant::now() < deadline);
+    }
+    #[test]
+    fn successful_callback_check_to_wait_race_uses_same_mutex() {
+        check_race(false);
+    }
+    #[test]
+    fn failing_callback_check_to_wait_race_retains_fresh_error_and_fence() {
+        check_race(true);
+    }
+    #[test]
+    fn terminal_private_wake_never_reinvokes_callback_or_renews_deadline() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = count.clone();
+        let (shared, mut receiver) = Shared::new(&AllocationBudget::default(), move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        let deadline = Instant::now();
+        shared.request_wake_handoff();
+        shared.wake();
+        let result = shared.wait_wake_handoff_until(deadline);
+        receiver.close();
+        drop(receiver);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert_eq!(result, Err(DocumentResultSettlementReason::TimedOut));
+        assert_eq!(shared.wake_activity.load(Ordering::Acquire), 1);
+    }
+}

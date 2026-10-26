@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 use winit::application::ApplicationHandler;
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event_loop::ActiveEventLoop;
 
 static HOLD_TEXT_COMPLETION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HELD_TEXT_COMPLETION: std::sync::Mutex<
@@ -156,7 +156,7 @@ impl Metrics {
         }
     }
 }
-pub(crate) fn start(proxy: EventLoopProxy<UserEvent>) {
+pub(crate) fn start(proxy: super::HostProxy) {
     std::thread::spawn(move || {
         let usual = [
             (1800, Step::DismissSetup),

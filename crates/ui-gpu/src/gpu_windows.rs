@@ -927,6 +927,55 @@ impl Gpu {
     }
 }
 
+// R12 windowless notification fixture. No device, native handle or accepted GPU
+// work exists. ACTUAL Gpu::shutdown closes its sender and joins its callback
+// owner; this is protocol evidence, never D3D qualification.
+#[cfg(test)]
+pub(super) struct NotificationFixture {
+    pub(super) identity: usize,
+    exited: mpsc::Receiver<thread::ThreadId>,
+}
+#[cfg(test)]
+impl NotificationFixture {
+    pub(super) fn finish(self, deadline: std::time::Instant) {
+        self.exited
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("original windowless callback owner must exit within the original deadline");
+        assert!(self.exited.try_recv().is_err(), "exactly one original callback owner exits");
+        assert!(std::time::Instant::now() < deadline);
+    }
+}
+#[cfg(test)]
+pub(super) fn notification_fixture(
+    wake: impl Fn(Result<(), String>) + Send + 'static,
+    deadline: std::time::Instant,
+) -> (Gpu, NotificationFixture) {
+    let (wait, messages) = mpsc::channel::<Wait>();
+    let (exited, exit) = mpsc::sync_channel(1);
+    let readiness = Arc::new(Mutex::new(Readiness::Dormant));
+    let identity = Arc::as_ptr(&readiness) as usize;
+    let worker = thread::spawn(move || {
+        let result = match messages.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("windowless callback owner deadline".to_owned()),
+            Ok(message) => {
+                drop(message); // real Retirement quarantine behavior still applies
+                Err("windowless fixture accepts no native GPU work".to_owned())
+            }
+        };
+        drop(wake);
+        let _ = exited.send(thread::current().id());
+        result
+    });
+    (Gpu { backend: None, wait, thread: Some(worker), readiness }, NotificationFixture { identity, exited: exit })
+}
+#[cfg(test)]
+impl Gpu {
+    pub(super) fn notification_fixture_identity(&self) -> usize {
+        Arc::as_ptr(&self.readiness) as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

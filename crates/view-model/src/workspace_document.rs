@@ -915,6 +915,33 @@ pub struct WorkspaceDocumentTransport {
     budget: AllocationBudget,
 }
 
+/// Notification quiescence only: no result, ACK, source or join authority.
+/// Worker identities are checked and never reused by the original transport.
+#[derive(Debug)]
+pub struct DocumentWakeHandoff {
+    worker: u64,
+}
+/// Borrowed handoff failure custody; never extracts a source or acknowledges it.
+pub struct DocumentWakeInspection<'a> {
+    original: DocumentResultInspection<'a>,
+}
+impl DocumentWakeInspection<'_> {
+    pub fn delivery_failure(&self) -> Option<&DocumentDeliveryFailure> {
+        self.original.delivery_failure()
+    }
+    pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        match self.original.delivery_failure() {
+            Some(DocumentDeliveryFailure::WakePanicked(payload)) => Some(payload.as_ref()),
+            _ => None,
+        }
+    }
+}
+impl DocumentWakeHandoff {
+    pub fn matches(&self, transport: &WorkspaceDocumentTransport) -> bool {
+        transport.receiver.wake_handoff_matches(self.worker)
+    }
+}
+
 // A mistaken Drop is NOT successful cleanup. The original transport already
 // quarantines its worker/slot in that case; keep our reservation quarantined as
 // well (including initial destinations still owned by that worker). No source
@@ -934,6 +961,20 @@ impl Drop for AdapterCharge {
     }
 }
 impl WorkspaceDocumentTransport {
+    /// Nonblocking terminal request; retains this exact receiver and all data.
+    pub fn request_off_ui_wakes(&self) {
+        self.receiver.request_wake_handoff();
+    }
+    pub fn wake_handoff_inspection(&self) -> DocumentWakeInspection<'_> {
+        DocumentWakeInspection { original: self.receiver.retained_commit_error() }
+    }
+    /// OFF UI: wait for already claimed callbacks, using the original deadline.
+    pub fn wait_off_ui_wakes_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<DocumentWakeHandoff, DocumentResultSettlementReason> {
+        self.receiver.wait_wake_handoff_until(deadline).map(|worker| DocumentWakeHandoff { worker })
+    }
     /// OFF UI: no source owner or nested error is extracted from the slot.
     pub fn retained_commit_error(&self) -> DocumentResultInspection<'_> {
         self.receiver.retained_commit_error()
@@ -1242,6 +1283,10 @@ fn admit_start(
     // Source payload storage still belongs to the existing document budgets.
     let bytes = size_of::<WorkspaceDocumentTransport>()
         .checked_mul(2)
+        .and_then(|n| n.checked_add(2 * size_of::<DocumentWakeHandoff>()))
+        .and_then(|n| n.checked_add(2 * size_of::<DocumentWakeInspection<'_>>()))
+        .and_then(|n| n.checked_add(2 * size_of::<Result<DocumentWakeHandoff, DocumentResultSettlementReason>>()))
+        .and_then(|n| n.checked_add(size_of::<Instant>() + size_of::<&WorkspaceDocumentTransport>()))
         .and_then(|n| n.checked_add(2 * size_of::<WorkspaceDocumentShutdown>()))
         .and_then(|n| n.checked_add(size_of::<DocumentShutdownBindRefusal>()))
         .and_then(|n| n.checked_add(size_of::<WorkspaceDocumentStopRefusal>()))

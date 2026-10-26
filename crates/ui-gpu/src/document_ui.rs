@@ -130,6 +130,14 @@ struct FontTerminal<T> {
     changed: std::sync::Condvar,
     native: NativeExitObservation,
 }
+pub(super) struct FontWakeInspection<'a, T> {
+    state: std::sync::MutexGuard<'a, FontState<T>>,
+}
+impl<T> FontWakeInspection<'_, T> {
+    pub(super) fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.state.wake_panic.as_deref()
+    }
+}
 impl<T> Default for FontTerminal<T> {
     fn default() -> Self {
         Self {
@@ -194,6 +202,7 @@ impl<T: Send + 'static> StartupFont<T> {
                 )
             })
             .and_then(|n| n.checked_add(NativeExitObservation::operation_stack_bytes()?))
+            .and_then(|n| n.checked_add(2 * std::mem::size_of::<FontWakeInspection<'_, T>>()))
             // take_ready's wrapper -> shared body -> synchronous effect:
             // wrapper deadline/receiver, effect deadline/borrowed arguments,
             // and the added helper return overlap. All are stack-only values.
@@ -335,6 +344,9 @@ impl<T: Send + 'static> StartupFont<T> {
     pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.panic.as_deref()
     }
+    pub(super) fn wake_inspection(&self) -> FontWakeInspection<'_, T> {
+        FontWakeInspection { state: self.terminal.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
+    }
     /// OFF UI: successful native join is followed by explicit right retirement.
     /// ROOT's startup caller must use the existing off-UI executor as shutdown does.
     #[cfg(test)]
@@ -446,6 +458,46 @@ impl<T: Send + 'static> StartupFont<T> {
         drop(self.take_ready_with(deadline, NativeExitObservation::wait_until)?);
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn notification_fixture_cleanup_until(
+        &mut self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Result<(), FontSettlementReason> {
+        // Fixture teardown ONLY. Never pass cleanup_deadline to a production
+        // settlement/deadline setter, and never clear the original verdict.
+        if std::time::Instant::now() >= cleanup_deadline {
+            return Err(FontSettlementReason::TimedOut);
+        }
+        if let Some(original) = &self.thread {
+            let observed =
+                self.terminal.native.wait_until(original, cleanup_deadline).map_err(FontSettlementReason::Native)?;
+            if observed != NativeExitState::Exited {
+                return Err(FontSettlementReason::ThreadExitPending);
+            }
+            if std::time::Instant::now() >= cleanup_deadline {
+                return Err(FontSettlementReason::TimedOut);
+            }
+            if let Err(original) = self.thread.take().unwrap().join() {
+                if self.panic.is_none() {
+                    self.panic = Some(original);
+                } else {
+                    std::mem::forget(original);
+                }
+            }
+            self.retirement_pending = true;
+        }
+        if self.retirement_pending {
+            if std::time::Instant::now() >= cleanup_deadline {
+                return Err(FontSettlementReason::TimedOut);
+            }
+            self.terminal.native.retire_after_join().map_err(FontSettlementReason::Native)?;
+            self.retirement_pending = false;
+        }
+        if std::time::Instant::now() >= cleanup_deadline {
+            return Err(FontSettlementReason::TimedOut);
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct Host {
@@ -499,7 +551,8 @@ impl App {
         let proxy = self.proxy.clone();
         match self.view.start_bounded_document_worker_at(root, self.wrap.budget(), move || {
             proxy
-                .send_event(UserEvent::DocumentReady)
+                .send_owned_wake(UserEvent::DocumentReady)
+                .map(|_| ())
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "GUI document wake closed"))
         }) {
             Ok(transport) => {

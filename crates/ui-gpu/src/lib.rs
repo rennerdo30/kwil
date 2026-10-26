@@ -36,6 +36,7 @@ mod markdown_diagram;
 mod markdown_images;
 mod markdown_ui;
 mod menu;
+mod notification;
 mod palette_ui;
 mod palette_view;
 mod prompt_ui;
@@ -56,6 +57,7 @@ mod zoom;
 
 use font::Font;
 use kwil_view_model::{CommandArgs, CommandStatus, Damage, Notify, View, Workspace};
+use notification::HostProxy;
 #[cfg(all(feature = "gpu", not(windows)))]
 mod gpu;
 #[cfg(all(feature = "gpu", windows))]
@@ -84,8 +86,9 @@ use std::sync::Arc as Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{Window, WindowId};
 
 fn bg() -> u32 {
@@ -146,8 +149,8 @@ impl std::fmt::Display for GuiError {
 }
 
 enum UserEvent {
-    FileDialog(file_dialog::Event),
-    CloseDialog(close_dialog::Reply),
+    FileDialog(notification::Receipt<file_dialog::Event>),
+    CloseDialog(notification::Receipt<close_dialog::Reply>),
     HighlightsReady,
     WrapReady,
     StartupFontReady,
@@ -162,7 +165,9 @@ enum UserEvent {
     SettingsPanelReady,
     WelcomeReady,
     RegistrationReady,
-    RegistrationStarted(Result<Box<kwil_view_model::file_type_registration::FileTypeRegistration>, String>),
+    RegistrationStarted(
+        notification::Delivery<Result<Box<kwil_view_model::file_type_registration::FileTypeRegistration>, String>>,
+    ),
     /// Owner-free wake for the single bounded worker result slot.
     DocumentReady,
     OpenExternal,
@@ -179,35 +184,92 @@ enum UserEvent {
     SessionChanged(bool),
     DroppedFile(std::path::PathBuf),
     #[cfg(feature = "gpu")]
-    GpuReady(Result<Box<gpu::Gpu>, String>, f64),
+    GpuReady(notification::Delivery<Result<Box<gpu::Gpu>, String>>, f64),
     #[cfg(feature = "gpu")]
     GpuAvailable(Result<(), String>),
     #[cfg(feature = "frame-harness")]
     Harness(harness::Step),
 }
 
-/// The same host can receive bounded worker wake events in dispatch tests
-/// without constructing a native event loop or window.
-#[derive(Clone)]
-enum HostProxy {
-    Native(EventLoopProxy<UserEvent>),
-    #[cfg(test)]
-    Test(std::sync::mpsc::Sender<UserEvent>),
-}
-impl HostProxy {
-    fn send_event(&self, event: UserEvent) -> Result<(), ()> {
+impl UserEvent {
+    fn notification_policy(&self) -> notification::Policy {
+        use notification::Policy;
         match self {
-            Self::Native(proxy) => proxy.send_event(event).map_err(|_| ()),
-            #[cfg(test)]
-            Self::Test(sender) => sender.send(event).map_err(|_| ()),
+            Self::HighlightsReady
+            | Self::WrapReady
+            | Self::StartupFontReady
+            | Self::SearchReady
+            | Self::PaletteReady
+            | Self::SettingsPanelReady
+            | Self::WelcomeReady
+            | Self::RegistrationReady
+            | Self::DocumentReady
+            | Self::LogReady => Policy::Wake,
+            Self::PaletteRoot(_)
+            | Self::SettingsPath(_)
+            | Self::Notice(_)
+            | Self::WindowPlacementLoaded(_)
+            | Self::DiagnosticsReady(_)
+            | Self::FontReady(_)
+            | Self::UiFontReady(_)
+            | Self::UiFallbackReady(_, _)
+            | Self::GlyphReady(_, _)
+            | Self::SettingsReady(_, _)
+            | Self::MarkdownReady(_) => Policy::Value,
+            Self::SessionChanged(_) | Self::WindowPlacementProgress | Self::DroppedFile(_) => Policy::Intent,
+            #[cfg(windows)]
+            Self::WindowPlacementTouched => Policy::Intent,
+            #[cfg(feature = "frame-harness")]
+            Self::Harness(_) => Policy::Intent,
+            Self::OpenExternal => Policy::ExternalOpen,
+            Self::FileDialog(_) | Self::CloseDialog(_) => Policy::Control,
+            Self::RegistrationStarted(_) => Policy::Owner,
+            #[cfg(feature = "gpu")]
+            Self::GpuReady(_, _) => Policy::Owner,
+            #[cfg(feature = "gpu")]
+            Self::GpuAvailable(Ok(())) => Policy::Readiness,
+            #[cfg(feature = "gpu")]
+            Self::GpuAvailable(Err(_)) => Policy::GpuError,
         }
     }
-    #[cfg(feature = "frame-harness")]
-    fn native(&self) -> Option<EventLoopProxy<UserEvent>> {
+    fn notification_name(&self) -> &'static str {
         match self {
-            Self::Native(proxy) => Some(proxy.clone()),
-            #[cfg(test)]
-            Self::Test(_) => None,
+            Self::FileDialog(_) => "FileDialog",
+            Self::CloseDialog(_) => "CloseDialog",
+            Self::HighlightsReady => "HighlightsReady",
+            Self::WrapReady => "WrapReady",
+            Self::StartupFontReady => "StartupFontReady",
+            Self::SearchReady => "SearchReady",
+            Self::WindowPlacementLoaded(_) => "WindowPlacementLoaded",
+            Self::WindowPlacementProgress => "WindowPlacementProgress",
+            #[cfg(windows)]
+            Self::WindowPlacementTouched => "WindowPlacementTouched",
+            Self::PaletteRoot(_) => "PaletteRoot",
+            Self::PaletteReady => "PaletteReady",
+            Self::SettingsPath(_) => "SettingsPath",
+            Self::SettingsPanelReady => "SettingsPanelReady",
+            Self::WelcomeReady => "WelcomeReady",
+            Self::RegistrationReady => "RegistrationReady",
+            Self::RegistrationStarted(_) => "RegistrationStarted",
+            Self::DocumentReady => "DocumentReady",
+            Self::OpenExternal => "OpenExternal",
+            Self::Notice(_) => "Notice",
+            Self::GlyphReady(_, _) => "GlyphReady",
+            Self::SettingsReady(_, _) => "SettingsReady",
+            Self::DiagnosticsReady(_) => "DiagnosticsReady",
+            Self::LogReady => "LogReady",
+            Self::MarkdownReady(_) => "MarkdownReady",
+            Self::FontReady(_) => "FontReady",
+            Self::UiFontReady(_) => "UiFontReady",
+            Self::UiFallbackReady(_, _) => "UiFallbackReady",
+            Self::SessionChanged(_) => "SessionChanged",
+            Self::DroppedFile(_) => "DroppedFile",
+            #[cfg(feature = "gpu")]
+            Self::GpuReady(_, _) => "GpuReady",
+            #[cfg(feature = "gpu")]
+            Self::GpuAvailable(_) => "GpuAvailable",
+            #[cfg(feature = "frame-harness")]
+            Self::Harness(_) => "Harness",
         }
     }
 }
@@ -229,6 +291,53 @@ struct Gfx {
     #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: isize,
     pixels: Vec<u32>,
+}
+
+// Actual origin-only owners, moved here after dispatch and retained on failure.
+type OriginUiOwners = (Option<Gfx>, Option<desktop_window::Dialog>, file_dialog::Dialogs, Option<close_dialog::Ticket>);
+
+#[cfg(feature = "gpu")]
+struct GpuNotificationCallback {
+    capability: notification::CallbackCapability,
+}
+#[cfg(feature = "gpu")]
+impl GpuNotificationCallback {
+    fn send(&self, result: Result<(), String>) {
+        let wake = self.capability.proxy();
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(original) => match wake.retain_gpu_error(original) {
+                Ok(diagnostic) => Err(diagnostic),
+                Err(reason) => {
+                    wake.fail(reason);
+                    return;
+                }
+            },
+        };
+        let _ = wake.send_event(UserEvent::GpuAvailable(result));
+    }
+}
+#[cfg(feature = "gpu")]
+struct GpuNotificationProducer {
+    proxy: HostProxy,
+    transfer: notification::ProducerTransfer,
+    callback: GpuNotificationCallback,
+}
+#[cfg(feature = "gpu")]
+impl GpuNotificationProducer {
+    fn run(self) {
+        let Self { proxy, transfer, callback } = self;
+        transfer.start();
+        let start = std::time::Instant::now();
+        let result = gpu::Gpu::init_with_wake(move |result| callback.send(result));
+        if result.is_err() {
+            transfer.no_owner_created();
+        }
+        let _ = proxy.send_event(UserEvent::GpuReady(
+            transfer.publish(result.map(Box::new)),
+            start.elapsed().as_secs_f64() * 1000.0,
+        ));
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -487,20 +596,38 @@ pub fn run_workspace_with_external_open(
     on_event: Box<dyn FnMut(GuiEvent)>,
     on_external_ready: Box<dyn FnOnce(ExternalOpen)>,
 ) -> std::ops::ControlFlow<GuiStartRefusal, Result<(), GuiError>> {
-    let (document, event_loop, budget) = match document_ui::prepare_startup(workspace, budget, || {
+    let (mut document, event_loop, budget) = match document_ui::prepare_startup(workspace, budget, || {
         trace::mark("gui entry");
         EventLoop::<UserEvent>::with_user_event().build().map_err(GuiStartReason::EventLoop)
     }) {
         std::ops::ControlFlow::Break(refusal) => return std::ops::ControlFlow::Break(refusal),
         std::ops::ControlFlow::Continue(prepared) => prepared,
     };
+    let proxy = match HostProxy::admit(event_loop.create_proxy(), &budget) {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            // No callback/producer has ever escaped: this original loop is unstarted.
+            document.frontend_error = Some(GuiError::Unavailable(error.to_string()));
+            return std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(document)));
+        }
+    };
+    document.notifications = Some(proxy.clone());
+    let mut origin = match notification::OriginLoopOwner::<_, OriginUiOwners>::admit(event_loop, proxy.clone(), &budget)
+    {
+        Ok(origin) => origin,
+        Err((unstarted_loop, error)) => {
+            drop(unstarted_loop); // still no escaped callback or started producer
+            document.frontend_error = Some(GuiError::Unavailable(error.to_string()));
+            return std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(document)));
+        }
+    };
     // The retained original owner stays outside this guard too. Fallible font
     // spawns and source-free App initialization only borrow its preallocated box.
     let mut document = Some(document);
     let initialized =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<App, document_ui::FontSpawnFailure> {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            let proxy = HostProxy::Native(event_loop.create_proxy());
+            origin.receiver_mut().set_control_flow(ControlFlow::Wait);
+            let proxy = proxy.clone();
             let open_proxy = proxy.clone();
             let (external_open, external_inbox) = kwil_view_model::document_worker::external_open_channel(move || {
                 open_proxy
@@ -517,7 +644,8 @@ pub fn run_workspace_with_external_open(
                 move || Font::startup(font_size_rx),
                 move || {
                     font_proxy
-                        .send_event(UserEvent::StartupFontReady)
+                        .send_owned_wake(UserEvent::StartupFontReady)
+                        .map(|_| ())
                         .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
                 },
             )?;
@@ -528,7 +656,8 @@ pub fn run_workspace_with_external_open(
                 move || font::UiFont::startup(ui_font_size_rx),
                 move || {
                     font_proxy
-                        .send_event(UserEvent::StartupFontReady)
+                        .send_owned_wake(UserEvent::StartupFontReady)
+                        .map(|_| ())
                         .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
                 },
             )?;
@@ -648,7 +777,7 @@ pub fn run_workspace_with_external_open(
             })
         }));
     let mut app = match initialized {
-        Ok(Ok(app)) => app,
+        Ok(Ok(app)) => std::mem::ManuallyDrop::new(app),
         result => {
             let mut failure = document.take().unwrap();
             match result {
@@ -679,7 +808,7 @@ pub fn run_workspace_with_external_open(
             }
         };
         app.logs.admit_projection_disk(1 << 30); // Same aggregate disk admission as SearchWorker::new.
-        event_loop.run_app(&mut app)
+        origin.receiver_mut().run_app_on_demand(&mut *app)
     }));
     let result = match attempted {
         Ok(result) => result,
@@ -688,71 +817,12 @@ pub fn run_workspace_with_external_open(
             Ok(())
         }
     };
-    app.desktop_window.take();
-    // Transfer every owner before awaiting any result. The GUI loop has ended;
-    // these jobs await existing workers, which keep all I/O off the frontend.
-    let prep_job = app.registration_prep.take().map(|handle| {
-        Box::new(move || handle.join().map_err(|_| "registration preparation panicked".to_owned())) as shutdown::Job
-    });
-    let welcome_job = app.welcome_worker.take().map(|worker| {
-        let handle = worker.stop();
-        Box::new(move || {
-            let report = handle.join();
-            let mut errors = Vec::new();
-            if report.worker_result.is_err() {
-                errors.push("setup worker panicked".to_owned());
-            }
-            for report in report.reports {
-                if let welcome::Report::Completed(completion) = report {
-                    if let Err(error) = completion.result {
-                        errors.push(format!("Setup completion: {error}"));
-                    }
-                    if let Some(path) = completion.retained_temporary {
-                        errors.push(format!("Setup cleanup retained: {}", path.display()));
-                    }
-                }
-            }
-            if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
-        }) as shutdown::Job
-    });
-    let registration_job = app.file_types.take().map(|page| {
-        let handle = page.service.stop();
-        Box::new(move || handle.shutdown()) as shutdown::Job
-    });
-    let settings_job = app.settings_panel.as_mut().map(|panel| {
-        let handle = panel.stop();
-        Box::new(move || handle.shutdown()) as shutdown::Job
-    });
-    #[cfg(all(feature = "gpu", windows))]
-    let gpu_job = app.gpu.take().map(|gpu| Box::new(move || gpu.shutdown()) as shutdown::Job);
-    #[cfg(all(feature = "gpu", not(windows)))]
-    let gpu_job = app.gpu.take().map(|gpu| Box::new(move || gpu.shutdown().wait()) as shutdown::Job);
-    #[cfg(not(feature = "gpu"))]
-    let gpu_job = None;
-    let diagnostics_job = app.about.shutdown();
-    let placement_latest = app.window_latest;
-    let placement_job = app.window_placement.take().map(|service| {
-        Box::new(move || {
-            std::thread::spawn(move || service.stop(placement_latest))
-                .join()
-                .map_err(|_| "Window placement shutdown panicked".to_owned())?
-        }) as shutdown::Job
-    });
-    let shutdown_result = shutdown::drain([
-        prep_job,
-        welcome_job,
-        registration_job,
-        settings_job,
-        placement_job,
-        gpu_job,
-        diagnostics_job,
-    ]);
-    if let Some(palette) = &mut app.palette {
-        let handles = palette.stop();
-        // Preserve the existing palette cleanup and require its actual joins.
-        for handle in handles {
-            let _ = handle.join();
-        }
+    // Seal notification/admission without waiting on this origin/UI thread.
+    app.external_inbox.close();
+    proxy.request_terminal();
+    app.document.deadline.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(35));
+    if let Some(transport) = &app.document.live.transport {
+        transport.request_off_ui_wakes();
     }
     let App {
         document: mut failure,
@@ -770,9 +840,34 @@ pub fn run_workspace_with_external_open(
         font_size,
         ui_font_thread,
         ui_font_size,
+        registration_prep,
+        welcome_worker,
+        file_types,
+        settings_panel,
+        window_placement,
+        window_latest,
+        about,
+        palette,
+        #[cfg(feature = "gpu")]
+        gpu,
+        gfx,
+        desktop_window,
+        file_dialogs,
+        close_dialog,
         ..
-    } = app;
-    failure.auxiliary_error = shutdown_result.err();
+    } = std::mem::ManuallyDrop::into_inner(app);
+    origin.retain_owners((gfx, desktop_window, file_dialogs, close_dialog));
+    failure.auxiliary = shutdown::AuxiliaryOwners {
+        prep: registration_prep,
+        welcome: welcome_worker,
+        registration: file_types,
+        settings: settings_panel,
+        placement: window_placement.map(|service| (service, window_latest)),
+        diagnostics: Some(about),
+        palette,
+        #[cfg(feature = "gpu")]
+        gpu,
+    };
     failure.frontend_error = error;
     failure.event_loop_error = result.err();
     failure.font = font_thread;
@@ -800,7 +895,22 @@ pub fn run_workspace_with_external_open(
     {
         return std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(failure)));
     }
-    std::ops::ControlFlow::Continue(Ok(()))
+    let success = match failure.take_final_success() {
+        Ok(success) => success,
+        Err(_) => return std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(failure))),
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| origin.release(success))) {
+        Ok(Ok(())) => std::ops::ControlFlow::Continue(Ok(())),
+        Ok(Err(reason)) => {
+            failure.notification_refused(reason);
+            std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(failure)))
+        }
+        Err(payload) => {
+            failure.panic = Some(payload);
+            failure.notification_refused(notification::Reason::NativePanicked);
+            std::ops::ControlFlow::Continue(Err(GuiError::Shutdown(failure)))
+        }
+    }
 }
 
 impl App {
@@ -923,11 +1033,8 @@ impl App {
             let _ = proxy.send_event(UserEvent::SettingsPath(result));
         });
         #[cfg(feature = "frame-harness")]
-        if self.opts.hidden
-            && std::env::var_os("KWIL_FRAME_SCRIPT").is_some()
-            && let Some(proxy) = self.proxy.native()
-        {
-            harness::start(proxy);
+        if self.opts.hidden && std::env::var_os("KWIL_FRAME_SCRIPT").is_some() {
+            harness::start(self.proxy.clone());
         }
         if let Some(cb) = self.on_first_frame.take() {
             let p = self.proxy.clone();
@@ -3106,7 +3213,9 @@ impl ApplicationHandler<UserEvent> for App {
                 Damage::default()
             }
             UserEvent::CloseDialog(reply) => {
-                self.close_dialog_event(reply);
+                if !self.consume_close_dialog_notification(reply) {
+                    return;
+                }
                 if self.may_exit() {
                     el.exit();
                 }
@@ -3114,7 +3223,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             UserEvent::FileDialog(event) => {
-                self.file_dialog_event(event);
+                if !self.consume_file_dialog_notification(event) {
+                    return;
+                }
                 if self.may_exit() {
                     el.exit();
                 }
@@ -3253,21 +3364,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.welcome_registration_changed();
                 Damage { full: true, status: true, ..Default::default() }
             }
-            UserEvent::RegistrationStarted(result) => {
-                self.welcome_view.hits = Default::default();
-                self.registration_starting = false;
-                match result {
-                    Ok(mut service) => {
-                        service.worker_ready();
-                        self.file_types = Some(filetypes_ui::Page { service: *service, ui: Default::default() });
-                    }
-                    Err(error) => {
-                        self.view.set_notice(format!("File-type setup: {error}"));
-                        self.welcome_view.problem = Some(error);
-                    }
-                }
-                Damage { full: true, status: true, ..Default::default() }
-            }
+            UserEvent::RegistrationStarted(result) => self.adopt_registration_notification(result),
             UserEvent::SettingsPath(path) => {
                 self.registration_path = path.as_ref().ok().cloned();
                 if self.welcome_worker.is_none() {
@@ -3490,25 +3587,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             #[cfg(feature = "gpu")]
             UserEvent::GpuReady(result, ms) => {
-                if std::env::var_os("KWIL_TRACE_STARTUP").is_some() {
-                    eprintln!("kwil-gpu device_init_ms={ms:.3} native_dx12_damage_present={}", cfg!(windows));
-                }
-                match result {
-                    #[allow(unused_mut)]
-                    Ok(mut gpu) => {
-                        #[cfg(not(windows))]
-                        if let Some(gfx) = &self.gfx
-                            && let gpu::Presented::Failed(error) = gpu.attach_window(gfx.window.clone())
-                        {
-                            eprintln!("kwil GPU surface unavailable: {error}");
-                            self.apply(Damage { full: true, ..Default::default() });
-                            return;
-                        }
-                        self.gpu = Some(*gpu);
-                    }
-                    Err(error) => eprintln!("kwil-gpu unavailable: {error}"),
-                }
-                self.apply(Damage { full: true, ..Default::default() });
+                self.adopt_gpu_notification(result, ms);
                 return;
             }
             #[cfg(feature = "gpu")]
@@ -4151,6 +4230,45 @@ impl App {
             g.pixels.resize(self.size.0 * self.size.1, bg());
         }
     }
+    #[cfg(feature = "gpu")]
+    fn adopt_gpu_notification(&mut self, mut result: notification::Delivery<Result<Box<gpu::Gpu>, String>>, ms: f64) {
+        if !result.matches(&self.proxy, notification::SlotKind::Gpu) {
+            self.proxy.fail(notification::Reason::Identity);
+            return;
+        }
+        if std::env::var_os("KWIL_TRACE_STARTUP").is_some() {
+            eprintln!("kwil-gpu device_init_ms={ms:.3} native_dx12_damage_present={}", cfg!(windows));
+        }
+        match result.value_mut() {
+            Ok(gpu) => {
+                #[cfg(not(windows))]
+                if let Some(gfx) = &self.gfx
+                    && let gpu::Presented::Failed(error) = gpu.attach_window(gfx.window.clone())
+                {
+                    eprintln!("kwil GPU surface unavailable: {error}");
+                    self.apply(Damage { full: true, ..Default::default() });
+                    return;
+                }
+                #[cfg(windows)]
+                let _ = gpu;
+                if let Err(reason) = result.adopt_into(&mut self.gpu, |result| {
+                    let Ok(gpu) = result else { unreachable!() };
+                    *gpu
+                }) {
+                    self.proxy.fail(reason);
+                }
+            }
+            Err(_) => {
+                if let Err(reason) = result.consume_error(|result| {
+                    let Err(error) = result else { unreachable!() };
+                    eprintln!("kwil-gpu unavailable: {error}");
+                }) {
+                    self.proxy.fail(reason);
+                }
+            }
+        }
+        self.apply(Damage { full: true, ..Default::default() });
+    }
     fn reload_font(&mut self) {
         if self.font_loading {
             self.font_reload_pending = true;
@@ -4244,17 +4362,26 @@ impl App {
         {
             self.gpu_started = true;
             let proxy = self.proxy.clone();
-            std::thread::spawn(move || {
-                let start = std::time::Instant::now();
-                let result = {
-                    let wake = proxy.clone();
-                    gpu::Gpu::init_with_wake(move |result| {
-                        let _ = wake.send_event(UserEvent::GpuAvailable(result));
-                    })
-                };
-                let _ =
-                    proxy.send_event(UserEvent::GpuReady(result.map(Box::new), start.elapsed().as_secs_f64() * 1000.0));
-            });
+            let transfer = match proxy.reserve(
+                notification::SlotKind::Gpu,
+                2 * std::mem::size_of::<GpuNotificationProducer>()
+                    + 2 * std::mem::size_of::<notification::Delivery<Result<Box<gpu::Gpu>, String>>>(),
+            ) {
+                Ok(transfer) => transfer,
+                Err(reason) => {
+                    proxy.fail(reason);
+                    return;
+                }
+            };
+            let capability = match proxy.reserve_callback(2 * std::mem::size_of::<GpuNotificationCallback>()) {
+                Ok(capability) => capability,
+                Err(reason) => {
+                    proxy.fail(reason);
+                    return;
+                }
+            };
+            let capture = GpuNotificationProducer { proxy, transfer, callback: GpuNotificationCallback { capability } };
+            std::thread::spawn(move || capture.run());
         }
     }
 }

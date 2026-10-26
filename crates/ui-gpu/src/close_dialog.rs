@@ -35,6 +35,53 @@ pub(super) struct Reply {
     pub ticket: Ticket,
     pub outcome: Result<Choice, String>,
 }
+
+struct ConfirmationNotificationProducer {
+    reply_ticket: Ticket,
+    proxy: HostProxy,
+    endpoint: notification::ControlEndpoint,
+    owner: isize,
+    label: String,
+}
+impl ConfirmationNotificationProducer {
+    fn admit(reply_ticket: Ticket, proxy: HostProxy, owner: isize, label: String) -> Result<Self, String> {
+        let endpoint = proxy
+            .control_endpoint(
+                notification::SlotKind::Confirmation,
+                2 * std::mem::size_of::<Self>() + 2 * std::mem::size_of::<notification::Receipt<Reply>>(),
+            )
+            .map_err(|reason| {
+                proxy.fail(reason);
+                format!("Confirmation notification admission: {reason:?}")
+            })?;
+        Ok(Self { reply_ticket, proxy, endpoint, owner, label })
+    }
+    fn run(self) {
+        self.endpoint.start();
+        let outcome = show(self.owner, &self.label, &self.reply_ticket);
+        let _ = self.publish(outcome);
+    }
+    fn publish(self, outcome: Result<Choice, String>) -> Result<(), notification::SendRefusal> {
+        let outcome = match outcome {
+            Err(original) => match self.proxy.retain_control_error(original) {
+                Ok(diagnostic) => Err(diagnostic),
+                Err(reason) => {
+                    self.proxy.fail(reason);
+                    return Err(notification::SendRefusal::Fatal(reason));
+                }
+            },
+            outcome => outcome,
+        };
+        match self.endpoint.receipt(Reply { ticket: self.reply_ticket, outcome }, true) {
+            Ok(receipt) => self.proxy.send_event(UserEvent::CloseDialog(receipt)),
+            Err(original) => {
+                self.proxy.fail(notification::Reason::UnresolvedControl);
+                std::mem::forget(original);
+                Err(notification::SendRefusal::RefusedControl)
+            }
+        }
+    }
+}
 impl CloseTicket {
     fn capture(view: &Workspace) -> Option<Self> {
         let editor = view.editor()?;
@@ -73,6 +120,23 @@ impl Ticket {
     }
 }
 impl App {
+    pub(super) fn consume_close_dialog_notification(&mut self, reply: notification::Receipt<Reply>) -> bool {
+        if !reply.matches(&self.proxy, notification::SlotKind::Confirmation) {
+            self.proxy.fail(notification::Reason::Identity);
+            return false;
+        }
+        if !self.close_dialog.as_ref().is_some_and(|ticket| ticket.same_request(&reply.value().ticket)) {
+            self.proxy.fail(notification::Reason::Identity);
+            return false;
+        }
+        match reply.consume(|reply| self.close_dialog_event(reply)) {
+            Ok(()) => true,
+            Err(reason) => {
+                self.proxy.fail(reason);
+                false
+            }
+        }
+    }
     pub(super) fn sync_close_dialog(&mut self) {
         self.sync_binary_input();
         if self.file_dialogs.exiting() || self.file_dialogs.busy() {
@@ -127,12 +191,10 @@ impl App {
     }
     fn launch_confirmation(&mut self, ticket: Ticket, owner: isize, label: String) {
         self.submit_confirmation(ticket, move |reply_ticket, proxy| {
+            let capture = ConfirmationNotificationProducer::admit(reply_ticket, proxy, owner, label)?;
             std::thread::Builder::new()
                 .name("kwil-close-confirmation".into())
-                .spawn(move || {
-                    let outcome = show(owner, &label, &reply_ticket);
-                    let _ = proxy.send_event(UserEvent::CloseDialog(Reply { ticket: reply_ticket, outcome }));
-                })
+                .spawn(move || capture.run())
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         });
@@ -216,6 +278,24 @@ impl App {
             || matches!(&self.close_dialog, Some(Ticket::Binary(prompt)) if prompt.native)
     }
 }
+/// Windowless native-effect adapter: actual captured request, actual production
+/// submit/receipt/identity/choice handling; never a terminal synthetic Cancel.
+#[cfg(test)]
+pub(super) fn notification_fixture_reply(app: &mut App, deadline: std::time::Instant) {
+    assert!(std::time::Instant::now() < deadline);
+    app.view.request_window_close(false).unwrap();
+    let ticket = Ticket::capture(&app.view).expect("actual dirty close must provide the original captured ticket");
+    let hidden = app.opts.hidden;
+    app.opts.hidden = false; // injected adapter below never calls native show()
+    let admitted = app.submit_confirmation(ticket, |reply_ticket, proxy| {
+        ConfirmationNotificationProducer::admit(reply_ticket, proxy, 0, "windowless protocol".into())?
+            .publish(Ok(Choice::Cancel))
+            .map_err(|reason| format!("windowless confirmation publication: {reason:?}"))
+    });
+    app.opts.hidden = hidden;
+    assert!(admitted, "production confirmation request must actually be admitted");
+}
+
 #[cfg(windows)]
 fn show(owner: isize, label: &str, purpose: &Ticket) -> Result<Choice, String> {
     use windows_sys::Win32::UI::Controls::*;

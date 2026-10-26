@@ -32,6 +32,8 @@ pub enum Status {
     Markdown(super::markdown_ui::SettlementReason),
     EditorFont(super::document_ui::FontSettlementReason),
     ChromeFont(super::document_ui::FontSettlementReason),
+    Notification(super::notification::Reason),
+    DocumentNotification(kwil_view_model::document_worker::DocumentResultSettlementReason),
     Spawn,
     Panicked,
 }
@@ -48,6 +50,127 @@ pub(super) struct Owners {
     pub search: Option<kwil_view_model::search_session::SearchSession>,
     pub external_inbox: kwil_view_model::document_worker::ExternalOpenInbox,
     pub external_open: Option<kwil_view_model::document_worker::ExternalOpen>,
+}
+
+/// Concrete original owners cross the ONE existing scoped executor. Erased
+/// non-Send Jobs are constructed and consumed only inside that executor.
+#[derive(Default)]
+pub(super) struct AuxiliaryOwners {
+    pub prep: Option<std::thread::JoinHandle<()>>,
+    pub welcome: Option<super::welcome::Worker>,
+    pub registration: Option<super::filetypes_ui::Page>,
+    pub settings: Option<kwil_view_model::settings_session::SettingsSession>,
+    pub placement: Option<(super::window_placement::Service, Option<super::window_placement::Placement>)>,
+    pub diagnostics: Option<super::about::About>,
+    pub palette: Option<kwil_view_model::palette_session::PaletteSession>,
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<super::gpu::Gpu>,
+}
+impl AuxiliaryOwners {
+    fn pending(&self) -> bool {
+        let pending = self.prep.is_some()
+            || self.welcome.is_some()
+            || self.registration.is_some()
+            || self.settings.is_some()
+            || self.placement.is_some()
+            || self.diagnostics.is_some()
+            || self.palette.is_some();
+        #[cfg(feature = "gpu")]
+        let pending = pending || self.gpu.is_some();
+        pending
+    }
+    fn metadata_bytes() -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_mul(2)?
+            .checked_add(2 * std::mem::size_of::<[Option<Job>; 8]>())?
+            .checked_add(std::mem::size_of::<super::welcome::Shutdown>())?
+            .checked_add(std::mem::size_of::<kwil_view_model::file_type_registration::RegistrationRetirement>())?
+            .checked_add(std::mem::size_of::<kwil_view_model::settings_session::SettingsShutdown>())?
+            .checked_add(2 * std::mem::size_of::<Result<(), String>>())
+    }
+    fn settle(&mut self, panic: &mut Option<Box<dyn std::any::Any + Send>>) -> Result<(), String> {
+        let prep = self.prep.take().map(|handle| {
+            Box::new(move || handle.join().map_err(|_| "registration preparation panicked".to_owned())) as Job
+        });
+        let welcome = self.welcome.take().map(|worker| {
+            Box::new(move || {
+                let report = worker.stop().join();
+                let mut errors = Vec::new();
+                if report.worker_result.is_err() {
+                    errors.push("setup worker panicked".to_owned());
+                }
+                for report in report.reports {
+                    if let super::welcome::Report::Completed(completion) = report {
+                        if let Err(error) = completion.result {
+                            errors.push(format!("Setup completion: {error}"));
+                        }
+                        if let Some(path) = completion.retained_temporary {
+                            errors.push(format!("Setup cleanup retained: {}", path.display()));
+                        }
+                    }
+                }
+                if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+            }) as Job
+        });
+        let registration = self.registration.take().map(|page| Box::new(move || page.service.stop().shutdown()) as Job);
+        let settings = self.settings.take().map(|mut panel| Box::new(move || panel.stop().shutdown()) as Job);
+        let placement = self.placement.take().map(|(service, latest)| {
+            Box::new(move || {
+                std::thread::spawn(move || service.stop(latest))
+                    .join()
+                    .map_err(|_| "Window placement shutdown panicked".to_owned())?
+            }) as Job
+        });
+        #[cfg(all(feature = "gpu", windows))]
+        let gpu = self.gpu.take().map(|gpu| Box::new(move || gpu.shutdown()) as Job);
+        #[cfg(all(feature = "gpu", not(windows)))]
+        let gpu = self.gpu.take().map(|gpu| Box::new(move || gpu.shutdown().wait()) as Job);
+        #[cfg(not(feature = "gpu"))]
+        let gpu = None;
+        let diagnostics = self.diagnostics.take().map(|mut about| {
+            Box::new(move || match about.shutdown() {
+                Some(job) => job(),
+                None => Ok(()),
+            }) as Job
+        });
+        let palette = self.palette.take().map(|mut palette| {
+            Box::new(move || {
+                for handle in palette.stop() {
+                    let _ = handle.join();
+                }
+                Ok(())
+            }) as Job
+        });
+        // No stop method runs while building this array. A panicking job cannot
+        // bypass the other original jobs; drain catches each original payload.
+        drain_with_custody([prep, welcome, registration, settings, placement, gpu, diagnostics, palette], panic)
+    }
+}
+impl Drop for AuxiliaryOwners {
+    fn drop(&mut self) {
+        // A refused executor/preamble must not implicitly retire original owners
+        // on the frontend. Failure's matching metadata charge is retained too.
+        std::mem::forget(self.prep.take());
+        std::mem::forget(self.welcome.take());
+        std::mem::forget(self.registration.take());
+        std::mem::forget(self.settings.take());
+        std::mem::forget(self.placement.take());
+        std::mem::forget(self.diagnostics.take());
+        std::mem::forget(self.palette.take());
+        #[cfg(feature = "gpu")]
+        std::mem::forget(self.gpu.take());
+    }
+}
+
+/// Minted only after the original full cleanup and combined error checks.
+pub(super) struct FinalSuccess {
+    native: super::notification::NativeQuiescenceProof,
+    deadline: Instant,
+}
+impl FinalSuccess {
+    pub(super) fn into_parts(self) -> (super::notification::NativeQuiescenceProof, Instant) {
+        (self.native, self.deadline)
+    }
 }
 
 /// One preallocated outcome owner, used during live delivery and returned in
@@ -92,7 +215,18 @@ pub struct Failure {
     pub(super) font_size: Option<std::sync::mpsc::SyncSender<f32>>,
     pub(super) chrome_font_size: Option<std::sync::mpsc::SyncSender<f32>>,
     external_sealed: bool,
-    _metadata: MetadataReservation,
+    pub(super) notifications: Option<super::HostProxy>,
+    native_quiescence: Option<super::notification::NativeQuiescenceProof>,
+    document_handoff: Option<kwil_view_model::workspace_document::DocumentWakeHandoff>,
+    pub(super) auxiliary: AuxiliaryOwners,
+    _metadata: Option<MetadataReservation>,
+}
+impl Drop for Failure {
+    fn drop(&mut self) {
+        if self.auxiliary.pending() {
+            std::mem::forget(self._metadata.take());
+        }
+    }
 }
 #[derive(Clone, Copy)]
 enum Operation {
@@ -121,6 +255,11 @@ impl std::fmt::Display for Failure {
         if let Some(error) = &self.frontend_error {
             write!(f, "; {error}")?;
         }
+        if let Some(notification) = self.notification_failure()
+            && notification.reason().is_some()
+        {
+            write!(f, "; notification: {notification:?}")?;
+        }
         if let Some(reason) = self.bind_reason() {
             write!(f, "; binding: {reason:?}")?;
         }
@@ -145,6 +284,11 @@ impl Failure {
             + 2 * std::mem::size_of::<std::ops::ControlFlow<super::GuiStartRefusal, Result<(), super::GuiError>>>()
             + std::mem::size_of::<kwil_view_model::search_session::SearchRequest>())
         .checked_add(prepared_overlap)
+        .and_then(|bytes| bytes.checked_add(AuxiliaryOwners::metadata_bytes()?))
+        .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<FinalSuccess>()))
+        .and_then(|bytes| {
+            bytes.checked_add(2 * std::mem::size_of::<Option<super::notification::PanicInspection<'_>>>())
+        })
         .and_then(|bytes| {
             bytes.checked_add(kwil_view_model::search_session::SearchWorker::checked_retained_metadata_bytes()?)
         })
@@ -195,11 +339,15 @@ impl Failure {
             external_inbox: None,
             external_producer: None,
             external_sealed: false,
+            notifications: None,
+            native_quiescence: None,
+            document_handoff: None,
+            auxiliary: AuxiliaryOwners::default(),
             font: Some(super::document_ui::StartupFont::admit(budget)?),
             chrome_font: Some(super::document_ui::StartupFont::admit(budget)?),
             font_size: None,
             chrome_font_size: None,
-            _metadata: metadata,
+            _metadata: Some(metadata),
         }))
     }
     pub fn status(&self) -> Status {
@@ -357,9 +505,6 @@ impl Failure {
         if self.status == Status::Complete {
             return Ok(());
         }
-        if self.panic.is_some() {
-            return Err(Status::Panicked);
-        }
         self.execute(Operation::Shutdown)
     }
     /// Recover only an actually unstarted document lane. Every refusal returns
@@ -383,16 +528,27 @@ impl Failure {
         std::ops::ControlFlow::Continue((workspace, budget))
     }
     fn execute(&mut self, operation: Operation) -> Result<(), Status> {
-        if self.panic.is_some() {
-            return Err(Status::Panicked);
-        }
         let result = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name("kwil-gui-shutdown".into())
                 .spawn_scoped(scope, || {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match operation {
-                        Operation::Shutdown => self.settle_off_ui(),
-                        Operation::RecoverUnstarted => self.recover_off_ui(),
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.notification_preamble()?;
+                        let auxiliary = self.auxiliary.settle(&mut self.panic);
+                        if self.auxiliary_error.is_none() {
+                            self.auxiliary_error = auxiliary.err();
+                        }
+                        if self.panic.is_some() {
+                            return Err(Status::Panicked);
+                        }
+                        let outcome = match operation {
+                            Operation::Shutdown => self.settle_off_ui(),
+                            Operation::RecoverUnstarted => self.recover_off_ui(),
+                        };
+                        if let (Some(proxy), Some(deadline)) = (&self.notifications, self.deadline) {
+                            proxy.wait_capabilities_until(deadline).map_err(Status::Notification)?;
+                        }
+                        outcome
                     }))
                 })
                 .map(|thread| thread.join())
@@ -417,6 +573,111 @@ impl Failure {
                 Err(Status::Spawn)
             }
         }
+    }
+    fn notification_preamble(&mut self) -> Result<(), Status> {
+        let Some(proxy) = &self.notifications else {
+            return Ok(());
+        };
+        let deadline = *self.deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(35));
+        if let Some(inbox) = &self.external_inbox {
+            inbox.close();
+        }
+        proxy.request_terminal();
+        if let Some(transport) = &self.live.transport {
+            transport.request_off_ui_wakes();
+            let proof = transport.wait_off_ui_wakes_until(deadline).map_err(Status::DocumentNotification)?;
+            if !proof.matches(transport) {
+                return Err(Status::ReceiptIdentity);
+            }
+            self.document_handoff = Some(proof);
+        } else if self.live.ever_started && self.document_handoff.is_none() {
+            return Err(Status::ReceiptIdentity);
+        }
+        self.native_quiescence = Some(proxy.wait_native_until(deadline).map_err(Status::Notification)?);
+        Ok(())
+    }
+    pub fn notification_failure(&self) -> Option<super::notification::Inspection<'_>> {
+        self.notifications.as_ref().and_then(super::HostProxy::inspect)
+    }
+    pub fn notification_panic(&self) -> Option<super::notification::PanicInspection<'_>> {
+        use super::notification::PanicInspection;
+        if let Some(payload) = self.panic_payload() {
+            return Some(PanicInspection::direct(payload));
+        }
+        if let Some(kwil_view_model::document_worker::DocumentDeliveryFailure::WakePanicked(payload)) =
+            self.delivery_failure()
+        {
+            return Some(PanicInspection::direct(payload.as_ref()));
+        }
+        if let Some(transport) = &self.live.transport
+            && let Some(inspection) = PanicInspection::document(transport.wake_handoff_inspection())
+        {
+            return Some(inspection);
+        }
+        if let Some(font) = &self.font
+            && let Some(inspection) = PanicInspection::editor(font.wake_inspection())
+        {
+            return Some(inspection);
+        }
+        if let Some(font) = &self.chrome_font
+            && let Some(inspection) = PanicInspection::chrome(font.wake_inspection())
+        {
+            return Some(inspection);
+        }
+        self.notifications.as_ref().and_then(super::HostProxy::inspect).and_then(PanicInspection::gate)
+    }
+    pub(super) fn notification_refused(&mut self, reason: super::notification::Reason) {
+        self.status = Status::Notification(reason);
+        if let Some(proxy) = &self.notifications {
+            proxy.fail(reason);
+        }
+    }
+    pub(super) fn take_final_success(&mut self) -> Result<FinalSuccess, Status> {
+        if self.status != Status::Complete
+            || self.panic.is_some()
+            || self.font_spawn_error.is_some()
+            || self.spawn_error.is_some()
+            || self.auxiliary_error.is_some()
+            || self.frontend_error.is_some()
+            || self.event_loop_error.is_some()
+            || self.live.start_failure.is_some()
+            || self.live.prepare_refusal.is_some()
+        {
+            return Err(self.status);
+        }
+        if self.live.ever_started && self.document_handoff.is_none() {
+            return Err(Status::ReceiptIdentity);
+        }
+        if let Some(reason) = self.notification_failure().and_then(|inspection| inspection.reason()) {
+            self.status = Status::Notification(reason);
+            return Err(self.status);
+        }
+        let deadline = self.deadline.ok_or(Status::ReceiptIdentity)?;
+        if Instant::now() >= deadline {
+            return Err(Status::Notification(super::notification::Reason::TimedOut));
+        }
+        let native = self.native_quiescence.take().ok_or(Status::ReceiptIdentity)?;
+        Ok(FinalSuccess { native, deadline })
+    }
+    #[cfg(test)]
+    pub(super) fn notification_fixture_cleanup_retained(&mut self) -> Result<(), Status> {
+        // Explicit fixture custody, not retry/success authority. Preserve the
+        // original failure/status and deadline while using the SAME real source
+        // barriers, original joins and explicit native-right retirements.
+        let deadline = self.deadline.ok_or(Status::ReceiptIdentity)?;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    self.notification_preamble()?;
+                    self.settle_off_ui()?;
+                    if Instant::now() >= deadline {
+                        return Err(Status::RecoveryTimedOut);
+                    }
+                    Ok(())
+                })
+                .join()
+                .unwrap()
+        })
     }
     fn recover_off_ui(&mut self) -> Result<(), Status> {
         if self.live.ever_started
@@ -730,13 +991,27 @@ impl Failure {
 }
 pub(super) type Job = Box<dyn FnOnce() -> Result<(), String>>;
 
+#[cfg(test)]
 pub(super) fn drain<const N: usize>(jobs: [Option<Job>; N]) -> Result<(), String> {
+    drain_with_custody(jobs, &mut None)
+}
+fn drain_with_custody<const N: usize>(
+    jobs: [Option<Job>; N],
+    panic: &mut Option<Box<dyn std::any::Any + Send>>,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     for job in jobs.into_iter().flatten() {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => errors.push(error),
-            Err(_) => errors.push("shutdown lane panicked".into()),
+            Err(original) => {
+                if panic.is_none() {
+                    *panic = Some(original);
+                } else {
+                    std::mem::forget(original);
+                }
+                errors.push("shutdown lane panicked".into());
+            }
         }
     }
     if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }

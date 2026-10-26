@@ -1315,13 +1315,77 @@ fn copy(texture: &wgpu::Texture, x: usize, y: usize) -> wgpu::TexelCopyTextureIn
     }
 }
 
+// R12 windowless protocol fixture: actual Gpu stop/retire_renderer/shutdown
+// paths, with no device/window/native GPU work. Not GPU qualification.
+#[cfg(test)]
+pub(super) struct NotificationFixture {
+    pub(super) identity: usize,
+    supervisor: thread::JoinHandle<()>,
+    exited: mpsc::Receiver<()>,
+}
+#[cfg(test)]
+impl NotificationFixture {
+    pub(super) fn finish(self, deadline: std::time::Instant) {
+        self.exited
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("original windowless retirement supervisor must finish on time");
+        self.supervisor.join().unwrap();
+        assert!(std::time::Instant::now() < deadline);
+    }
+}
+#[cfg(test)]
+pub(super) fn notification_fixture(
+    wake: impl Fn(Result<(), String>) + Send + 'static,
+    deadline: std::time::Instant,
+) -> (Gpu, NotificationFixture) {
+    let (mut gpu, commands) = tests::fake_gpu();
+    let identity = Arc::as_ptr(&gpu.shared) as usize;
+    let (done, finished) = mpsc::sync_channel(1);
+    let renderer = thread::spawn(move || {
+        if matches!(
+            commands.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ) {
+            drop(commands);
+            drop(wake);
+            let _ = done.send(()); // follows actual resource/callback disposal
+        }
+    });
+    let (retire, retirement) = mpsc::sync_channel::<Retirement>(1);
+    let (shutdown, status) = mpsc::sync_channel(1);
+    let (exited, exit) = mpsc::sync_channel(1);
+    let supervisor = thread::spawn(move || {
+        let original = retirement.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        let retired =
+            retire_renderer(renderer, finished, deadline.saturating_duration_since(std::time::Instant::now()));
+        let result = match original {
+            Ok(original) => {
+                drop(original);
+                retired
+            }
+            Err(error) => ShutdownStatus::Detached(format!("windowless original retirement missing: {error}")),
+        };
+        let _ = shutdown.send(result);
+        let _ = exited.send(());
+    });
+    gpu.retire = Some(retire);
+    gpu.shutdown = Some(status);
+    (gpu, NotificationFixture { identity, supervisor, exited: exit })
+}
+#[cfg(test)]
+impl Gpu {
+    pub(super) fn notification_fixture_identity(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // No device, native window, timer, polling loop or driver required. Leaving
     // the fake mailbox reserved models an acquire that never returns.
-    fn fake_gpu() -> (Gpu, mpsc::Receiver<Command>) {
+    pub(super) fn fake_gpu() -> (Gpu, mpsc::Receiver<Command>) {
         let (tx, rx) = mpsc::sync_channel(1);
         (
             Gpu {

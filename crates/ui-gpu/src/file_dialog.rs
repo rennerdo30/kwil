@@ -290,17 +290,55 @@ impl Dialogs {
     }
 }
 
+// R12 cfg(test)-only windowless Port/Gate protocol. The fake has no OS dialog
+// resources. Completion owns the exact request admitted by production Gate.sync;
+// Stopped is emitted only after the original port's real shutdown and request
+// disposal. Consumption still goes through production Dialogs.event/Gate.event.
+#[cfg(test)]
+pub(super) struct NotificationFixture {
+    port: tests::Fake,
+    deadline: std::time::Instant,
+}
+#[cfg(test)]
+impl NotificationFixture {
+    pub(super) fn new(deadline: std::time::Instant) -> Self {
+        Self { port: tests::Fake::default(), deadline }
+    }
+    pub(super) fn ready(&self, emit: impl FnOnce(Event)) {
+        assert!(std::time::Instant::now() < self.deadline);
+        emit(Event::Ready);
+    }
+    pub(super) fn submit(&mut self, dialogs: &mut Dialogs, workspace: &mut Workspace) {
+        assert!(std::time::Instant::now() < self.deadline);
+        dialogs.gate.sync(workspace, 0, &mut self.port);
+        assert!(self.port.request.is_some(), "the original production gate must actually admit its captured request");
+    }
+    pub(super) fn shutdown(&mut self, dialogs: &mut Dialogs, workspace: &mut Workspace, mut emit: impl FnMut(Event)) {
+        assert!(std::time::Instant::now() < self.deadline);
+        dialogs.gate.shutdown(workspace, &mut self.port);
+        assert_eq!(self.port.shutdowns, 1, "original port receives actual shutdown exactly once");
+        if let Some(request) = self.port.request.take() {
+            emit(Event::Completed { ticket: *request.ticket, outcome: Outcome::Cancelled });
+        }
+        assert!(self.port.request.is_none());
+        emit(Event::Stopped(Ok(()))); // windowless port has no remaining resources
+    }
+    pub(super) fn is_stopped(dialogs: &Dialogs) -> bool {
+        dialogs.gate.stopped()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kwil_view_model::{CommandArgs, View};
 
     #[derive(Default)]
-    struct Fake {
-        request: Option<Request>,
+    pub(super) struct Fake {
+        pub(super) request: Option<Request>,
         submits: usize,
         cancels: usize,
-        shutdowns: usize,
+        pub(super) shutdowns: usize,
         reject: bool,
     }
     impl Port for Fake {

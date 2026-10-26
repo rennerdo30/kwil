@@ -1,6 +1,48 @@
 //! File/tab actions stay outside editor command dispatch and renderer geometry.
 use super::*;
 
+struct FileDialogNotificationCallback {
+    proxy: HostProxy,
+    endpoint: notification::ControlEndpoint,
+}
+impl FileDialogNotificationCallback {
+    fn send(&self, event: file_dialog::Event) {
+        let event = match event {
+            file_dialog::Event::Stopped(Err(original)) => match self.proxy.retain_control_error(original) {
+                Ok(diagnostic) => file_dialog::Event::Stopped(Err(diagnostic)),
+                Err(reason) => {
+                    self.proxy.fail(reason);
+                    return;
+                }
+            },
+            event => event,
+        };
+        let terminal = matches!(&event, file_dialog::Event::Stopped(_));
+        match self.endpoint.receipt(event, terminal) {
+            Ok(receipt) => {
+                let _ = self.proxy.send_event(UserEvent::FileDialog(receipt));
+            }
+            Err(original) => {
+                self.proxy.fail(notification::Reason::UnresolvedControl);
+                std::mem::forget(original);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn notification_fixture_sender(proxy: HostProxy) -> impl Fn(file_dialog::Event) {
+    let endpoint = proxy
+        .control_endpoint(
+            notification::SlotKind::FileDialog,
+            2 * std::mem::size_of::<FileDialogNotificationCallback>()
+                + 2 * std::mem::size_of::<notification::Receipt<file_dialog::Event>>(),
+        )
+        .unwrap_or_else(|reason| panic!("windowless original callback admission: {reason:?}"));
+    let callback = FileDialogNotificationCallback { proxy, endpoint };
+    move |event| callback.send(event)
+}
+
 pub(super) fn sync_active_document<T>(
     workspace: &Workspace,
     previous: &mut kwil_view_model::SessionDocumentId,
@@ -43,6 +85,28 @@ pub(super) fn submit(workspace: &mut Workspace) -> Damage {
 }
 
 impl App {
+    pub(super) fn consume_file_dialog_notification(
+        &mut self,
+        event: notification::Receipt<file_dialog::Event>,
+    ) -> bool {
+        if !event.matches(&self.proxy, notification::SlotKind::FileDialog) {
+            self.proxy.fail(notification::Reason::Identity);
+            return false;
+        }
+        let failed = matches!(event.value(), file_dialog::Event::Stopped(Err(_)));
+        match event.consume(|event| self.file_dialog_event(event)) {
+            Ok(()) => {
+                if failed {
+                    self.proxy.fail(notification::Reason::ControlError);
+                }
+                true
+            }
+            Err(reason) => {
+                self.proxy.fail(reason);
+                false
+            }
+        }
+    }
     pub(super) fn external_modal(&self) -> bool {
         self.document_input_blocked()
             || self.file_modal()
@@ -140,9 +204,19 @@ impl App {
         let owner = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
         let proxy = self.proxy.clone();
         if !self.confirmation_worker_busy() {
-            self.file_dialogs.sync(&mut self.view, owner, self.opts.hidden, move |event| {
-                let _ = proxy.send_event(UserEvent::FileDialog(event));
-            });
+            let endpoint = match proxy.control_endpoint(
+                notification::SlotKind::FileDialog,
+                2 * std::mem::size_of::<FileDialogNotificationCallback>()
+                    + 2 * std::mem::size_of::<notification::Receipt<file_dialog::Event>>(),
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(reason) => {
+                    proxy.fail(reason);
+                    return;
+                }
+            };
+            let callback = FileDialogNotificationCallback { proxy, endpoint };
+            self.file_dialogs.sync(&mut self.view, owner, self.opts.hidden, move |event| callback.send(event));
         }
         self.save_path = self
             .view

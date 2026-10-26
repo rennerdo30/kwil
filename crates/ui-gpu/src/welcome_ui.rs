@@ -229,7 +229,75 @@ fn draw_about(
     }
 }
 
+struct RegistrationNotificationProducer {
+    path: std::path::PathBuf,
+    mode: registration_host::HostMode,
+    proxy: HostProxy,
+    transfer: notification::ProducerTransfer,
+}
+impl RegistrationNotificationProducer {
+    fn run(self) {
+        let Self { path, mode, proxy, transfer } = self;
+        transfer.start();
+        let result = registration_host::prepare(&path, mode).and_then(|prepared| {
+            let wake = proxy.clone();
+            kwil_view_model::file_type_registration::FileTypeRegistration::start(
+                prepared.journal,
+                prepared.context,
+                prepared.factory,
+                std::sync::Arc::new(move || {
+                    let _ = wake.send_event(UserEvent::RegistrationReady);
+                }),
+            )
+            .map(|mut service| {
+                let _ = service.status();
+                Box::new(service)
+            })
+            .map_err(|error| error.to_string())
+        });
+        if result.is_err() {
+            transfer.no_owner_created();
+        }
+        let _ = proxy.send_event(UserEvent::RegistrationStarted(transfer.publish(result)));
+    }
+}
+
 impl App {
+    pub(super) fn adopt_registration_notification(
+        &mut self,
+        mut result: notification::Delivery<
+            Result<Box<kwil_view_model::file_type_registration::FileTypeRegistration>, String>,
+        >,
+    ) -> Damage {
+        if !result.matches(&self.proxy, notification::SlotKind::Registration) {
+            self.proxy.fail(notification::Reason::Identity);
+            return Damage::default();
+        }
+        self.welcome_view.hits = Default::default();
+        self.registration_starting = false;
+        match result.value_mut() {
+            Ok(service) => {
+                service.worker_ready();
+                let ui = Default::default();
+                if let Err(reason) = result.adopt_into(&mut self.file_types, |result| {
+                    let Ok(service) = result else { unreachable!() };
+                    filetypes_ui::Page { service: *service, ui }
+                }) {
+                    self.proxy.fail(reason);
+                }
+            }
+            Err(_) => {
+                if let Err(reason) = result.consume_error(|result| {
+                    let Err(error) = result else { unreachable!() };
+                    self.view.set_notice(format!("File-type setup: {error}"));
+                    self.welcome_view.problem = Some(error);
+                }) {
+                    self.proxy.fail(reason);
+                }
+            }
+        }
+        Damage { full: true, status: true, ..Default::default() }
+    }
     /// One background preparation per App. Native setup is never started merely
     /// by displaying About; this is called after the user's Next/open-page action.
     pub(super) fn start_registration(&mut self) {
@@ -256,26 +324,25 @@ impl App {
             registration_host::HostMode::Interactive
         };
         let proxy = self.proxy.clone();
+        let transfer = match proxy.reserve(
+            notification::SlotKind::Registration,
+            2 * std::mem::size_of::<RegistrationNotificationProducer>()
+                + 2 * std::mem::size_of::<
+                    notification::Delivery<
+                        Result<Box<kwil_view_model::file_type_registration::FileTypeRegistration>, String>,
+                    >,
+                >(),
+        ) {
+            Ok(transfer) => transfer,
+            Err(reason) => {
+                proxy.fail(reason);
+                self.welcome_view.problem = Some(format!("Registration notification admission: {reason:?}"));
+                return;
+            }
+        };
         self.registration_starting = true;
-        match std::thread::Builder::new().name("kwil-registration-prepare".into()).spawn(move || {
-            let result = registration_host::prepare(&path, mode).and_then(|prepared| {
-                let wake = proxy.clone();
-                kwil_view_model::file_type_registration::FileTypeRegistration::start(
-                    prepared.journal,
-                    prepared.context,
-                    prepared.factory,
-                    std::sync::Arc::new(move || {
-                        let _ = wake.send_event(UserEvent::RegistrationReady);
-                    }),
-                )
-                .map(|mut service| {
-                    let _ = service.status();
-                    Box::new(service)
-                })
-                .map_err(|e| e.to_string())
-            });
-            let _ = proxy.send_event(UserEvent::RegistrationStarted(result));
-        }) {
+        let capture = RegistrationNotificationProducer { path, mode, proxy, transfer };
+        match std::thread::Builder::new().name("kwil-registration-prepare".into()).spawn(move || capture.run()) {
             Ok(thread) => self.registration_prep = Some(thread),
             Err(error) => {
                 self.registration_starting = false;
