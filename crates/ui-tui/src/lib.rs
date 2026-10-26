@@ -1997,80 +1997,51 @@ fn language_mouse(
     }
 }
 
-/// Close only for the successful completion of the requested revision.
-/// A prompt, failed request, failed write or concurrent edit never exits.
-#[derive(Default)]
+/// Key/prompt controls use the real Workspace. Save effects and completion
+/// ownership live in view-model's workspace_document::save_quit_tests.
 #[cfg(test)]
 struct SaveFlow {
-    closing: bool,
-    path: Option<String>,
-    revision: Option<u64>,
-    refusal: Option<kwil_view_model::SaveCompletionRefusal>,
+    owner: Option<document_ui::StartupOwner>,
+    deadline: std::time::Instant,
 }
 
 #[cfg(test)]
 impl SaveFlow {
-    fn request(
-        &mut self,
-        view: &mut View,
-        path: Option<std::path::PathBuf>,
-        quit: bool,
-    ) -> Option<kwil_core_workspace::SaveRequest> {
-        self.closing |= quit;
-        let Some(editor) = view.editor_mut() else {
-            self.closing = false;
-            view.set_notice("Indexing: editing will be available when ready".into());
-            return None;
-        };
-        if path.is_none() && editor.document().path().is_none() {
-            self.path = Some(String::new());
-            view.set_notice("Save as:  (Enter a path, Enter to save, Esc to cancel)".into());
-            return None;
-        }
-        match editor.save_request(path) {
-            Ok(request) => {
-                self.revision = Some(request.revision);
-                view.set_notice("Saving…".into());
-                Some(request)
-            }
-            Err(error) => {
-                self.closing = false;
-                view.set_notice(format!("Save failed: {error}"));
-                None
-            }
-        }
+    fn new() -> Self {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let budget = AllocationBudget::default();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.set_rows(3);
+        let document = DocumentLane::new(&budget).unwrap();
+        let mut owner = document_ui::StartupOwner::new(workspace, budget);
+        owner.ticket.document = Some(document);
+        Self { owner: Some(owner), deadline }
     }
+    fn workspace(&mut self) -> &mut Workspace {
+        self.owner.as_mut().unwrap().ticket.view.as_mut().unwrap()
+    }
+    fn finish(mut self) {
+        let (ticket, budget) = self.owner.take().unwrap().into_parts();
+        let deadline = self.deadline;
+        let caller = std::thread::current().id();
+        std::thread::spawn(move || {
+            assert_ne!(std::thread::current().id(), caller);
+            let ticket = test_support::expect_cleanup(test_support::finish_bounded_ticket_off_ui(ticket, deadline));
+            assert!(ticket.view.is_none());
+            assert!(ticket.document.as_ref().unwrap().settled);
+            drop(budget);
+        })
+        .join()
+        .unwrap();
+    }
+}
 
-    fn finish(&mut self, view: &mut View, saved: std::io::Result<kwil_core_workspace::SavedSnapshot>) -> bool {
-        let revision = saved.as_ref().ok().map(|saved| saved.revision);
-        let requested = self.revision.take();
-        let closing = std::mem::take(&mut self.closing);
-        let Some(editor) = view.editor_mut() else { return false };
-        // A successful worker trim can install a new, clean revision during
-        // finish_save. Compare the source revision before that installation.
-        let current_revision = revision == Some(editor.document().revision());
-        match editor.finish_save(saved) {
-            ControlFlow::Continue(Ok(result)) => {
-                let clean_revision = current_revision && !editor.document().is_dirty();
-                let notice = match result.status {
-                    CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => message,
-                    _ if !clean_revision => "Saved earlier revision; current changes remain unsaved".into(),
-                    _ => "Saved".into(),
-                };
-                view.refresh_after_edit(result.damage);
-                view.set_notice(notice);
-                closing && requested.is_some() && revision == requested && clean_revision
-            }
-            ControlFlow::Continue(Err(error)) => {
-                view.set_notice(format!("Save failed: {error}"));
-                false
-            }
-            ControlFlow::Break(refusal) => {
-                let notice = format!("Save completion retained: {:?}", refusal.reason);
-                self.refusal = Some(refusal);
-                view.set_notice(notice);
-                false
-            }
+#[cfg(test)]
+impl Drop for SaveFlow {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            // Failed assertions cannot destroy queued save sources on UI.
+            std::mem::forget(owner);
         }
     }
 }
@@ -3431,131 +3402,54 @@ mod tests {
     }
 
     #[test]
-    fn vim_wq_prompts_untitled_and_closes_only_after_successful_save() {
+    fn vim_wq_prompts_untitled_and_keeps_text_and_close_intent() {
         let file = SaveFile::new();
-        let mut view = View::new(None);
-        view.set_rows(3);
-        execute(&mut view, "edit.insert", Some("keep me".into()), false, Duration::ZERO);
-        assert!(matches!(vim_wq(&mut view), KeyResult::SaveAndQuit));
-        let mut save = SaveFlow::default();
-        assert!(save.request(&mut view, None, true).is_none());
-        assert!(save.closing);
+        let mut save = SaveFlow::new();
+        execute(save.workspace(), "edit.insert", Some("keep me".into()), false, Duration::ZERO);
+        assert!(matches!(vim_wq(save.workspace()), KeyResult::SaveAndQuit));
+        // The same branch as the run loop, using the real Workspace prompt.
+        save.workspace().file_command("file.saveAndQuit").unwrap();
+        assert!(save.workspace().close_pending());
+        assert!(save.workspace().file_prompt().is_some());
         for c in file.0.to_str().unwrap().chars() {
-            path_key(&mut view, &mut save.path, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            file_prompt::key(save.workspace(), KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        assert_eq!(view.line(0), Some(b"keep me".as_slice()));
-        let KeyResult::Save(path) =
-            path_key(&mut view, &mut save.path, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("path must submit save")
-        };
-        let request = save.request(&mut view, path, false).unwrap();
-        assert!(view.editor().unwrap().document().is_dirty(), "request must not mark document saved");
-        let result = std::thread::spawn(move || kwil_core_workspace::save_snapshot(request)).join().unwrap();
-        assert!(save.finish(&mut view, result));
-        assert!(!view.editor().unwrap().document().is_dirty());
-        assert_eq!(std::fs::read(&file.0).unwrap(), b"keep me");
+        assert_eq!(save.workspace().line(0), Some(b"keep me".as_slice()));
+        assert_eq!(save.workspace().file_prompt().unwrap().text, file.0.to_str().unwrap());
+        file_prompt::key(save.workspace(), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(save.workspace().file_prompt().is_none(), "Enter submitted the real save request");
+        assert!(save.workspace().editor().unwrap().document().is_dirty(), "request must not mark document saved");
+        assert!(save.workspace().close_pending());
+        assert!(!save.workspace().wants_exit(), "prompt/request cannot authorize exit");
+        // Concrete storage, sealed success, clean revision and exit assertions:
+        // workspace_document::save_quit_tests::savequit_success_marks_only_the_requested_revision_clean_and_exits.
+        save.finish();
     }
 
     #[test]
-    fn savequit_failure_and_concurrent_edits_keep_document_open() {
+    fn savequit_cancelled_prompt_and_rejected_request_clear_close_intent() {
         let file = SaveFile::new();
-        let mut view = View::new(None);
-        view.set_rows(3);
-        execute(&mut view, "edit.insert", Some("before".into()), false, Duration::ZERO);
-        let mut save = SaveFlow::default();
-        save.request(&mut view, Some(file.0.clone()), true).unwrap();
-        assert!(!save.finish(&mut view, Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))));
-        assert!(view.status_text().contains("Save failed: denied"));
-        assert!(!save.closing);
-        let request = save.request(&mut view, Some(file.0.clone()), true).unwrap();
-        execute(&mut view, "edit.insert", Some(" after".into()), false, Duration::from_secs(1));
-        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
-        assert!(view.editor().unwrap().document().is_dirty());
-        assert_eq!(view.line(0), Some(b"before after".as_slice()));
-        assert_eq!(std::fs::read(&file.0).unwrap(), b"before");
-        assert!(!save.closing);
-    }
-
-    #[test]
-    fn savequit_cancelled_prompt_and_failed_request_do_not_close_later() {
-        let file = SaveFile::new();
-        let mut view = View::new(None);
-        view.set_rows(3);
-        let mut save = SaveFlow::default();
-        assert!(save.request(&mut view, None, true).is_none());
+        let mut save = SaveFlow::new();
+        assert!(matches!(vim_wq(save.workspace()), KeyResult::SaveAndQuit));
+        save.workspace().file_command("file.saveAndQuit").unwrap();
+        assert!(save.workspace().close_pending());
         assert!(matches!(
-            path_key(&mut view, &mut save.path, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            file_prompt::key(save.workspace(), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             KeyResult::Cancel
         ));
-        // The run-loop Cancel branch clears the close intent.
-        save.closing = false;
-        let request = save.request(&mut view, Some(file.0.clone()), false).unwrap();
-        assert!(
-            save.request(&mut view, Some(file.0.clone()), true).is_none(),
-            "second save is rejected while worker is active"
-        );
-        assert!(view.status_text().contains("save already in progress"));
-        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
-        let request = save.request(&mut view, None, false).unwrap();
-        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
-    }
-
-    #[test]
-    fn savequit_unrequested_completion_never_exits_even_when_clean() {
-        let file = SaveFile::new();
-        let mut view = View::new(None);
-        view.set_rows(3);
-        let request = view.editor_mut().unwrap().save_request(Some(file.0.clone())).unwrap();
-        // A close request alone must not make an unsolicited/stale completion
-        // equivalent to the save requested by :wq.
-        let mut save = SaveFlow { closing: true, ..Default::default() };
-        assert!(!save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
-        assert!(!view.editor().unwrap().document().is_dirty());
-    }
-
-    #[test]
-    fn savequit_stale_completion_does_not_close_after_undo_to_clean_revision() {
-        let file = SaveFile::new();
-        let earlier_file = SaveFile::new();
-        let mut view = View::new(None);
-        view.set_rows(3);
-        let mut save = SaveFlow::default();
-        let request = save.request(&mut view, Some(file.0.clone()), false).unwrap();
-        let saved = kwil_core_workspace::save_snapshot(request).unwrap();
-        assert!(!save.finish(&mut view, Ok(saved)));
-        // Produce a real earlier-revision worker result without relying on
-        // the storage result's fields beyond its public revision contract.
-        let stale = kwil_core_workspace::save_snapshot(
-            kwil_view_model::Editor::new(kwil_view_model::Document::new())
-                .save_request(Some(earlier_file.0.clone()))
-                .unwrap(),
-        )
-        .unwrap();
-        execute(&mut view, "edit.insert", Some("new revision".into()), false, Duration::ZERO);
-        let request = save.request(&mut view, None, true).unwrap();
-        assert_ne!(request.revision, stale.revision);
-        execute(&mut view, "edit.undo", None, false, Duration::from_secs(1));
-        assert!(!view.editor().unwrap().document().is_dirty());
-        assert!(!save.finish(&mut view, Ok(stale)), "a duplicate old completion is not the pending :wq save");
-        assert!(!save.closing);
-    }
-
-    #[test]
-    fn savequit_successful_trim_installs_a_clean_saved_revision() {
-        let file = SaveFile::new();
-        let mut view = View::new(None);
-        view.set_rows(3);
-        view.editor_mut().unwrap().settings.editor.trim_trailing_whitespace_on_save = true;
-        execute(&mut view, "edit.insert", Some("trim me  ".into()), false, Duration::ZERO);
-        let mut save = SaveFlow::default();
-        let request = save.request(&mut view, Some(file.0.clone()), true).unwrap();
-        assert!(save.finish(&mut view, kwil_core_workspace::save_snapshot(request)));
-        assert!(!view.editor().unwrap().document().is_dirty());
-        assert_eq!(std::fs::read(&file.0).unwrap(), b"trim me");
-        let mut bytes = Vec::new();
-        view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
-        assert_eq!(bytes, b"trim me");
+        assert!(save.workspace().file_prompt().is_none());
+        assert!(!save.workspace().close_pending());
+        let id = save.workspace().active_id();
+        save.workspace().save_document(id, Some(file.0.clone())).unwrap();
+        assert!(matches!(vim_wq(save.workspace()), KeyResult::SaveAndQuit));
+        let error = save.workspace().file_command("file.saveAndQuit").unwrap_err();
+        save.workspace().set_notice(format!("Save failed: {error}"));
+        assert!(save.workspace().status_text().contains("save already in progress"));
+        assert!(!save.workspace().close_pending());
+        assert!(!save.workspace().wants_exit());
+        // Later real successes cannot close: the matching model test retains
+        // both successive physical saves and their sealed retirement checks.
+        save.finish();
     }
 
     #[test]

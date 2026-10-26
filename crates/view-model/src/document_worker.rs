@@ -32,6 +32,96 @@ pub use result_transport::{
     DocumentResultSettlementFailure, DocumentResultSettlementReason, DocumentResultSettlementTicket,
     DocumentResultStopRefusal, DocumentResultTransportStatus, DocumentWrapRetryRefusal, DocumentWrapRetryToken,
 };
+// Per-worker test configuration only. The existing journal scheduler Control
+// stays unchanged; no shipping worker field or fault switch is introduced.
+#[cfg(test)]
+enum ScheduleTestControl {
+    Journal(scheduler_tests::Control),
+    Save(SaveQuitTestControl),
+}
+#[cfg(test)]
+impl ScheduleTestControl {
+    fn received(
+        &mut self,
+        request: &DocumentRequest,
+        deferred: &std::collections::VecDeque<DocumentRequest>,
+        storage: Option<&Storage>,
+    ) {
+        if let Self::Journal(control) = self {
+            control.received(request, deferred, storage);
+        }
+    }
+    fn applying(&mut self, request: &DocumentRequest) {
+        if let Self::Journal(control) = self {
+            control.applying(request);
+        }
+    }
+    fn hold_ready(&mut self, document: DocumentId, generation: u64, storage: Option<&mut Storage>) {
+        if let Self::Journal(control) = self {
+            control.hold_ready(document, generation, storage);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveQuitTestEvent {
+    Ready,
+    BeforeEffect { revision: u64 },
+    BeforePublish { revision: u64, error: Option<io::ErrorKind> },
+}
+
+/// Holds only owner-free observations. All pauses run synchronously on the
+/// original producer, outside transport locks, under the fixture's deadline.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SaveQuitTestGate {
+    pub(crate) events: mpsc::SyncSender<SaveQuitTestEvent>,
+    pub(crate) release: std::sync::Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
+    pub(crate) holding: std::sync::Arc<AtomicBool>,
+    pub(crate) deadline: std::time::Instant,
+}
+#[cfg(test)]
+impl SaveQuitTestGate {
+    pub(crate) fn pause(&self, event: SaveQuitTestEvent) {
+        if !self.holding.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.events.try_send(event).expect("bounded per-worker save observation");
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(self.deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("original save fixture deadline and explicit release");
+    }
+}
+#[cfg(test)]
+pub(crate) struct SaveQuitTestControl {
+    pub(crate) document: DocumentId,
+    pub(crate) deny_next: bool,
+    pub(crate) gate: SaveQuitTestGate,
+}
+#[cfg(test)]
+impl SaveQuitTestControl {
+    fn before_effect(&mut self, document: DocumentId, revision: u64) -> io::Result<()> {
+        if document != self.document {
+            return Ok(());
+        }
+        self.gate.pause(SaveQuitTestEvent::BeforeEffect { revision });
+        if std::mem::take(&mut self.deny_next) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        }
+        Ok(())
+    }
+    fn before_publish(&self, document: DocumentId, revision: u64, result: &io::Result<SavedSnapshot>) {
+        if document == self.document {
+            self.gate.pause(SaveQuitTestEvent::BeforePublish {
+                revision,
+                error: result.as_ref().err().map(io::Error::kind),
+            });
+        }
+    }
+}
 pub(crate) use result_transport::{DocumentContinuationPermit, DocumentJournalSink};
 #[cfg(test)]
 use std::sync::mpsc::SyncSender;
@@ -753,7 +843,7 @@ impl DocumentWorker {
             complete,
             None,
             #[cfg(test)]
-            schedule_control,
+            schedule_control.map(ScheduleTestControl::Journal),
         )
     }
 
@@ -775,10 +865,26 @@ impl DocumentWorker {
         Ok((worker, receiver))
     }
 
+    #[cfg(test)]
+    pub(crate) fn spawn_bounded_save_quit_test(
+        budget: &crate::visual_rows::AllocationBudget,
+        wake: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+        control: SaveQuitTestControl,
+    ) -> io::Result<(Self, DocumentResultReceiver)> {
+        let (shared, receiver) = result_transport::Shared::new(budget, wake)?;
+        let delivery = shared.clone();
+        let worker = Self::spawn_transport_inner(
+            move |result| delivery.publish(result),
+            Some(shared),
+            Some(ScheduleTestControl::Save(control)),
+        )?;
+        Ok((worker, receiver))
+    }
+
     fn spawn_transport_inner(
         complete: impl Fn(DocumentResult) + Send + 'static,
         transport: Option<std::sync::Arc<result_transport::Shared>>,
-        #[cfg(test)] mut schedule_control: Option<scheduler_tests::Control>,
+        #[cfg(test)] mut schedule_control: Option<ScheduleTestControl>,
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(16);
         let tx = result_transport::RequestSender::new(tx, transport.as_ref());
@@ -1271,11 +1377,19 @@ impl DocumentWorker {
                                 reserved.push((*owner, path.clone()));
                             }
                             let result = validate_save_destination(document, &request.path, &reserved).and_then(|()| {
+                                #[cfg(test)]
+                                if let Some(ScheduleTestControl::Save(control)) = &mut schedule_control {
+                                    control.before_effect(document, revision)?;
+                                }
                                 match storage.as_mut() {
                                     Some(storage) => storage.encoding.save(request, plan, &cancel),
                                     None => Err(io::Error::other("Workspace storage is not prepared")),
                                 }
                             });
+                            #[cfg(test)]
+                            if let Some(ScheduleTestControl::Save(control)) = &schedule_control {
+                                control.before_publish(document, revision, &result);
+                            }
                             complete(DocumentResult::Saved { document, revision, result });
                         }
                         DocumentRequest::ValidateReopen { document, generation, path, original, cached } => {

@@ -1282,3 +1282,7 @@ mod tests;
 #[cfg(test)]
 #[path = "workspace_document_retry_ack_tests.rs"]
 mod retry_ack_tests;
+
+#[cfg(test)]
+#[path = "workspace_document/save_quit_tests.rs"]
+mod save_quit_tests;
