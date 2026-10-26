@@ -39,7 +39,7 @@ commands! {
         "edit.deleteLine" => "Delete Line", "edit.cutLine" => "Cut Line", "edit.indent" => "Indent",
         "edit.outdent" => "Outdent", "edit.toggleComment" => "Toggle Comment",
         "edit.comment" => "Comment Selection", "edit.uncomment" => "Uncomment Selection",
-        "edit.trimTrailingWhitespace" => "Trim Trailing Whitespace",
+        "edit.trimTrailingWhitespace" => "Trim Trailing Whitespace (May Change Literals)",
         "edit.formatDocument" => "Format Document", "edit.formatSelection" => "Format Selection",
         "edit.deleteCharacter" => "Delete Character", "edit.pasteAfter" => "Paste After",
         "edit.pasteBefore" => "Paste Before", "edit.repeat" => "Repeat Last Change",
