@@ -465,10 +465,14 @@ impl SearchHost {
         }
     }
     #[cfg(test)]
-    fn shutdown(mut self) -> std::io::Result<()> {
-        self.take_shutdown_worker()
-            .map_err(std::io::Error::other)?
-            .map_or(Ok(()), |worker| worker.shutdown_bounded(Duration::from_secs(5)).map_err(std::io::Error::other))
+    fn shutdown(mut self, deadline: std::time::Instant) -> std::io::Result<()> {
+        match self.take_shutdown_worker().map_err(std::io::Error::other)? {
+            None => Ok(()),
+            Some(worker) => match test_support::finish_search_worker_off_ui(worker, deadline) {
+                ControlFlow::Continue(()) => Ok(()),
+                ControlFlow::Break(error) => Err(std::io::Error::other(error)),
+            },
+        }
     }
 }
 
@@ -1159,10 +1163,19 @@ mod tests {
         }
         fn finish(self) {
             let root = self.root.clone();
+            let deadline = Instant::now() + Duration::from_secs(35);
             let cleanup = std::thread::spawn(move || {
-                shutdown_bounded_workspace(self.view, self.host, self.rx, self.document, self.wrap, None)
+                test_support::expect_cleanup(shutdown_bounded_workspace(
+                    self.view,
+                    self.host,
+                    self.rx,
+                    self.document,
+                    self.wrap,
+                    None,
+                    deadline,
+                ))
             });
-            cleanup.join().unwrap().unwrap();
+            cleanup.join().unwrap();
             assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
             assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-tui-search-"));
             std::fs::remove_dir_all(root).unwrap();
@@ -1433,10 +1446,14 @@ mod tests {
         );
         assert_eq!(std::fs::read(&preserved).unwrap(), b"original tiny source\n");
         assert_eq!(std::fs::read(&path).unwrap(), b"different replacement identity\n");
-        std::thread::spawn(move || shutdown_bounded_workspace(view, search, receiver, document, None, None))
-            .join()
-            .unwrap()
-            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(35);
+        std::thread::spawn(move || {
+            test_support::expect_cleanup(shutdown_bounded_workspace(
+                view, search, receiver, document, None, None, deadline,
+            ))
+        })
+        .join()
+        .unwrap();
         assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
         assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-tui-search-changed-source-"));
         std::fs::remove_dir_all(root).unwrap();
@@ -1533,7 +1550,10 @@ mod tests {
                     let info = transport.result_info().unwrap();
                     assert!(held.replace(info).is_none(), "one bounded retained editor return");
                     let before = transport.status();
-                    assert!(h.document.receive(&mut h.view, &mut h.host, &mut h.keys, false).unwrap().is_none());
+                    assert!(matches!(
+                        h.document.transport.as_mut().unwrap().receive(&mut h.view, false),
+                        Err(DocumentResultSettlementReason::ConsumerRefused)
+                    ));
                     assert_eq!(h.document.transport.as_ref().unwrap().status(), before);
                 }
                 message => h.dispatch(message),
@@ -2063,7 +2083,7 @@ mod tests {
         // cannot acknowledge retirement while the document still owns it.
         let pinned =
             worker.shutdown_bounded(Duration::ZERO).expect_err("actual replacement history must pin search retirement");
-        let mut ticket = crate::ShutdownTicket {
+        let ticket = crate::ShutdownTicket {
             document: Some(document),
             highlighting: None,
             search_binding: Some(binding),
@@ -2078,9 +2098,9 @@ mod tests {
             document_started: false,
             terminal_failure: None,
         };
+        let deadline = Instant::now() + Duration::from_secs(10);
         let ticket = std::thread::spawn(move || {
-            crate::finish_shutdown(&mut ticket, Duration::from_secs(10)).unwrap();
-            ticket
+            test_support::expect_cleanup(test_support::finish_bounded_ticket_off_ui(ticket, deadline))
         })
         .join()
         .unwrap();
@@ -2137,8 +2157,9 @@ mod tests {
         host.command(&mut view, &mut keys, &settings, call);
         assert!(view.file_prompt().is_some());
         assert!(!host.is_open(), "search cannot replace a live native-path prompt");
+        let deadline = Instant::now() + Duration::from_secs(5);
         std::thread::spawn(move || {
-            host.shutdown().unwrap();
+            host.shutdown(deadline).unwrap();
             drop(view);
         })
         .join()

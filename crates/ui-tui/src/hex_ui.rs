@@ -494,7 +494,14 @@ mod tests {
         }
         fn idle(&mut self, stage: &str) {
             self.until(stage, |h| {
-                !h.workspace.document_busy(h.workspace.active_id())
+                let status = h.document.transport.as_ref().unwrap().status();
+                !status.closed
+                    && !status.worker_done
+                    && status.failure.is_none()
+                    && !status.occupied
+                    && !status.retry_pending
+                    && !status.retry_acknowledgement_required
+                    && !h.workspace.document_busy(h.workspace.active_id())
                     && h.workspace.editor().is_some_and(|editor| !editor.has_pending_edit_receipt())
                     && h.workspace.recovery_notice().is_none()
             });
@@ -564,11 +571,19 @@ mod tests {
         }
         fn finish(self) {
             let root = self.root.clone();
+            let deadline = Instant::now() + Duration::from_secs(35);
             std::thread::spawn(move || {
-                crate::shutdown_bounded_workspace(self.workspace, self.search, self.receiver, self.document, None, None)
+                crate::test_support::expect_cleanup(crate::shutdown_bounded_workspace(
+                    self.workspace,
+                    self.search,
+                    self.receiver,
+                    self.document,
+                    None,
+                    None,
+                    deadline,
+                ))
             })
             .join()
-            .unwrap()
             .unwrap();
             assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
             assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-tui-hex-host-"));
@@ -588,7 +603,14 @@ mod tests {
         assert!(host.paint().contains("0000000000000000  FF FE 41 00"));
         host.press(KeyCode::Char('8'), KeyModifiers::NONE);
         host.press(KeyCode::Char('0'), KeyModifiers::NONE);
-        assert!(host.workspace.document_busy(host.workspace.active_id()));
+        assert!(
+            host.workspace.document_busy(host.workspace.active_id()),
+            "hex edit was not loaned; state: {}; transport={:?}; info={:?}; trail={:?}",
+            host.state(),
+            host.document.transport.as_ref().map(|transport| transport.status()),
+            host.document.transport.as_ref().and_then(|transport| transport.result_info()),
+            host.trail
+        );
         assert!(host.workspace.editor().is_none(), "actual editor is owned by raw edit worker");
         assert!(
             host.paint().contains("0000000000000000  FF FE 41 00"),

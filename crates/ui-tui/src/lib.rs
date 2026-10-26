@@ -1031,7 +1031,8 @@ fn shutdown_bounded_workspace(
     document: DocumentLane,
     wrap: Option<wrap_ui::Runtime>,
     highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
-) -> std::io::Result<()> {
+    deadline: std::time::Instant,
+) -> ControlFlow<test_support::TestCleanupFailure, ShutdownTicket> {
     let ticket = ShutdownTicket {
         document: Some(document),
         highlighting,
@@ -1049,7 +1050,7 @@ fn shutdown_bounded_workspace(
         #[cfg(test)]
         document_started: false,
     };
-    shutdown_bounded_ticket(ticket, None)
+    test_support::finish_bounded_ticket_off_ui(ticket, deadline)
 }
 
 fn shutdown_bounded_ticket(ticket: ShutdownTicket, budget: Option<AllocationBudget>) -> std::io::Result<()> {
@@ -1242,6 +1243,15 @@ fn finish_bounded_shutdown(ticket: &mut ShutdownTicket, timeout: Duration, expli
                     break;
                 }
                 Err(reason) => {
+                    #[cfg(test)]
+                    {
+                        document.cleanup_attempt = match reason {
+                            DocumentShutdownReason::Transport(reason) => {
+                                Some(test_support::CleanupAttemptFailure::Document(reason))
+                            }
+                            _ => None,
+                        };
+                    }
                     if let DocumentShutdownReason::Transport(reason) = reason {
                         document.settlement_reason = Some(reason);
                     }
@@ -1271,9 +1281,13 @@ fn finish_bounded_shutdown(ticket: &mut ShutdownTicket, timeout: Duration, expli
         if explicit_retry {
             worker.retry_retirement();
         }
-        worker
-            .settle_until(deadline)
-            .map_err(|reason| format!("Search retirement: {reason:?}; exact worker retained"))?;
+        worker.settle_until(deadline).map_err(|reason| {
+            #[cfg(test)]
+            {
+                document.cleanup_attempt = Some(test_support::CleanupAttemptFailure::Search(reason));
+            }
+            format!("Search retirement: {reason:?}; exact worker retained")
+        })?;
     }
     drop(ticket.worker.take());
     Ok(())
@@ -1290,6 +1304,10 @@ fn receive_bounded_document(
         && document.retry.is_none()
     {
         document.settlement_reason = Some(reason);
+        #[cfg(test)]
+        {
+            document.cleanup_attempt = Some(test_support::CleanupAttemptFailure::Document(reason));
+        }
         return Err(format!("Wrap settlement retained ({reason:?}) in the worker slot; explicit retry required"));
     }
     let wait = remaining();
@@ -2587,6 +2605,7 @@ mod tests {
 
     #[test]
     fn tui_start_refusal_preserves_original_editor_error_and_shared_budget() {
+        let _process_guard = test_support::process_shutdown_guard();
         #[derive(Debug)]
         struct InitCause(std::sync::Arc<()>);
         impl std::fmt::Display for InitCause {
@@ -2646,6 +2665,7 @@ mod tests {
 
     #[test]
     fn tui_start_header_admission_refusal_precedes_terminal_and_preserves_input() {
+        let _process_guard = test_support::process_shutdown_guard();
         let workspace = Workspace::new(View::new(None)).unwrap();
         let document = workspace.active_id();
         let editor = workspace.editor().unwrap() as *const kwil_view_model::Editor;
@@ -2671,6 +2691,7 @@ mod tests {
 
     #[test]
     fn tui_start_unsafe_retired_wrap_fence_returns_input_without_forcing_rearm() {
+        let _process_guard = test_support::process_shutdown_guard();
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         let editor = workspace.editor().unwrap() as *const kwil_view_model::Editor;
         workspace.begin_wrap_shutdown();
@@ -2808,6 +2829,7 @@ mod tests {
 
     #[test]
     fn shutdown_deadline_retains_exact_ticket_refuses_new_run_and_explicit_retry_drains() {
+        let _process_guard = test_support::process_shutdown_guard();
         ensure_shutdown_idle().unwrap();
         let (sender, stopped) = mpsc::channel();
         let mut ticket = ShutdownTicket {

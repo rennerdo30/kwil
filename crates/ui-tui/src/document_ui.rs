@@ -72,6 +72,8 @@ pub(super) struct DocumentLane {
     pub shutdown: Option<WorkspaceDocumentShutdown>,
     pub bind_reason: Option<DocumentShutdownBindReason>,
     pub settlement_reason: Option<DocumentResultSettlementReason>,
+    #[cfg(test)]
+    pub cleanup_attempt: Option<test_support::CleanupAttemptFailure>,
     pub refused_prepare: Option<mpsc::TrySendError<Box<DocumentRequest>>>,
     _startup_refusal: Option<WorkspaceDocumentStartFailure>,
     pub retry: Option<DocumentWrapRetryToken>,
@@ -121,6 +123,8 @@ impl DocumentLane {
             shutdown: None,
             bind_reason: None,
             settlement_reason: None,
+            #[cfg(test)]
+            cleanup_attempt: None,
             refused_prepare: None,
             _startup_refusal: None,
             retry: None,

@@ -866,7 +866,7 @@ mod tests {
             // test-only retries under one original deadline; production never
             // arms this bounded teardown backoff.
             let Self { view, search, document, runtime, events, root, .. } = self;
-            let mut ticket = crate::ShutdownTicket {
+            let ticket = crate::ShutdownTicket {
                 document: Some(document),
                 highlighting: None,
                 search_binding: None,
@@ -883,31 +883,9 @@ mod tests {
             };
             let deadline = Instant::now() + DEADLINE;
             std::thread::spawn(move || {
-                let mut explicit_retry = false;
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    assert!(!remaining.is_zero(), "bounded actual frontend cleanup deadline");
-                    match crate::finish_bounded_shutdown(&mut ticket, remaining, explicit_retry) {
-                        Ok(()) => break,
-                        Err(error) => {
-                            let document = ticket.document.as_ref().unwrap();
-                            match document.settlement_reason {
-                                Some(crate::DocumentResultSettlementReason::ThreadExitPending) => assert!(
-                                    document.shutdown.is_some(),
-                                    "actual thread exit retains Workspace/history inside the sealed bundle"
-                                ),
-                                Some(crate::DocumentResultSettlementReason::WrapThreadExitPending) => assert!(
-                                    (document.transport.is_some() && ticket.view.is_some())
-                                        || document.shutdown.is_some(),
-                                    "wrap exit retains its original live or sealed Workspace owner"
-                                ),
-                                reason => panic!("unexpected cleanup refusal {reason:?}: {error}"),
-                            }
-                            explicit_retry = true;
-                            std::thread::park_timeout(Duration::from_millis(1).min(remaining));
-                        }
-                    }
-                }
+                let ticket = crate::test_support::expect_cleanup(crate::test_support::finish_bounded_ticket_off_ui(
+                    ticket, deadline,
+                ));
                 assert!(ticket.document.as_ref().unwrap().settled);
                 assert!(ticket.view.is_none());
             })

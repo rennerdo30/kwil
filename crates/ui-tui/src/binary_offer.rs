@@ -220,11 +220,21 @@ mod tests {
         }
         fn until(&mut self, stage: &str, done: impl Fn(&Self) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(10);
+            self.until_before(stage, deadline, done);
+        }
+        fn until_before(&mut self, stage: &str, deadline: Instant, done: impl Fn(&Self) -> bool) {
             while !done(self) {
                 let message = self
                     .receiver
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .unwrap_or_else(|error| panic!("binary TUI stage {stage}: {error}; notice={}", self.view.notice()));
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "binary TUI stage {stage}: {error}; status={:?}; info={:?}; notice={}",
+                            self.document.transport.as_ref().map(WorkspaceDocumentTransport::status),
+                            self.document.transport.as_ref().and_then(WorkspaceDocumentTransport::result_info),
+                            self.view.notice()
+                        )
+                    });
                 assert!(matches!(message, Msg::DocumentReady), "document worker wake");
                 self.document.ready(&mut self.view, &mut self.search, &mut self.keys).unwrap();
                 self.modal.sync(&mut self.view, &mut self.keys);
@@ -269,9 +279,34 @@ mod tests {
             self.view.active_id()
         }
         fn offered(&mut self) -> Offer {
-            self.until("binary detected without a decoded editor", |f| f.view.binary_offer().is_some());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            self.until_before("binary detected without a decoded editor", deadline, |f| {
+                f.view.binary_offer().is_some()
+            });
             assert!(self.view.editor().is_none());
-            self.view.binary_offer().unwrap()
+            let offer = self.view.binary_offer().unwrap();
+            // Model acceptance still leaves its completed carrier charged on
+            // the original producer. Consume actual capacity wakes/receives
+            // before ONE choice, without retrying the user's accepting input.
+            self.until_before("same binary offer and producer capacity ready", deadline, |f| {
+                assert_eq!(f.view.binary_offer(), Some(offer), "capacity cannot retarget the captured offer");
+                let status = f.document.transport.as_ref().unwrap().status();
+                assert!(
+                    !status.closed && !status.worker_done && status.failure.is_none(),
+                    "binary choice capacity failed: {status:?}; notice={}",
+                    f.view.notice()
+                );
+                !status.occupied
+                    && !status.retry_pending
+                    && !status.retry_acknowledgement_required
+                    && f.document.retry.is_none()
+                    && f.document.replacement.is_none()
+                    && f.view.recovery_ready()
+                    && f.view.recovery_notice().is_none()
+                    && !f.view.file_saves_pending()
+                    && !f.view.document_busy(offer.ticket.document())
+            });
+            offer
         }
         fn settled(&mut self, id: kwil_view_model::SessionDocumentId) {
             self.until("choice and document receipts settled", |f| {
@@ -301,12 +336,10 @@ mod tests {
                     && info.document == Some(id)
                 {
                     let before = transport.status();
-                    assert!(
-                        self.document
-                            .receive(&mut self.view, &mut self.search, &mut self.keys, false)
-                            .unwrap()
-                            .is_none()
-                    );
+                    assert!(matches!(
+                        self.document.transport.as_mut().unwrap().receive(&mut self.view, false),
+                        Err(DocumentResultSettlementReason::ConsumerRefused)
+                    ));
                     assert_eq!(self.document.transport.as_ref().unwrap().status(), before);
                     return info;
                 }
@@ -342,11 +375,19 @@ mod tests {
         }
         fn finish(self) {
             let root = self.root.clone();
+            let deadline = Instant::now() + Duration::from_secs(35);
             std::thread::spawn(move || {
-                crate::shutdown_bounded_workspace(self.view, self.search, self.receiver, self.document, None, None)
+                crate::test_support::expect_cleanup(crate::shutdown_bounded_workspace(
+                    self.view,
+                    self.search,
+                    self.receiver,
+                    self.document,
+                    None,
+                    None,
+                    deadline,
+                ))
             })
             .join()
-            .unwrap()
             .unwrap();
             assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
             assert!(root.file_name().unwrap().to_string_lossy().starts_with("kwil-tui-binary-offer-"));
@@ -574,8 +615,7 @@ mod tests {
         f.modal.sync(&mut f.view, &mut f.keys);
         f.view.close(id, true).unwrap();
         f.view.file_command("file.reopenClosed").unwrap();
-        f.until("reopened binary offer", |f| f.view.binary_offer().is_some());
-        let new = f.view.binary_offer().unwrap();
+        let new = f.offered();
         assert_eq!(new.ticket.document(), old.ticket.document());
         assert!(new.ticket.generation() > old.ticket.generation());
         let mut stale_callback = Host { offer: Some(old), ..Default::default() };
