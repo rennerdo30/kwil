@@ -124,6 +124,9 @@ through Settings before removing the executable if you enabled them.
 
 ## Linking
 
+For stable/prerelease self-update settings and managed-install exclusions, see
+[Updates](UPDATES.md). Frozen beta.1 copies still require manual replacement.
+
 Windows release builds request Rust's `+crt-static` for both MSVC targets. The
 release gate inspects both normal and delay-load PE imports and refuses dynamic
 Visual C++/Universal CRT imports. Windows system DLLs remain normal OS

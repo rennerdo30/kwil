@@ -2087,6 +2087,7 @@ dependencies = [
 name = "kwil-update"
 version = "0.1.0-beta.1"
 dependencies = [
+ "kwil-core-commands",
  "self-replace",
  "serde",
  "sha2",
