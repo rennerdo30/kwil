@@ -631,6 +631,9 @@ mod platform {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
             };
+            // Accepted sockets can inherit the listener's nonblocking mode on
+            // BSD/macOS. All frame I/O below uses blocking, deadline-bound calls.
+            stream.set_nonblocking(false)?;
             let deadline = Instant::now() + IO_TIMEOUT;
             let _ = (|| {
                 authenticate(stream.as_raw_fd())?;

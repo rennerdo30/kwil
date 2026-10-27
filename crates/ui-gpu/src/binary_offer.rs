@@ -627,6 +627,12 @@ mod tests {
                     panic!("unexpected held GUI completion event")
                 };
                 let info = app.document.live.transport.as_ref().unwrap().result_info();
+                // A capacity wake may precede the next publication. Receiving
+                // after an empty sample could consume a newly published Preview
+                // without recording it, or consume the completion meant to hold.
+                if info.is_none() {
+                    continue;
+                }
                 if info.is_some_and(|info| info.kind == ResultKind::Opened && info.document == Some(id)) {
                     assert!(completion.is_none(), "one original worker slot");
                     completion = info;
