@@ -1,9 +1,16 @@
-# Beta candidate
+# Beta readiness
 
-**0.1.0-beta.1** is prepared as an unpublished prerelease draft, not an RC.
-V1 remains the full scope in [SPEC.md](SPEC.md).
+## Next candidate: 0.1.0-beta.2
 
-## Current candidate
+Source is being prepared for beta.2, including native shutdown waiting, GUI
+notification lifetime fixes, update channels and guarded fixture/IPC repairs.
+There is no beta.2 tag or draft yet. Exact candidate CI, packaged GUI/TUI checks
+and installer lifecycle qualification remain required; the source version is
+not acceptance. V1 remains the full scope in [SPEC.md](SPEC.md).
+
+## Frozen beta.1 draft
+
+**0.1.0-beta.1** remains an unpublished prerelease draft, not an RC.
 
 - Tag `v0.1.0-beta.1` points to
   `904e5d586f18291ea5a0a0f2451d689b119e2f27`.
@@ -34,19 +41,22 @@ concrete draft and final packaged checks. See [release notes](BETA_RELEASE_NOTES
 
 ## Setup preparation remains unqualified
 
-A private source-only schema-2 installer candidate is being prepared for a future
-beta.2. It retains the full beta identity, maps beta.N to Windows Installer's
-numeric 0.0.N, and retains the existing Programs/Kwil family/path and manual
-update policy. This changes neither the immutable beta.1 tag/raw assets nor the
-current draft's publication state. No new setup build, native acceptance or
-release/publish wiring is established by this source work.
+Schema-2 installer identity is committed (26da691). It retains the full beta
+identity and maps beta.N to MSI 0.0.N, with the existing family/path and manual
+update policy. Hosted run 40341998956 generated MSI/portable ZIP artifacts for
+x64 and ARM64 but failed worker admission before installation. Those generated
+packages are not qualified setup assets or release attachments.
 
-Explicit-parent-desktop diagnostic run 40312316490 at 908515e failed on x64 and
-ARM64 with 0xC0000142, absent sentinel and complete cleanup. No further diagnostic
-run is approved. High-IL restricted-token evidence is not ordinary Medium-IL
-standard-user qualification. All five lifecycle gaps remain open; KW-66 native
-exit fixes are separate and excluded from this package.
+The ordinary-user environment proof is committed (4192666) with 176 passing
+inert controls. It has not been provisioned or dispatched and remains subject
+to the owner's concrete approval documented in
+[the proof runbook](ORDINARY_USER_PROOF.md). All five native lifecycle gaps
+remain unwaived. Release workflow setup wiring remains pending qualification.
 
+The older restricted-token explicit-desktop diagnostic 40312316490 failed on
+both architectures with 0xC0000142. It does not establish ordinary-user coverage,
+and no unchanged diagnostic retry is proposed. Later native-exit/GUI fixes are
+committed, but new packaged acceptance must use the exact next candidate.
 ## Historical evaluation snapshot
 
 A Windows x64 portable evaluation snapshot has been prepared from commit `e74f1b890c2b5128dd61569f0999a3dce74eab13` (binary version `0.1.0`). It is not a published beta release or a tagged prerelease. It excludes later committed cooperative-worker changes and uncommitted integration candidates.

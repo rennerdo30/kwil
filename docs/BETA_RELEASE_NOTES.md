@@ -1,7 +1,9 @@
-# Kwil 0.1.0-beta.1
+# Kwil 0.1.0-beta.2
+
+Draft notes for the next candidate. Artifacts and packaged native gates are not yet qualified.
 
 An early beta for evaluation and feedback. This is not an RC or a claim that the
-full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.1/docs/SPEC.md)
+full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.2/docs/SPEC.md)
 is complete. Test with copies of important files.
 
 ## Downloads and installation
@@ -17,10 +19,20 @@ These binaries are unsigned. Checksums detect a mismatch; they do not
 authenticate the publisher. There is no qualified MSI, ZIP installer, package
 manager distribution or macOS notarization in this beta.
 
-Install and replace beta binaries manually, while Kwil is closed. Beta releases
-are excluded from the stable auto-updater; beta copies also do not automatically
-advance to stable. The stable one-line download installers do not select betas.
+The default stable update channel can advance this build to a newer stable
+release. Set update.channel = "prerelease" to also receive published betas;
+update.check = false disables checks. Downloads still use SHA-256 verification,
+without independent signature verification. Managed packages with
+kwil.no-update require explicit replacement. Frozen beta.1 copies must be
+replaced manually to obtain this updater. Stable download installers do not
+select betas.
 
+## Changes since beta.1
+
+- Deadline-bounded native worker exit waiting.
+- GUI notification and receiver ownership retained through shutdown.
+- Stable/prerelease update settings and numeric prerelease ordering.
+- Guarded save/quit, readiness, cleanup and IPC regression fixes.
 ## Evaluation areas
 
 - GUI and TUI text editing, tabs, undo/redo and saving.
@@ -30,7 +42,7 @@ advance to stable. The stable one-line download installers do not select betas.
 
 This list identifies areas to evaluate, not blanket platform or performance
 acceptance. Exact candidate checks and remaining release gates are recorded in
-[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.1/docs/BETA.md).
+[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.2/docs/BETA.md).
 
 ## Known limitations
 
