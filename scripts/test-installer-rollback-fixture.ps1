@@ -58,6 +58,9 @@ Kwil lifecycle fixture: failure after predecessor removal.
 Action ended 10:00:06: KwilRollbackProbe. Return value 3.
 Property(S): KWIL_OLDER = $predecessor
 "@
+# Here-strings inherit checkout line endings. Build each transport encoding
+# from canonical LF once; otherwise CRLF source becomes CRCRLF in the test.
+$log = $log.Replace("`r`n","`n")
 Assert-KwilRollbackFixtureLog 1603 $log $predecessor; $count++
 Assert-KwilRollbackFixtureLog 1603 ($log.Replace("`n","`r`n")) $predecessor; $count++
 foreach ($exit in 0,3010,1618) { Reject { Assert-KwilRollbackFixtureLog $exit $log $predecessor } 'naturally with 1603' }
