@@ -710,7 +710,9 @@ fn owned_shutdown_until_refusal_returns_the_exact_original_facade_and_handle() {
         generation: 19,
     };
     let entered = observed.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    let refusal = worker.shutdown_until(deadline);
+    // This thread owns the epilogue release. Refuse before spending its
+    // cleanup deadline waiting for that same release.
+    let refusal = worker.shutdown_until(Instant::now());
     let released = release.send(());
     let (reason, retained, cleanup) = match refusal {
         Err(error) => {
