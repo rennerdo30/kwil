@@ -1207,3 +1207,28 @@ fn schema2_legacy_numeric_maintenance_and_replacement_authority_are_unchanged() 
     other_arch.architecture = "arm64".into();
     assert_eq!(operation(&other_arch, Some(&before), &install_session()).unwrap_err().code, "architecture-conflict");
 }
+
+#[test]
+fn foreign_values_are_reported_directly_even_when_the_containing_key_is_foreign() {
+    let package = package("1.2.3");
+    for value in package.resources.iter().filter(|row| row.kind() == "R") {
+        let key = package.resources.iter().find(|row| row.kind() == "K" && row.relative() == value.relative()).unwrap();
+        for observation in [
+            Observation::Value { value_type: 1, bytes: vec![0, 0] },
+            Observation::Value { value_type: 4, bytes: 7u32.to_le_bytes().to_vec() },
+        ] {
+            let mut api = InventoryApi::empty();
+            api.seen.insert(key.identity(), Observation::Key);
+            api.seen.insert(value.identity(), observation);
+            let before = api.seen.clone();
+            let refusal = resources(&package, None, &mut api).unwrap_err();
+            assert_eq!(refusal.code, "foreign-resource");
+            assert_eq!(
+                refusal.resource,
+                value.identity(),
+                "a containing key must not mask the value-specific collision"
+            );
+            assert_eq!(api.seen, before, "refusal is read-only");
+        }
+    }
+}

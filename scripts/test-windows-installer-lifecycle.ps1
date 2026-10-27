@@ -307,7 +307,7 @@ function Invoke-Driver {
     Write-Json (Join-Path $EvidenceDirectory 'budgets.json') $Budget
     Write-Json (Join-Path $EvidenceDirectory 'r1-repair-oracles.json') @(
         @{finding='P1-outer-dist-cancellation';oracle='wrapperInProcess=true; each original child receipt has an absolute-stage-capped wait; stage expiry refuses the next child; backend requires120+30 before launch';tamper='old2400s wrapper timeout cannot occur because no wrapper child exists';runtimeVerification='not-run'},
-        @{finding='P2-masked-foreign-R';oracle='masked-R-by-foreign-K records exact blocking K; installed changed R requires exact changed-owned-value identity';tamper='a different resource diagnostic fails ExpectedResource; masked K never counts as direct R coverage';runtimeVerification='not-run'},
+        @{finding='P2-masked-foreign-R';oracle='fresh empty/wrong-type R requires its exact foreign-resource identity even with a foreign containing K; installed changed R requires exact changed-owned-value identity';tamper='a key-only or different-resource diagnostic fails ExpectedResource';runtimeVerification='not-run'},
         @{finding='P2-metadata-only-upgrade';oracle='LICENSES.txt hash and size change with same component/id/fileKey; old bytes before upgrade, new hash and not-old hash after';tamper='retaining old file bytes with new registration fails replacement oracle';runtimeVerification='not-run'},
         @{finding='P2-visible-task-worker';oracle='scheduled pwsh arguments explicitly require -WindowStyle Hidden';tamper='removing Hidden from action arguments fails before task registration';runtimeVerification='not-run'},
         @{finding='P2-job-budget-overrun';oracle='Assert-BudgetPlan plus monotonic per-stage launch caps; driver3060+checkout60+artifact300+slack180=job3600';tamper='increasing a stage without reallocating totals or artifact reserve fails budget assertions';runtimeVerification='not-run'}
@@ -597,7 +597,7 @@ function Invoke-Worker {
     $script:Gaps = @(
         'rollback after early predecessor removal: separate fixed-failure MSI fixture authored; native restoration proof still required',
         'newly claimed resources DURING upgrade, including a new R in a verified owned K: component schema 1 fixes all 29 resources; coordinated schema fixture required',
-        'fresh foreign-R collision cases are masked by a foreign claimed K; only installed changed-R cases assert a value-specific refusal',
+        'fresh foreign-R direct empty/wrong-type refusal controls authored; native exact-value proof still required',
         'Explorer invocation/icon and GUI first frame: static LNK/verb bytes only in this harness',
         'registry-link/reparse ancestry, corrupt cached original and architecture-switch refusal not yet authored'
     )
@@ -693,11 +693,10 @@ function Invoke-Worker {
         foreach ($kind in 'String','DWord') {
             $key = New-ForeignKey $row.relative
             try { $key.SetValue((Get-ValueName $row), $(if ($kind -ceq 'String') { '' } else { 7 }), [Microsoft.Win32.RegistryValueKind]::$kind) } finally { $key.Dispose() }
-            # With no verified predecessor, this fixture creates a foreign K
-            # before its R. Assert THAT exact key refusal, explicitly mark the
-            # R oracle masked, and never count it as value-specific coverage.
-            $blockingKey = @($script:Original.inventory | Where-Object { $_.kind -ceq 'K' -and $script:ForeignKeys.Contains($_.relative) })[0]
-            $null = Invoke-Msi "foreign-value-masked-$kind-$($row.id)" $msi -Refuse -ExpectedDiagnostic 'Kwil installer preflight: foreign-resource' -ExpectedResource (Get-DistResourceIdentity $blockingKey) -Coverage 'masked-R-by-foreign-K'
+            # The containing key is foreign too. The guard observes concrete
+            # file/value collisions before keys, so THIS exact empty/wrong-type
+            # R must be named. A generic key refusal cannot satisfy this case.
+            $null = Invoke-Msi "foreign-value-direct-$kind-$($row.id)" $msi -Refuse -ExpectedDiagnostic 'Kwil installer preflight: foreign-resource' -ExpectedResource (Get-DistResourceIdentity $row) -Coverage 'direct-R-with-foreign-K'
             $key = Open-Hkcu $row.relative $true
             try {
                 Assert-Case ($key.GetValueKind((Get-ValueName $row)).ToString() -ceq $kind) 'foreign value type changed'

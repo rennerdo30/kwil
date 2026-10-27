@@ -125,7 +125,15 @@ pub fn resources(active: &Package, original: Option<&Package>, api: &mut impl Re
             require(matches_original(row, &seen, api.install_root())?, code, row.identity())?;
         }
     }
-    for row in &active.resources {
+    // A present value is a concrete collision even when its containing key is
+    // also foreign. Inspect files/values before keys so diagnostics and native
+    // controls can establish that exact refusal; every key is still checked.
+    for row in active
+        .resources
+        .iter()
+        .filter(|row| row.kind() != "K")
+        .chain(active.resources.iter().filter(|row| row.kind() == "K"))
+    {
         let old = original.and_then(|p| p.resources.iter().find(|r| r.identity() == row.identity()));
         if let Some(old) = old {
             require(old.component() == row.component(), "component-mismatch", row.identity())?;
