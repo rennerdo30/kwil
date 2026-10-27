@@ -11,6 +11,8 @@ on:
       # Diagnostic-only changes must not launch the expensive MSI lifecycle.
       - '!scripts/test-windows-installer-token.ps1'
       - 'scripts/dist.ps1'
+      - 'scripts/installer-rollback-fixture.ps1'
+      - 'scripts/test-installer-rollback-fixture.ps1'
       - 'scripts/check-static-runtime.py'
       - 'dist.bat'
       - 'crates/**'
@@ -46,6 +48,10 @@ jobs:
         timeout-minutes: 1
         with:
           persist-credentials: false
+      - name: Check inert rollback fixture controls
+        timeout-minutes: 1
+        shell: pwsh
+        run: ./scripts/test-installer-rollback-fixture.ps1
       - name: Build actual dist and exercise isolated current-user MSI lifecycle
         timeout-minutes: 54
         shell: pwsh

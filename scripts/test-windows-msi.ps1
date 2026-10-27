@@ -20,6 +20,7 @@ param([string]$PackagingRoot)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 . ([IO.Path]::Combine($PSScriptRoot,'windows-msi.ps1'))
+. (Join-Path $PSScriptRoot 'installer-rollback-fixture.ps1')
 $script:KwilTestCount=0
 
 function Test-KwilEqual {
@@ -488,6 +489,17 @@ if($PSBoundParameters.ContainsKey('PackagingRoot')) {
         Test-KwilEqual $repacked.productCode $manifest.productCode 'repack ProductCode stable'
         Assert-Kwil ($repacked.packageCode -cne $manifest.packageCode) 'fixture PackageCode must be fresh'
         $original=Open-KwilInput $out 16777216;try{$originalHash=$original.Sha256}finally{$original.Stream.Dispose()}
+        # Separate, non-runnable fixture clone: real MSI SQL/readback and all
+        # embedded streams are checked, but no install or guard is executed.
+        $rollbackInstaller=New-Object -ComObject WindowsInstaller.Installer
+        try {
+            $rollback=New-KwilRollbackFixture $rollbackInstaller $out ([IO.Path]::Combine($root,$architecture+'-rollback-fixture.msi')) $architecture $manifest.packageCode
+            Test-KwilEqual $rollback.SourceSha256 $originalHash 'rollback clone preserves original MSI'
+            Test-KwilEqual $rollback.FixtureOnly $true 'rollback clone cannot claim release artifact'
+            Assert-Kwil ($rollback.PackageCode -cne $manifest.packageCode) 'rollback clone fresh PackageCode'
+            Assert-Kwil ($rollback.Sha256 -cne $originalHash) 'rollback clone has the intended mutations'
+            $script:KwilTestCount+=2
+        } finally { Release-KwilCom $rollbackInstaller }
         $tamper=[IO.Path]::Combine($root,$architecture+'-tamper.msi');[IO.File]::Copy($out,$tamper,$false)
         $ci=New-Object -ComObject WindowsInstaller.Installer;$db=$null
         try {

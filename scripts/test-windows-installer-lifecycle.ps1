@@ -8,8 +8,9 @@ Every refusal must come from KwilPreflight (or the rollback LaunchCondition)
 before InstallInitialize. A random
 msiexec error, UAC failure or timeout cannot count as a passing negative case.
 
-Schema 1 cannot express new upgrade resources or a post-removal failing action.
-Those acceptance cases remain explicit gaps until ROOT approves a shared seam.
+The fixed component schema cannot express new upgrade resources. A separate
+fixture-only MSI adds a fixed Type19 failure after predecessor removal; it is
+never a release package or a shipped guard bypass. Native proof is still needed.
 The result intentionally cannot say full lifecycle acceptance with gaps present.
 No MSI or fixture is automatically uninstalled/deleted after a failed case.
 #>
@@ -495,8 +496,9 @@ function Assert-Registration($Package, [bool]$Absent = $false) {
 }
 
 function Invoke-Msi {
-    param([string]$Label, [string]$Path, [ValidateSet('Install','Repair','Uninstall')][string]$Operation = 'Install', [switch]$Refuse, [string[]]$Properties = @(), [string]$ExpectedDiagnostic = 'Kwil installer preflight:', [string]$ExpectedResource = '', [string]$Coverage = 'direct')
+    param([string]$Label, [string]$Path, [ValidateSet('Install','Repair','Uninstall')][string]$Operation = 'Install', [switch]$Refuse, [string[]]$Properties = @(), [string]$ExpectedDiagnostic = 'Kwil installer preflight:', [string]$ExpectedResource = '', [string]$Coverage = 'direct', [switch]$RollbackFault)
     $null = Assert-Owner
+    Assert-Case (-not ($Refuse -and $RollbackFault) -and (-not $RollbackFault -or $Operation -ceq 'Install')) 'rollback fault is a distinct install outcome, never a preflight refusal'
     $rawLog = Join-Path $EvidenceDirectory "$Label.msi.native.log"
     $log = Join-Path $EvidenceDirectory "$Label.msi.log"
     $verb = if ($Operation -ceq 'Uninstall') { '/x' } else { '/i' }
@@ -515,7 +517,9 @@ function Invoke-Msi {
         while (($length=$reader.Read($buffer,0,$buffer.Length)) -gt 0) { $writer.Write($buffer,0,$length) }
     } finally { $reader.Dispose(); $writer.Dispose() }
     $text = [IO.File]::ReadAllText($log)
-    if ($Refuse) {
+    if ($RollbackFault) {
+        Assert-KwilRollbackFixtureLog $code $text $script:Original.productCode
+    } elseif ($Refuse) {
         Assert-Case ($code -eq 1603) "$Label must refuse with 1603, got $code"
         Assert-Case ($text -match [regex]::Escape($ExpectedDiagnostic)) "$Label did not produce expected diagnostic: $ExpectedDiagnostic"
         if ($ExpectedResource) {
@@ -527,7 +531,7 @@ function Invoke-Msi {
         Assert-Case ($code -eq 0) "$Label failed exit=$code; reboot-required is not silently accepted"
         Assert-Case ($text -match 'Action start [^\r\n]*: KwilPreflight\.') "$Label did not run actual guard"
     }
-    $script:Results.Add([ordered]@{case=$Label;operation=$Operation;exitCode=$code;expectedRefusal=[bool]$Refuse;expectedResource=$ExpectedResource;coverage=$Coverage;log=[IO.Path]::GetFileName($log)})
+    $script:Results.Add([ordered]@{case=$Label;operation=$Operation;exitCode=$code;expectedRefusal=[bool]$Refuse;expectedRollbackFailure=[bool]$RollbackFault;expectedResource=$ExpectedResource;coverage=$Coverage;log=[IO.Path]::GetFileName($log)})
     return $text
 }
 
@@ -591,8 +595,8 @@ function Invoke-Worker {
     Add-Receipt "worker pid=$PID workSeconds=$($Budget.WorkerWork) taskSeconds=$($Budget.WorkerTask) sid=$(Get-Sid) elevated=false commit=$($owner.commit)"
     $script:Results = [Collections.Generic.List[object]]::new()
     $script:Gaps = @(
-        'rollback after early predecessor removal: ROOT-approved bounded fault injection seam required',
-        'newly claimed resources DURING upgrade, including a new R in a verified owned K: schema 1 fixes all 29 resources; coordinated schema fixture required',
+        'rollback after early predecessor removal: separate fixed-failure MSI fixture authored; native restoration proof still required',
+        'newly claimed resources DURING upgrade, including a new R in a verified owned K: component schema 1 fixes all 29 resources; coordinated schema fixture required',
         'fresh foreign-R collision cases are masked by a foreign claimed K; only installed changed-R cases assert a value-specific refusal',
         'Explorer invocation/icon and GUI first frame: static LNK/verb bytes only in this harness',
         'registry-link/reparse ancestry, corrupt cached original and architecture-switch refusal not yet authored'
@@ -618,6 +622,7 @@ function Invoke-Worker {
     $script:UserPath = [Environment]::GetEnvironmentVariable('PATH','User')
     $script:MachinePath = [Environment]::GetEnvironmentVariable('PATH','Machine')
     . (Join-Path $PSScriptRoot 'dist.ps1')
+    . (Join-Path $PSScriptRoot 'installer-rollback-fixture.ps1')
     $msis = @(Get-ChildItem -LiteralPath (Join-Path $EvidenceDirectory 'original') -Filter '*.msi' -File)
     Assert-Case ($msis.Count -eq 1) 'one retained original MSI required'
     $msi = $msis[0].FullName
@@ -646,6 +651,8 @@ function Invoke-Worker {
         $higherRelease = if ($ordinal -lt 65535) { '0.1.0-beta.' + ($ordinal+1).ToString([Globalization.CultureInfo]::InvariantCulture) } else { '0.1.0' }
     } else { throw 'No higher supported ReleaseVersion; coordinated contract update required' }
     $higher = New-FixturePackage 'higher-version' $higherRelease $script:Original.commit -ChangedNotice
+    $rollback = New-KwilRollbackFixture $script:Installer $higher.Path (Join-Path $EvidenceDirectory 'rollback-fault-fixture.msi') $Architecture $higher.Package.packageCode
+    Write-Json (Join-Path $EvidenceDirectory 'rollback-fixture.json') $rollback
     $oldNotice = @($script:Original.inventory | Where-Object { $_.kind -ceq 'F' -and $_.root -ceq 'I' -and $_.relative -ceq 'LICENSES.txt' })[0]
     $newNotice = @($higher.Package.inventory | Where-Object { $_.kind -ceq 'F' -and $_.root -ceq 'I' -and $_.relative -ceq 'LICENSES.txt' })[0]
     Assert-Case ($oldNotice.component -ceq $newNotice.component -and $oldNotice.id -ceq $newNotice.id -and $oldNotice.fileKey -ceq $newNotice.fileKey) 'replacement fixture changed logical component identity'
@@ -828,6 +835,18 @@ function Invoke-Worker {
     Assert-Resources $script:Original
     Assert-Preserved
 
+    # Real rollback, not a refusal before InstallInitialize. The separate
+    # incoming MSI runs BOTH guards, removes the verified predecessor, then its
+    # fixed Type19 action fails. Registration, every old byte and all unknown
+    # fixture-owned data must return unchanged. The normal higher MSI is intact.
+    $oldCacheHash = Get-Hash (Get-Registration $script:Original.productCode)
+    $null = Invoke-Msi 'rollback-after-predecessor-removal' $rollback.Path -RollbackFault
+    Assert-Resources $script:Original
+    Assert-Registration $script:Original
+    Assert-Registration $higher.Package $true
+    Assert-Case ((Get-Hash (Get-Registration $script:Original.productCode)) -ceq $oldCacheHash) 'rollback changed the cached original package'
+    Assert-Case ((Get-Hash $higher.Path) -ceq $rollback.SourceSha256) 'rollback fixture changed the normal upgrade MSI'
+    Assert-Preserved
     Invoke-PairCases $msi $higher.Path
     $installedNotice = Join-Path $script:InstallRoot 'LICENSES.txt'
     Assert-Case ((Get-Hash $installedNotice) -ceq $oldNotice.sha256) 'replacement test did not start with original bytes'
