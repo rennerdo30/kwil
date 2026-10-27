@@ -2,11 +2,34 @@
 
 ## Next candidate: 0.1.0-beta.2
 
-Source is being prepared for beta.2, including native shutdown waiting, GUI
-notification lifetime fixes, update channels and guarded fixture/IPC repairs.
-There is no beta.2 tag or draft yet. Exact candidate CI, packaged GUI/TUI checks
-and installer lifecycle qualification remain required; the source version is
-not acceptance. V1 remains the full scope in [SPEC.md](SPEC.md).
+Beta.2 source includes native shutdown waiting, GUI notification lifetime,
+update channels, guarded fixture/IPC repairs and final closed-journal durability
+acknowledgement. There is no beta.2 tag or draft yet. V1 remains the full scope
+in [SPEC.md](SPEC.md).
+
+- Commit `5007980da3b961a891a6ba1965a9c21388f25854` passed
+  [hosted CI 40458026047](https://github.com/rennerdo30/kwil/actions/runs/40458026047)
+  on Windows, macOS and Linux: full workspace tests, strict lint and formatting.
+- Native smoke exposed a further Quit hang despite that green CI. Commit
+  `77d09c1e33247393f58d9094791462edec8da277` publishes the exact successful
+  journal Finish durability boundary before closing it. Its real save/close
+  regression fails on the old source at its unchanged ten-second deadline and
+  passes after the fix. All seven save/quit controls, the journal-boundary
+  control and strict model lint pass. Successor hosted CI is still required.
+- A static-CRT Windows x64 release pair built from that exact source passes
+  native CPU GUI edit/save/undo/redo, clean Quit (exit 0), then reopen/edit/undo
+  and clean Quit (exit 0). Disk bytes are checked exactly. Both runs use the
+  original thirty-second deadline and cloaked owned windows.
+- The same release pair passes hidden ConPTY TUI opening/search (four matches)
+  and natural Quit (exit 0), without termination or deadline expiry. This is
+  Windows x64 functional evidence; other packaged platforms, visual quality
+  and performance remain separate gates.
+- Release pair SHA-256: GUI
+  `f3a0e197bcbc641871f32d8328af62adb1bbc6e39886051d5c28678e1d79d3ee`;
+  console
+  `22b4e6dc8d8dd92086e31677f06c209474f46eccac5282ddc5a34c12c5e02bba`.
+- Installer lifecycle qualification and release setup wiring remain open below.
+  These local binaries are not qualified setup assets or published downloads.
 
 ## Frozen beta.1 draft
 
