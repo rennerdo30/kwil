@@ -35,8 +35,9 @@ maps to `0.1.0`. Visible beta identity is retained; suffix stripping is forbidde
 This prepares a future beta.2 setup path, not available or qualified setup assets.
 The release workflow still stages raw binaries; setup/publish wiring is excluded
 until exact artifacts and worker/lifecycle gates are qualified. Prereleases do not enter the stable
-updater or download installers; prerelease copies also do not auto-advance to a
-stable version. See [beta gates and limitations](BETA.md).
+updater or download installers. Builds after beta.1 can opt into prerelease
+updates and can advance from beta to stable; see [update settings](UPDATES.md).
+Frozen beta.1 copies still require manual replacement. See [beta gates and limitations](BETA.md).
 
 ## Asset contract (do not change without updating `crates/update`)
 
@@ -46,7 +47,8 @@ stable version. See [beta gates and limitations](BETA.md).
 - The console entry point runs terminal work itself. For a GUI it forwards arguments unchanged to `kwil.exe`, waits for its first-frame acknowledgement, then returns. Before acknowledging readiness, the GUI detaches from the shell console and releases standard handles. Startup diagnostics use launcher-owned pipes, so redirected shell streams reach EOF when the launcher exits. Startup failure is handled while it still owns the terminal; CLI and TUI paths keep their console.
 - Keep the existing `.exe` asset name so older single-file updater clients can still find it.
 - `SHA256SUMS` in `sha256sum` format (`<hex>  <file name>`).
-- Drafts and prereleases are never offered to auto-update.
+- Drafts are never offered. Stable-channel updates exclude prereleases;
+  `update.channel = "prerelease"` explicitly opts into published prereleases.
 
 ## Not yet in place
 
