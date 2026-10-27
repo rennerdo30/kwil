@@ -388,3 +388,19 @@ fn source_barrier_sender_control_flow_keeps_original_unboxed_carrier_size() {
         std::mem::size_of::<Result<(), TrySendError<DocumentRequest>>>(),
     );
 }
+
+#[test]
+fn journal_finish_reports_only_exact_successful_generation_boundary() {
+    let root = tests::Scratch::new();
+    let deadline = Instant::now() + LIMIT;
+    let (_prepared, mut storage) = seeded_storage(&root.0, deadline);
+    assert_eq!(finish_journal(&mut storage, ID, GENERATION - 1).unwrap(), None);
+    assert!(storage.journals.contains_key(&ID));
+    assert!(storage.finished_journals.is_empty());
+    assert_eq!(finish_journal(&mut storage, ID, GENERATION).unwrap(), Some((REVISION, 0)));
+    assert!(!storage.journals.contains_key(&ID));
+    assert!(storage.finished_journals.contains_key(&ID));
+    assert_eq!(finish_journal(&mut storage, ID, GENERATION).unwrap(), None);
+    assert_eq!(finish_journal(&mut storage, DocumentId(99), GENERATION).unwrap(), None);
+    finish_storage(storage, deadline);
+}

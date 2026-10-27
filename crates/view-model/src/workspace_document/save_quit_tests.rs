@@ -427,3 +427,26 @@ fn savequit_successful_trim_installs_a_clean_saved_revision() {
     fixture.until(|workspace, _| workspace.wants_exit());
     fixture.finish();
 }
+
+#[test]
+fn saved_closed_tab_shutdown_retains_exact_final_journal_durability() {
+    let mut f = Fixture::new(false);
+    let path = f.root.join("closed-save.txt");
+    let id = f.workspace().active_id();
+    f.edit("saved closed tab\n");
+    f.workspace_mut().save_document(id, Some(path.clone())).unwrap();
+    let revision = f.before_effect();
+    f.complete(revision);
+    assert_eq!(std::fs::read(&path).unwrap(), b"saved closed tab\n");
+    assert!(!f.workspace().views[&id].editor().unwrap().document().is_dirty());
+    assert!(f.workspace_mut().close(id, false).unwrap());
+    let editor = f.workspace().closed_views[&id].editor().unwrap();
+    let target = (editor.document().revision(), editor.next_edit_sequence() - 1);
+    f.until(|workspace, transport| {
+        workspace.files.queue.is_empty()
+            && !transport.status().occupied
+            && workspace.files.durable.get(&id) == Some(&target)
+    });
+    assert_eq!(f.workspace().files.durable.get(&id), Some(&target));
+    f.finish();
+}

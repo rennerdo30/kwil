@@ -1551,7 +1551,20 @@ impl DocumentWorker {
                         DocumentRequest::FinishJournal { document, generation } => {
                             let result = storage
                                 .as_mut()
-                                .map_or(Ok(()), |storage| finish_journal(storage, document, generation));
+                                .map_or(Ok(None), |storage| finish_journal(storage, document, generation));
+                            let result = result.map(|durable| {
+                                if let Some((revision, sequence)) = durable {
+                                    // Finish acknowledges the final sync after all earlier
+                                    // journal commands. Publish its exact boundary before
+                                    // the close result; this journal cannot be flushed again.
+                                    complete(DocumentResult::JournalDurable {
+                                        document,
+                                        revision,
+                                        sequence,
+                                        result: Ok(()),
+                                    });
+                                }
+                            });
                             complete(DocumentResult::JournalClosed { document, result });
                         }
                         DocumentRequest::FlushJournals => {
@@ -1994,9 +2007,9 @@ fn persist_session(storage: &mut Storage, next: &Session) -> io::Result<()> {
     Ok(())
 }
 
-fn finish_journal(storage: &mut Storage, document: DocumentId, generation: u64) -> io::Result<()> {
+fn finish_journal(storage: &mut Storage, document: DocumentId, generation: u64) -> io::Result<Option<(u64, u64)>> {
     if !storage.journals.get(&document).is_some_and(|journal| journal.generation <= generation) {
-        return Ok(());
+        return Ok(None);
     }
     if storage.transports.contains_key(&document) {
         return Err(io::Error::new(
@@ -2017,15 +2030,22 @@ fn finish_journal(storage: &mut Storage, document: DocumentId, generation: u64) 
             .finished
             .recv_timeout(Duration::from_secs(30))
             .map_err(|_| io::Error::other("Journal close timed out; exact previous owners retained"))?
-            .map(|_| ())
+            .and_then(|revision| {
+                if revision == journal.revision {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("Journal finish revision mismatch; exact owner retained"))
+                }
+            })
     });
     if let Err(error) = result {
         journal.failed = true;
         return Err(error);
     }
     let journal = storage.journals.remove(&document).expect("finished journal still owned");
+    let durable = (journal.revision, journal.sequence);
     storage.finished_journals.insert(document, journal);
-    Ok(())
+    Ok(Some(durable))
 }
 
 struct SeedSnapshot {
