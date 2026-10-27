@@ -1922,7 +1922,24 @@ fn result_transport_done_notice_does_not_prove_actual_thread_exit() {
             held.recv_timeout(LIMIT).unwrap();
         },
     );
-    let failure = receiver.stop(worker).unwrap().settle(LIMIT, |_| ControlFlow::Continue(())).unwrap_err();
+    // This control observes the real native handle once while its epilogue is
+    // held. A deadline-bounded wait would intentionally consume the release
+    // deadline, racing the same gate it is meant to inspect.
+    let failure = receiver
+        .stop(worker)
+        .unwrap()
+        .settle_with_native(
+            LIMIT,
+            |_| ControlFlow::Continue(()),
+            |shared, deadline| {
+                shared.settle_native_until_with(
+                    deadline,
+                    NativeExitObservation::query,
+                    NativeExitObservation::retire_after_join,
+                )
+            },
+        )
+        .unwrap_err();
     assert_eq!(failure.reason, DocumentResultSettlementReason::ThreadExitPending);
     epilogue.recv_timeout(LIMIT).unwrap();
     assert!(!lock(&shared.worker).as_ref().unwrap().is_finished());

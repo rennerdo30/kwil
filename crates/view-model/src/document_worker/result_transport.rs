@@ -2348,7 +2348,19 @@ impl DocumentResultSettlementTicket {
     pub fn settle(
         self,
         timeout: Duration,
+        accept: impl FnMut(DocumentResult) -> ControlFlow<DocumentResult, ()>,
+    ) -> Result<(), DocumentResultSettlementFailure> {
+        self.settle_with_native(timeout, accept, Shared::settle_native_until)
+    }
+
+    // Test-only synchronous effect seam for held completion-notice controls.
+    // Ordinary settlement above still uses the real deadline-bounded wait.
+    #[cfg(test)]
+    fn settle_with_native(
+        self,
+        timeout: Duration,
         mut accept: impl FnMut(DocumentResult) -> ControlFlow<DocumentResult, ()>,
+        mut settle_native: impl FnMut(&Shared, Instant) -> Result<(), DocumentResultSettlementReason>,
     ) -> Result<(), DocumentResultSettlementFailure> {
         let started = Instant::now();
         let shared = self.receiver.shared.clone();
@@ -2370,7 +2382,7 @@ impl DocumentResultSettlementTicket {
             let mut state = lock(&shared.state);
             if state.worker_done && state.worker_panicked {
                 drop(state);
-                let reason = match shared.settle_native_until(deadline) {
+                let reason = match settle_native(&shared, deadline) {
                     Err(reason) => reason,
                     Ok(()) => lock(&shared.state).failure().unwrap_or(DocumentResultSettlementReason::WorkerPanicked),
                 };
@@ -2431,7 +2443,7 @@ impl DocumentResultSettlementTicket {
             if state.worker_done {
                 let acknowledged = state.stopped_acknowledged;
                 drop(state);
-                if let Err(reason) = shared.settle_native_until(deadline) {
+                if let Err(reason) = settle_native(&shared, deadline) {
                     return Err(DocumentResultSettlementFailure { ticket: self, reason });
                 }
                 if let Some(reason) = lock(&shared.state).failure() {
