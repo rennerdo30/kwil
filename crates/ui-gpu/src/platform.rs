@@ -16,6 +16,10 @@ pub(crate) fn decorate_window(_hwnd: isize, _dark: bool, _remote: bool, _dialog:
 pub(crate) struct Native;
 #[cfg(not(windows))]
 impl Native {
+    #[cfg(feature = "gpu")]
+    pub fn in_size_move(&self) -> bool {
+        false
+    }
     pub fn register(_hwnd: isize, _send: impl Fn(super::UserEvent) + Send + Sync + 'static) -> Self {
         Self
     }

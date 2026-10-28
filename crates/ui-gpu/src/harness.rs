@@ -115,6 +115,14 @@ pub(crate) enum Step {
     RecentMiddleClick,
     DismissSetup,
     ResizeProbe,
+    ResizeFinish,
+    ResizeCheck,
+    DailyProbe,
+    DailyType,
+    DailyTyped,
+    DailyUndone,
+    DailyRedone,
+    DailySaved,
     DesktopWindowProbe,
     DesktopSettingsProbe,
     ThemeLight,
@@ -137,6 +145,7 @@ struct Counts {
 pub(crate) struct Metrics {
     phase: usize,
     per: [Counts; 5],
+    resize_settled: Option<u64>,
 }
 impl Metrics {
     pub fn present(&mut self, full: bool, damage: u64, copy: u64) {
@@ -208,7 +217,25 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (200, Step::UsabilityCapture("welcome-complete.bmp")),
             (100, Step::End),
         ];
-        let resize = [(1800, Step::DismissSetup), (200, Step::ResizeProbe), (100, Step::End)];
+        let resize = [
+            (1800, Step::DismissSetup),
+            (200, Step::Idle),
+            (100, Step::ResizeProbe),
+            (100, Step::ResizeFinish),
+            (200, Step::ResizeCheck),
+            (200, Step::End),
+        ];
+        let daily = [
+            (1800, Step::DismissSetup),
+            (200, Step::Idle),
+            (100, Step::DailyProbe),
+            (200, Step::DailyType),
+            (200, Step::DailyTyped),
+            (200, Step::DailyUndone),
+            (200, Step::DailyRedone),
+            (700, Step::DailySaved),
+            (200, Step::End),
+        ];
         let desktop = [
             (1800, Step::WelcomeProbe),
             (100, Step::DesktopWindowProbe),
@@ -371,6 +398,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             find.as_slice()
         } else if std::env::var_os("KWIL_DESKTOP_WINDOW_PROBE").is_some() {
             desktop.as_slice()
+        } else if std::env::var_os("KWIL_DAILY_USE_PROBE").is_some() {
+            daily.as_slice()
         } else if std::env::var_os("KWIL_RESIZE_PROBE").is_some() {
             resize.as_slice()
         } else if std::env::var_os("KWIL_WELCOME_PROBE").is_some() {
@@ -680,22 +709,88 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             use winit::application::ApplicationHandler;
             use winit::event::WindowEvent;
             let id = app.gfx.as_ref().unwrap().window.id();
-            let original = app.size;
+            resize_interaction(app, true);
             let mut event_ms = Vec::new();
             let mut paint_ms = Vec::new();
-            for (w, h) in [(1080, 700), (1180, 740), (1280, 800), (1380, 840), (1480, 900), original] {
+            let presents = app.metrics.per[app.metrics.phase].presents;
+            for step in 0..50 {
+                let (w, h) = (1000 + step * 4, 650 + step * 2);
                 let start = std::time::Instant::now();
                 app.window_event(el, id, WindowEvent::Resized(winit::dpi::PhysicalSize::new(w as u32, h as u32)));
                 event_ms.push(start.elapsed().as_secs_f64() * 1000.0);
                 let start = std::time::Instant::now();
-                assert!(app.render());
+                // Windows may deliver WM_PAINT between individual WM_SIZEs.
+                app.window_event(el, id, WindowEvent::RedrawRequested);
                 paint_ms.push(start.elapsed().as_secs_f64() * 1000.0);
             }
-            let text = format!("six bounded App resize events; event_ms={event_ms:?}; paint_ms={paint_ms:?}\n");
+            let burst_presents = app.metrics.per[app.metrics.phase].presents - presents;
+            let text = format!(
+                "50 bounded App resize+redraw events; event_ms={event_ms:?}; paint_ms={paint_ms:?}; presents={burst_presents}\n"
+            );
             println!("{text}");
             if let Some(dir) = &dir {
                 std::fs::write(dir.join("resize-timing.txt"), text).unwrap();
             }
+            let _ = app.gfx.as_ref().unwrap().window.request_inner_size(winit::dpi::PhysicalSize::new(1196, 748));
+            if std::env::var_os("KWIL_RESIZE_REQUIRE_COALESCING").is_some() {
+                assert!(burst_presents <= 1, "intermediate resize paints must be coalesced");
+                assert!(
+                    event_ms.iter().zip(&paint_ms).all(|(event, paint)| event + paint < 8.333),
+                    "every resize+redraw step must finish within a 120 Hz frame"
+                );
+            }
+        }
+        Step::ResizeFinish => {
+            assert_eq!(app.size, (1196, 748));
+            #[cfg(windows)]
+            assert!(!app.gpu_active(), "CPU owns interactive resize frames");
+            capture(app, dir.as_deref(), "resize-drag.bmp");
+            resize_interaction(app, false);
+        }
+        Step::ResizeCheck => {
+            assert_eq!(app.size, (1196, 748));
+            assert!(app.pending_resize.is_none(), "final geometry must be consumed");
+            assert_eq!(app.gfx.as_ref().unwrap().pixels.len(), 1196 * 748);
+            capture(app, dir.as_deref(), "resize-final.bmp");
+            app.metrics.resize_settled = Some(app.metrics.per[app.metrics.phase].presents);
+            println!("kwil-resize final_geometry=1196x748 capture=resize-final.bmp");
+        }
+        Step::DailyProbe => daily_probe(app, el, dir.as_deref()),
+        Step::DailyType => daily_type(app, el, dir.as_deref()),
+        Step::DailyTyped => {
+            assert!(
+                app.view.line(0).unwrap().starts_with(b"daily line 0"),
+                "line={:?} notice={}",
+                app.view.line(0),
+                app.view.notice()
+            );
+            assert_eq!(app.view.editor().unwrap().primary_cursor().head, 6, "typing advances caret");
+            assert!(app.render());
+            capture(app, dir.as_deref(), "daily-typed.bmp");
+            app.run_menu_command(Some(el), "edit.undo");
+        }
+        Step::DailyUndone => {
+            assert!(app.view.line(0).unwrap().starts_with(b"line 0"));
+            app.run_menu_command(Some(el), "edit.redo");
+        }
+        Step::DailyRedone => {
+            assert!(app.view.line(0).unwrap().starts_with(b"daily line 0"));
+            app.run_menu_command(Some(el), "edit.selectAll");
+            app.save();
+        }
+        Step::DailySaved => {
+            let path = app.view.editor().unwrap().document().path().unwrap();
+            let original = std::fs::read(dir.as_ref().unwrap().join("original.txt")).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), [b"daily ".as_slice(), &original].concat());
+            assert!(!app.view.file_saves_pending(), "save completion must reach the GUI");
+            assert!(!app.view.editor().unwrap().document().is_dirty(), "save marks the revision clean");
+            assert!(app.horizontal <= app.bars().1.maximum, "caret reveal must not scroll beyond the horizontal track");
+            capture(app, dir.as_deref(), "daily-saved.bmp");
+            let cursor = app.view.editor().unwrap().primary_cursor();
+            assert_ne!(cursor.anchor, cursor.head, "selection remains after save");
+            std::fs::write(dir.as_ref().unwrap().join("daily-use.txt"),
+                "PASS scrollbar tracks and thumb drags on both axes; typed text, caret, mouse selection, undo/redo, exact worker save bytes\n").unwrap();
+            println!("kwil-daily save=true exact_bytes=true");
         }
         Step::WelcomeScrollDamage => {
             assert!(app.render());
@@ -1362,8 +1457,26 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             capture(app, dir.as_deref(), name);
         }
         Step::End => {
+            if let Some(presents) = app.metrics.resize_settled {
+                assert_eq!(app.metrics.per[app.metrics.phase].presents, presents, "zero idle presents after resize");
+                if let Some(dir) = &dir {
+                    std::fs::write(dir.join("resize-idle.txt"), "PASS: zero idle presents after final resize frame\n")
+                        .unwrap();
+                }
+            }
             capture(app, dir.as_deref(), "status.bmp");
             app.metrics.print();
+            if let Some(dir) = &dir {
+                let counts = app.metrics.per[app.metrics.phase];
+                std::fs::write(
+                    dir.join("frame-counts.txt"),
+                    format!(
+                        "presents={} full={} damage_px={} copy_px={}\n",
+                        counts.presents, counts.full, counts.damage, counts.copy
+                    ),
+                )
+                .unwrap();
+            }
             println!(
                 "kwil-frame final_remote={} cursor_blink_allowed={}",
                 app.policy.remote(),
@@ -1545,10 +1658,132 @@ fn choose_theme(app: &mut App, el: &ActiveEventLoop, value: &str) {
     );
 }
 
+fn daily_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
+    use winit::{
+        dpi::PhysicalPosition,
+        event::{DeviceId, ElementState, MouseButton, WindowEvent},
+    };
+    fn point(app: &mut App, el: &ActiveEventLoop, x: usize, y: usize) {
+        let id = app.gfx.as_ref().unwrap().window.id();
+        app.window_event(
+            el,
+            id,
+            WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: PhysicalPosition::new(x as f64, y as f64),
+            },
+        );
+    }
+    fn button(app: &mut App, el: &ActiveEventLoop, state: ElementState) {
+        let id = app.gfx.as_ref().unwrap().window.id();
+        app.window_event(
+            el,
+            id,
+            WindowEvent::MouseInput { device_id: DeviceId::dummy(), state, button: MouseButton::Left },
+        );
+    }
+    let body = app.body_area();
+    let (v, h) = app.bars();
+    assert!(v.maximum > 0 && h.maximum > 0, "both overflow scrollbars must be present");
+    point(app, el, body.x + body.width - 2, body.y + v.thumb_start + v.thumb_length + 2);
+    button(app, el, ElementState::Pressed);
+    button(app, el, ElementState::Released);
+    assert!(app.view.top() > 0, "vertical track click pages");
+    let (v, _) = app.bars();
+    point(app, el, body.x + body.width - 2, body.y + v.thumb_start + v.thumb_length / 2);
+    button(app, el, ElementState::Pressed);
+    assert!(app.drag.is_some());
+    point(app, el, body.x + body.width - 2, body.y + v.length);
+    button(app, el, ElementState::Released);
+    assert_eq!(app.view.top(), v.maximum, "vertical thumb reaches bottom");
+    let (v, h) = app.bars();
+    point(app, el, body.x + h.thumb_start + h.thumb_length + 2, body.y + v.length + 2);
+    button(app, el, ElementState::Pressed);
+    button(app, el, ElementState::Released);
+    assert!(app.horizontal > 0, "horizontal track click pages");
+    let (_, h) = app.bars();
+    point(app, el, body.x + h.thumb_start + h.thumb_length / 2, body.y + v.length + 2);
+    button(app, el, ElementState::Pressed);
+    assert!(app.drag.is_some());
+    point(app, el, body.x + h.length, body.y + v.length + 2);
+    button(app, el, ElementState::Released);
+    assert_eq!(app.horizontal, h.maximum, "horizontal thumb reaches right endpoint");
+    assert!(app.render());
+    capture(app, dir, "daily-scrollbars.bmp");
+    let (v, _) = app.bars();
+    point(app, el, body.x + body.width - 2, body.y + v.thumb_start + v.thumb_length / 2);
+    button(app, el, ElementState::Pressed);
+    point(app, el, body.x + body.width - 2, body.y);
+    button(app, el, ElementState::Released);
+    let (v, h) = app.bars();
+    point(app, el, body.x + h.thumb_start + h.thumb_length / 2, body.y + v.length + 2);
+    button(app, el, ElementState::Pressed);
+    point(app, el, body.x, body.y + v.length + 2);
+    button(app, el, ElementState::Released);
+    assert_eq!((app.view.top(), app.horizontal), (0, 0));
+    assert!(app.render());
+}
+
+fn daily_type(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
+    use winit::event::{DeviceId, ElementState, Ime, MouseButton, WindowEvent};
+    let id = app.gfx.as_ref().unwrap().window.id();
+    let body = app.body_area();
+    let font = app.font.as_ref().unwrap();
+    let (cw, ch) = (font.cw, font.ch);
+    let (x, y) = (body.x + super::GUTTER_COLS * cw + 1, body.y + ch / 2);
+    let point = |app: &mut App, x, y| {
+        app.window_event(
+            el,
+            id,
+            WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: winit::dpi::PhysicalPosition::new(x as f64, y as f64),
+            },
+        );
+    };
+    let button = |app: &mut App, state| {
+        app.window_event(
+            el,
+            id,
+            WindowEvent::MouseInput { device_id: DeviceId::dummy(), state, button: MouseButton::Left },
+        );
+    };
+    point(app, x, y);
+    button(app, ElementState::Pressed);
+    point(app, x + cw * 5, y);
+    button(app, ElementState::Released);
+    let cursor = app.view.editor().unwrap().primary_cursor();
+    assert_ne!(cursor.anchor, cursor.head, "mouse drag selects text");
+    assert!(app.render());
+    capture(app, dir, "daily-selection.bmp");
+    point(app, x, y);
+    button(app, ElementState::Pressed);
+    button(app, ElementState::Released);
+    app.window_event(el, id, WindowEvent::Ime(Ime::Enabled));
+    app.window_event(el, id, WindowEvent::Ime(Ime::Commit("daily ".into())));
+    println!("kwil-daily scrollbars_track_drag=true typing=true caret=true selection=true undo_redo=true");
+}
+
+fn resize_interaction(app: &App, active: bool) {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE};
+        SendMessageW(
+            app.gfx.as_ref().unwrap().hwnd as _,
+            if active { WM_ENTERSIZEMOVE } else { WM_EXITSIZEMOVE },
+            0,
+            0,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (app, active);
+}
+
 fn capture(app: &App, dir: Option<&Path>, name: &str) {
     if let (Some(dir), Some(gfx)) = (dir, app.desktop_window.as_ref().map(|d| &d.gfx).or(app.gfx.as_ref())) {
         #[cfg(all(windows, feature = "gpu"))]
         if app.desktop_window.is_none()
+            && app.gpu_active()
             && let Some(gpu) = &app.gpu
         {
             let pixels = gpu.read_pixels().expect("native DX12 capture readback");
@@ -1592,13 +1827,18 @@ fn native_probe(hwnd: isize, output: Option<&Path>) {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let required = WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
         let controls = style & required == required;
+        let close = GetMenuState(GetSystemMenu(hwnd, 0), SC_CLOSE, MF_BYCOMMAND) & (MF_DISABLED | MF_GRAYED) == 0;
         let small = SendMessageW(hwnd, WM_GETICON, ICON_SMALL as usize, 0) != 0;
         let big = SendMessageW(hwnd, WM_GETICON, ICON_BIG as usize, 0) != 0;
         let mut cloaked = 0u32;
         let hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&mut cloaked as *mut u32).cast(), 4);
         let metadata = format!(
-            "kwil-native caption_resize_min_max={controls} small_icon={small} taskbar_icon={big} cloaked={}",
+            "kwil-native caption_resize_min_max={controls} close_enabled={close} small_icon={small} taskbar_icon={big} cloaked={}",
             hr >= 0 && cloaked != 0
+        );
+        assert!(
+            controls && close && small && big && hr >= 0 && cloaked != 0,
+            "native controls, both icon slots and hidden cloak are required"
         );
         println!("{metadata}");
         if let Some(output) = output {

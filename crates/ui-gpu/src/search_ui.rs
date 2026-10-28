@@ -922,6 +922,7 @@ pub(crate) mod host_dispatch_tests {
                 desktop_window: None,
                 desktop_dispatch: false,
                 pending_resize: None,
+                resize_ready_at: None,
                 window_placement: None,
                 window_normal: None,
                 window_latest: None,
