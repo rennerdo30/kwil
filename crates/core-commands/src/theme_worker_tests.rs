@@ -268,7 +268,10 @@ fn obsolete_completion_at(stage: PublishStage) {
         ThemeSelection::Named(ThemeId::Dark),
         Scheme::Dark,
         None,
-        true,
+        // This control owns the exact desired revision. Native directory
+        // notifications can legitimately supersede it (including on macOS).
+        // Live watcher delivery is covered by the folder reload control.
+        false,
         move || {
             let _ = wake_tx.send(());
             // Hold publication stable until the observer has cloned it. A fast

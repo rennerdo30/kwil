@@ -423,21 +423,32 @@ impl WorkspaceDocumentShutdown {
         delivery: crate::document_worker::result_transport::DocumentDeliveryId,
         timeout: Duration,
     ) -> Result<crate::document_worker::DocumentProducerRetryToken, DocumentResultSettlementReason> {
+        self.request_prepublication_reset_with_clock(delivery, timeout, Instant::now)
+    }
+    fn request_prepublication_reset_with_clock(
+        &mut self,
+        delivery: crate::document_worker::result_transport::DocumentDeliveryId,
+        timeout: Duration,
+        mut now: impl FnMut() -> Instant,
+    ) -> Result<crate::document_worker::DocumentProducerRetryToken, DocumentResultSettlementReason> {
         if !self.search_binding_decided || !matches!(self.phase, ShutdownPhase::Drain | ShutdownPhase::Barrier) {
             return Err(DocumentResultSettlementReason::RetryUnavailable);
         }
-        let deadline =
-            *self.deadline.get_or_insert_with(|| Instant::now().checked_add(timeout).unwrap_or_else(Instant::now));
-        self.ticket
-            .as_mut()
-            .unwrap()
-            .request_prepublication_reset(delivery, deadline.saturating_duration_since(Instant::now()))
+        let deadline = *self.deadline.get_or_insert_with(|| now().checked_add(timeout).unwrap_or_else(&mut now));
+        self.ticket.as_mut().unwrap().request_prepublication_reset(delivery, deadline.saturating_duration_since(now()))
     }
     pub fn acknowledge_prepublication_reset(
         &mut self,
         token: crate::document_worker::DocumentProducerRetryToken,
     ) -> Result<(), crate::document_worker::DocumentProducerRetryRefusal> {
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        self.acknowledge_prepublication_reset_at(token, Instant::now())
+    }
+    fn acknowledge_prepublication_reset_at(
+        &mut self,
+        token: crate::document_worker::DocumentProducerRetryToken,
+        now: Instant,
+    ) -> Result<(), crate::document_worker::DocumentProducerRetryRefusal> {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
             return Err(crate::document_worker::DocumentProducerRetryRefusal {
                 token,
                 reason: DocumentResultSettlementReason::TimedOut,
@@ -454,6 +465,16 @@ impl WorkspaceDocumentShutdown {
     /// OFF UI. Share the caller's accepted deadline with every shutdown stage.
     /// A later call can shorten this deadline but can never extend it.
     pub fn settle_until(&mut self, deadline: Instant) -> Result<DocumentShutdownStatus, DocumentShutdownReason> {
+        self.settle_until_with(deadline, Instant::now, |deadline| deadline)
+    }
+    // Synchronous effects: production keeps the caller's absolute deadline for
+    // every wait. Contract controls can advance time independently of fixture IO.
+    fn settle_until_with(
+        &mut self,
+        deadline: Instant,
+        mut now: impl FnMut() -> Instant,
+        mut wait_deadline: impl FnMut(Instant) -> Instant,
+    ) -> Result<DocumentShutdownStatus, DocumentShutdownReason> {
         if !self.search_binding_decided {
             return Err(DocumentShutdownReason::SearchBindingRequired);
         }
@@ -463,7 +484,7 @@ impl WorkspaceDocumentShutdown {
             return Ok(DocumentShutdownStatus::Complete);
         }
         loop {
-            if Instant::now() >= deadline {
+            if now() >= deadline {
                 return Err(DocumentShutdownReason::Transport(DocumentResultSettlementReason::TimedOut));
             }
             match self.phase {
@@ -495,7 +516,7 @@ impl WorkspaceDocumentShutdown {
                             self.workspace.as_mut().unwrap(),
                             &self.budget,
                             self.permit.as_ref().unwrap(),
-                            deadline,
+                            wait_deadline(deadline),
                         )
                         .map_err(DocumentShutdownReason::Transport)?;
                     if let Some(update) = update {
@@ -626,7 +647,11 @@ impl WorkspaceDocumentShutdown {
                     {
                         observe.try_send(retry_ack_tests::RetirementObservation::BeforeWait).unwrap();
                     }
-                    self.ticket.as_ref().unwrap().wait_until(deadline).map_err(DocumentShutdownReason::Transport)?;
+                    self.ticket
+                        .as_ref()
+                        .unwrap()
+                        .wait_until(wait_deadline(deadline))
+                        .map_err(DocumentShutdownReason::Transport)?;
                 }
                 ShutdownPhase::SearchRelease => {
                     if !self.search_released {
@@ -645,7 +670,11 @@ impl WorkspaceDocumentShutdown {
                     self.phase = ShutdownPhase::Stop;
                 }
                 ShutdownPhase::Stop => {
-                    self.ticket.as_mut().unwrap().finish_until(deadline).map_err(DocumentShutdownReason::Transport)?;
+                    self.ticket
+                        .as_mut()
+                        .unwrap()
+                        .finish_until(wait_deadline(deadline))
+                        .map_err(DocumentShutdownReason::Transport)?;
                     self.phase = ShutdownPhase::Complete;
                     // Worker sources and actual JoinHandle are now retired.
                     self.workspace.take();

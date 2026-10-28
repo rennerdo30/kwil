@@ -361,6 +361,51 @@ fn finish_until(ticket: WorkspaceDocumentSettlementTicket, workspace: &mut Works
     });
 }
 
+// These two shutdown controls assert ordering and retained absolute time, not
+// filesystem or hosted-runner throughput. Keep a logical epoch already behind
+// wall time so accidentally using the real clock fails deterministically.
+fn shutdown_contract_time() -> Instant {
+    Instant::now() - LIMIT * 2
+}
+
+fn settle_shutdown_contract(
+    bundle: &mut WorkspaceDocumentShutdown,
+    requested_deadline: Instant,
+    now: Instant,
+) -> Result<DocumentShutdownStatus, DocumentShutdownReason> {
+    let deadline = bundle.deadline().map_or(requested_deadline, |old| old.min(requested_deadline));
+    bundle.settle_until_with(
+        requested_deadline,
+        || now,
+        |actual| {
+            assert_eq!(actual, deadline, "every transport effect receives the retained absolute deadline");
+            // Bound each real fixture IO wait with the existing LIMIT. Logical
+            // time advances only when the control explicitly changes `now`.
+            let remaining = actual.saturating_duration_since(now);
+            assert!(remaining <= LIMIT);
+            Instant::now() + remaining
+        },
+    )
+}
+
+fn finish_shutdown_contract_fixture(ticket: WorkspaceDocumentSettlementTicket, workspace: &mut Workspace) {
+    // All semantic assertions precede teardown. One real settlement attempt,
+    // with the existing fixture limit; no retry or logical-deadline renewal.
+    ticket.settle(LIMIT, |result| accept(workspace, result)).unwrap();
+}
+
+fn assert_shutdown_contract_expired(bundle: &mut WorkspaceDocumentShutdown, deadline: Instant) {
+    let phase = bundle.phase;
+    assert_eq!(
+        settle_shutdown_contract(bundle, deadline + LIMIT, deadline),
+        Err(DocumentShutdownReason::Transport(DocumentResultSettlementReason::TimedOut)),
+        "a later requested deadline cannot extend the first deadline"
+    );
+    assert_eq!(bundle.deadline(), Some(deadline));
+    assert_eq!(bundle.phase, phase, "expiry cannot advance source release or native exit");
+    assert!(!bundle.status().closed);
+}
+
 fn finish_saved_workspace_until(workspace: Workspace, transport: WorkspaceDocumentTransport, deadline: Instant) {
     let mut bundle = match workspace.into_document_shutdown(transport) {
         ControlFlow::Continue(bundle) => bundle,
@@ -1337,6 +1382,8 @@ fn workspace_document_shutdown_finalizes_earlier_save_before_later_receipt_admis
         ControlFlow::Break(_) => panic!("original two-tab worker must bind"),
     };
     bundle.bind_search_sources(DocumentSearchBinding::NoSearchWorker).unwrap();
+    let now = shutdown_contract_time();
+    let deadline = now + LIMIT;
     bundle.deadline = Some(deadline);
     std::thread::scope(|scope| {
         let bundle = &mut bundle;
@@ -1400,23 +1447,24 @@ fn workspace_document_shutdown_finalizes_earlier_save_before_later_receipt_admis
                     ),
                     "retry cannot replace the original refusal outcome"
                 );
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                assert!(!remaining.is_zero());
-                assert_eq!(bundle.settle(remaining).unwrap(), DocumentShutdownStatus::SourcesReleased);
+                assert_eq!(
+                    settle_shutdown_contract(bundle, deadline, now).unwrap(),
+                    DocumentShutdownStatus::SourcesReleased
+                );
                 assert_eq!(bundle.deadline(), Some(deadline));
                 assert!(bundle.workspace.as_ref().unwrap().views.is_empty());
                 assert!(bundle.workspace.as_ref().unwrap().closed_views.is_empty());
                 assert!(bundle.workspace.as_ref().unwrap().files.saves.is_empty());
                 assert!(!bundle.status().closed);
+                assert_shutdown_contract_expired(bundle, deadline);
                 let mut workspace = bundle.workspace.take().unwrap();
                 let worker = workspace.files.worker.take().unwrap();
                 let ticket = bundle.ticket.take().unwrap().into_legacy_for_test(worker);
                 let charge = bundle.charge.0.take();
                 let live_charge = workspace.files.live_document_metadata.take();
-                finish_until(
+                finish_shutdown_contract_fixture(
                     WorkspaceDocumentSettlementTicket { ticket, charge: AdapterCharge(charge), live_charge },
                     &mut workspace,
-                    deadline,
                 );
                 bundle.phase = ShutdownPhase::Complete;
                 assert_eq!(bundle.deadline(), Some(deadline));
@@ -1839,33 +1887,25 @@ fn workspace_document_shutdown_deferred_reset_invalidates_old_barrier_and_keeps_
             .spawn(move || {
                 // Deliberately install a marker before a still-possible accepted
                 // continuation; only a newer matching marker may release sources.
+                let now = shutdown_contract_time();
+                let deadline = now + LIMIT;
                 let old = bundle.permit.as_ref().unwrap().request_barrier().unwrap();
                 bundle.barrier = Some(old);
                 assert_eq!(
-                    bundle.settle(LIMIT),
+                    settle_shutdown_contract(bundle, deadline, now),
                     Err(DocumentShutdownReason::Transport(DocumentResultSettlementReason::ConsumerRefused))
                 );
                 let deadline = bundle.deadline().unwrap();
                 let delivery = bundle.result_info().unwrap().delivery().unwrap();
-                let mut token = bundle.request_prepublication_reset(delivery, LIMIT).unwrap();
-                loop {
-                    match bundle.acknowledge_prepublication_reset(token) {
-                        Ok(()) => break,
-                        Err(refusal) => {
-                            assert!(matches!(
-                                refusal.reason,
-                                DocumentResultSettlementReason::Busy | DocumentResultSettlementReason::RetryUnavailable
-                            ));
-                            token = refusal.token;
-                            let remaining = deadline.saturating_duration_since(Instant::now());
-                            assert!(!remaining.is_zero());
-                            ready.recv_timeout(remaining).expect("bound original producer reset-ready wake");
-                        }
-                    }
-                }
+                let token = bundle.request_prepublication_reset_with_clock(delivery, LIMIT, || now).unwrap();
+                bundle.ticket.as_ref().unwrap().wait_for_reset_for_test(&token);
+                bundle.acknowledge_prepublication_reset_at(token, now).unwrap();
                 assert_eq!(bundle.deadline(), Some(deadline));
                 assert!(bundle.workspace.as_ref().unwrap().files.saves.contains_key(&id));
-                assert_eq!(bundle.settle(LIMIT).unwrap(), DocumentShutdownStatus::SourcesReleased);
+                assert_eq!(
+                    settle_shutdown_contract(bundle, deadline, now).unwrap(),
+                    DocumentShutdownStatus::SourcesReleased
+                );
                 assert_ne!(
                     bundle.barrier,
                     Some(old),
@@ -1873,16 +1913,16 @@ fn workspace_document_shutdown_deferred_reset_invalidates_old_barrier_and_keeps_
                 );
                 assert_eq!(bundle.deadline(), Some(deadline));
                 assert!(bundle.workspace.as_ref().unwrap().views.is_empty());
+                assert_shutdown_contract_expired(bundle, deadline);
                 let mut workspace = bundle.workspace.take().unwrap();
                 let worker = workspace.files.worker.take().unwrap();
                 let ticket = bundle.ticket.take().unwrap().into_legacy_for_test(worker);
                 let charge = bundle.charge.0.take();
                 bundle.phase = ShutdownPhase::Complete;
                 let live_charge = workspace.files.live_document_metadata.take();
-                finish_until(
+                finish_shutdown_contract_fixture(
                     WorkspaceDocumentSettlementTicket { ticket, charge: AdapterCharge(charge), live_charge },
                     &mut workspace,
-                    deadline,
                 );
                 assert_eq!(bundle.deadline(), Some(deadline));
             })
