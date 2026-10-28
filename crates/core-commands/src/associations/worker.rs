@@ -970,7 +970,7 @@ mod tests {
         let fake = Fake::default();
         let location = Location::WindowsValue { subkey: r"Kwil.txt\shell\open\command".into(), name: String::new() };
         let old = super::super::ValueBudget::new(super::super::MAX_VALUE_BYTES)
-            .registry(r#""\\?\E:\old\kwil.exe" "%1""#)
+            .registry(r#""\\?\E:\old\kwil-custom-build.exe" "%1""#)
             .unwrap();
         let receipt = AssociationReceipt {
             owner: fake.owner(),

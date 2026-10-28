@@ -155,6 +155,7 @@ fn replacement(
     location: &Location,
     value: &StoredValue,
     executable: &str,
+    receipt_owned: bool,
     exists: &mut impl FnMut(&Path) -> Result<bool, AssociationError>,
     budget: &mut ValueBudget,
 ) -> Result<Option<StoredValue>, AssociationError> {
@@ -174,8 +175,9 @@ fn replacement(
         let Some(path) = text.strip_prefix('"').and_then(|s| s.strip_suffix(r#"" "%1""#)) else { return Ok(None) };
         path
     };
-    // A foreign executable, even inside a Kwil key, is never reclaimed.
-    if !parsed.rsplit(['\\', '/']).next().is_some_and(|s| s.eq_ignore_ascii_case("kwil.exe")) {
+    // Without a receipt, a foreign executable inside a Kwil key is never
+    // reclaimed. An exact receipt After match also owns renamed Kwil builds.
+    if !receipt_owned && !parsed.rsplit(['\\', '/']).next().is_some_and(|s| s.eq_ignore_ascii_case("kwil.exe")) {
         return Ok(None);
     }
     if parsed.starts_with(r"\\?\") || !exists(Path::new(parsed))? {
@@ -224,7 +226,7 @@ fn repair_with(
         let (mut changes, admission) = receipt.remaining.copied()?;
         for change in &mut changes {
             if let Some(before) = &change.before
-                && let Some(new) = replacement(&change.location, before, &executable, exists, &mut budget)?
+                && let Some(new) = replacement(&change.location, before, &executable, false, exists, &mut budget)?
             {
                 let current = adapter.read_bounded(&change.location, &mut budget)?;
                 if current == change.before && current.as_ref() != Some(&new) {
@@ -234,7 +236,7 @@ fn repair_with(
                 change.before = Some(new);
             }
             if let Some(after) = &change.after
-                && let Some(new) = replacement(&change.location, after, &executable, exists, &mut budget)?
+                && let Some(new) = replacement(&change.location, after, &executable, true, exists, &mut budget)?
             {
                 let current = adapter.read_bounded(&change.location, &mut budget)?;
                 if current == change.after && current.as_ref() != Some(&new) {
@@ -252,7 +254,7 @@ fn repair_with(
         for suffix in [r"\shell\open\command", r"\DefaultIcon"] {
             let location = Location::WindowsValue { subkey: format!("{key}{suffix}"), name: String::new() };
             if let Some(old) = adapter.read_bounded(&location, &mut budget)?
-                && let Some(new) = replacement(&location, &old, &executable, exists, &mut budget)?
+                && let Some(new) = replacement(&location, &old, &executable, false, exists, &mut budget)?
                 && old != new
                 && adapter.read_bounded(&location, &mut budget)?.as_ref() == Some(&old)
             {
