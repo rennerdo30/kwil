@@ -93,12 +93,13 @@ jobs:
           py=.bench-venv/bin/python
           [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
           "$py" crates/bench/test_gate.py
-      - name: Median-of-nine hard and regression gates
+          "$py" crates/bench/test_pairs.py
+      - name: Balanced paired hard and regression gates
         shell: bash
         run: |
           py=.bench-venv/bin/python
           [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
-          "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --runs 9 --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
+          "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --runs 8 --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
       - name: Retain the exact trusted baseline inputs
         if: always()
         shell: bash

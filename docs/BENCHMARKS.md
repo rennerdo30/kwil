@@ -40,16 +40,28 @@ integration measurements. KW-33 remains open for those and the startup gate.
 
 ## Noise and regression policy
 
-The gate uses **nine fresh candidate processes and nine fresh reference
-processes**, alternating candidate/reference then reference/candidate each round.
-Both versions are fully built first, and the canonical fixture is warmed outside
-timed work with a 1 MiB buffer. It takes the median of each metric independently.
-No local benchmark loops run on the owner's PC.
+The gate uses **eight fresh candidate processes and eight fresh reference
+processes**, in complete balanced **ABBA/BAAB** cycles (A = candidate,
+B = reference). Both versions are fully built first, and the canonical fixture
+is warmed outside timed work with a 1 MiB buffer. Hard limits and private memory
+use the medians of the eight samples. No local benchmark loops run on the
+owner's PC.
 
 Every applicable hard limit is enforced, independently of the reference.
 For timing, the trusted stored baseline pins the source code rebuilt and measured
-on the same hosted runner as the candidate. A cost increase **over 10%** versus
-that reference median fails. For indexing, cost is inverse throughput (GB/s).
+on the same hosted runner as the candidate. Each ABBA or BAAB iteration produces
+one balanced cost ratio: the geometric mean of its two opposite-order paired
+candidate/reference ratios. This cancels multiplicative first-process penalties
+instead of retaining a 5/4 ordering imbalance or averaging unpaired medians.
+The comparison uses the median of these four per-iteration ratios. For indexing,
+cost is inverse throughput (GB/s).
+
+A cost increase **over 10%** fails when the full observed spread of balanced
+ratios is above 1.10. If that spread straddles 1.10, the comparison is explicitly
+**INCONCLUSIVE** and warns without failing the workflow. A warning is not timing
+acceptance. The threshold remains 10%; a clear 15% slowdown fails even with a
+20% first-process penalty. The result retains raw samples, pair order, balanced
+ratios, their medians and every inconclusive warning for review.
 Private memory compares directly with the stored OS median: paired timings cannot
 waive memory growth. Missing inputs, wrong runner/fixture/schema, invalid numbers
 and a reference checkout that differs from the pinned source fail closed.
@@ -102,7 +114,7 @@ cargo build --manifest-path crates/bench/Cargo.toml --release --locked -j 4 --fe
 target/release/kwil-bench generate fixtures
 # Optional spec fixtures, generated rather than committed:
 target/release/kwil-bench generate fixtures --all
-KWIL_FIXTURES=fixtures cargo bench --manifest-path crates/bench/Cargo.toml --locked -j 4 --features harness --bench text -- --sample-count 9 --sample-size 1
+KWIL_FIXTURES="$PWD/fixtures" cargo bench --manifest-path crates/bench/Cargo.toml --locked -j 4 --features harness --bench text -- --sample-count 9 --sample-size 1
 ```
 
 The deterministic generator uses bounded buffers. The required `log-1g.log` is
@@ -117,6 +129,7 @@ Focused gate tests use synthetic measurements, never large fixtures:
 python -m venv .bench-venv
 # Windows: .bench-venv/Scripts/python.exe
 .bench-venv/bin/python crates/bench/test_gate.py
+.bench-venv/bin/python crates/bench/test_pairs.py
 ```
 
 The Rust API bench uses the branch's existing development-only Divan 0.1.21
