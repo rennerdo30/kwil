@@ -158,6 +158,8 @@ enum UserEvent {
     WindowPlacementLoaded(Result<Option<window_placement::Placement>, String>),
     WindowPlacementProgress,
     #[cfg(windows)]
+    ResizeReady,
+    #[cfg(windows)]
     WindowPlacementTouched,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
@@ -205,6 +207,8 @@ impl UserEvent {
             | Self::RegistrationReady
             | Self::DocumentReady
             | Self::LogReady => Policy::Wake,
+            #[cfg(windows)]
+            Self::ResizeReady => Policy::Wake,
             Self::PaletteRoot(_)
             | Self::SettingsPath(_)
             | Self::Notice(_)
@@ -242,6 +246,8 @@ impl UserEvent {
             Self::SearchReady => "SearchReady",
             Self::WindowPlacementLoaded(_) => "WindowPlacementLoaded",
             Self::WindowPlacementProgress => "WindowPlacementProgress",
+            #[cfg(windows)]
+            Self::ResizeReady => "ResizeReady",
             #[cfg(windows)]
             Self::WindowPlacementTouched => "WindowPlacementTouched",
             Self::PaletteRoot(_) => "PaletteRoot",
@@ -524,6 +530,7 @@ struct App {
     desktop_window: Option<desktop_window::Dialog>,
     desktop_dispatch: bool,
     pending_resize: Option<(usize, usize)>,
+    resize_ready_at: Option<std::time::Instant>,
     window_placement: Option<window_placement::Service>,
     window_normal: Option<window_placement::Placement>,
     window_latest: Option<window_placement::Placement>,
@@ -718,6 +725,7 @@ pub fn run_workspace_with_external_open(
                 desktop_window: None,
                 desktop_dispatch: false,
                 pending_resize: None,
+                resize_ready_at: None,
                 window_placement: None,
                 window_normal: None,
                 window_latest: None,
@@ -1099,8 +1107,12 @@ impl App {
                 scrollbar::Bar::sized(0, body.width.saturating_sub(self.ui.bar), 0, 0, 0, self.ui.min_thumb),
             );
         }
-        let (page, total) =
-            horizontal_extent(&self.view, self.columns() as usize, self.settings.editor.tab_size as usize);
+        // Keep a cell for the caret after the final glyph, including at EOF.
+        let (page, total) = horizontal_extent(
+            &self.view,
+            self.columns().saturating_sub(1) as usize,
+            self.settings.editor.tab_size as usize,
+        );
         (
             scrollbar::Bar::sized(
                 0,
@@ -1189,6 +1201,9 @@ impl App {
         {
             self.gpu.is_some()
                 && !self.policy.remote()
+                // DXGI resize can stall even after retirement. CPU owns drag
+                // frames; GPU resumes once at the final native geometry.
+                && !self.gfx.as_ref().and_then(|gfx| gfx.native.as_ref()).is_some_and(|n| n.in_size_move())
                 && self.opts.renderer.unwrap_or(self.settings.render.backend)
                     != kwil_core_commands::settings::RenderBackend::Cpu
         }
@@ -1872,7 +1887,7 @@ impl App {
             || byte > start + last_byte
             || (byte == start + last_byte && last_column >= self.columns() as usize)
         {
-            self.scroll_bar(false, byte);
+            self.scroll_bar(false, byte.min(self.bars().1.maximum));
         }
     }
 
@@ -2001,6 +2016,21 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
+        // WM_PAINT can arrive between every pair of WM_SIZE messages. Retain
+        // damage until this one-shot deadline instead of allocating/rasterizing
+        // and recreating the swapchain for every intermediate geometry.
+        if self.pending_resize.is_some() && self.resize_ready_at.is_some_and(|at| std::time::Instant::now() < at) {
+            return true;
+        }
+        // Disarm before an asynchronous presenter can defer this frame. An
+        // expired WaitUntil must not spin while we wait for the worker's wake.
+        if self.resize_ready_at.take().is_some() {
+            #[cfg(windows)]
+            if let Some(native) = self.gfx.as_ref().and_then(|gfx| gfx.native.as_ref()) {
+                native.cancel_resize_wake();
+            }
+        }
+        self.sync_presenter();
         // A native present already in flight keeps ownership until its worker
         // acknowledges the pause. Preserve all damage and wait for that wake.
         #[cfg(all(feature = "gpu", not(windows)))]
@@ -2587,8 +2617,7 @@ impl App {
         let mut rects: Vec<_> = damage.iter().filter_map(|area| area.to_softbuffer()).collect();
         #[cfg(feature = "gpu")]
         if !rects.is_empty()
-            && !self.policy.remote()
-            && self.opts.renderer.unwrap_or(self.settings.render.backend) != RenderBackend::Cpu
+            && gpu_active
             && let Some(gpu) = &mut self.gpu
         {
             #[cfg(windows)]
@@ -2602,15 +2631,23 @@ impl App {
                     }
                 }
                 match &gfx.gpu_canvas {
-                    Some(canvas) => gpu.present(
-                        canvas.show((w, h)),
-                        pixels,
-                        (w, h),
-                        &damage,
-                        p.scroll,
-                        ch,
-                        tabs::rect(geometry.text),
-                    ),
+                    Some(canvas) => {
+                        let hwnd = canvas.prepare((w, h));
+                        let reveal = !canvas.visible();
+                        if reveal {
+                            damage.clear();
+                            damage.push(Rect { x: 0, y: 0, w, h });
+                        }
+                        gpu.present(
+                            hwnd,
+                            pixels,
+                            (w, h),
+                            &damage,
+                            if reveal { 0 } else { p.scroll },
+                            ch,
+                            tabs::rect(geometry.text),
+                        )
+                    }
                     None => gpu::Presented::Failed("GPU child surface unavailable".into()),
                 }
             };
@@ -2619,6 +2656,12 @@ impl App {
                 gpu.present(gfx.window.clone(), pixels, (w, h), &damage, p.scroll, ch, tabs::rect(geometry.text));
             match presented {
                 gpu::Presented::Yes => {
+                    // Retrying an older pending DX12 frame returns Deferred;
+                    // only a current full, final-size success reveals the child.
+                    #[cfg(windows)]
+                    if let Some(canvas) = &gfx.gpu_canvas {
+                        canvas.show();
+                    }
                     #[cfg(feature = "frame-harness")]
                     self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
                     drop(document_update);
@@ -2630,8 +2673,23 @@ impl App {
                 }
                 gpu::Presented::Deferred => {
                     self.pending.full = true;
-                    self.document.live.update = document_update;
-                    return true;
+                    #[cfg(windows)]
+                    let cpu_visible = gfx.gpu_canvas.as_ref().is_some_and(|canvas| !canvas.visible());
+                    #[cfg(not(windows))]
+                    let cpu_visible = false;
+                    if !cpu_visible {
+                        self.document.live.update = document_update;
+                        return true;
+                    }
+                    // The CPU remains the visible presenter during handback.
+                    // Keep it current even if geometry/edits changed while GPU
+                    // readiness or an older pending submission was deferred.
+                    damage.clear();
+                    damage.push(Rect { x: 0, y: 0, w, h });
+                    rects.clear();
+                    if let Some(full) = (Rect { x: 0, y: 0, w, h }).to_softbuffer() {
+                        rects.push(full);
+                    }
                 }
                 gpu::Presented::Failed(error) => {
                     eprintln!("kwil GPU presentation failed; using CPU: {error}");
@@ -3103,10 +3161,22 @@ fn cloak_and_show(hwnd: isize) {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn new_events(&mut self, _el: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        if self.pending_resize.is_some()
+            && self.resize_ready_at.is_some_and(|at| std::time::Instant::now() >= at)
+            && let Some(gfx) = &self.gfx
+        {
+            self.redraw_requested = true;
+            gfx.window.request_redraw();
+        }
+    }
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.sync_desktop_window(el);
         self.sync_close_dialog();
         self.resume_external_open();
+        // No timer survives a consumed resize. This is a dirty-geometry wake,
+        // never a recurring animation/idle frame source.
+        el.set_control_flow(self.resize_ready_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gfx.is_some() {
@@ -3202,6 +3272,16 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::WindowPlacementProgress => {
                 self.placement_progress();
                 Damage::default()
+            }
+            #[cfg(windows)]
+            UserEvent::ResizeReady => {
+                if self.pending_resize.is_some()
+                    && let Some(gfx) = &self.gfx
+                {
+                    self.redraw_requested = true;
+                    gfx.window.request_redraw();
+                }
+                return;
             }
             #[cfg(windows)]
             UserEvent::WindowPlacementTouched => {
@@ -3703,6 +3783,15 @@ impl ApplicationHandler<UserEvent> for App {
                 self.drag = None;
                 self.selecting = false;
                 self.pending_resize = Some(latest);
+                if self.resize_ready_at.is_none() {
+                    self.resize_ready_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(8));
+                    // Native timers also run inside Windows' drag-size modal
+                    // loop, where the outer winit WaitUntil cannot wake us.
+                    #[cfg(windows)]
+                    if let Some(native) = self.gfx.as_ref().and_then(|gfx| gfx.native.as_ref()) {
+                        native.arm_resize_wake();
+                    }
+                }
                 self.wrap_geometry_pending();
                 self.pending.full = true;
                 if let Some(gfx) = &self.gfx {

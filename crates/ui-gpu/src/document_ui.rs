@@ -588,7 +588,8 @@ impl App {
             return;
         };
         #[cfg(feature = "frame-harness")]
-        let admitted = admitted && !harness::hold_preview_completion(transport.result_info(), self.view.active_id());
+        let admitted = admitted
+            && !harness::hold_preview_completion(&mut self.metrics, transport.result_info(), self.view.active_id());
         let update = match transport.receive(&mut self.view, admitted) {
             Ok(Some(update)) => update,
             Ok(None) => return,

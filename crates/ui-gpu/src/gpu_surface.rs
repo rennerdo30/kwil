@@ -8,6 +8,8 @@ use windows_sys::Win32::{
 };
 pub(super) struct Canvas {
     hwnd: HWND,
+    size: std::cell::Cell<(usize, usize)>,
+    visible: std::cell::Cell<bool>,
 }
 unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if message == WM_NCHITTEST {
@@ -40,26 +42,44 @@ impl Canvas {
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, procedure as *const () as isize);
         }
-        Ok(Self { hwnd })
+        Ok(Self { hwnd, size: std::cell::Cell::new((0, 0)), visible: std::cell::Cell::new(false) })
     }
-    pub fn show(&self, size: (usize, usize)) -> isize {
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                std::ptr::null_mut(),
-                0,
-                0,
-                size.0 as i32,
-                size.1 as i32,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
-            );
+    /// Position the flip surface without revealing its retained pre-handoff
+    /// pixels. A changed size must also wait for a fresh successful present.
+    pub fn prepare(&self, size: (usize, usize)) -> isize {
+        if self.size.get() != size {
+            self.hide();
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    size.0 as i32,
+                    size.1 as i32,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+            self.size.set(size);
         }
         self.hwnd as isize
+    }
+    pub fn visible(&self) -> bool {
+        self.visible.get()
+    }
+    /// Called only after the presenter accepts the current full image.
+    pub fn show(&self) {
+        if !self.visible.replace(true) {
+            unsafe {
+                ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
     }
     pub fn hide(&self) {
         unsafe {
             ShowWindow(self.hwnd, SW_HIDE);
         }
+        self.visible.set(false);
     }
     #[cfg(feature = "frame-harness")]
     pub fn hwnd(&self) -> isize {

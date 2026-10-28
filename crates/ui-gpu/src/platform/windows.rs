@@ -31,6 +31,7 @@ use windows_sys::{
 };
 type SendEvent = Box<dyn Fn(UserEvent) + Send + Sync>;
 const SUBCLASS_ID: usize = 0x4b57494c;
+const RESIZE_TIMER_ID: usize = 0x4b57525a;
 
 pub(crate) struct Native {
     hwnd: HWND,
@@ -44,11 +45,32 @@ pub(crate) struct Native {
 struct State {
     send: SendEvent,
     user_placed: AtomicBool,
+    in_size_move: AtomicBool,
 }
 impl Native {
+    #[cfg(feature = "gpu")]
+    pub fn in_size_move(&self) -> bool {
+        self.state.in_size_move.load(Ordering::Acquire)
+    }
+    pub fn arm_resize_wake(&self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetTimer;
+        // The outer event-loop deadline remains the fallback if SetTimer fails.
+        unsafe {
+            SetTimer(self.hwnd, RESIZE_TIMER_ID, 8, None);
+        }
+    }
+    pub fn cancel_resize_wake(&self) {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(self.hwnd, RESIZE_TIMER_ID);
+        }
+    }
     pub fn register(hwnd: isize, send: impl Fn(UserEvent) + Send + Sync + 'static) -> Self {
         let hwnd = hwnd as HWND;
-        let state = Arc::new(State { send: Box::new(send), user_placed: AtomicBool::new(false) });
+        let state = Arc::new(State {
+            send: Box::new(send),
+            user_placed: AtomicBool::new(false),
+            in_size_move: AtomicBool::new(false),
+        });
         let ptr = Arc::as_ptr(&state) as usize;
         let subclass = unsafe { SetWindowSubclass(hwnd, Some(window_proc), SUBCLASS_ID, ptr) != 0 };
         let session = subclass && unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != 0 };
@@ -128,6 +150,7 @@ pub(crate) fn decorate_window(hwnd: isize, dark: bool, remote: bool, dialog: boo
 }
 impl Drop for Native {
     fn drop(&mut self) {
+        self.cancel_resize_wake();
         unsafe {
             if self.session {
                 WTSUnRegisterSessionNotification(self.hwnd);
@@ -149,9 +172,22 @@ impl Drop for Native {
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _id: usize, data: usize) -> LRESULT {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, WM_ENTERSIZEMOVE, WM_SYSCOMMAND,
+        SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_SYSCOMMAND,
     };
+    if msg == windows_sys::Win32::UI::WindowsAndMessaging::WM_TIMER && w == RESIZE_TIMER_ID {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, RESIZE_TIMER_ID);
+            ((&*(data as *const State)).send)(UserEvent::ResizeReady);
+        }
+        return 0;
+    }
+    if msg == WM_ENTERSIZEMOVE || msg == WM_EXITSIZEMOVE {
+        unsafe {
+            (&*(data as *const State)).in_size_move.store(msg == WM_ENTERSIZEMOVE, Ordering::Release);
+        }
+    }
     if msg == WM_ENTERSIZEMOVE
+        || msg == WM_EXITSIZEMOVE
         || (msg == WM_SYSCOMMAND
             && [SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SC_MOVE, SC_SIZE].contains(&((w as u32) & 0xfff0)))
     {
