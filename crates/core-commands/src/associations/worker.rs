@@ -328,9 +328,12 @@ struct Engine<A> {
     identity: PlanToken,
 }
 impl<A: AssociationAdapter> Engine<A> {
-    fn new(adapter: A, journal: Journal) -> Result<Self, WorkerError> {
+    fn new(mut adapter: A, mut journal: Journal) -> Result<Self, WorkerError> {
         if journal.active.as_ref().is_some_and(|r| r.receipt.owner() != adapter.owner()) {
             return Err(failure("journal belongs to another user/backend; refusing recovery"));
+        }
+        if let Some(executable) = adapter.repair_executable() {
+            super::windows_paths::repair(&mut adapter, &executable, journal.active.as_mut().map(|r| &mut r.receipt))?;
         }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let identity = PlanToken {
@@ -866,6 +869,7 @@ mod tests {
     }
     #[derive(Default)]
     struct FakeState {
+        repair_target: Option<PathBuf>,
         values: Vec<(Location, StoredValue)>,
         writes: usize,
         reads: usize,
@@ -881,6 +885,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct Fake(Arc<Mutex<FakeState>>);
     impl AssociationAdapter for Fake {
+        fn repair_executable(&self) -> Option<PathBuf> {
+            self.0.lock().unwrap().repair_target.clone()
+        }
         fn owner(&self) -> String {
             "isolated-fake-user".into()
         }
@@ -955,6 +962,42 @@ mod tests {
     }
     fn engine(scratch: &Scratch, fake: &Fake) -> Engine<Fake> {
         Engine::new(fake.clone(), Journal::open(scratch.0.clone()).unwrap()).unwrap()
+    }
+    #[test]
+    fn explorer_worker_startup_repairs_legacy_receipt_and_unregisters_after_restart() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let location = Location::WindowsValue { subkey: r"Kwil.txt\shell\open\command".into(), name: String::new() };
+        let old = super::super::ValueBudget::new(super::super::MAX_VALUE_BYTES)
+            .registry(r#""\\?\E:\old\kwil.exe" "%1""#)
+            .unwrap();
+        let receipt = AssociationReceipt {
+            owner: fake.owner(),
+            remaining: super::super::SharedChanges::admitted(
+                vec![super::super::Change { location: location.clone(), before: None, after: Some(old.clone()) }],
+                super::super::Admission::acquire(super::super::WORKSPACE_BYTES).unwrap(),
+            ),
+        };
+        let mut journal = Journal::open(scratch.0.clone()).unwrap();
+        journal.begin(receipt).unwrap();
+        let original = fs::read(journal.path(1, "intent")).unwrap();
+        drop(journal);
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.values.push((location, old));
+            state.repair_target = Some(PathBuf::from(r"E:\new\kwil.exe"));
+            state.expected_changes = Some(1);
+        }
+        let mut first = engine(&scratch, &fake);
+        assert_eq!(status(&mut first).recovery.unwrap().current, vec![CurrentState::Applied]);
+        assert_eq!(fake.0.lock().unwrap().writes, 1);
+        drop(first);
+        let mut resumed = engine(&scratch, &fake);
+        assert_eq!(status(&mut resumed).recovery.unwrap().current, vec![CurrentState::Applied]);
+        resumed.execute(Request::Undo { journal_id: 1 }).unwrap();
+        assert!(fake.0.lock().unwrap().values.is_empty());
+        assert_eq!(fs::read(resumed.journal.path(1, "intent")).unwrap(), original);
     }
     fn planned(engine: &mut Engine<Fake>) -> (PlanToken, AssociationPlan) {
         match engine.execute(Request::Plan(request())).unwrap() {

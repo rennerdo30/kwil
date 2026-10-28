@@ -51,6 +51,26 @@ pub fn prepare(settings_path: &Path, mode: HostMode) -> Result<Prepared, String>
     }
 }
 
+/// Post-first-frame best-effort repair. Isolation refuses before native access.
+pub(super) fn spawn_repair(hidden: bool) {
+    schedule_repair(hidden, std::env::var_os("KWIL_WORKSPACE_ROOT").is_some(), || {
+        #[cfg(windows)]
+        if let Err(error) = std::thread::Builder::new().name("kwil-association-repair".into()).spawn(|| {
+            if let Err(error) = windows::repair_existing() {
+                eprintln!("kwil: file-type repair: {error}");
+            }
+        }) {
+            eprintln!("kwil: cannot start file-type repair: {error}");
+        }
+    });
+}
+
+fn schedule_repair(hidden: bool, isolated: bool, start: impl FnOnce()) {
+    if !hidden && !isolated {
+        start();
+    }
+}
+
 /// No public constructor: only successful native preparation can create this.
 /// Guards stay on the worker for its entire journal lifetime, including Undo.
 pub struct NativeAdapter {
@@ -63,6 +83,26 @@ pub struct NativeAdapter {
 }
 
 impl AssociationAdapter for NativeAdapter {
+    fn windows_registration_keys(&mut self) -> Result<Vec<String>, AssociationError> {
+        #[cfg(windows)]
+        {
+            self.inner.windows_registration_keys()
+        }
+        #[cfg(not(windows))]
+        {
+            match self._unconstructible {}
+        }
+    }
+    fn repair_executable(&self) -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            self.inner.repair_executable()
+        }
+        #[cfg(not(windows))]
+        {
+            match self._unconstructible {}
+        }
+    }
     fn read_bounded(
         &mut self,
         location: &Location,
@@ -130,6 +170,15 @@ impl AssociationAdapter for NativeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_repair_isolation_precedes_native_factory() {
+        for (hidden, isolated) in [(true, false), (false, true), (true, true)] {
+            schedule_repair(hidden, isolated, || panic!("isolated startup must never reach native code"));
+        }
+        let mut called = false;
+        schedule_repair(false, false, || called = true);
+        assert!(called);
+    }
     #[test]
     fn hidden_mode_refuses_even_an_invalid_settings_path_before_io() {
         let error = prepare(Path::new("relative/does-not-exist/settings.toml"), HostMode::HiddenHarness).err().unwrap();

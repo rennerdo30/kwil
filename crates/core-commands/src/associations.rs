@@ -20,6 +20,7 @@ use std::{
     },
 };
 
+pub mod windows_paths;
 pub mod worker;
 
 // Quota-exhaustion cases intentionally reserve the complete process-wide pool.
@@ -218,6 +219,14 @@ fn err(s: impl Into<String>) -> AssociationError {
 /// Adapters must make each individual write atomic or leave it unchanged on
 /// error. Only the native platform adapter may touch that platform's resources.
 pub trait AssociationAdapter {
+    /// Windows ProgID roots only, bounded by MAX_CHANGES. Fakes never open a hive.
+    fn windows_registration_keys(&mut self) -> Result<Vec<String>, AssociationError> {
+        Ok(Vec::new())
+    }
+    /// Native workers opt in to repair while holding their journal lock.
+    fn repair_executable(&self) -> Option<PathBuf> {
+        None
+    }
     /// Stable per-user/backend identity, included in persisted ownership receipts.
     fn owner(&self) -> String;
     fn read(&mut self, location: &Location) -> Result<Option<StoredValue>, AssociationError>;
@@ -339,7 +348,13 @@ pub fn plan(
     }
     let admission = Admission::acquire(WORKSPACE_BYTES)?;
     let mut values = ValueBudget::new(worker::MAX_RECORD_BYTES);
-    let executable = request.executable.to_str().ok_or_else(|| err("executable must be Unicode"))?;
+    let shell_path;
+    let executable = if matches!(request.platform, AssociationPlatform::Windows) {
+        shell_path = windows_paths::explorer_executable(&request.executable)?;
+        shell_path.as_str()
+    } else {
+        request.executable.to_str().ok_or_else(|| err("executable must be Unicode"))?
+    };
     if executable.chars().any(|c| c.is_control() || c == '"' || c == '%') {
         return Err(err("executable contains unsupported association command characters"));
     }
@@ -855,6 +870,12 @@ impl WindowsAssociations {
 }
 #[cfg(windows)]
 impl AssociationAdapter for WindowsAssociations {
+    fn windows_registration_keys(&mut self) -> Result<Vec<String>, AssociationError> {
+        windows_paths::native_keys()
+    }
+    fn repair_executable(&self) -> Option<PathBuf> {
+        std::env::current_exe().ok()
+    }
     fn owner(&self) -> String {
         self.owner.clone()
     }
@@ -926,10 +947,14 @@ fn windows_registry(
     let valid = if let Some(rest) = subkey.strip_prefix("Kwil.") {
         let ext = rest.split('\\').next().unwrap_or("");
         crate::settings_ui::normalize_extension(ext).is_ok()
-            && (rest == ext || rest == format!("{ext}\\shell\\open\\command"))
+            && (rest == ext || rest == format!("{ext}\\shell\\open\\command") || rest == format!("{ext}\\DefaultIcon"))
             && name.is_empty()
     } else if let Some(ext) = subkey.strip_prefix('.').and_then(|s| s.strip_suffix("\\OpenWithProgids")) {
         crate::settings_ui::normalize_extension(ext).is_ok() && *name == format!("Kwil.{ext}")
+    } else if [r"Applications\kwil.exe\shell\open\command", r"Applications\kwil.exe\DefaultIcon"]
+        .contains(&subkey.as_str())
+    {
+        name.is_empty()
     } else {
         false
     };
@@ -1155,6 +1180,41 @@ mod tests {
             executable: std::env::current_dir().unwrap().join("kwil.exe"),
             types: vec![FileType { extension: "txt".into(), content_type: None }],
             default_choice: DefaultChoice::KeepCurrent,
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn explorer_registration_strips_verbatim_drive_and_unc_paths() {
+        let _guard = test_admission_guard();
+        for (input, expected) in [
+            (r"\\?\E:\Kwil builds\kwil.exe", r#""E:\Kwil builds\kwil.exe" "%1""#),
+            (r"\\?\UNC\server\share\Kwil\kwil.exe", r#""\\server\share\Kwil\kwil.exe" "%1""#),
+        ] {
+            let mut fake = Fake::default();
+            let mut request = request();
+            request.executable = input.into();
+            let plan = plan(&mut fake, &request).unwrap();
+            let receipt = apply(&mut fake, &plan).unwrap();
+            let command = Location::WindowsValue { subkey: r"Kwil.txt\shell\open\command".into(), name: String::new() };
+            let value = fake.read(&command).unwrap().unwrap();
+            let units: Vec<u16> = value.bytes.as_chunks::<2>().0.iter().map(|v| u16::from_le_bytes(*v)).collect();
+            let actual = String::from_utf16(&units[..units.len() - 1]).unwrap();
+            assert_eq!(actual, expected);
+            assert!(!serde_json::to_string(&receipt).unwrap().contains(r"\\\\?\\"));
+            eprintln!("fake hive Explorer command: {actual}");
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn explorer_registration_refuses_paths_requiring_verbatim_semantics_before_reads() {
+        let _guard = test_admission_guard();
+        for path in [format!(r"\\?\E:\{}\kwil.exe", "a".repeat(250)), r"\\?\E:\trailing.\kwil.exe".into()] {
+            let mut fake = Fake::default();
+            let mut request = request();
+            request.executable = path.into();
+            let error = plan(&mut fake, &request).unwrap_err();
+            assert!(error.to_string().contains("Explorer"));
+            assert_eq!(fake.writes, 0);
         }
     }
     #[test]

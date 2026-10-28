@@ -324,9 +324,10 @@ pub(super) fn prepare(settings_path: &Path) -> Result<Prepared, String> {
         review_acl(&file, &sid, true, false)?;
         guards.push(file);
     }
-    let executable =
-        fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    validate_path(&executable)?;
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let executable = kwil_core_commands::associations::windows_paths::explorer_executable(&executable)
+        .map(PathBuf::from)
+        .map_err(|e| e.to_string())?;
     let identity = security::sid_text(&sid)?;
     let context = RegistrationContext {
         platform: AssociationPlatform::Windows,
@@ -346,6 +347,15 @@ pub(super) fn prepare(settings_path: &Path) -> Result<Prepared, String> {
             Ok(NativeAdapter { inner: WindowsAssociations::new(identity)?, _guards: guards })
         }),
     })
+}
+
+pub(super) fn repair_existing() -> Result<(), String> {
+    let sid = token_user()?;
+    let mut adapter = WindowsAssociations::new(security::sid_text(&sid)?).map_err(|e| e.to_string())?;
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    kwil_core_commands::associations::windows_paths::repair(&mut adapter, &executable, None)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
