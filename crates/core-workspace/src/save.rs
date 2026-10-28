@@ -224,7 +224,7 @@ fn commit_with_operations(
     }
     #[cfg(windows)]
     if let Some(security) = security {
-        security.verify_dacl(&path, &mut warnings);
+        security.restore_and_verify_dacl(&path, &mut warnings);
     }
     // The rename and original pin are committed. Never roll back or remove the
     // destination if opening/syncing its parent directory now fails.

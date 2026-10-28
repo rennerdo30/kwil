@@ -1,5 +1,5 @@
-//! DACL preservation is judged on the committed destination. ReplaceFileW can
-//! preserve it even if setting it on the temporary file was refused.
+//! Explicitly copy the DACL before and after replacement: the OS may merge
+//! inherited permissions during replacement. Judge the committed destination.
 use super::{Path, io, wide};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
@@ -61,21 +61,31 @@ impl Descriptor {
         if let Ok(mut current) = Self::read(target) {
             self.copy_token_identity(target, &mut current);
         }
+        let _ = self.copy_dacl(target);
+    }
+
+    fn copy_dacl(&mut self, target: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if FAIL_DACL_COPY.get() {
+            return Err(io::Error::from_raw_os_error(5));
+        }
         let mut control = 0;
         let mut revision = 0;
         // SAFETY: a valid owned descriptor and writable scalar outputs.
         let ok = unsafe { GetSecurityDescriptorControl(self.ptr(), &mut control, &mut revision) };
         if ok == 0 {
-            return;
+            return Err(io::Error::last_os_error());
         }
         let protection = if control & SE_DACL_PROTECTED != 0 {
             PROTECTED_DACL_SECURITY_INFORMATION
         } else {
             UNPROTECTED_DACL_SECURITY_INFORMATION
         };
-        // SAFETY: valid descriptor and terminated path. Failure is not final:
-        // ReplaceFileW also merges the original DACL; verify after replacement.
-        unsafe { SetFileSecurityW(wide(target).as_ptr(), DACL_SECURITY_INFORMATION | protection, self.ptr()) };
+        // SAFETY: valid descriptor and terminated path.
+        if unsafe { SetFileSecurityW(wide(target).as_ptr(), DACL_SECURITY_INFORMATION | protection, self.ptr()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn copy_token_identity(&mut self, target: &Path, current: &mut Self) {
@@ -144,7 +154,11 @@ impl Descriptor {
         }
     }
 
-    pub(super) fn verify_dacl(self, path: &Path, warnings: &mut Vec<String>) {
+    pub(super) fn restore_and_verify_dacl(mut self, path: &Path, warnings: &mut Vec<String>) {
+        // Do not rely on the replacement primitive's environment-dependent
+        // inheritance merge. Reapply the original DACL to the final file.
+        // If copying is refused but it is already equivalent, remain quiet.
+        let _ = self.copy_dacl(path);
         self.verify_against(Self::read(path), warnings);
     }
 
@@ -161,6 +175,23 @@ impl Descriptor {
 }
 
 type SidGetter = unsafe extern "system" fn(PSECURITY_DESCRIPTOR, *mut PSID, *mut i32) -> i32;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_DACL_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn with_failed_dacl_copy<R>(run: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAIL_DACL_COPY.set(self.0);
+        }
+    }
+    let _reset = Reset(FAIL_DACL_COPY.replace(true));
+    run()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Permissions {

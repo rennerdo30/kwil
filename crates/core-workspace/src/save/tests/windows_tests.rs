@@ -86,7 +86,9 @@ fn windows_foreign_owner_copy_is_quiet_when_dacl_is_preserved() {
     assert_ne!(owner(&mut before), owner(&mut descriptor(&f.path())));
     let mut warnings = Vec::new();
     preserve_metadata(&source, &f.path(), &fs::metadata(&source).unwrap(), &mut warnings).unwrap();
-    assert_eq!(dacl(&mut descriptor(&f.path())), dacl(&mut before));
+    assert!(
+        windows_security::same_dacl(dacl(&mut descriptor(&f.path())).as_deref(), dacl(&mut before).as_deref()).unwrap()
+    );
     assert!(warnings.is_empty(), "{warnings:?}");
 }
 
@@ -96,42 +98,26 @@ fn windows_save_warns_when_final_dacl_is_not_preserved() {
     fs::write(f.path(), b"old").unwrap();
     let original = open_for_editing(&f.path()).unwrap();
     let buffer = Buffer::from_file(original.clone()).unwrap();
-    let saved = commit_with_operations(
-        f.request(original, &buffer),
-        |s, f| s.write_to(f).map(|_| None),
-        |_| Ok(()),
-        |temp, destination, backup| {
-            replace(temp, destination, backup)?;
-            // Simulate a filesystem/replacement that did not retain the DACL.
-            // A null DACL grants access only on this disposable test file.
-            let mut sd = [0usize; 8];
-            unsafe {
-                assert_ne!(InitializeSecurityDescriptor(sd.as_mut_ptr().cast(), 1), 0);
-                assert_ne!(SetSecurityDescriptorDacl(sd.as_mut_ptr().cast(), 1, std::ptr::null_mut(), 0), 0);
-                assert_ne!(
-                    SetFileSecurityW(
-                        wide(destination).as_ptr(),
-                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                        sd.as_mut_ptr().cast()
-                    ),
-                    0
-                );
-            }
-            Ok(())
-        },
-        sync_parent,
-    )
+    let saved = windows_security::with_failed_dacl_copy(|| {
+        commit_with_operations(
+            f.request(original, &buffer),
+            |s, f| s.write_to(f).map(|_| None),
+            |_| Ok(()),
+            |temp, destination, backup| {
+                replace(temp, destination, backup)?;
+                // The OS changes the DACL and the product's explicit copying is
+                // injected to fail. The final mismatch must reach the frontend.
+                set_null_dacl(destination);
+                Ok(())
+            },
+            sync_parent,
+        )
+    })
     .unwrap();
     assert!(saved.warnings.iter().any(|w| w.contains("DACL")), "{:?}", saved.warnings);
 }
 
-#[test]
-fn windows_replacefile_security_probe() {
-    let f = Fixture::new();
-    fs::write(f.path(), b"old").unwrap();
-    let actual_owner = owner(&mut descriptor(&f.path()));
-    assert!(!actual_owner.is_empty());
-    println!("Testing replacement with the OS-assigned owner ({} SID bytes)", actual_owner.len());
+fn set_distinct_protected_dacl(path: &Path) {
     // Keep this filtered token's user fully authorized to replace the file.
     // A small Authenticated Users grant makes the protected DACL distinct
     // from a newly created sibling without importing a system file's policy.
@@ -184,20 +170,70 @@ fn windows_replacefile_security_probe() {
         assert_ne!(SetSecurityDescriptorDacl(sd.as_mut_ptr().cast(), 1, acl.as_ptr().cast(), 0), 0);
         assert_ne!(
             SetFileSecurityW(
-                wide(&f.path()).as_ptr(),
+                wide(path).as_ptr(),
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 sd.as_mut_ptr().cast()
             ),
             0
         );
     }
-    let replacement = f.0.join("replacement");
-    fs::write(&replacement, b"new").unwrap();
+}
+
+#[test]
+fn windows_full_save_preserves_protected_dacl_without_warning() {
+    let f = Fixture::new();
+    fs::write(f.path(), b"old").unwrap();
+    set_distinct_protected_dacl(&f.path());
     let mut before = descriptor(&f.path());
-    let mut temp = descriptor(&replacement);
-    assert_ne!(dacl(&mut before), dacl(&mut temp));
-    replace(&replacement, &f.path(), Some(&f.0.join("backup"))).unwrap();
+    let original = open_for_editing(&f.path()).unwrap();
+    let mut buffer = Buffer::from_file(original.clone()).unwrap();
+    buffer.insert(0, b"new ").unwrap();
+    let saved = save_snapshot(f.request(original, &buffer)).unwrap();
     let mut after = descriptor(&f.path());
-    assert_eq!(dacl(&mut after), dacl(&mut before));
-    println!("ReplaceFileW preserves a distinct original DACL without manual copying");
+    assert!(windows_security::same_dacl(dacl(&mut before).as_deref(), dacl(&mut after).as_deref()).unwrap());
+    assert!(saved.warnings.is_empty(), "{:?}", saved.warnings);
+    assert_eq!(fs::read(f.path()).unwrap(), b"new old");
+}
+
+fn set_null_dacl(path: &Path) {
+    let mut sd = [0usize; 8];
+    unsafe {
+        assert_ne!(InitializeSecurityDescriptor(sd.as_mut_ptr().cast(), 1), 0);
+        assert_ne!(SetSecurityDescriptorDacl(sd.as_mut_ptr().cast(), 1, std::ptr::null_mut(), 0), 0);
+        assert_ne!(
+            SetFileSecurityW(
+                wide(path).as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                sd.as_mut_ptr().cast()
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+fn windows_save_repairs_dacl_changed_by_replacement() {
+    let f = Fixture::new();
+    fs::write(f.path(), b"old").unwrap();
+    set_distinct_protected_dacl(&f.path());
+    let mut before = descriptor(&f.path());
+    let original = open_for_editing(&f.path()).unwrap();
+    let buffer = Buffer::from_file(original.clone()).unwrap();
+    let saved = commit_with_operations(
+        f.request(original, &buffer),
+        |s, f| s.write_to(f).map(|_| None),
+        |_| Ok(()),
+        |temp, destination, backup| {
+            replace(temp, destination, backup)?;
+            // Deterministically model OS-dependent replacement ACL changes.
+            set_null_dacl(destination);
+            Ok(())
+        },
+        sync_parent,
+    )
+    .unwrap();
+    assert!(
+        windows_security::same_dacl(dacl(&mut before).as_deref(), dacl(&mut descriptor(&f.path())).as_deref()).unwrap()
+    );
+    assert!(saved.warnings.is_empty(), "{:?}", saved.warnings);
 }
