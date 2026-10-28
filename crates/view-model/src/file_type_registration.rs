@@ -2,10 +2,14 @@
 //! worker. Start after first paint. No native adapter is chosen here. Never
 //! call `worker_ready` on a timer: address it only from the worker wake event.
 //!
-//! All registration needs preview -> explicit register_selected(review, current).
+//! The settings page uses one action, `apply`: it makes the OS match the checked
+//! types. Internally that is Plan -> Apply, or Undo -> Plan -> Apply when a
+//! registration exists (owner, 2026-10-29, KW-72: the old review/skip flow and
+//! "unregister before you may change anything" made no sense). A failure between
+//! Undo and the new Apply leaves no Kwil registration and the user's previous
+//! handlers restored: a safe state, reported plainly. `remove_all` is Undo.
+//! The palette's current-file flow keeps preview -> register_selected.
 //! Dropping or stopping retires the worker, snapshots and receipts off the UI.
-//! Adding types to a retained registration is gated until ROOT adopts Extend;
-//! this module never uses Undo followed by Plan to simulate an update.
 use kwil_core_commands::{
     associations::{
         AssociationAdapter, AssociationError, AssociationPlatform, AssociationRequest, DefaultChoice, FileType,
@@ -235,6 +239,15 @@ struct Pending {
     id: RequestId,
     kind: PendingKind,
 }
+/// What `apply` still has to do after the current worker request finishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Chain {
+    None,
+    /// Plan done -> apply it at once (no separate review click).
+    ApplyAfterPlan,
+    /// Undo done -> plan and apply these types.
+    PlanAfterUndo(Vec<Extension>),
+}
 struct Resources {
     worker: AssociationWorker,
     events: Events,
@@ -248,6 +261,10 @@ struct Resources {
     recovery: Option<u64>,
     rows: Vec<ExtensionStatus>,
     status: RegistrationStatus,
+    /// Types Kwil has registered right now, from the receipt and the OS state;
+    /// `None` until known (or when the platform's receipt cannot name them).
+    registered: Option<Vec<Extension>>,
+    chain: Chain,
     #[cfg(test)]
     submit_error: Option<SubmitError>,
 }
@@ -348,6 +365,8 @@ impl FileTypeRegistration {
                 recovery: None,
                 rows: Vec::new(),
                 status: RegistrationStatus::Idle,
+                registered: None,
+                chain: Chain::None,
                 #[cfg(test)]
                 submit_error: None,
             }),
@@ -412,6 +431,78 @@ impl FileTypeRegistration {
     /// Explicit whole-registration unregister, not a silent update or per-row Undo.
     pub fn unregister(&mut self, journal_id: u64) -> Result<RequestId, ActionError> {
         self.submit(RegistrationAction::Unregister { journal_id })
+    }
+    /// Types Kwil has registered right now, once a status or action reported it.
+    pub fn registered(&self) -> Option<&[Extension]> {
+        self.state().registered.as_deref()
+    }
+    /// A Kwil registration receipt exists, so "Remove all" has something to do,
+    /// even when no type is fully registered any more (e.g. a half-finished undo).
+    pub fn has_registration(&self) -> bool {
+        self.state().recovery.is_some()
+    }
+    /// (to add, to remove) when the checked types are applied.
+    pub fn change_counts(&self) -> (usize, usize) {
+        let selected = self.selection().extensions();
+        match self.registered() {
+            Some(registered) => (
+                selected.iter().filter(|e| !registered.contains(e)).count(),
+                registered.iter().filter(|e| !selected.contains(e)).count(),
+            ),
+            None => (selected.len(), 0),
+        }
+    }
+    /// Make the operating system match the checked types: one click, no review.
+    pub fn apply(&mut self) -> Result<(), ActionError> {
+        if self.state().pending.is_some() {
+            return Err(ActionError { kind: ActionErrorKind::Busy, action: RegistrationAction::Status });
+        }
+        let target = self.selection().extensions().to_vec();
+        let result = match self.state().recovery {
+            Some(journal_id) => {
+                self.state_mut().chain = if target.is_empty() { Chain::None } else { Chain::PlanAfterUndo(target) };
+                self.unregister(journal_id).map(drop)
+            }
+            None if target.is_empty() => Ok(()),
+            None => {
+                self.state_mut().chain = Chain::ApplyAfterPlan;
+                self.preview().map(drop)
+            }
+        };
+        if result.is_err() {
+            self.state_mut().chain = Chain::None;
+        }
+        result
+    }
+    /// Remove everything Kwil registered and restore the previous handlers.
+    pub fn remove_all(&mut self) -> Result<(), ActionError> {
+        let Some(journal_id) = self.state().recovery else { return Ok(()) };
+        self.state_mut().chain = Chain::None;
+        self.unregister(journal_id).map(drop)
+    }
+    /// Continue `apply` after a finished worker request; any other outcome ends it.
+    fn continue_chain(&mut self) {
+        let chain = std::mem::replace(&mut self.state_mut().chain, Chain::None);
+        let status = self.state().status.clone();
+        let result = match (chain, status) {
+            (Chain::ApplyAfterPlan, RegistrationStatus::Ready { review }) => {
+                self.register_selected(review, None).map(drop)
+            }
+            (Chain::PlanAfterUndo(extensions), RegistrationStatus::Unregistered { .. }) => {
+                self.state_mut().chain = Chain::ApplyAfterPlan;
+                self.submit(RegistrationAction::Preview { extensions, current: None }).map(drop)
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            let state = self.state_mut();
+            state.chain = Chain::None;
+            let message = match error.kind {
+                ActionErrorKind::StaleReview => "The checked types changed while applying; apply again.".to_owned(),
+                kind => format!("Applying stopped: {kind:?}"),
+            };
+            state.status = RegistrationStatus::Failed { message, recovery: state.recovery };
+        }
     }
     fn submit(&mut self, action: RegistrationAction) -> Result<RequestId, ActionError> {
         let result = self.prepare(&action);
@@ -536,17 +627,20 @@ impl FileTypeRegistration {
         let Some(event) = self.state().events.try_recv() else {
             return false;
         };
-        self.accept(&event);
+        if self.accept(&event) {
+            self.continue_chain();
+        }
         retired.event = Some(event);
         retirement.ready.notify_one();
         true
     }
-    fn accept(&mut self, event: &Event) {
+    /// True when the event answered our pending request (and was applied).
+    fn accept(&mut self, event: &Event) -> bool {
         let state = self.state_mut();
-        let Some(pending) = state.pending.take() else { return };
+        let Some(pending) = state.pending.take() else { return false };
         if pending.id != event.request_id {
             state.pending = Some(pending); // foreign event cannot consume our ownership
-            return;
+            return false;
         }
         match &event.result {
             Err(error) => {
@@ -560,14 +654,14 @@ impl FileTypeRegistration {
             }
             Ok(Response::Planned { token, plan }) => {
                 let PendingKind::Preview { selected, current } = pending.kind else {
-                    return;
+                    return true;
                 };
                 let Some(generation) = state.next_review.checked_add(1) else {
                     state.status = RegistrationStatus::Failed {
                         message: "registration review generation exhausted; replace controller".into(),
                         recovery: state.recovery,
                     };
-                    return;
+                    return true;
                 };
                 state.next_review = generation;
                 let id = ReviewId { incarnation: state.incarnation.clone(), generation };
@@ -605,6 +699,11 @@ impl FileTypeRegistration {
             }
             Ok(Response::Applied { journal_id }) => {
                 state.recovery = Some(*journal_id);
+                if let Some(review) = &state.review {
+                    let mut registered = review.selected.clone();
+                    registered.sort();
+                    state.registered = Some(registered);
+                }
                 for row in &mut state.rows {
                     row.outcome = if row.changed_values == 0 {
                         ExtensionOutcome::VerificationIncomplete
@@ -624,6 +723,7 @@ impl FileTypeRegistration {
                 state.review = None;
                 state.preview = None;
                 state.recovery = None;
+                state.registered = Some(Vec::new());
                 for row in &mut state.rows {
                     row.outcome = ExtensionOutcome::RestoredVisible;
                     row.before = row.changed_values;
@@ -633,6 +733,7 @@ impl FileTypeRegistration {
             }
             Ok(Response::Status(status)) => inspect(state, status),
         }
+        true
     }
     fn retire(&mut self) {
         if let Some(resources) = self.resources.take() {
@@ -672,7 +773,41 @@ fn affects(context: &RegistrationContext, extension: &Extension, location: &Loca
         _ => false,
     }
 }
+/// Types whose "Open with" binding (Windows) or role (macOS) Kwil owns right
+/// now. Linux receipts name a shared desktop file, not single types: `None`.
+fn registered_types(context: &RegistrationContext, status: &Status) -> Option<Vec<Extension>> {
+    let Some(recovery) = &status.recovery else { return Some(Vec::new()) };
+    let mut found = Vec::new();
+    for (change, current) in recovery.receipt.pending().iter().zip(&recovery.current) {
+        if *current != CurrentState::Applied {
+            continue;
+        }
+        let name = match (&context.platform, &change.location) {
+            (AssociationPlatform::Windows, Location::WindowsValue { subkey, .. }) => {
+                subkey.strip_prefix('.').and_then(|tail| tail.strip_suffix("\\OpenWithProgids")).map(str::to_owned)
+            }
+            (AssociationPlatform::MacOS { .. }, Location::MacRole { uti, .. }) => context
+                .content_types
+                .iter()
+                .find(|(_, value)| *value == uti)
+                .map(|(extension, _)| extension.as_str().to_owned()),
+            (AssociationPlatform::Linux { .. }, _) => return None,
+            _ => None,
+        };
+        if let Some(extension) = name.and_then(|name| Extension::parse(&name).ok()) {
+            found.push(extension);
+        }
+    }
+    found.sort();
+    found.dedup();
+    Some(found)
+}
 fn inspect(state: &mut Resources, status: &Status) {
+    state.registered = registered_types(&state.context, status);
+    if let Some(registered) = &state.registered {
+        // The checkboxes start from what is really registered, not an old draft.
+        state.selection = Selection::from_extensions(registered.iter().cloned());
+    }
     state.recovery = status.recovery.as_ref().map(|recovery| recovery.journal_id);
     if let Some(recovery) = &status.recovery {
         // Restart may have an aggregate receipt without per-extension metadata.

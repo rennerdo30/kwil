@@ -208,6 +208,7 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (2000, Step::WelcomeProbe),
             (100, Step::UsabilityCapture("welcome.bmp")),
             (100, Step::WelcomeNext),
+            (300, Step::UsabilityCapture("welcome-file-types-open.bmp")),
             (100, Step::WelcomeKeyboard),
             (100, Step::WelcomeScrollDamage),
             (300, Step::UsabilityCapture("welcome-file-types.bmp")),

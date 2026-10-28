@@ -451,7 +451,7 @@ impl<A: AssociationAdapter> Engine<A> {
                         .iter()
                         .map(|c| match super::read_one(&mut self.adapter, &c.location) {
                             Ok(v) if v == c.before => CurrentState::Before,
-                            Ok(v) if v == c.after => CurrentState::Applied,
+                            Ok(v) if super::same_owned_value(&v, &c.after) => CurrentState::Applied,
                             Ok(_) => CurrentState::Conflict,
                             Err(e) => CurrentState::Unreadable(e.to_string()),
                         })
