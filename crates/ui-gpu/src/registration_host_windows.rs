@@ -315,7 +315,7 @@ pub(super) fn prepare(settings_path: &Path) -> Result<Prepared, String> {
     guards.push(ensure_private_child(&journal, &sid)?);
     // Existing journals retain recovery only when every entry already has the
     // same private owner ACL. No contents, registry values or receipts are read.
-    let cap = (kwil_core_commands::associations::worker::MAX_JOURNAL_TRANSACTIONS * 2 + 1) as usize;
+    let cap = kwil_core_commands::associations::worker::MAX_JOURNAL_ENTRIES;
     for (count, entry) in fs::read_dir(&journal).map_err(|e| e.to_string())?.enumerate() {
         if count >= cap {
             return Err("Registration journal exceeds its finite entry limit".into());
@@ -350,11 +350,12 @@ pub(super) fn prepare(settings_path: &Path) -> Result<Prepared, String> {
 }
 
 pub(super) fn repair_existing() -> Result<(), String> {
-    let sid = token_user()?;
-    let mut adapter = WindowsAssociations::new(security::sid_text(&sid)?).map_err(|e| e.to_string())?;
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    kwil_core_commands::associations::windows_paths::repair(&mut adapter, &executable, None)
-        .map(|_| ())
+    let settings = kwil_core_commands::settings::Settings::path(&executable).map_err(|e| e.to_string())?;
+    // The same SID, ancestor, ACL and record checks as explicit registration.
+    // Guards transfer into the factory and live through journal replay/repair.
+    let prepared = prepare(&settings)?;
+    kwil_core_commands::associations::worker::repair_startup(prepared.journal, prepared.factory)
         .map_err(|e| e.to_string())
 }
 

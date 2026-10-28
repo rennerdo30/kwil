@@ -188,20 +188,61 @@ fn replacement(
     Ok(None)
 }
 
-/// Run on a worker, never before the first frame. The immutable original journal
-/// stays intact. Effective owned path bytes are derived again on restart so
-/// Unregister recognizes repaired values and cannot restore a broken Kwil path.
-/// Foreign Before bytes are restored exactly as originally recorded.
-pub fn repair(
-    adapter: &mut impl AssociationAdapter,
-    executable: &Path,
-    receipt: Option<&mut AssociationReceipt>,
-) -> Result<usize, AssociationError> {
-    repair_with(adapter, executable, receipt, &mut |path| match std::fs::metadata(path) {
+/// Repair unreceipted inventory on a worker after the first frame. Receipt-owned
+/// paths go through worker::repair_startup and its durable write-ahead records.
+pub(super) fn repair(adapter: &mut impl AssociationAdapter, executable: &Path) -> Result<usize, AssociationError> {
+    repair_with(adapter, executable, None, &mut |path| match std::fs::metadata(path) {
         Ok(m) => Ok(m.is_file()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(err(format!("Cannot inspect registered executable: {e}"))),
     })
+}
+
+pub(super) fn receipt_repairs(
+    adapter: &mut impl AssociationAdapter,
+    executable: &Path,
+    receipt: &AssociationReceipt,
+) -> Result<SharedChanges, AssociationError> {
+    receipt_repairs_with(adapter, executable, receipt, &mut |path| match std::fs::metadata(path) {
+        Ok(m) => Ok(m.is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(err(format!("Cannot inspect registered executable: {e}"))),
+    })
+}
+
+fn receipt_repairs_with(
+    adapter: &mut impl AssociationAdapter,
+    executable: &Path,
+    receipt: &AssociationReceipt,
+    exists: &mut impl FnMut(&Path) -> Result<bool, AssociationError>,
+) -> Result<SharedChanges, AssociationError> {
+    let admission = Admission::acquire(WORKSPACE_BYTES)?;
+    if receipt.owner != adapter.owner() {
+        return Err(err("Cannot repair another user's receipt"));
+    }
+    let executable = explorer_executable(executable)?;
+    let mut budget = ValueBudget::new(worker::MAX_RECORD_BYTES);
+    let mut changes = Vec::new();
+    for change in receipt.pending() {
+        if let Some(after) = &change.after
+            && let Some(new) = replacement(&change.location, after, &executable, true, exists, &mut budget)?
+            && *after != new
+        {
+            let current = adapter.read_bounded(&change.location, &mut budget)?;
+            if current == change.after || current.as_ref() == Some(&new) {
+                changes.push(Change {
+                    location: change.location.clone(),
+                    before: change.after.clone(),
+                    after: Some(new),
+                });
+            }
+        }
+    }
+    Ok(SharedChanges::admitted(changes, admission))
+}
+
+pub(super) fn repair_location(location: &Location) -> bool {
+    path_value(location).is_some()
 }
 
 fn repair_with(
@@ -220,33 +261,15 @@ fn repair_with(
     let mut budget = ValueBudget::new(worker::MAX_RECORD_BYTES);
     let mut repaired = 0;
     if let Some(receipt) = receipt {
-        if receipt.owner != adapter.owner() {
-            return Err(err("Cannot repair another user's receipt"));
-        }
+        let repairs = receipt_repairs_with(adapter, Path::new(&executable), receipt, exists)?;
         let (mut changes, admission) = receipt.remaining.copied()?;
-        for change in &mut changes {
-            if let Some(before) = &change.before
-                && let Some(new) = replacement(&change.location, before, &executable, false, exists, &mut budget)?
-            {
-                let current = adapter.read_bounded(&change.location, &mut budget)?;
-                if current == change.before && current.as_ref() != Some(&new) {
-                    adapter.write(&change.location, Some(&new))?;
-                    repaired += 1;
-                }
-                change.before = Some(new);
+        for repair in repairs.iter() {
+            let change = changes.iter_mut().find(|change| change.location == repair.location).unwrap();
+            if adapter.read_bounded(&change.location, &mut budget)? == repair.before {
+                adapter.write(&change.location, repair.after.as_ref())?;
+                repaired += 1;
             }
-            if let Some(after) = &change.after
-                && let Some(new) = replacement(&change.location, after, &executable, true, exists, &mut budget)?
-            {
-                let current = adapter.read_bounded(&change.location, &mut budget)?;
-                if current == change.after && current.as_ref() != Some(&new) {
-                    adapter.write(&change.location, Some(&new))?;
-                    repaired += 1;
-                    change.after = Some(new);
-                } else if current.as_ref() == Some(&new) {
-                    change.after = Some(new);
-                }
-            }
+            change.after = repair.after.clone();
         }
         receipt.remaining = SharedChanges::admitted(changes, admission);
     }
@@ -431,7 +454,7 @@ mod tests {
         assert!(!is_build_executable(Path::new(r"E:\Apps\Kwil\kwil.exe")));
     }
     #[test]
-    fn explorer_unregister_never_restores_a_broken_owned_command() {
+    fn explorer_unregister_preserves_exact_original_before() {
         let _guard = test_admission_guard();
         let location = command("Kwil.txt");
         let mut receipt = AssociationReceipt {
@@ -451,7 +474,7 @@ mod tests {
         };
         repair_with(&mut hive, Path::new(r"E:\new\kwil.exe"), Some(&mut receipt), &mut |_| Ok(false)).unwrap();
         assert!(rollback(&mut hive, &mut receipt).is_empty());
-        assert_eq!(hive.read(&location).unwrap(), Some(value(r#""E:\new\kwil.exe" "%1""#)));
+        assert_eq!(hive.read(&location).unwrap(), Some(value(r#""\\?\E:\older\kwil.exe" "%1""#)));
     }
     #[cfg(windows)]
     #[test]
@@ -466,7 +489,7 @@ mod tests {
             values: vec![(location.clone(), value(&format!("\"{}\" \"%1\"", missing.display())))],
             ..Default::default()
         };
-        assert_eq!(repair(&mut hive, Path::new(r"E:\new\kwil.exe"), None).unwrap(), 1);
+        assert_eq!(repair(&mut hive, Path::new(r"E:\new\kwil.exe")).unwrap(), 1);
         assert_eq!(hive.read(&location).unwrap(), Some(value(r#""E:\new\kwil.exe" "%1""#)));
     }
 }
