@@ -85,7 +85,13 @@ fn windows_user_owned_save_is_quiet_and_preserves_dacl() {
     let mut buffer = Buffer::from_file(original.clone()).unwrap();
     buffer.insert(0, b"new ").unwrap();
     let saved = save_snapshot(f.request(original, &buffer)).unwrap();
-    assert_eq!(dacl(&mut descriptor(&f.path())), dacl(&mut before));
+    // Windows can materialize inherited duplicates. Production verification
+    // compares permissions while the independent raw descriptor read ensures
+    // we are checking the actual destination, not the pre-replace temp.
+    assert!(
+        windows_security::same_dacl(dacl(&mut before).as_deref(), dacl(&mut descriptor(&f.path())).as_deref(),)
+            .unwrap()
+    );
     assert_eq!(fs::read(f.path()).unwrap(), b"new old");
     assert!(saved.warnings.is_empty(), "{:?}", saved.warnings);
 }

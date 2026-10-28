@@ -144,8 +144,12 @@ impl Descriptor {
         }
     }
 
-    pub(super) fn verify_dacl(mut self, path: &Path, warnings: &mut Vec<String>) {
-        let result = Self::read(path).and_then(|mut saved| Ok(self.dacl()? == saved.dacl()?));
+    pub(super) fn verify_dacl(self, path: &Path, warnings: &mut Vec<String>) {
+        self.verify_against(Self::read(path), warnings);
+    }
+
+    fn verify_against(mut self, saved: io::Result<Self>, warnings: &mut Vec<String>) {
+        let result = saved.and_then(|mut saved| same_dacl(self.dacl()?, saved.dacl()?));
         match result {
             Ok(true) => {}
             Ok(false) => {
@@ -157,3 +161,143 @@ impl Descriptor {
 }
 
 type SidGetter = unsafe extern "system" fn(PSECURITY_DESCRIPTOR, *mut PSID, *mut i32) -> i32;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Permissions {
+    Unrestricted,
+    Entries(Vec<AceRun>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AceRun {
+    // Within consecutive allows (or denies), order and duplicate entries do
+    // not affect access checks. Never commute an allow across a deny: SIDs
+    // can overlap through group membership, changing the access decision.
+    Standard { kind: u8, rights: std::collections::BTreeMap<(Vec<u8>, u8), u32> },
+    // Object/callback/unknown ACEs carry additional semantics. Retain their
+    // complete payload and position rather than guessing at equivalence.
+    Other(Vec<u8>),
+}
+
+pub(super) fn same_dacl(before: Option<&[u8]>, after: Option<&[u8]>) -> io::Result<bool> {
+    Ok(normalize_dacl(before)? == normalize_dacl(after)?)
+}
+
+fn normalize_dacl(acl: Option<&[u8]>) -> io::Result<Permissions> {
+    let Some(acl) = acl.filter(|acl| !acl.is_empty()) else {
+        return Ok(Permissions::Unrestricted);
+    };
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid DACL or ACE layout");
+    if acl.len() < 8 {
+        return Err(invalid());
+    }
+    let count = u16::from_le_bytes([acl[4], acl[5]]);
+    let mut offset = 8;
+    let mut runs = Vec::new();
+    let mut seen = std::collections::BTreeMap::<_, u32>::new();
+    for _ in 0..count {
+        let header = acl.get(offset..offset + 4).ok_or_else(invalid)?;
+        let size = u16::from_le_bytes([header[2], header[3]]) as usize;
+        if size < 4 {
+            return Err(invalid());
+        }
+        let ace = acl.get(offset..offset + size).ok_or_else(invalid)?;
+        offset += size;
+        let kind = ace[0];
+        if kind != 0 && kind != 1 {
+            // Unknown ACEs may alter the access-check context.
+            seen.clear();
+            runs.push(AceRun::Other(ace.to_vec()));
+            continue;
+        }
+        // ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE: header, mask, SID.
+        if ace.len() < 16 {
+            return Err(invalid());
+        }
+        let sid_len = 8 + 4 * ace[9] as usize;
+        let sid = ace.get(8..8 + sid_len).ok_or_else(invalid)?.to_vec();
+        let mut mask = u32::from_le_bytes(ace[4..8].try_into().unwrap());
+        // INHERITED_ACE records provenance, not access semantics. All actual
+        // inheritance/propagation flags remain part of the permission key.
+        let flags = ace[1] & !(INHERITED_ACE as u8);
+        // A repeated grant/denial to the same trustee cannot affect bits the
+        // earlier ACE already decided, even across a run of the other type.
+        // Subtract only identical trustee/type/propagation keys, never infer
+        // group membership or commute a new permission across a deny.
+        let previous = seen.entry((kind, sid.clone(), flags)).or_default();
+        let original_mask = mask;
+        mask &= !*previous;
+        *previous |= original_mask;
+        if mask == 0 {
+            continue;
+        }
+        if !matches!(runs.last(), Some(AceRun::Standard { kind: previous, .. }) if *previous == kind) {
+            runs.push(AceRun::Standard { kind, rights: Default::default() });
+        }
+        if let Some(AceRun::Standard { rights, .. }) = runs.last_mut() {
+            *rights.entry((sid, flags)).or_default() |= mask;
+        }
+    }
+    // Ignore unused allocation bytes beyond the last ACE, including ACL size
+    // and reserved fields. An empty ACL still denies all (unlike a null DACL).
+    Ok(Permissions::Entries(runs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real self-relative security descriptors, including ACL allocation slack.
+    fn descriptor(aces: &[(u8, u8, u32, u32)], slack: usize) -> Descriptor {
+        let size = 8 + aces.len() * 20 + slack;
+        let mut bytes = vec![0u8; 20 + size];
+        bytes[0] = 1;
+        bytes[2..4].copy_from_slice(&(SE_SELF_RELATIVE | SE_DACL_PRESENT).to_le_bytes());
+        bytes[16..20].copy_from_slice(&20u32.to_le_bytes());
+        bytes[20] = 2;
+        bytes[22..24].copy_from_slice(&(size as u16).to_le_bytes());
+        bytes[24..26].copy_from_slice(&(aces.len() as u16).to_le_bytes());
+        for (index, &(kind, flags, mask, trustee)) in aces.iter().enumerate() {
+            let ace = &mut bytes[28 + index * 20..][..20];
+            ace[0] = kind;
+            ace[1] = flags;
+            ace[2..4].copy_from_slice(&20u16.to_le_bytes());
+            ace[4..8].copy_from_slice(&mask.to_le_bytes());
+            ace[8..16].copy_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5]);
+            ace[16..20].copy_from_slice(&trustee.to_le_bytes());
+        }
+        bytes[28 + aces.len() * 20..].fill(0xa5);
+        Descriptor(bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect())
+    }
+
+    fn warnings(before: &[(u8, u8, u32, u32)], after: &[(u8, u8, u32, u32)], slack: usize) -> Vec<String> {
+        let mut warnings = Vec::new();
+        descriptor(before, 0).verify_against(Ok(descriptor(after, slack)), &mut warnings);
+        warnings
+    }
+
+    #[test]
+    fn equivalent_inherited_duplicates_and_unused_acl_bytes_are_quiet() {
+        let before = [(0, 0, 3, 18), (0, 0, 7, 11)];
+        let after = [(0, 16, 7, 11), (0, 0, 3, 18), (0, 16, 3, 18), (0, 0, 7, 11)];
+        assert!(warnings(&before, &after, 16).is_empty());
+        assert!(warnings(&before, &before, 16).is_empty());
+        let interleaved = [(0, 0, 3, 18), (1, 0, 1, 11)];
+        assert!(warnings(&interleaved, &[interleaved[0], interleaved[1], (0, 16, 3, 18)], 0).is_empty());
+    }
+
+    #[test]
+    fn missing_or_extra_allow_warns() {
+        let before = [(0, 0, 3, 18), (0, 0, 7, 11)];
+        assert!(!warnings(&before, &before[..1], 0).is_empty());
+        assert!(!warnings(&before[..1], &before, 0).is_empty());
+    }
+
+    #[test]
+    fn changed_deny_and_changed_allow_deny_precedence_warn() {
+        let before = [(1, 0, 1, 18), (0, 0, 3, 18)];
+        assert!(!warnings(&before, &[(1, 0, 2, 18), before[1]], 0).is_empty());
+        assert!(!warnings(&before, &[before[1], before[0]], 0).is_empty());
+        assert!(!warnings(&[(0, 0, 3, 18)], &[(0, INHERIT_ONLY_ACE as u8, 3, 18)], 0).is_empty());
+    }
+}
