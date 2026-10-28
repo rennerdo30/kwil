@@ -159,6 +159,21 @@ fn join_with_retirement_refusal(shared: &Shared, deadline: Instant, error: Nativ
 // producer; consume its real Stopped slot with finish_until's ACK sequence,
 // then use the EXISTING one-query seam. No replacement handle or join policy.
 impl BoundDocumentTicket {
+    pub(crate) fn wait_for_reset_for_test(&self, token: &DocumentProducerRetryToken) {
+        let shared = &self.receiver.shared;
+        let deadline = Instant::now() + LIMIT;
+        let mut state = lock(&shared.state);
+        while state.retry.is_some() || state.retry_running || state.transfer_active {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "fixture producer reset did not complete");
+            state = shared.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        assert!(
+            state.retry_acknowledgement_required.is_some_and(|control| control.same_identity(&token.control)),
+            "the specific producer reset must be ready before its single ACK"
+        );
+    }
+
     fn finish_held_until_with_query(
         &mut self,
         deadline: Instant,
