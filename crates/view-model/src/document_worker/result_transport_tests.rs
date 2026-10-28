@@ -8,6 +8,43 @@ use std::sync::{
 
 const LIMIT: Duration = Duration::from_secs(2);
 
+// Test consumers sometimes need to leave Saved unaccepted. Classify the slot
+// and claim empty capacity under ONE lock; a wake is not a slot reservation.
+impl DocumentResultReceiver {
+    pub(crate) fn next_save_test_event(&mut self, deadline: Instant) -> Option<ResultInfo> {
+        let mut state = lock(&self.shared.state);
+        loop {
+            assert_eq!(state.failure(), None, "save fixture transport failure");
+            if !state.transfer_active && !state.retire_requested {
+                if let Some(slot) = &state.slot {
+                    let delivery = DocumentDeliveryId { worker: self.shared.worker_id, delivery: state.delivery };
+                    return Some(slot.info(delivery));
+                }
+                if !state.in_flight && state.capacity_generation != self.observed_capacity {
+                    self.observed_capacity = state.capacity_generation;
+                    return None;
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "real save slot exceeded the existing absolute deadline");
+            state = self.shared.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
+
+    pub(crate) fn wait_save_retired_for_test(&self, delivery: DocumentDeliveryId, deadline: Instant) {
+        let mut state = lock(&self.shared.state);
+        assert_eq!(delivery.worker, self.shared.worker_id);
+        while state.delivery == delivery.delivery && state.in_flight {
+            assert_eq!(state.failure(), None, "save fixture retirement failure");
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "original producer residual retirement exceeded the existing deadline");
+            state = self.shared.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        assert_eq!(state.failure(), None);
+        assert!(state.commit_error.is_none(), "the original producer retired the first refusal");
+    }
+}
+
 struct NativeTeardown {
     entered: mpsc::SyncSender<std::thread::ThreadId>,
     release: mpsc::Receiver<()>,
