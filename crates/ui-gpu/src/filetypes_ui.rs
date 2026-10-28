@@ -1,9 +1,9 @@
-//! "Register file types" page inside the settings window, over the frozen
-//! `file_type_registration` service (KW46). Selection lives in the service's
-//! `Selection`; previews, registration, skip, status and unregister are its
-//! own requests on its own worker. This page never claims an operating-system
-//! result the service has not reported: Windows registers "Open with" only and
-//! the default app stays the user's choice in Windows Settings.
+//! "Register file types" page inside the settings window, over the
+//! `file_type_registration` service (KW46). The checkboxes start from what is
+//! really registered; "Apply" makes the OS match them and "Remove all" undoes
+//! everything (owner, 2026-10-29, KW-72). This page never claims an
+//! operating-system result the service has not reported: Windows registers
+//! "Open with" only and the default app stays the user's choice in Settings.
 //!
 //! Requires ROOT adoption of `core_commands::file_types` and
 //! `view_model::file_type_registration`; until then `hosted_none` is compiled
@@ -21,7 +21,6 @@ const TOGGLE: u32 = 0x2000_0000;
 const CUSTOM: u32 = 0x3000_0000;
 const GROUP: u32 = 0x4000_0000;
 const PRIMARY: u32 = 1;
-const SKIP: u32 = 2;
 const UNREGISTER: u32 = 3;
 const ADD: u32 = 4;
 const FIELD: u32 = 5;
@@ -93,21 +92,39 @@ fn error_text(error: &ActionError) -> String {
     }
 }
 
-fn status_text(status: &RegistrationStatus) -> (String, bool) {
-    match status {
-        RegistrationStatus::Idle => ("Not reviewed yet".into(), false),
-        RegistrationStatus::Pending => ("Working…".into(), false),
-        RegistrationStatus::Ready { .. } => ("Reviewed: nothing has changed yet".into(), false),
-        RegistrationStatus::Skipped => ("Skipped: nothing was changed".into(), false),
-        RegistrationStatus::Cancelled => ("Review cancelled".into(), false),
-        RegistrationStatus::Applied { .. } => ("File-type choices applied".into(), false),
-        RegistrationStatus::Unregistered { .. } => ("Unregistered: previous state restored".into(), false),
-        RegistrationStatus::RetainedRecovery { .. } => {
-            ("Existing registration saved; Unregister restores previous choices".into(), true)
-        }
-        RegistrationStatus::NoRetainedReceipt { .. } => ("No registration recorded".into(), false),
-        RegistrationStatus::Failed { message, .. } => (desktop::visible(message, 200), true),
+/// One plain sentence about the real state, and whether it needs attention.
+fn status_text(service: &FileTypeRegistration) -> (String, bool) {
+    match service.registration_status() {
+        RegistrationStatus::Pending => return ("Working…".into(), false),
+        RegistrationStatus::Failed { message, .. } => return (desktop::visible(message, 200), true),
+        _ => {}
     }
+    match service.registered() {
+        Some([]) if service.has_registration() => {
+            ("Some Kwil entries are left over. “Remove all” cleans them up.".into(), true)
+        }
+        Some([]) => ("No file types registered.".into(), false),
+        Some(types) => {
+            let n = types.len();
+            (format!("Kwil is in “Open with” for {n} file type{}.", if n == 1 { "" } else { "s" }), false)
+        }
+        // The receipt cannot name single types (Linux), or no status yet.
+        None if service.has_registration() => ("Kwil is registered.".into(), false),
+        None => ("No file types registered.".into(), false),
+    }
+}
+
+/// "Apply will add 3, remove 2.", or None when the checkboxes match the real state.
+fn change_text(service: &FileTypeRegistration) -> Option<String> {
+    let (add, remove) = service.change_counts();
+    let mut parts = Vec::new();
+    if add > 0 {
+        parts.push(format!("add {add}"));
+    }
+    if remove > 0 {
+        parts.push(format!("remove {remove}"));
+    }
+    (!parts.is_empty()).then(|| format!("Apply will {}.", parts.join(", ")))
 }
 
 fn outcome_mark(outcome: ExtensionOutcome) -> Option<bool> {
@@ -138,24 +155,6 @@ pub(super) struct RegistrationUi {
 pub(super) struct Page {
     pub service: FileTypeRegistration,
     pub ui: RegistrationUi,
-}
-
-/// The reviewed preview still describes the current selection.
-fn review_is_current(service: &FileTypeRegistration) -> Option<kwil_view_model::file_type_registration::ReviewId> {
-    let preview = service.reviewed_preview()?;
-    let reviewed: Vec<&Extension> = preview.extensions.iter().map(|status| &status.extension).collect();
-    let selected: Vec<&Extension> = service.selection().extensions().iter().collect();
-    (matches!(service.registration_status(), RegistrationStatus::Ready { .. }) && reviewed == selected)
-        .then_some(preview.review.clone())
-}
-
-fn applied_journal(status: &RegistrationStatus) -> Option<u64> {
-    match status {
-        RegistrationStatus::Applied { journal_id } | RegistrationStatus::RetainedRecovery { journal_id, .. } => {
-            Some(*journal_id)
-        }
-        _ => None,
-    }
 }
 
 /// Flattened list: group headers and rows of checkbox cells.
@@ -198,8 +197,8 @@ impl HostedPage for Page {
         "Register file types"
     }
     fn summary(&self) -> String {
-        let (status, _) = status_text(self.service.registration_status());
-        format!("Open supported files with Kwil from your file manager · {status}")
+        let (status, _) = status_text(&self.service);
+        format!("Open files with Kwil from your file manager · {status}")
     }
     fn keywords(&self) -> &'static str {
         "register file types extensions associations open with default app explorer finder"
@@ -271,11 +270,10 @@ impl HostedPage for Page {
         desktop::button(buf, stride, font, add, "Add", Style::Secondary, hot(ADD), c, s);
         hits.push(add, Target::Hosted(ADD));
         y += s.control + s.gap;
-        // Bottom bar: status, summary and the explicit actions.
+        // Bottom bar: the real state and the two actions.
         let bottom = Rect { x: area.x, y: (area.y + area.h).saturating_sub(s.control), w: area.w, h: s.control };
-        let status = self.service.registration_status();
-        let journal = applied_journal(status);
-        let reviewed = review_is_current(&self.service);
+        let pending = matches!(self.service.registration_status(), RegistrationStatus::Pending);
+        let changes = change_text(&self.service);
         let mut x = bottom.x + bottom.w;
         let mut action = |x: &mut usize, label: &str, style, code| {
             let w = desktop::button_width(font, label, s);
@@ -285,36 +283,20 @@ impl HostedPage for Page {
             hits.push(r, Target::Hosted(code));
             *x = x.saturating_sub(s.gap);
         };
-        let pending = matches!(status, RegistrationStatus::Pending);
         if !pending {
-            if journal.is_some() {
-                action(&mut x, "Unregister", Style::Danger, UNREGISTER);
-            } else {
-                let label = if reviewed.is_some() { "Register selected" } else { "Review changes" };
-                action(&mut x, label, Style::Primary, PRIMARY);
-                if !self.ui.setup {
-                    action(&mut x, "Skip", Style::Secondary, SKIP);
-                }
+            if changes.is_some() {
+                action(&mut x, "Apply", Style::Primary, PRIMARY);
+            }
+            if self.service.has_registration() {
+                action(&mut x, "Remove all", Style::Danger, UNREGISTER);
             }
         }
-        let selected = self.service.selection().extensions().len();
-        let (state, attention) = status_text(status);
-        let summary = format!("{selected} selected · {state}");
+        let (state, attention) = status_text(&self.service);
         let text = Rect { x: bottom.x, w: x.saturating_sub(bottom.x + s.gap), ..bottom };
-        desktop::label(buf, stride, font, text, &summary, if attention { c.error } else { c.muted });
-        // Review result or error, above the bar.
+        desktop::label(buf, stride, font, text, &state, if attention { c.error } else { c.muted });
+        // What Apply will do, or an error, above the bar.
         let mut bottom_y = bottom.y.saturating_sub(s.gap);
-        let message = self.ui.error.clone().map(|e| (e, true)).or_else(|| {
-            let preview = self.service.reviewed_preview().filter(|_| reviewed.is_some())?;
-            let changes = preview.extensions.iter().filter(|e| e.outcome == ExtensionOutcome::Planned).count();
-            let unchanged = preview.extensions.len() - changes;
-            let mut text = format!("Review: {changes} will be added, {unchanged} matched when reviewed.");
-            if let Some(note) = preview.notes.first() {
-                text.push(' ');
-                text.push_str(note);
-            }
-            Some((text, false))
-        });
+        let message = self.ui.error.clone().map(|e| (e, true)).or_else(|| changes.map(|text| (text, false)));
         if let Some((message, error)) = message {
             let wrapped = desktop::wrap(font, &message, area.w, 2);
             bottom_y = bottom_y.saturating_sub(wrapped.len() * s.text);
@@ -334,6 +316,7 @@ impl HostedPage for Page {
         self.ui.scroll = self.ui.scroll.min(all.len().saturating_sub(visible));
         self.ui.rows = (visible, all.len());
         let statuses = self.service.extension_status();
+        let registered = self.service.registered().unwrap_or_default();
         for (slot, line) in all.iter().skip(self.ui.scroll).take(visible).enumerate() {
             let r = Rect { x: list.x, y: list.y + slot * row_h, w: list.w.saturating_sub(s.thumb + s.gap), h: row_h };
             if r.y + r.h > list.y + list.h {
@@ -368,11 +351,13 @@ impl HostedPage for Page {
                         let checked = self.service.selection().contains(&extension);
                         let text = format!(".{}", extension.as_str());
                         desktop::checkbox(buf, stride, font, cell, &text, checked, hot(*code), true, c, s);
-                        if let Some(mark) = statuses
+                        // Accent dot: registered right now. Error dot: needs attention.
+                        let problem = statuses
                             .iter()
                             .find(|status| status.extension == extension)
-                            .and_then(|status| outcome_mark(status.outcome))
-                        {
+                            .and_then(|status| outcome_mark(status.outcome));
+                        let mark = problem.or(registered.contains(&extension).then_some(false));
+                        if let Some(mark) = mark {
                             let center = ((cell.x + cell.w) as f32 - s.gap as f32, cell.y as f32 + cell.h as f32 / 2.0);
                             chrome::disc(
                                 buf,
@@ -546,32 +531,35 @@ impl Page {
             c,
             s,
         );
-        let status = self.service.registration_status();
-        if matches!(status, RegistrationStatus::Pending) {
+        if matches!(self.service.registration_status(), RegistrationStatus::Pending) {
             desktop::label(buf, stride, font, bottom, "Working…", c.muted);
             return;
         }
-        let (code, label) = if applied_journal(status).is_some() {
-            (UNREGISTER, "Unregister")
-        } else if review_is_current(&self.service).is_some() {
-            (PRIMARY, "Register selected")
+        let changes = change_text(&self.service);
+        let (code, label, style) = if changes.is_some() {
+            (PRIMARY, "Apply", Style::Primary)
+        } else if self.service.has_registration() {
+            (UNREGISTER, "Remove all", Style::Danger)
         } else {
-            (PRIMARY, "Review changes")
+            (0, "", Style::Primary)
         };
-        let width = desktop::button_width(font, label, s).min(bottom.w);
-        let action = Rect { x: bottom.x + bottom.w - width, w: width, ..bottom };
-        desktop::button(buf, stride, font, action, label, Style::Primary, hover == Some(code), c, s);
-        hits.push(action, Target::Hosted(code));
-        let summary = self.ui.error.clone().unwrap_or_else(|| {
-            format!("{} selected · {}", self.service.selection().extensions().len(), status_text(status).0)
-        });
+        let mut left = bottom.x + bottom.w;
+        if !label.is_empty() {
+            let width = desktop::button_width(font, label, s).min(bottom.w);
+            let action = Rect { x: bottom.x + bottom.w - width, w: width, ..bottom };
+            desktop::button(buf, stride, font, action, label, style, hover == Some(code), c, s);
+            hits.push(action, Target::Hosted(code));
+            left = action.x;
+        }
+        let (state, attention) = status_text(&self.service);
+        let summary = self.ui.error.clone().or(changes).unwrap_or(state);
         desktop::label(
             buf,
             stride,
             font,
-            Rect { w: action.x.saturating_sub(bottom.x + s.gap), ..bottom },
+            Rect { w: left.saturating_sub(bottom.x + s.gap), ..bottom },
             &summary,
-            if self.ui.error.is_some() { c.error } else { c.muted },
+            if self.ui.error.is_some() || attention { c.error } else { c.muted },
         );
     }
     pub(super) fn custom_focused(&self) -> bool {
@@ -630,15 +618,8 @@ impl Page {
                 Ok(())
             }
             (_, ADD) => self.add_custom(),
-            (_, PRIMARY) => match review_is_current(&self.service) {
-                Some(review) => self.service.register_selected(review, None).map(drop).map_err(|e| error_text(&e)),
-                None => self.service.preview().map(drop).map_err(|e| error_text(&e)),
-            },
-            (_, SKIP) => self.service.skip().map(drop).map_err(|e| error_text(&e)),
-            (_, UNREGISTER) => match applied_journal(self.service.registration_status()) {
-                Some(journal) => self.service.unregister(journal).map(drop).map_err(|e| error_text(&e)),
-                None => Ok(()),
-            },
+            (_, PRIMARY) => self.service.apply().map_err(|e| error_text(&e)),
+            (_, UNREGISTER) => self.service.remove_all().map_err(|e| error_text(&e)),
             _ => Ok(()),
         };
         if code != FIELD && code != ADD && code != (PRESET | 3) {

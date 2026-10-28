@@ -289,6 +289,16 @@ impl Selection {
         assert!(extensions.len() <= MAX_SELECTED_EXTENSIONS, "catalog exceeds bounded selection");
         Self { preset, extensions }
     }
+    /// Exactly these extensions (e.g. what is registered right now). Types that
+    /// may not be registered any more are left out, so applying removes them.
+    pub fn from_extensions(extensions: impl IntoIterator<Item = Extension>) -> Self {
+        let mut extensions: Vec<_> =
+            extensions.into_iter().filter(|extension| registration_allowed(extension.as_str())).collect();
+        extensions.sort();
+        extensions.dedup();
+        extensions.truncate(MAX_SELECTED_EXTENSIONS);
+        Self { preset: Preset::Custom, extensions }
+    }
     pub fn preset(&self) -> Preset {
         self.preset
     }

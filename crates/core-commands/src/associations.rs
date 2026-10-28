@@ -203,6 +203,40 @@ impl StoredValue {
     fn as_text(&self) -> Result<&str, AssociationError> {
         std::str::from_utf8(&self.bytes).map_err(|_| err("unsupported non-UTF-8 association file"))
     }
+    /// Text of a registry string (UTF-16LE, `kind` 1) or a user file (UTF-8, `kind` 0).
+    fn decoded(&self) -> Option<String> {
+        match self.kind {
+            1 => {
+                let units: Vec<u16> =
+                    self.bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+                let units = units.strip_suffix(&[0]).unwrap_or(&units);
+                String::from_utf16(units).ok()
+            }
+            0 => std::str::from_utf8(&self.bytes).ok().map(str::to_owned),
+            _ => None,
+        }
+    }
+}
+
+/// `current` is the value Kwil wrote (`after`), possibly with only canonicalize's
+/// Windows namespace prefix removed. Older Kwil builds wrote `"\\?\C:\…\kwil.exe"`
+/// commands that Explorer cannot launch; startup repair (KW-70) or a manual fix
+/// strips the prefix. Such a value is still Kwil's own, so status and Unregister
+/// must not treat it as another application's change (KW-72). Anything else
+/// differing stays a conflict and is never overwritten.
+pub(crate) fn same_owned_value(current: &Option<StoredValue>, after: &Option<StoredValue>) -> bool {
+    if current == after {
+        return true;
+    }
+    let (Some(current), Some(after)) = (current, after) else { return false };
+    if current.kind != after.kind {
+        return false;
+    }
+    let strip = |text: String| text.replace(r"\\?\UNC\", r"\\").replace(r"\\?\", "");
+    match (current.decoded(), after.decoded()) {
+        (Some(current), Some(after)) => after.contains(r"\\?\") && strip(current) == strip(after),
+        _ => false,
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssociationError(pub String);
@@ -563,7 +597,7 @@ pub fn rollback(adapter: &mut impl AssociationAdapter, receipt: &mut Association
             if current == change.before {
                 return Ok(());
             }
-            if current != change.after {
+            if !same_owned_value(&current, &change.after) {
                 return Err(err("association was changed by another application; refusing rollback overwrite"));
             }
             adapter.write(&change.location, change.before.as_ref())
@@ -582,6 +616,43 @@ pub fn rollback(adapter: &mut impl AssociationAdapter, receipt: &mut Association
 #[cfg(test)]
 #[path = "associations/budget_tests.rs"]
 mod budget_tests;
+
+#[cfg(test)]
+mod owned_value_tests {
+    use super::*;
+
+    fn reg(text: &str) -> Option<StoredValue> {
+        let bytes = text.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect();
+        Some(StoredValue { kind: 1, bytes })
+    }
+
+    #[test]
+    fn prefix_stripped_kwil_command_is_still_owned() {
+        let after = reg(r#""\\?\E:\Kwil builds\kwil.exe" "%1""#);
+        assert!(same_owned_value(&reg(r#""E:\Kwil builds\kwil.exe" "%1""#), &after));
+        assert!(same_owned_value(&after, &after));
+        let unc = reg(r#""\\?\UNC\server\share\kwil.exe" "%1""#);
+        assert!(same_owned_value(&reg(r#""\\server\share\kwil.exe" "%1""#), &unc));
+        let file = Some(StoredValue::text(r"Exec=\\?\C:\kwil.exe %f"));
+        assert!(same_owned_value(&Some(StoredValue::text(r"Exec=C:\kwil.exe %f")), &file));
+    }
+
+    #[test]
+    fn any_other_difference_stays_a_conflict() {
+        let after = reg(r#""\\?\E:\Kwil builds\kwil.exe" "%1""#);
+        // Another program, another path, other arguments, a removed value.
+        assert!(!same_owned_value(&reg(r#""C:\Program Files\Code\code.exe" "%1""#), &after));
+        assert!(!same_owned_value(&reg(r#""E:\Other\kwil.exe" "%1""#), &after));
+        assert!(!same_owned_value(&reg(r#""E:\Kwil builds\kwil.exe" "%1" --x"#), &after));
+        assert!(!same_owned_value(&None, &after));
+        // Without a prefix in the receipt, only exact equality counts.
+        let plain = reg(r#""E:\kwil.exe" "%1""#);
+        assert!(!same_owned_value(&reg(r#""e:\kwil.exe" "%1""#), &plain));
+        // Same text in another value kind is not the same value.
+        let text = Some(StoredValue::text(r#""E:\Kwil builds\kwil.exe" "%1""#));
+        assert!(!same_owned_value(&text, &after));
+    }
+}
 
 fn identifier(s: &str, mime: bool) -> bool {
     !s.is_empty()

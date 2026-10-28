@@ -622,3 +622,99 @@ static REGISTRATION_ADMISSION_CASE: std::sync::Mutex<()> = std::sync::Mutex::new
 fn registration_admission_case() -> std::sync::MutexGuard<'static, ()> {
     REGISTRATION_ADMISSION_CASE.lock().unwrap_or_else(|poison| poison.into_inner())
 }
+
+// KW-72 (owner, 2026-10-29): "after unregister it still tells me that its
+// registered, also the menu flow makes no sense". One Apply makes the OS match
+// the checkboxes; Remove all clears everything; status shows the real state.
+impl Harness {
+    /// Follow one apply/remove chain to its end (each step is one worker event).
+    fn settle(&mut self) -> RegistrationStatus {
+        for _ in 0..6 {
+            if !matches!(self.session().registration_status(), RegistrationStatus::Pending) {
+                break;
+            }
+            self.event();
+        }
+        self.session().registration_status().clone()
+    }
+    fn open_with(&self) -> Vec<String> {
+        let mut found: Vec<String> = self
+            .fake
+            .lock()
+            .unwrap()
+            .values
+            .iter()
+            .filter_map(|(location, _)| match location {
+                Location::WindowsValue { subkey, .. } => {
+                    subkey.strip_prefix('.').and_then(|tail| tail.strip_suffix("\\OpenWithProgids")).map(str::to_owned)
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+}
+fn names(extensions: Option<&[Extension]>) -> Vec<String> {
+    extensions.unwrap_or_default().iter().map(|e| e.as_str().to_owned()).collect()
+}
+#[test]
+fn registration_apply_remove_all_and_reapply_show_the_real_state() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    *h.session().selection_mut() = Selection::new(Preset::PlainTextOnly);
+    assert_eq!(h.session().change_counts(), (3, 0));
+    h.session().apply().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }), "one click registers");
+    assert_eq!(names(h.session().registered()), ["log", "text", "txt"]);
+    assert_eq!(h.open_with(), ["log", "text", "txt"]);
+    assert_eq!(h.session().change_counts(), (0, 0));
+
+    h.session().remove_all().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Unregistered { .. }));
+    assert!(h.fake.lock().unwrap().values.is_empty(), "nothing of Kwil stays registered");
+    // Reopening the page asks the worker again: it must not claim a registration.
+    h.session().status().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::NoRetainedReceipt { .. }));
+    assert!(!h.session().has_registration());
+    assert_eq!(names(h.session().registered()), Vec::<String>::new());
+    assert!(h.session().selection().extensions().is_empty(), "checkboxes show the real (empty) state");
+
+    // Register again.
+    h.session().selection_mut().add_custom("log").unwrap();
+    h.session().apply().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    assert_eq!(h.open_with(), ["log"]);
+}
+#[test]
+fn registration_apply_adds_and_removes_single_types_of_an_existing_registration() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    for extension in ["txt", "log"] {
+        h.session().selection_mut().add_custom(extension).unwrap();
+    }
+    h.session().apply().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    h.session().selection_mut().toggle(Extension::parse("log").unwrap(), false).unwrap();
+    h.session().selection_mut().add_custom("md").unwrap();
+    assert_eq!(h.session().change_counts(), (1, 1));
+    h.session().apply().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }), "no 'unregister first' detour");
+    assert_eq!(h.open_with(), ["md", "txt"]);
+    assert_eq!(names(h.session().registered()), ["md", "txt"]);
+}
+#[test]
+fn registration_status_resets_checkboxes_to_what_is_registered() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    h.session().selection_mut().add_custom("txt").unwrap();
+    h.session().apply().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    // An unapplied draft is replaced by the real state when the page reopens.
+    *h.session().selection_mut() = Selection::new(Preset::PlainTextOnly);
+    h.session().status().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::RetainedRecovery { .. }));
+    assert_eq!(names(Some(h.session().selection().extensions())), ["txt"]);
+    assert!(h.session().has_registration());
+}
