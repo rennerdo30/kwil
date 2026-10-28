@@ -12,6 +12,8 @@ mod trim_spool;
 pub use trim_spool::{TrimRanges, TrimSpool};
 mod compressed;
 mod encoded;
+#[cfg(windows)]
+mod windows_security;
 pub use compressed::{
     CompressedCheckpointOwners, CompressedSaveRetirement, CompressedSavedSnapshot, save_compressed_snapshot,
 };
@@ -34,8 +36,8 @@ pub struct SavedSnapshot {
     pub file: TextFile,
     pub snapshot: Snapshot,
     pub revision: u64,
-    /// Windows security descriptor preservation is best effort; failures are
-    /// returned to the frontend as warnings, never hidden.
+    /// Windows warns if the saved DACL differs or cannot be verified.
+    /// Unprivileged owner/group transfer failures are not user-facing warnings.
     pub warnings: Vec<String>,
     pub trimmed_rows: Option<Range<u64>>,
     pub trim_deletions: Option<TrimSpool>,
@@ -185,6 +187,10 @@ fn commit_with_operations(
     let mut temp = Temporary::new(parent).map_err(|e| save_error(&path, e))?;
     let trimmed_rows = write(&request.snapshot, temp.file.as_mut().unwrap()).map_err(|e| save_error(&path, e))?;
     let mut warnings = Vec::new();
+    #[cfg(windows)]
+    let security =
+        metadata.as_ref().map(|m| preserve_metadata(&path, &temp.path, m, &mut warnings)).transpose()?.flatten();
+    #[cfg(not(windows))]
     if let Some(metadata) = &metadata {
         preserve_metadata(&path, &temp.path, metadata, &mut warnings)?;
     }
@@ -215,6 +221,10 @@ fn commit_with_operations(
     }
     if let Some(pin) = pin {
         pin.commit();
+    }
+    #[cfg(windows)]
+    if let Some(security) = security {
+        security.restore_and_verify_dacl(&path, &mut warnings);
     }
     // The rename and original pin are committed. Never roll back or remove the
     // destination if opening/syncing its parent directory now fails.
@@ -387,14 +397,13 @@ fn wide(path: &Path) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn preserve_metadata(path: &Path, temp: &Path, _: &fs::Metadata, warnings: &mut Vec<String>) -> io::Result<()> {
-    use windows_sys::Win32::{
-        Security::{
-            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW, OWNER_SECURITY_INFORMATION,
-            SetFileSecurityW,
-        },
-        Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW},
-    };
+fn preserve_metadata(
+    path: &Path,
+    temp: &Path,
+    _: &fs::Metadata,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<windows_security::Descriptor>> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW};
     let source = wide(path);
     let target = wide(temp);
     // SAFETY: terminated paths and a bounded aligned writable descriptor buffer.
@@ -405,24 +414,16 @@ fn preserve_metadata(path: &Path, temp: &Path, _: &fs::Metadata, warnings: &mut 
     if unsafe { SetFileAttributesW(target.as_ptr(), attributes) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let flags = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-    let mut descriptor = vec![0_u32; (64 << 10) / 4];
-    let mut needed = 0;
-    // SAFETY: descriptor has 64 KiB writable, aligned storage; required count is writable.
-    if unsafe { GetFileSecurityW(source.as_ptr(), flags, descriptor.as_mut_ptr().cast(), 64 << 10, &mut needed) } == 0 {
-        warnings.push(format!("could not read original ACL/owner: {}", io::Error::last_os_error()));
-        return Ok(());
-    }
-    // SAFETY: successful GetFileSecurityW produced this self-relative descriptor.
-    if unsafe { SetFileSecurityW(target.as_ptr(), flags, descriptor.as_mut_ptr().cast()) } == 0 {
-        // Owner/group may require extra privilege even when DACL is writable.
-        warnings.push(format!("could not preserve full ACL/owner: {}", io::Error::last_os_error()));
-        if unsafe { SetFileSecurityW(target.as_ptr(), DACL_SECURITY_INFORMATION, descriptor.as_mut_ptr().cast()) } == 0
-        {
-            warnings.push(format!("could not preserve DACL: {}", io::Error::last_os_error()));
+    match windows_security::Descriptor::read(path) {
+        Ok(mut security) => {
+            security.copy_to(temp);
+            Ok(Some(security))
+        }
+        Err(error) => {
+            warnings.push(format!("could not verify saved permissions: original DACL could not be read: {error}"));
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -454,6 +455,8 @@ fn replace(temp: &Path, destination: &Path, backup: Option<&Path>) -> io::Result
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    mod windows_tests;
     use super::*;
 
     #[test]
