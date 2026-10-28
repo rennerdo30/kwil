@@ -33,6 +33,15 @@ select betas.
 - GUI notification and receiver ownership retained through shutdown.
 - Stable/prerelease update settings and numeric prerelease ordering.
 - Guarded save/quit, readiness, cleanup and IPC regression fixes.
+- Smooth window resizing: intermediate sizes are coalesced and no stale frame
+  shows after a drag (KW-58).
+- Scrollbars, typing, caret, selection, window controls and the window/taskbar
+  icon checked and corrected (KW-48).
+- Saving on Windows no longer warns about owner/ACL preservation unless the
+  file's permissions really differ afterwards.
+- File-type registrations use normal paths that Explorer can launch; broken
+  Kwil-owned registrations repair themselves at startup (KW-70).
+- Several intermittent test failures fixed (KW-68, KW-69).
 ## Evaluation areas
 
 - GUI and TUI text editing, tabs, undo/redo and saving.
