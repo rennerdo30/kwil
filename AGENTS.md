@@ -8,6 +8,13 @@ Read `E:/Development/AGENTS.md` and `E:/Development/general-agent-rules.md` firs
 - **Pair Desk:** project `kwil` (ids `KW-n`).
 - **Identity:** commit only as `rennerdo30 <9086097+rennerdo30@users.noreply.github.com>`.
 - **Review limit** (owner, 2026-10-27): at most three review rounds per change. Renaming the change or starting a new review job does not reset the count; after round three, ROOT resolves the remaining findings or reports the concrete blocker instead of continuing review loops.
+- **No loops** (owner, 2026-10-29: "be careful to not be in a forever loop ... document that we don't get into loops again"):
+  - **The goal outranks the gates.** Work toward the owner's stated goal (now: KW-67, ship beta.2). Before starting any new job or round, ask: does this move that goal? If not, record it on the desk and do not start it.
+  - **Fix rounds:** at most **two** fix rounds per PR. After that the coordinator either merges with the open point recorded as an issue, or stops and asks the owner with options. A new job on the same problem counts as the same rounds.
+  - **Flaky CI tests:** a failure in code the PR does not touch is **re-run once**. If the re-run is green, merge and record the flake on the desk. Open a fix job only when the same test fails on `main` itself twice. Never chain flake jobs (fixing one flake is not a reason to hunt the next).
+  - **Required CI** for a merge or the beta tag is one green run on the exact commit; a green re-run of a flaky job counts. Do not demand several consecutive green runs.
+  - **No new qualification layers** (proof harnesses, extra deadline or ownership frameworks, installer qualification) unless the owner's goal needs them; say so first and ask.
+  - **Report the loop:** if the same problem comes back a third time, stop all work on it and tell the owner in one message: what failed each time, and the options.
 - **Repository:** public at `https://github.com/rennerdo30/kwil` (owner, 2026-10-23). Push with explicit refs (`git push origin HEAD:refs/heads/<branch>`). Releases are drafts made by `.github/workflows/release.yml`; only the owner publishes (`docs/RELEASING.md`).
 - **CI runners:** GitHub-hosted (owner, 2026-10-23: public repo). This is an exception to the shared self-hosted rule: a public repo must never run fork pull requests on the owner's machines, hosted runners are free for public repositories, and Windows/macOS/ARM builds need those runners anyway.
 - **Build:** output goes to `E:/Development/_cache/cargo-target/kwil*` (`.cargo/config.toml`); toolchain pinned in `rust-toolchain.toml`. Use `rustup ... --no-self-update`; rustup self-updates belong to the owner.
