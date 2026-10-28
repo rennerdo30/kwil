@@ -1,0 +1,123 @@
+name: Bench budgets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TARGET_DIR: target
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  budgets:
+    # Optional performance check: never add this job to required branch checks.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          key: bench-core-${{ hashFiles('Cargo.lock', 'crates/bench/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build core-text measurement binary
+        run: cargo build --manifest-path crates/bench/Cargo.toml --release --locked -j 4 --features harness
+      - name: Check the isolated benchmark workspace
+        shell: bash
+        run: |
+          cargo fmt --manifest-path crates/bench/Cargo.toml --check
+          cargo clippy --manifest-path crates/bench/Cargo.toml --all-targets --features harness --locked -j 4 -- -D warnings
+      - name: Cache generated fixtures
+        id: fixtures
+        uses: actions/cache/restore@v6
+        with:
+          path: fixtures
+          key: bench-core-fixtures-v1-${{ matrix.os }}-${{ hashFiles('crates/bench/src/fixtures.rs') }}
+      - name: Generate the required fixture on demand
+        shell: bash
+        run: target/release/kwil-bench generate fixtures
+      - name: Read reviewed OS baseline
+        shell: bash
+        run: |
+          mkdir -p baseline
+          git fetch origin bench-baseline
+          git show FETCH_HEAD:${{ matrix.os }}.json > baseline/current.json
+          git show FETCH_HEAD:reference.json > baseline/reference.json
+          git rev-parse FETCH_HEAD > baseline/commit.txt
+      - name: Python environment
+        shell: bash
+        run: python -m venv .bench-venv
+      - name: Read the trusted reference source
+        id: baseline
+        shell: bash
+        run: |
+          py=.bench-venv/bin/python
+          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
+          "$py" -c 'import json,re; from pathlib import Path; s=json.loads(Path("baseline/reference.json").read_text())["source_head"]; assert re.fullmatch("[0-9a-f]{40}",s); print("source="+s)' >> "$GITHUB_OUTPUT"
+      - name: Check out the pinned baseline code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.baseline.outputs.source }}
+          path: .bench-reference
+          persist-credentials: false
+      - name: Build baseline measurement binary before sampling either version
+        working-directory: .bench-reference
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-reference
+        # --manifest-path supports both the original workspace member and the
+        # isolated layout, so a reviewed future baseline refresh stays buildable.
+        run: cargo build --manifest-path crates/bench/Cargo.toml --release --locked -j 4 --features harness
+      - name: Divan API benchmarks (nine samples, one operation per sample)
+        shell: bash
+        env:
+          KWIL_FIXTURES: ${{ github.workspace }}/fixtures
+        run: cargo bench --manifest-path crates/bench/Cargo.toml --locked -j 4 --features harness --bench text -- --sample-count 9 --sample-size 1
+      - name: Gate contract tests
+        shell: bash
+        run: |
+          py=.bench-venv/bin/python
+          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
+          "$py" crates/bench/test_gate.py
+          "$py" crates/bench/test_pairs.py
+      - name: Balanced paired hard and regression gates
+        shell: bash
+        run: |
+          py=.bench-venv/bin/python
+          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
+          "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --runs 8 --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
+      - name: Retain the exact trusted baseline inputs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p results/baseline
+          for file in baseline/current.json baseline/reference.json baseline/commit.txt; do
+            [ ! -f "$file" ] || cp "$file" results/baseline/
+          done
+      - name: Retain raw samples, medians and commit even on gate failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: results
+          if-no-files-found: error
+      - name: Preserve completed fixture even when a performance gate fails
+        if: always() && steps.fixtures.outputs.cache-hit != 'true' && hashFiles('fixtures/log-1g.log') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: fixtures
+          key: ${{ steps.fixtures.outputs.cache-primary-key }}
