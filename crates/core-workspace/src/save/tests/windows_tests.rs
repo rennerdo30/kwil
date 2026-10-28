@@ -132,15 +132,61 @@ fn windows_replacefile_security_probe() {
     let actual_owner = owner(&mut descriptor(&f.path()));
     assert!(!actual_owner.is_empty());
     println!("Testing replacement with the OS-assigned owner ({} SID bytes)", actual_owner.len());
-    // Give the original a different DACL from a newly created sibling, so
-    // this detects preservation rather than comparing identical defaults.
-    let mut foreign = descriptor(&foreign_source());
+    // Keep this filtered token's user fully authorized to replace the file.
+    // A small Authenticated Users grant makes the protected DACL distinct
+    // from a newly created sibling without importing a system file's policy.
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Storage::FileSystem::{FILE_ALL_ACCESS, FILE_READ_DATA},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    let mut token = std::ptr::null_mut();
+    let mut user = [0usize; 128];
+    let mut needed = 0;
+    let mut authenticated_users = [0u32; 17];
+    let mut sid_size = std::mem::size_of_val(&authenticated_users) as u32;
+    let mut acl = [0u32; 256];
+    let mut sd = [0usize; 8];
     unsafe {
+        assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token), 0);
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            std::mem::size_of_val(&user) as u32,
+            &mut needed,
+        );
+        CloseHandle(token);
+        assert_ne!(ok, 0);
+        let user_sid = (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+        assert_ne!(
+            CreateWellKnownSid(
+                WinAuthenticatedUserSid,
+                std::ptr::null_mut(),
+                authenticated_users.as_mut_ptr().cast(),
+                &mut sid_size
+            ),
+            0
+        );
+        assert_ne!(InitializeAcl(acl.as_mut_ptr().cast(), std::mem::size_of_val(&acl) as u32, 2), 0);
+        assert_ne!(AddAccessAllowedAceEx(acl.as_mut_ptr().cast(), 2, 0, FILE_ALL_ACCESS, user_sid), 0);
+        assert_ne!(
+            AddAccessAllowedAceEx(
+                acl.as_mut_ptr().cast(),
+                2,
+                0,
+                FILE_READ_DATA,
+                authenticated_users.as_mut_ptr().cast()
+            ),
+            0
+        );
+        assert_ne!(InitializeSecurityDescriptor(sd.as_mut_ptr().cast(), 1), 0);
+        assert_ne!(SetSecurityDescriptorDacl(sd.as_mut_ptr().cast(), 1, acl.as_ptr().cast(), 0), 0);
         assert_ne!(
             SetFileSecurityW(
                 wide(&f.path()).as_ptr(),
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                foreign.as_mut_ptr().cast()
+                sd.as_mut_ptr().cast()
             ),
             0
         );
