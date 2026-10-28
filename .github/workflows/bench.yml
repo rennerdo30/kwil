@@ -79,7 +79,9 @@ jobs:
         working-directory: .bench-reference
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target-reference
-        run: cargo build --release --locked -j 4 -p kwil-bench --features harness
+        # --manifest-path supports both the original workspace member and the
+        # isolated layout, so a reviewed future baseline refresh stays buildable.
+        run: cargo build --manifest-path crates/bench/Cargo.toml --release --locked -j 4 --features harness
       - name: Divan API benchmarks (nine samples, one operation per sample)
         shell: bash
         env:
