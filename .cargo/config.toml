@@ -13,6 +13,11 @@ debug = "line-tables-only"   # small debug info; full debug only when needed
 opt-level = 2                # dependencies are fast at run time and compile once
 debug = false
 
+# The CPU compositor is also the interactive debug frontend. Keep debug
+# assertions/onboarding, but do not run per-pixel painting without optimization.
+[profile.dev.package.kwil-ui-gpu]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

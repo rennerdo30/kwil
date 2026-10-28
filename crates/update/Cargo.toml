@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+kwil-core-commands = { path = "../core-commands" }
 ureq = { version = "3.5.0", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.1"

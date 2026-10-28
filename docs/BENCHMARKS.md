@@ -1,263 +1,124 @@
-# Speed budgets
+# Benchmarks and speed gates (KW-33)
 
-KW-33 measures only operations present at `b1b5c55`. Main was merged after KW-9
-landed; the same TextFile methods now return checked Results, which the harness
-propagates rather than bypassing file-safety checks. No new search/diff/edit API
-is benchmarked. The benchmark crate is unpublished.
-Its linked library has no default features, sampling thread or periodic timer.
-The `harness` feature enables the binary and text measurements. Divan **0.1.21**
-(MIT OR Apache-2.0, published 2025-10-04, checked through the crates.io API
-2026-10-23) is a development dependency. Its nine added lockfile packages do not
-enter the shipped binary. Existing serde_json/libc/windows-sys versions are reused.
+The optional **Bench budgets** workflow measures the core-text operations from
+spec §3 that are currently compatible with main. It runs on pushes to `main`,
+manual `workflow_dispatch`, and PRs carrying the `bench` label. Unlabelled PRs
+skip the budget job. **Never make Bench budgets a required branch check.** The
+normal `CI` workflow is unchanged: no fixture generation, release build or timed
+measurement is added to it. The bench crate is a separate Cargo workspace,
+excluded from the production workspace glob, with its own lockfile. Ordinary CI
+does not compile its dependencies, and the production lockfile and cache keys
+stay unchanged. Benchmark checks run in the optional workflow.
 
-## Measurements
+## Current coverage
 
-All times use release builds and warm OS file cache. Text benches use four index
-workers; startup uses the viewer's production count (available CPUs, at most eight). GB/s is
-decimal bytes/second; fixture sizes and private memory use binary GiB/MiB.
-No disk cache flush, privilege escalation, GPU device startup or network is involved.
+| Measurement | Target | Hard limit |
+|---|---|---|
+| `TextFile::open` plus first 60 lines of the 1 GiB log | 40 ms | 100 ms |
+| Background line-index algorithm, four workers | 2 GB/s | 1 GB/s |
+| Jump to line 15,000,000 after indexing | one frame | 16 ms |
+| Private memory after opening and indexing, excluding clean file page cache | 64 MiB | 256 MiB |
 
-| Measurement | What is timed / sampled | §3 target | Hard gate |
-|---|---|---|---|
-| Open + first screen | `TextFile::open` + first 60 raw lines, fresh process | ≤40 ms | ≤100 ms |
-| Index | Fresh `TextFile::build_index(4)`, including worker creation/join | ≥2 GB/s | ≥1 GB/s |
-| Jump to line 15M | `TextFile::lines(15_000_000, 60)` with ready index | ≤1 frame | ≤16 ms |
-| Clean 1 GiB open memory | After index + jump, absolute process private memory | ≤64 MiB | ≤256 MiB |
-| GUI launch with file | OS process creation to successful content present | ≤40 ms | ≤100 ms |
-| GUI empty launch | OS process creation to successful present | ≤25 ms | ≤60 ms |
-| Launch to index done | OS process creation to worker completion | No separate limit | OS baseline |
-| Viewer idle | Actual successful presents in two scripted idle phases | 0 | 0 |
-| Viewer scroll | 20 single-line steps; presents, copied/damaged pixels, CPU p99 | One copy + exposed row and status | 20 partial presents; Windows copy and exact damage |
+These are core-text measurements, not full-editor memory or input-to-pixels
+acceptance. Windows samples process private usage; Linux sums anonymous resident
+pages from `/proc/self/smaps`. This preserves the existing per-OS baseline's
+memory definition. Divan reports API timings; the fresh-process harness supplies
+the actual gate medians and memory measurements.
 
-Divan reports the first three timings, index byte throughput, and the associated
-budgets on stderr. Memory is deliberately measured by the **fresh-process harness**,
-not a shared Divan process retaining previous mappings and allocator state. Windows
-uses `PROCESS_MEMORY_COUNTERS_EX::PrivateUsage` (private committed bytes). Linux
-sums `Anonymous` from `/proc/self/smaps` (resident anonymous pages); this excludes
-read-only mapped file page cache, but is not Windows private commit. The OS
-baselines are never mixed. This is the core/viewer measurement, not a claim that
-every future editing path is memory-bounded.
+**GUI startup gating is explicitly deferred.** Main already owns
+`KWIL_TRACE_STARTUP` and the `ui-gpu/frame-harness` script. Its first-frame mark
+currently identifies the first chrome frame, not content-ready presentation.
+A launch-to-file-content gate must wait until that existing trace marks
+content-ready. The old `--trace-startup`, TUI trace adapter, viewer-only scroll
+contract and A/A diagnostic are superseded and are not ported into the current
+app/UI. Those files remain byte-identical to main. Existing UI harness metrics
+are not claimed as keystroke-to-pixels or refresh-rate acceptance.
 
-`--trace-startup` prints `t_launch`, `t_first_frame`, `t_index_done` in milliseconds
-since OS process creation to stderr, then exits after both a successful first
-present and index completion. Indexing may finish *before* the first frame; its
-timestamp is preserved. Windows uses process FILETIME; Linux uses `/proc/self/stat`
-and CLOCK_BOOTTIME (clock-tick start resolution); macOS uses proc_pidinfo.
-The flag suppresses automatic update startup. It works with `--gui --hidden` and
-`--tui` in an interactive terminal. TUI cleanup restores the terminal before exit.
-It never turns a failed present into a successful startup measurement.
+The other §3 budgets (search, diff, palette, full-editor memory, typing, scrolling,
+single-instance and remote drawing) still need their own representative
+integration measurements. KW-33 remains open for those and the startup gate.
 
-For Linux CI, the parent records CLOCK_BOOTTIME immediately before Popen and
-reads that child's `/proc/<pid>/stat` start tick. It subtracts the difference
-between this precise launch boundary and the kernel's floored creation tick
-from the raw trace marks. That cancels the shared 10 ms quantization error.
-Gated ages conservatively include process-spawn overhead; they measure launch
-request to the child's actual timestamp, not time until Python reads the pipe.
-The original OS marks, correction and spawn interval remain in each sample.
-The standalone flag still prints the OS process-age marks. Windows uses its
-precise process FILETIME without correction.
+## Noise and regression policy
 
-The `frame-harness` app feature links the scenario seam. `--frame-script` starts a
-bounded script worker only after the first frame and index: settle, idle 500 ms,
-20 scroll steps, idle 500 ms, exit. Each step waits for a successful present
-acknowledgement before the worker sends another step (five-second deadline).
-The 20 ms interval is a minimum gap, not an assumption that a hosted Windows
-present completes within 20 ms. CPU p99 is still recorded. The UI remains event-driven. Actual present
-damage and successful native screen copies feed the statistics; a model-only
-damage test cannot pass this gate. p99 is reported from the 20 measured CPU frame
-durations (nearest rank = maximum); this is not input-to-display latency.
-At each scripted scroll event, before asking the view for damage, the harness
-derives the exposed-row rectangle, status rectangle and exact copy area from
-the viewport width, height and line height. Each successful present must match
-those independent rectangles and copy area. Missing rows/status, misplaced
-damage, missing copies and compensating copy sizes cannot pass through equal
-aggregate totals. Windows enforces copy + exposed row + status. **TODO KW-11:** Linux native copy;
-the current viewer presents the moved region as damage there. No real RDP/VNC
-wire measurement is claimed (KW-30).
+The gate uses **nine fresh candidate processes and nine fresh reference
+processes**, alternating candidate/reference then reference/candidate each round.
+Both versions are fully built first, and the canonical fixture is warmed outside
+timed work with a 1 MiB buffer. It takes the median of each metric independently.
+No local benchmark loops run on the owner's PC.
 
-## Fixtures and light local use
+Every applicable hard limit is enforced, independently of the reference.
+For timing, the trusted stored baseline pins the source code rebuilt and measured
+on the same hosted runner as the candidate. A cost increase **over 10%** versus
+that reference median fails. For indexing, cost is inverse throughput (GB/s).
+Private memory compares directly with the stored OS median: paired timings cannot
+waive memory growth. Missing inputs, wrong runner/fixture/schema, invalid numbers
+and a reference checkout that differs from the pinned source fail closed.
+Targets are informative; they do not become additional flaky gates. Thresholds
+are never relaxed to obtain a green run. Raw samples, medians, source commits,
+the stored baseline and reference manifest are uploaded even on gate failure.
 
-Generation is explicit, never in a test or normal application startup. The port of
-`spike/textbench gen` keeps its deterministic xorshift log format without linking
-any spike. It writes bounded buffered chunks to ignored `fixtures/`:
+## Stored baseline: keep `bench-baseline`
 
-- `log-1g.log`: at least 1 GiB, over 20M log lines, including `line=15000000`.
-- `csv-20m.csv`: exactly 20M CSV rows.
-- `one-line-100m.json`: 100 MiB, valid one-line JSON.
-- `mixed-encoding/`: UTF-8/mixed endings, UTF-16LE, Windows-1252 and invalid bytes.
-- `tree-100k/`: 100 shards, 1,000 small files each.
+The **data branch is still required**. The workflow reads it but has only
+`contents: read`; PRs and manual runs cannot overwrite a baseline or write main.
+It fetches one exact data commit and reads all three inputs from that commit:
 
-CI generates all fixtures once per OS/generator-source cache key. A completion
-stamp is written only after successful full generation. Change the generator
-version and baseline fixture version together when changing fixture semantics.
-Completed fixtures are cached even when the performance gate fails, so the
-deliberate slowdown and baseline bootstrap do not trigger regeneration each run.
-Locally generate only the log unless another fixture is specifically needed:
+- `ubuntu-24.04.json`: the reviewed Linux samples and medians.
+- `windows-2025.json`: the reviewed Windows samples and medians.
+- `reference.json`: `source_head`, a full commit SHA containing the reference
+  measurement crate and source. That checkout is independently verified before
+  any sampling starts.
 
-```powershell
-$env:CARGO_TARGET_DIR='E:/Development/_cache/cargo-target/kwil-kw-33-bench-ci'
-$env:KWIL_NO_UPDATE='1'
-cargo build --release --locked -j 4 -p kwil-bench --features harness -p kwil --features frame-harness
-& "$env:CARGO_TARGET_DIR/release/kwil-bench.exe" generate fixtures
-python -m venv fixtures/bench-venv
-fixtures/bench-venv/Scripts/python.exe crates/bench/run.py --bin-dir "$env:CARGO_TARGET_DIR/release" --fixtures fixtures --runner owner-windows --runs 3 --output fixtures/local.json
-# Divan alternative (three samples, one operation each; do not run repeatedly):
-$env:KWIL_FIXTURES=(Resolve-Path fixtures).Path
-cargo bench --locked -j 4 -p kwil-bench --features harness --bench text -- --sample-count 3 --sample-size 1
-& "$env:CARGO_TARGET_DIR/release/kwil.exe" --tui --trace-startup fixtures/log-1g.log
+The existing data commit is `081a4df61f4ec8ea82d0988a7489dd3c84679722`;
+its reference source is `2a297eb814064f68144c91a8df665855fe1eace2`.
+Schema 1 remains compatible: the older result's startup fields are ignored by
+the four current core-text gates. No baseline reseeding is part of this port.
+
+A future baseline update is a deliberate reviewed change on the data branch,
+not an automatic reward for a green candidate. Download each OS result JSON
+from one accepted run, inspect raw samples and hard-limit results, then commit
+those exact result files as `<runner>.json`. Update `reference.json` with the
+accepted measurement source SHA and run URL in the **same data commit**. Push
+with `git push origin HEAD:refs/heads/bench-baseline` after review. Keep the
+measurement API, fixture version and memory definitions compatible. Do not point
+at main before it contains the bench crate, use an unreviewed candidate, copy a
+failed result, or change a threshold as part of refreshing the baseline.
+Artifacts expire; the data branch keeps the trusted results and source pointer
+independently of artifact retention.
+
+## Commands and fixtures
+
+Run on hosted CI using:
+
+```sh
+gh workflow run bench.yml --repo rennerdo30/kwil --ref kw/33-bench-ci
 ```
 
-Agent GUI runs always use `--hidden` and a timeout. The runner records each child
-PID and terminates only that child on its 60-second deadline. No local full suite,
-stress loop, repeated benchmark campaign, cold-cache test or low-RAM run is allowed.
-The fixture generator is bounded by the caller's launch timeout.
+For an admitted benchmark machine (not the owner's PC):
 
-## CI and baselines
+```sh
+cargo build --manifest-path crates/bench/Cargo.toml --release --locked -j 4 --features harness
+# Only the fixture consumed by the current gates:
+target/release/kwil-bench generate fixtures
+# Optional spec fixtures, generated rather than committed:
+target/release/kwil-bench generate fixtures --all
+KWIL_FIXTURES=fixtures cargo bench --manifest-path crates/bench/Cargo.toml --locked -j 4 --features harness --bench text -- --sample-count 9 --sample-size 1
+```
 
-`bench.yml` runs on pushes to main, PRs with label `bench` (including later pushes),
-and manual dispatch. Public GitHub-hosted `windows-2025` and `ubuntu-24.04` runners
-are required by the repository rule, which supersedes the older self-hosted text
-in the spec/issue. Linux uses Xvfb for actual window creation/presents.
-Both OSes also smoke the TUI trace in a real terminal (Linux PTY and hidden
-Windows console). These functional smokes are separate from GUI launch budgets.
+The deterministic generator uses bounded buffers. The required `log-1g.log` is
+at least 1 GiB and contains over 20 million numbered lines. `--all` also creates
+a 20M-line CSV, 100 MiB single-line JSON, mixed encodings and a 100k-file tree;
+these optional fixtures do not imply gated coverage. All fixtures live under
+the ignored `fixtures/` directory and CI caches them by generator hash and OS.
 
-The runner builds candidate and pinned baseline code before sampling, warms the
-mapped file cache using a 1 MiB buffer, then measures **nine fresh processes per
-version**, separately for text, GUI file and GUI empty. Samples are interleaved;
-the version measured first alternates each round. Every numeric budget retains
-its hard limit. Timings fail on **cost >110% of the baseline-code median measured
-on the same OS runner**. Throughput compares inverse GB/s, i.e. time per byte.
-Private memory keeps its original **stored OS median** comparison: CPU speed is
-not a memory calibration. A slow reference can never waive a hard limit. Raw
-candidate/reference samples, medians, exact baseline inputs and source commits
-are uploaded on success or failure. Tests inject slow timings to check every
-hard limit, regression direction, paired calibration, memory growth and
-missing/mismatched baseline rejection.
+Focused gate tests use synthetic measurements, never large fixtures:
 
-### Separate hosted A/A diagnostic
+```sh
+python -m venv .bench-venv
+# Windows: .bench-venv/Scripts/python.exe
+.bench-venv/bin/python crates/bench/test_gate.py
+```
 
-The parent approved a bounded A/A investigation after run 39838683508 failed
-Linux startup/index regression limits while Windows passed. Add the `bench-aa`
-label to PR #9 once, or manually dispatch with `diagnostic_aa=true`. The normal
-production gate still runs and retains its own outcome. The additional step
-runs even after that gate fails, provided the focused protocol checks passed;
-it cannot turn the failed job green. Subsequent pushes do not repeat A/A merely
-because the label remains present. To request another deliberate diagnostic,
-remove and re-add the label.
-
-Both A/A roles execute the **same executable paths**. SHA-256 is recorded for
-app and harness in both roles and checked again after sampling. Nine paired
-rounds retain the production order: text, file startup, empty startup for each
-role; A/B and B/A alternate. Every child records its PID, command, raw output,
-parent wall time, process CPU time and native resource counters. Linux uses
-`wait4` for that exact child's rusage (faults, context switches, I/O and peak
-RSS), with a pidfd-based timeout that cannot target a reused PID. Windows keeps
-a handle to the started process and reads `GetProcessTimes` and
-`GetProcessIoCounters` after exit. Windows counters are not Unix rusage and
-are labelled separately. CPU time sums all threads, so it can exceed wall time;
-these counters alone do not establish scheduling or frequency as the cause.
-
-The `diagnostic-only-aa-<runner>-attempt-<n>` artifact has a separate schema,
-`diagnostic_only=true`, `acceptance_eligible=false`, partial child records on
-failure and the production gate's unchanged outcome. Its A/B ratios are evidence,
-never an acceptance waiver or a baseline update. The script rejects ordinary
-local invocation; no owner-PC A/A campaign is authorized. Native collector and
-negative protocol checks run on hosted CI, without local Cargo-lane use.
-
-The parent approved paired timing comparison on 2026-10-23 after
-[run 39830020650](https://github.com/rennerdo30/kwil/actions/runs/39830020650)
-measured unchanged baseline code at 10.96 GB/s versus its stored 17.35 GB/s;
-the candidate measured 10.27 GB/s on that same host. Literal OS numbers were
-mostly measuring hosted-machine variation. The threshold remains >10% and
-hard limits remain independent of the calibration.
-
-Baselines are `windows-2025.json`, `ubuntu-24.04.json` and a `reference.json`
-source pointer on the separate
-**`bench-baseline` branch**. CI reads that branch with `contents: read`, never
-writes to it or `main`, and fails closed if it is absent or incompatible. Files
-use the same schema as the uploaded result JSON; `reference.json` pins the
-reviewed source head for both OSes. CI verifies the checked-out SHA before
-measuring it. This choice keeps baseline
-updates explicit and reviewable, avoids artifact expiry silently resetting the
-comparison, and prevents a PR from blessing its own results through CI writes.
-Branch protection/review of baseline changes belongs to the coordinator.
-
-To deliberately update the initialized baseline:
-
-1. Run the workflow on the intended reviewed source. A missing or incompatible
-   baseline fails closed; samples are retained if execution reached measurement.
-2. Download both `bench-<runner>-attempt-<n>` artifacts. Check their source commit, raw
-   samples, hard limits and frame results. Investigate any slowdown first.
-   Attempt-specific names retain earlier samples when a workflow is rerun.
-3. Commit the exact result JSON files to `bench-baseline` in a separate checkout
-   (identity through environment; explicit-ref push). Never copy owner-PC numbers
-   into a hosted baseline or mix runner OS/images. Record the reason and source
-   run links in the baseline commit and KW-33. Update `reference.json`'s
-   `source_head` to the corresponding reviewed head whose merge produced the
-   result files. Both OS files must represent that source. Never change the
-   pointer merely to make an unexplained regression pass.
-4. Re-run the candidate gate against those stored files. Baseline updates do not
-   change the §3 limits or the >10% comparison.
-
-The acceptance proof temporarily adds a real one-second delay to the line-index
-build on this PR, runs CI against the stored baseline, and removes it in a later
-commit. The red run must specifically show an index budget/regression failure,
-then the final head must pass the same workflow. Run links and local numbers are
-recorded in the PR and KW-33.
-
-### Acceptance evidence
-
-- **Package acceptance is partial; KW-33 remains open.** This package gates the
-  original text/viewer APIs only. Typing and keystroke-to-pixels p99, search,
-  diff, palette and single-instance budgets need coordinator integration in the
-  slots below. Reported CPU frame p99 does not fulfill the input latency budget.
-- The parent approved a reviewed-main refresh after KW-16/KW-25 integration:
-  `bench-baseline` commit `081a4df` stores the exact nine-pair results from
-  [run 39834499282](https://github.com/rennerdo30/kwil/actions/runs/39834499282)
-  and pins reference source `2a297eb`. No hard limit or >10% threshold changed.
-- [Run 39836398983](https://github.com/rennerdo30/kwil/actions/runs/39836398983)
-  passed Windows; Linux failed open+first-screen at 0.051217 ms versus
-  0.044938 ms (+14%). Candidate/reference production measurement source was
-  unchanged; six of nine corresponding measurements were within 4%, while two
-  candidate measurements were 23–25% slower. This is retained as a failed run,
-  not discarded or used to waive the threshold.
-- [Paired-protocol deliberate delayed-index red run](https://github.com/rennerdo30/kwil/actions/runs/39832069461),
-  head `f4fd7d305efd8a46275e1938b083b2335257636e`: the actual one-second
-  index delay fails both OSes. Linux reaches **1.0026 GB/s**, above the hard
-  limit, but fails the relative gate versus **13.4645 GB/s** reference
-  (**+1,243% time/byte**); startup-to-index fails too. This proves the approved
-  calibration still detects an actual regression independently of hard limits.
-  Windows fails the index hard limit. Both frame scenarios pass with present
-  acknowledgements. The delay is removed after this run.
-- Baseline seed: [hosted run 39827665077](https://github.com/rennerdo30/kwil/actions/runs/39827665077),
-  source merge `c2530a2699c6afa5744bf33f9b36f98e6eb8bf13`; exact result files
-  stored on `bench-baseline` at `8dadd5d76ea71ea67c2c3c703619897171b56721`.
-  Both OS hard-limit checks, TUI traces and viewer scenarios passed before the
-  expected missing-baseline failure.
-- [Deliberate delayed-index red run](https://github.com/rennerdo30/kwil/actions/runs/39828494393),
-  head `5a668071755e281b8f60440c519fd93400e1ddad`: one second in actual
-  `LineIndex::build`, Linux **0.9831 GB/s**, Windows **0.8954 GB/s**, both below
-  the **1 GB/s hard limit**. The delay is removed in `190753b`.
-- Initial local light check (three samples, b1b5c55 text operations before main
-  integration): fresh-process open **0.1636 ms**, index **6.8656 GB/s**, jump
-  **0.0086 ms**, private **3.9336 MiB**. Separate three-sample Divan medians:
-  open **0.06609 ms**, index **6.695 GB/s**, jump **0.001799 ms**.
-- Final local viewer smoke before main integration: hidden GUI first frame
-  **62.755 ms**, index done **129.760 ms**; idle **0 + 0** presents, scroll
-  **20** partial presents, **19,456,000** copied pixels, **1,024,000** damaged
-  pixels. Hidden Windows TUI trace exited successfully. Full suites, cold cache,
-  low-RAM stress and native RDP/VNC were not run locally.
-
-## Slots for integration after other packages merge
-
-- **TODO KW-22:** literal search, 1 GiB, target 300 ms / hard 1 s.
-- **TODO KW-28:** 100k-line diff, target 100 ms / hard 500 ms.
-- **TODO KW-16:** piece-tree edit, typing damage, keystroke-to-pixels ≤16 ms.
-- **TODO KW-25:** palette/file finder against the generated 100k-file tree ≤16 ms.
-- **TODO single-instance package:** second launch to shown file ≤50 ms.
-- **TODO KW-10:** decoded mixed-encoding viewport measurements; current TextFile
-  exposes raw bytes only.
-- **TODO KW-11/KW-30:** Linux copy, native remote-session/wire metrics, display
-  timing and dropped frames. A CPU p99 alone does not prove refresh-rate delivery.
-- **TODO KW-40:** CI small-RAM machine / 4 GiB fixture; not substituted by a
-  working-set estimate or an owner-PC stress run.
+The Rust API bench uses the branch's existing development-only Divan 0.1.21
+(MIT OR Apache-2.0). The ordinary crate has no UI dependencies, release app
+changes or background sampling threads.

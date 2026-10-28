@@ -25,7 +25,7 @@ Crate versions were checked on crates.io on 2026-10-23.
 
 Kwil is a text editor, not an IDE and not an AI editor. Not planned: AI features, chat, agents, LSP/IDE features, git panels, debuggers, terminals inside the editor, remote/SSH editing and collaboration.
 
-Maybe later, only if speed stays intact: plugins (v2, as WASM components), split views, folding, bookmarks, macros, inline markdown rendering and a settings UI.
+Maybe later, only if speed stays intact: plugins (v2, as WASM components), split views, folding, bookmarks, macros and inline markdown rendering. (A settings screen moved into v1: owner, 2026-10-23, KW-46.)
 
 ## 2. Principles
 
@@ -70,6 +70,7 @@ crates/
   core-search    in-buffer search, find-in-files, replace transactions
   core-diff      line and word diff, alignment model
   core-markdown  markdown parse into a render model (no drawing)
+  core-format    bounded worker formatters, selection tidy and external formatter hooks
   core-workspace files, sessions, hot exit, file watching, single-instance IPC
   core-commands  command registry, keymaps, settings (shared by both frontends)
   view-model     viewport, layout model, decorations; frontend-independent
@@ -92,6 +93,8 @@ Threading: the UI thread, plus a small fixed pool of worker threads (`std::threa
 5. UTF-8 is checked lazily per chunk (`simdutf8`). Invalid bytes are shown as escape glyphs and kept byte-exact on save.
 
 Legacy encodings (Shift-JIS, Windows-1252, UTF-16, …) are decoded to UTF-8 with `encoding_rs` per viewport and per search chunk, using a sparse decode index built in the background, and encoded back on save. There is never a full decoded copy in RAM (principle 7).
+
+**Known v1 limitation (owner approved 2026-10-23, KW-45):** stateful encodings are not supported in v1. **ISO-2022-JP** files open with a clear "unsupported encoding" message, never as garbled text. Its escape sequences switch the decoder state for unbounded stretches, and `encoding_rs` decoders cannot be checkpointed, so per-viewport decoding would need a full replay from the file start, which principle 7 rules out. All stateless encodings are supported: UTF-8, UTF-16 LE/BE, Windows-1252, Shift_JIS, EUC-JP, GBK/GB18030, Big5, KOI8-R and the rest of `encoding_rs`. A stateful checkpoint representation is the follow-up (KW-45).
 
 **mmap safety:** if another program truncates a mapped file, reading it can crash the process (SIGBUS on Unix). Rule: files under 64 MB (configurable) are read fully into memory, which takes a few ms. Larger files are mapped, watched with `notify`, and re-checked by size and mtime before each region read. If they changed, the editor shows "file changed on disk" instead of reading stale pages.
 
@@ -213,13 +216,15 @@ Two files, or a buffer vs. its saved version. Line diff with `imara-diff 0.2` (h
 "Open as hex" and "Toggle hex view" for any file: an offset column, 16 bytes per row in hex, and an ASCII column. It uses the same mapped file and viewport model as text, so multi-GB binaries open instantly (row = offset / 16, no line index needed). Files detected as binary on open offer hex view. The viewer comes in M1 and byte editing in M2. It works in the GUI and the TUI.
 
 ### Format document (owner, 2026-10-23, KW-7)
-"Format document" and "Format selection" for any file type. Built-in in-process formatters cover JSON, XML/HTML, YAML, TOML, CSS and SQL. Every other type gets the generic tidy steps (re-indent, trim trailing whitespace, normalize line endings), and an external formatter can be configured per type, run on a worker with a timeout. Formatting runs on a worker and applies as one undo step. A file-type picker lets any file be treated as any type.
+"Format document" and "Format selection" for any file type. Built-in in-process formatters cover JSON, XML/HTML, YAML, TOML, CSS and SQL. A formatter never changes meaning: constructs it cannot prove safe stay byte-for-byte. Generic tidy (re-indent, trim trailing whitespace, normalize line endings) runs only for types with a literal tokenizer; string and heredoc interiors stay untouched. Types without a tokenizer receive no edits and a status explaining how to configure an external formatter or explicitly invoke "Trim trailing whitespace" (which warns that it may change literals). Final-newline insertion follows the same safety rule and never runs for YAML. An external formatter can be configured per type, run on a worker with a timeout. Formatting runs on a worker and applies as one undo step. A file-type picker lets any file be treated as any type. (Coordinator safety policy, KW-7 review round 2, 2026-10-23.)
 
 ### Log watcher mode (owner, 2026-10-23, KW-41)
 "Like glogg, only better." Follow mode (`tail -f`) with auto-scroll at the bottom and a pause when the user scrolls up; clean handling of rotation and truncation. A filter pane shows only lines matching one or more regexes (AND/OR/NOT) with live counts; clicking a line jumps to it. Several coloured highlight rules and automatic level detection for common log formats; line marks. Faster than glogg on multi-GB logs: the line index extends on append instead of rescanning, filters stream from workers, hits show in the signal strip, and lines with timestamps support a time-range jump. It works in the TUI too (`kwil --follow app.log`). Filter results are kept as compact line-number runs, never as copied text (principle 7).
 
 ### Markdown
 Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, strikethrough). Rendered natively by our renderer, without a webview (a webview would cost startup time and memory). Code blocks are highlighted with the same syntax engine. Images are decoded lazily on a worker.
+
+**Approved v1 exception (owner, 2026-10-23): bounded-document Markdown preview.** The owner explicitly approved the bounded-preview scope change instead of requiring the new all-size disk-backed parser for v1. The initial product limit is 256 KiB of logical source text; larger documents show a clear preview-unavailable message without parsing or presenting a prefix as the complete document. This limit applies only to rendered Markdown preview: opening, editing, searching and saving text retain their any-size requirements. Preview parsing and image decoding remain worker-owned, with bounded model/image admission and native GUI/TUI presentation. An all-size parser remains follow-up work, not a v1 completion gate. The owner also approved implementing the concrete image adapter after ROOT's dependency review and manifest change; that approval does not waive codec limits, licensing, verification or host integration.
 
 ### Syntax highlighting
 - `tree-sitter 0.27` with `tree-sitter-highlight`. Grammars come from `arborium` (a tree-sitter distribution with ~70–96 permissively licensed grammars, with a feature flag per language).
@@ -228,7 +233,21 @@ Parsed with `pulldown-cmark 0.13` (fast; CommonMark plus tables, task lists, str
 - v1 bundles ~30 common languages. The rest load as prebuilt grammar libraries on first use, which also keeps clean builds fast.
 
 ### Settings and keymaps
-One TOML settings file that reloads live; no settings UI in v1. Every action is a command with an id, so it can be bound and found in the palette.
+One TOML settings file that reloads live and stays the source of truth. Every action is a command with an id, so it can be bound and found in the palette.
+
+**Settings screen (owner, 2026-10-23, KW-46: "proper settings menu", "register extensions for example"):** a native settings screen in the GUI (a navigable list in the TUI) with categories, search, a description and default for each setting, and reset. It edits the TOML file live; an "Open settings file" button stays for power users. It opens on the first frame after the key. Pages include **Keymap** (pick the preset, rebind by pressing keys, conflicts shown) and **File types**:
+- **Register extensions:** register Kwil for chosen extensions in the OS. Per user, no admin rights, reversible: Windows `HKCU\Software\Classes` (ProgIDs, "Open with", optional default), macOS Launch Services, Linux `.desktop` plus `xdg-mime`.
+- **Extension → language mapping** for highlighting (KW-47).
+
+### Highlight any file type (owner, 2026-10-23, KW-47)
+Every file gets highlighting. Detection order:
+1. the user's extension mapping;
+2. modelines (`vim: ft=`, `-*- mode -*-`);
+3. shebang and first line;
+4. file name and extension tables;
+5. content sniffing.
+
+A language picker in the status bar and palette sets any language for any file. Unknown types get a generic highlighter (strings, numbers, common comment styles, brackets) instead of plain text. Languages beyond the bundled set load on first use as prebuilt, permissively licensed grammar libraries. Detection never costs more than a bounded first-line read on the startup path.
 
 Keymaps (owner, 2026-10-23, KW-2): the keymap is configurable and ships with three presets, chosen by one setting (`keymap = "vscode" | "notepad++" | "vim"`). Any binding can be overridden in the same file.
 - **VS Code** (default): the common VS Code shortcuts (Ctrl+D selects the next match).
@@ -309,7 +328,7 @@ debug = "line-tables-only"
 | M5 Compare | Diff views |
 | M6 Polish & ship | Themes, remote-mode measurements on RDP and VNC, installers (MSI/winget, dmg/Homebrew, AppImage/Flatpak), GitHub Actions releases, auto-update, platform integration and accessibility |
 
-Work packages are tracked on Pair Desk, project `kwil`, grouped by milestone: one item per feature area, with its spec section and done criteria. M0 is KW-1; the spec work packages are KW-9 to KW-36; owner wishes are KW-3 (keymaps), KW-4/KW-6 (releases), KW-5 (auto-update), KW-7 (format), KW-8 (hex view), KW-37 (themes), KW-38 (logo), KW-39 (native window controls), KW-40 (less RAM than file size) and KW-41 (log watcher).
+Work packages are tracked on Pair Desk, project `kwil`, grouped by milestone: one item per feature area, with its spec section and done criteria. M0 is KW-1; the spec work packages are KW-9 to KW-36; owner wishes are KW-3 (keymaps), KW-4/KW-6 (releases), KW-5 (auto-update), KW-7 (format), KW-8 (hex view), KW-37 (themes), KW-38 (logo), KW-39 (native window controls), KW-40 (less RAM than file size), KW-41 (log watcher), KW-46 (settings screen, register extensions) and KW-47 (highlight any file type).
 
 ## 12. Owner decisions and open questions
 

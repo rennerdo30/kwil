@@ -33,6 +33,9 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +45,9 @@ jobs:
       - uses: actions/checkout@v7
       # rust-toolchain.toml pins the version; rustup installs it on first use.
       - run: rustup show active-toolchain
+      - name: Configure compiler cache
+        id: sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       # Caches ~/.cargo (registry, git) and target/ dependencies. The key is
       # OS + job + our own inputs (lockfile, pinned toolchain, cargo config);
       # rust-cache's automatic environment hash also covers every toolchain
@@ -56,6 +62,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Prove Linux association safe-open mutations
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          ./crates/core-commands/scripts/check-association-unix-mutations.ps1 -ProcessFixture
+          ./crates/core-commands/scripts/check-association-unix-mutations.ps1
+      - name: Prove Unix save permissions reject broken preservation
+        if: runner.os != 'Windows'
+        shell: pwsh
+        run: ./crates/view-model/scripts/fail-first.ps1 -UnixOnly
       # The release profile (thin LTO, 1 codegen unit) is built only by the
       # release workflow; the smoke test uses the debug binary from the tests.
       - name: Smoke test
@@ -66,3 +83,6 @@ jobs:
           [ -f "$exe.exe" ] && exe="$exe.exe"
           "$exe" --version
           "$exe" --help > /dev/null
+      - name: Compiler cache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        run: sccache --show-stats

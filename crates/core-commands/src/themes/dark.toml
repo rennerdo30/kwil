@@ -1,0 +1,75 @@
+version = 1
+name = "dark"
+base = "dark"
+
+[ui]
+"editor.background" = "#191a1eff"
+"editor.foreground" = "#e5e7ebff"
+"gutter.background" = "#16171bff"
+"gutter.foreground" = "#7c818cff"
+"status.background" = "#16171bff"
+"status.foreground" = "#b9c1cfff"
+"selection.background" = "#304765ff"
+"cursor.foreground" = "#e5e7ebff"
+"line.background" = "#22242aff"
+"whitespace.foreground" = "#7c818cff"
+"tab.background" = "#16171bff"
+"tab.foreground" = "#9ba1acff"
+"tab.active.background" = "#22242aff"
+"tab.active.foreground" = "#f4f5f7ff"
+"panel.background" = "#202126ff"
+"panel.foreground" = "#e5e7ebff"
+"border.foreground" = "#35373fff"
+"accent.foreground" = "#78aaffff"
+"search.background" = "#695522ff"
+"diff.added.background" = "#183d30ff"
+"diff.removed.background" = "#482832ff"
+"error.foreground" = "#ff8080ff"
+
+[syntax.keyword]
+foreground = "#c5a3ffff"
+
+[syntax.string]
+foreground = "#a8d7a0ff"
+
+[syntax.comment]
+foreground = "#74869cff"
+
+[syntax.number]
+foreground = "#f1bf8aff"
+
+[syntax.type]
+foreground = "#8fd8d0ff"
+
+[syntax.function]
+foreground = "#8fe3ffff"
+
+[syntax.variable]
+foreground = "#d6e4f0ff"
+
+[syntax.constant]
+foreground = "#f1bf8aff"
+
+[syntax.operator]
+foreground = "#a7b9d0ff"
+
+[syntax.punctuation]
+foreground = "#8b9bb2ff"
+
+[syntax.tag]
+foreground = "#c5a3ffff"
+
+[syntax.attribute]
+foreground = "#8fd8d0ff"
+
+[syntax.property]
+foreground = "#d6e4f0ff"
+
+[syntax.heading]
+foreground = "#8fe3ffff"
+
+[syntax.link]
+foreground = "#8fe3ffff"
+
+[syntax.error]
+foreground = "#ff8080ff"

@@ -1,5 +1,8 @@
 //! Bounded, frontend-independent Markdown preview. See the crate README for edit integration.
 
+pub mod bounded;
+pub mod image_decode;
+
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::{ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
@@ -597,3 +600,5 @@ mod tests {
         assert!(parse_section_with_limit(input, 0..input.len(), 20).is_ok());
     }
 }
+
+pub mod diagram;

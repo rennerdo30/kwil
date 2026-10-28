@@ -7,9 +7,8 @@ import run
 class GateTests(unittest.TestCase):
     def setUp(self):
         self.base = {"schema": run.SCHEMA, "runner": "windows-2025", "fixture": "v1",
-                     "medians": {"open_first_ms": 1, "index_gb_s": 4, "jump_ms": 1,
-                                 "private_mb": 8, "startup_file_ms": 40,
-                                 "startup_empty_ms": 25, "startup_index_ms": 200}}
+                     "medians": {"open_first_ms": 1, "index_gb_s": 4,
+                                 "jump_ms": 1, "private_mb": 8}}
 
     def test_same_passes_and_cost_over_ten_percent_fails(self):
         self.assertEqual(run.check(self.base, self.base), [])
@@ -40,6 +39,18 @@ class GateTests(unittest.TestCase):
             bad["medians"]["index_gb_s"] = value
             self.assertTrue(run.check(bad, self.base))
             self.assertTrue(run.check(self.base, bad))
+
+    def test_incomplete_candidate_fails_with_a_metric_diagnostic(self):
+        bad = copy.deepcopy(self.base)
+        del bad["medians"]["jump_ms"]
+        self.assertIn("invalid measurement: jump_ms", run.check(bad, self.base))
+
+    def test_boolean_measurements_are_not_timings(self):
+        for comparison in (False, True):
+            bad = copy.deepcopy(self.base)
+            bad["medians"]["jump_ms"] = True
+            errors = run.check(self.base, bad) if comparison else run.check(bad, self.base)
+            self.assertTrue(errors)
 
     def test_paired_timing_compensates_host_speed_but_keeps_ten_percent_gate(self):
         reference = copy.deepcopy(self.base)
@@ -76,17 +87,6 @@ class GateTests(unittest.TestCase):
         wrong = copy.deepcopy(self.base)
         wrong["runner"] = "ubuntu-24.04"
         self.assertTrue(run.check(self.base, self.base, wrong))
-
-    def test_linux_tick_phase_cannot_create_a_startup_regression(self):
-        for phase in (0.1, 3.5, 9.8):
-            raw = {"launch": 2 + phase, "first_frame": 40 + phase, "index_done": 90 + phase}
-            corrected = run.correct_trace(raw, {"mode": "parent_launch", "offset_ms": phase})
-            self.assertAlmostEqual(corrected["first_frame"], 40)
-            self.assertAlmostEqual(corrected["index_done"], 90)
-            self.assertEqual(corrected["clock"]["raw_os_marks"], raw)
-        with self.assertRaises(RuntimeError):
-            run.correct_trace({"launch": 1, "first_frame": 2, "index_done": 3}, {"offset_ms": 5})
-
 
 if __name__ == "__main__":
     unittest.main()

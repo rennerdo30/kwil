@@ -7,6 +7,48 @@
 use kwil_core_text::TextFile;
 use std::path::PathBuf;
 
+mod document;
+mod editor;
+pub mod grid;
+pub mod hex;
+pub mod hex_session;
+pub mod highlight_session;
+pub mod highlighting;
+pub mod language_selection;
+pub mod palette_session;
+pub mod search_panel;
+pub mod search_session;
+pub mod settings_panels;
+pub mod settings_session;
+pub mod visual_rows;
+mod workspace;
+pub use workspace::workspace_document;
+pub use workspace::workspace_wrap;
+#[cfg(test)]
+mod cleanup_test_support;
+pub mod wrap_host;
+pub mod wrap_session;
+#[cfg(test)]
+mod wrap_tests;
+pub use workspace::{
+    EditorInputTicket, FilePrompt, FilePromptKind, NativeFilePrompt, TabAction, TabArea, TabGeometry, TabMetrics,
+    TabSlot, Workspace, WorkspaceInitRefusal,
+};
+pub mod document_worker;
+pub use kwil_core_workspace::session::DocumentId as SessionDocumentId;
+#[cfg(test)]
+mod tests;
+mod text;
+pub use document::{Document, DocumentEncoding, DocumentLineEnding};
+pub use editor::receipts::{ByteReplacement, EditKind, EditObserver, EditReceipt, SnapshotInsert};
+pub use editor::visual::{
+    ChargedDamage, CommitFailure, PrepareFailure, PrepareFault, PreparedVisualCommit, PublishedVisualCursor,
+    RetiredVisualState, VisualEditorState,
+};
+pub use editor::{Clipboard, ClipboardData, CommandArgs, CommandResult, CommandStatus, Cursor, Editor, Motion};
+pub use editor::{EditObserverRefusal, EditObserverRefusalReason};
+pub use editor::{SaveCompletionRefusal, SaveCompletionRefusalReason};
+
 /// A message from a worker thread for the status bar (update notices,
 /// errors). Frontends turn it into a wake-up of their event loop.
 pub type Notify = Box<dyn Fn(String) + Send + 'static>;
@@ -24,13 +66,35 @@ pub struct Damage {
     pub status: bool,
 }
 
+/// Selects who owns body layout and its cache. This does not change the
+/// document representation, command semantics or frontend modal ownership.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ViewBodyPolicy {
+    /// View maintains the existing logical-line viewport and byte windows.
+    #[default]
+    LogicalLines,
+    /// An external layout owner supplies prepared rows, including pending/error
+    /// presentation. Legacy line accessors expose no fallback body in this mode.
+    Prepared,
+}
+
 pub struct View {
+    input_incarnation: std::sync::Arc<()>,
     file: Option<TextFile>,
     path: Option<PathBuf>,
     top: u64,
     rows: usize,
+    body_policy: ViewBodyPolicy,
     lines: Vec<Vec<u8>>,
+    line_offsets: Vec<u64>,
+    line_sources: Vec<std::ops::Range<u64>>,
     notice: String,
+    editor: Option<Editor>,
+    pending_goto: Option<(u64, u64, bool)>,
+    first_byte_column: u64,
+    line_byte_limit: usize,
+    // Worker-decoded read-only first block; never interpreted as edit bytes.
+    preview: Option<Vec<u8>>,
 }
 
 impl View {
@@ -39,7 +103,39 @@ impl View {
             Some((p, f)) => (Some(p), Some(f)),
             None => (None, None),
         };
-        View { file, path, top: 0, rows: 0, lines: Vec::new(), notice: String::new() }
+        let editor = if file.is_none() { Some(Editor::new(Document::new())) } else { None };
+        let mut view = View {
+            input_incarnation: std::sync::Arc::new(()),
+            file,
+            path,
+            top: 0,
+            rows: 0,
+            body_policy: ViewBodyPolicy::LogicalLines,
+            lines: Vec::new(),
+            line_offsets: Vec::new(),
+            line_sources: Vec::new(),
+            notice: String::new(),
+            editor,
+            pending_goto: None,
+            first_byte_column: 0,
+            line_byte_limit: 16 << 10,
+            preview: None,
+        };
+        if view.file.as_ref().is_some_and(|file| file.index().is_some()) {
+            view.index_ready();
+        }
+        view
+    }
+
+    /// Install a worker-rendered first block before full preparation/indexing.
+    /// Resizes and horizontal windows only touch this immutable bounded cache.
+    pub fn from_preview(path: PathBuf, file: TextFile, text: Vec<u8>) -> Self {
+        let mut view = Self::new(None);
+        view.editor = None;
+        view.path = Some(path);
+        view.file = Some(file);
+        view.preview = Some(text);
+        view
     }
 
     pub fn file(&self) -> Option<&TextFile> {
@@ -54,14 +150,70 @@ impl View {
         self.rows
     }
 
+    pub fn body_policy(&self) -> ViewBodyPolicy {
+        self.body_policy
+    }
+
+    /// The body owner sets this BEFORE resize, input or refresh. Prepared mode
+    /// discards only legacy paint caches; it never maps a visual anchor through
+    /// Editor's logical viewport. Commands and document metadata remain live.
+    ///
+    /// Switching back explicitly rebuilds current logical rows, even if edits
+    /// produced no legacy damage while prepared. The external owner must still
+    /// settle its own pages, intents and source holders before releasing them.
+    pub fn set_body_policy(&mut self, policy: ViewBodyPolicy) -> Damage {
+        if self.body_policy == policy {
+            return Damage::default();
+        }
+        self.body_policy = policy;
+        self.lines.clear();
+        self.line_offsets.clear();
+        self.line_sources.clear();
+        if policy == ViewBodyPolicy::LogicalLines {
+            self.top = self.editor.as_ref().map_or(self.top, |editor| editor.top()).min(self.max_top());
+            if let Some(editor) = &mut self.editor {
+                editor.set_viewport(self.top, self.rows);
+            }
+            self.reload();
+        }
+        Damage { full: true, status: true, ..Damage::default() }
+    }
+
     /// Lines of the file, once the background index is ready.
     pub fn line_count(&self) -> Option<u64> {
+        if let Some(editor) = &self.editor {
+            return Some(editor.document().buffer().line_count());
+        }
+        if self.preview.is_some() {
+            return None;
+        }
         self.file.as_ref()?.index().map(|i| i.line_count())
     }
 
-    /// Text of visible row `row` (without line ending), if there is a line.
+    /// Text of visible logical row `row` (without line ending). Prepared mode
+    /// returns None, including while its external layout is pending or failed.
     pub fn line(&self, row: usize) -> Option<&[u8]> {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return None;
+        }
         self.lines.get(row).map(|l| l.as_slice())
+    }
+
+    /// Source-byte column of this row's UTF-8-aligned visible window.
+    pub fn line_offset(&self, row: usize) -> u64 {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return 0;
+        }
+        self.line_offsets.get(row).copied().unwrap_or(0)
+    }
+
+    /// Cached absolute byte window, computed during viewport reload. Styling
+    /// reads no file bytes and performs no line-index lookup on the input path.
+    pub fn line_source(&self, row: usize) -> Option<std::ops::Range<u64>> {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return None;
+        }
+        self.line_sources.get(row).cloned()
     }
 
     /// 1-based line number shown in the gutter for `row`.
@@ -71,7 +223,13 @@ impl View {
 
     pub fn set_rows(&mut self, rows: usize) -> Damage {
         self.rows = rows;
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return Damage { full: true, ..Damage::default() };
+        }
         self.top = self.top.min(self.max_top());
+        if let Some(editor) = &mut self.editor {
+            editor.set_viewport(self.top, rows);
+        }
         self.reload();
         Damage { full: true, ..Damage::default() }
     }
@@ -79,8 +237,48 @@ impl View {
     /// Call when the background index finished: line counts and scrolling
     /// become available.
     pub fn index_ready(&mut self) -> Damage {
+        let installing = self.editor.is_none();
+        if self.editor.is_none()
+            && self.preview.is_none()
+            && let (Some(path), Some(file)) = (&self.path, &self.file)
+            && file.index().is_some()
+        {
+            match Document::from_indexed_file(path.clone(), file.clone()) {
+                Ok(document) => {
+                    let mut editor = Editor::new(document);
+                    if self.body_policy == ViewBodyPolicy::LogicalLines {
+                        editor.set_viewport(self.top, self.rows);
+                    }
+                    self.editor = Some(editor);
+                }
+                Err(error) => {
+                    self.notice = error.to_string();
+                }
+            }
+        }
+        if self.editor.is_some()
+            && let Some((line, column, extend)) = self.pending_goto.take()
+            && let Some(editor) = &mut self.editor
+        {
+            match editor.go_to_line(line, column, extend) {
+                Ok(damage) => {
+                    if self.body_policy == ViewBodyPolicy::LogicalLines {
+                        self.top = editor.top();
+                    }
+                    self.reload();
+                    return damage;
+                }
+                Err(error) => {
+                    self.notice = error.to_string();
+                }
+            }
+        }
         self.reload();
-        Damage { status: true, ..Damage::default() }
+        Damage {
+            status: true,
+            rows: if installing && self.editor.is_some() && self.rows > 0 { vec![0] } else { Vec::new() },
+            ..Damage::default()
+        }
     }
 
     pub fn set_notice(&mut self, notice: String) -> Damage {
@@ -95,12 +293,20 @@ impl View {
     /// Scrolls by `delta` lines (clamped). Before the index is ready the
     /// view stays on the first screen.
     pub fn scroll(&mut self, delta: i64) -> Damage {
+        // Prepared navigation belongs to the external body owner, including
+        // pending pages. Never reinterpret its row delta as logical lines.
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return Damage::default();
+        }
         let new_top = (self.top as i64 + delta).clamp(0, self.max_top() as i64) as u64;
         let d = new_top as i64 - self.top as i64;
         if d == 0 {
             return Damage::default();
         }
         self.top = new_top;
+        if let Some(editor) = &mut self.editor {
+            editor.set_viewport(self.top, self.rows);
+        }
         self.reload();
         let mut damage = Damage { status: true, ..Damage::default() };
         if d.unsigned_abs() as usize >= self.rows {
@@ -122,6 +328,64 @@ impl View {
     }
 
     fn reload(&mut self) {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return;
+        }
+        if let Some(editor) = &self.editor {
+            self.preview = None;
+            let snapshot = editor.document().snapshot();
+            let result = (0..self.rows)
+                .take_while(|row| self.top + (*row as u64) < snapshot.line_count())
+                .map(|row| {
+                    let range = text::line(&snapshot, self.top + row as u64)?;
+                    let wanted = range.start.saturating_add(self.first_byte_column).min(range.end);
+                    let context = wanted.saturating_sub(3).max(range.start);
+                    let end = wanted.saturating_add(self.line_byte_limit as u64 + 4).min(range.end);
+                    let bytes = text::read(&snapshot, context..end, self.line_byte_limit as u64 + 7)?;
+                    let start = grid::boundary(&bytes, (wanted - context) as usize);
+                    let end = grid::boundary(&bytes, (start + self.line_byte_limit).min(bytes.len()));
+                    Ok((
+                        context - range.start + start as u64,
+                        context + start as u64..context + end as u64,
+                        bytes[start..end].to_vec(),
+                    ))
+                })
+                .collect::<std::io::Result<Vec<_>>>();
+            match result {
+                Ok(lines) => {
+                    self.line_offsets.clear();
+                    self.line_sources.clear();
+                    self.lines.clear();
+                    for (offset, source, bytes) in lines {
+                        self.line_offsets.push(offset);
+                        self.line_sources.push(source);
+                        self.lines.push(bytes);
+                    }
+                }
+                Err(error) => self.notice = error.to_string(),
+            }
+            return;
+        }
+        self.line_sources.clear();
+        if let Some(preview) = &self.preview {
+            self.lines.clear();
+            self.line_offsets.clear();
+            let mut remaining = preview.as_slice();
+            for _ in 0..self.rows {
+                let end = remaining.iter().position(|b| matches!(b, b'\r' | b'\n')).unwrap_or(remaining.len());
+                let line = &remaining[..end];
+                let start = grid::boundary(line, self.first_byte_column.min(line.len() as u64) as usize);
+                let stop = grid::boundary(line, start.saturating_add(self.line_byte_limit).min(line.len()));
+                self.lines.push(line[start..stop].to_vec());
+                self.line_offsets.push(start as u64);
+                if end == remaining.len() {
+                    break;
+                }
+                let width = if remaining[end..].starts_with(b"\r\n") { 2 } else { 1 };
+                remaining = &remaining[end + width..];
+            }
+            return;
+        }
         let Some(file) = &self.file else {
             self.lines = vec![b"No file open. Usage: kwil <file>".to_vec()];
             return;
@@ -131,16 +395,123 @@ impl View {
             None => file.first_lines(self.rows),
         });
         match lines {
-            Ok(lines) => self.lines = lines.into_iter().map(|l| l.to_vec()).collect(),
+            Ok(lines) => {
+                let (offsets, lines) = lines
+                    .into_iter()
+                    .map(|l| {
+                        let start = grid::boundary(l, self.first_byte_column.min(l.len() as u64) as usize);
+                        let end = grid::boundary(l, start.saturating_add(self.line_byte_limit).min(l.len()));
+                        (start as u64, l[start..end].to_vec())
+                    })
+                    .unzip();
+                self.line_offsets = offsets;
+                self.lines = lines;
+            }
             Err(e) => self.notice = e.to_string(),
         }
     }
 
+    pub fn editor(&self) -> Option<&Editor> {
+        self.editor.as_ref()
+    }
+    /// After direct operations call refresh_after_edit with their Damage.
+    /// Editing is unavailable until the background sparse index is ready.
+    pub fn editor_mut(&mut self) -> Option<&mut Editor> {
+        self.editor.as_mut()
+    }
+
+    /// Cursor-only damage never changes source bytes. Retain the viewport cache
+    /// unless navigation actually moved it; mouse drags must not read every line.
+    pub fn refresh_after_cursor(&mut self, damage: Damage) -> Damage {
+        if self.body_policy == ViewBodyPolicy::Prepared {
+            return damage;
+        }
+        let top = self.editor.as_ref().map_or(self.top, |editor| editor.top());
+        if self.top != top {
+            self.top = top;
+            self.reload();
+        }
+        damage
+    }
+
+    pub fn refresh_after_edit(&mut self, damage: Damage) -> Damage {
+        if let Some(editor) = &self.editor {
+            if self.body_policy == ViewBodyPolicy::LogicalLines {
+                self.top = editor.top();
+            }
+            self.path = editor.document.path.clone();
+            self.file = editor.document.original.clone();
+        }
+        if damage.full || damage.scroll != 0 || !damage.rows.is_empty() {
+            self.reload();
+        }
+        damage
+    }
+
+    /// Bounded byte window for long-line layout. The frontend chooses a
+    /// visible column range; the default never caches an entire giant line.
+    pub fn set_horizontal_window(&mut self, first_byte: u64, max_bytes: usize) -> Damage {
+        self.first_byte_column = first_byte;
+        self.line_byte_limit = max_bytes.clamp(1, 64 << 10);
+        self.reload();
+        Damage { full: true, ..Damage::default() }
+    }
+
+    pub fn execute(&mut self, id: &str, args: &CommandArgs, count: u32) -> std::io::Result<CommandResult> {
+        let Some(editor) = &mut self.editor else {
+            if id == "navigation.goToLine"
+                && let Some(line) = args.line
+            {
+                self.pending_goto = Some((line, args.column.unwrap_or(1), args.extend));
+            }
+            return Ok(CommandResult {
+                damage: Damage { status: true, ..Damage::default() },
+                status: CommandStatus::IndexNotReady,
+            });
+        };
+        let mut result = editor.execute(id, args, count)?;
+        result.damage = self.refresh_after_edit(result.damage);
+        Ok(result)
+    }
+
+    /// Transient notice, exactly as set; frontends must not parse `status_text`.
+    pub fn notice(&self) -> &str {
+        &self.notice
+    }
+
+    /// Zero-based caret coordinates.
+    pub fn status_position(&self) -> Option<(u64, u64)> {
+        self.editor
+            .as_ref()
+            .and_then(|editor| editor.position_at(editor.primary_cursor().head).ok())
+            .or_else(|| self.file.as_ref().map(|_| (self.top, 0)))
+    }
+
+    /// Background line-index progress while the line count is still unknown.
+    pub fn indexing_percent(&self) -> Option<u64> {
+        let file = self.file.as_ref()?;
+        if self.line_count().is_some() {
+            return None;
+        }
+        let progress = file.progress();
+        Some(((u128::from(progress.scanned) * 100) / u128::from(progress.total.max(1))).min(100) as u64)
+    }
+
     pub fn status_text(&self) -> String {
-        let name = self.path.as_ref().map_or_else(|| "kwil".to_string(), |p| p.display().to_string());
+        let mut name = self.path.as_ref().map_or_else(|| "kwil".to_string(), |p| p.display().to_string());
+        if self.editor.as_ref().is_some_and(|editor| editor.document().is_dirty()) {
+            name.push_str(" *");
+        }
         let lines = match (self.file.as_ref(), self.line_count()) {
             (None, _) => String::new(),
-            (Some(_), Some(n)) => format!("  |  {n} lines  |  Ln {}", self.top + 1),
+            (Some(_), Some(n)) => {
+                let (row, column) = self
+                    .editor
+                    .as_ref()
+                    .and_then(|e| e.position_at(e.primary_cursor().head).ok())
+                    .unwrap_or((self.top, 0));
+                format!("  |  {n} lines  |  Ln {}, Col {}", row + 1, column + 1)
+            }
             (Some(f), None) => {
                 let p = f.progress();
                 format!("  |  ~ indexing {}%", p.scanned * 100 / p.total.max(1))
@@ -152,12 +523,69 @@ impl View {
 }
 
 #[cfg(test)]
-mod tests {
+#[path = "prepared_body_tests.rs"]
+mod prepared_body_tests;
+
+#[cfg(test)]
+mod viewer_tests {
     use super::*;
+
+    #[test]
+    fn decoded_preview_preserves_deferred_navigation_until_prepared_editor() {
+        let original = view_with_lines("decoded-preview-goto", 6);
+        let mut view = View::from_preview(
+            original.path.clone().unwrap(),
+            original.file.clone().unwrap(),
+            b"preview only".to_vec(),
+        );
+        view.set_rows(2);
+        view.execute(
+            "navigation.goToLine",
+            &CommandArgs { line: Some(4), column: Some(3), extend: true, ..Default::default() },
+            1,
+        )
+        .unwrap();
+        view.index_ready();
+        assert_eq!(view.pending_goto, Some((4, 3, true)));
+        view.editor = original.editor;
+        view.editor.as_mut().unwrap().set_viewport(view.top, view.rows);
+        view.index_ready();
+        assert!(view.pending_goto.is_none());
+        let cursor = view.editor().unwrap().primary_cursor();
+        assert_eq!(cursor.anchor, 0);
+        assert_eq!(view.editor().unwrap().position_at(cursor.head).unwrap(), (3, 2));
+        assert_eq!(view.line((3 - view.top()) as usize), Some(&b"line 3"[..]));
+    }
+
+    #[test]
+    fn decoded_preview_remains_read_only_and_resize_uses_cached_text() {
+        let original = view_with_lines("decoded-preview", 3);
+        let path = original.path.clone().unwrap();
+        let mut view = View::from_preview(path.clone(), original.file.clone().unwrap(), b"A\r\nB\rC\n\\xD8".to_vec());
+        drop(original);
+        view.index_ready();
+        assert!(view.editor().is_none(), "a ready raw index must not make the preview editable");
+        std::fs::remove_file(&path).unwrap();
+        view.set_rows(5);
+        assert_eq!(view.line(0), Some(&b"A"[..]));
+        assert_eq!(view.line(1), Some(&b"B"[..]));
+        assert_eq!(view.line(2), Some(&b"C"[..]));
+        assert_eq!(view.line(3), Some(&b"\\xD8"[..]));
+        assert!(view.line_source(0).is_none(), "presentation escapes have no logical editing coordinates");
+        assert!(view.line_count().is_none(), "raw file index must not supply decoded line metrics");
+        view.index_ready();
+        assert!(view.editor().is_none(), "raw index completion must never attach a UTF-8 editor to encoded bytes");
+        assert_eq!(view.line(0), Some(&b"A"[..]));
+        let parent = path.parent().unwrap().to_path_buf();
+        drop(view);
+        std::fs::remove_dir(parent).unwrap();
+    }
 
     fn view_with_lines(name: &str, n: usize) -> View {
         // One file per test: tests run in parallel and must not share it.
-        let dir = std::env::temp_dir().join(format!("kwil-vm-test-{}-{name}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kwil-vm-test-{}-{id}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.txt");
         let text: String = (0..n).map(|i| format!("line {i}\n")).collect();
@@ -167,6 +595,17 @@ mod tests {
         let mut v = View::new(Some((path, file)));
         v.set_rows(10);
         v
+    }
+
+    #[test]
+    fn index_completion_damages_newly_available_caret() {
+        let mut view = view_with_lines("late-caret", 10);
+        // The frontend has drawn the viewer while the index worker ran.
+        view.editor = None;
+        let damage = view.index_ready();
+        assert!(view.editor().is_some());
+        assert!(damage.full || damage.rows.contains(&0));
+        assert!(damage.status);
     }
 
     #[test]
@@ -194,3 +633,44 @@ mod tests {
         assert_eq!(v.top(), 0);
     }
 }
+
+pub mod file_type_registration;
+
+#[cfg(test)]
+mod cursor_cache_tests {
+    use super::*;
+    #[test]
+    fn cursor_drag_reuses_visible_text_until_the_viewport_moves() {
+        let mut view = View::new(None);
+        view.set_rows(8);
+        view.execute("edit.insert", &CommandArgs { text: Some("one line\n".repeat(64)), ..Default::default() }, 1)
+            .unwrap();
+        let damage = view.editor_mut().unwrap().set_cursors(vec![Cursor::caret(0)], 0).unwrap();
+        view.refresh_after_cursor(damage);
+        view.lines[0].reserve(4096);
+        let capacity = view.lines[0].capacity();
+        let before = view.lines.clone();
+        let damage = view
+            .editor_mut()
+            .unwrap()
+            .set_cursors(vec![Cursor { anchor: 0, head: 20, desired_column: None }], 0)
+            .unwrap();
+        assert!(!damage.rows.is_empty());
+        view.refresh_after_cursor(damage);
+        assert_eq!(view.lines, before);
+        assert_eq!(
+            view.lines[0].capacity(),
+            capacity,
+            "drag must retain the existing byte cache, not read/allocate it again"
+        );
+        let damage = view.editor_mut().unwrap().set_cursors(vec![Cursor::caret(100)], 0).unwrap();
+        view.refresh_after_cursor(damage);
+        assert!(view.top() > 0);
+        assert_eq!(view.line(0), Some(&b"one line"[..]));
+    }
+}
+
+pub mod log_session;
+
+pub mod compare_source;
+pub mod snapshot_layout_source;

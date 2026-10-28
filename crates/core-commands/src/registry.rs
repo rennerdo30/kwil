@@ -39,13 +39,16 @@ commands! {
         "edit.deleteLine" => "Delete Line", "edit.cutLine" => "Cut Line", "edit.indent" => "Indent",
         "edit.outdent" => "Outdent", "edit.toggleComment" => "Toggle Comment",
         "edit.comment" => "Comment Selection", "edit.uncomment" => "Uncomment Selection",
-        "edit.trimTrailingWhitespace" => "Trim Trailing Whitespace",
+        "edit.trimTrailingWhitespace" => "Trim Trailing Whitespace (May Change Literals)",
         "edit.formatDocument" => "Format Document", "edit.formatSelection" => "Format Selection",
         "edit.deleteCharacter" => "Delete Character", "edit.pasteAfter" => "Paste After",
         "edit.pasteBefore" => "Paste Before", "edit.repeat" => "Repeat Last Change",
         "edit.insert" => "Insert Text", "edit.append" => "Append Text",
         "edit.openBelow" => "Open Line Below", "edit.openAbove" => "Open Line Above",
         "edit.insertLineStart" => "Insert at First Nonblank", "edit.appendLineEnd" => "Append at Line End"
+        , "edit.newline" => "Insert Newline", "edit.backspace" => "Delete Previous Character",
+        "edit.delete" => "Delete Next Character", "edit.deleteWordBackward" => "Delete Previous Word",
+        "edit.deleteWordForward" => "Delete Next Word", "edit.selectWord" => "Select Word", "edit.selectLine" => "Select Line"
     },
     "Navigation" => {
         "navigation.goToLine" => "Go to Line", "navigation.matchBracket" => "Go to Matching Bracket",
@@ -59,6 +62,7 @@ commands! {
         "motion.aroundWord" => "Around Word", "motion.innerQuote" => "Inside Quotes",
         "motion.aroundQuote" => "Around Quotes", "motion.innerParentheses" => "Inside Parentheses",
         "motion.aroundParentheses" => "Around Parentheses"
+        , "motion.smartHome" => "First Nonblank or Line Start", "motion.pageUp" => "Page Up", "motion.pageDown" => "Page Down"
     },
     "Vim" => {
         "operator.delete" => "Delete Range", "operator.change" => "Change Range",
@@ -69,9 +73,13 @@ commands! {
     "View" => {
         "view.commandPalette" => "Command Palette", "view.fileFinder" => "Find File",
         "view.toggleHex" => "Toggle Hex View", "view.toggleWordWrap" => "Toggle Word Wrap",
+        "view.retryWrap" => "Retry Wrapped View",
         "view.toggleWhitespace" => "Toggle Whitespace", "view.zoomIn" => "Zoom In",
         "view.zoomOut" => "Zoom Out", "view.zoomReset" => "Reset Zoom",
-        "view.toggleMarkdown" => "Toggle Markdown Preview", "view.settings" => "Open Settings"
+        "view.logFilters" => "Filter Log Levels and Time",
+        "view.markdownText" => "Markdown: Text", "view.markdownPreview" => "Markdown: Preview", "view.markdownSplit" => "Markdown: Split",
+        "view.toggleMarkdown" => "Toggle Markdown Preview", "view.settings" => "Open Settings",
+        "view.settingsFile" => "Open Settings File"
     },
     "Search" => {
         "search.find" => "Find", "search.findNext" => "Find Next",

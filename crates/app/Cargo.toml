@@ -6,20 +6,27 @@ license.workspace = true
 description = "A blazing fast plain text editor for GUI and terminal."
 publish = false
 
-[features]
-frame-harness = ["kwil-ui-gpu/frame-harness"]
-
 [[bin]]
 name = "kwil"
 path = "src/main.rs"
 
 [dependencies]
-kwil-bench = { path = "../bench" }
 kwil-core-text = { path = "../core-text" }
+kwil-core-workspace = { path = "../core-workspace" }
 kwil-view-model = { path = "../view-model" }
 kwil-ui-gpu = { path = "../ui-gpu" }
 kwil-ui-tui = { path = "../ui-tui" }
 kwil-update = { path = "../update" }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Console", "Win32_System_RemoteDesktop", "Win32_System_StationsAndDesktops", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+
+
+[features]
+# Build only on Windows; release staging renames kwil-console.exe to kwil.com.
+windows-console = []
+
+[[bin]]
+name = "kwil-console"
+path = "src/console.rs"
+required-features = ["windows-console"]

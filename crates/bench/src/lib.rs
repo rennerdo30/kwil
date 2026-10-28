@@ -1,6 +1,4 @@
-//! Kept measurement seams; no sampling thread or timer unless explicitly requested.
-pub mod frames;
-pub mod startup;
+//! Core-text measurements; GUI tracing and frame scripts belong to ui-gpu.
 
 #[cfg(feature = "harness")]
 pub mod fixtures;

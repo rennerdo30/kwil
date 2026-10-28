@@ -6,11 +6,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
-    inputs:
-      diagnostic_aa:
-        description: Also collect hosted A/A evidence (never grants production acceptance)
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -22,47 +17,48 @@ concurrency:
 env:
   CARGO_TARGET_DIR: target
   CARGO_INCREMENTAL: 0
-  KWIL_NO_UPDATE: 1
 
 jobs:
   budgets:
+    # Optional performance check: never add this job to required branch checks.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - name: X11 runtime libraries for the real window smoke
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-0
       - uses: Swatinem/rust-cache@v2
         with:
           add-rust-environment-hash-key: false
-          key: bench-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: bench-core-${{ hashFiles('Cargo.lock', 'crates/bench/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build measurement binaries
-        run: cargo build --release --locked -j 4 -p kwil-bench --features harness -p kwil --features frame-harness
+      - name: Build core-text measurement binary
+        run: cargo build --manifest-path crates/bench/Cargo.toml --release --locked -j 4 --features harness
+      - name: Check the isolated benchmark workspace
+        shell: bash
+        run: |
+          cargo fmt --manifest-path crates/bench/Cargo.toml --check
+          cargo clippy --manifest-path crates/bench/Cargo.toml --all-targets --features harness --locked -j 4 -- -D warnings
       - name: Cache generated fixtures
         id: fixtures
         uses: actions/cache/restore@v6
         with:
           path: fixtures
-          key: bench-fixtures-v1-${{ matrix.os }}-${{ hashFiles('crates/bench/src/fixtures.rs') }}
-      - name: Generate fixtures on demand
+          key: bench-core-fixtures-v1-${{ matrix.os }}-${{ hashFiles('crates/bench/src/fixtures.rs') }}
+      - name: Generate the required fixture on demand
         shell: bash
-        run: target/release/kwil-bench generate fixtures --all
+        run: target/release/kwil-bench generate fixtures
       - name: Read reviewed OS baseline
         shell: bash
         run: |
           mkdir -p baseline
-          if git fetch origin bench-baseline; then
-            git show FETCH_HEAD:${{ matrix.os }}.json > baseline/current.json
-            git show FETCH_HEAD:reference.json > baseline/reference.json
-            git rev-parse FETCH_HEAD > baseline/commit.txt
-          fi
+          git fetch origin bench-baseline
+          git show FETCH_HEAD:${{ matrix.os }}.json > baseline/current.json
+          git show FETCH_HEAD:reference.json > baseline/reference.json
+          git rev-parse FETCH_HEAD > baseline/commit.txt
       - name: Python environment
         shell: bash
         run: python -m venv .bench-venv
@@ -78,72 +74,37 @@ jobs:
         with:
           ref: ${{ steps.baseline.outputs.source }}
           path: .bench-reference
-      - name: Build the baseline measurement binaries before sampling either version
+          persist-credentials: false
+      - name: Build baseline measurement binary before sampling either version
         working-directory: .bench-reference
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target-reference
-        run: cargo build --release --locked -j 4 -p kwil-bench --features harness -p kwil --features frame-harness
+        run: cargo build --release --locked -j 4 -p kwil-bench --features harness
       - name: Divan API benchmarks (nine samples, one operation per sample)
         shell: bash
         env:
           KWIL_FIXTURES: ${{ github.workspace }}/fixtures
-        run: cargo bench --locked -j 4 -p kwil-bench --features harness --bench text -- --sample-count 9 --sample-size 1
+        run: cargo bench --manifest-path crates/bench/Cargo.toml --locked -j 4 --features harness --bench text -- --sample-count 9 --sample-size 1
       - name: Gate contract tests
-        id: protocol
         shell: bash
         run: |
           py=.bench-venv/bin/python
           [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
           "$py" crates/bench/test_gate.py
-          "$py" crates/bench/test_diagnostic_aa.py
-      - name: Real terminal startup trace (Linux PTY)
-        if: runner.os == 'Linux'
-        run: .bench-venv/bin/python crates/bench/tui_smoke.py target/release/kwil fixtures/log-1g.log results/tui-trace.txt
-      - name: Hidden terminal startup trace (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./crates/bench/tui_smoke.ps1
       - name: Median-of-nine hard and regression gates
-        id: gate
         shell: bash
         run: |
           py=.bench-venv/bin/python
           [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
-          if [ '${{ runner.os }}' = Linux ]; then
-            xvfb-run -a "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --runs 9 --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
-          else
-            "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --runs 9 --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
-          fi
-      - name: DIAGNOSTIC ONLY - nine paired A/A rounds with identical executables
-        id: aa
-        if: >-
-          ${{ !cancelled() && steps.protocol.outcome == 'success' &&
-          (inputs.diagnostic_aa == true ||
-           (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'bench-aa')) }}
-        shell: bash
-        env:
-          PRODUCTION_GATE_OUTCOME: ${{ steps.gate.outcome }}
-        run: |
-          py=.bench-venv/bin/python
-          [ -f .bench-venv/Scripts/python.exe ] && py=.bench-venv/Scripts/python.exe
-          if [ '${{ runner.os }}' = Linux ]; then
-            xvfb-run -a "$py" crates/bench/diagnostic_aa.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/diagnostic-aa-${{ matrix.os }}.json
-          else
-            "$py" crates/bench/diagnostic_aa.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --output results/diagnostic-aa-${{ matrix.os }}.json
-          fi
-      - name: Retain separately labelled A/A diagnostic evidence
-        if: always() && steps.aa.outcome != 'skipped' && steps.aa.outcome != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: diagnostic-only-aa-${{ matrix.os }}-attempt-${{ github.run_attempt }}
-          path: results/diagnostic-aa-${{ matrix.os }}.json
-          if-no-files-found: error
+          "$py" crates/bench/run.py --bin-dir target/release --fixtures fixtures --runner '${{ matrix.os }}' --runs 9 --output results/${{ matrix.os }}.json --baseline baseline/current.json --reference-bin-dir target-reference/release --reference-source .bench-reference --reference-manifest baseline/reference.json
       - name: Retain the exact trusted baseline inputs
         if: always()
         shell: bash
         run: |
           mkdir -p results/baseline
-          cp baseline/*.json baseline/commit.txt results/baseline/
+          for file in baseline/current.json baseline/reference.json baseline/commit.txt; do
+            [ ! -f "$file" ] || cp "$file" results/baseline/
+          done
       - name: Retain raw samples, medians and commit even on gate failure
         if: always()
         uses: actions/upload-artifact@v7
@@ -151,8 +112,8 @@ jobs:
           name: bench-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: results
           if-no-files-found: error
-      - name: Preserve completed fixtures even when a performance gate fails
-        if: always() && steps.fixtures.outputs.cache-hit != 'true' && hashFiles('fixtures/complete-v1') != ''
+      - name: Preserve completed fixture even when a performance gate fails
+        if: always() && steps.fixtures.outputs.cache-hit != 'true' && hashFiles('fixtures/log-1g.log') != ''
         uses: actions/cache/save@v6
         with:
           path: fixtures

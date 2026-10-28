@@ -4,8 +4,13 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
+
+mod original_save;
+pub use original_save::{OriginalSavePin, cleanup_stale_save_backups};
+mod read_batch;
+pub use read_batch::with_checked_read_batch;
 
 /// Files below this size are read into memory; larger ones are mapped
 /// (spec §5, "mmap safety").
@@ -163,6 +168,25 @@ struct Shared {
     kind: OnceLock<FileKind>,
     index: OnceLock<LineIndex>,
     scanned: AtomicU64,
+    // Drops after the file handle and mapping, so Windows can delete backups.
+    save_backing: Mutex<Option<original_save::SaveBacking>>,
+    read_generation: AtomicU64,
+}
+
+/// Weak bookkeeping never keeps an obsolete mapping/backing alive. Source
+/// identity is the Arc allocation, so even equal filenames are distinguished.
+#[derive(Clone)]
+pub(crate) struct OriginalRef {
+    file: std::sync::Weak<Shared>,
+    cost: usize,
+}
+impl OriginalRef {
+    pub fn id(&self) -> usize {
+        self.file.as_ptr() as usize
+    }
+    pub fn retained_bytes(&self) -> usize {
+        if self.file.strong_count() == 0 { 0 } else { self.cost }
+    }
 }
 
 /// An open file. The first screen is readable at once; the line index
@@ -187,6 +211,19 @@ pub struct IndexProgress {
 }
 
 impl TextFile {
+    /// Worker-only retirement seam. Close the shared mapping/handle only if no
+    /// snapshot, buffer or reader retains it. Failure returns this owner intact
+    /// so its private backing must remain available until a later worker event.
+    pub fn try_close(self) -> Result<(), Self> {
+        match Arc::try_unwrap(self.shared) {
+            Ok(shared) => {
+                drop(shared);
+                Ok(())
+            }
+            Err(shared) => Err(Self { shared }),
+        }
+    }
+
     /// Opens `path` without scanning it. kind() samples lazily and caches.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
         Self::open_with_mapper(path, |f| {
@@ -197,11 +234,36 @@ impl TextFile {
     }
 
     fn open_with_mapper(path: &Path, map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>) -> Result<Self, OpenError> {
+        Self::open_with_policy(path, false, map)
+    }
+
+    /// Saved originals remain file-backed even below the normal mapping
+    /// threshold, so undo never retains another full resident copy per save.
+    pub fn open_saved_version(path: &Path) -> Result<Self, OpenError> {
+        Self::open_with_policy(path, true, |file| {
+            // SAFETY: saved versions obey TextFile's checked mapped-view contract.
+            unsafe { memmap2::Mmap::map(file) }
+        })
+    }
+
+    fn open_with_policy(
+        path: &Path,
+        map_small: bool,
+        map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>,
+    ) -> Result<Self, OpenError> {
         let path = std::path::absolute(path)?;
-        let mut f = File::open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+        let mut f = options.open(&path)?;
         let stamp = Stamp::read(&f)?;
         let len = stamp.len;
-        let bytes = if len < MAP_THRESHOLD {
+        let bytes = if len == 0 || !map_small && len < MAP_THRESHOLD {
             let mut v = Vec::with_capacity(len as usize);
             // Bound the read even if the file grows after metadata was read.
             (&mut f).take(len).read_to_end(&mut v)?;
@@ -221,6 +283,8 @@ impl TextFile {
                 kind: OnceLock::new(),
                 index: OnceLock::new(),
                 scanned: AtomicU64::new(0),
+                save_backing: Mutex::new(None),
+                read_generation: AtomicU64::new(0),
             }),
         })
     }
@@ -229,11 +293,57 @@ impl TextFile {
     /// A missing path counts as replaced. Other I/O errors propagate, and
     /// callers must not read the old mapping on error.
     pub fn check(&self) -> io::Result<FileState> {
+        self.observe_check(self.check_path_live())
+    }
+
+    fn check_source(&self) -> io::Result<FileState> {
+        self.observe_check(self.check_source_live())
+    }
+
+    fn observe_check(&self, result: io::Result<FileState>) -> io::Result<FileState> {
+        if !matches!(&result, Ok(FileState::Unchanged)) {
+            self.shared.read_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn check_source_live(&self) -> io::Result<FileState> {
+        let pinned = self.shared.save_backing.lock().map_err(|_| io::Error::other("save pin lock poisoned"))?;
+        if pinned.is_some() {
+            // A save pins this exact object. Path replacement can no longer
+            // redirect old pieces or worker snapshots to the new file.
+            return Ok(self.shared.stamp.state(&Stamp::read(&self.shared._file)?));
+        }
+        self.check_path_live()
+    }
+
+    fn check_path_live(&self) -> io::Result<FileState> {
         match File::open(&self.shared.path) {
             Ok(file) => Ok(self.shared.stamp.state(&Stamp::read(&file)?)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(FileState::Replaced),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.shared.path
+    }
+
+    pub fn resident_original_bytes(&self) -> usize {
+        match &self.shared.bytes {
+            Bytes::Owned(bytes) => bytes.len(),
+            Bytes::Mapped(_) => 0,
+        }
+    }
+
+    pub(crate) fn history_backing_ref(&self) -> OriginalRef {
+        // The one initially opened resident original is baseline. Saved
+        // versions are mapped; their sparse index/handles/path are charged
+        // once per snapshot, not once per piece of that same original.
+        let cost = std::mem::size_of::<Shared>()
+            + self.shared.path.as_os_str().len() * 4
+            + self.index().map_or(0, LineIndex::memory_bytes);
+        OriginalRef { file: Arc::downgrade(&self.shared), cost }
     }
 
     /// Reopens append-only growth. Existing checkpoints are cloned and only
@@ -266,7 +376,22 @@ impl TextFile {
     /// this slice across a wake-up; the check cannot prevent a concurrent
     /// external truncation while the slice is being read.
     pub fn bytes(&self) -> Result<&[u8], ReadError> {
-        match self.check().map_err(ReadError::Io)? {
+        if let Some(result) = read_batch::admitted(self) {
+            result?;
+            return Ok(self.shared.bytes.as_slice());
+        }
+        match self.check_source().map_err(ReadError::Io)? {
+            FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
+            state => Err(ReadError::Changed(state)),
+        }
+    }
+
+    /// Worker capture only, after its caller has admitted the fixed source
+    /// check and temporary handle. Bypass the UI command's read-batch cache:
+    /// it can grow a HashMap and must never retain admission across worker
+    /// quota pauses. The live source check and mapped-read caveat are unchanged.
+    pub(crate) fn worker_bytes(&self) -> Result<&[u8], ReadError> {
+        match self.observe_check(self.check_source_live()).map_err(ReadError::Io)? {
             FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
             state => Err(ReadError::Changed(state)),
         }
@@ -299,6 +424,8 @@ impl TextFile {
         let this = self.clone();
         std::thread::spawn(move || {
             before();
+            // Opening housekeeping stays off the UI/first-screen path.
+            let _ = cleanup_stale_save_backups(&this.shared.path);
             done(this.build_index(threads).map(|_| ()));
         })
     }
@@ -335,7 +462,16 @@ impl TextFile {
 }
 
 fn detect_kind(bytes: &[u8]) -> FileKind {
-    if bytes.starts_with(b"\xef\xbb\xbf") || bytes.starts_with(b"\xff\xfe") || bytes.starts_with(b"\xfe\xff") {
+    if [
+        crate::encoding::Encoding::UTF32_LE,
+        crate::encoding::Encoding::UTF32_BE,
+        crate::encoding::Encoding::UTF8,
+        crate::encoding::Encoding::UTF16_LE,
+        crate::encoding::Encoding::UTF16_BE,
+    ]
+    .iter()
+    .any(|encoding| bytes.starts_with(encoding.bom_bytes()))
+    {
         return FileKind::Text;
     }
     const SAMPLE: usize = 64 << 10;

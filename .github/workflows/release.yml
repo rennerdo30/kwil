@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,8 +18,25 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  candidate-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful CI for the exact tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main&status=success&per_page=1" --jq '.workflow_runs | length')
+          if [ "$count" != "1" ]; then
+            echo "The tagged commit must pass CI before release artifacts are built." >&2
+            exit 1
+          fi
+
   build:
+    needs: candidate-ci
     name: build (${{ matrix.target }})
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +59,9 @@ jobs:
             exit 1
           fi
       - run: rustup target add ${{ matrix.target }}
+      - name: Configure compiler cache
+        id: sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       # Dependencies cached per target; tags are rare, so this mainly helps
       # re-runs of a failed release.
       - uses: Swatinem/rust-cache@v2
@@ -48,12 +69,35 @@ jobs:
           add-rust-environment-hash-key: false
           key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           cache-on-failure: true
-      - run: cargo build --release --locked -p kwil --target ${{ matrix.target }}
+      - name: Build platform entry points
+        shell: bash
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+          CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+        run: |
+          features=()
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            features=(--features windows-console)
+          fi
+          cargo build --release --locked -p kwil --target ${{ matrix.target }} "${features[@]}"
+      - name: Verify Windows static runtime in both entry points
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python scripts/check-static-runtime.py \
+            target/${{ matrix.target }}/release/kwil.exe \
+            target/${{ matrix.target }}/release/kwil-console.exe
+      - name: Compiler cache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        run: sccache --show-stats
       - name: Stage the binary
         shell: bash
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/kwil${{ matrix.ext }}" "dist/kwil-${{ matrix.target }}${{ matrix.ext }}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/kwil-console.exe" "dist/kwil-${{ matrix.target }}.com"
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: kwil-${{ matrix.target }}
@@ -66,6 +110,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -77,8 +122,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          flags=(--draft)
+          notes=(--generate-notes)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+            notes=(--notes-file docs/BETA_RELEASE_NOTES.md)
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --draft \
+            "${flags[@]}" \
             --title "Kwil $GITHUB_REF_NAME" \
-            --generate-notes
+            "${notes[@]}"

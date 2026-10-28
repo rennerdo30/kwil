@@ -3,9 +3,9 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ enum Message {
 /// The callback runs on a dedicated worker; it should only enqueue a result or
 /// wake the frontend, and must return promptly. Dropping joins that worker.
 pub struct FileWatcher {
-    watcher: Option<RecommendedWatcher>,
+    watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
     tx: SyncSender<Message>,
     worker: Option<JoinHandle<()>>,
 }
@@ -45,6 +45,30 @@ pub struct FileWatcher {
 impl FileWatcher {
     pub fn new(
         paths: &[PathBuf],
+        debounce: Duration,
+        callback: impl FnMut(io::Result<FileEvent>) + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::start(paths, false, debounce, callback)
+    }
+
+    /// Nonrecursive directory invalidations, including newly created files.
+    /// The callback path is the stable directory path, not a journal of children.
+    /// Parent watches keep a removed/recreated directory observable. Access-only
+    /// events are ignored, and no idle polling is introduced.
+    pub fn directory(
+        path: &Path,
+        debounce: Duration,
+        callback: impl FnMut(io::Result<FileEvent>) + Send + 'static,
+    ) -> io::Result<Self> {
+        if !path.is_dir() || std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "watch an existing real directory"));
+        }
+        Self::start(&[path.canonicalize()?], true, debounce, callback)
+    }
+
+    fn start(
+        paths: &[PathBuf],
+        directories: bool,
         debounce: Duration,
         mut callback: impl FnMut(io::Result<FileEvent>) + Send + 'static,
     ) -> io::Result<Self> {
@@ -76,6 +100,13 @@ impl FileWatcher {
         for parent in parents {
             watcher.watch(&parent, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
         }
+        if directories {
+            for path in &paths {
+                watcher.watch(path, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
+            }
+        }
+        let watcher = Arc::new(Mutex::new(watcher));
+        let rearm = watcher.clone();
         let worker = thread::Builder::new().name("kwil-file-watch".into()).spawn(move || {
             let mut pending = BTreeMap::<PathBuf, (Instant, FileEventKind)>::new();
             loop {
@@ -89,7 +120,21 @@ impl FileWatcher {
                         if event.need_rescan() {
                             callback(Err(io::Error::other("file watcher backend requires a rescan")));
                         }
-                        for change in changes(&event, &paths) {
+                        if directories {
+                            for path in &paths {
+                                if directory_needs_rearm(&event, path) {
+                                    let mut watcher = rearm.lock().unwrap_or_else(|p| p.into_inner());
+                                    let _ = watcher.unwatch(path);
+                                    if std::fs::symlink_metadata(path)
+                                        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                                        && let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive)
+                                    {
+                                        callback(Err(io::Error::other(e)));
+                                    }
+                                }
+                            }
+                        }
+                        for change in changes_in(&event, &paths, directories) {
                             // Keep the first deadline: continuous appends still wake
                             // the frontend once per debounce period, never starve it.
                             pending
@@ -118,13 +163,22 @@ impl FileWatcher {
 
 impl Drop for FileWatcher {
     fn drop(&mut self) {
-        // End native callbacks first; send then wakes an otherwise idle worker.
+        // Stop wakes an otherwise idle worker; the final shared watcher handle
+        // is dropped as the worker exits, ending native callbacks as well.
         drop(self.watcher.take());
         let _ = self.tx.send(Message::Stop);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
+}
+
+fn directory_needs_rearm(event: &Event, path: &Path) -> bool {
+    // Only replacement/rotation can invalidate the directory's native watch.
+    // Catalogue reads emit Access events on some backends: rearming those can
+    // lose child events before changes_in gets a chance to filter the read.
+    matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)))
+        && event.paths.iter().any(|p| same_path(p, path))
 }
 
 fn watch_path(path: &Path) -> io::Result<PathBuf> {
@@ -137,7 +191,12 @@ fn watch_path(path: &Path) -> io::Result<PathBuf> {
     Ok(absolute.parent().expect("absolute file parent").canonicalize()?.join(name))
 }
 
+#[cfg(test)]
 fn changes(event: &Event, watched: &BTreeSet<PathBuf>) -> Vec<FileEvent> {
+    changes_in(event, watched, false)
+}
+
+fn changes_in(event: &Event, watched: &BTreeSet<PathBuf>, directories: bool) -> Vec<FileEvent> {
     let kind = match event.kind {
         EventKind::Modify(ModifyKind::Name(_)) => FileEventKind::Renamed,
         EventKind::Remove(_) => FileEventKind::Removed,
@@ -148,7 +207,12 @@ fn changes(event: &Event, watched: &BTreeSet<PathBuf>) -> Vec<FileEvent> {
     // that can no longer be canonicalised after rotation.
     watched
         .iter()
-        .filter(|path| event.paths.iter().any(|p| same_path(p, path)))
+        .filter(|path| {
+            event
+                .paths
+                .iter()
+                .any(|p| same_path(p, path) || directories && p.parent().is_some_and(|parent| same_path(parent, path)))
+        })
         .map(|path| FileEvent { path: path.clone(), kind })
         .collect()
 }
@@ -172,7 +236,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{AccessKind, CreateKind, DataChange, RemoveKind, RenameMode};
+    use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
     use std::io::Write;
     use std::time::SystemTime;
 
@@ -305,5 +369,128 @@ mod tests {
                 expected.map(|kind| FileEvent { path: path.clone(), kind }).into_iter().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn watcher_directory_child_contract_preserves_exact_file_filter() {
+        let dir = TempDir::new();
+        let root = dir.0.canonicalize().unwrap();
+        let child = root.join("new.toml");
+        let watched = BTreeSet::from([root.clone()]);
+        for (kind, expected) in [
+            (EventKind::Create(CreateKind::File), FileEventKind::Modified),
+            (EventKind::Modify(ModifyKind::Data(DataChange::Any)), FileEventKind::Modified),
+            (EventKind::Remove(RemoveKind::File), FileEventKind::Removed),
+            (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), FileEventKind::Renamed),
+        ] {
+            let event = Event::new(kind).add_path(child.clone());
+            assert_eq!(changes_in(&event, &watched, true), vec![FileEvent { path: root.clone(), kind: expected }]);
+            assert!(changes_in(&event, &watched, false).is_empty(), "existing exact file semantics changed");
+        }
+        let nested = Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("sub/child.toml"));
+        assert!(changes_in(&nested, &watched, true).is_empty(), "folder watch must be nonrecursive");
+        let access = Event::new(EventKind::Access(AccessKind::Any)).add_path(child);
+        assert!(changes_in(&access, &watched, true).is_empty(), "reading themes must not feed back");
+    }
+
+    #[test]
+    fn watcher_directory_rearm_requires_lifecycle_event_on_watched_path() {
+        let root = PathBuf::from("themes");
+        let other = PathBuf::from("other");
+        for kind in [
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Create(CreateKind::Any),
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Remove(RemoveKind::Any),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+        ] {
+            let event = Event::new(kind).add_path(root.clone());
+            assert!(directory_needs_rearm(&event, &root), "directory lifecycle must rearm: {kind:?}");
+            let child = Event::new(kind).add_path(root.join("child.toml"));
+            assert!(!directory_needs_rearm(&child, &root), "child-only lifecycle must not rearm: {kind:?}");
+            let unrelated = Event::new(kind).add_path(other.clone());
+            assert!(!directory_needs_rearm(&unrelated, &root), "unrelated lifecycle must not rearm: {kind:?}");
+        }
+        // Both sides of a rename can carry the stable watched name.
+        for paths in [[root.clone(), other.clone()], [other, root.clone()]] {
+            let mut event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+            event.paths = paths.into();
+            assert!(directory_needs_rearm(&event, &root));
+        }
+        let no_path = Event::new(EventKind::Create(CreateKind::Folder));
+        assert!(!directory_needs_rearm(&no_path, &root));
+    }
+
+    #[test]
+    fn watcher_directory_rearm_ignores_reads_data_and_ambiguous_events() {
+        let root = PathBuf::from("themes");
+        for kind in [
+            EventKind::Access(AccessKind::Any),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Other),
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            let event = Event::new(kind).add_path(root.clone()).add_path(root.join("child.toml"));
+            assert!(!directory_needs_rearm(&event, &root), "live directory watch must stay armed: {kind:?}");
+        }
+    }
+
+    #[test]
+    fn watcher_directory_native_create_rename_remove_contract() {
+        let dir = TempDir::new();
+        let root = dir.0.canonicalize().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watcher = FileWatcher::directory(&root, Duration::from_millis(10), move |e| {
+            let _ = tx.send(e);
+        })
+        .unwrap();
+        let child = root.join("new.toml");
+        fs_write_fixture(&child);
+        let event = rx.recv_timeout(Duration::from_secs(5)).expect("directory create wake").unwrap();
+        assert_eq!(event.path, root);
+        while rx.try_recv().is_ok() {}
+        let renamed = root.join("renamed.toml");
+        std::fs::rename(&child, &renamed).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).expect("directory rename wake").unwrap();
+        while rx.try_recv().is_ok() {}
+        std::fs::remove_file(renamed).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).expect("directory remove wake").unwrap();
+        drop(watcher);
+    }
+    #[test]
+    fn watcher_directory_native_rearms_after_parent_observes_recreation() {
+        let dir = TempDir::new();
+        let root = dir.0.canonicalize().unwrap().join("themes");
+        std::fs::create_dir(&root).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watcher = FileWatcher::directory(&root, Duration::from_millis(10), move |e| {
+            let _ = tx.send(e);
+        })
+        .unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let removed = rx.recv_timeout(Duration::from_secs(5)).expect("parent sees directory removal").unwrap();
+        assert_eq!(removed, FileEvent { path: root.clone(), kind: FileEventKind::Removed });
+        std::fs::create_dir(&root).unwrap();
+        let created = rx.recv_timeout(Duration::from_secs(5)).expect("parent sees directory recreation").unwrap();
+        assert_eq!(created, FileEvent { path: root.clone(), kind: FileEventKind::Modified });
+        while rx.try_recv().is_ok() {}
+        fs_write_fixture(&root.join("after-recreation.toml"));
+        let child = rx.recv_timeout(Duration::from_secs(5)).expect("recreated directory sees child create").unwrap();
+        assert_eq!(child, FileEvent { path: root, kind: FileEventKind::Modified });
+        drop(watcher);
+    }
+
+    fn fs_write_fixture(path: &Path) {
+        std::fs::write(path, b"fixture").unwrap();
     }
 }

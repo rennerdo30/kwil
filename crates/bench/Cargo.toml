@@ -1,8 +1,11 @@
+[workspace]
+
 [package]
 name = "kwil-bench"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
 publish = false
 
 [features]
@@ -17,7 +20,7 @@ serde_json = { version = "1", optional = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
 divan = "=0.1.21"

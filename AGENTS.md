@@ -7,6 +7,7 @@ Read `E:/Development/AGENTS.md` and `E:/Development/general-agent-rules.md` firs
 - **Remote-friendly drawing:** event-driven, no frame loop, no idle frames, damage-only presents, scroll by copy (owner, 2026-10-23; spec §6).
 - **Pair Desk:** project `kwil` (ids `KW-n`).
 - **Identity:** commit only as `rennerdo30 <9086097+rennerdo30@users.noreply.github.com>`.
+- **Review limit** (owner, 2026-10-27): at most three review rounds per change. Renaming the change or starting a new review job does not reset the count; after round three, ROOT resolves the remaining findings or reports the concrete blocker instead of continuing review loops.
 - **Repository:** public at `https://github.com/rennerdo30/kwil` (owner, 2026-10-23). Push with explicit refs (`git push origin HEAD:refs/heads/<branch>`). Releases are drafts made by `.github/workflows/release.yml`; only the owner publishes (`docs/RELEASING.md`).
 - **CI runners:** GitHub-hosted (owner, 2026-10-23: public repo). This is an exception to the shared self-hosted rule: a public repo must never run fork pull requests on the owner's machines, hosted runners are free for public repositories, and Windows/macOS/ARM builds need those runners anyway.
 - **Build:** output goes to `E:/Development/_cache/cargo-target/kwil*` (`.cargo/config.toml`); toolchain pinned in `rust-toolchain.toml`. Use `rustup ... --no-self-update`; rustup self-updates belong to the owner.

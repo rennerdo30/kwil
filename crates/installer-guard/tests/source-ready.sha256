@@ -1,0 +1,36 @@
+# installer-guard source-ready SHA-256 receipt; excludes this receipt.
+# SOURCE ONLY: compiler, Clippy, tests, native API, MSI pairing and installer lifecycle NOT RUN in this lease.
+# R3 P2 cause: individually mapped RVA descriptor rows could alternate low/far physical offsets and replay the stream.
+# Repair: one checked PhysicalRange/rva_range admits each COMPLETE normal/delay descriptor directory before RVA metadata I/O.
+# Shared admission also covers complete export directory, EAT, export name-pointer and ordinal arrays; physical row walks never remap.
+# file_range bounds complete optional header and section table. Partial overlapping mappings fail closed before table iteration.
+# Dynamic names retain single-physical-section bounds and overlap cache; thunk/IAT tables are not traversed.
+# No whole-image buffering, architecture expansion, cap weakening, dependency change or exported ABI change.
+# Four new file-backed test functions: alternating 94-section normal/delay descriptors, normal/delay boundaries, all export table boundaries, partial overlap.
+# Alternating case has 92 valid distinct names plus null descriptor; two-window test read ceiling; expected one 64 KiB read and zero rewinds.
+# Boundary oracles accept exact section end and refuse one-byte crossing before far reads.
+# Existing 32 portable tests and Windows ignored database pairing test preserved; now 36 portable plus one Windows ignored test authored, NOT RUN.
+# Formatter: pinned rustfmt 1.99.1, PID 44172, 10-second timeout, exit 0; only src/pe.rs and tests/stream.rs formatted.
+# Base fbcddabbe4b188b3d72198aabd8d9ce2fdc83f29; prior receipt b22d717d5a2af2e02ac6fe14deb20664a0964d7a25a06183e9e7637c3a29566c
+# No test fixtures generated or executed in this lease. ROOT owns build/integration/manifests/lock/commits.
+# Pinned root input 544d98d80d3e03ac09662445811bf5ab4acd7cecda9d86ba0e2ab0f1ea0b0be5  Cargo.toml
+# Pinned root input 9e646af8978ddaf1ebe554bd659c0dde5d83d3e4b8123640a4fd8bfc776037bd  Cargo.lock
+# Pinned root input 5b2b2d1e21ee545552f2270ce3c5bd923fec65dcd6e86dd0ef1ac1ed88f54d44  scripts/windows-installer-contract.json
+# Pinned root input fb92572c9090294869fdc52b8d573de4e5bd8b116b28b6a9291ca213947e483c  docs/decisions/0004-windows-installer.md
+42d4d1df2fc5312fec113d7d9886463c69dec1a0c6c057a8eccb8e4dc4d3109d  Cargo.toml
+68bc29c615904b2383a6769fbe85fd32455ab5ffab7aedeeabaa145b1ada18d2  src/identity.rs
+4b1eb207cdebb2e225c95a38d6055028fcdd30e1e5d1be451bc7b784420a6f0e  src/lib.rs
+808f4c43d175ac9c33c867b007dddd7beccbe34dca1facf4997457b52c488bc0  src/model.rs
+9e2e59f93c4f8d84f252443710f179c4d8b908b406a5ecaa6cb2cc78d09a667b  src/pe.rs
+c9ad2fbb5bafbbe248f6783fadf706383a92b04204993cf4f24a467d00478291  src/policy.rs
+d8374b1ca4f3a8e272757f700cdfb39983f4d632155faff34231f96d11bc0175  src/stream.rs
+52e51f79bf994bb2d960e380a74b1ff78950d55e37ce30f2f0ea3604679a7cad  src/tables.rs
+f08a93fc271cd37726211d1fc015d3002b9e50fddefb613bdefbd2ed175e5e0e  src/token_access.rs
+7e959d5eec9fe5888a98fa42cde374b918a62284a50da8808ae84ab3f724962c  src/windows/db.rs
+1e22b6846372d5a5adc46a48095037d81ec4b189af60f95dc8235452a6af612d  src/windows/in_use.rs
+d834c0d9ff1d4e05db4c91d43e42885a856b04a8bf052abdfa64f412f0149e2f  src/windows/mod.rs
+93fc2de263370de7d15cea86a8f265374af8a7cb4f0d0484a9985a57dcb27a34  src/windows/paths.rs
+8a98ea1512bfd9028c6a1dc1707417343df2c17e705fb4b653d50dafc69a9ea5  src/windows/registration.rs
+a3159dbd738cae13e0a3550c757d77778ba8753daefc3877e9c7c9008c55ce5c  src/windows/registry.rs
+1ec2bb6b5a75d018333e24116b0c4013ad4c209fc076345d73eb964aa0aa9ea8  tests/policy.rs
+ee0950ddb71d96a60437794aefb548f1ff7a644e0743753eb0f059659ad60785  tests/stream.rs

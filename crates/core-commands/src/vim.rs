@@ -80,8 +80,20 @@ impl Motion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Argument {
     None,
+    /// Standalone gj/gk intent. The registered up/down id remains executable
+    /// as logical movement when wrapping does not own the text body. While
+    /// wrapping owns it, frontends dispatch this intent through the shared
+    /// WrapHost visual navigation API, preserving count and selection extension.
+    VisualMotion {
+        extend: bool,
+    },
     Search(String),
-    Substitute { pattern: String, replacement: String, global: bool, whole_file: bool },
+    Substitute {
+        pattern: String,
+        replacement: String,
+        global: bool,
+        whole_file: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +107,22 @@ pub struct Invocation {
     pub motion: Option<Motion>,
     pub register: Option<char>,
     pub argument: Argument,
+}
+
+impl Invocation {
+    /// Explicit visual-row intent, distinct from logical j/k and operators.
+    /// Record/replay must preserve the complete invocation, including argument;
+    /// reconstructing it from the command id loses this distinction.
+    pub fn visual_motion(&self) -> Option<Motion> {
+        if !matches!(self.argument, Argument::VisualMotion { .. }) {
+            return None;
+        }
+        match (self.id, self.motion) {
+            ("motion.down", Some(Motion::Down)) => Some(Motion::Down),
+            ("motion.up", Some(Motion::Up)) => Some(Motion::Up),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,6 +264,17 @@ impl Vim {
         }
     }
 
+    fn visual_motion(&mut self, motion: Motion) -> VimResult {
+        // Decision 0003 preserves logical operator ranges. Until visual-row
+        // operator semantics are specified, refuse before emitting a command
+        // or entering Insert mode; never reinterpret dgj/cgk as logical dj/ck.
+        if self.operator.is_some() {
+            return self.error("visual-row motions are not supported for operators; use j or k");
+        }
+        let extend = matches!(self.mode, Mode::Visual | Mode::VisualLine);
+        self.emit(motion.id(), Some(motion), Argument::VisualMotion { extend })
+    }
+
     pub fn feed(&mut self, key: KeyChord) -> VimResult {
         if key.key == Key::Named(NamedKey::Escape) {
             self.cancel_pending();
@@ -272,7 +311,9 @@ impl Vim {
                 }
                 Prefix::Register => self.error("invalid register"),
                 Prefix::G if c == 'g' => self.motion(Motion::FirstLine),
-                Prefix::G => self.error("expected gg"),
+                Prefix::G if c == 'j' => self.visual_motion(Motion::Down),
+                Prefix::G if c == 'k' => self.visual_motion(Motion::Up),
+                Prefix::G => self.error("expected gg, gj or gk"),
                 Prefix::Object(around) => {
                     let motion = match (around, c) {
                         (false, 'w') => Motion::InnerWord,
