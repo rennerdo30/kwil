@@ -296,7 +296,7 @@ pub const SCHEMA: &[SettingSpec] = &[
         "update.channel",
         "Update channel",
         Updates,
-        "Choose stable or prerelease updates.",
+        "Beta builds default to prerelease updates; stable builds default to stable. Choose stable to receive only stable releases.",
         SettingKind::Choice(&["stable", "prerelease"]),
         |s| SettingValue::Text(
             match s.update.channel {

@@ -13,9 +13,12 @@ check = true
 channel = "stable"
 ```
 
-`stable` is the default and installs only published stable releases. A beta
-build using this channel can advance to a newer stable release. To receive
-published betas as well, set `channel = "prerelease"`. This channel chooses the
+Beta and other prerelease builds default to `prerelease`; stable builds default
+to `stable`. An explicit `update.channel` always overrides the build's default,
+in both the settings UI and `kwil --update`. Set `channel = "stable"` as above to
+receive only published stable releases. A beta build using this channel can
+advance to a newer stable release. The `prerelease` channel receives published
+betas as well as stable releases and chooses the
 highest newer semantic version, regardless of publication order: beta.10 follows
 beta.9, and 0.1.0 follows every 0.1.0 prerelease. Neither channel installs drafts,
 the same version, or a downgrade. Invalid versions or inconsistent prerelease

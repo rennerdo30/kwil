@@ -29,12 +29,24 @@ pub enum Remote {
     On,
     Off,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateChannel {
-    #[default]
     Stable,
     Prerelease,
+}
+impl UpdateChannel {
+    // Cargo guarantees a valid semver version. A '-' in build metadata alone
+    // does not make a stable version a prerelease.
+    fn for_version(version: &str) -> Self {
+        if version.split('+').next().unwrap_or(version).contains('-') { Self::Prerelease } else { Self::Stable }
+    }
+}
+impl Default for UpdateChannel {
+    fn default() -> Self {
+        // Both this crate and the app inherit workspace.package.version.
+        Self::for_version(env!("CARGO_PKG_VERSION"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -77,7 +89,7 @@ group!(RenderSettings {
     cursor_blink: bool = true
 });
 group!(TabsSettings { layout: TabLayout = TabLayout::Horizontal });
-group!(UpdateSettings { check: bool = true, channel: UpdateChannel = UpdateChannel::Stable });
+group!(UpdateSettings { check: bool = true, channel: UpdateChannel = UpdateChannel::default() });
 group!(FontSettings {
     family: String = "monospace".into(),
     size: f32 = 14.0,
@@ -782,6 +794,25 @@ impl SettingsWorker {
 impl Drop for SettingsWorker {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod update_channel_tests {
+    use super::*;
+
+    #[test]
+    fn prerelease_versions_default_to_prerelease() {
+        for version in ["0.1.0-beta.2", "1.0.0-rc.1+build.42", "1.0.0-1"] {
+            assert_eq!(UpdateChannel::for_version(version), UpdateChannel::Prerelease);
+        }
+    }
+
+    #[test]
+    fn stable_versions_default_to_stable() {
+        for version in ["0.1.0", "1.0.0", "1.0.0+build-beta.2"] {
+            assert_eq!(UpdateChannel::for_version(version), UpdateChannel::Stable);
+        }
     }
 }
 
