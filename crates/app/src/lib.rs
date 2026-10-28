@@ -200,8 +200,10 @@ fn run_app(console_launcher: bool) -> ExitCode {
         eprintln!("kwil: {error}");
         return ExitCode::from(2);
     }
-    let on_first_frame = |_gui: bool| -> Box<dyn FnOnce(Notify)> {
+    let hidden = args.hidden;
+    let on_first_frame = move |_gui: bool| -> Box<dyn FnOnce(Notify)> {
         Box::new(move |notify: Notify| {
+            kwil_ui_gpu::repair_file_type_registrations_after_first_frame(hidden);
             #[cfg(windows)]
             if _gui {
                 windows::first_frame();

@@ -53,6 +53,11 @@ mod welcome;
 mod welcome_ui;
 mod wheel;
 mod wrap_ui;
+
+/// Both frontends call this only after presenting their first frame.
+pub fn repair_file_type_registrations_after_first_frame(hidden: bool) {
+    registration_host::spawn_repair(hidden);
+}
 mod zoom;
 
 use font::Font;

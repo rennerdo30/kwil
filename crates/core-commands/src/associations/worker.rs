@@ -6,7 +6,8 @@
 //! Tokens are local to this worker incarnation; restart never resumes Apply.
 //! An immutable, synced full receipt precedes every backend write. Until Undo
 //! retires it, even a failed/interrupted Apply prevents another transaction.
-//! Undo always replays the original receipt, so an interrupted Undo is retryable.
+//! Undo preserves the original Before bytes. Append-only repair records durably
+//! update owned After signatures before writes, so interrupted repair/Undo retry.
 //! Native restoration must pass the backend durability barrier before retirement;
 //! a failed/unsupported barrier retains that full receipt even if reads show Before.
 //! Records are never replaced, renamed or deleted. History has a finite limit;
@@ -34,6 +35,20 @@ use std::{
 
 pub const QUEUE_CAPACITY: usize = 8;
 pub const MAX_JOURNAL_TRANSACTIONS: u64 = 32;
+pub const MAX_REPAIR_RECORDS: usize = 32;
+pub const MAX_JOURNAL_ENTRIES: usize = MAX_JOURNAL_TRANSACTIONS as usize * 2 + MAX_REPAIR_RECORDS + 1;
+
+/// Background startup entry point; the host verifies and guards this directory.
+pub fn repair_startup<A: AssociationAdapter, F: FnOnce() -> Result<A, AssociationError>>(
+    journal_directory: PathBuf,
+    factory: F,
+) -> Result<(), WorkerError> {
+    // Same lock, receipt validation, repair replay and write-ahead publication as
+    // the settings worker, without starting the UI/controller or another thread.
+    let journal = Journal::open(journal_directory)?;
+    let _engine = Engine::new(factory()?, journal)?;
+    Ok(())
+}
 pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const MAX_PATH: usize = 4096;
 
@@ -328,9 +343,12 @@ struct Engine<A> {
     identity: PlanToken,
 }
 impl<A: AssociationAdapter> Engine<A> {
-    fn new(adapter: A, journal: Journal) -> Result<Self, WorkerError> {
+    fn new(mut adapter: A, mut journal: Journal) -> Result<Self, WorkerError> {
         if journal.active.as_ref().is_some_and(|r| r.receipt.owner() != adapter.owner()) {
             return Err(failure("journal belongs to another user/backend; refusing recovery"));
+        }
+        if let Some(executable) = adapter.repair_executable() {
+            journal.repair_owned(&mut adapter, &executable)?;
         }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let identity = PlanToken {
@@ -463,12 +481,22 @@ struct Intent {
     id: u64,
     receipt: AssociationReceipt,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairRecord {
+    version: u32,
+    id: u64,
+    owner: String,
+    // Before here is the preceding After, never the user's original Before.
+    changes: super::SharedChanges,
+}
 struct Journal {
     directory: PathBuf,
     _lock: File,
     active: Option<Intent>,
     last: u64,
     poisoned: bool,
+    repairs: Vec<(u64, u64)>,
     #[cfg(test)]
     fail_sync: bool,
 }
@@ -496,13 +524,14 @@ impl Journal {
             active: None,
             last: 0,
             poisoned: false,
+            repairs: Vec::new(),
             #[cfg(test)]
             fail_sync: false,
         };
         let mut ids = Vec::new();
         let mut retired = Vec::new();
         for (count, entry) in fs::read_dir(&journal.directory)?.enumerate() {
-            if count > (MAX_JOURNAL_TRANSACTIONS * 2) as usize {
+            if count >= MAX_JOURNAL_ENTRIES {
                 return Err(failure("journal directory exceeds record limit"));
             }
             let entry = entry?;
@@ -527,22 +556,47 @@ impl Journal {
                     debug_assert!(bytes.is_empty());
                     retired.push(id);
                 }
+                suffix if suffix.starts_with("repair-") => {
+                    let sequence = &suffix[7..];
+                    if sequence.len() != 8 || !sequence.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(failure("invalid repair record name"));
+                    }
+                    let sequence: u64 = sequence.parse().map_err(|_| failure("invalid repair sequence"))?;
+                    if sequence == 0
+                        || sequence > MAX_REPAIR_RECORDS as u64
+                        || journal.repairs.len() >= MAX_REPAIR_RECORDS
+                    {
+                        return Err(failure("repair history exceeds limit"));
+                    }
+                    journal.repairs.push((id, sequence));
+                }
                 _ => return Err(failure("unexpected journal record kind")),
             }
         }
         if retired.iter().any(|id| !ids.contains(id)) {
             return Err(failure("retirement marker has no intent"));
         }
+        if journal.repairs.iter().any(|(id, _)| !ids.contains(id)) {
+            return Err(failure("repair record has no original intent"));
+        }
+        journal.repairs.sort_unstable();
         ids.sort_unstable();
         for id in ids {
             // Check even retired files: never follow special files or hide corruption.
             let bytes = read_record(&journal.path(id, "intent"), MAX_RECORD_BYTES)?;
-            let intent: Intent =
+            let mut intent: Intent =
                 serde_json::from_slice(&bytes).map_err(|e| failure(format!("invalid journal intent {id}: {e}")))?;
             if intent.version != 1 || intent.id != id {
                 return Err(failure("journal version/id mismatch"));
             }
             validate_receipt(&intent.receipt)?;
+            for (index, (_, sequence)) in journal.repairs.iter().filter(|(owner, _)| *owner == id).enumerate() {
+                if *sequence != index as u64 + 1 {
+                    return Err(failure("repair history has a gap"));
+                }
+                let repair = journal.read_repair(id, *sequence)?;
+                advance_receipt(&mut intent.receipt, &repair)?;
+            }
             if !retired.contains(&id) {
                 if journal.active.is_some() {
                     return Err(failure("multiple pending receipts; refusing ambiguous recovery"));
@@ -554,6 +608,85 @@ impl Journal {
     }
     fn path(&self, id: u64, suffix: &str) -> PathBuf {
         self.directory.join(format!("{id:020}.{suffix}"))
+    }
+    fn read_repair(&self, id: u64, sequence: u64) -> Result<RepairRecord, WorkerError> {
+        let _workspace = super::Admission::acquire(super::WORKSPACE_BYTES)?;
+        let bytes = read_record(&self.path(id, &format!("repair-{sequence:08}")), MAX_RECORD_BYTES)?;
+        let repair: RepairRecord =
+            serde_json::from_slice(&bytes).map_err(|e| failure(format!("invalid repair record: {e}")))?;
+        if repair.version != 1 || repair.id != id {
+            return Err(failure("repair version/id mismatch"));
+        }
+        validate_receipt(&AssociationReceipt { owner: repair.owner.clone(), remaining: repair.changes.clone() })?;
+        if repair
+            .changes
+            .iter()
+            .any(|c| !super::windows_paths::repair_location(&c.location) || c.before.is_none() || c.after.is_none())
+        {
+            return Err(failure("repair record is outside owned command/icon values"));
+        }
+        Ok(repair)
+    }
+    fn replay_repair(
+        &self,
+        adapter: &mut impl AssociationAdapter,
+        sequence: u64,
+        repair: &RepairRecord,
+    ) -> Result<(), WorkerError> {
+        if repair.owner != adapter.owner() {
+            return Err(failure("repair belongs to another user/backend"));
+        }
+        // A preceding process may have exited after writing complete bytes but
+        // before its flush. Establish durability again before replaying them.
+        open_regular(&self.path(repair.id, &format!("repair-{sequence:08}")), true)?.sync_all()?;
+        sync_directory(&self.directory)?;
+        let mut changed = false;
+        for change in repair.changes.iter() {
+            if super::read_one(adapter, &change.location)? == change.before {
+                adapter.write(&change.location, change.after.as_ref())?;
+                changed = true;
+            }
+        }
+        if changed {
+            adapter.notify_changes();
+        }
+        Ok(())
+    }
+    fn repair_owned(&mut self, adapter: &mut impl AssociationAdapter, executable: &Path) -> Result<(), WorkerError> {
+        if let Some(active) = &self.active {
+            let id = active.id;
+            // Replaying a durable record is idempotent and recognizes both sides
+            // of an interrupted backend write; foreign signatures are untouched.
+            for (_, sequence) in self.repairs.iter().filter(|(owner, _)| *owner == id) {
+                self.replay_repair(adapter, *sequence, &self.read_repair(id, *sequence)?)?;
+            }
+            let changes =
+                super::windows_paths::receipt_repairs(adapter, executable, &self.active.as_ref().unwrap().receipt)?;
+            if !changes.is_empty() {
+                if self.repairs.len() >= MAX_REPAIR_RECORDS {
+                    return Err(failure("repair history is full; new repair refused"));
+                }
+                let sequence = self.repairs.iter().filter(|(owner, _)| *owner == id).count() as u64 + 1;
+                let repair = RepairRecord { version: 1, id, owner: adapter.owner(), changes };
+                let bytes = bounded_json(&repair)?;
+                self.poisoned = true;
+                let mut file = private_new(&self.path(id, &format!("repair-{sequence:08}")))?;
+                file.write_all(&bytes)?;
+                #[cfg(test)]
+                if self.fail_sync {
+                    return Err(failure("injected repair sync failure"));
+                }
+                file.sync_all()?;
+                sync_directory(&self.directory)?;
+                self.repairs.push((id, sequence));
+                advance_receipt(&mut self.active.as_mut().unwrap().receipt, &repair)?;
+                self.poisoned = false;
+                // The durable After is published before the first hive write.
+                self.replay_repair(adapter, sequence, &repair)?;
+            }
+        }
+        super::windows_paths::repair(adapter, executable)?;
+        Ok(())
     }
     fn begin(&mut self, receipt: AssociationReceipt) -> Result<u64, WorkerError> {
         if self.poisoned || self.active.is_some() {
@@ -608,6 +741,25 @@ impl Journal {
         self.active = None;
         Ok(())
     }
+}
+
+fn advance_receipt(receipt: &mut AssociationReceipt, repair: &RepairRecord) -> Result<(), WorkerError> {
+    if receipt.owner != repair.owner {
+        return Err(failure("repair owner does not match original receipt"));
+    }
+    let (mut changes, admission) = receipt.remaining.copied()?;
+    for update in repair.changes.iter() {
+        let change = changes
+            .iter_mut()
+            .find(|change| change.location == update.location)
+            .ok_or_else(|| failure("repair location is absent from original receipt"))?;
+        if change.after != update.before {
+            return Err(failure("repair history does not match preceding After"));
+        }
+        change.after = update.after.clone();
+    }
+    receipt.remaining = super::SharedChanges::admitted(changes, admission);
+    Ok(())
 }
 
 pub(super) fn validate_plan(plan: &AssociationPlan) -> Result<(), WorkerError> {
@@ -866,6 +1018,7 @@ mod tests {
     }
     #[derive(Default)]
     struct FakeState {
+        repair_target: Option<PathBuf>,
         values: Vec<(Location, StoredValue)>,
         writes: usize,
         reads: usize,
@@ -881,6 +1034,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct Fake(Arc<Mutex<FakeState>>);
     impl AssociationAdapter for Fake {
+        fn windows_registration_keys(&mut self) -> Result<Vec<String>, AssociationError> {
+            Ok(if self.0.lock().unwrap().repair_target.is_some() { vec!["Kwil.txt".into()] } else { Vec::new() })
+        }
+        fn repair_executable(&self) -> Option<PathBuf> {
+            self.0.lock().unwrap().repair_target.clone()
+        }
         fn owner(&self) -> String {
             "isolated-fake-user".into()
         }
@@ -956,11 +1115,127 @@ mod tests {
     fn engine(scratch: &Scratch, fake: &Fake) -> Engine<Fake> {
         Engine::new(fake.clone(), Journal::open(scratch.0.clone()).unwrap()).unwrap()
     }
+    #[test]
+    fn explorer_worker_startup_repairs_legacy_receipt_and_unregisters_after_restart() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let location = Location::WindowsValue { subkey: r"Kwil.txt\shell\open\command".into(), name: String::new() };
+        let old = super::super::ValueBudget::new(super::super::MAX_VALUE_BYTES)
+            .registry(r#""\\?\E:\old\kwil-custom-build.exe" "%1""#)
+            .unwrap();
+        let receipt = AssociationReceipt {
+            owner: fake.owner(),
+            remaining: super::super::SharedChanges::admitted(
+                vec![super::super::Change { location: location.clone(), before: None, after: Some(old.clone()) }],
+                super::super::Admission::acquire(super::super::WORKSPACE_BYTES).unwrap(),
+            ),
+        };
+        let mut journal = Journal::open(scratch.0.clone()).unwrap();
+        journal.begin(receipt).unwrap();
+        let original = fs::read(journal.path(1, "intent")).unwrap();
+        drop(journal);
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.values.push((location, old));
+            state.repair_target = Some(PathBuf::from(r"E:\new\kwil.exe"));
+            state.expected_changes = Some(1);
+        }
+        let mut first = engine(&scratch, &fake);
+        assert_eq!(status(&mut first).recovery.unwrap().current, vec![CurrentState::Applied]);
+        assert_eq!(fake.0.lock().unwrap().writes, 1);
+        drop(first);
+        let mut resumed = engine(&scratch, &fake);
+        assert_eq!(status(&mut resumed).recovery.unwrap().current, vec![CurrentState::Applied]);
+        resumed.execute(Request::Undo { journal_id: 1 }).unwrap();
+        assert!(fake.0.lock().unwrap().values.is_empty());
+        assert_eq!(fs::read(resumed.journal.path(1, "intent")).unwrap(), original);
+    }
     fn planned(engine: &mut Engine<Fake>) -> (PlanToken, AssociationPlan) {
         match engine.execute(Request::Plan(request())).unwrap() {
             Response::Planned { token, plan } => (token, plan),
             other => panic!("unexpected {other:?}"),
         }
+    }
+    fn seed_repair_receipt(scratch: &Scratch, fake: &Fake, name: &str) -> (Location, StoredValue) {
+        let location = Location::WindowsValue { subkey: r"Kwil.txt\shell\open\command".into(), name: String::new() };
+        let previous = StoredValue::text("exact previous foreign handler");
+        let missing = scratch.0.join("missing-A").join(name);
+        let old = super::super::ValueBudget::new(super::super::MAX_VALUE_BYTES)
+            .registry(&format!("\"{}\" \"%1\"", missing.display()))
+            .unwrap();
+        let receipt = AssociationReceipt {
+            owner: fake.owner(),
+            remaining: super::super::SharedChanges::admitted(
+                vec![super::super::Change {
+                    location: location.clone(),
+                    before: Some(previous.clone()),
+                    after: Some(old.clone()),
+                }],
+                super::super::Admission::acquire(super::super::WORKSPACE_BYTES).unwrap(),
+            ),
+        };
+        Journal::open(scratch.0.clone()).unwrap().begin(receipt).unwrap();
+        let mut state = fake.0.lock().unwrap();
+        state.values.push((location.clone(), old));
+        state.expected_changes = Some(1);
+        (location, previous)
+    }
+    #[test]
+    fn review_repaired_a_to_b_then_launch_c_preserves_unregister_ownership() {
+        let _guard = crate::associations::test_admission_guard();
+        for interruption in ["none", "flush", "backend"] {
+            let scratch = Scratch::new();
+            let fake = Fake::default();
+            let (location, previous) = seed_repair_receipt(&scratch, &fake, "kwil.exe");
+            let original = fs::read(scratch.0.join("00000000000000000001.intent")).unwrap();
+            let binaries = Scratch::new();
+            let b = binaries.0.join("B-kwil.exe");
+            fs::write(&b, b"existing B").unwrap();
+            fake.0.lock().unwrap().repair_target = Some(b.clone());
+            if interruption == "none" {
+                drop(engine(&scratch, &fake));
+            } else {
+                let mut journal = Journal::open(scratch.0.clone()).unwrap();
+                journal.fail_sync = interruption == "flush";
+                fake.0.lock().unwrap().fail_from = (interruption == "backend").then_some(1);
+                assert!(journal.repair_owned(&mut fake.clone(), &b).is_err());
+                assert_eq!(fake.0.lock().unwrap().writes, usize::from(interruption == "backend"));
+                assert!(journal.path(1, "repair-00000001").is_file());
+            }
+            fake.0.lock().unwrap().fail_from = None;
+            fake.0.lock().unwrap().repair_target = Some(binaries.0.join("C-kwil.exe"));
+            let mut resumed = engine(&scratch, &fake);
+            assert_eq!(status(&mut resumed).recovery.unwrap().current, vec![CurrentState::Applied]);
+            resumed.execute(Request::Undo { journal_id: 1 }).unwrap();
+            assert_eq!(fake.0.lock().unwrap().values, vec![(location, previous)]);
+            assert_eq!(fs::read(resumed.journal.path(1, "intent")).unwrap(), original);
+        }
+    }
+    #[test]
+    fn review_background_startup_repairs_receipt_owned_custom_executable_without_settings_page() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let (location, previous) = seed_repair_receipt(&scratch, &fake, "kwil-custom-build.exe");
+        let target = scratch.0.join("current-kwil.exe");
+        fake.0.lock().unwrap().repair_target = Some(target.clone());
+        let lock = Journal::open(scratch.0.clone()).unwrap();
+        assert!(
+            repair_startup::<Fake, _>(scratch.0.clone(), || panic!("locked journal must refuse before factory"))
+                .is_err()
+        );
+        assert_eq!(fake.0.lock().unwrap().writes, 0);
+        drop(lock);
+        let factory = fake.clone();
+        repair_startup(scratch.0.clone(), move || Ok(factory)).unwrap();
+        let expected = super::super::ValueBudget::new(super::super::MAX_VALUE_BYTES)
+            .registry(&format!("\"{}\" \"%1\"", target.display()))
+            .unwrap();
+        assert_eq!(fake.0.lock().unwrap().values, vec![(location.clone(), expected)]);
+        let mut resumed = engine(&scratch, &fake);
+        resumed.execute(Request::Undo { journal_id: 1 }).unwrap();
+        assert_eq!(fake.0.lock().unwrap().values, vec![(location, previous)]);
     }
     fn status(engine: &mut Engine<Fake>) -> Status {
         match engine.execute(Request::Status).unwrap() {

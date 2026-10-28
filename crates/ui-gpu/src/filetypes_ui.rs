@@ -53,6 +53,8 @@ const WINDOWS_NOTE: &str = "Adds Kwil to “Open with” for your account only. 
 const MACOS_NOTE: &str = "Asks Launch Services to list this Kwil app for the chosen types, for your account only.";
 const LINUX_NOTE: &str =
     "Adds a desktop entry and file-type choices for your account only. Nothing outside your home folder changes.";
+const BUILD_NOTE: &str =
+    "Registrations point to this cargo build folder. A rebuild replaces the executable. You can still register.";
 
 /// What the platform will do, stated before anything is requested.
 fn platform_note() -> &'static str {
@@ -224,6 +226,12 @@ impl HostedPage for Page {
         for line in desktop::wrap(font, platform_note(), area.w, 2) {
             desktop::label(buf, stride, font, Rect { x: area.x, y, w: area.w, h: s.text }, &line, c.muted);
             y += s.text;
+        }
+        if self.service.registers_build_folder() {
+            for line in desktop::wrap(font, BUILD_NOTE, area.w, 3) {
+                desktop::label(buf, stride, font, Rect { x: area.x, y, w: area.w, h: s.text }, &line, c.error);
+                y += s.text;
+            }
         }
         y += s.gap;
         // Presets.
@@ -415,7 +423,12 @@ impl Page {
         let top = Rect { h: bottom.y.saturating_sub(area.y + s.hairline * 2), ..area };
         let columns = (top.w.saturating_sub(s.thumb + s.gap) / (s.control * 3).max(1)).max(1);
         let rows = lines(self.service.selection(), columns);
-        let total = rows.len() + 4;
+        let notes = if self.service.registers_build_folder() {
+            desktop::wrap(font, BUILD_NOTE, top.w.saturating_sub(s.thumb + s.gap), 4)
+        } else {
+            vec!["Scroll for all types · Open with only".into()]
+        };
+        let total = rows.len() + 3 + notes.len();
         let visible = top.h / s.nav.max(1);
         self.ui.scroll = self.ui.scroll.min(total.saturating_sub(visible.max(1)));
         self.ui.rows = (visible.max(1), total);
@@ -425,6 +438,11 @@ impl Page {
                 break;
             }
             let row = Rect { x: top.x, y: top.y + slot * s.nav, w: top.w.saturating_sub(s.thumb + s.gap), h: s.nav };
+            if index < notes.len() {
+                desktop::label(buf, stride, font, row, &notes[index], c.muted);
+                continue;
+            }
+            let index = index - notes.len() + 1;
             match index {
                 0 => {
                     desktop::label(buf, stride, font, row, "Scroll for all types · Open with only", c.muted);

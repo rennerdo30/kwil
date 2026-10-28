@@ -1612,7 +1612,7 @@ fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
     assert!(root.is_absolute());
     let context = RegistrationContext {
         platform: AssociationPlatform::Windows,
-        executable: root.join("kwil.exe"),
+        executable: root.join("target/debug/kwil.exe"),
         content_types: Default::default(),
         default_choice: DefaultChoice::KeepCurrent,
         limits: RegistrationLimits::Base128,

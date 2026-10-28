@@ -364,6 +364,9 @@ impl FileTypeRegistration {
     pub fn selection(&self) -> &Selection {
         &self.state().selection
     }
+    pub fn registers_build_folder(&self) -> bool {
+        kwil_core_commands::associations::windows_paths::is_build_executable(&self.state().context.executable)
+    }
     /// Edits are pure. register_selected rechecks the exact selected snapshot.
     pub fn selection_mut(&mut self) -> &mut Selection {
         &mut self.state_mut().selection
