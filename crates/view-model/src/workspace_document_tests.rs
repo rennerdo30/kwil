@@ -1544,22 +1544,116 @@ fn workspace_document_error_display_and_source_keep_actual_nested_io_error() {
 fn await_real_save_slot(
     workspace: &mut Workspace,
     transport: &mut WorkspaceDocumentTransport,
-    ready: &Receiver<()>,
     deadline: Instant,
 ) -> crate::document_worker::result_transport::DocumentDeliveryId {
+    await_real_save_slot_with(workspace, transport, deadline, |_| {})
+}
+
+fn await_real_save_slot_with(
+    workspace: &mut Workspace,
+    transport: &mut WorkspaceDocumentTransport,
+    deadline: Instant,
+    mut after_empty_observation: impl FnMut(&mut WorkspaceDocumentTransport),
+) -> crate::document_worker::result_transport::DocumentDeliveryId {
     loop {
-        if let Some(info) = transport.result_info()
-            && info.kind == ResultKind::Saved
-        {
-            return info.delivery().unwrap();
+        if transport.result_info().is_none() {
+            after_empty_observation(transport);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "real save slot exceeded the existing absolute deadline");
-        ready.recv_timeout(remaining).expect("real result/capacity wake");
-        if transport.result_info().is_none_or(|info| info.kind != ResultKind::Saved) {
-            drop(transport.receive(workspace, true).unwrap());
+        match transport.receiver.next_save_test_event(deadline) {
+            Some(info) if info.kind == ResultKind::Saved => return info.delivery().unwrap(),
+            Some(_) => {
+                // An unaccepted delivery cannot change until this sole consumer
+                // accepts it. Completed residuals are excluded under the lock.
+                drop(transport.receive(workspace, true).unwrap());
+            }
+            None => {
+                // The helper claimed a real capacity generation, not a result.
+                // Run its fixture's capacity work without a receive that could
+                // accidentally accept a Saved published since the observation.
+                let _ = workspace.flush_receipts();
+                workspace.pump_files();
+                workspace.pump_hex();
+            }
         }
     }
+}
+
+fn await_real_save_retirement(
+    transport: &WorkspaceDocumentTransport,
+    delivery: crate::document_worker::result_transport::DocumentDeliveryId,
+    deadline: Instant,
+) {
+    transport.receiver.wait_save_retired_for_test(delivery, deadline);
+}
+
+fn hold_save_before_publication(workspace: &mut Workspace, lane: &mut HeldLiveLane, path: PathBuf) -> DocumentId {
+    lane.until(workspace, "save-race/prepare", |workspace, info, _| {
+        workspace.recovery_ready() && info.is_some_and(|info| info.kind == ResultKind::Prepared)
+    });
+    lane.resume();
+    lane.until(workspace, "save-race/empty-capacity", |_, _, lane| !lane.transport.status().occupied);
+    let id = workspace.active_id();
+    workspace.views.get_mut(&id).unwrap().editor_mut().unwrap().insert_text("saved text", Duration::ZERO).unwrap();
+    workspace.save_document(id, Some(path)).unwrap();
+    assert!(lane.transport.result_info().is_none(), "the producer is held in the previous capacity wake");
+    id
+}
+
+#[test]
+fn workspace_document_save_slot_arrival_after_empty_observation_stays_unaccepted() {
+    let scratch = Scratch::new();
+    let mut workspace = workspace();
+    let budget = AllocationBudget::default();
+    let mut lane = HeldLiveLane::start(&mut workspace, &budget, scratch.0.join("recovery"));
+    let id = hold_save_before_publication(&mut workspace, &mut lane, scratch.0.join("saved.txt"));
+    workspace.set_document_commit_fault_for_test(commit::CommitFault::AfterSavePreparation);
+    // Only AFTER the helper observes the empty slot may the real producer
+    // publish Saved. Receiving based on that observation must not consume it.
+    let mut scheduled = false;
+    let delivery = await_real_save_slot_with(&mut workspace, &mut lane.transport, lane.deadline, |transport| {
+        assert!(!scheduled);
+        assert!(transport.result_info().is_none());
+        scheduled = true;
+        lane.held.store(false, Ordering::Release);
+        lane.resume.send(()).unwrap();
+        lane.ready.recv_timeout(lane.deadline.saturating_duration_since(Instant::now())).unwrap();
+        assert_eq!(transport.result_info().unwrap().kind, ResultKind::Saved);
+    });
+    assert!(scheduled);
+    assert_eq!(lane.transport.result_info().unwrap().delivery(), Some(delivery));
+    assert!(workspace.files.saves.contains_key(&id));
+    assert!(lane.transport.retained_commit_error().commit().is_none(), "Saved has not been received at all");
+    workspace.set_document_commit_fault_for_test(commit::CommitFault::None);
+    assert!(lane.transport.receive(&mut workspace, true).unwrap().is_some());
+    await_real_save_retirement(&lane.transport, delivery, lane.deadline);
+    finish_saved_workspace_until(workspace, lane.transport, lane.deadline);
+}
+
+#[test]
+fn workspace_document_save_retirement_does_not_wait_for_a_later_delivery() {
+    let scratch = Scratch::new();
+    let mut workspace = workspace();
+    let budget = AllocationBudget::default();
+    let mut lane = HeldLiveLane::start(&mut workspace, &budget, scratch.0.join("recovery"));
+    hold_save_before_publication(&mut workspace, &mut lane, scratch.0.join("saved.txt"));
+    workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::Persist(workspace.session.clone())).unwrap();
+    lane.held.store(false, Ordering::Release);
+    lane.resume();
+    let delivery = await_real_save_slot(&mut workspace, &mut lane.transport, lane.deadline);
+    assert!(lane.transport.receive(&mut workspace, true).unwrap().is_some());
+    let next = loop {
+        if let Some(info) = lane.transport.receiver.next_save_test_event(lane.deadline) {
+            break info;
+        }
+    };
+    assert_ne!(next.delivery(), Some(delivery));
+    assert!(lane.transport.status().occupied, "a later unaccepted delivery now occupies the same slot");
+    // All previous wake units are consumed. The later result cannot retire
+    // until accepted, so waiting on global occupancy deterministically stalls.
+    while lane.ready.try_recv().is_ok() {}
+    await_real_save_retirement(&lane.transport, delivery, lane.deadline);
+    assert_eq!(lane.transport.result_info().unwrap().delivery(), next.delivery(), "leave the later result untouched");
+    finish_saved_workspace_until(workspace, lane.transport, lane.deadline);
 }
 
 fn acknowledge_reset_on_real_wake(
@@ -1620,7 +1714,7 @@ fn workspace_document_real_worker_resets_exact_prepublication_save_then_publishe
     editor.insert_text("a  \nb\t\nlast ", Duration::ZERO).unwrap();
     workspace.save_document(id, Some(scratch.0.join("saved.txt"))).unwrap();
     let deadline = Instant::now() + LIMIT;
-    let delivery = await_real_save_slot(&mut workspace, &mut transport, &ready, deadline);
+    let delivery = await_real_save_slot(&mut workspace, &mut transport, deadline);
     workspace.set_document_commit_fault_for_test(commit::CommitFault::AfterSavePreparation);
     assert!(matches!(transport.receive(&mut workspace, true), Err(DocumentResultSettlementReason::ConsumerRefused)));
     let first = {
@@ -1659,11 +1753,7 @@ fn workspace_document_real_worker_resets_exact_prepublication_save_then_publishe
     assert_eq!(bytes, b"a\nb\nlast");
     assert_eq!(editor.primary_cursor().head, 2, "reprepare must remap the current cursor");
     assert_eq!(editor.document().buffer.history_depth().0, history.0 + 1);
-    while transport.status().occupied {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero());
-        ready.recv_timeout(remaining).expect("original producer residual retirement wake");
-    }
+    await_real_save_retirement(&transport, delivery, deadline);
     assert!(transport.retained_commit_error().retained_commit_error().is_none());
     finish_saved_workspace_until(workspace, transport, deadline);
 }
@@ -1686,7 +1776,7 @@ fn workspace_document_real_worker_deferred_reset_retains_flight_through_fresh_ad
     let _ = workspace.flush_receipts();
     assert!(workspace.files.saves.contains_key(&id));
     let deadline = Instant::now() + LIMIT;
-    let delivery = await_real_save_slot(&mut workspace, &mut transport, &ready, deadline);
+    let delivery = await_real_save_slot(&mut workspace, &mut transport, deadline);
     assert_eq!(transport.result_info().unwrap().generation, Some(1));
     assert!(matches!(transport.receive(&mut workspace, true), Err(DocumentResultSettlementReason::ConsumerRefused)));
     assert!(
@@ -1719,11 +1809,7 @@ fn workspace_document_real_worker_deferred_reset_retains_flight_through_fresh_ad
     let mut bytes = Vec::new();
     workspace.views[&id].editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
     assert_eq!(bytes, b"a\nb\nlast");
-    while transport.status().occupied {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero());
-        ready.recv_timeout(remaining).expect("same producer completed residual wake");
-    }
+    await_real_save_retirement(&transport, delivery, deadline);
     finish_saved_workspace_until(workspace, transport, deadline);
 }
 
