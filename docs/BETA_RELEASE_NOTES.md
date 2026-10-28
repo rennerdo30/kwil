@@ -19,8 +19,9 @@ These binaries are unsigned. Checksums detect a mismatch; they do not
 authenticate the publisher. There is no qualified MSI, ZIP installer, package
 manager distribution or macOS notarization in this beta.
 
-The default stable update channel can advance this build to a newer stable
-release. Set update.channel = "prerelease" to also receive published betas;
+Beta builds now follow published betas and stable releases by default; stable
+builds default to stable releases. An explicit update.channel setting always
+wins. Set `channel = "stable"` in `[update]` to receive only stable releases;
 update.check = false disables checks. Downloads still use SHA-256 verification,
 without independent signature verification. Managed packages with
 kwil.no-update require explicit replacement. Frozen beta.1 copies must be

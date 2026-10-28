@@ -651,7 +651,12 @@ fn settings_defaults_unknown_keys_and_typed_values() {
     assert_eq!(defaults.keymap, Preset::VsCode);
     assert_eq!(defaults.render.remote, Remote::Auto);
     assert!(defaults.update.check);
-    assert_eq!(defaults.update.channel, UpdateChannel::Stable);
+    let expected_channel = if env!("CARGO_PKG_VERSION").split('+').next().unwrap().contains('-') {
+        UpdateChannel::Prerelease
+    } else {
+        UpdateChannel::Stable
+    };
+    assert_eq!(defaults.update.channel, expected_channel);
     assert_eq!(defaults.editor.tab_size, 4);
     assert!(!defaults.editor.word_wrap);
     assert_eq!(defaults.font.family, "monospace");

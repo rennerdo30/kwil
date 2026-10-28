@@ -10,7 +10,8 @@
 //! - Off when `KWIL_NO_UPDATE` is set, when a `kwil.no-update` file sits next
 //!   to the executable (package managers, portable installs), in debug
 //!   builds, and for version 0.0.0.
-//! - The existing settings select stable (default) or prerelease updates.
+//! - The existing settings select stable or prerelease updates; the default
+//!   follows the compiled version (prerelease builds follow prereleases).
 //!   Drafts are never offered. Stable never installs a prerelease.
 //!
 //! Not yet: signature verification (needs a signing key from the owner,
@@ -560,7 +561,9 @@ mod tests {
         );
         let defaults = Settings::parse("").unwrap().settings.update;
         assert!(defaults.check);
-        assert_eq!(defaults.channel, UpdateChannel::Stable);
+        assert_eq!(defaults.channel, UpdateChannel::default());
+        let stable = Settings::parse("[update]\nchannel = 'stable'\n").unwrap().settings.update;
+        assert_eq!(stable.channel, UpdateChannel::Stable);
     }
 
     #[test]

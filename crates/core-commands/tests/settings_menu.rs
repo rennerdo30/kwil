@@ -1,6 +1,27 @@
 use kwil_core_commands::{settings_ui::*, *};
 
 #[test]
+fn update_channel_shows_effective_default_and_preserves_explicit_choices() {
+    let expected =
+        if env!("CARGO_PKG_VERSION").split('+').next().unwrap().contains('-') { "prerelease" } else { "stable" };
+    for source in ["", "[update]\ncheck = true\n"] {
+        let mut menu = SettingsMenu::new(SettingsDocument::parse(source).unwrap());
+        menu.search("update.channel");
+        let row = menu.selected().unwrap();
+        assert_eq!(row.current, SettingValue::Text(expected.into()));
+        assert_eq!(row.default, SettingValue::Text(expected.into()));
+    }
+    for channel in ["stable", "prerelease"] {
+        let source = format!("[update]\nchannel = '{channel}'\n");
+        let mut menu = SettingsMenu::new(SettingsDocument::parse(&source).unwrap());
+        menu.search("update.channel");
+        assert_eq!(menu.selected().unwrap().current, SettingValue::Text(channel.into()));
+        menu.reset_selected().unwrap();
+        assert_eq!(menu.selected().unwrap().current, SettingValue::Text(expected.into()));
+    }
+}
+
+#[test]
 fn schema_search_navigation_current_default_and_reset() {
     let doc = SettingsDocument::parse("[editor]\ntab_size = 8 # keep\n").unwrap();
     let mut menu = SettingsMenu::new(doc);
