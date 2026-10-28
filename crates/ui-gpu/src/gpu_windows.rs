@@ -165,6 +165,8 @@ pub(crate) struct Gpu {
     wait: mpsc::Sender<Wait>,
     thread: Option<thread::JoinHandle<Result<(), String>>>,
     readiness: Arc<Mutex<Readiness>>,
+    #[cfg(feature = "frame-harness")]
+    injected_present: Option<Presented>,
 }
 // Immutable handles shared only for waits; the last owner closes the handle.
 struct Event(HANDLE);
@@ -372,6 +374,8 @@ impl Gpu {
                 wait: tx,
                 thread: Some(thread),
                 readiness,
+                #[cfg(feature = "frame-harness")]
+                injected_present: None,
             })
         }
     }
@@ -384,6 +388,10 @@ impl Gpu {
         if let Some(b) = &mut self.backend {
             b.full = true;
         }
+    }
+    #[cfg(feature = "frame-harness")]
+    pub fn inject_present_once(&mut self, result: Presented) {
+        self.injected_present = Some(result);
     }
     /// ROOT forwards GpuAvailable's payload. Success does not manufacture a
     /// credit: the worker published it before waking and errors stay terminal.
@@ -435,6 +443,10 @@ impl Gpu {
         ch: usize,
         body: Rect,
     ) -> Presented {
+        #[cfg(feature = "frame-harness")]
+        if let Some(result) = self.injected_present.take() {
+            return result;
+        }
         if size.0 == 0 || size.1 == 0 || size.0.checked_mul(size.1).is_none_or(|n| n > MAX_PIXELS || n != pixels.len())
         {
             return Presented::Failed("DX12 viewport exceeds admission".into());
@@ -967,7 +979,17 @@ pub(super) fn notification_fixture(
         let _ = exited.send(thread::current().id());
         result
     });
-    (Gpu { backend: None, wait, thread: Some(worker), readiness }, NotificationFixture { identity, exited: exit })
+    (
+        Gpu {
+            backend: None,
+            wait,
+            thread: Some(worker),
+            readiness,
+            #[cfg(feature = "frame-harness")]
+            injected_present: None,
+        },
+        NotificationFixture { identity, exited: exit },
+    )
 }
 #[cfg(test)]
 impl Gpu {

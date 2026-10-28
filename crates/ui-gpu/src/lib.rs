@@ -2631,15 +2631,23 @@ impl App {
                     }
                 }
                 match &gfx.gpu_canvas {
-                    Some(canvas) => gpu.present(
-                        canvas.show((w, h)),
-                        pixels,
-                        (w, h),
-                        &damage,
-                        p.scroll,
-                        ch,
-                        tabs::rect(geometry.text),
-                    ),
+                    Some(canvas) => {
+                        let hwnd = canvas.prepare((w, h));
+                        let reveal = !canvas.visible();
+                        if reveal {
+                            damage.clear();
+                            damage.push(Rect { x: 0, y: 0, w, h });
+                        }
+                        gpu.present(
+                            hwnd,
+                            pixels,
+                            (w, h),
+                            &damage,
+                            if reveal { 0 } else { p.scroll },
+                            ch,
+                            tabs::rect(geometry.text),
+                        )
+                    }
                     None => gpu::Presented::Failed("GPU child surface unavailable".into()),
                 }
             };
@@ -2648,6 +2656,12 @@ impl App {
                 gpu.present(gfx.window.clone(), pixels, (w, h), &damage, p.scroll, ch, tabs::rect(geometry.text));
             match presented {
                 gpu::Presented::Yes => {
+                    // Retrying an older pending DX12 frame returns Deferred;
+                    // only a current full, final-size success reveals the child.
+                    #[cfg(windows)]
+                    if let Some(canvas) = &gfx.gpu_canvas {
+                        canvas.show();
+                    }
                     #[cfg(feature = "frame-harness")]
                     self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
                     drop(document_update);
@@ -2659,8 +2673,23 @@ impl App {
                 }
                 gpu::Presented::Deferred => {
                     self.pending.full = true;
-                    self.document.live.update = document_update;
-                    return true;
+                    #[cfg(windows)]
+                    let cpu_visible = gfx.gpu_canvas.as_ref().is_some_and(|canvas| !canvas.visible());
+                    #[cfg(not(windows))]
+                    let cpu_visible = false;
+                    if !cpu_visible {
+                        self.document.live.update = document_update;
+                        return true;
+                    }
+                    // The CPU remains the visible presenter during handback.
+                    // Keep it current even if geometry/edits changed while GPU
+                    // readiness or an older pending submission was deferred.
+                    damage.clear();
+                    damage.push(Rect { x: 0, y: 0, w, h });
+                    rects.clear();
+                    if let Some(full) = (Rect { x: 0, y: 0, w, h }).to_softbuffer() {
+                        rects.push(full);
+                    }
                 }
                 gpu::Presented::Failed(error) => {
                     eprintln!("kwil GPU presentation failed; using CPU: {error}");

@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$Executable,
-    [ValidateSet('resize','daily')][string]$Probe='resize',
+    [ValidateSet('resize','daily','handback')][string]$Probe='resize',
     [ValidateSet('cpu','auto')][string]$Renderer='cpu',
     [switch]$RequireCoalescing
 )
@@ -25,7 +25,9 @@ $env:KWIL_INSTANCE_NAMESPACE="gui-daily-$PID-$([guid]::NewGuid().ToString('N'))"
 $env:KWIL_NO_UPDATE='1'
 $env:KWIL_FRAME_SCRIPT='1'
 $env:KWIL_CAPTURE_DIR=$dir
-if($Probe -eq 'resize') { $env:KWIL_RESIZE_PROBE='1' } else { $env:KWIL_DAILY_USE_PROBE='1' }
+if($Probe -eq 'resize') { $env:KWIL_RESIZE_PROBE='1' }
+elseif($Probe -eq 'handback') { $env:KWIL_HANDBACK_PROBE='1' }
+else { $env:KWIL_DAILY_USE_PROBE='1' }
 if($RequireCoalescing) { $env:KWIL_RESIZE_REQUIRE_COALESCING='1' }
 $exe=(Resolve-Path -LiteralPath $Executable).Path
 $hash=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
@@ -49,7 +51,7 @@ Get-ChildItem -LiteralPath $dir -Filter '*.bmp' | ForEach-Object {
     finally { $bitmap.Dispose() }
 }
 Get-Content "$dir/stdout.txt","$dir/stderr.txt"
-foreach($name in @('harness-failure.txt','native-window.txt','daily-use.txt','resize-timing.txt','resize-idle.txt','frame-counts.txt')) {
+foreach($name in @('harness-failure.txt','native-window.txt','daily-use.txt','handback-result.txt','resize-timing.txt','resize-idle.txt','frame-counts.txt')) {
     $path=Join-Path $dir $name
     if(Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path }
 }

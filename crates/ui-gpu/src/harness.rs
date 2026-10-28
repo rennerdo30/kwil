@@ -7,26 +7,21 @@ use std::{
 use winit::application::ApplicationHandler;
 use winit::event_loop::ActiveEventLoop;
 
-static HOLD_TEXT_COMPLETION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static HELD_TEXT_COMPLETION: std::sync::Mutex<
-    Option<kwil_view_model::document_worker::result_transport::DocumentDeliveryId>,
-> = std::sync::Mutex::new(None);
-
 pub(super) fn hold_preview_completion(
+    metrics: &mut Metrics,
     info: Option<kwil_view_model::workspace_document::ResultInfo>,
     active: kwil_view_model::SessionDocumentId,
 ) -> bool {
     use kwil_view_model::workspace_document::ResultKind;
-    use std::sync::atomic::Ordering;
     let Some(info) = info else { return false };
-    let mut held = HELD_TEXT_COMPLETION.try_lock().expect("finite harness scalar gate");
+    let held = &mut metrics.held_text_completion;
     if held.is_some() {
         assert_eq!(*held, info.delivery(), "held original slot cannot be replaced");
         return true;
     }
     if info.kind == ResultKind::Opened
         && info.document == Some(active)
-        && HOLD_TEXT_COMPLETION.swap(false, Ordering::AcqRel)
+        && std::mem::take(&mut metrics.hold_text_completion)
     {
         *held = Some(info.delivery().expect("original bounded delivery identity"));
         true
@@ -116,6 +111,10 @@ pub(crate) enum Step {
     DismissSetup,
     ResizeProbe,
     ResizeFinish,
+    HandbackDeferred,
+    HandbackSucceeded,
+    HandbackFailed,
+    HandbackFailedCheck,
     ResizeCheck,
     DailyProbe,
     DailyType,
@@ -146,6 +145,10 @@ pub(crate) struct Metrics {
     phase: usize,
     per: [Counts; 5],
     resize_settled: Option<u64>,
+    // UI-owned probe state belongs to this App, never a process-global gate
+    // shared by concurrent headless hosts (or another window's delivery).
+    hold_text_completion: bool,
+    held_text_completion: Option<kwil_view_model::document_worker::result_transport::DocumentDeliveryId>,
 }
 impl Metrics {
     pub fn present(&mut self, full: bool, damage: u64, copy: u64) {
@@ -234,6 +237,17 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (200, Step::DailyUndone),
             (200, Step::DailyRedone),
             (700, Step::DailySaved),
+            (200, Step::End),
+        ];
+        let handback = [
+            (1800, Step::DismissSetup),
+            (200, Step::Idle),
+            (100, Step::ResizeProbe),
+            (100, Step::HandbackDeferred),
+            (200, Step::HandbackSucceeded),
+            (100, Step::ResizeProbe),
+            (100, Step::HandbackFailed),
+            (200, Step::HandbackFailedCheck),
             (200, Step::End),
         ];
         let desktop = [
@@ -398,6 +412,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             find.as_slice()
         } else if std::env::var_os("KWIL_DESKTOP_WINDOW_PROBE").is_some() {
             desktop.as_slice()
+        } else if std::env::var_os("KWIL_HANDBACK_PROBE").is_some() {
+            handback.as_slice()
         } else if std::env::var_os("KWIL_DAILY_USE_PROBE").is_some() {
             daily.as_slice()
         } else if std::env::var_os("KWIL_RESIZE_PROBE").is_some() {
@@ -453,7 +469,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
         Step::BinaryHex | Step::BinaryText | Step::BinaryCancel => {
             if matches!(step, Step::BinaryText) {
-                HOLD_TEXT_COMPLETION.store(true, std::sync::atomic::Ordering::Release);
+                app.metrics.hold_text_completion = true;
             }
             let key = match step {
                 Step::BinaryHex => super::Key::Named(super::NamedKey::Enter),
@@ -507,9 +523,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.view.editor().is_some());
         }
         Step::BinaryPreviewCheck => {
-            assert!(HELD_TEXT_COMPLETION.try_lock().unwrap().is_some());
+            assert!(app.metrics.held_text_completion.is_some());
             assert_eq!(
-                *HELD_TEXT_COMPLETION.try_lock().unwrap(),
+                app.metrics.held_text_completion,
                 app.document.live.transport.as_ref().unwrap().result_info().unwrap().delivery()
             );
             assert!(app.view.editor().is_none());
@@ -520,7 +536,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.render(), "actual GUI render paints while final completion is held");
         }
         Step::BinaryReleasePreview => {
-            let delivery = HELD_TEXT_COMPLETION.try_lock().unwrap().take().unwrap();
+            let delivery = app.metrics.held_text_completion.take().unwrap();
             let transport = app.document.live.transport.as_ref().unwrap();
             assert_eq!(transport.result_info().unwrap().delivery(), Some(delivery));
             transport.wake_ready();
@@ -738,6 +754,67 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                     event_ms.iter().zip(&paint_ms).all(|(event, paint)| event + paint < 8.333),
                     "every resize+redraw step must finish within a 120 Hz frame"
                 );
+            }
+        }
+        Step::HandbackDeferred | Step::HandbackFailed => {
+            #[cfg(all(windows, feature = "gpu"))]
+            {
+                assert!(!app.gpu_active());
+                resize_interaction(app, false);
+                let result = if matches!(step, Step::HandbackDeferred) {
+                    super::gpu::Presented::Deferred
+                } else {
+                    super::gpu::Presented::Failed("controlled handback failure".into())
+                };
+                app.gpu.as_mut().unwrap().inject_present_once(result);
+                let damage = app.view.set_notice(
+                    if matches!(step, Step::HandbackDeferred) {
+                        "Controlled deferred GPU handback"
+                    } else {
+                        "Controlled failed GPU handback"
+                    }
+                    .into(),
+                );
+                app.apply(damage);
+                app.pending.full = true;
+                assert!(app.render());
+                assert_cpu_image(
+                    app,
+                    dir.as_deref(),
+                    if matches!(step, Step::HandbackDeferred) {
+                        "handback-deferred.bmp"
+                    } else {
+                        "handback-failed.bmp"
+                    },
+                );
+                app.gfx.as_ref().unwrap().window.request_redraw();
+            }
+        }
+        Step::HandbackSucceeded => {
+            #[cfg(all(windows, feature = "gpu"))]
+            {
+                let gfx = app.gfx.as_ref().unwrap();
+                assert!(app.gpu_active());
+                assert_ne!(
+                    unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                            gfx.gpu_canvas.as_ref().unwrap().hwnd() as _,
+                        )
+                    },
+                    0
+                );
+                assert_eq!(app.gpu.as_ref().unwrap().matches(&gfx.pixels), Ok(true));
+                capture(app, dir.as_deref(), "handback-succeeded.bmp");
+            }
+        }
+        Step::HandbackFailedCheck => {
+            #[cfg(all(windows, feature = "gpu"))]
+            {
+                assert!(app.gpu.is_none());
+                assert_cpu_image(app, dir.as_deref(), "handback-failed-final.bmp");
+                std::fs::write(dir.as_ref().unwrap().join("handback-result.txt"),
+                    "PASS: deferred and failed handback keep the CPU child-hidden and pixel-correct; fresh GPU success reveals matching pixels\n").unwrap();
+                app.metrics.resize_settled = Some(app.metrics.per[app.metrics.phase].presents);
             }
         }
         Step::ResizeFinish => {
@@ -1762,6 +1839,30 @@ fn daily_type(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
     app.window_event(el, id, WindowEvent::Ime(Ime::Enabled));
     app.window_event(el, id, WindowEvent::Ime(Ime::Commit("daily ".into())));
     println!("kwil-daily scrollbars_track_drag=true typing=true caret=true selection=true undo_redo=true");
+}
+
+#[cfg(all(windows, feature = "gpu"))]
+fn assert_cpu_image(app: &App, dir: Option<&Path>, name: &str) {
+    let gfx = app.gfx.as_ref().unwrap();
+    assert_eq!(
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(gfx.gpu_canvas.as_ref().unwrap().hwnd() as _)
+        },
+        0,
+        "CPU must remain visible until fresh GPU success"
+    );
+    let path = dir.unwrap().join(name);
+    capture_dc(gfx.hwnd, &path, false).unwrap();
+    let bitmap = std::fs::read(path).unwrap();
+    let (w, h) = app.size;
+    let stride = (w * 3 + 3) & !3;
+    for y in 0..h {
+        for x in 0..w {
+            let offset = 54 + (h - 1 - y) * stride + x * 3;
+            let pixel = u32::from_le_bytes([bitmap[offset], bitmap[offset + 1], bitmap[offset + 2], 0]);
+            assert_eq!(pixel, gfx.pixels[y * w + x] & 0xffffff, "CPU window-DC pixel at {x},{y}");
+        }
+    }
 }
 
 fn resize_interaction(app: &App, active: bool) {
