@@ -483,7 +483,14 @@ mod external_change {
         workspace.file_prompt_mut().unwrap().text = "2".into();
         submit(&mut workspace);
         // Reload may wait in the pending slot first; wait for its result.
-        lane.until(&mut workspace, |w| !w.document_busy(id) && w.status_text().contains("Reloaded from disk"));
+        // Notices can be replaced by later ones; wait for the reloaded content.
+        lane.until(&mut workspace, |w| {
+            !w.document_busy(id)
+                && w.editor().is_some_and(|editor| {
+                    let mut bytes = Vec::new();
+                    editor.document().snapshot().write_to(&mut bytes).is_ok() && bytes == b"changed outside\n"
+                })
+        });
         assert_eq!(text(&workspace), "changed outside\n");
         assert!(!workspace.editor().unwrap().document().is_dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed outside\n");
