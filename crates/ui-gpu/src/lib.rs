@@ -41,6 +41,7 @@ mod palette_ui;
 mod palette_view;
 mod prompt_ui;
 mod registration_host;
+pub use registration_host::remove_file_types;
 mod scrollbar;
 mod search_ui;
 mod search_view;

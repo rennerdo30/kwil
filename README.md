@@ -3,8 +3,8 @@
 A plain text editor for the desktop and terminal, written in Rust. Speed and a
 quiet, responsive interface come first.
 
-**Early beta:** `0.1.0-beta.1` is prepared as a draft. The full v1 specification
-is still in progress. See [beta status](docs/BETA.md) and
+**Early beta:** `0.1.0-beta.2` is published as a prerelease. The full v1
+specification is still in progress. See [beta status](docs/BETA.md) and
 [release notes](docs/BETA_RELEASE_NOTES.md) before evaluating it with copies of
 important files.
 
@@ -43,28 +43,32 @@ budgets are also unfinished. ISO-2022-JP is explicitly unsupported.
 
 ## Try it
 
-The beta uses raw executables for Windows, macOS and Linux, on x64 and ARM64.
-After publication, download the matching assets and `SHA256SUMS` from
-[Releases](https://github.com/rennerdo30/kwil/releases).
+Download from [Releases](https://github.com/rennerdo30/kwil/releases), for x64
+or ARM64:
 
-On Windows, keep the matching pair together as `kwil.exe` and `kwil.com`:
+- **Windows:** run `kwil-<version>-windows-<arch>-setup.exe` (per user, no admin
+  rights; Start menu entry and uninstaller), or extract the `.zip` and keep
+  `kwil.exe` and `kwil.com` together.
+- **macOS / Linux:** extract `kwil-<version>-<platform>.tar.gz`.
+
+Packages arrive from beta.3 on; beta.2 ships bare executables (rename the
+Windows pair to `kwil.exe` and `kwil.com`). Then:
 
 ```powershell
 .\kwil.exe notes.txt
 .\kwil.com --tui notes.txt
 ```
 
-On macOS or Linux, make the downloaded executable runnable, rename it to `kwil`
-and run:
+On macOS or Linux:
 
 ```sh
 ./kwil notes.txt
 ./kwil --tui notes.txt
 ```
 
-Beta binaries are unsigned and installed/replaced manually. Stable installers
-and the auto-updater do not select beta releases. See the
-[installation guide](docs/INSTALL.md) for stable-release requirements.
+Builds are unsigned, so SmartScreen and Gatekeeper warn on first start. Kwil
+updates itself: beta builds follow betas, stable builds follow stable releases
+([updates](docs/UPDATES.md)). See the [installation guide](docs/INSTALL.md).
 
 To build from source, use `scripts/run.bat` on Windows or `scripts/run.sh`
 elsewhere. Add `--release` for an optimized build or `--tui` for terminal mode.

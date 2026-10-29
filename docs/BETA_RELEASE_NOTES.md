@@ -1,34 +1,46 @@
-# Kwil 0.1.0-beta.2
+# Kwil 0.1.0-beta.3
 
 Draft notes for the next candidate. Artifacts and packaged native gates are not yet qualified.
 
 An early beta for evaluation and feedback. This is not an RC or a claim that the
-full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.2/docs/SPEC.md)
+full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.3/docs/SPEC.md)
 is complete. Test with copies of important files.
 
 ## Downloads and installation
 
-The release contains raw executables for Windows, macOS and Linux, on x64 and
-ARM64, plus `SHA256SUMS`. Windows needs both matching files: rename the `.exe`
-asset to `kwil.exe` and the `.com` asset to `kwil.com`, in the same folder.
-Start the GUI with `kwil.exe`; use `kwil.com --tui` for the terminal.
-On macOS/Linux, make the matching executable runnable and use `--tui` to force
-the terminal frontend.
+- **Windows:** `kwil-<version>-windows-x64-setup.exe` (or `-arm64-`) installs
+  for your user without admin rights, with a Start menu entry and an
+  uninstaller. The `.zip` is the portable alternative: keep `kwil.exe` and
+  `kwil.com` together.
+- **macOS / Linux:** extract `kwil-<version>-<platform>.tar.gz` and run `kwil`
+  (`--tui` forces the terminal frontend).
+- The bare `kwil-<target>` files are what the built-in updater downloads.
 
-These binaries are unsigned. Checksums detect a mismatch; they do not
-authenticate the publisher. There is no qualified MSI, ZIP installer, package
-manager distribution or macOS notarization in this beta.
+Every package contains `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt`; the About
+page shows the same notices. The builds are unsigned, so Windows SmartScreen and
+macOS Gatekeeper warn on first start. `SHA256SUMS` detects damaged downloads; it
+does not authenticate the publisher. There is no package manager distribution
+or macOS notarization yet.
 
 Beta builds now follow published betas and stable releases by default; stable
 builds default to stable releases. An explicit update.channel setting always
 wins. Set `channel = "stable"` in `[update]` to receive only stable releases;
 update.check = false disables checks. Downloads still use SHA-256 verification,
-without independent signature verification. Managed packages with
-kwil.no-update require explicit replacement. Frozen beta.1 copies must be
-replaced manually to obtain this updater. Stable download installers do not
+without independent signature verification. beta.2 copies update to
+this release by themselves; frozen beta.1 copies must be replaced manually. Stable download installers do not
 select betas.
 
-## Changes since beta.1
+## Changes since beta.2
+
+- Windows setup (NSIS, per user) and zip; tar.gz archives for macOS and Linux.
+- Third-party license notices ship with every package and on the About page;
+  CI refuses dependencies under licenses that are not accepted.
+- Uninstalling removes Kwil's "Open with" entries first
+  (`kwil --unregister-file-types`).
+- Updating an installed Windows copy also updates its version in Installed apps.
+- Smaller macOS and Linux binaries (symbols stripped).
+
+## Changes in beta.2
 
 - Deadline-bounded native worker exit waiting.
 - GUI notification and receiver ownership retained through shutdown.
@@ -43,6 +55,7 @@ select betas.
 - File-type registrations use normal paths that Explorer can launch; broken
   Kwil-owned registrations repair themselves at startup (KW-70).
 - Several intermittent test failures fixed (KW-68, KW-69).
+
 ## Evaluation areas
 
 - GUI and TUI text editing, tabs, undo/redo and saving.
@@ -52,7 +65,7 @@ select betas.
 
 This list identifies areas to evaluate, not blanket platform or performance
 acceptance. Exact candidate checks and remaining release gates are recorded in
-[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.2/docs/BETA.md).
+[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.3/docs/BETA.md).
 
 ## Known limitations
 

@@ -27,6 +27,7 @@ Options:
   --tui        Force the terminal UI
   --renderer auto|cpu|gpu  Select the GUI rendering backend (overrides settings)
   --update     Check for an update now and install it
+  --unregister-file-types  Remove Kwil from \"Open with\" (Windows; the uninstaller runs this)
   --version    Print the version
   -h, --help   Print this help
   --           Treat following arguments as literal file names
@@ -41,6 +42,7 @@ struct Args {
     tui: bool,
     hidden: bool,
     update: bool,
+    unregister_file_types: bool,
     renderer: Option<kwil_ui_gpu::RenderBackend>,
     files: Vec<FileArgument>,
 }
@@ -87,6 +89,7 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
             // Agent and test runs: window composed but never shown (Windows).
             Some("--hidden") => a.hidden = true,
             Some("--update") => a.update = true,
+            Some("--unregister-file-types") => a.unregister_file_types = true,
             Some("--version" | "-V") => {
                 println!("kwil {VERSION}");
                 std::process::exit(0);
@@ -178,6 +181,23 @@ fn run_app(console_launcher: bool) -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+        };
+    }
+    if args.unregister_file_types {
+        use kwil_view_model::file_type_registration::RemoveAllOutcome;
+        return match kwil_ui_gpu::remove_file_types(std::time::Duration::from_secs(60)) {
+            Ok(RemoveAllOutcome::NothingRegistered) => {
+                println!("No Kwil file types are registered");
+                ExitCode::SUCCESS
+            }
+            Ok(RemoveAllOutcome::Removed) => {
+                println!("Removed Kwil from \"Open with\" and restored the previous handlers");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("kwil: cannot remove the file types: {e}");
+                ExitCode::FAILURE
+            }
         };
     }
 

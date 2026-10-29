@@ -1,0 +1,16 @@
+Third-party software in Kwil
+
+Kwil includes the following Rust crates. Each license text is listed once,
+after the crates that use it. Syntax grammar notices follow on the About page
+and in THIRD-PARTY-NOTICES.txt.
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{{id}}})
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+{{/each}}

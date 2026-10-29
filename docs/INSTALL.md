@@ -1,83 +1,51 @@
 # Install Kwil
 
-## Local Windows distribution
+## Downloads
 
-From the repository root, run:
+Every GitHub Release (https://github.com/rennerdo30/kwil/releases) offers:
 
-```powershell
-.\dist.bat
-# Optional: retain work/logs and set bounded build/package timeouts (seconds).
-.\dist.bat -KeepWorkDirectory -BuildTimeoutSeconds 1800 -PackageTimeoutSeconds 120
-```
+| Platform | For people | Bare binaries (used by the updater) |
+| --- | --- | --- |
+| Windows x64 / ARM64 | `kwil-<version>-windows-<arch>-setup.exe`, `kwil-<version>-windows-<arch>.zip` | `kwil-<target>.exe`, `kwil-<target>.com` |
+| macOS Apple silicon / Intel | `kwil-<version>-macos-<arch>.tar.gz` | `kwil-<target>` |
+| Linux x64 / ARM64 | `kwil-<version>-linux-<arch>.tar.gz` | `kwil-<target>` |
 
-Prerequisites must already be installed: Windows x64 or ARM64, PowerShell 7
-(`pwsh.exe`), Git, rustup, the pinned Rust toolchain for the native MSVC target,
-Windows SDK/linker tools and `makecab.exe`. Locked Cargo dependencies must be
-cached, and `E:/Development/_cache/cargo-target` must exist. The build is offline;
-it does not download or install missing tools or dependencies.
+Each archive and the installer contain `LICENSE.txt` and
+`THIRD-PARTY-NOTICES.txt` (the licenses of all bundled Rust crates and syntax
+grammars; the same text is on the About page). `SHA256SUMS` covers every file.
+Builds are not signed yet: Windows SmartScreen and macOS Gatekeeper warn on
+first start. Checksums detect damaged downloads; they do not authenticate the
+publisher.
 
-The driver archives one exact **committed HEAD**. Application, installer backend,
-guard, assets and lockfile integration must already be committed; dirty and
-untracked inputs are ignored. Only the invoked driver comes from the working
-tree. Missing committed integration is a refusal, not a fallback to dirty code.
+## Windows setup
 
-On success, `dist/kwil-<version>-<12-hex-commit>-<target>/` contains an unsigned
-MSI, `*-portable.zip`, the MSI's adjacent `<full-msi-filename>.manifest.json`
-sidecar, `INSTALL.txt`, `manifest.json` and `SHA256SUMS`. Checksums cover the MSI,
-sidecar, ZIP, instructions and outer manifest; they are not publisher signatures.
-Existing output directories are refused, never overwritten. **Building does not
-install or launch Kwil, sign artifacts or publish a release.**
+Run `kwil-<version>-windows-<arch>-setup.exe` as your normal user; it needs no
+administrator rights. It installs `kwil.exe` and `kwil.com` to
+`%LOCALAPPDATA%\Programs\Kwil`, adds a Start menu shortcut and an Installed
+apps entry. It does not change PATH or default apps; the first-run page offers
+file-type registration ("Open with").
 
-To try the MSI, open the generated `.msi` as your normal, non-elevated user.
-The installer contract specifies `%LOCALAPPDATA%/Programs/Kwil` (without a
-version subdirectory), an Apps & Features entry, a current-user Start Menu
-shortcut and an Explorer **Open with Kwil** static context-menu verb for files.
-On Windows 11, look under **Show more options**. This verb opens `kwil.exe`;
-it does not choose Kwil as a default application. The MSI does not change PATH.
-Uninstall through Windows Settings > Apps (Apps & Features / Installed apps).
-Settings, recovery data, edited documents and unrelated files/registry values
-are retained.
+Kwil updates itself in place (see [Updates](UPDATES.md)) and keeps the version
+in Installed apps current. Close Kwil before installing over an existing copy;
+the setup asks if it is still running.
 
-Keep the exact original MSI and its sidecar. Close Kwil before maintenance.
-Explicit repair of missing owned resources uses the retained original package
-(replace the placeholder with its actual path):
+Uninstall through Settings > Apps > Installed apps. The uninstaller first
+removes Kwil's "Open with" entries (`kwil --unregister-file-types`, the same
+as "Remove all" on the file-types page), then the installed files, shortcut and
+entry. Settings and recovery data in `%APPDATA%\kwil` stay. Silent use:
+`setup.exe /S`, `uninstall.exe /S`; `/D=<folder>` (last argument) picks
+another folder.
 
-```powershell
-msiexec /i "<retained-original.msi>" REINSTALL=ALL REINSTALLMODE=amus
-```
+The installer script is `installer/kwil.nsi`; `scripts/package-windows.ps1`
+builds the setup and zip, and CI installs, runs and uninstalls the x64 setup
+(`scripts/test-nsis-installer.ps1`) for every release.
 
-There is no advertised/automatic repair. A present changed installer-authored
-file, shortcut or registry value blocks repair, upgrade and uninstall; it is
-not overwritten or deleted. Preserve modifications and restore the original
-resource before retrying. A repacked MSI with a different PackageCode cannot
-substitute for the retained original. Schema-2 packaging accepts only exact `0.1.0-beta.N` (N 1..65535,
-no leading zero) or stable `0.1.0`. Beta keeps its full identity in the
-filename, manifests and Apps & Features name `Kwil Beta 0.1.0-beta.N`;
-Windows Installer's technical ProductVersion is `0.0.N`. Stable is visibly
-`Kwil 0.1.0` with numeric version `0.1.0`. Beta.9 precedes beta.10 and
-all betas precede stable. Other versions are refused until the contract changes.
-Upgrades require a strictly higher mapped numeric version; equal-version
-builds, downgrades and architecture switching in place are refused. The family
-and destination are shared, so beta and stable do not coexist. Legacy numeric
-0.1.0 cannot be replaced by a beta or equal schema-2 stable: use its retained
-original MSI to uninstall first. Exact original PackageCode remains mandatory.
+## Portable (zip, tar.gz)
 
-For portable use, extract the ZIP into a new writable folder and keep `kwil.exe`
-and `kwil.com` together. Run `kwil.exe` for the GUI or `kwil.com --tui` for explicit
-terminal use. `kwil.portable` keeps settings beside the executable; the MSI
-omits it and uses the normal user settings location. Both payloads contain
-`kwil.no-update`, disabling self-update: update these copies explicitly by
-rebuilding/reinstalling or replacing the portable distribution. The ZIP adds no
-Start Menu or Explorer registration.
-
-The schema-2 identity migration is source preparation only. It is not compiled,
-packaged or qualified by this change. Host worker admission and all five native
-lifecycle gaps remain held; no new diagnostic run is authorized. Installer/guard
-integration and native lifecycle qualification remain pending.
-These instructions describe the source contract, not a passed install, repair,
-upgrade or uninstall run, nor v1 completion. See [decision 0004](decisions/0004-windows-installer.md)
-and its normative [machine-readable contract](../scripts/windows-installer-contract.json).
-Local artifacts are not a release and confer no publication authorization.
+Extract into a writable folder. On Windows keep `kwil.exe` and `kwil.com`
+together; run `kwil.exe` for the GUI or `kwil.com --tui` in a terminal. On
+macOS and Linux run `kwil`. Portable copies update themselves too; put a
+`kwil.no-update` file next to the executable to turn that off.
 
 ## Published-release download scripts
 
@@ -137,7 +105,3 @@ Linux GNU builds retain their platform/display-library dependencies. macOS
 builds retain system-framework dependencies. Neither platform is described as
 fully static. A musl/Linux distribution requires separate GUI/display-driver
 qualification before changing the current GNU asset contract.
-
-No published release, hosted static-artifact inspection or native installation
-is established merely by adding these scripts. Hosted release and installer
-checks must pass before distribution is advertised as available.

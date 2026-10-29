@@ -27,8 +27,10 @@ labels are excluded. Build metadata does not make a version newer.
 The updater reads the settings on its next check. Set `check = false` to disable
 updates, including `--update`. Invalid or unreadable settings stop the check.
 `KWIL_NO_UPDATE`, a `kwil.no-update` file beside the executable, development
-version 0.0.0, and debug builds also disable updates. Managed MSI and portable
-packages carrying the marker must be upgraded through their package mechanism.
+version 0.0.0, and debug builds also disable updates. Package managers that
+ship the marker upgrade Kwil themselves. The Windows setup and the zip/tar.gz
+archives do not ship it: they update in place, and an installed Windows copy
+also updates the version shown in Installed apps.
 The existing stable download/install scripts do not install prereleases.
 
 Release discovery is bounded to ten pages of 100 releases and 8 MiB of metadata

@@ -246,8 +246,9 @@ pub(super) fn draw(
     let available = bottom.saturating_sub(top) / line.max(1);
     let text = if state.license {
         format!(
-            "{}\n\nThird-party components\nRust dependencies carry their own MIT, Apache-2.0, BSD or other permissive notices. See the source repository and Cargo.lock for exact versions. OS fonts are not redistributed.\n\n{}",
+            "{}\n\nThird-party components\nOS fonts are not redistributed.\n\n{}\n\n{}",
             include_str!("../../../LICENSE"),
+            include_str!(concat!(env!("OUT_DIR"), "/third-party-notices.txt")),
             include_str!("../../core-syntax/LICENSES.txt")
         )
     } else {

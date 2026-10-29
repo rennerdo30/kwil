@@ -6,7 +6,7 @@
 //! preparation may create one missing final settings directory, then its private
 //! journal child, beneath an existing reviewed ancestor. No recursive creation.
 use kwil_core_commands::associations::{AssociationAdapter, AssociationError, Change, Location, StoredValue};
-use kwil_view_model::file_type_registration::RegistrationContext;
+use kwil_view_model::file_type_registration::{FileTypeRegistration, RegistrationContext, RemoveAllOutcome};
 use std::path::{Path, PathBuf};
 
 #[cfg(any(windows, test))]
@@ -49,6 +49,28 @@ pub fn prepare(settings_path: &Path, mode: HostMode) -> Result<Prepared, String>
         let _ = settings_path;
         Err("File-type registration is unavailable: this platform's bundle/MIME context has not been verified".into())
     }
+}
+
+/// `kwil --unregister-file-types`: the file-type page's "Remove all" without a
+/// window, on this profile's journal. The Windows uninstaller runs it.
+pub fn remove_file_types(timeout: std::time::Duration) -> Result<RemoveAllOutcome, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let settings = kwil_core_commands::settings::Settings::path(&exe).map_err(|e| e.to_string())?;
+    let prepared = prepare(&settings, HostMode::Interactive)?;
+    let (send, wake) = std::sync::mpsc::channel();
+    let mut service = FileTypeRegistration::start(
+        prepared.journal,
+        prepared.context,
+        prepared.factory,
+        std::sync::Arc::new(move || {
+            let _ = send.send(());
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    let result = service.remove_all_blocking(&wake, deadline);
+    service.stop().shutdown()?;
+    result
 }
 
 /// Post-first-frame best-effort repair. Isolation refuses before native access.
