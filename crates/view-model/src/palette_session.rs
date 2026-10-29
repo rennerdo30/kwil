@@ -82,6 +82,22 @@ impl PaletteSession {
         &self.model
     }
 
+    /// Replace the catalogue after Open Folder. Old discovery/query workers
+    /// are cancelled immediately and joined away from the input thread.
+    pub fn set_root(&mut self, root: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> io::Result<()> {
+        let mut next = Self::new(root, wake)?;
+        next.set_tabs(self.tabs.clone()).map_err(|error| io::Error::other(format!("{error:?}")))?;
+        next.input_epoch = self.input_epoch.checked_add(1).expect("palette input identity exhausted");
+        let handles = self.stop();
+        std::thread::Builder::new().name("kwil-catalogue-cleanup".into()).spawn(move || {
+            for handle in handles {
+                let _ = handle.join();
+            }
+        })?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn input_epoch(&self) -> u64 {
         self.input_epoch
     }
@@ -224,6 +240,49 @@ impl Drop for PaletteSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_commands_folder_switch_replaces_the_finder_catalogue() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "kwil-folder-picker-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        for folder in ["first", "second"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        std::fs::write(root.join("first/alpha.txt"), b"alpha").unwrap();
+        std::fs::write(root.join("second/beta.txt"), b"beta").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = tx.send(());
+        });
+        let mut host = PaletteSession::new(root.join("first"), wake.clone()).unwrap();
+        let wait = |host: &mut PaletteSession, name: &str| {
+            host.open("").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                host.worker_ready();
+                if host.model().results_are_fresh()
+                    && host.model().rows().iter().any(
+                        |row| matches!(&row.action, PaletteAction::OpenFile(path) if path.file_name().unwrap() == name),
+                    )
+                {
+                    break;
+                }
+                rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            }
+        };
+        wait(&mut host, "alpha.txt");
+        host.set_root(root.join("second"), wake).unwrap();
+        wait(&mut host, "beta.txt");
+        assert!(host.model().rows().iter().all(
+            |row| !matches!(&row.action, PaletteAction::OpenFile(path) if path.file_name().unwrap() == "alpha.txt")
+        ));
+        finish(host);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn tab_metadata_refresh_preserves_a_pending_non_tab_query() {
         use std::sync::{Condvar, Mutex, mpsc};

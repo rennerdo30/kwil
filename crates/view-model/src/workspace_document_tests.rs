@@ -757,7 +757,7 @@ fn workspace_document_close_drains_an_accepted_editor_loan_through_the_original_
     let operation = 41;
     let editor = Box::new(workspace.views.get_mut(&id).unwrap().editor.take().unwrap());
     let identity = &*editor as *const crate::Editor as usize;
-    workspace.files.loans.insert(id, super::super::EditorLoan { key, operation });
+    workspace.files.loans.insert(id, super::super::EditorLoan { key, operation, formatting: false, file_action: None });
     workspace
         .files
         .worker

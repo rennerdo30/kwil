@@ -211,7 +211,38 @@ pub struct SaveResumeKey {
     pub(crate) generation: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum FileAction {
+    Reload(Option<kwil_core_text::encoding::Encoding>),
+    Keep,
+    Encoding(kwil_core_text::encoding::Encoding),
+    LineEnding(crate::DocumentLineEnding),
+}
+impl FileAction {
+    pub(crate) fn resets_journal(self) -> bool {
+        matches!(self, Self::Reload(_) | Self::Keep | Self::Encoding(_) | Self::LineEnding(_))
+    }
+    pub(crate) fn notice(self) -> &'static str {
+        match self {
+            Self::Reload(_) => "Reloaded from disk",
+            Self::Keep => "Local changes kept; disk version marked as seen",
+            Self::Encoding(_) => "Encoding selected for the next save",
+            Self::LineEnding(_) => "Line endings converted; save to write changes",
+        }
+    }
+}
+
 pub enum DocumentRequest {
+    SetFolder {
+        path: PathBuf,
+    },
+    FileAction {
+        key: kwil_core_search::worker::SearchKey,
+        operation: u64,
+        editor: Box<crate::Editor>,
+        action: FileAction,
+        journal: u64,
+    },
     ResumeSaveCompletion {
         key: SaveResumeKey,
     },
@@ -298,6 +329,13 @@ pub enum DocumentRequest {
         editor: Box<crate::Editor>,
         recipe: kwil_core_search::worker::ReplaceRecipe,
     },
+    Format {
+        key: kwil_core_search::worker::SearchKey,
+        operation: u64,
+        editor: Box<crate::Editor>,
+        selection: bool,
+        language: Option<String>,
+    },
     Prepare {
         root: Option<PathBuf>,
     },
@@ -358,6 +396,7 @@ pub enum DocumentRequest {
 }
 
 pub enum DocumentResult {
+    FolderReady(io::Result<PathBuf>),
     ResumeSaveCompletion {
         key: SaveResumeKey,
     },
@@ -744,6 +783,7 @@ impl JournalControlCredits {
 
 fn journal_document(request: &DocumentRequest) -> Option<DocumentId> {
     match request {
+        DocumentRequest::FileAction { key, .. } => Some(DocumentId(key.document_id)),
         DocumentRequest::SealedJournal(packet) => Some(packet.document),
         DocumentRequest::ResumeSaveCompletion { key } => Some(key.document),
         DocumentRequest::SeedJournal { document, .. }
@@ -766,9 +806,14 @@ fn journal_can_run(
     if deferred.iter().take(before).any(|older| journal_document(older) == Some(document)) {
         return false;
     }
+    if matches!(request, DocumentRequest::FileAction { .. })
+        && storage.is_some_and(|storage| storage.transports.contains_key(&document))
+    {
+        return false;
+    }
     // A scalar completion respects preceding same-document journal work, but
     // cannot consume a journal slot or require a new journal lineage.
-    if matches!(request, DocumentRequest::ResumeSaveCompletion { .. }) {
+    if matches!(request, DocumentRequest::ResumeSaveCompletion { .. } | DocumentRequest::FileAction { .. }) {
         return true;
     }
     let Some(storage) = storage else { return true };
@@ -1253,6 +1298,86 @@ impl DocumentWorker {
                             });
                             complete(DocumentResult::Saved { document, revision, result });
                         }
+                        DocumentRequest::SetFolder { path } => {
+                            let result = std::fs::metadata(&path).and_then(|metadata| {
+                                if path.is_absolute() && metadata.is_dir() {
+                                    Ok(path)
+                                } else {
+                                    Err(io::Error::other("Choose an existing absolute folder path"))
+                                }
+                            });
+                            complete(DocumentResult::FolderReady(result));
+                        }
+                        DocumentRequest::FileAction { key, operation, mut editor, action, journal } => {
+                            let document = DocumentId(key.document_id);
+                            let mut reseed = false;
+                            let result = (|| {
+                                editor.admit_worker_loan(key.revision)?;
+                                let state =
+                                    storage.as_mut().ok_or_else(|| io::Error::other("Workspace is not ready"))?;
+                                if action.resets_journal() {
+                                    reserve_transport(state, document)?;
+                                }
+                                match action {
+                                    FileAction::Reload(encoding) => {
+                                        editor.raw_reopen_ready()?;
+                                        let path = editor
+                                            .document()
+                                            .path()
+                                            .ok_or_else(|| io::Error::other("Open a file from disk first"))?
+                                            .to_path_buf();
+                                        let file = kwil_core_workspace::open_for_editing(&path)?;
+                                        let prepared =
+                                            state.encoding.open(path, file, encoding, &cancel, |_| Ok(()))?;
+                                        finish_journal(state, document, journal)?;
+                                        reseed = true;
+                                        editor.install_raw_reopen(prepared);
+                                    }
+                                    FileAction::Encoding(encoding) => {
+                                        editor.raw_reopen_ready()?;
+                                        finish_journal(state, document, journal)?;
+                                        reseed = true;
+                                        editor.select_save_encoding(encoding);
+                                    }
+                                    FileAction::Keep => {
+                                        editor.raw_reopen_ready()?;
+                                        let changed = editor.document().original.as_ref().is_some_and(|original| {
+                                            original.check().ok() != Some(kwil_core_text::FileState::Unchanged)
+                                        });
+                                        let path = editor
+                                            .document()
+                                            .path()
+                                            .ok_or_else(|| io::Error::other("Open a file from disk first"))?;
+                                        let seen = kwil_core_workspace::open_for_editing(path)?;
+                                        finish_journal(state, document, journal)?;
+                                        reseed = true;
+                                        editor.reset_file_policy_observer();
+                                        editor.document.original = Some(seen);
+                                        if changed {
+                                            editor.document.mark_unsaved();
+                                        }
+                                    }
+                                    FileAction::LineEnding(ending) => {
+                                        editor.raw_reopen_ready()?;
+                                        finish_journal(state, document, journal)?;
+                                        reseed = true;
+                                        editor.reset_file_policy_observer();
+                                        let converted = editor.convert_line_endings(ending);
+                                        editor.reset_file_policy_observer();
+                                        converted?;
+                                    }
+                                }
+                                Ok(crate::Damage { full: true, status: true, ..Default::default() })
+                            })();
+                            if reseed {
+                                storage
+                                    .as_mut()
+                                    .unwrap()
+                                    .transports
+                                    .insert(document, TransportSeed::document(editor.document()));
+                            }
+                            complete(DocumentResult::Replaced { key, operation, editor, result });
+                        }
                         DocumentRequest::Replace { document, operation, mut editor, recipe } => {
                             let key = recipe.key;
                             let result = if document.0 != key.document_id {
@@ -1263,6 +1388,10 @@ impl DocumentWorker {
                             } else {
                                 editor.apply_search_replacement(recipe)
                             };
+                            complete(DocumentResult::Replaced { key, operation, editor, result });
+                        }
+                        DocumentRequest::Format { key, operation, mut editor, selection, language } => {
+                            let result = editor.apply_formatting(selection, language);
                             complete(DocumentResult::Replaced { key, operation, editor, result });
                         }
                         DocumentRequest::Prepare { root } => {

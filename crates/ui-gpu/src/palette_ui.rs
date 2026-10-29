@@ -266,6 +266,14 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
+                if self.dispatch_compare(command) {
+                    return;
+                }
+                if self.view.compare.open && (command.starts_with("edit.") || command.starts_with("search.")) {
+                    let damage = self.view.set_notice("Close the read-only comparison to edit or search".into());
+                    self.apply(damage);
+                    return;
+                }
                 if self.dispatch_theme(command) {
                     return;
                 }
@@ -286,7 +294,8 @@ impl App {
                     return;
                 }
                 self.close_language();
-                if self.dispatch_language(command)
+                if self.dispatch_format(command)
+                    || self.dispatch_language(command)
                     || self.dispatch_logs(command)
                     || self.dispatch_markdown(command)
                     || self.dispatch_search(command)

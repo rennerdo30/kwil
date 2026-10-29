@@ -6,11 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+kwil-core-diff = { path = "../core-diff" }
 kwil-core-runtime = { path = "../core-runtime" }
 kwil-core-search = { path = "../core-search" }
 kwil-core-syntax = { path = "../core-syntax" }
 kwil-core-text = { path = "../core-text" }
 kwil-core-commands = { path = "../core-commands" }
+kwil-core-format = { path = "../core-format" }
 kwil-core-workspace = { path = "../core-workspace" }
 unicode-width = "0.2.2"
 unicode-segmentation = "1.13.3"

@@ -175,7 +175,7 @@ follow = false
 detect_levels = true
 [log.highlight_rules]
 "ERROR|FATAL" = "#ff6060"
-[formatters.rs]
+[formatters.rust]
 executable = "rustfmt"
 args = ["--edition", "2024"]
 timeout_ms = 5000

@@ -22,6 +22,9 @@ use workspace_wrap::WorkspaceWrapState;
 #[path = "workspace_document.rs"]
 pub mod workspace_document;
 
+#[path = "file_commands.rs"]
+mod file_commands;
+
 enum BinaryPhase {
     Opening,
     Offered(BinaryOffer),
@@ -120,6 +123,26 @@ pub enum FilePromptKind {
     Open,
     SaveAs,
     Recent,
+    Folder,
+    Encoding,
+    ReopenEncoding,
+    SaveEncoding,
+    LineEnding,
+    Reload,
+}
+
+#[cfg(test)]
+mod file_command_acceptance {
+    use super::*;
+
+    #[test]
+    fn file_commands_open_real_prompts_instead_of_falling_through() {
+        for command in ["file.setEncoding", "file.setLineEnding", "file.openFolder"] {
+            let mut workspace = Workspace::new(View::new(None)).unwrap();
+            assert!(workspace.file_command(command).unwrap(), "{command} must be hosted");
+            assert!(workspace.file_prompt().is_some(), "{command} needs a real prompt");
+        }
+    }
 }
 
 pub struct FilePrompt {
@@ -184,10 +207,13 @@ impl SaveFlight {
 struct EditorLoan {
     key: kwil_core_search::worker::SearchKey,
     operation: u64,
+    formatting: bool,
+    file_action: Option<crate::document_worker::FileAction>,
 }
 
 #[derive(Default)]
 struct FileFlow {
+    folder: Option<PathBuf>,
     live_document_metadata: Option<crate::visual_rows::MetadataReservation>,
     document_budget: Option<crate::visual_rows::AllocationBudget>,
     // Bound shutdown keeps the actual sender alive, but ordinary pumps must
@@ -244,6 +270,7 @@ pub struct EditorInputTicket {
 }
 
 pub struct Workspace {
+    pub compare: crate::compare_session::Session,
     wrap: WorkspaceWrapState,
     hex: HexFlow,
     binary: BinaryFlow,
@@ -318,6 +345,7 @@ impl Workspace {
 
     fn empty() -> Self {
         Self {
+            compare: crate::compare_session::Session::default(),
             wrap: WorkspaceWrapState::default(),
             hex: HexFlow::default(),
             binary: BinaryFlow::default(),
@@ -418,7 +446,43 @@ impl Workspace {
     }
 
     pub fn submit_search_replacement(&mut self, recipe: kwil_core_search::worker::ReplaceRecipe) -> io::Result<()> {
-        let id = DocumentId(recipe.key.document_id);
+        let key = recipe.key;
+        self.submit_editor_job(key, false, move |operation, editor| DocumentRequest::Replace {
+            document: DocumentId(key.document_id),
+            operation,
+            editor,
+            recipe,
+        })
+    }
+
+    /// Shared GUI/TUI entry point. The existing document lane wakes the host
+    /// and returns the same editor, including undo history and journal observer.
+    pub fn format_command(&mut self, selection: bool, language: Option<String>) -> io::Result<()> {
+        if self.wrap_input_blocked() {
+            return Err(io::Error::other("Wrapped body is settling; formatting was not started"));
+        }
+        let editor = self.editor().ok_or_else(|| io::Error::other("Document is not ready for formatting"))?;
+        let key = kwil_core_search::worker::SearchKey {
+            document_id: self.active_id().0,
+            revision: editor.document().revision(),
+            generation: 0,
+        };
+        self.submit_editor_job(key, true, move |operation, editor| DocumentRequest::Format {
+            key,
+            operation,
+            editor,
+            selection,
+            language,
+        })
+    }
+
+    fn submit_editor_job(
+        &mut self,
+        key: kwil_core_search::worker::SearchKey,
+        formatting: bool,
+        request: impl FnOnce(u64, Box<Editor>) -> DocumentRequest,
+    ) -> io::Result<()> {
+        let id = DocumentId(key.document_id);
         if self.hex_owns_document(id) {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Text replacement is unavailable in hex view"));
         }
@@ -443,7 +507,7 @@ impl Workspace {
             self.views.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Search tab is closed"))?;
         view.editor()
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Document is not ready"))?
-            .admit_worker_loan(recipe.key.revision)?;
+            .admit_worker_loan(key.revision)?;
         self.pump_files();
         if !self.files.queue.is_empty() {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Recovery queue is full; retry replacement"));
@@ -452,14 +516,16 @@ impl Workspace {
         let operation =
             self.files.next_loan.checked_add(1).ok_or_else(|| io::Error::other("Replacement identity exhausted"))?;
         self.files.next_loan = operation;
-        let key = recipe.key;
         let editor = Box::new(self.views.get_mut(&id).unwrap().editor.take().unwrap());
-        let request = DocumentRequest::Replace { document: id, operation, editor, recipe };
+        let request = request(operation, editor);
         match self.files.worker.as_ref().unwrap().try_submit(request) {
             Ok(()) => {
-                self.files.loans.insert(id, EditorLoan { key, operation });
+                self.files.loans.insert(id, EditorLoan { key, operation, formatting, file_action: None });
                 self.input_epoch = self.input_epoch.wrapping_add(1);
-                self.views.get_mut(&id).unwrap().set_notice("Replacing...".into());
+                self.views
+                    .get_mut(&id)
+                    .unwrap()
+                    .set_notice(if formatting { "Formatting..." } else { "Replacing..." }.into());
                 Ok(())
             }
             Err(error) => {
@@ -467,7 +533,10 @@ impl Workspace {
                     std::sync::mpsc::TrySendError::Full(request) => (request, io::ErrorKind::WouldBlock),
                     std::sync::mpsc::TrySendError::Disconnected(request) => (request, io::ErrorKind::BrokenPipe),
                 };
-                let DocumentRequest::Replace { editor, .. } = *request else { unreachable!() };
+                let (DocumentRequest::Replace { editor, .. } | DocumentRequest::Format { editor, .. }) = *request
+                else {
+                    unreachable!()
+                };
                 self.views.get_mut(&id).unwrap().editor = Some(*editor);
                 Err(io::Error::new(kind, "Replacement was not admitted; editor retained"))
             }
@@ -1168,6 +1237,7 @@ impl Workspace {
         self.files.exit_without_metadata = false;
     }
     pub fn cancel_file_prompt(&mut self) {
+        self.compare.prompt = false;
         self.hex.prompt = false;
         self.files.prompt = None;
         self.files.save_all.clear();
@@ -1183,6 +1253,7 @@ impl Workspace {
                     FilePromptKind::Open => "Open",
                     FilePromptKind::SaveAs => "Save as",
                     FilePromptKind::Recent => "Recent (number)",
+                    _ => p.kind.title(),
                 };
                 format!("{label}: {}  (Enter to submit, Esc to cancel)", p.text)
             })
@@ -1195,9 +1266,14 @@ impl Workspace {
             return Ok(());
         }
         let prompt = self.files.prompt.take().unwrap();
+        if !matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::Recent | FilePromptKind::SaveAs) {
+            return self.submit_command_prompt(prompt);
+        }
         match prompt.kind {
             FilePromptKind::Open => {
-                if std::mem::take(&mut self.hex.prompt) {
+                if std::mem::take(&mut self.compare.prompt) {
+                    self.compare_path(prompt.text.into())?;
+                } else if std::mem::take(&mut self.hex.prompt) {
                     let (_, outcome) = self.open_hex_path(prompt.text.into(), self.rows())?;
                     if outcome == crate::hex_session::OpenOutcome::NeedsRawReopen {
                         self.set_notice("Save decoded changes before reopening physical bytes".into());
@@ -1234,6 +1310,7 @@ impl Workspace {
                 }
                 self.save_document(prompt.document, Some(prompt.text.into()))?;
             }
+            _ => unreachable!(),
         }
         Ok(())
     }
@@ -1289,6 +1366,50 @@ impl Workspace {
         self.pump_files();
         self.checkpoint_session();
         Ok(id)
+    }
+
+    /// Native watch invalidation. Reuse checked open and its existing worker
+    /// disposal lane; dirty editors and all in-flight operations are preserved.
+    pub fn reload_log(&mut self) -> io::Result<()> {
+        let id = self.active_id();
+        if self.document_busy(id) || self.wrap_input_blocked() || self.files.queue.len() > 250 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Log reload waits for the current operation"));
+        }
+        let view = self.views.get(&id).ok_or_else(|| io::Error::other("Log tab closed"))?;
+        if view.editor().is_none() && !self.files.failed_opens.contains(&id) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Log file is opening"));
+        }
+        if view.editor().is_some_and(|editor| editor.document().is_dirty()) {
+            return Err(io::Error::other("Save log edits before following the file"));
+        }
+        let path =
+            view.path.as_ref().ok_or_else(|| io::Error::other("Save the log file before following it"))?.to_path_buf();
+        // Restore the exact editor if admission refuses, before any transfer.
+        let editor = self.views.get_mut(&id).unwrap().editor.take();
+        let request = match self.checked_open_request(id, 0, path) {
+            Ok(request) => request,
+            Err(error) => {
+                self.views.get_mut(&id).unwrap().editor = editor;
+                return Err(error);
+            }
+        };
+        if let Some(editor) = editor {
+            self.binary.retiring.push((id, Box::new(editor)));
+        }
+        let tab = self.session.tab_mut(id).unwrap();
+        tab.revision = 0;
+        tab.saved_revision = 0;
+        self.input_epoch = self.input_epoch.wrapping_add(1);
+        // The old file must retire, never feed the new checked open.
+        if let DocumentRequest::OpenChecked { ticket, path, file } = request {
+            if let Some(file) = file {
+                self.files.queue.push_back(DocumentRequest::RetireSource { file });
+            }
+            self.files.queue.push_back(DocumentRequest::OpenChecked { ticket, path, file: None });
+        }
+        self.wrap.path_changed();
+        self.pump_files();
+        Ok(())
     }
 
     /// App-owned CLI/IPC parsing feeds already validated native paths here.
@@ -1402,6 +1523,9 @@ impl Workspace {
     pub fn file_command(&mut self, command: &str) -> io::Result<bool> {
         if self.hex.disposing {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Raw document disposal is in progress"));
+        }
+        if self.file_feature_command(command)? {
+            return Ok(true);
         }
         match command {
             "file.openHex" => {
@@ -1764,6 +1888,15 @@ impl Workspace {
         );
         let mut damage = Damage { status: true, ..Default::default() };
         match result {
+            DocumentResult::FolderReady(result) => match result {
+                Ok(root) => {
+                    self.set_notice(format!("Workspace folder: {}", root.display()));
+                    self.files.folder = Some(root);
+                }
+                Err(error) => {
+                    self.set_notice(format!("Open Folder: {error}"));
+                }
+            },
             DocumentResult::SourceBarrier(_) => {
                 damage = Damage::default();
             }
@@ -1820,6 +1953,8 @@ impl Workspace {
                     self.set_notice("Unexpected replacement completion identity".into());
                     return std::ops::ControlFlow::Continue(damage);
                 }
+                let formatting = self.files.loans.get(&id).is_some_and(|loan| loan.formatting);
+                let action = self.finish_file_action(id, result.is_ok());
                 let view = self.views.get_mut(&id).expect("loan target cannot close");
                 debug_assert!(view.editor.is_none());
                 view.editor = Some(*editor);
@@ -1834,11 +1969,12 @@ impl Workspace {
                     self.files.replacement_journals.insert(id, sequence);
                 }
                 prepare_view_publication(view, intended_wrap, false);
-                self.files.loans.remove(&id);
                 self.input_epoch = self.input_epoch.wrapping_add(1);
                 let notice = match result {
-                    Ok(_) => "Replacement complete".to_string(),
-                    Err(error) => format!("Replacement failed: {error}"),
+                    Ok(_) if formatting => "Formatting complete".to_string(),
+                    Err(error) if formatting => format!("Format: {error}"),
+                    Ok(_) => action.map_or("Replacement complete", |action| action.notice()).to_string(),
+                    Err(error) => format!("{}: {error}", action.map_or("Replacement failed", |action| action.notice())),
                 };
                 // The worker's viewport may predate a resize. Rebuild only the
                 // existing bounded visible cache once ownership is restored.
@@ -2982,6 +3118,60 @@ mod tests {
         assert!(workspace.views[&recovered].pending_goto.is_none());
     }
     use crate::CommandArgs;
+
+    #[test]
+    fn log_reload_reopens_current_path_and_preserves_dirty_edits() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kwil-log-reload-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "INFO initial\n").unwrap();
+        let file = kwil_core_text::TextFile::open(&path).unwrap();
+        file.build_index(1).unwrap();
+        let mut workspace = Workspace::new(View::new(Some((path.clone(), file)))).unwrap();
+        let id = workspace.active_id();
+        for bytes in [b"INFO initial\nERROR appended\n".as_slice(), b"WARN truncated\n", b"INFO rotated\n"] {
+            std::fs::write(&path, bytes).unwrap();
+            workspace.reload_log().unwrap();
+            assert!(workspace.editor().is_none());
+            let request = workspace.files.queue.pop_back().unwrap();
+            let DocumentRequest::OpenChecked { ticket, file, .. } = request else { panic!("checked reopen") };
+            assert!(file.is_none(), "must not reuse the invalidated file");
+            let file = kwil_core_text::TextFile::open(&path).unwrap();
+            let document = crate::Document::from_file(path.clone(), file).unwrap();
+            workspace
+                .test_document_result(DocumentResult::CheckedOpened { ticket, result: Ok(Some(Box::new(document))) });
+            assert_eq!(workspace.active_id(), id);
+            let mut current = Vec::new();
+            workspace.editor().unwrap().document().snapshot().write_to(&mut current).unwrap();
+            assert_eq!(current, bytes);
+        }
+        // Rotation may leave the name absent until a later native notification.
+        workspace.reload_log().unwrap();
+        let DocumentRequest::OpenChecked { ticket, .. } = workspace.files.queue.pop_back().unwrap() else {
+            panic!("checked reopen")
+        };
+        workspace.test_document_result(DocumentResult::CheckedOpened {
+            ticket,
+            result: Err(io::Error::new(io::ErrorKind::NotFound, "rotation gap")),
+        });
+        workspace.reload_log().expect("a later create notification must reopen the failed placeholder");
+        let DocumentRequest::OpenChecked { ticket, .. } = workspace.files.queue.pop_back().unwrap() else {
+            panic!("checked reopen")
+        };
+        let file = kwil_core_text::TextFile::open(&path).unwrap();
+        let document = crate::Document::from_file(path.clone(), file).unwrap();
+        workspace.test_document_result(DocumentResult::CheckedOpened { ticket, result: Ok(Some(Box::new(document))) });
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("keep me".into()), ..Default::default() }, 1)
+            .unwrap();
+        assert!(workspace.reload_log().unwrap_err().to_string().contains("Save log edits"));
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        drop(workspace);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn file_commands_create_cycle_close_reopen_and_preserve_unsaved_tabs() {
@@ -4428,7 +4618,7 @@ impl Workspace {
     /// Capture only native-chooser prompt kinds. TUI's String path stays intact.
     pub fn native_file_prompt(&self) -> Option<NativeFilePrompt> {
         let prompt = self.files.prompt.as_ref()?;
-        if prompt.kind == FilePromptKind::Recent {
+        if !matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::SaveAs) {
             return None;
         }
         Some(NativeFilePrompt {
@@ -4478,7 +4668,9 @@ impl Workspace {
         }
         self.files.prompt = None;
         let hex = std::mem::take(&mut self.hex.prompt);
+        let compare = std::mem::take(&mut self.compare.prompt);
         let result = match ticket.kind {
+            FilePromptKind::Open if compare => self.compare_path(path),
             FilePromptKind::Open if hex => self.open_hex_path(path, self.rows()).map(|(_, outcome)| {
                 if outcome == crate::hex_session::OpenOutcome::NeedsRawReopen {
                     self.set_notice("Save decoded changes before reopening physical bytes".into());
@@ -4486,7 +4678,7 @@ impl Workspace {
             }),
             FilePromptKind::Open => self.open_path(path).map(|_| ()),
             FilePromptKind::SaveAs => self.save_document(ticket.document, Some(path)),
-            FilePromptKind::Recent => {
+            _ => {
                 unreachable!("native_file_prompt excludes recent-number prompts")
             }
         };

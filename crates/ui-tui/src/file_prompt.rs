@@ -81,6 +81,16 @@ pub(super) fn key(view: &mut Workspace, key: KeyEvent) -> KeyResult {
         KeyCode::Backspace => {
             view.file_prompt_mut().unwrap().text.pop();
         }
+        KeyCode::Up | KeyCode::Down => {
+            let prompt = view.file_prompt_mut().unwrap();
+            let count = prompt.kind.choices().len();
+            if count > 0 {
+                let current = prompt.text.parse::<usize>().ok().unwrap_or(0);
+                let number =
+                    if key.code == KeyCode::Up { current.saturating_sub(1).max(1) } else { (current + 1).min(count) };
+                prompt.text = number.to_string();
+            }
+        }
         KeyCode::Char(c)
             if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
         {
@@ -92,9 +102,47 @@ pub(super) fn key(view: &mut Workspace, key: KeyEvent) -> KeyResult {
     KeyResult::Changed(true)
 }
 
+pub(super) fn draw_prompt(frame: &mut ratatui::Frame, workspace: &Workspace) {
+    let Some(prompt) = workspace.file_prompt() else { return };
+    let bounds = frame.area();
+    let width = bounds.width.min(72);
+    let choices = prompt.kind.choices();
+    let height = bounds.height.min((choices.len() + 5).min(16) as u16).max(1);
+    let area =
+        Rect { x: bounds.x + (bounds.width - width) / 2, y: bounds.y + (bounds.height - height) / 3, width, height };
+    let selected = prompt.text.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+    let visible = height.saturating_sub(4) as usize;
+    let first = selected.unwrap_or(0).saturating_sub(visible.saturating_sub(1));
+    let mut lines =
+        vec![ratatui::text::Line::from(prompt.kind.title()), ratatui::text::Line::from(format!("> {}", prompt.text))];
+    lines.extend(choices.iter().enumerate().skip(first).take(visible).map(|(i, choice)| {
+        ratatui::text::Line::from(format!("{} {}: {choice}", if selected == Some(i) { ">" } else { " " }, i + 1))
+    }));
+    lines.push(ratatui::text::Line::from("↑ ↓ or number / path  Enter: apply  Esc: cancel"));
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Paragraph::new(lines).style(Style::default().fg(Color::White).bg(Color::Rgb(8, 13, 24))), area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_commands_picker_keys_and_terminal_card_preserve_document_text() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1).unwrap();
+        workspace.file_command("file.setEncoding").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().kind, kwil_view_model::FilePromptKind::SaveEncoding);
+        key(&mut workspace, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(workspace.file_prompt().unwrap().text, "1");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_prompt(frame, &workspace)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Save with encoding") && text.contains("UTF-8"));
+        key(&mut workspace, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(workspace.file_prompt().is_none());
+        assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 4);
+    }
 
     #[test]
     fn close_save_blank_enter_keeps_unicode_prompt_and_escape_cancels_close() {

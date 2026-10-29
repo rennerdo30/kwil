@@ -11,6 +11,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
 mod binary_offer;
+mod compare_ui;
 mod document_ui;
 mod file_prompt;
 mod hex_ui;
@@ -181,6 +182,10 @@ fn run_workspace_with_terminal_init(
         let budget = &startup.budget;
         let ShutdownTicket { view, document, search, wrap, highlighting, rx, .. } = &mut startup.ticket;
         let view = view.as_mut().expect("guarded original Workspace");
+        let compare_sender = tx.clone();
+        view.compare.set_wake(std::sync::Arc::new(move || {
+            let _ = compare_sender.send(Msg::Notice(String::new()));
+        }));
         let document = document.as_mut().expect("admitted startup headers");
         let search = search.as_mut().expect("original search facade");
         let rx = rx.as_ref().expect("original event receiver");
@@ -322,18 +327,21 @@ fn run_workspace_with_terminal_init(
                         };
                         match root.and_then(|root| {
                             let sender = tx.clone();
-                            kwil_view_model::palette_session::PaletteSession::new(
-                                root,
-                                std::sync::Arc::new(move || {
-                                    let _ = sender.send(Msg::PaletteReady);
-                                }),
-                            )
+                            let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                                let _ = sender.send(Msg::PaletteReady);
+                            });
+                            if let Some(host) = &mut palette {
+                                host.set_root(root, wake).map(|_| None)
+                            } else {
+                                kwil_view_model::palette_session::PaletteSession::new(root, wake).map(Some)
+                            }
                             .map_err(|error| error.to_string())
                         }) {
-                            Ok(host) => {
+                            Ok(Some(host)) => {
                                 palette = Some(host);
                                 search_changed
                             }
+                            Ok(None) => true,
                             Err(error) => {
                                 view.set_notice(format!("Palette: {error}"));
                                 true
@@ -501,6 +509,7 @@ fn run_workspace_with_terminal_init(
                         settings_panel.as_ref().is_some_and(|panel| panel.is_open()),
                     ),
                     Msg::Notice(n) => {
+                        view.poll_compare();
                         view.set_notice(n);
                         true
                     }
@@ -567,6 +576,11 @@ fn run_workspace_with_terminal_init(
                             )
                         } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
                             palette_ui::key(view, host, k, &mut keys, started.elapsed(), settings.keymap)
+                        } else if view.compare.open
+                            && !(k.modifiers.contains(KeyModifiers::CONTROL)
+                                && matches!(k.code, KeyCode::Char('p' | 'P')))
+                        {
+                            compare_ui::key(view, &mut keys, k)
                         } else if view.close_pending() && k.code == KeyCode::Esc {
                             KeyResult::Cancel
                         } else if search.is_open() {
@@ -599,6 +613,17 @@ fn run_workspace_with_terminal_init(
                         match intent {
                             KeyResult::RetryWrap | KeyResult::BodyInvoke(_, _) | KeyResult::BodyExecute(_, _, _) => {
                                 unreachable!("body intent resolved")
+                            }
+                            KeyResult::Format(selection) => {
+                                let language = highlighting
+                                    .as_ref()
+                                    .map(|host| host.language_status(view).label())
+                                    .filter(|language| *language != "Automatic")
+                                    .map(str::to_owned);
+                                if let Err(error) = view.format_command(selection, language) {
+                                    view.set_notice(format!("Format: {error}"));
+                                }
+                                true
                             }
                             KeyResult::Search(_) => unreachable!("search intent resolved above"),
                             KeyResult::Hex(_, _) => unreachable!("hex intent resolved above"),
@@ -662,7 +687,8 @@ fn run_workspace_with_terminal_init(
                                 }
                                 true
                             }
-                            KeyResult::Settings => {
+                            KeyResult::Settings | KeyResult::LogHighlights => {
+                                let log_highlights = matches!(intent, KeyResult::LogHighlights);
                                 if let Some(host) = &mut palette {
                                     let _ = host.input(kwil_view_model::palette_session::PaletteInput::Cancel);
                                 }
@@ -670,6 +696,9 @@ fn run_workspace_with_terminal_init(
                                 keys.cancel_pending();
                                 if let Some(panel) = &mut settings_panel {
                                     panel.open();
+                                    if log_highlights && let Err(error) = panel.open_log_highlights() {
+                                        view.set_notice(error);
+                                    }
                                 } else {
                                     view.set_notice("Settings are starting; try again shortly".into());
                                 }
@@ -711,7 +740,9 @@ fn run_workspace_with_terminal_init(
                                 true
                             }
                             KeyResult::File(command) => {
-                                if let Err(error) = view.file_command(command) {
+                                if !view.compare_command(command)
+                                    && let Err(error) = view.file_command(command)
+                                {
                                     view.set_notice(error.to_string());
                                 }
                                 if view.wants_exit() {
@@ -728,6 +759,9 @@ fn run_workspace_with_terminal_init(
                         }
                     }
                     Msg::Input(Event::Paste(text)) => {
+                        if view.compare.open {
+                            continue;
+                        }
                         if themes.is_open() {
                             themes.input(
                                 kwil_view_model::palette_session::PaletteInput::Text(&text),
@@ -808,6 +842,18 @@ fn run_workspace_with_terminal_init(
                         let size = terminal.size()?;
                         search_ui::mouse(search, view, &mut keys, &m, Rect::new(0, 0, size.width, size.height))
                     }
+                    Msg::Input(Event::Mouse(m)) if view.compare.open => {
+                        match m.kind {
+                            MouseEventKind::ScrollDown => {
+                                view.compare.action(kwil_view_model::compare_session::Action::Scroll(3))
+                            }
+                            MouseEventKind::ScrollUp => {
+                                view.compare.action(kwil_view_model::compare_session::Action::Scroll(-3))
+                            }
+                            _ => {}
+                        }
+                        true
+                    }
                     Msg::Input(Event::Mouse(m))
                         if {
                             let size = terminal.size()?;
@@ -839,6 +885,10 @@ fn run_workspace_with_terminal_init(
                     },
                     Msg::Input(_) => false,
                 };
+            if let Some(root) = view.take_workspace_folder() {
+                let _ = tx.send(Msg::PaletteRoot(Ok(root)));
+                changed = true;
+            }
             if view.wants_exit() {
                 exiting = true;
             }
@@ -897,6 +947,7 @@ fn run_workspace_with_terminal_init(
             {
                 view.set_notice(format!("Palette: {error:?}"));
             }
+            changed |= view.poll_compare();
             if changed {
                 if user_input {
                     view.checkpoint_session();
@@ -981,6 +1032,9 @@ fn run_workspace_with_terminal_init(
                             draw_language_status(f, host, view);
                         }
                     }
+                    if view.compare.open {
+                        compare_ui::draw(f, view, settings.tabs.layout);
+                    }
                     search_ui::draw_prepared(
                         f,
                         search,
@@ -995,6 +1049,7 @@ fn run_workspace_with_terminal_init(
                     if let Some(menu) = &language_menu {
                         draw_language(f, menu);
                     }
+                    file_prompt::draw_prompt(f, view);
                     if let Some(panel) = &settings_panel {
                         settings_ui::draw(f, panel);
                     }
@@ -1762,12 +1817,14 @@ fn combine_shutdown_results(primary: std::io::Result<()>, cleanup: std::io::Resu
 }
 
 enum KeyResult {
+    Format(bool),
     Theme(&'static str),
     RetryWrap,
     CheckUpdate,
     BodyInvoke(kwil_core_commands::vim::Invocation, bool),
     BodyExecute(&'static str, CommandArgs, u32),
     Settings,
+    LogHighlights,
     SettingsFile,
     Quit,
     Save(Option<std::path::PathBuf>),
@@ -1784,6 +1841,9 @@ enum KeyResult {
 /// Preserve Workspace's body ownership at the palette invocation boundary;
 /// existing View-only key tests retain the same text adapter.
 trait TuiTarget {
+    fn comparison_open(&self) -> bool {
+        false
+    }
     fn body_blocked(&self) -> bool {
         false
     }
@@ -1805,6 +1865,9 @@ impl TuiTarget for View {
     }
 }
 impl TuiTarget for Workspace {
+    fn comparison_open(&self) -> bool {
+        self.compare.open
+    }
     fn body_blocked(&self) -> bool {
         self.wrap_input_blocked()
     }
@@ -2258,10 +2321,20 @@ fn invoke(
     elapsed: std::time::Duration,
     preset: Preset,
 ) -> KeyResult {
+    if matches!(call.id, "edit.formatDocument" | "edit.formatSelection") {
+        return KeyResult::Format(call.id == "edit.formatSelection");
+    }
+    if call.id.starts_with("compare.") {
+        return KeyResult::File(call.id);
+    }
+    if view.comparison_open() && (call.id.starts_with("edit.") || call.id.starts_with("search.")) {
+        view.text_view_mut().set_notice("Close the read-only comparison to edit or search".into());
+        return KeyResult::Changed(true);
+    }
     if matches!(call.id, "theme.select" | "theme.preview" | "theme.import" | "theme.followSystem") {
         return KeyResult::Theme(call.id);
     }
-    if view.raw_body() && !hex_ui::chrome_command(call.id) {
+    if view.raw_body() && !hex_ui::chrome_command(call.id) && !call.id.starts_with("log.") {
         return KeyResult::Hex(call, extend);
     }
     let body_blocked = view.body_blocked();
@@ -2277,6 +2350,22 @@ fn invoke(
     }
     if matches!(call.id, "update.check" | "update.apply") {
         return KeyResult::CheckUpdate;
+    }
+    if call.id.starts_with("log.") {
+        if !view.is_log_document() {
+            view.set_notice("Open a log file first".into());
+        } else if matches!(call.id, "log.toggleMark" | "log.nextMark" | "log.previousMark") {
+            if body_blocked || prepared_body(view) {
+                view.set_notice("Open the unwrapped log text to navigate line marks".into());
+            } else if let Err(error) = view.log_mark_command(call.id, None) {
+                view.set_notice(error.to_string());
+            }
+        } else if call.id == "log.highlightRules" {
+            return KeyResult::LogHighlights;
+        } else {
+            view.set_notice("Log follow, text, level and time filters are in the window UI (kwil --gui)".into());
+        }
+        return KeyResult::Changed(true);
     }
     if call.id == "view.logFilters" || call.id.starts_with("view.markdown") || call.id == "view.toggleMarkdown" {
         view.set_notice("Markdown preview and log filters are in the window UI (kwil --gui)".into());
@@ -2307,6 +2396,11 @@ fn invoke(
     if matches!(
         call.id,
         "file.new"
+            | "file.openFolder"
+            | "file.setEncoding"
+            | "file.setLineEnding"
+            | "file.reload"
+            | "file.keepChanges"
             | "file.open"
             | "file.openHex"
             | "view.toggleHex"
@@ -2478,6 +2572,24 @@ fn resolve_wrap(
         }
         return KeyResult::Changed(true);
     }
+    if matches!(&intent, KeyResult::Format(_)) {
+        let refusal = if view.wrap_input_blocked() {
+            Some("Wrapped body is settling; formatting was not started")
+        } else {
+            match runtime.as_ref() {
+                Some(runtime) if runtime.closed() => Some("Wrapped body is closed; formatting was not started"),
+                Some(runtime) => wrap_ui::mutation_notice(runtime.gate()),
+                None if prepared_body(view) => Some("Prepared text is starting; formatting was not started"),
+                None => None,
+            }
+        };
+        return if let Some(message) = refusal {
+            view.set_notice(message.into());
+            KeyResult::Changed(true)
+        } else {
+            intent
+        };
+    }
     if !matches!(&intent, KeyResult::BodyInvoke(_, _) | KeyResult::BodyExecute(_, _, _)) {
         return intent;
     }
@@ -2583,7 +2695,10 @@ fn draw_area_highlighted(
             + view.line_offset(row);
         let selections =
             view.editor().and_then(|editor| editor.selection_ranges(view.top() + row as u64).ok()).unwrap_or_default();
-        let mut spans = vec![Span::styled(format!("{:>7} ", view.line_number(row)), gutter_style)];
+        let mut spans = vec![Span::styled(
+            format!("{:>7}{}", view.line_number(row), if view.log_marked(view.line_number(row)) { '*' } else { ' ' }),
+            gutter_style,
+        )];
         for cell in cells {
             let selected = selections.iter().any(|range| {
                 range.start < source + cell.bytes.end as u64 && source + (cell.bytes.start as u64) < range.end
@@ -3332,6 +3447,11 @@ mod tests {
     #[test]
     fn kw20_file_commands_are_dispatched_before_editor_fallback() {
         for command in [
+            "file.setEncoding",
+            "file.setLineEnding",
+            "file.reload",
+            "file.keepChanges",
+            "file.openFolder",
             "file.new",
             "file.open",
             "file.saveAs",
@@ -3415,16 +3535,90 @@ mod tests {
     }
 
     #[test]
+    fn formatting_keys_use_the_document_host_and_respect_prepared_body_startup() {
+        for preset in [Preset::VsCode, Preset::Vim] {
+            for (id, selection) in [("edit.formatDocument", false), ("edit.formatSelection", true)] {
+                let mut view = View::new(None);
+                let mut keys = KeymapEngine::new(preset, &[binding("f6", id)]).unwrap();
+                assert!(matches!(
+                    key(&mut view, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), Duration::ZERO, &mut keys, preset),
+                    KeyResult::Format(actual) if actual == selection
+                ));
+            }
+        }
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        view.set_body_policy(kwil_view_model::ViewBodyPolicy::Prepared);
+        view.editor_mut().unwrap().settings.editor.word_wrap = true;
+        assert!(matches!(
+            resolve_wrap(&mut view, None, KeyResult::Format(false), Duration::ZERO, Preset::VsCode),
+            KeyResult::Changed(true)
+        ));
+        assert!(view.notice().contains("formatting was not started"));
+        assert!(!view.search_replacement_pending());
+    }
+
+    #[test]
+    fn log_commands_require_a_log_document() {
+        for command in kwil_core_commands::COMMANDS.iter().filter(|c| c.id.starts_with("log.")) {
+            let mut view = View::new(None);
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+g", command.id)]).unwrap();
+            key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            assert_eq!(view.notice(), "Open a log file first", "{}", command.id);
+        }
+    }
+
+    #[test]
+    fn log_commands_navigate_marks_and_explain_window_only_actions() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kwil-tui-log-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "INFO first\nERROR second\n").unwrap();
+        let file = kwil_core_workspace::open_for_editing(&path).unwrap();
+        file.build_index(1).unwrap();
+        let mut view = View::new(Some((path.clone(), file)));
+        view.set_rows(3);
+        for command in ["log.toggleMark", "log.nextMark", "log.previousMark", "log.resume", "log.highlightRules"] {
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+g", command)]).unwrap();
+            let result = key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            if command == "log.resume" {
+                assert!(view.notice().contains("window UI"));
+            }
+            if command == "log.highlightRules" {
+                assert!(matches!(result, KeyResult::LogHighlights));
+            }
+        }
+        assert!(view.log_marked(1));
+        assert_eq!(view.editor().unwrap().primary_cursor().head, 0);
+        drop(view);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn vim_command_status_is_visible_in_test_backend() {
         let mut view = View::new(None);
         view.set_rows(3);
-        let mut keys = KeymapEngine::new(Preset::Vim, &[binding("z", "file.openFolder")]).unwrap();
-        key(&mut view, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
-        assert!(view.status_text().contains("command not implemented: file.openFolder"));
+        let mut keys = KeymapEngine::new(Preset::Vim, &[]).unwrap();
+        key(&mut view, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        assert!(view.status_text().contains("register is empty"));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
         terminal.draw(|frame| draw(frame, &view)).unwrap();
         let status: String = (0..80).map(|x| terminal.backend().buffer()[(x, 3)].symbol()).collect();
-        assert!(status.contains("command not implemented: file.openFolder"));
+        assert!(status.contains("register is empty"));
         key(&mut view, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
         assert!(view.status_text().contains("register is empty"));
         for c in ":unknown".chars() {

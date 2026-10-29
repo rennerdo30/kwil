@@ -12,6 +12,7 @@ mod binary_offer;
 mod chrome;
 mod clipboard;
 mod close_dialog;
+mod compare_ui;
 mod context_menu;
 mod desktop;
 mod desktop_window;
@@ -1561,6 +1562,9 @@ impl App {
             self.update_file_prompt();
             return;
         }
+        if self.compare_key(ev) {
+            return;
+        }
         if self.markdown_mode() == markdown_ui::Mode::Preview
             && !self.palette_open()
             && !self.search_panel.is_open()
@@ -1688,7 +1692,7 @@ impl App {
                         {
                             return;
                         }
-                        if self.dispatch_zoom(call.id) {
+                        if self.dispatch_format(call.id) || self.dispatch_zoom(call.id) {
                             return;
                         }
                         if self.dispatch_file(call.id) {
@@ -1799,6 +1803,31 @@ impl App {
         input::translate(key, text, mods, false).map_or(UnboundKey::Ignore, UnboundKey::Edit)
     }
 
+    fn dispatch_format(&mut self, id: &str) -> bool {
+        if !matches!(id, "edit.formatDocument" | "edit.formatSelection") {
+            return false;
+        }
+        if self.preview_blocks_command(id) || self.wrap_command(id, 1, false) {
+            return true;
+        }
+        if self.logs.owns_body() {
+            self.view.set_notice("Leave log view to format the document".into());
+            self.apply(Damage { status: true, ..Default::default() });
+            return true;
+        }
+        let language = self
+            .highlighting
+            .as_ref()
+            .map(|host| host.language_status(&self.view).label())
+            .filter(|language| *language != "Automatic")
+            .map(str::to_owned);
+        if let Err(error) = self.view.format_command(id == "edit.formatSelection", language) {
+            self.view.set_notice(format!("Format: {error}"));
+        }
+        self.apply(Damage { status: true, ..Default::default() });
+        true
+    }
+
     fn edit(&mut self, action: input::Action) {
         if self.file_modal() || self.language_owns_input() {
             return;
@@ -1813,7 +1842,9 @@ impl App {
         if self.logs.owns_body() && (id.starts_with("edit.") || id.starts_with("search.replace")) {
             return;
         }
-        if self.dispatch_language(id)
+        if self.dispatch_format(id)
+            || self.dispatch_language(id)
+            || self.dispatch_compare(id)
             || self.dispatch_logs(id)
             || self.dispatch_markdown(id)
             || self.dispatch_search(id)
@@ -1823,6 +1854,9 @@ impl App {
             || self.dispatch_zoom(id)
             || self.dispatch_file(id)
         {
+            return;
+        }
+        if self.view.compare.open {
             return;
         }
         if self.markdown_mode() == markdown_ui::Mode::Preview && id.starts_with("edit.") && id != "edit.copy" {
@@ -2032,6 +2066,7 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
+        self.compare_ready();
         // WM_PAINT can arrive between every pair of WM_SIZE messages. Retain
         // damage until this one-shot deadline instead of allocating/rasterizing
         // and recreating the swapchain for every intermediate geometry.
@@ -2250,7 +2285,9 @@ impl App {
             font.invalidate_rows();
             pixels.fill(bg());
             body_pixels.fill(bg());
-            for row in (0..rows).filter(|_| !binary_blocks_paint && !projection_owns_body && !hex_active) {
+            for row in (0..rows)
+                .filter(|_| !binary_blocks_paint && !projection_owns_body && !hex_active && !self.view.compare.open)
+            {
                 if wrap_active {
                     wrapped_paint.row(
                         body_pixels,
@@ -2292,13 +2329,9 @@ impl App {
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for row in p
-                .rows
-                .iter()
-                .copied()
-                .chain(document_rows())
-                .filter(|&r| r < rows && !binary_blocks_paint && !projection_owns_body && !hex_active)
-            {
+            for row in p.rows.iter().copied().chain(document_rows()).filter(|&r| {
+                r < rows && !binary_blocks_paint && !projection_owns_body && !hex_active && !self.view.compare.open
+            }) {
                 if wrap_active {
                     wrapped_paint.row(
                         body_pixels,
@@ -2353,9 +2386,21 @@ impl App {
             }
         }
         if projection_owns_body && body_changed {
-            log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source);
+            log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source, &self.view);
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             damage.push(tabs::rect(body));
+        }
+        if self.view.compare.open && body_changed {
+            compare_ui::draw(&self.view.compare, body_pixels, bw, font, |row| {
+                p.full || p.rows.contains(&row) || document_rows().any(|dirty| dirty == row)
+            });
+            for row in
+                (0..rows).filter(|row| p.full || p.rows.contains(row) || document_rows().any(|dirty| dirty == *row))
+            {
+                let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
+                tabs::composite(body_pixels, bw, pixels, w, body, area);
+                damage.push(tabs::translated(area, body));
+            }
         }
         let chrome_frame = self.chrome_frame.as_ref().unwrap();
         if p.full || chrome_changed {
@@ -2885,7 +2930,7 @@ fn draw_row(
     fill(buf, w, Rect { x: 0, y, w: gutter.min(w), h: ch }, gutter_bg());
     fill(buf, w, Rect { x: gutter, y, w: w.saturating_sub(gutter), h: ch }, bg());
     if let Some(text) = view.line(r) {
-        let num = format!("{:>7} ", view.line_number(r));
+        let num = format!("{:>7}{}", view.line_number(r), if view.log_marked(view.line_number(r)) { '*' } else { ' ' });
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, gutter_fg(), gutter_bg());
         draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, fg(), bg());
         if let Some(source) = view.line_source(r) {
@@ -3282,6 +3327,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        self.compare_ready();
         let d = match ev {
             UserEvent::StartupFontReady => {
                 self.try_finish_startup(el);
@@ -3345,15 +3391,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 match root.and_then(|root| {
                     let proxy = self.proxy.clone();
-                    kwil_view_model::palette_session::PaletteSession::new(
-                        root,
-                        std::sync::Arc::new(move || {
-                            let _ = proxy.send_event(UserEvent::PaletteReady);
-                        }),
-                    )
+                    let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                        let _ = proxy.send_event(UserEvent::PaletteReady);
+                    });
+                    if let Some(palette) = &mut self.palette {
+                        palette.set_root(root, wake).map(|_| None)
+                    } else {
+                        kwil_view_model::palette_session::PaletteSession::new(root, wake).map(Some)
+                    }
                     .map_err(|error| error.to_string())
                 }) {
-                    Ok(palette) => self.palette = Some(palette),
+                    Ok(Some(palette)) => self.palette = Some(palette),
+                    Ok(None) => {}
                     Err(error) => {
                         self.view.set_notice(format!("Palette: {error}"));
                     }
@@ -3400,6 +3449,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
             UserEvent::OpenExternal => self.external_open_event(),
+            UserEvent::Notice(msg) if msg.is_empty() && self.view.compare.open => Damage::default(),
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else {
@@ -3813,6 +3863,21 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if self.welcome_input(&ev) {
             return;
+        }
+        if self.view.compare.open && !self.palette_open() && !self.settings_open() && !self.menu.state.is_open() {
+            match &ev {
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y > 0.0,
+                        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                    };
+                    self.view.compare.action(kwil_view_model::compare_session::Action::Scroll(if up { -3 } else { 3 }));
+                    return;
+                }
+                WindowEvent::MouseInput { .. } if self.body_area().contains(self.pointer.0, self.pointer.1) => return,
+                WindowEvent::Ime(_) => return,
+                _ => {}
+            }
         }
         match ev {
             WindowEvent::CloseRequested => self.request_close(el, false),

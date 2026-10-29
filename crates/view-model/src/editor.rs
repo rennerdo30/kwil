@@ -7,6 +7,8 @@ use kwil_core_commands::{
     vim::{Invocation, Motion as VimMotion},
 };
 use kwil_core_text::{Buffer, Snapshot};
+
+mod file_commands;
 use std::{
     collections::{BTreeMap, VecDeque},
     io,
@@ -17,6 +19,7 @@ use std::{
 
 mod commands;
 mod compound;
+mod formatting;
 mod hex;
 mod replacement;
 use compound::CompoundEdit;

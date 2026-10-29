@@ -673,13 +673,14 @@ impl SettingsPanelController {
                 }
             }
             SettingsPanel::Formatters => {
-                if doc.settings().formatters.len() > (PANEL_ROW_LIMIT - 1) / 3 {
+                if doc.settings().formatters.len() > (PANEL_ROW_LIMIT - 1) / 4 {
                     return Err(error("formatter panel exceeds row limit"));
                 }
                 for (language, formatter) in &doc.settings().formatters {
                     for (field, value, default) in [
                         ("executable", formatter.executable.clone(), "".into()),
                         ("args", encode_args(&formatter.args), "".into()),
+                        ("range_args", encode_args(&formatter.range_args), "".into()),
                         ("timeout_ms", formatter.timeout_ms.to_string(), "5000".into()),
                     ] {
                         let mut view = base_row(format!("{language}.{field}"), value);
@@ -702,7 +703,9 @@ impl SettingsPanelController {
             view.add = true;
             view.description = match self.panel {
                 SettingsPanel::FileTypes => "Extension → language",
-                SettingsPanel::Formatters => "language.executable, language.args or language.timeout_ms",
+                SettingsPanel::Formatters => {
+                    "language.executable, language.args, language.range_args or language.timeout_ms"
+                }
                 _ => "Key → value",
             }
             .into();
@@ -772,11 +775,11 @@ fn entry_action(panel: SettingsPanel, edit: &EntryEdit) -> Result<PanelEdit, Set
             let (language, field) = key.rsplit_once('.').unwrap_or((&key, "executable"));
             let value = match field {
                 "executable" => SettingValue::Text(value),
-                "args" => SettingValue::Strings(decode_args(&value)?),
+                "args" | "range_args" => SettingValue::Strings(decode_args(&value)?),
                 "timeout_ms" => {
                     SettingValue::Integer(value.parse().map_err(|_| error("formatter timeout must be an integer"))?)
                 }
-                _ => return Err(error("formatter field must be executable, args or timeout_ms")),
+                _ => return Err(error("formatter field must be executable, args, range_args or timeout_ms")),
             };
             PanelEdit::Formatter { language: language.into(), field: field.into(), value }
         }

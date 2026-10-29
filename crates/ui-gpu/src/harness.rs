@@ -31,6 +31,10 @@ pub(super) fn hold_preview_completion(
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
+    FileCommand(&'static str),
+    FilePromptChoice(&'static str),
+    CompareOpen,
+    CompareCheck,
     MarkdownSplit,
     MarkdownSection(u64),
     MarkdownNarrow,
@@ -61,6 +65,13 @@ pub(crate) enum Step {
     LogsOpen,
     LogsCheck,
     LogsClose,
+    LogCommandsOpen,
+    LogFollowStart,
+    LogFollowAppend,
+    LogFollowCheck,
+    LogFollowPause,
+    LogFollowPausedCheck,
+    LogFollowResumeCheck,
     FolderOpen,
     FolderCheck,
     FolderSelect,
@@ -399,7 +410,41 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::BinaryColdCheck),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
+        let log_commands = [
+            (1800, Step::DismissSetup),
+            (500, Step::LogCommandsOpen),
+            (400, Step::UsabilityCapture("log-text-filter.bmp")),
+            (100, Step::LogFollowStart),
+            (600, Step::LogFollowAppend),
+            (700, Step::LogFollowCheck),
+            (100, Step::UsabilityCapture("log-follow.bmp")),
+            (100, Step::LogFollowPause),
+            (400, Step::LogFollowPausedCheck),
+            (700, Step::LogFollowResumeCheck),
+            (100, Step::UsabilityCapture("log-resumed.bmp")),
+            (100, Step::End),
+        ];
+        let files = [
+            (1800, Step::DismissSetup),
+            (300, Step::FileCommand("file.setEncoding")),
+            (200, Step::UsabilityCapture("file-encoding.bmp")),
+            (100, Step::FilePromptChoice("2")),
+            (200, Step::UsabilityCapture("file-encoding-list.bmp")),
+            (200, Step::FileCommand("file.setLineEnding")),
+            (200, Step::UsabilityCapture("file-line-endings.bmp")),
+            (200, Step::FileCommand("file.openFolder")),
+            (200, Step::UsabilityCapture("file-folder.bmp")),
+            (100, Step::End),
+        ];
+        let compare =
+            [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
+        let steps = if std::env::var_os("KWIL_LOG_COMMANDS_PROBE").is_some() {
+            log_commands.as_slice()
+        } else if std::env::var_os("KWIL_FILE_COMMANDS_PROBE").is_some() {
+            files.as_slice()
+        } else if std::env::var_os("KWIL_COMPARE_PROBE").is_some() {
+            compare.as_slice()
+        } else if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
             binary_cold.as_slice()
         } else if std::env::var_os("KWIL_BINARY_OFFER_PROBE").is_some() {
             binary.as_slice()
@@ -450,6 +495,21 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::CompareOpen => {
+            assert!(app.opts.hidden);
+            app.edit(super::input::Action::Text("Edited buffer: ".into()));
+            assert!(app.dispatch_compare("compare.saved"));
+        }
+        Step::CompareCheck => {
+            let page = app.view.compare.page.as_ref().expect("comparison worker published a page");
+            assert!(page.changes > 0);
+            assert!(page.rows.iter().any(|row| row.kind == kwil_view_model::compare_session::Kind::Modify));
+            app.apply(Damage { full: true, status: true, ..Default::default() });
+            assert!(app.render());
+            capture(app, dir.as_deref(), "compare.bmp");
+            app.dispatch_compare("compare.close");
+            app.edit(super::input::Action::Command("edit.undo"));
+        }
         Step::BinaryOpen => {
             assert!(app.opts.hidden, "binary harness never admits visible OS dialogs");
             let path = PathBuf::from(
@@ -1114,6 +1174,51 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 .unwrap();
             }
         }
+        Step::LogCommandsOpen => {
+            use super::{HostKey, Key, NamedKey};
+            assert!(app.dispatch_logs("log.filter"));
+            app.key_after_settings(
+                Some(el),
+                &HostKey { logical_key: Key::Character("ERROR".into()), text: Some("ERROR"), repeat: false },
+            );
+            app.key_after_settings(
+                Some(el),
+                &HostKey { logical_key: Key::Named(NamedKey::Enter), text: None, repeat: false },
+            );
+        }
+        Step::LogFollowStart => {
+            assert_eq!(app.logs.viewport_extent().0, 80);
+            assert!(app.dispatch_logs("log.resume"));
+        }
+        Step::LogFollowAppend | Step::LogFollowPause => {
+            if matches!(step, Step::LogFollowPause) {
+                assert!(app.dispatch_logs("log.pause"));
+            }
+            let path = app.view.editor().unwrap().document().path().unwrap();
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            use std::io::Write;
+            file.write_all(if matches!(step, Step::LogFollowPause) {
+                b"ERROR paused append\n"
+            } else {
+                b"ERROR followed append\n"
+            })
+            .unwrap();
+        }
+        Step::LogFollowCheck => {
+            assert_eq!(app.logs.viewport_extent().0, 81);
+            assert!(app.logs.viewport_position().0 > 0, "follow reveals the matching tail");
+            assert!(app.dispatch_logs("log.toggleMark"));
+        }
+        Step::LogFollowPausedCheck => {
+            assert_eq!(app.logs.viewport_extent().0, 81, "pause preserves the displayed page");
+            assert!(app.dispatch_logs("log.resume"));
+        }
+        Step::LogFollowResumeCheck => {
+            assert_eq!(app.logs.viewport_extent().0, 82);
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join("log-commands-result.txt"), "PASS: real palette filter input, 80 matching original lines; native append follows to 81; pause holds 81; resume catches up to 82; marked filtered source line").unwrap();
+            }
+        }
         Step::LogsOpen => {
             assert!(app.is_log_document());
             app.filter_log_level(Some(kwil_core_syntax::logs::Level::Error));
@@ -1508,6 +1613,18 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             }
             app.settings_epoch = app.settings_epoch.wrapping_add(1);
             app.palette_redraw();
+        }
+        Step::FileCommand(command) => {
+            app.view.cancel_file_prompt();
+            assert!(app.dispatch_file(command));
+            assert!(app.view.file_prompt().is_some());
+        }
+        Step::FilePromptChoice(number) => {
+            app.save_path = Some(number.into());
+            app.update_file_prompt();
+            let damage = super::file_prompt::submit(&mut app.view);
+            app.sync_file_ui();
+            app.apply(damage);
         }
         Step::PaletteOpen => {
             app.dispatch_palette("view.commandPalette");
