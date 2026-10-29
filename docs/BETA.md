@@ -6,13 +6,20 @@ changes and its known limitations.
 
 ## Published
 
+- **0.1.0-beta.3**, published 2026-10-29 from main `62a814e`: Windows setup and
+  zip, macOS/Linux tar.gz, license notices; beta.2 updated itself to it.
 - **0.1.0-beta.2**, published as a GitHub prerelease on 2026-10-29 from main
   `6dff1ba`: bare executables for six targets plus `SHA256SUMS`. A build
   versioned 0.1.0-beta.1 updated itself to it on Windows x64, and the replaced
   files match the published checksums.
 - **0.1.0-beta.1** was never published; its tag stays as history.
 
-## Next candidate: 0.1.0-beta.3
+## Next candidate: 0.1.0-beta.4
+
+Every palette command runs (themes, logs, compare, file encoding/line endings/
+reload/open folder, formatter, Check for Updates).
+
+## In beta.3
 
 Adds the per-user NSIS setup and zip for Windows, tar.gz archives for macOS and
 Linux, third-party license notices in every package and on the About page,
