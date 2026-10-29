@@ -211,6 +211,18 @@ struct EditorLoan {
     file_action: Option<crate::document_worker::FileAction>,
 }
 
+enum PendingEditorAction {
+    File(crate::document_worker::FileAction),
+    Format { selection: bool, language: Option<String> },
+    Replace(kwil_core_search::worker::ReplaceRecipe),
+}
+
+struct PendingEditorJob {
+    key: kwil_core_search::worker::SearchKey,
+    operation: u64,
+    action: PendingEditorAction,
+}
+
 #[derive(Default)]
 struct FileFlow {
     folder: Option<PathBuf>,
@@ -224,6 +236,9 @@ struct FileFlow {
     #[cfg(test)]
     next_document_commit_fault: workspace_document::commit::CommitFault,
     loans: HashMap<DocumentId, EditorLoan>,
+    // One replaceable intent per open tab. Editors remain in their views until
+    // the existing recovery queue and worker can admit the actual loan.
+    pending_editor_jobs: HashMap<DocumentId, PendingEditorJob>,
     next_loan: u64,
     replacement_journals: HashMap<DocumentId, u64>,
     worker: Option<DocumentWorker>,
@@ -420,7 +435,8 @@ impl Workspace {
     /// editing, layout reloads and save/close actions for this target while true.
     /// Other tabs remain available. No new event or export is required.
     pub fn document_busy(&self, id: DocumentId) -> bool {
-        self.files.loans.contains_key(&id)
+        self.files.pending_editor_jobs.contains_key(&id)
+            || self.files.loans.contains_key(&id)
             || self.files.saves.get(&id).is_some_and(|flight| flight.resume == SaveResumePhase::Transport)
             || self.hex.busy(id)
             || self.binary.flights.get(&id).is_some_and(|flight| !matches!(flight.phase, BinaryPhase::Offered(_)))
@@ -435,24 +451,28 @@ impl Workspace {
     }
 
     pub fn search_replacement_pending(&self) -> bool {
-        !self.files.loans.is_empty() || !self.hex.loans.is_empty() || self.hex.opening()
+        !self.files.pending_editor_jobs.is_empty()
+            || !self.files.loans.is_empty()
+            || !self.hex.loans.is_empty()
+            || self.hex.opening()
     }
 
     /// O(1) UI admission. Recipe validation, iteration and edits run on the
     /// existing fixed worker; queue rejection restores the exact editor.
     /// Cached identity of an accepted editor loan; this never acquires a source.
     pub fn search_replacement_operation(&self, key: kwil_core_search::worker::SearchKey) -> Option<u64> {
-        self.files.loans.get(&DocumentId(key.document_id)).filter(|loan| loan.key == key).map(|loan| loan.operation)
+        let id = DocumentId(key.document_id);
+        self.files
+            .pending_editor_jobs
+            .get(&id)
+            .filter(|job| job.key == key)
+            .map(|job| job.operation)
+            .or_else(|| self.files.loans.get(&id).filter(|loan| loan.key == key).map(|loan| loan.operation))
     }
 
     pub fn submit_search_replacement(&mut self, recipe: kwil_core_search::worker::ReplaceRecipe) -> io::Result<()> {
         let key = recipe.key;
-        self.submit_editor_job(key, false, move |operation, editor| DocumentRequest::Replace {
-            document: DocumentId(key.document_id),
-            operation,
-            editor,
-            recipe,
-        })
+        self.submit_editor_job(key, PendingEditorAction::Replace(recipe))
     }
 
     /// Shared GUI/TUI entry point. The existing document lane wakes the host
@@ -461,90 +481,197 @@ impl Workspace {
         if self.wrap_input_blocked() {
             return Err(io::Error::other("Wrapped body is settling; formatting was not started"));
         }
-        let editor = self.editor().ok_or_else(|| io::Error::other("Document is not ready for formatting"))?;
-        let key = kwil_core_search::worker::SearchKey {
-            document_id: self.active_id().0,
-            revision: editor.document().revision(),
-            generation: 0,
-        };
-        self.submit_editor_job(key, true, move |operation, editor| DocumentRequest::Format {
-            key,
-            operation,
-            editor,
-            selection,
-            language,
-        })
+        let id = self.active_id();
+        let revision = self.editor_job_revision(id);
+        let key = kwil_core_search::worker::SearchKey { document_id: self.active_id().0, revision, generation: 0 };
+        self.submit_editor_job(key, PendingEditorAction::Format { selection, language })
+    }
+
+    fn editor_job_revision(&self, id: DocumentId) -> u64 {
+        self.views[&id].editor().map_or_else(
+            || {
+                self.files.loans.get(&id).map_or_else(
+                    || self.session.tabs().iter().find(|tab| tab.id == id).unwrap().revision,
+                    |loan| loan.key.revision,
+                )
+            },
+            |editor| editor.document().revision(),
+        )
     }
 
     fn submit_editor_job(
         &mut self,
         key: kwil_core_search::worker::SearchKey,
-        formatting: bool,
-        request: impl FnOnce(u64, Box<Editor>) -> DocumentRequest,
+        action: PendingEditorAction,
     ) -> io::Result<()> {
         let id = DocumentId(key.document_id);
+        self.editor_job_ready(key, &action)?;
+        let operation = self.files.next_loan.checked_add(1).ok_or_else(|| {
+            io::Error::other(if matches!(action, PendingEditorAction::File(_)) {
+                "File operation identity exhausted"
+            } else {
+                "Replacement identity exhausted"
+            })
+        })?;
+        self.files.next_loan = operation;
+        // Replace before pumping: an older waiting intent must not start just
+        // because the newer request happens to arrive at a capacity boundary.
+        self.files.pending_editor_jobs.remove(&id);
+        self.pump_files();
+        self.files.pending_editor_jobs.insert(id, PendingEditorJob { key, operation, action });
+        self.input_epoch = self.input_epoch.wrapping_add(1);
+        self.start_pending_editor_job(id)
+    }
+
+    /// Validate real refusals even while a transient dependency is busy. A
+    /// pending intent owns no editor and cannot bypass normal loan admission.
+    fn editor_job_ready(
+        &mut self,
+        key: kwil_core_search::worker::SearchKey,
+        action: &PendingEditorAction,
+    ) -> io::Result<bool> {
+        let id = DocumentId(key.document_id);
+        let file = matches!(action, PendingEditorAction::File(_));
         if self.hex_owns_document(id) {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Text replacement is unavailable in hex view"));
         }
-        if self.files.preparing
+        if self.files.worker.is_none()
+            || self.files.document_shutdown
+            || self.files.preparing
             || self.files.deferred_recovery.is_some()
             || !self.files.storage_ready
-            || self.files.worker.is_none()
-            || self.document_busy(id)
-            || self.files.saves.contains_key(&id)
             || self.close_pending()
             || self.files.prompt.is_some()
         {
             return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Document/recovery worker is busy; retry replacement",
+                if file { io::ErrorKind::Other } else { io::ErrorKind::WouldBlock },
+                if file {
+                    "File worker is busy; retry after opening or saving completes"
+                } else {
+                    "Document/recovery worker is busy; retry replacement"
+                },
             ));
         }
-        // A document opened at start-up and never edited has no observer until
-        // the next session checkpoint; install it now, as the checkpoint would.
-        // Only then: installing also queues seeds for other unsaved tabs.
         if !self.files.observed.contains_key(&id) {
             self.install_journal_observers();
         }
-        if !self.files.observed.contains_key(&id) || self.files.journal_failed.contains_key(&id) {
-            return Err(io::Error::other("Replacement requires an admitted recovery observer"));
-        }
         let view =
             self.views.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Search tab is closed"))?;
-        view.editor()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Document is not ready"))?
-            .admit_worker_loan(key.revision)?;
-        self.pump_files();
-        if !self.files.queue.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Recovery queue is full; retry replacement"));
+        if self.files.journal_failed.contains_key(&id)
+            || (self.files.storage_ready && view.editor().is_some() && !self.files.observed.contains_key(&id))
+        {
+            return Err(io::Error::other(if file {
+                "File worker is busy; retry after opening or saving completes"
+            } else {
+                "Replacement requires an admitted recovery observer"
+            }));
         }
+        if let Some(editor) = view.editor() {
+            match editor.admit_worker_loan(key.revision) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        } else if self.files.failed_opens.contains(&id) || (!self.files.loans.contains_key(&id) && view.path.is_none())
+        {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Document is not ready"));
+        } else {
+            let revision = self.files.loans.get(&id).map_or_else(
+                || self.session.tabs().iter().find(|tab| tab.id == id).unwrap().revision,
+                |loan| loan.key.revision,
+            );
+            if revision != key.revision {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "Search revision is stale; search again"));
+            }
+            return Ok(false);
+        }
+        Ok(self.files.storage_ready
+            && !self.files.preparing
+            && self.files.deferred_recovery.is_none()
+            && !self.files.loans.contains_key(&id)
+            && !self.files.saves.contains_key(&id)
+            && !self.hex.busy(id)
+            && self.files.queue.is_empty())
+    }
+
+    fn start_pending_editor_job(&mut self, id: DocumentId) -> io::Result<()> {
+        let Some(job) = self.files.pending_editor_jobs.remove(&id) else { return Ok(()) };
+        if !self.editor_job_ready(job.key, &job.action)? {
+            self.files.pending_editor_jobs.insert(id, job);
+            self.views.get_mut(&id).unwrap().set_notice("Waiting for recovery to finish…".into());
+            return Ok(());
+        }
+        let PendingEditorJob { key, operation, action } = job;
         self.sync_all();
-        let operation =
-            self.files.next_loan.checked_add(1).ok_or_else(|| io::Error::other("Replacement identity exhausted"))?;
-        self.files.next_loan = operation;
+        let formatting = matches!(action, PendingEditorAction::Format { .. });
+        let file_action = if let PendingEditorAction::File(action) = &action { Some(*action) } else { None };
         let editor = Box::new(self.views.get_mut(&id).unwrap().editor.take().unwrap());
-        let request = request(operation, editor);
+        let request = match action {
+            PendingEditorAction::Replace(recipe) => {
+                DocumentRequest::Replace { document: id, operation, editor, recipe }
+            }
+            PendingEditorAction::Format { selection, language } => {
+                DocumentRequest::Format { key, operation, editor, selection, language }
+            }
+            PendingEditorAction::File(action) => DocumentRequest::FileAction {
+                key,
+                operation,
+                editor,
+                action,
+                journal: self.files.observed.get(&id).map_or(0, |(_, generation)| *generation),
+            },
+        };
         match self.files.worker.as_ref().unwrap().try_submit(request) {
             Ok(()) => {
-                self.files.loans.insert(id, EditorLoan { key, operation, formatting, file_action: None });
+                self.files.loans.insert(id, EditorLoan { key, operation, formatting, file_action });
                 self.input_epoch = self.input_epoch.wrapping_add(1);
-                self.views
-                    .get_mut(&id)
-                    .unwrap()
-                    .set_notice(if formatting { "Formatting..." } else { "Replacing..." }.into());
+                self.views.get_mut(&id).unwrap().set_notice(
+                    if file_action.is_some() {
+                        "Updating file..."
+                    } else if formatting {
+                        "Formatting..."
+                    } else {
+                        "Replacing..."
+                    }
+                    .into(),
+                );
                 Ok(())
             }
             Err(error) => {
-                let (request, kind) = match error {
-                    std::sync::mpsc::TrySendError::Full(request) => (request, io::ErrorKind::WouldBlock),
-                    std::sync::mpsc::TrySendError::Disconnected(request) => (request, io::ErrorKind::BrokenPipe),
+                let (request, full) = match error {
+                    std::sync::mpsc::TrySendError::Full(request) => (request, true),
+                    std::sync::mpsc::TrySendError::Disconnected(request) => (request, false),
                 };
-                let (DocumentRequest::Replace { editor, .. } | DocumentRequest::Format { editor, .. }) = *request
-                else {
-                    unreachable!()
+                let (editor, action) = match *request {
+                    DocumentRequest::Replace { editor, recipe, .. } => (editor, PendingEditorAction::Replace(recipe)),
+                    DocumentRequest::Format { editor, selection, language, .. } => {
+                        (editor, PendingEditorAction::Format { selection, language })
+                    }
+                    DocumentRequest::FileAction { editor, action, .. } => (editor, PendingEditorAction::File(action)),
+                    _ => unreachable!(),
                 };
                 self.views.get_mut(&id).unwrap().editor = Some(*editor);
-                Err(io::Error::new(kind, "Replacement was not admitted; editor retained"))
+                if full {
+                    self.files.pending_editor_jobs.insert(id, PendingEditorJob { key, operation, action });
+                    self.views.get_mut(&id).unwrap().set_notice("Waiting for recovery to finish…".into());
+                    Ok(())
+                } else if file_action.is_some() {
+                    Err(io::Error::other("File operation was not admitted; document retained"))
+                } else {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "Replacement was not admitted; editor retained"))
+                }
+            }
+        }
+    }
+
+    fn pump_pending_editor_jobs(&mut self) {
+        // IDs only: never acquire snapshots or clone a replacement recipe.
+        let ids: Vec<_> = self.files.pending_editor_jobs.keys().copied().collect();
+        for id in ids {
+            if let Err(error) = self.start_pending_editor_job(id)
+                && let Some(view) = self.views.get_mut(&id)
+            {
+                view.set_notice(error.to_string());
             }
         }
     }
@@ -790,6 +917,7 @@ impl Workspace {
 
     /// Refuse dirty close until the caller saves or explicitly chooses discard.
     pub fn close(&mut self, id: DocumentId, discard: bool) -> io::Result<bool> {
+        self.files.pending_editor_jobs.remove(&id);
         if self.files.queue.len() >= 254 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Recovery queue must drain before closing"));
         }
@@ -1068,6 +1196,7 @@ impl Workspace {
 
     fn pump_files(&mut self) {
         if self.files.document_shutdown {
+            self.files.pending_editor_jobs.clear();
             return;
         }
         if self.files.preparing {
@@ -1116,6 +1245,7 @@ impl Workspace {
                 }
             }
         }
+        self.pump_pending_editor_jobs();
     }
 
     /// Cheap metadata snapshot. Coalesce writes while one worker write is active.
@@ -1689,6 +1819,7 @@ impl Workspace {
         if self.files.quit { self.request_close_policy(true, false) } else { self.discard_close_target() }
     }
     fn request_close_policy(&mut self, discard: bool, allow_hot_exit: bool) -> io::Result<()> {
+        self.files.pending_editor_jobs.clear();
         if discard && self.files.manual_guard {
             self.files.exit_without_metadata = true;
         }
@@ -1725,6 +1856,9 @@ impl Workspace {
     }
 
     fn advance_close(&mut self, mut discard: bool) -> io::Result<()> {
+        for id in &self.files.close {
+            self.files.pending_editor_jobs.remove(id);
+        }
         while let Some(id) = self.files.close.front().copied() {
             if self.document_busy(id) {
                 self.set_notice("Replacement in progress; close will wait. Esc cancels close".into());
@@ -2280,6 +2414,7 @@ impl Workspace {
             self.cancel_close_intent();
         }
         self.check_hot_exit();
+        damage.status |= !self.files.pending_editor_jobs.is_empty();
         self.pump_files();
         self.pump_hex();
         std::ops::ControlFlow::Continue(damage)

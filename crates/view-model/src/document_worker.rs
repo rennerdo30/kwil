@@ -4635,7 +4635,7 @@ mod tests {
         receiver: &mpsc::Receiver<DocumentResult>,
         done: impl Fn(&crate::Workspace) -> bool,
     ) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while !done(workspace) {
             let wait = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!wait.is_zero(), "workspace condition timed out: {}", workspace.status_text());

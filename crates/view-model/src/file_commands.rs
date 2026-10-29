@@ -83,7 +83,7 @@ impl Workspace {
             generation: self.files.next_prompt,
             kind,
             document: self.active_id(),
-            revision: self.editor().map_or(0, |e| e.document().revision()),
+            revision: self.editor_job_revision(self.active_id()),
             text: String::new(),
         });
         self.prompt_notice();
@@ -105,14 +105,14 @@ impl Workspace {
             self.set_notice("Switch to text view before changing text file options".into());
             return Ok(true);
         }
-        let Some(editor) = self.editor() else {
-            self.set_notice("Wait for the document to finish opening".into());
-            return Ok(true);
-        };
+        let id = self.active_id();
+        let tab = self.session.tabs().iter().find(|tab| tab.id == id).unwrap();
+        let named = self.editor().map_or(self.views[&id].path.is_some(), |editor| editor.document().path().is_some());
+        let dirty = self.editor().map_or(tab.revision != tab.saved_revision, |editor| editor.document().is_dirty());
         if command == "file.reload" || command == "file.keepChanges" {
-            if editor.document().path().is_none() {
+            if !named {
                 self.set_notice("Open a file from disk first".into());
-            } else if command == "file.reload" && editor.document().is_dirty() {
+            } else if command == "file.reload" && dirty {
                 self.command_prompt(FilePromptKind::Reload);
             } else {
                 self.submit_file_action(if command == "file.reload" {
@@ -123,8 +123,7 @@ impl Workspace {
             }
         } else {
             let mut kind = kind.unwrap();
-            if kind == FilePromptKind::Encoding && (editor.document().is_dirty() || editor.document().path().is_none())
-            {
+            if kind == FilePromptKind::Encoding && (dirty || !named) {
                 kind = FilePromptKind::SaveEncoding;
             }
             self.command_prompt(kind);
@@ -146,9 +145,7 @@ impl Workspace {
                 self.pump_files();
                 return Ok(());
             }
-            if prompt.document != self.active_id()
-                || self.editor().is_none_or(|e| e.document().revision() != prompt.revision)
-            {
+            if prompt.document != self.active_id() || self.editor_job_revision(prompt.document) != prompt.revision {
                 return Err(io::Error::other("Document changed; reopen the file command"));
             }
             let index = prompt
@@ -163,8 +160,14 @@ impl Workspace {
                 FilePromptKind::Encoding => {
                     let kind = if index == 0 { FilePromptKind::ReopenEncoding } else { FilePromptKind::SaveEncoding };
                     if index == 0
-                        && (self.editor().unwrap().document().is_dirty()
-                            || self.editor().unwrap().document().path().is_none())
+                        && (self.views[&prompt.document].path.is_none()
+                            || self.editor().map_or_else(
+                                || {
+                                    let tab = self.session.tabs().iter().find(|tab| tab.id == prompt.document).unwrap();
+                                    tab.revision != tab.saved_revision
+                                },
+                                |editor| editor.document().is_dirty(),
+                            ))
                     {
                         return Err(io::Error::other("Save your changes before reopening with an encoding"));
                     }
@@ -195,50 +198,9 @@ impl Workspace {
 
     fn submit_file_action(&mut self, action: FileAction) -> io::Result<()> {
         let id = self.active_id();
-        if !self.files.storage_ready
-            || self.files.worker.is_none()
-            || self.document_busy(id)
-            || self.files.saves.contains_key(&id)
-            || self.close_pending()
-        {
-            return Err(io::Error::other("File worker is busy; retry after opening or saving completes"));
-        }
-        let editor = self.editor().ok_or_else(|| io::Error::other("Document is not ready"))?;
-        editor.admit_worker_loan(editor.document().revision())?;
-        self.pump_files();
-        if !self.files.queue.is_empty() {
-            return Err(io::Error::other("Recovery queue is busy; retry"));
-        }
-        self.sync_all();
-        self.files.next_loan =
-            self.files.next_loan.checked_add(1).ok_or_else(|| io::Error::other("File operation identity exhausted"))?;
-        let operation = self.files.next_loan;
-        let key = kwil_core_search::worker::SearchKey {
-            document_id: id.0,
-            revision: self.editor().unwrap().document().revision(),
-            generation: operation,
-        };
-        let journal = self.files.observed.get(&id).map_or(0, |(_, generation)| *generation);
-        let editor = Box::new(self.views.get_mut(&id).unwrap().editor.take().unwrap());
-        let request = DocumentRequest::FileAction { key, operation, editor, action, journal };
-        match self.files.worker.as_ref().unwrap().try_submit(request) {
-            Ok(()) => {
-                self.files
-                    .loans
-                    .insert(id, EditorLoan { key, operation, formatting: false, file_action: Some(action) });
-                self.input_epoch = self.input_epoch.wrapping_add(1);
-                self.set_notice("Updating file...".into());
-                Ok(())
-            }
-            Err(error) => {
-                let request = match error {
-                    std::sync::mpsc::TrySendError::Full(r) | std::sync::mpsc::TrySendError::Disconnected(r) => r,
-                };
-                let DocumentRequest::FileAction { editor, .. } = *request else { unreachable!() };
-                self.views.get_mut(&id).unwrap().editor = Some(*editor);
-                Err(io::Error::other("File operation was not admitted; document retained"))
-            }
-        }
+        let revision = self.editor_job_revision(id);
+        let key = kwil_core_search::worker::SearchKey { document_id: id.0, revision, generation: 0 };
+        self.submit_editor_job(key, PendingEditorAction::File(action))
     }
 
     pub(super) fn finish_file_action(&mut self, id: DocumentId, _success: bool) -> Option<FileAction> {

@@ -1476,6 +1476,7 @@ impl Workspace {
             2 * max_records
                 * (size_of::<super::super::SaveFlight>()
                     + size_of::<super::super::EditorLoan>()
+                    + size_of::<super::super::PendingEditorJob>()
                     + size_of::<String>()
                     + 8 * size_of::<(DocumentId, u64, u64)>()
                     + 128),
@@ -1490,6 +1491,11 @@ impl Workspace {
         add(&mut bytes, self.files.queue.capacity().checked_mul(size_of::<DocumentRequest>()).ok_or_else(overflow)?)?;
         map(&mut bytes, self.files.saves.capacity(), size_of::<(DocumentId, super::super::SaveFlight)>())?;
         map(&mut bytes, self.files.loans.capacity(), size_of::<(DocumentId, super::super::EditorLoan)>())?;
+        map(
+            &mut bytes,
+            self.files.pending_editor_jobs.capacity(),
+            size_of::<(DocumentId, super::super::PendingEditorJob)>(),
+        )?;
         map(&mut bytes, self.files.observed.capacity(), size_of::<(DocumentId, (u64, u64))>())?;
         map(&mut bytes, self.files.durable.capacity(), size_of::<(DocumentId, (u64, u64))>())?;
         map(&mut bytes, self.files.replacement_journals.capacity(), size_of::<(DocumentId, u64)>())?;

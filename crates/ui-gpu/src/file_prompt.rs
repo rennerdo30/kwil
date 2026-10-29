@@ -271,29 +271,19 @@ mod tests {
         workspace
             .execute("edit.insert", &CommandArgs { text: Some("one\ntwo\n".into()), ..Default::default() }, 1)
             .unwrap();
-        // File actions are refused ("retry") while recovery work is still queued;
-        // persist and retry like a user would, a bounded number of times.
-        let admit = |workspace: &mut Workspace, command: &str, choice: &str| {
-            for _ in 0..10 {
-                workspace.checkpoint_session();
-                lane.through(workspace, kwil_view_model::workspace_document::ResultKind::Persisted);
-                assert!(workspace.file_command(command).unwrap());
-                workspace.file_prompt_mut().unwrap().text = choice.into();
-                submit(workspace);
-                if workspace.file_prompt().is_none() {
-                    return;
-                }
-                workspace.cancel_file_prompt();
-            }
-            panic!("{command} was never admitted: {}", workspace.status_text());
+        let choose = |workspace: &mut Workspace, command: &str, choice: &str| {
+            assert!(workspace.file_command(command).unwrap());
+            workspace.file_prompt_mut().unwrap().text = choice.into();
+            submit(workspace);
+            assert!(workspace.file_prompt().is_none(), "{command} must be accepted without retries");
         };
-        admit(&mut workspace, "file.setLineEnding", "2");
+        choose(&mut workspace, "file.setLineEnding", "2");
         let id = workspace.active_id();
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         let mut bytes = Vec::new();
         workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
         assert_eq!(bytes, b"one\r\ntwo\r\n");
-        admit(&mut workspace, "file.setEncoding", "2");
+        choose(&mut workspace, "file.setEncoding", "2");
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         let path = root.join("saved.txt");
         workspace.save_document(id, Some(path.clone())).unwrap();
@@ -313,7 +303,7 @@ mod tests {
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         assert!(workspace.editor().unwrap().document().is_dirty(), "keeping an older clean buffer needs a save");
         assert_eq!(std::fs::read(&path).unwrap(), b"outside\n");
-        admit(&mut workspace, "file.reload", "1");
+        choose(&mut workspace, "file.reload", "1");
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         bytes.clear();
         workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
