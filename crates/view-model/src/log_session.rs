@@ -1803,7 +1803,8 @@ mod tests {
         let mailbox = shared.mailbox.lock().unwrap();
         assert!(mailbox.pending.is_none() && mailbox.retired.iter().all(Option::is_none));
         assert!(mailbox.report.is_none() && mailbox.viewport_report.is_none());
-        assert!(INDEX_LEASES.lock().unwrap().iter().all(Option::is_none));
+        // INDEX_LEASES is process-wide; parallel tests legitimately hold their own
+        // slots here. Lease release is checked per slot by the quota test below.
     }
 
     #[test]
