@@ -803,6 +803,7 @@ impl Workspace {
     /// does not approve exit or discard unsaved work: metadata and admitted
     /// recovery must be durable before ownership is transferred.
     pub fn prepare_hex_shutdown(&mut self) -> bool {
+        self.files.pending_editor_jobs.clear();
         if !self.prepare_binary_shutdown() {
             return false;
         }

@@ -308,6 +308,7 @@ impl Workspace {
         let WorkspaceDocumentTransport { receiver, charge, budget } = transport;
         match receiver.begin_bound(workspace.files.worker.as_ref().unwrap()) {
             Ok((ticket, permit)) => {
+                workspace.files.pending_editor_jobs.clear();
                 workspace.files.document_shutdown = true;
                 ControlFlow::Continue(WorkspaceDocumentShutdown {
                     workspace: Some(workspace),

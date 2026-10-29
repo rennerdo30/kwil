@@ -81,6 +81,196 @@ fn take_loan(receiver: &mpsc::Receiver<DocumentRequest>) -> (u64, Box<Editor>, R
     }
 }
 
+#[test]
+fn worker_admission_file_action_waits_for_full_queue_without_retry() {
+    let (mut workspace, receiver) = channel_workspace(1);
+    let id = workspace.active_id();
+    assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
+    workspace.file_command("file.setLineEnding").unwrap();
+    workspace.file_prompt_mut().unwrap().text = "2".into();
+    workspace.submit_file_prompt().expect("transient contention accepts the file action");
+    assert!(workspace.file_prompt().is_none());
+    assert!(workspace.document_busy(id));
+    assert_eq!(workspace.notice(), "Waiting for recovery to finish…");
+    assert!(workspace.views[&id].editor().is_some(), "waiting must not loan the editor early");
+    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    let DocumentRequest::FileAction { key, operation, editor, .. } = receiver.try_recv().unwrap() else {
+        panic!("the accepted file action must start automatically")
+    };
+    workspace.test_document_result(DocumentResult::Replaced { key, operation, editor, result: Ok(Damage::default()) });
+    assert!(!workspace.document_busy(id));
+}
+
+#[test]
+fn worker_admission_format_waits_for_full_queue_without_retry() {
+    let (mut workspace, receiver) = channel_workspace(1);
+    let id = workspace.active_id();
+    assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
+    workspace.format_command(false, Some("json".into())).expect("transient contention accepts Format");
+    assert!(workspace.document_busy(id));
+    assert_eq!(workspace.notice(), "Waiting for recovery to finish…");
+    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    let DocumentRequest::Format { key, operation, editor, language, .. } = receiver.try_recv().unwrap() else {
+        panic!("the accepted Format must start automatically")
+    };
+    assert_eq!(language.as_deref(), Some("json"));
+    workspace.test_document_result(DocumentResult::Replaced { key, operation, editor, result: Ok(Damage::default()) });
+    assert!(!workspace.document_busy(id));
+}
+
+#[test]
+fn worker_admission_replace_waits_for_recovery_queue_without_retry() {
+    let (mut workspace, receiver) = channel_workspace(1);
+    let id = workspace.active_id();
+    assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
+    workspace.files.queue.push_back(DocumentRequest::FlushJournals);
+    let recipe = insert_recipe(&workspace);
+    let key = recipe.key;
+    workspace.submit_search_replacement(recipe).expect("transient contention accepts Replace");
+    let operation = workspace.search_replacement_operation(key).expect("accepted identity is available while waiting");
+    assert!(workspace.document_busy(id));
+    assert_eq!(workspace.notice(), "Waiting for recovery to finish…");
+    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::FlushJournals));
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    let (started_operation, mut editor, recipe) = take_loan(&receiver);
+    assert_eq!(started_operation, operation);
+    let result = editor.apply_search_replacement(recipe);
+    workspace.test_document_result(DocumentResult::Replaced { key, operation, editor, result });
+    assert!(!workspace.document_busy(id));
+    assert_eq!(bytes(&workspace, id), b"replaced");
+}
+
+#[test]
+fn worker_admission_newer_intent_replaces_the_single_slot_and_keeps_its_tab() {
+    let (mut workspace, receiver) = channel_workspace(1);
+    let id = workspace.active_id();
+    assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
+    let first = insert_recipe(&workspace);
+    let first_key = first.key;
+    workspace.submit_search_replacement(first).unwrap();
+    let first_operation = workspace.search_replacement_operation(first_key).unwrap();
+    workspace.format_command(false, Some("json".into())).unwrap();
+    assert!(workspace.search_replacement_operation(first_key).is_none());
+    let mut latest = insert_recipe(&workspace);
+    latest.key.generation += 1;
+    let key = latest.key;
+    workspace.submit_search_replacement(latest).unwrap();
+    let operation = workspace.search_replacement_operation(key).unwrap();
+    assert!(operation > first_operation);
+    let other = workspace.open(View::new(None)).unwrap();
+    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    let (started, mut editor, recipe) = take_loan(&receiver);
+    assert_eq!(started, operation);
+    assert_eq!(recipe.key, key);
+    let result = editor.apply_search_replacement(recipe);
+    workspace.test_document_result(DocumentResult::Replaced { key, operation, editor, result });
+    assert_eq!(workspace.active_id(), other);
+    assert_eq!(bytes(&workspace, id), b"replaced");
+    assert!(bytes(&workspace, other).is_empty());
+    assert!(!workspace.search_replacement_pending());
+}
+
+#[test]
+fn worker_admission_close_and_shutdown_drop_waiting_intents() {
+    for shutdown in [false, true] {
+        let (mut workspace, receiver) = channel_workspace(1);
+        let id = workspace.active_id();
+        assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
+        let recipe = insert_recipe(&workspace);
+        let key = recipe.key;
+        workspace.submit_search_replacement(recipe).unwrap();
+        if shutdown {
+            workspace.prepare_hex_shutdown();
+        } else {
+            assert!(workspace.close(id, true).unwrap());
+        }
+        assert!(workspace.search_replacement_operation(key).is_none());
+        assert!(!workspace.search_replacement_pending());
+        assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
+        workspace.test_document_result(DocumentResult::CapacityAvailable);
+        assert!(!workspace.document_busy(id));
+        assert!(!workspace.files.loans.contains_key(&id));
+    }
+}
+
+#[test]
+fn worker_admission_real_open_and_save_resume_format_and_file_action() {
+    let root = Scratch::new();
+    let path = root.0.join("source.json");
+    std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+    let (mut workspace, receiver) = real_workspace(&root);
+    let id = workspace.open_path(path.clone()).unwrap();
+    assert!(workspace.editor().is_none());
+    workspace.format_command(false, Some("json".into())).unwrap();
+    assert_eq!(workspace.notice(), "Waiting for recovery to finish…");
+    drive(&mut workspace, &receiver, |w| !w.search_replacement_pending());
+    assert!(String::from_utf8(bytes(&workspace, id)).unwrap().contains("\"a\": 1"));
+    workspace.save_document(id, None).unwrap();
+    assert!(workspace.files.saves.contains_key(&id));
+    workspace.file_command("file.setLineEnding").unwrap();
+    workspace.file_prompt_mut().unwrap().text = "2".into();
+    workspace.submit_file_prompt().unwrap();
+    assert_eq!(workspace.notice(), "Waiting for recovery to finish…");
+    drive(&mut workspace, &receiver, |w| !w.search_replacement_pending());
+    assert!(bytes(&workspace, id).windows(2).any(|pair| pair == b"\r\n"));
+    stop(workspace, &receiver);
+}
+
+#[test]
+fn worker_admission_real_refusals_keep_messages_and_do_not_queue() {
+    let (mut workspace, receiver) = channel_workspace(1);
+    let id = workspace.active_id();
+    assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
+    let busy = "Document/recovery worker is busy; retry replacement";
+    workspace.files.quit = true;
+    assert_eq!(workspace.format_command(false, None).unwrap_err().to_string(), busy);
+    workspace.files.quit = false;
+    workspace.file_command("file.setLineEnding").unwrap();
+    assert_eq!(workspace.format_command(false, None).unwrap_err().to_string(), busy);
+    workspace.cancel_file_prompt();
+    workspace.files.journal_failed.insert(id, "fixture failure".into());
+    assert_eq!(
+        workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap_err().to_string(),
+        "Replacement requires an admitted recovery observer"
+    );
+    workspace.file_command("file.setLineEnding").unwrap();
+    workspace.file_prompt_mut().unwrap().text = "2".into();
+    assert_eq!(
+        workspace.submit_file_prompt().unwrap_err().to_string(),
+        "File worker is busy; retry after opening or saving completes"
+    );
+    workspace.cancel_file_prompt();
+    workspace.files.journal_failed.clear();
+    workspace.files.observed.remove(&id);
+    workspace.hex.disposing = true; // prevents observer installation
+    assert_eq!(
+        workspace.format_command(false, None).unwrap_err().to_string(),
+        "Replacement requires an admitted recovery observer"
+    );
+    workspace.hex.disposing = false;
+    workspace.install_journal_observers();
+    let mut stale = insert_recipe(&workspace);
+    stale.key.revision += 1;
+    assert_eq!(
+        workspace.submit_search_replacement(stale).unwrap_err().to_string(),
+        "Search revision is stale; search again"
+    );
+    workspace.views.get_mut(&id).unwrap().editor.as_mut().unwrap().document.representation =
+        crate::hex_session::Representation::RawBytes;
+    assert_eq!(
+        workspace.format_command(false, None).unwrap_err().to_string(),
+        "Text replacement is unavailable in hex view"
+    );
+    assert!(!workspace.search_replacement_pending());
+    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
+    assert!(receiver.try_recv().is_err());
+}
+
 fn drive(workspace: &mut Workspace, receiver: &mpsc::Receiver<DocumentResult>, done: impl Fn(&Workspace) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done(workspace) {
@@ -181,38 +371,37 @@ fn formatting_document_worker_returns_exact_editor_and_one_undo_edit() {
 }
 
 #[test]
-fn formatting_full_queue_restores_editor_and_undo_history() {
+fn formatting_full_queue_preserves_editor_and_undo_history_until_automatic_admission() {
     let (mut workspace, receiver) = channel_workspace(1);
+    let id = workspace.active_id();
     workspace
         .execute("edit.insert", &crate::CommandArgs { text: Some("kept".into()), ..Default::default() }, 1)
         .unwrap();
     // The insertion's journal request occupies the only slot.
-    assert!(workspace.format_command(false, Some("json".into())).is_err());
-    assert_eq!(bytes(&workspace, workspace.active_id()), b"kept");
-    assert!(!workspace.search_replacement_pending());
-    let _ = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    workspace.format_command(false, Some("json".into())).unwrap();
+    assert_eq!(bytes(&workspace, id), b"kept");
+    assert!(workspace.search_replacement_pending());
+    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::Journal { .. }));
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    let DocumentRequest::Format { key, operation, mut editor, selection, language } = receiver.try_recv().unwrap()
+    else {
+        panic!("Format was not started automatically")
+    };
+    let result = editor.apply_formatting(selection, language);
+    workspace.test_document_result(DocumentResult::Replaced { key, operation, editor, result });
     workspace.execute("edit.undo", &crate::CommandArgs::default(), 1).unwrap();
-    assert!(bytes(&workspace, workspace.active_id()).is_empty());
+    assert!(bytes(&workspace, id).is_empty());
 }
 
 #[test]
-fn replacement_full_queue_and_disconnect_restore_actual_editor_and_observer() {
+fn replacement_disconnect_restores_actual_editor_and_observer() {
     let (mut workspace, receiver) = channel_workspace(1);
     let id = workspace.active_id();
-    assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
-    assert_eq!(
-        workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
-    assert!(!workspace.document_busy(id));
-    assert!(bytes(&workspace, id).is_empty());
-    assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
     workspace
         .execute("edit.insert", &crate::CommandArgs { text: Some("kept".into()), ..Default::default() }, 1)
         .unwrap();
     let DocumentRequest::Journal { receipt, .. } = receiver.try_recv().unwrap() else { panic!("observer was lost") };
     assert_eq!(receipt.replacement_count(), 1);
-    assert_eq!(bytes(&workspace, id), b"kept");
     drop(receiver);
     assert_eq!(
         workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap_err().kind(),
@@ -220,10 +409,7 @@ fn replacement_full_queue_and_disconnect_restore_actual_editor_and_observer() {
     );
     assert_eq!(bytes(&workspace, id), b"kept");
     workspace.execute("edit.undo", &crate::CommandArgs::default(), 1).unwrap();
-    assert!(
-        workspace.editor().unwrap().has_pending_edit_receipt(),
-        "original observer still retains refused undo receipt"
-    );
+    assert!(workspace.editor().unwrap().has_pending_edit_receipt(), "original observer retains refused undo receipt");
     assert!(bytes(&workspace, id).is_empty());
 }
 
@@ -264,29 +450,48 @@ fn replacement_loan_freezes_target_and_exit_but_preserves_other_tab_and_cache() 
 }
 
 #[test]
-fn replacement_pending_receipt_and_save_are_refused_before_transfer() {
+fn worker_admission_pending_receipt_and_save_wait_before_transfer() {
     let (mut workspace, receiver) = channel_workspace(1);
+    let id = workspace.active_id();
     assert!(workspace.files.worker.as_ref().unwrap().try_submit(DocumentRequest::SessionTimer).is_ok());
     workspace
         .execute("edit.insert", &crate::CommandArgs { text: Some("retained".into()), ..Default::default() }, 1)
         .unwrap();
     assert!(workspace.editor().unwrap().has_pending_edit_receipt());
-    assert_eq!(
-        workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
+    workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap();
+    assert!(workspace.views[&id].editor().is_some());
     assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::SessionTimer));
-    workspace.editor_mut().unwrap().flush_edit_receipt().unwrap();
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
     assert!(matches!(receiver.try_recv().unwrap(), DocumentRequest::Journal { .. }));
-    let path = std::env::temp_dir().join("kwil-no-io-loan-save.txt");
-    workspace.editor_mut().unwrap().save_request(Some(path)).unwrap();
-    assert_eq!(
-        workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
-    workspace.editor_mut().unwrap().finish_save_for_test(Err(io::Error::other("cancel fixture save"))).unwrap_err();
-    assert_eq!(bytes(&workspace, workspace.active_id()), b"retained");
-    assert!(receiver.try_recv().is_err());
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    let (operation, editor, recipe) = take_loan(&receiver);
+    workspace.test_document_result(DocumentResult::Replaced {
+        key: recipe.key,
+        operation,
+        editor,
+        result: Err(io::Error::other("fixture leaves bytes unchanged")),
+    });
+    while let Ok(request) = receiver.try_recv() {
+        assert!(matches!(request, DocumentRequest::SessionTimer | DocumentRequest::Persist(_)));
+    }
+    let root = Scratch::new();
+    workspace.editor_mut().unwrap().save_request(Some(root.0.join("save.txt"))).unwrap();
+    workspace.submit_search_replacement(insert_recipe(&workspace)).unwrap();
+    assert!(receiver.try_recv().is_err(), "the editor is still saving");
+    workspace
+        .views
+        .get_mut(&id)
+        .unwrap()
+        .editor_mut()
+        .unwrap()
+        .finish_save_for_test(Err(io::Error::other("cancel fixture save")))
+        .unwrap_err();
+    workspace.test_document_result(DocumentResult::CapacityAvailable);
+    let (operation, mut editor, recipe) = take_loan(&receiver);
+    let key = recipe.key;
+    let result = editor.apply_search_replacement(recipe);
+    workspace.test_document_result(DocumentResult::Replaced { key, operation, editor, result });
+    assert_eq!(bytes(&workspace, id), b"replacedretained");
 }
 
 #[test]
