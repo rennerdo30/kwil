@@ -3802,7 +3802,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.view.compare.action(kwil_view_model::compare_session::Action::Scroll(if up { -3 } else { 3 }));
                     return;
                 }
-                WindowEvent::MouseInput { .. } | WindowEvent::Ime(_) => return,
+                WindowEvent::MouseInput { .. } if self.body_area().contains(self.pointer.0, self.pointer.1) => return,
+                WindowEvent::Ime(_) => return,
                 _ => {}
             }
         }

@@ -348,7 +348,7 @@ impl Session {
         self.page = None;
         self.source = None;
         // A busy result is discarded in poll, then the input retires on worker.
-        if !self.busy {
+        if !self.busy && self.worker.is_some() {
             let _ = self.send(Request::Close);
         }
     }
@@ -540,6 +540,8 @@ mod tests {
     fn compare_open_prompt_preserves_tab_and_discards_closed_completion() {
         let fixture = Fixture::new(b"disk\n");
         let mut view = workspace("buffer\n");
+        view.compare_command("compare.close");
+        assert!(view.compare.worker.is_none(), "closing an absent comparison must not start a worker");
         let (tx, rx) = mpsc::channel();
         view.compare.set_wake(Arc::new(move || {
             let _ = tx.send(());
