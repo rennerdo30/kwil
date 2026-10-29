@@ -125,13 +125,19 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
         draw_panel(frame, host, area);
         return;
     }
-    let style = Style::default().fg(Color::Rgb(214, 228, 240)).bg(Color::Rgb(8, 13, 24));
+    let style = Style::default()
+        .fg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelForeground, Color::Rgb(214, 228, 240)))
+        .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(8, 13, 24)));
     let columns = width as usize - 2;
     let mut caret = None;
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(style), area);
     let mut line = |row: u16, text: String, selected| {
-        let style = if selected { style.bg(Color::Rgb(25, 42, 67)) } else { style };
+        let style = if selected {
+            style.bg(theme_ui::color(kwil_core_commands::theme::UiRole::Selection, Color::Rgb(25, 42, 67)))
+        } else {
+            style
+        };
         frame.render_widget(
             Paragraph::new(display_text(&text)).style(style),
             Rect { x: area.x + 1, y: area.y + row, width: width - 2, height: 1 },
@@ -182,11 +188,17 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
     let Ok(Some(summary)) = host.panel_window(0, 0) else { return };
     let first = summary.selection.saturating_sub(visible / 2).min(summary.total.saturating_sub(visible));
     let Ok(Some(window)) = host.panel_window(first, visible) else { return };
-    let style = Style::default().fg(Color::Rgb(214, 228, 240)).bg(Color::Rgb(8, 13, 24));
+    let style = Style::default()
+        .fg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelForeground, Color::Rgb(214, 228, 240)))
+        .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(8, 13, 24)));
     frame.render_widget(ratatui::widgets::Clear, area);
     let mut line = |row, text: String, selected| {
         frame.render_widget(
-            Paragraph::new(display_text(&text)).style(if selected { style.bg(Color::Rgb(25, 42, 67)) } else { style }),
+            Paragraph::new(display_text(&text)).style(if selected {
+                style.bg(theme_ui::color(kwil_core_commands::theme::UiRole::Selection, Color::Rgb(25, 42, 67)))
+            } else {
+                style
+            }),
             Rect { x: area.x + 1, y: area.y + row, width: area.width - 2, height: 1 },
         );
     };

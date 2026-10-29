@@ -351,7 +351,7 @@ fn options(kind: FilePromptKind, previous: u32) -> u32 {
     match kind {
         FilePromptKind::Open => base | FILE_MUST_EXIST,
         FilePromptKind::SaveAs => (base & !FILE_MUST_EXIST) | OVERWRITE_PROMPT,
-        FilePromptKind::Recent => base,
+        _ => base,
     }
 }
 
@@ -369,7 +369,7 @@ fn choose_inner(request: &Request, pump: &Pump) -> Result<Outcome, String> {
     let (class, iid) = match request.ticket.kind() {
         FilePromptKind::Open => (&CLSID_OPEN, &IID_OPEN),
         FilePromptKind::SaveAs => (&CLSID_SAVE, &IID_SAVE),
-        FilePromptKind::Recent => return Err("recent-number prompt is not a native chooser".into()),
+        _ => return Err("this prompt is not a native chooser".into()),
     };
     let mut raw = null_mut();
     let hr = unsafe { CoCreateInstance(class, null_mut(), CLSCTX_INPROC_SERVER, iid, &mut raw) };

@@ -622,6 +622,7 @@ impl Workspace {
             }
             DocumentResult::Replaced { key, operation, editor, result } => {
                 let id = DocumentId(key.document_id);
+                let action = self.files.loans.get(&id).and_then(|loan| loan.file_action);
                 // The destination exists and is admitted before either swap.
                 let shell = commit.shell.as_mut().unwrap();
                 std::mem::swap(&mut **editor, shell.editor.as_mut().unwrap());
@@ -632,9 +633,11 @@ impl Workspace {
                 if panic_after_field {
                     panic!("controlled panic after first source field");
                 }
-                commit.replacement =
-                    Some(ExactReplacementReceipt { key: *key, operation: *operation, succeeded: result.is_ok() });
-                self.files.loans.remove(&id);
+                if action.is_none() {
+                    commit.replacement =
+                        Some(ExactReplacementReceipt { key: *key, operation: *operation, succeeded: result.is_ok() });
+                }
+                self.finish_file_action(id, result.is_ok());
                 self.input_epoch = self.input_epoch.wrapping_add(1);
                 let installed = self.views.get_mut(&id).unwrap();
                 let editor = installed.editor.as_mut().unwrap();
@@ -647,8 +650,11 @@ impl Workspace {
                 }
                 super::super::prepare_view_publication(installed, intended, false);
                 installed.set_notice(match result {
-                    Ok(_) => "Replacement complete".into(),
-                    Err(error) => format!("Replacement failed: {error}"),
+                    Ok(_) => action.map_or("Replacement complete", |action| action.notice()).into(),
+                    Err(error) => format!(
+                        "{}: {error}",
+                        if action.is_some() { "File operation failed" } else { "Replacement failed" }
+                    ),
                 });
                 installed.refresh_after_edit(Damage { full: true, status: true, ..Default::default() });
                 if self.files.hot_exit {

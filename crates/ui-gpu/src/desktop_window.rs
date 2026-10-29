@@ -289,7 +289,7 @@ impl App {
             dialog.gfx.pixels.resize(w.saturating_mul(h), 0);
             dialog.allocated = dialog.size;
         }
-        let theme = theme_ui::chrome();
+        let theme = &theme_ui::chrome();
         let colors = desktop::Colors::new(theme);
         dialog.gfx.pixels.fill(colors.sidebar);
         let Some(font) = dialog.font.as_mut() else { return true };

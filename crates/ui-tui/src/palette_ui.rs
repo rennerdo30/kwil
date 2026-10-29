@@ -232,8 +232,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame, palette: &Palette) {
     let Some(area) = panel(frame.area()) else {
         return;
     };
-    let bg = Color::Rgb(0x08, 0x0d, 0x18);
-    let fg = Color::Rgb(0xd6, 0xe4, 0xf0);
+    let bg = theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18));
+    let fg = theme_ui::color(kwil_core_commands::theme::UiRole::Foreground, Color::Rgb(0xd6, 0xe4, 0xf0));
     let style = Style::default().fg(fg).bg(bg);
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(style), area);
@@ -247,7 +247,11 @@ pub(super) fn draw(frame: &mut ratatui::Frame, palette: &Palette) {
     let first = palette.selected().unwrap_or(0).saturating_sub(visible - 1);
     for (row, item) in palette.rows().iter().enumerate().skip(first).take(visible) {
         let selected = palette.selected() == Some(row);
-        let bg = if selected { Color::Rgb(0x19, 0x2a, 0x43) } else { bg };
+        let bg = if selected {
+            theme_ui::color(kwil_core_commands::theme::UiRole::ActiveTabBackground, Color::Rgb(0x19, 0x2a, 0x43))
+        } else {
+            bg
+        };
         let row_area = Rect { x: area.x, y: area.y + (row - first + 1) as u16, width: area.width, height: 1 };
         frame.render_widget(Paragraph::new("").style(style.bg(bg)), row_area);
         frame.render_widget(

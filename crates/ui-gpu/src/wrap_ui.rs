@@ -1027,7 +1027,7 @@ impl App {
                 None,
                 None,
                 self.font.as_mut(),
-                theme_ui::chrome(),
+                &theme_ui::chrome(),
                 &[],
                 &[],
                 std::iter::empty(),
@@ -1038,7 +1038,7 @@ impl App {
         let page =
             self.wrap.shared.as_ref().filter(|_| live).and_then(WrapHost::page).filter(|page| page.key == context.key);
         let cursors = self.wrap.shared.as_ref().filter(|_| live).and_then(WrapHost::visual_cursors).unwrap_or(&[]);
-        let theme = theme_ui::chrome();
+        let theme = &theme_ui::chrome();
         let hits = self.search_panel.visible_hits(self.view.active_id(), context.key.source.revision);
         let font = self.wrap.font.as_mut().map(font::UiFont::monospace);
         paint_row(
@@ -1085,7 +1085,7 @@ fn atom_color(atom: &PaintAtom, spans: &[&kwil_view_model::highlighting::Span], 
     spans
         .get(first)
         .filter(|span| (span.range.start as u64) <= atom.source.start && atom.source.start < span.range.end as u64)
-        .map_or(fallback, |span| theme_ui::syntax_rgb(kwil_view_model::highlight_session::syntax_rgb(span.class)))
+        .map_or(fallback, |span| theme_ui::syntax_rgb(span.class))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1843,7 +1843,7 @@ mod tests {
         until(&mut app, &rx, |app| app.wrap.shared.as_ref().unwrap().mutation_gate() == MutationGate::Allowed);
         assert_eq!(app.view.editor().unwrap().primary_cursor().anchor, 0);
         assert_eq!(app.view.editor().unwrap().primary_cursor().head, "界".len() as u64);
-        let theme = theme_ui::chrome();
+        let theme = &theme_ui::chrome();
         let selected =
             font::blend(theme_ui::rgb(theme, UiRole::Background), theme_ui::rgb(theme, UiRole::Selection), 100);
         assert_eq!(app.body_pixels[GUTTER_COLS * 8], selected);

@@ -7,6 +7,7 @@
 use kwil_core_text::TextFile;
 use std::path::PathBuf;
 
+pub mod compare_session;
 mod document;
 mod editor;
 pub mod grid;
@@ -20,6 +21,7 @@ pub mod search_panel;
 pub mod search_session;
 pub mod settings_panels;
 pub mod settings_session;
+pub mod theme_session;
 pub mod visual_rows;
 mod workspace;
 pub use workspace::workspace_document;

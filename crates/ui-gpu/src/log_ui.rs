@@ -1800,7 +1800,7 @@ pub(super) fn draw_body(
                     y,
                     &row.bytes[start..end],
                     end - start,
-                    theme_ui::syntax_rgb(kwil_view_model::highlight_session::syntax_rgb(span.class)),
+                    theme_ui::syntax_rgb(span.class),
                     row_bg,
                 );
             }
@@ -1820,7 +1820,7 @@ pub(super) fn draw_body(
                     span_index += 1;
                 }
                 if let Some(span) = row.spans.get(span_index).filter(|span| span.range.start as u64 <= offset) {
-                    let color = theme_ui::syntax_rgb(kwil_view_model::highlight_session::syntax_rgb(span.class));
+                    let color = theme_ui::syntax_rgb(span.class);
                     let x = gutter + cell.column * font.cw;
                     fill(pixels, stride, Rect { x, y, w: cell.width * font.cw, h: font.ch }, row_bg);
                     draw_text(pixels, stride, font, x, y, cell.text.as_bytes(), cell.width, color, row_bg);

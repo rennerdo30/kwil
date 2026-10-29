@@ -121,26 +121,7 @@ commands! {
 /// Commands whose feature no frontend runs yet. They stay bindable and in the
 /// keymap editor, but the palette hides them. Remove an id here in the change
 /// that lands its feature; the frontend palette contract tests then cover it.
-pub const NOT_HOSTED: &[&str] = &[
-    "file.openFolder",
-    "file.reload",
-    "file.keepChanges",
-    "file.setEncoding",
-    "file.setLineEnding",
-    "edit.formatDocument",
-    "edit.formatSelection",
-    "compare.files",
-    "compare.saved",
-    "compare.nextChange",
-    "compare.previousChange",
-    "compare.toggleIgnoreWhitespace",
-    "compare.toggleUnchanged",
-    "compare.close",
-    "theme.select",
-    "theme.preview",
-    "theme.import",
-    "theme.followSystem",
-];
+pub const NOT_HOSTED: &[&str] = &["edit.formatDocument", "edit.formatSelection"];
 
 /// Whether the command palette offers this command. Key-only commands
 /// (motions, operators, modes, palette navigation) and `NOT_HOSTED` are hidden,
@@ -152,4 +133,14 @@ pub fn in_palette(id: &str) -> bool {
 
 pub fn command(id: &str) -> Option<&'static Command> {
     COMMANDS.iter().find(|command| command.id == id)
+}
+
+#[cfg(test)]
+mod compare_command_tests {
+    #[test]
+    fn comparison_commands_are_available() {
+        for command in super::COMMANDS.iter().filter(|command| command.id.starts_with("compare.")) {
+            assert!(super::in_palette(command.id), "{} must be available", command.id);
+        }
+    }
 }

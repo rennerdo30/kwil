@@ -46,11 +46,15 @@ pub(super) fn draw_prepared(
     if !prepared_body {
         super::draw_area_highlighted(frame, workspace, rect(geometry.body, area), false, highlights);
     }
-    let idle = Color::Rgb(0x10, 0x1d, 0x31);
-    let foreground = Color::Rgb(0xd6, 0xe4, 0xf0);
+    let idle = theme_ui::color(kwil_core_commands::theme::UiRole::TabBackground, Color::Rgb(0x10, 0x1d, 0x31));
+    let foreground = theme_ui::color(kwil_core_commands::theme::UiRole::Foreground, Color::Rgb(0xd6, 0xe4, 0xf0));
     frame.render_widget(Paragraph::new("").style(Style::default().bg(idle)), rect(geometry.chrome, area));
     for slot in &geometry.slots {
-        let bg = if slot.active { Color::Rgb(0x19, 0x2a, 0x43) } else { idle };
+        let bg = if slot.active {
+            theme_ui::color(kwil_core_commands::theme::UiRole::ActiveTabBackground, Color::Rgb(0x19, 0x2a, 0x43))
+        } else {
+            idle
+        };
         let style = Style::default().fg(foreground).bg(bg);
         frame.render_widget(Paragraph::new("").style(style), rect(slot.area, area));
         let title = TabArea { width: slot.close.x - slot.area.x, ..slot.area };
@@ -75,8 +79,11 @@ pub(super) fn draw_prepared(
     } else {
         workspace.status_text()
     };
-    let status = Paragraph::new(status)
-        .style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18)));
+    let status = Paragraph::new(status).style(
+        Style::default()
+            .fg(theme_ui::color(kwil_core_commands::theme::UiRole::StatusForeground, Color::Rgb(0x8f, 0xe3, 0xff)))
+            .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18))),
+    );
     frame.render_widget(
         status,
         Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
