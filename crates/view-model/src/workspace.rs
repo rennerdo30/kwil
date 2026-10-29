@@ -22,6 +22,9 @@ use workspace_wrap::WorkspaceWrapState;
 #[path = "workspace_document.rs"]
 pub mod workspace_document;
 
+#[path = "file_commands.rs"]
+mod file_commands;
+
 enum BinaryPhase {
     Opening,
     Offered(BinaryOffer),
@@ -120,6 +123,26 @@ pub enum FilePromptKind {
     Open,
     SaveAs,
     Recent,
+    Folder,
+    Encoding,
+    ReopenEncoding,
+    SaveEncoding,
+    LineEnding,
+    Reload,
+}
+
+#[cfg(test)]
+mod file_command_acceptance {
+    use super::*;
+
+    #[test]
+    fn file_commands_open_real_prompts_instead_of_falling_through() {
+        for command in ["file.setEncoding", "file.setLineEnding", "file.openFolder"] {
+            let mut workspace = Workspace::new(View::new(None)).unwrap();
+            assert!(workspace.file_command(command).unwrap(), "{command} must be hosted");
+            assert!(workspace.file_prompt().is_some(), "{command} needs a real prompt");
+        }
+    }
 }
 
 pub struct FilePrompt {
@@ -184,10 +207,12 @@ impl SaveFlight {
 struct EditorLoan {
     key: kwil_core_search::worker::SearchKey,
     operation: u64,
+    file_action: Option<crate::document_worker::FileAction>,
 }
 
 #[derive(Default)]
 struct FileFlow {
+    folder: Option<PathBuf>,
     live_document_metadata: Option<crate::visual_rows::MetadataReservation>,
     document_budget: Option<crate::visual_rows::AllocationBudget>,
     // Bound shutdown keeps the actual sender alive, but ordinary pumps must
@@ -457,7 +482,7 @@ impl Workspace {
         let request = DocumentRequest::Replace { document: id, operation, editor, recipe };
         match self.files.worker.as_ref().unwrap().try_submit(request) {
             Ok(()) => {
-                self.files.loans.insert(id, EditorLoan { key, operation });
+                self.files.loans.insert(id, EditorLoan { key, operation, file_action: None });
                 self.input_epoch = self.input_epoch.wrapping_add(1);
                 self.views.get_mut(&id).unwrap().set_notice("Replacing...".into());
                 Ok(())
@@ -1183,6 +1208,7 @@ impl Workspace {
                     FilePromptKind::Open => "Open",
                     FilePromptKind::SaveAs => "Save as",
                     FilePromptKind::Recent => "Recent (number)",
+                    _ => p.kind.title(),
                 };
                 format!("{label}: {}  (Enter to submit, Esc to cancel)", p.text)
             })
@@ -1195,6 +1221,9 @@ impl Workspace {
             return Ok(());
         }
         let prompt = self.files.prompt.take().unwrap();
+        if !matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::Recent | FilePromptKind::SaveAs) {
+            return self.submit_command_prompt(prompt);
+        }
         match prompt.kind {
             FilePromptKind::Open => {
                 if std::mem::take(&mut self.hex.prompt) {
@@ -1234,6 +1263,7 @@ impl Workspace {
                 }
                 self.save_document(prompt.document, Some(prompt.text.into()))?;
             }
+            _ => unreachable!(),
         }
         Ok(())
     }
@@ -1402,6 +1432,9 @@ impl Workspace {
     pub fn file_command(&mut self, command: &str) -> io::Result<bool> {
         if self.hex.disposing {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Raw document disposal is in progress"));
+        }
+        if self.file_feature_command(command)? {
+            return Ok(true);
         }
         match command {
             "file.openHex" => {
@@ -1764,6 +1797,15 @@ impl Workspace {
         );
         let mut damage = Damage { status: true, ..Default::default() };
         match result {
+            DocumentResult::FolderReady(result) => match result {
+                Ok(root) => {
+                    self.set_notice(format!("Workspace folder: {}", root.display()));
+                    self.files.folder = Some(root);
+                }
+                Err(error) => {
+                    self.set_notice(format!("Open Folder: {error}"));
+                }
+            },
             DocumentResult::SourceBarrier(_) => {
                 damage = Damage::default();
             }
@@ -1820,6 +1862,7 @@ impl Workspace {
                     self.set_notice("Unexpected replacement completion identity".into());
                     return std::ops::ControlFlow::Continue(damage);
                 }
+                let action = self.finish_file_action(id, result.is_ok());
                 let view = self.views.get_mut(&id).expect("loan target cannot close");
                 debug_assert!(view.editor.is_none());
                 view.editor = Some(*editor);
@@ -1834,11 +1877,10 @@ impl Workspace {
                     self.files.replacement_journals.insert(id, sequence);
                 }
                 prepare_view_publication(view, intended_wrap, false);
-                self.files.loans.remove(&id);
                 self.input_epoch = self.input_epoch.wrapping_add(1);
                 let notice = match result {
-                    Ok(_) => "Replacement complete".to_string(),
-                    Err(error) => format!("Replacement failed: {error}"),
+                    Ok(_) => action.map_or("Replacement complete", |action| action.notice()).to_string(),
+                    Err(error) => format!("{}: {error}", action.map_or("Replacement failed", |action| action.notice())),
                 };
                 // The worker's viewport may predate a resize. Rebuild only the
                 // existing bounded visible cache once ownership is restored.
@@ -4428,7 +4470,7 @@ impl Workspace {
     /// Capture only native-chooser prompt kinds. TUI's String path stays intact.
     pub fn native_file_prompt(&self) -> Option<NativeFilePrompt> {
         let prompt = self.files.prompt.as_ref()?;
-        if prompt.kind == FilePromptKind::Recent {
+        if !matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::SaveAs) {
             return None;
         }
         Some(NativeFilePrompt {
@@ -4486,7 +4528,7 @@ impl Workspace {
             }),
             FilePromptKind::Open => self.open_path(path).map(|_| ()),
             FilePromptKind::SaveAs => self.save_document(ticket.document, Some(path)),
-            FilePromptKind::Recent => {
+            _ => {
                 unreachable!("native_file_prompt excludes recent-number prompts")
             }
         };

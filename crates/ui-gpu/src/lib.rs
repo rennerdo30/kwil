@@ -3329,15 +3329,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 match root.and_then(|root| {
                     let proxy = self.proxy.clone();
-                    kwil_view_model::palette_session::PaletteSession::new(
-                        root,
-                        std::sync::Arc::new(move || {
-                            let _ = proxy.send_event(UserEvent::PaletteReady);
-                        }),
-                    )
+                    let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                        let _ = proxy.send_event(UserEvent::PaletteReady);
+                    });
+                    if let Some(palette) = &mut self.palette {
+                        palette.set_root(root, wake).map(|_| None)
+                    } else {
+                        kwil_view_model::palette_session::PaletteSession::new(root, wake).map(Some)
+                    }
                     .map_err(|error| error.to_string())
                 }) {
-                    Ok(palette) => self.palette = Some(palette),
+                    Ok(Some(palette)) => self.palette = Some(palette),
+                    Ok(None) => {}
                     Err(error) => {
                         self.view.set_notice(format!("Palette: {error}"));
                     }

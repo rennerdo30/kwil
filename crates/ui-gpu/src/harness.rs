@@ -31,6 +31,7 @@ pub(super) fn hold_preview_completion(
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
+    FileCommand(&'static str),
     MarkdownSplit,
     MarkdownSection(u64),
     MarkdownNarrow,
@@ -399,7 +400,19 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::BinaryColdCheck),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
+        let files = [
+            (1800, Step::DismissSetup),
+            (300, Step::FileCommand("file.setEncoding")),
+            (200, Step::UsabilityCapture("file-encoding.bmp")),
+            (200, Step::FileCommand("file.setLineEnding")),
+            (200, Step::UsabilityCapture("file-line-endings.bmp")),
+            (200, Step::FileCommand("file.openFolder")),
+            (200, Step::UsabilityCapture("file-folder.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_FILE_COMMANDS_PROBE").is_some() {
+            files.as_slice()
+        } else if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
             binary_cold.as_slice()
         } else if std::env::var_os("KWIL_BINARY_OFFER_PROBE").is_some() {
             binary.as_slice()
@@ -1508,6 +1521,11 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             }
             app.settings_epoch = app.settings_epoch.wrapping_add(1);
             app.palette_redraw();
+        }
+        Step::FileCommand(command) => {
+            app.view.cancel_file_prompt();
+            assert!(app.dispatch_file(command));
+            assert!(app.view.file_prompt().is_some());
         }
         Step::PaletteOpen => {
             app.dispatch_palette("view.commandPalette");

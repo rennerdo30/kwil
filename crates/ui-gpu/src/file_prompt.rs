@@ -192,6 +192,9 @@ impl App {
     }
 
     pub(super) fn sync_file_ui(&mut self) {
+        if let Some(root) = self.view.take_workspace_folder() {
+            let _ = self.proxy.send_event(UserEvent::PaletteRoot(Ok(root)));
+        }
         self.sync_binary_input();
         if let Some(palette) = self.palette.as_mut().filter(|palette| palette.model().is_open()) {
             match palette.refresh_tabs(&self.view) {
@@ -221,7 +224,7 @@ impl App {
         self.save_path = self
             .view
             .file_prompt()
-            .filter(|prompt| !file_dialog::native_supported() || prompt.kind == kwil_view_model::FilePromptKind::Recent)
+            .filter(|_| !file_dialog::native_supported() || self.view.native_file_prompt().is_none())
             .map(|prompt| prompt.text.clone());
         if self.save_path.is_some() || self.prompt_view.area.take().is_some() {
             self.palette_dirty = true;
@@ -258,6 +261,56 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_commands_use_the_gui_prompt_and_bounded_document_completion() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let root = crate::test_support::directory("kwil-gui-file-commands").unwrap();
+        let lane = crate::document_ui::fixtures::Lane::start(&mut workspace, root.join("state"));
+        lane.until(&mut workspace, |workspace| workspace.recovery_ready());
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("one\ntwo\n".into()), ..Default::default() }, 1)
+            .unwrap();
+        assert!(workspace.file_command("file.setLineEnding").unwrap());
+        workspace.file_prompt_mut().unwrap().text = "2".into();
+        submit(&mut workspace);
+        let id = workspace.active_id();
+        lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
+        let mut bytes = Vec::new();
+        workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"one\r\ntwo\r\n");
+        workspace.file_command("file.setEncoding").unwrap();
+        workspace.file_prompt_mut().unwrap().text = "2".into();
+        submit(&mut workspace);
+        lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
+        let path = root.join("saved.txt");
+        workspace.save_document(id, Some(path.clone())).unwrap();
+        lane.until(&mut workspace, |workspace| !workspace.file_saves_pending());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            "one\r\ntwo\r\n".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>()
+        );
+        workspace.file_command("file.reload").unwrap();
+        lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
+        bytes.clear();
+        workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"one\r\ntwo\r\n");
+        std::fs::rename(&path, root.join("previous.txt")).unwrap();
+        std::fs::write(&path, b"outside\n").unwrap();
+        workspace.file_command("file.keepChanges").unwrap();
+        lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
+        assert!(workspace.editor().unwrap().document().is_dirty(), "keeping an older clean buffer needs a save");
+        assert_eq!(std::fs::read(&path).unwrap(), b"outside\n");
+        workspace.file_command("file.reload").unwrap();
+        workspace.file_prompt_mut().unwrap().text = "1".into();
+        submit(&mut workspace);
+        lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
+        bytes.clear();
+        workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"outside\n");
+        lane.settle(workspace);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     #[cfg(not(windows))]

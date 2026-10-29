@@ -122,11 +122,6 @@ commands! {
 /// keymap editor, but the palette hides them. Remove an id here in the change
 /// that lands its feature; the frontend palette contract tests then cover it.
 pub const NOT_HOSTED: &[&str] = &[
-    "file.openFolder",
-    "file.reload",
-    "file.keepChanges",
-    "file.setEncoding",
-    "file.setLineEnding",
     "edit.formatDocument",
     "edit.formatSelection",
     "compare.files",

@@ -69,11 +69,13 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
 
 ## Known limitations
 
+- CR-only (classic Mac) line endings are not converted yet
+
 - Any-size opening and resident index memory limits are unfinished. Mapping
   refusal does not yet have the required positioned-read fallback.
 - Complete metadata pre-growth admission is unfinished. Large or demanding
   editing workloads have not received bounded-memory acceptance.
-- Encoding and line-ending commands, complete regex/long-line search and folder
+- Complete regex/long-line search and folder
   replacement remain incomplete.
 - Compare panes/collapse, formatter execution, log following/filtering, custom
   themes and some GUI/TUI feature parity remain incomplete.

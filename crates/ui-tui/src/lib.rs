@@ -312,18 +312,21 @@ fn run_workspace_with_terminal_init(
                         };
                         match root.and_then(|root| {
                             let sender = tx.clone();
-                            kwil_view_model::palette_session::PaletteSession::new(
-                                root,
-                                std::sync::Arc::new(move || {
-                                    let _ = sender.send(Msg::PaletteReady);
-                                }),
-                            )
+                            let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                                let _ = sender.send(Msg::PaletteReady);
+                            });
+                            if let Some(host) = &mut palette {
+                                host.set_root(root, wake).map(|_| None)
+                            } else {
+                                kwil_view_model::palette_session::PaletteSession::new(root, wake).map(Some)
+                            }
                             .map_err(|error| error.to_string())
                         }) {
-                            Ok(host) => {
+                            Ok(Some(host)) => {
                                 palette = Some(host);
                                 search_changed
                             }
+                            Ok(None) => true,
                             Err(error) => {
                                 view.set_notice(format!("Palette: {error}"));
                                 true
@@ -781,6 +784,10 @@ fn run_workspace_with_terminal_init(
                     },
                     Msg::Input(_) => false,
                 };
+            if let Some(root) = view.take_workspace_folder() {
+                let _ = tx.send(Msg::PaletteRoot(Ok(root)));
+                changed = true;
+            }
             if view.wants_exit() {
                 exiting = true;
             }
@@ -929,6 +936,7 @@ fn run_workspace_with_terminal_init(
                     if let Some(menu) = &language_menu {
                         draw_language(f, menu);
                     }
+                    file_prompt::draw_prompt(f, view);
                     if let Some(panel) = &settings_panel {
                         settings_ui::draw(f, panel);
                     }
@@ -2226,6 +2234,11 @@ fn invoke(
     if matches!(
         call.id,
         "file.new"
+            | "file.openFolder"
+            | "file.setEncoding"
+            | "file.setLineEnding"
+            | "file.reload"
+            | "file.keepChanges"
             | "file.open"
             | "file.openHex"
             | "view.toggleHex"
@@ -3239,6 +3252,11 @@ mod tests {
     #[test]
     fn kw20_file_commands_are_dispatched_before_editor_fallback() {
         for command in [
+            "file.setEncoding",
+            "file.setLineEnding",
+            "file.reload",
+            "file.keepChanges",
+            "file.openFolder",
             "file.new",
             "file.open",
             "file.saveAs",
@@ -3325,13 +3343,13 @@ mod tests {
     fn vim_command_status_is_visible_in_test_backend() {
         let mut view = View::new(None);
         view.set_rows(3);
-        let mut keys = KeymapEngine::new(Preset::Vim, &[binding("z", "file.openFolder")]).unwrap();
-        key(&mut view, KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
-        assert!(view.status_text().contains("command not implemented: file.openFolder"));
+        let mut keys = KeymapEngine::new(Preset::Vim, &[]).unwrap();
+        key(&mut view, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
+        assert!(view.status_text().contains("register is empty"));
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
         terminal.draw(|frame| draw(frame, &view)).unwrap();
         let status: String = (0..80).map(|x| terminal.backend().buffer()[(x, 3)].symbol()).collect();
-        assert!(status.contains("command not implemented: file.openFolder"));
+        assert!(status.contains("register is empty"));
         key(&mut view, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), Duration::ZERO, &mut keys, Preset::Vim);
         assert!(view.status_text().contains("register is empty"));
         for c in ":unknown".chars() {
