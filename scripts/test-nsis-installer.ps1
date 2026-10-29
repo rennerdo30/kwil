@@ -50,3 +50,5 @@ Assert (!(Test-Path $key)) 'Installed apps entry removed'
 while ((Test-Path $dir) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
 Assert (!(Test-Path $dir)) 'install folder removed'
 Assert (!(Test-Path $shortcut)) 'Start menu shortcut removed'
+# Every check passed; do not leak the last native exit code into the step.
+exit 0
