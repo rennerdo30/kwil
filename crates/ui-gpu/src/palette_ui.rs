@@ -250,6 +250,16 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
+                if matches!(command, "update.check" | "update.apply") {
+                    let proxy = self.proxy.clone();
+                    let started = kwil_update::spawn_check(env!("CARGO_PKG_VERSION"), move |message| {
+                        let _ = proxy.send_event(UserEvent::Notice(message));
+                    });
+                    let notice = if started { "Checking for updates…" } else { "An update check is already running" };
+                    let damage = self.view.set_notice(notice.into());
+                    self.apply(damage);
+                    return;
+                }
                 if command == "view.retryWrap" && self.wrap_command(command, 1, false) {
                     return;
                 }
@@ -507,5 +517,34 @@ mod tests {
             assert!(matches!(keys.feed("ctrl+v".parse().unwrap()), VimResult::Pending));
             assert!(matches!(keys.feed("ctrl+s".parse().unwrap()), VimResult::Command(call) if call.id == "file.save"));
         }
+    }
+}
+
+#[cfg(test)]
+mod command_contract {
+    use kwil_core_commands::palette::PaletteAction;
+
+    /// Every command the palette offers runs in the GUI: none may answer
+    /// "command not implemented" or panic. Hide unfinished features through
+    /// `NOT_HOSTED` instead.
+    #[test]
+    fn every_palette_command_runs_in_the_gui() {
+        let mut broken = Vec::new();
+        for command in kwil_core_commands::COMMANDS.iter().filter(|c| kwil_core_commands::in_palette(c.id)) {
+            if matches!(command.id, "file.quit" | "file.saveAndQuit") {
+                continue;
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (mut app, _events) = crate::search_ui::host_dispatch_tests::host("alpha beta\n");
+                app.palette_action(PaletteAction::Command(command.id));
+                app.view.status_text()
+            }));
+            match outcome {
+                Ok(status) if status.contains("not implemented") => broken.push(format!("{}: {status}", command.id)),
+                Ok(_) => {}
+                Err(_) => broken.push(format!("{}: panicked", command.id)),
+            }
+        }
+        assert!(broken.is_empty(), "palette commands without a GUI host:\n{}", broken.join("\n"));
     }
 }

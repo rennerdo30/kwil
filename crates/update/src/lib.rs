@@ -152,6 +152,39 @@ pub fn spawn_background(current: &'static str, notify: impl Fn(String) + Send + 
     });
 }
 
+static CHECKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// "Check for Updates" from a frontend: the check `kwil --update` runs, on a
+/// background thread, one at a time. `notify` receives the outcome as a status
+/// message. False when a check is already running (or no thread could start).
+pub fn spawn_check(current: &'static str, notify: impl FnOnce(String) + Send + 'static) -> bool {
+    use std::sync::atomic::Ordering::{AcqRel, Release};
+    if CHECKING.swap(true, AcqRel) {
+        return false;
+    }
+    let started = std::thread::Builder::new().name("kwil-update-check".into()).spawn(move || {
+        let message = check_message(current);
+        CHECKING.store(false, Release);
+        notify(message);
+    });
+    if started.is_err() {
+        CHECKING.store(false, Release);
+    }
+    started.is_ok()
+}
+
+/// The outcome of one explicit check as a status message. Blocking.
+pub fn check_message(current: &str) -> String {
+    if let Some(why) = disabled_reason(current) {
+        return format!("Updates are off ({why})");
+    }
+    match check_and_install(current) {
+        Ok(Outcome::UpToDate) => format!("Kwil {current} is up to date"),
+        Ok(Outcome::Installed(version)) => format!("Updated to {version}; restart Kwil to use it"),
+        Err(error) => format!("Update check failed: {error}"),
+    }
+}
+
 /// Checks GitHub for a newer release and installs it. Blocking; used by
 /// `spawn_background` and by `kwil --update`.
 pub fn check_and_install(current: &str) -> Result<Outcome, Error> {

@@ -9,5 +9,6 @@ publish = false
 kwil-view-model = { path = "../view-model" }
 kwil-core-workspace = { path = "../core-workspace" }
 kwil-core-commands = { path = "../core-commands" }
+kwil-update = { path = "../update" }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 crossterm = "0.29.0"

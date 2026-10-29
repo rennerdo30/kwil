@@ -22,6 +22,7 @@ softbuffer = "0.4.8"
 fontdue = "0.9.5"
 raw-window-handle = "0.6.2"
 kwil-core-commands = { path = "../core-commands" }
+kwil-update = { path = "../update" }
 swash = "0.2.10"
 fontdb = "0.24.0"
 unicode-width = "0.2.2"

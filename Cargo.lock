@@ -2048,6 +2048,7 @@ dependencies = [
  "kwil-core-syntax",
  "kwil-core-text",
  "kwil-core-workspace",
+ "kwil-update",
  "kwil-view-model",
  "libc",
  "pollster",
@@ -2071,6 +2072,7 @@ dependencies = [
  "crossterm",
  "kwil-core-commands",
  "kwil-core-workspace",
+ "kwil-update",
  "kwil-view-model",
  "ratatui",
 ]

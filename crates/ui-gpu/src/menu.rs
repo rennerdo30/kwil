@@ -111,7 +111,12 @@ pub(super) const MENUS: &[Menu] = &[
     },
     Menu {
         title: "&Help",
-        entries: &[Item("Show All &Commands\u{2026}", "view.commandPalette"), Separator, Item("&About Kwil", ABOUT)],
+        entries: &[
+            Item("Show All &Commands\u{2026}", "view.commandPalette"),
+            Item("Check for &Updates", "update.check"),
+            Separator,
+            Item("&About Kwil", ABOUT),
+        ],
     },
 ];
 
