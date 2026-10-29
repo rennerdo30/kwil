@@ -31,6 +31,7 @@ pub(super) fn hold_preview_completion(
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
+    Command(&'static str),
     FileCommand(&'static str),
     FilePromptChoice(&'static str),
     CompareOpen,
@@ -438,7 +439,16 @@ pub(crate) fn start(proxy: super::HostProxy) {
         ];
         let compare =
             [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
-        let steps = if std::env::var_os("KWIL_LOG_COMMANDS_PROBE").is_some() {
+        let format = [
+            (1800, Step::DismissSetup),
+            (300, Step::Command("edit.formatDocument")),
+            (2500, Step::UsabilityCapture("formatted.bmp")),
+            (100, Step::Command("file.save")),
+            (2000, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_FORMAT_PROBE").is_some() {
+            format.as_slice()
+        } else if std::env::var_os("KWIL_LOG_COMMANDS_PROBE").is_some() {
             log_commands.as_slice()
         } else if std::env::var_os("KWIL_FILE_COMMANDS_PROBE").is_some() {
             files.as_slice()
@@ -1613,6 +1623,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             }
             app.settings_epoch = app.settings_epoch.wrapping_add(1);
             app.palette_redraw();
+        }
+        Step::Command(command) => {
+            app.palette_action(kwil_core_commands::palette::PaletteAction::Command(command));
         }
         Step::FileCommand(command) => {
             app.view.cancel_file_prompt();

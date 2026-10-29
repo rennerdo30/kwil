@@ -500,6 +500,9 @@ impl Workspace {
                 "Document/recovery worker is busy; retry replacement",
             ));
         }
+        // A document opened at start-up and never edited has no observer until
+        // the next session checkpoint; install it now, as the checkpoint would.
+        self.install_journal_observers();
         if !self.files.observed.contains_key(&id) || self.files.journal_failed.contains_key(&id) {
             return Err(io::Error::other("Replacement requires an admitted recovery observer"));
         }
