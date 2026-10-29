@@ -99,23 +99,23 @@ use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{Window, WindowId};
 
 fn bg() -> u32 {
-    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::Background)
+    theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::Background)
 }
 fn fg() -> u32 {
-    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::Foreground)
+    theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::Foreground)
 }
 fn gutter_bg() -> u32 {
-    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::GutterBackground)
+    theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::GutterBackground)
 }
 fn gutter_fg() -> u32 {
-    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::GutterForeground)
+    theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::GutterForeground)
 }
 #[cfg(test)]
 fn status_bg() -> u32 {
-    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::StatusBackground)
+    theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::StatusBackground)
 }
 fn status_fg() -> u32 {
-    theme_ui::rgb(theme_ui::chrome(), kwil_core_commands::theme::UiRole::StatusForeground)
+    theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::StatusForeground)
 }
 const GUTTER_COLS: usize = 9;
 /// Minimum clip reserved by the row painters; the DPI-sized scrollbar
@@ -170,6 +170,7 @@ enum UserEvent {
     WindowPlacementTouched,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
+    ThemeReady,
     SettingsPath(Result<std::path::PathBuf, String>),
     SettingsPanelReady,
     WelcomeReady,
@@ -209,6 +210,7 @@ impl UserEvent {
             | Self::StartupFontReady
             | Self::SearchReady
             | Self::PaletteReady
+            | Self::ThemeReady
             | Self::SettingsPanelReady
             | Self::WelcomeReady
             | Self::RegistrationReady
@@ -259,6 +261,7 @@ impl UserEvent {
             Self::WindowPlacementTouched => "WindowPlacementTouched",
             Self::PaletteRoot(_) => "PaletteRoot",
             Self::PaletteReady => "PaletteReady",
+            Self::ThemeReady => "ThemeReady",
             Self::SettingsPath(_) => "SettingsPath",
             Self::SettingsPanelReady => "SettingsPanelReady",
             Self::WelcomeReady => "WelcomeReady",
@@ -483,6 +486,8 @@ struct StartupFonts {
 }
 
 struct App {
+    themes: kwil_view_model::theme_session::ThemeHost,
+    theme_hits: Vec<(Rect, usize)>,
     startup_fonts: StartupFonts,
     hex: hex_host::Host,
     wrap: wrap_ui::Host,
@@ -680,6 +685,8 @@ pub fn run_workspace_with_external_open(
             let frontend_epoch = view.input_epoch();
             let horizontal = view.horizontal_origin();
             Ok(App {
+                themes: Default::default(),
+                theme_hits: Vec::new(),
                 startup_fonts: StartupFonts::default(),
                 hex: Default::default(),
                 wrap: wrap_ui::Host::with_budget(budget),
@@ -1602,6 +1609,7 @@ impl App {
             if let Some(command) = command {
                 if self.dispatch_search(command)
                     || self.dispatch_settings(command)
+                    || self.dispatch_theme(command)
                     || self.dispatch_palette(command)
                     || self.dispatch_zoom(command)
                 {
@@ -1679,6 +1687,7 @@ impl App {
                             || self.dispatch_language(call.id)
                             || self.dispatch_search_call(&call)
                             || self.dispatch_settings(call.id)
+                            || self.dispatch_theme(call.id)
                             || self.dispatch_palette(call.id)
                         {
                             return;
@@ -1814,6 +1823,7 @@ impl App {
             || self.dispatch_markdown(id)
             || self.dispatch_search(id)
             || self.dispatch_settings(id)
+            || self.dispatch_theme(id)
             || self.dispatch_palette(id)
             || self.dispatch_zoom(id)
             || self.dispatch_file(id)
@@ -2150,7 +2160,7 @@ impl App {
         let title = chrome::window_title(&self.view);
         let dragging = self.drag.map(|drag| drag.vertical);
         let hover = self.hover;
-        let theme = theme_ui::chrome();
+        let theme = &theme_ui::chrome();
         let markdown_mode = if hex_active { markdown_ui::Mode::Text } else { self.markdown_mode() };
         let markdown_eligible = !hex_active && self.view.editor().is_some_and(|editor| editor.is_markdown());
         let markdown_area = tabs::rect(lay.body);
@@ -2612,6 +2622,12 @@ impl App {
             }
         }
         if let Some(font) = self.ui_font.as_mut() {
+            if self.themes.is_open() {
+                self.palette_area = theme_ui::draw(&self.themes, &mut self.theme_hits, pixels, (w, h), font, &self.ui);
+                if let Some(area) = self.palette_area {
+                    damage.push(area);
+                }
+            }
             let anchor = self
                 .status_hits
                 .iter()
@@ -2917,7 +2933,7 @@ fn draw_row(
                         y,
                         &text[start..end],
                         end - start,
-                        theme_ui::syntax_rgb(kwil_view_model::highlight_session::syntax_rgb(span.class)),
+                        theme_ui::syntax_rgb(span.class),
                         bg(),
                     );
                 }
@@ -2933,7 +2949,7 @@ fn draw_row(
                     if let Some(span) = spans.get(index).filter(|span| span.range.start <= offset)
                         && cell.text != "\t"
                     {
-                        let color = theme_ui::syntax_rgb(kwil_view_model::highlight_session::syntax_rgb(span.class));
+                        let color = theme_ui::syntax_rgb(span.class);
                         let x = gutter + cell.column * cw;
                         fill(buf, w, Rect { x, y, w: cell.width * cw, h: ch }, bg());
                         draw_text(buf, w, font, x, y, cell.text.as_bytes(), cell.width, color, bg());
@@ -3364,6 +3380,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 Damage { status: true, ..Default::default() }
             }
+            UserEvent::ThemeReady => {
+                self.theme_hits.clear();
+                self.themes.worker_ready();
+                if !self.themes.status.is_empty() {
+                    self.view.set_notice(self.themes.status.clone());
+                }
+                self.theme_redraw();
+                return;
+            }
             UserEvent::PaletteReady => {
                 let mut notice = false;
                 if let Some(palette) = &mut self.palette {
@@ -3520,9 +3545,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::SettingsPanelReady => {
                 let mut open_path = None;
+                let mut theme_error = false;
                 // Drains the worker; an adopted external reload fences painted clicks.
                 self.settings_worker_ready();
                 if let Some(panel) = &mut self.settings_panel {
+                    theme_error = self.themes.settings_progress(panel);
                     if let Some(applied) = panel.take_applied() {
                         let _ = self.proxy.send_event(UserEvent::SettingsReady(
                             Box::new(applied.settings),
@@ -3549,6 +3576,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.settings_open() {
                     self.palette_redraw();
                 }
+                if theme_error {
+                    self.view.set_notice(self.themes.status.clone());
+                    self.theme_redraw();
+                }
                 return;
             }
             UserEvent::DiagnosticsReady(platform) => {
@@ -3572,6 +3603,18 @@ impl ApplicationHandler<UserEvent> for App {
                 let keymap_changed =
                     settings.keymap != self.settings.keymap || settings.bindings != self.settings.bindings;
                 self.settings = *settings;
+                self.themes.settings_ready(&self.settings.theme);
+                self.theme_hits.clear();
+                if !self.themes.is_started()
+                    && let Some(panel) = &self.settings_panel
+                {
+                    let proxy = self.proxy.clone();
+                    if let Err(error) = self.themes.start(panel.path(), move || {
+                        let _ = proxy.send_event(UserEvent::ThemeReady);
+                    }) {
+                        self.view.set_notice(format!("Themes: {error}"));
+                    }
+                }
                 self.search_settings_ready();
                 self.view.set_editor_settings(&self.settings);
                 self.view.set_session_restore(self.settings.files.restore_session);
@@ -3813,6 +3856,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.remember_placement();
             }
             WindowEvent::Resized(sz) => {
+                self.theme_hits.clear();
                 self.remember_placement();
                 self.close_context();
                 // The first Resized repeats the creation size.
@@ -4120,6 +4164,12 @@ impl ApplicationHandler<UserEvent> for App {
                             self.settings_input(kwil_view_model::settings_session::SettingsInput::Text(&text));
                         } else {
                             self.view.set_notice("IME settings input cancelled: its destination changed".into());
+                        }
+                        (Damage::default(), false)
+                    }
+                    ime::Destination::Palette { epoch } if self.themes.is_open() => {
+                        if epoch == self.goto_epoch {
+                            self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text));
                         }
                         (Damage::default(), false)
                     }
@@ -4453,12 +4503,15 @@ impl App {
         });
     }
     fn apply_native_theme(&mut self) {
-        let dark = if self.settings.theme.follow_os {
-            self.gfx.as_ref().is_none_or(|g| g.window.theme() != Some(winit::window::Theme::Light))
+        let scheme = if self.gfx.as_ref().is_some_and(|g| g.window.theme() == Some(winit::window::Theme::Light)) {
+            kwil_core_commands::theme::Scheme::Light
         } else {
-            self.settings.theme.name != "light"
+            kwil_core_commands::theme::Scheme::Dark
         };
-        if theme_ui::select(dark) {
+        self.themes.os_changed(scheme);
+        let theme = self.themes.active(self.policy.remote());
+        let dark = theme.scheme() == kwil_core_commands::theme::Scheme::Dark;
+        if theme_ui::select(theme) {
             self.pending.full = true;
             self.chrome_dirty = true;
             if let Some(gfx) = &self.gfx {
@@ -4475,11 +4528,6 @@ impl App {
         if let Some(g) = &self.gfx
             && let Some(native) = &g.native
         {
-            let dark = if self.settings.theme.follow_os {
-                g.window.theme() != Some(winit::window::Theme::Light)
-            } else {
-                self.settings.theme.name != "light"
-            };
             native.theme(dark, self.policy.remote() || !self.settings_loaded);
         }
     }

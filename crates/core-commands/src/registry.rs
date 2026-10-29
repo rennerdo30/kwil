@@ -141,10 +141,6 @@ pub const NOT_HOSTED: &[&str] = &[
     "log.nextMark",
     "log.previousMark",
     "log.goToTime",
-    "theme.select",
-    "theme.preview",
-    "theme.import",
-    "theme.followSystem",
 ];
 
 /// Whether the command palette offers this command. Key-only commands

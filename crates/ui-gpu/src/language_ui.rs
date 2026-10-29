@@ -113,7 +113,7 @@ pub(super) fn draw(
     let (area, visible) = card(size, anchor, m, state.rows.len())?;
     state.area = Some(area);
     state.first = desktop::reveal(state.first, state.selected, visible, state.rows.len());
-    let c = Colors::new(theme_ui::chrome());
+    let c = Colors::new(&theme_ui::chrome());
     let s = Sizes::new(m);
     let stride = size.0;
     desktop::card(pixels, stride, area, &c, &s);

@@ -21,6 +21,7 @@ mod settings_ui;
 mod tabs;
 #[cfg(test)]
 mod test_support;
+mod theme_ui;
 mod wrap_ui;
 use kwil_view_model::{
     document_worker::{DocumentRequest, DocumentResultSettlementReason, DocumentWrapRetryToken},
@@ -40,6 +41,7 @@ enum Msg {
     HighlightsReady,
     PaletteRoot(Result<std::path::PathBuf, String>),
     PaletteReady,
+    ThemeReady,
     SettingsPath(Result<std::path::PathBuf, String>),
     SettingsPanelReady,
     Input(Event),
@@ -147,6 +149,7 @@ fn run_workspace_with_terminal_init(
     let mut palette: Option<kwil_view_model::palette_session::PaletteSession> = None;
     let mut settings_panel: Option<kwil_view_model::settings_session::SettingsSession> = None;
     let mut settings_file_pending = false;
+    let mut themes = kwil_view_model::theme_session::ThemeHost::default();
     let mut language_menu: Option<LanguageMenu> = None;
     let mut binary_offer = binary_offer::Host::default();
     let mut external_gate = ExternalGate::default();
@@ -172,7 +175,8 @@ fn run_workspace_with_terminal_init(
         crossterm::execute!(
             std::io::stdout(),
             crossterm::event::EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableFocusChange
         )?;
         let terminal = terminal.as_mut().expect("initialized terminal");
         let budget = &startup.budget;
@@ -278,7 +282,13 @@ fn run_workspace_with_terminal_init(
             let user_input = matches!(&msg, Msg::Input(_));
             let size = terminal.size()?;
             let body = wrap_body_rect(view, size.width, size.height, settings.tabs.layout);
-            let blocked = wrap_modal(view, search, palette.as_ref(), settings_panel.as_ref(), language_menu.is_some());
+            let blocked = wrap_modal(
+                view,
+                search,
+                palette.as_ref(),
+                settings_panel.as_ref(),
+                language_menu.is_some() || themes.is_open(),
+            );
             let wrap_changed = wrap.as_mut().is_some_and(|host| host.sync(view, body, blocked));
             if view.hex_active() || view.wrap_input_blocked() {
                 if let Some(host) = highlighting {
@@ -378,8 +388,10 @@ fn run_workspace_with_terminal_init(
                     }
                     Msg::SettingsPanelReady => {
                         let mut open_path = None;
+                        let mut theme_error = false;
                         if let Some(panel) = &mut settings_panel {
                             panel.worker_ready();
+                            theme_error = themes.settings_progress(panel);
                             if let Some(applied) = panel.take_applied() {
                                 let _ = tx.send(Msg::Settings(Box::new(applied.settings), applied.language_mappings));
                             }
@@ -398,7 +410,17 @@ fn run_workspace_with_terminal_init(
                         {
                             view.set_notice(format!("Open settings: {error}"));
                         }
-                        opened || settings_panel.as_ref().is_some_and(|panel| panel.is_open())
+                        if theme_error {
+                            view.set_notice(themes.status.clone());
+                        }
+                        opened || theme_error || settings_panel.as_ref().is_some_and(|panel| panel.is_open())
+                    }
+                    Msg::ThemeReady => {
+                        themes.worker_ready();
+                        if !themes.status.is_empty() {
+                            view.set_notice(themes.status.clone());
+                        }
+                        true
                     }
                     Msg::Settings(next, mappings) => {
                         let accepted = if next.keymap == settings.keymap && next.bindings == settings.bindings {
@@ -418,6 +440,18 @@ fn run_workspace_with_terminal_init(
                             }
                         }
                         view.set_session_restore(settings.files.restore_session);
+                        themes.settings_ready(&settings.theme);
+                        if !themes.is_started()
+                            && let Some(panel) = &settings_panel
+                        {
+                            let sender = tx.clone();
+                            if let Err(error) = themes.start(panel.path(), move || {
+                                let _ = sender.send(Msg::ThemeReady);
+                            }) {
+                                view.set_notice(format!("Themes: {error}"));
+                            }
+                            themes.refresh_system();
+                        }
                         if settings.editor.word_wrap && !view.hex_active() {
                             view.set_body_policy(kwil_view_model::ViewBodyPolicy::Prepared);
                         }
@@ -491,6 +525,7 @@ fn run_workspace_with_terminal_init(
                         true
                     }
                     Msg::Input(Event::FocusLost | Event::FocusGained) => {
+                        themes.refresh_system();
                         view.cancel_hex_input();
                         keys.cancel_pending();
                         true
@@ -509,6 +544,10 @@ fn run_workspace_with_terminal_init(
                             view.set_notice("Wrapped movement cancelled".into());
                         }
                         let intent = if wrap_cancelled {
+                            KeyResult::Changed(true)
+                        } else if themes.is_open() {
+                            theme_ui::key(&mut themes, k, settings_panel.as_mut());
+                            view.set_notice(themes.status.clone());
                             KeyResult::Changed(true)
                         } else if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
                             if k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -600,6 +639,15 @@ fn run_workspace_with_terminal_init(
                                     }
                                     .into(),
                                 );
+                                true
+                            }
+                            KeyResult::Theme(command) => {
+                                if let Some(host) = &mut palette {
+                                    let _ = host.input(kwil_view_model::palette_session::PaletteInput::Cancel);
+                                }
+                                close_language(&mut language_menu, &mut keys);
+                                themes.command(command, settings_panel.as_mut());
+                                view.set_notice(themes.status.clone());
                                 true
                             }
                             KeyResult::SettingsFile => {
@@ -696,7 +744,13 @@ fn run_workspace_with_terminal_init(
                         if view.compare.open {
                             continue;
                         }
-                        if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
+                        if themes.is_open() {
+                            themes.input(
+                                kwil_view_model::palette_session::PaletteInput::Text(&text),
+                                settings_panel.as_mut(),
+                            );
+                            true
+                        } else if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
                             let _ = panel.input(kwil_view_model::settings_session::SettingsInput::Text(&text));
                             true
                         } else if let Some(prompt) = view.file_prompt_mut() {
@@ -739,7 +793,11 @@ fn run_workspace_with_terminal_init(
                             false
                         }
                     }
-                    Msg::Input(Event::Mouse(_)) if settings_panel.as_ref().is_some_and(|panel| panel.is_open()) => true,
+                    Msg::Input(Event::Mouse(_))
+                        if themes.is_open() || settings_panel.as_ref().is_some_and(|panel| panel.is_open()) =>
+                    {
+                        true
+                    }
                     Msg::Input(Event::Mouse(m)) if language_menu.is_some() && view.file_prompt().is_none() => {
                         let size = terminal.size()?;
                         language_mouse(
@@ -894,8 +952,13 @@ fn run_workspace_with_terminal_init(
                 // ratatui diffs against the previous frame and writes only
                 // the changed cells.
                 let body = wrap_body_rect(view, size.width, size.height, settings.tabs.layout);
-                let blocked =
-                    wrap_modal(view, search, palette.as_ref(), settings_panel.as_ref(), language_menu.is_some());
+                let blocked = wrap_modal(
+                    view,
+                    search,
+                    palette.as_ref(),
+                    settings_panel.as_ref(),
+                    language_menu.is_some() || themes.is_open(),
+                );
                 if let Some(host) = wrap {
                     host.sync(view, body, blocked);
                 }
@@ -929,7 +992,10 @@ fn run_workspace_with_terminal_init(
                     }
                     status
                 });
+                theme_ui::select(themes.active(true));
                 terminal.draw(|f| {
+                    let base = theme_ui::base();
+                    f.render_widget(Paragraph::new("").style(base), f.area());
                     tabs::draw_prepared(f, view, settings.tabs.layout, &spans, prepared, prepared_status.as_deref());
                     if !view.wrap_input_blocked()
                         && let Some(host) = wrap.as_ref().and_then(wrap_ui::Runtime::host)
@@ -967,6 +1033,7 @@ fn run_workspace_with_terminal_init(
                     if !settings_panel.as_ref().is_some_and(|panel| panel.is_open()) {
                         binary_offer.draw(f, view);
                     }
+                    theme_ui::draw(f, &themes);
                 })?;
                 if let Some(host) = wrap {
                     host.painted();
@@ -990,7 +1057,8 @@ fn run_workspace_with_terminal_init(
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::event::DisableMouseCapture,
-                crossterm::event::DisableBracketedPaste
+                crossterm::event::DisableBracketedPaste,
+                crossterm::event::DisableFocusChange
             );
             ratatui::restore();
             // Terminal Drop is also inside the borrow guard, before the
@@ -1726,6 +1794,7 @@ fn combine_shutdown_results(primary: std::io::Result<()>, cleanup: std::io::Resu
 }
 
 enum KeyResult {
+    Theme(&'static str),
     RetryWrap,
     CheckUpdate,
     BodyInvoke(kwil_core_commands::vim::Invocation, bool),
@@ -1984,7 +2053,11 @@ fn draw_language_status(
     let text = format!(" {} ", host.language_status(view).label());
     let width = (text.len() as u16).min(bounds.width);
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18))),
+        Paragraph::new(text).style(
+            Style::default()
+                .fg(theme_ui::color(kwil_core_commands::theme::UiRole::StatusForeground, Color::Rgb(0x8f, 0xe3, 0xff)))
+                .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18))),
+        ),
         Rect { x: bounds.right() - width, y: bounds.bottom() - 1, width, height: 1 },
     );
 }
@@ -1993,7 +2066,9 @@ fn draw_language(frame: &mut ratatui::Frame, menu: &LanguageMenu) {
     if area.width < 4 || area.height < 4 {
         return;
     }
-    let style = Style::default().fg(Color::Rgb(0xd6, 0xe4, 0xf0)).bg(Color::Rgb(0x08, 0x0d, 0x18));
+    let style = Style::default()
+        .fg(theme_ui::color(kwil_core_commands::theme::UiRole::Foreground, Color::Rgb(0xd6, 0xe4, 0xf0)))
+        .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18)));
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(style), area);
     let title = format!("File type ({})  Esc close", menu.ticket.status().label());
@@ -2005,8 +2080,11 @@ fn draw_language(frame: &mut ratatui::Frame, menu: &LanguageMenu) {
     let visible = area.height as usize - 3;
     let first = menu.selected.saturating_sub(visible - 1);
     for (index, row) in menu.ticket.items(&menu.query).enumerate().skip(first).take(visible) {
-        let background =
-            if index == menu.selected { Color::Rgb(0x19, 0x2a, 0x43) } else { Color::Rgb(0x08, 0x0d, 0x18) };
+        let background = if index == menu.selected {
+            theme_ui::color(kwil_core_commands::theme::UiRole::ActiveTabBackground, Color::Rgb(0x19, 0x2a, 0x43))
+        } else {
+            theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18))
+        };
         let label = format!(
             "{} {}{}",
             if row.selected { "*" } else { " " },
@@ -2224,6 +2302,9 @@ fn invoke(
     if view.comparison_open() && (call.id.starts_with("edit.") || call.id.starts_with("search.")) {
         view.text_view_mut().set_notice("Close the read-only comparison to edit or search".into());
         return KeyResult::Changed(true);
+    }
+    if matches!(call.id, "theme.select" | "theme.preview" | "theme.import" | "theme.followSystem") {
+        return KeyResult::Theme(call.id);
     }
     if view.raw_body() && !hex_ui::chrome_command(call.id) {
         return KeyResult::Hex(call, extend);
@@ -2533,7 +2614,8 @@ fn draw_area_highlighted(
         return;
     }
     let view = target.text_view();
-    let gutter_style = Style::default().fg(Color::Rgb(0x5b, 0x6b, 0x85));
+    let gutter_style = Style::default()
+        .fg(theme_ui::color(kwil_core_commands::theme::UiRole::GutterForeground, Color::Rgb(0x5b, 0x6b, 0x85)));
     for row in 0..view.rows().min(area.height.saturating_sub(u16::from(status)) as usize) {
         let y = area.y + row as u16;
         let Some(text) = view.line(row) else { continue };
@@ -2551,21 +2633,32 @@ fn draw_area_highlighted(
             let selected = selections.iter().any(|range| {
                 range.start < source + cell.bytes.end as u64 && source + (cell.bytes.start as u64) < range.end
             });
-            let mut style = if selected { Style::default().bg(Color::Rgb(0x30, 0x58, 0x80)) } else { Style::default() };
+            let mut style = if selected {
+                theme_ui::base()
+                    .bg(theme_ui::color(kwil_core_commands::theme::UiRole::Selection, Color::Rgb(0x30, 0x58, 0x80)))
+            } else {
+                theme_ui::base()
+            };
             let offset = source as usize + cell.bytes.start;
             let index = highlights.partition_point(|span| span.range.end <= offset);
             if let Some(span) = highlights.get(index).filter(|span| span.range.start <= offset) {
-                let rgb = kwil_view_model::highlight_session::syntax_rgb(span.class);
+                let rgb = theme_ui::syntax(span.class);
                 style = style.fg(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
             }
             spans.push(Span::styled(if cell.text == "\t" { " ".repeat(cell.width) } else { cell.text }, style));
         }
         let line = Line::from(spans);
-        f.render_widget(Paragraph::new(line), Rect { x: area.x, y, width: area.width, height: 1 });
+        f.render_widget(
+            Paragraph::new(line).style(theme_ui::base()),
+            Rect { x: area.x, y, width: area.width, height: 1 },
+        );
     }
     if status {
-        let status = Paragraph::new(view.status_text())
-            .style(Style::default().fg(Color::Rgb(0x8f, 0xe3, 0xff)).bg(Color::Rgb(0x08, 0x0d, 0x18)));
+        let status = Paragraph::new(view.status_text()).style(
+            Style::default()
+                .fg(theme_ui::color(kwil_core_commands::theme::UiRole::StatusForeground, Color::Rgb(0x8f, 0xe3, 0xff)))
+                .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18))),
+        );
         f.render_widget(
             status,
             Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
