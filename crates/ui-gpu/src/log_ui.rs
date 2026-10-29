@@ -1013,7 +1013,7 @@ impl App {
         if self.logs.follow_document != Some(self.view.active_id()) {
             self.logs.following = false;
         }
-        if self.logs.following && self.logs.follow_reload && self.view.editor().is_some() {
+        if self.logs.following && self.logs.follow_reload {
             match self.view.reload_log() {
                 Ok(()) => {
                     self.logs.follow_reload = false;

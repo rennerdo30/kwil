@@ -1299,25 +1299,26 @@ impl Workspace {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Log reload waits for the current operation"));
         }
         let view = self.views.get(&id).ok_or_else(|| io::Error::other("Log tab closed"))?;
-        let editor = view.editor().ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Log file is opening"))?;
-        if editor.document().is_dirty() {
+        if view.editor().is_none() && !self.files.failed_opens.contains(&id) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Log file is opening"));
+        }
+        if view.editor().is_some_and(|editor| editor.document().is_dirty()) {
             return Err(io::Error::other("Save log edits before following the file"));
         }
-        let path = editor
-            .document()
-            .path()
-            .ok_or_else(|| io::Error::other("Save the log file before following it"))?
-            .to_path_buf();
+        let path =
+            view.path.as_ref().ok_or_else(|| io::Error::other("Save the log file before following it"))?.to_path_buf();
         // Restore the exact editor if admission refuses, before any transfer.
-        let editor = self.views.get_mut(&id).unwrap().editor.take().unwrap();
+        let editor = self.views.get_mut(&id).unwrap().editor.take();
         let request = match self.checked_open_request(id, 0, path) {
             Ok(request) => request,
             Err(error) => {
-                self.views.get_mut(&id).unwrap().editor = Some(editor);
+                self.views.get_mut(&id).unwrap().editor = editor;
                 return Err(error);
             }
         };
-        self.binary.retiring.push((id, Box::new(editor)));
+        if let Some(editor) = editor {
+            self.binary.retiring.push((id, Box::new(editor)));
+        }
         let tab = self.session.tab_mut(id).unwrap();
         tab.revision = 0;
         tab.saved_revision = 0;
@@ -3055,6 +3056,22 @@ mod tests {
             workspace.editor().unwrap().document().snapshot().write_to(&mut current).unwrap();
             assert_eq!(current, bytes);
         }
+        // Rotation may leave the name absent until a later native notification.
+        workspace.reload_log().unwrap();
+        let DocumentRequest::OpenChecked { ticket, .. } = workspace.files.queue.pop_back().unwrap() else {
+            panic!("checked reopen")
+        };
+        workspace.test_document_result(DocumentResult::CheckedOpened {
+            ticket,
+            result: Err(io::Error::new(io::ErrorKind::NotFound, "rotation gap")),
+        });
+        workspace.reload_log().expect("a later create notification must reopen the failed placeholder");
+        let DocumentRequest::OpenChecked { ticket, .. } = workspace.files.queue.pop_back().unwrap() else {
+            panic!("checked reopen")
+        };
+        let file = kwil_core_text::TextFile::open(&path).unwrap();
+        let document = crate::Document::from_file(path.clone(), file).unwrap();
+        workspace.test_document_result(DocumentResult::CheckedOpened { ticket, result: Ok(Some(Box::new(document))) });
         workspace
             .execute("edit.insert", &CommandArgs { text: Some("keep me".into()), ..Default::default() }, 1)
             .unwrap();
