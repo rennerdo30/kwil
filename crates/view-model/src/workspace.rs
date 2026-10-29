@@ -718,6 +718,11 @@ impl Workspace {
         if dirty { format!("* {name}") } else { name }
     }
 
+    /// A journal result for `revision` that a later save already made durable.
+    fn journal_superseded(&self, document: DocumentId, revision: u64) -> bool {
+        self.session.tabs().iter().find(|tab| tab.id == document).is_some_and(|tab| tab.saved_revision >= revision)
+    }
+
     /// The tab has changes that are not saved.
     pub fn tab_dirty(&self, id: DocumentId) -> bool {
         self.session.tabs().iter().find(|tab| tab.id == id).is_some_and(|tab| {
@@ -2419,6 +2424,9 @@ impl Workspace {
                     damage = Damage::default();
                     self.checkpoint_session();
                 }
+                // A late failure for a revision a later save already wrote to
+                // disk (for example after an external change) changes nothing.
+                Err(_) if self.journal_superseded(document, revision) => damage = Damage::default(),
                 Err(error) => {
                     let message = format!("Tab {} revision {revision} is not journaled: {error}", document.0);
                     self.files.journal_failed.insert(document, message.clone());
@@ -2440,6 +2448,7 @@ impl Workspace {
                             ..Default::default()
                         };
                     }
+                    Err(_) if self.journal_superseded(document, revision) => damage = Damage::default(),
                     Err(error) => {
                         let message = format!("Tab {} recovery is not durable: {error}", document.0);
                         self.files.journal_failed.insert(document, message.clone());

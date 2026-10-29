@@ -482,7 +482,8 @@ mod external_change {
         let (mut workspace, lane, path, id) = conflicted("kwil-conflict-reload");
         workspace.file_prompt_mut().unwrap().text = "2".into();
         submit(&mut workspace);
-        lane.until(&mut workspace, |w| !w.document_busy(id) && w.file_prompt().is_none());
+        // Reload may wait in the pending slot first; wait for its result.
+        lane.until(&mut workspace, |w| !w.document_busy(id) && w.status_text().contains("Reloaded from disk"));
         assert_eq!(text(&workspace), "changed outside\n");
         assert!(!workspace.editor().unwrap().document().is_dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed outside\n");
