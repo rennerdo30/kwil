@@ -1,17 +1,32 @@
 # Theme backend (KW-37)
 
-This package provides data, worker and cache APIs. GUI/TUI selection commands,
-palette hover wiring, settings persistence, OS events, syntax scope adapters and
-one-full-redraw damage handling remain coordinator integration work. No native
-rendering or theme-switch speed claim follows from these contracts.
+The GUI and TUI host `theme.select`, `theme.preview`, `theme.import` and
+`theme.followSystem` in the command palette. Select and Preview open the same
+searchable picker of built-in and imported themes. Arrow keys (and GUI hover)
+preview immediately; Enter applies and saves `theme.name` with OS follow off.
+Esc restores the committed theme, including the latest OS preference while
+following the system. Preview never writes settings or the active cache.
+
+Import accepts an absolute file path to native `.toml`, strict VS Code `.json`
+or TextMate `.tmTheme`. The existing worker reads the bounded regular file,
+parses it and creates a new native theme without overwriting existing files.
+Choose the imported theme with Select Theme. User themes live in `themes/`
+beside `settings.toml`; the committed cache is `theme-active.bin` beside it.
+Errors appear in the status line and retain the last committed theme.
+
+Follow System toggles `theme.follow_os` through the settings worker. The GUI
+handles native OS theme events. The TUI refreshes on terminal focus: Windows
+uses the OS app-theme preference, other terminals use `COLORFGBG` when supplied
+(dark otherwise). Remote display uses opaque backgrounds. Both frontends map
+the syntax engine's broad token classes to their corresponding theme scopes;
+more specific imported scopes are retained but need richer syntax-engine spans.
+Source parsing and imports run after first frame, on the theme worker.
 
 `theme::Theme::builtin(Scheme)` constructs static data without source parsing.
 The corresponding native files are `crates/core-commands/src/themes/{dark,light}.toml`;
-focused tests require them to equal those constructors. Dark editor, gutter and
-status colours preserve the existing frontend constants, including background
-`#0d1424` and foreground `#d6e4f0`. No light palette existed in the provided base;
-the light data is new and needs parent visual acceptance. Geometry, fonts,
-shaping, settings and palette files are outside this package.
+focused tests require them to equal those constructors. Theme changes affect
+colours without changing geometry, fonts or shaping. Native visual acceptance
+and switch-speed measurements are separate from the backend contracts.
 
 ## Native format
 
@@ -76,7 +91,8 @@ always publishes the cancelled session, even after its source has been removed.
 4. `snapshot()` clones one immutable Arc. The host compares active theme content
    to its displayed theme: one actual change means one full redraw, while a
    catalogue-only diagnostic update does not require a full present. The worker
-   callback only wakes; it never draws. Both frontend adapters are still needed.
+   callback only wakes; it never draws. The shared frontend command host is
+   `view-model/src/theme_session.rs`; both frontends use its picker state.
 
 The theme worker has one desired-state slot and one snapshot slot. Requests
 reduce to complete selection state before coalescing, so Preview then Apply

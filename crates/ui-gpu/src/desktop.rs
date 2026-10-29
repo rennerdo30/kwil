@@ -802,12 +802,12 @@ mod tests {
     use super::*;
 
     fn colors() -> Colors {
-        Colors::new(theme_ui::chrome())
+        Colors::new(&theme_ui::chrome())
     }
 
     #[test]
     fn colours_come_from_the_theme_roles_and_keep_a_visible_hierarchy() {
-        let theme = theme_ui::chrome();
+        let theme = &theme_ui::chrome();
         let c = colors();
         assert_eq!(c.backdrop, theme_ui::rgb(theme, UiRole::Background));
         assert_eq!(c.accent, theme_ui::rgb(theme, UiRole::Accent));

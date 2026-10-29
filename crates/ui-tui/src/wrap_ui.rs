@@ -7,6 +7,7 @@
 //! No polling timer or additional worker is created. Production document wakes
 //! carry no owner; the frontend's one bounded receiver restores settlement.
 
+use super::theme_ui;
 #[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -344,6 +345,7 @@ impl Host {
         for y in area.y..area.bottom() {
             for x in area.x..area.right() {
                 buffer[(x, y)].reset();
+                buffer[(x, y)].set_style(theme_ui::base());
             }
         }
         let Some(page) = self.page() else {
@@ -363,7 +365,10 @@ impl Host {
                     y,
                     std::str::from_utf8(&label).expect("ASCII gutter"),
                     usize::from(gutter_width.min(area.right() - self.geometry.body.x)),
-                    Style::default().fg(Color::Rgb(0x5b, 0x6b, 0x85)),
+                    Style::default().fg(theme_ui::color(
+                        kwil_core_commands::theme::UiRole::GutterForeground,
+                        Color::Rgb(0x5b, 0x6b, 0x85),
+                    )),
                 );
             }
             for atom in page.atoms(row) {
@@ -372,7 +377,7 @@ impl Host {
                 if width == 0 || x < area.x || x >= area.right() {
                     continue;
                 }
-                let mut style = Style::default();
+                let mut style = theme_ui::base();
                 if valid_paint
                     && atom.kind == AtomKind::Normal
                     && self.check_syntax_request(atom.source.clone(), 0).is_ok()
@@ -381,7 +386,7 @@ impl Host {
                     if let Some(span) =
                         paint.syntax.get(index).filter(|span| (span.range.start as u64) < atom.source.end)
                     {
-                        let rgb = kwil_view_model::highlight_session::syntax_rgb(span.class);
+                        let rgb = theme_ui::syntax(span.class);
                         style = style.fg(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
                     }
                 }
@@ -407,7 +412,7 @@ impl Host {
                             overlaps(&(cursor.anchor.min(cursor.head)..cursor.anchor.max(cursor.head)), &atom.source)
                         })
                     {
-                        style = style.bg(SELECTION);
+                        style = style.bg(theme_ui::color(kwil_core_commands::theme::UiRole::Selection, SELECTION));
                     }
                 }
                 // Each atom starts at its PREPARED cell. set_stringn only

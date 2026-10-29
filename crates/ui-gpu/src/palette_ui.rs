@@ -110,6 +110,9 @@ impl App {
         }
     }
     pub(super) fn capture_input_destination(&self) -> ime::Destination {
+        if self.themes.is_open() {
+            return ime::Destination::Palette { epoch: self.goto_epoch };
+        }
         if self.language_owns_input() {
             return ime::Destination::Cancelled;
         }
@@ -132,7 +135,7 @@ impl App {
         }
     }
     pub(super) fn palette_open(&self) -> bool {
-        self.goto.is_some() || self.palette.as_ref().is_some_and(|p| p.model().is_open())
+        self.themes.is_open() || self.goto.is_some() || self.palette.as_ref().is_some_and(|p| p.model().is_open())
     }
 
     pub(super) fn palette_redraw(&mut self) {
@@ -225,6 +228,19 @@ impl App {
     }
 
     pub(super) fn palette_input(&mut self, input: kwil_view_model::palette_session::PaletteInput<'_>) {
+        if self.themes.is_open() {
+            self.theme_hits.clear();
+            self.themes.input(input, self.settings_panel.as_mut());
+            self.goto_epoch += 1;
+            if !self.themes.is_open()
+                && let Some(keys) = &mut self.keys
+            {
+                keys.set_context(kwil_core_commands::Context::Editor);
+            }
+            self.view.set_notice(self.themes.status.clone());
+            self.theme_redraw();
+            return;
+        }
         if self.goto.is_some() {
             self.goto_input(input);
             return;
@@ -250,6 +266,17 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
+                if self.dispatch_compare(command) {
+                    return;
+                }
+                if self.view.compare.open && (command.starts_with("edit.") || command.starts_with("search.")) {
+                    let damage = self.view.set_notice("Close the read-only comparison to edit or search".into());
+                    self.apply(damage);
+                    return;
+                }
+                if self.dispatch_theme(command) {
+                    return;
+                }
                 if matches!(command, "update.check" | "update.apply") {
                     let proxy = self.proxy.clone();
                     let started = kwil_update::spawn_check(env!("CARGO_PKG_VERSION"), move |message| {
@@ -453,6 +480,10 @@ impl App {
     }
 
     pub(super) fn palette_mouse(&mut self) {
+        if self.themes.is_open() {
+            self.theme_pointer(true);
+            return;
+        }
         if self.goto.is_some() {
             if self.palette_area.is_some_and(|area| area.contains(self.pointer)) {
                 self.palette_input(kwil_view_model::palette_session::PaletteInput::Accept);

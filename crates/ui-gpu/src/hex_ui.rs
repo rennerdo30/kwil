@@ -161,7 +161,7 @@ pub(super) fn draw_borrowed(
         }
     }
     let selection = session.view().selection();
-    let selected_bg = theme_ui::rgb(theme_ui::chrome(), UiRole::Selection);
+    let selected_bg = theme_ui::rgb(&theme_ui::chrome(), UiRole::Selection);
     for index in 0..rows {
         if !full && !dirty(index) {
             continue;

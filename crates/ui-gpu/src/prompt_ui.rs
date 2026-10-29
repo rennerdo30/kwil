@@ -125,7 +125,12 @@ pub(super) fn draw(
     view.hits = Hits::default();
     view.area = None;
     let prompt = view_model.file_prompt()?;
-    let recent: Vec<&Path> = view_model.session().recent().iter().take(RECENT_ROWS).map(PathBuf::as_path).collect();
+    let recent: Vec<&Path> = if prompt.kind.choices().is_empty() {
+        view_model.session().recent().iter().take(RECENT_ROWS).map(PathBuf::as_path).collect()
+    } else {
+        prompt.kind.choices().iter().map(Path::new).collect()
+    };
+    let native_dialog = native_dialog && matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::SaveAs);
     draw_card(prompt.kind, prompt.generation, &recent, text, pixels, size, font, theme, m, native_dialog, view)
 }
 
@@ -148,7 +153,7 @@ fn draw_card(
     let c = Colors::new(theme);
     let s = Sizes::new(m);
     let row_h = m.dip(44.0);
-    let listing = matches!(kind, FilePromptKind::Recent).then_some(recent.len());
+    let listing = (kind == FilePromptKind::Recent || !kind.choices().is_empty()).then_some(recent.len());
     let (area, visible) = layout(size, m, &s, listing)?;
     if view.generation != generation {
         // A new prompt starts at the top of its list.
@@ -160,16 +165,17 @@ fn draw_card(
     let stride = size.0;
     desktop::card(pixels, stride, area, &c, &s);
     let inner = inset(area, s.pad);
-    let title = match kind {
-        FilePromptKind::Open => "Open by path",
-        FilePromptKind::SaveAs => "Save as path",
-        FilePromptKind::Recent => "Open recent",
-    };
+    let title = kind.title();
     let pen = desktop::label(pixels, stride, font, Rect { h: s.text, ..inner }, title, c.fg);
     let mut y = inner.y + s.header - s.pad;
-    let chosen = typed(text, recent.len()).filter(|_| matches!(kind, FilePromptKind::Recent));
+    let chosen = typed(text, recent.len()).filter(|_| listing.is_some());
     match kind {
-        FilePromptKind::Recent => {
+        FilePromptKind::Recent
+        | FilePromptKind::Encoding
+        | FilePromptKind::ReopenEncoding
+        | FilePromptKind::SaveEncoding
+        | FilePromptKind::LineEnding
+        | FilePromptKind::Reload => {
             // Keyboard route, stated on the card: the typed number is the row.
             let (hint, color) = if !text.trim().is_empty() && chosen.is_none() {
                 (format!("No recent file {}", desktop::visible(text.trim(), 16)), c.error)
@@ -268,6 +274,8 @@ fn draw_card(
         FilePromptKind::Recent => chosen.map(|_| "Open"),
         FilePromptKind::Open => Some("Open"),
         FilePromptKind::SaveAs => Some("Save"),
+        FilePromptKind::Folder => Some("Open Folder"),
+        _ => chosen.map(|_| "Apply"),
     };
     if let Some(text) = primary {
         let bw = desktop::button_width(font, text, &s);
@@ -344,14 +352,17 @@ impl App {
     /// that Enter submits; the card reveals and highlights that row. The
     /// caller's `update_file_prompt` repaints.
     pub(super) fn prompt_step(&mut self, up: bool) {
-        if !self.view.file_prompt().is_some_and(|prompt| prompt.kind == FilePromptKind::Recent) {
-            return;
-        }
-        let count = self.view.session().recent().len().min(RECENT_ROWS);
+        let Some(prompt) = self.view.file_prompt() else { return };
+        let count = if prompt.kind == FilePromptKind::Recent {
+            self.view.session().recent().len().min(RECENT_ROWS)
+        } else {
+            prompt.kind.choices().len()
+        };
         if let Some(text) = self.save_path.as_mut()
             && let Some(number) = step(text, count, up)
         {
             *text = number.to_string();
+            self.update_file_prompt();
         }
     }
 
@@ -461,7 +472,7 @@ mod tests {
                     &mut pixels,
                     size,
                     &mut font,
-                    theme_ui::chrome(),
+                    &theme_ui::chrome(),
                     &m,
                     false,
                     view,
