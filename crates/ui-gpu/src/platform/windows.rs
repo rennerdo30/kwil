@@ -131,7 +131,7 @@ pub(crate) fn decorate_window(hwnd: isize, dark: bool, remote: bool, dialog: boo
     let enabled = 2i32; // DWMNCRP_ENABLED
     let theme = super::super::theme_ui::chrome();
     let colorref = |role| {
-        let rgb = super::super::theme_ui::rgb(theme, role);
+        let rgb = super::super::theme_ui::rgb(&theme, role);
         ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff)
     };
     let caption = colorref(kwil_core_commands::theme::UiRole::PanelBackground);

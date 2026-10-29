@@ -461,7 +461,7 @@ mod tests {
                     &mut pixels,
                     size,
                     &mut font,
-                    theme_ui::chrome(),
+                    &theme_ui::chrome(),
                     &m,
                     false,
                     view,

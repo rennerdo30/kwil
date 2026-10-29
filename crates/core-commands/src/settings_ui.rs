@@ -525,7 +525,9 @@ impl SettingsDocument {
             | (SettingKind::Float, SettingValue::Float(_))
             | (SettingKind::Text, SettingValue::Text(_))
             | (SettingKind::Strings, SettingValue::Strings(_)) => true,
-            (SettingKind::Choice(options), SettingValue::Text(v)) => options.contains(&v.as_str()),
+            (SettingKind::Choice(options), SettingValue::Text(v)) => {
+                options.contains(&v.as_str()) || (id == "theme.name" && crate::theme::ThemeId::user(v).is_ok())
+            }
             _ => false,
         };
         if !valid {

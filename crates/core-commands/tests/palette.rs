@@ -3,6 +3,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+#[test]
+fn theme_commands_are_available_in_the_palette() {
+    for id in ["theme.select", "theme.preview", "theme.import", "theme.followSystem"] {
+        assert!(kwil_core_commands::in_palette(id), "theme command must be hosted: {id}");
+    }
+}
+
 struct Worker {
     index: PaletteWorker,
     wake: mpsc::Receiver<()>,
