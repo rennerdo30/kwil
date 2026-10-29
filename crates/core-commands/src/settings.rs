@@ -118,7 +118,10 @@ group!(CompareSettings { ignore_whitespace: bool = false, collapse_unchanged: bo
 group!(SyntaxSettings { full_parse_limit_bytes: u64 = 20 * 1024 * 1024 });
 group!(LogSettings { follow: bool = false, detect_levels: bool = true,
     highlight_rules: BTreeMap<String, String> = BTreeMap::new() });
-group!(Formatter { executable: String = String::new(), args: Vec<String> = Vec::new(), timeout_ms: u32 = 5000 });
+group!(Formatter {
+    executable: String = String::new(), args: Vec<String> = Vec::new(),
+    range_args: Vec<String> = Vec::new(), timeout_ms: u32 = 5000
+});
 group!(Settings {
     keymap: Preset = Preset::VsCode, bindings: Vec<Binding> = Vec::new(),
     tabs: TabsSettings = TabsSettings::default(),
@@ -413,7 +416,7 @@ fn known(path: &str) -> &'static [&'static str] {
         "syntax" => &["full_parse_limit_bytes"],
         "log" => &["follow", "detect_levels", "highlight_rules"],
         "bindings[]" => &["keys", "command", "context", "mode"],
-        "formatters.*" => &["executable", "args", "timeout_ms"],
+        "formatters.*" => &["executable", "args", "range_args", "timeout_ms"],
         _ => &[],
     }
 }

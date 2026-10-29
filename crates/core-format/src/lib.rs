@@ -16,6 +16,17 @@ use std::{collections::BTreeMap, fmt, ops::Range};
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Worker-only stdin/stdout adapter for formatters with native range arguments.
+/// Hosts must preserve bytes outside the requested range before publishing.
+pub fn run_external(
+    input: &str,
+    formatter: &ExternalFormatter,
+    max_output_bytes: usize,
+) -> Result<String, FormatError> {
+    check_size(input.len(), &Settings { max_output_bytes, ..Settings::default() })?;
+    external::run(input, formatter, max_output_bytes)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
     Json,

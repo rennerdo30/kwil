@@ -184,6 +184,7 @@ impl SaveFlight {
 struct EditorLoan {
     key: kwil_core_search::worker::SearchKey,
     operation: u64,
+    formatting: bool,
 }
 
 #[derive(Default)]
@@ -418,7 +419,43 @@ impl Workspace {
     }
 
     pub fn submit_search_replacement(&mut self, recipe: kwil_core_search::worker::ReplaceRecipe) -> io::Result<()> {
-        let id = DocumentId(recipe.key.document_id);
+        let key = recipe.key;
+        self.submit_editor_job(key, false, move |operation, editor| DocumentRequest::Replace {
+            document: DocumentId(key.document_id),
+            operation,
+            editor,
+            recipe,
+        })
+    }
+
+    /// Shared GUI/TUI entry point. The existing document lane wakes the host
+    /// and returns the same editor, including undo history and journal observer.
+    pub fn format_command(&mut self, selection: bool, language: Option<String>) -> io::Result<()> {
+        if self.wrap_input_blocked() {
+            return Err(io::Error::other("Wrapped body is settling; formatting was not started"));
+        }
+        let editor = self.editor().ok_or_else(|| io::Error::other("Document is not ready for formatting"))?;
+        let key = kwil_core_search::worker::SearchKey {
+            document_id: self.active_id().0,
+            revision: editor.document().revision(),
+            generation: 0,
+        };
+        self.submit_editor_job(key, true, move |operation, editor| DocumentRequest::Format {
+            key,
+            operation,
+            editor,
+            selection,
+            language,
+        })
+    }
+
+    fn submit_editor_job(
+        &mut self,
+        key: kwil_core_search::worker::SearchKey,
+        formatting: bool,
+        request: impl FnOnce(u64, Box<Editor>) -> DocumentRequest,
+    ) -> io::Result<()> {
+        let id = DocumentId(key.document_id);
         if self.hex_owns_document(id) {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Text replacement is unavailable in hex view"));
         }
@@ -443,7 +480,7 @@ impl Workspace {
             self.views.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Search tab is closed"))?;
         view.editor()
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Document is not ready"))?
-            .admit_worker_loan(recipe.key.revision)?;
+            .admit_worker_loan(key.revision)?;
         self.pump_files();
         if !self.files.queue.is_empty() {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Recovery queue is full; retry replacement"));
@@ -452,14 +489,16 @@ impl Workspace {
         let operation =
             self.files.next_loan.checked_add(1).ok_or_else(|| io::Error::other("Replacement identity exhausted"))?;
         self.files.next_loan = operation;
-        let key = recipe.key;
         let editor = Box::new(self.views.get_mut(&id).unwrap().editor.take().unwrap());
-        let request = DocumentRequest::Replace { document: id, operation, editor, recipe };
+        let request = request(operation, editor);
         match self.files.worker.as_ref().unwrap().try_submit(request) {
             Ok(()) => {
-                self.files.loans.insert(id, EditorLoan { key, operation });
+                self.files.loans.insert(id, EditorLoan { key, operation, formatting });
                 self.input_epoch = self.input_epoch.wrapping_add(1);
-                self.views.get_mut(&id).unwrap().set_notice("Replacing...".into());
+                self.views
+                    .get_mut(&id)
+                    .unwrap()
+                    .set_notice(if formatting { "Formatting..." } else { "Replacing..." }.into());
                 Ok(())
             }
             Err(error) => {
@@ -467,7 +506,10 @@ impl Workspace {
                     std::sync::mpsc::TrySendError::Full(request) => (request, io::ErrorKind::WouldBlock),
                     std::sync::mpsc::TrySendError::Disconnected(request) => (request, io::ErrorKind::BrokenPipe),
                 };
-                let DocumentRequest::Replace { editor, .. } = *request else { unreachable!() };
+                let (DocumentRequest::Replace { editor, .. } | DocumentRequest::Format { editor, .. }) = *request
+                else {
+                    unreachable!()
+                };
                 self.views.get_mut(&id).unwrap().editor = Some(*editor);
                 Err(io::Error::new(kind, "Replacement was not admitted; editor retained"))
             }
@@ -1834,9 +1876,11 @@ impl Workspace {
                     self.files.replacement_journals.insert(id, sequence);
                 }
                 prepare_view_publication(view, intended_wrap, false);
-                self.files.loans.remove(&id);
+                let formatting = self.files.loans.remove(&id).is_some_and(|loan| loan.formatting);
                 self.input_epoch = self.input_epoch.wrapping_add(1);
                 let notice = match result {
+                    Ok(_) if formatting => "Formatting complete".to_string(),
+                    Err(error) if formatting => format!("Format: {error}"),
                     Ok(_) => "Replacement complete".to_string(),
                     Err(error) => format!("Replacement failed: {error}"),
                 };

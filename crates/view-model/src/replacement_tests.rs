@@ -156,6 +156,46 @@ fn replacement_stale_revision_and_missing_recovery_refuse_without_changes() {
 }
 
 #[test]
+fn formatting_document_worker_returns_exact_editor_and_one_undo_edit() {
+    let root = Scratch::new();
+    let (mut workspace, receiver) = real_workspace(&root);
+    let id = workspace.active_id();
+    let original = "{\"a\":1}\n";
+    workspace
+        .execute("edit.insert", &crate::CommandArgs { text: Some(original.into()), ..Default::default() }, 1)
+        .unwrap();
+    workspace.format_command(false, Some("json".into())).unwrap();
+    assert!(workspace.editor().is_none(), "worker exclusively owns the editor during formatting");
+    assert!(workspace.document_busy(id));
+    workspace.file_command("file.new").unwrap();
+    let other = workspace.active_id();
+    drive(&mut workspace, &receiver, |workspace| !workspace.search_replacement_pending());
+    assert_eq!(workspace.active_id(), other, "completion must not switch tabs");
+    assert!(bytes(&workspace, other).is_empty());
+    assert!(String::from_utf8(bytes(&workspace, id)).unwrap().contains("\"a\": 1"));
+    assert_eq!(workspace.view(id).unwrap().notice(), "Formatting complete");
+    workspace.activate(id);
+    workspace.execute("edit.undo", &crate::CommandArgs::default(), 1).unwrap();
+    assert_eq!(bytes(&workspace, id), original.as_bytes());
+    stop(workspace, &receiver);
+}
+
+#[test]
+fn formatting_full_queue_restores_editor_and_undo_history() {
+    let (mut workspace, receiver) = channel_workspace(1);
+    workspace
+        .execute("edit.insert", &crate::CommandArgs { text: Some("kept".into()), ..Default::default() }, 1)
+        .unwrap();
+    // The insertion's journal request occupies the only slot.
+    assert!(workspace.format_command(false, Some("json".into())).is_err());
+    assert_eq!(bytes(&workspace, workspace.active_id()), b"kept");
+    assert!(!workspace.search_replacement_pending());
+    let _ = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    workspace.execute("edit.undo", &crate::CommandArgs::default(), 1).unwrap();
+    assert!(bytes(&workspace, workspace.active_id()).is_empty());
+}
+
+#[test]
 fn replacement_full_queue_and_disconnect_restore_actual_editor_and_observer() {
     let (mut workspace, receiver) = channel_workspace(1);
     let id = workspace.active_id();

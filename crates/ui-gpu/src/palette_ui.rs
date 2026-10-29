@@ -267,7 +267,8 @@ impl App {
                     return;
                 }
                 self.close_language();
-                if self.dispatch_language(command)
+                if self.dispatch_format(command)
+                    || self.dispatch_language(command)
                     || self.dispatch_logs(command)
                     || self.dispatch_markdown(command)
                     || self.dispatch_search(command)

@@ -1679,7 +1679,7 @@ impl App {
                         {
                             return;
                         }
-                        if self.dispatch_zoom(call.id) {
+                        if self.dispatch_format(call.id) || self.dispatch_zoom(call.id) {
                             return;
                         }
                         if self.dispatch_file(call.id) {
@@ -1790,6 +1790,31 @@ impl App {
         input::translate(key, text, mods, false).map_or(UnboundKey::Ignore, UnboundKey::Edit)
     }
 
+    fn dispatch_format(&mut self, id: &str) -> bool {
+        if !matches!(id, "edit.formatDocument" | "edit.formatSelection") {
+            return false;
+        }
+        if self.preview_blocks_command(id) || self.wrap_command(id, 1, false) {
+            return true;
+        }
+        if self.logs.owns_body() {
+            self.view.set_notice("Leave log view to format the document".into());
+            self.apply(Damage { status: true, ..Default::default() });
+            return true;
+        }
+        let language = self
+            .highlighting
+            .as_ref()
+            .map(|host| host.language_status(&self.view).label())
+            .filter(|language| *language != "Automatic")
+            .map(str::to_owned);
+        if let Err(error) = self.view.format_command(id == "edit.formatSelection", language) {
+            self.view.set_notice(format!("Format: {error}"));
+        }
+        self.apply(Damage { status: true, ..Default::default() });
+        true
+    }
+
     fn edit(&mut self, action: input::Action) {
         if self.file_modal() || self.language_owns_input() {
             return;
@@ -1804,7 +1829,8 @@ impl App {
         if self.logs.owns_body() && (id.starts_with("edit.") || id.starts_with("search.replace")) {
             return;
         }
-        if self.dispatch_language(id)
+        if self.dispatch_format(id)
+            || self.dispatch_language(id)
             || self.dispatch_logs(id)
             || self.dispatch_markdown(id)
             || self.dispatch_search(id)

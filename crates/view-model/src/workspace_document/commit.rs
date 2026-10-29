@@ -634,7 +634,7 @@ impl Workspace {
                 }
                 commit.replacement =
                     Some(ExactReplacementReceipt { key: *key, operation: *operation, succeeded: result.is_ok() });
-                self.files.loans.remove(&id);
+                let formatting = self.files.loans.remove(&id).is_some_and(|loan| loan.formatting);
                 self.input_epoch = self.input_epoch.wrapping_add(1);
                 let installed = self.views.get_mut(&id).unwrap();
                 let editor = installed.editor.as_mut().unwrap();
@@ -647,6 +647,8 @@ impl Workspace {
                 }
                 super::super::prepare_view_publication(installed, intended, false);
                 installed.set_notice(match result {
+                    Ok(_) if formatting => "Formatting complete".into(),
+                    Err(error) if formatting => format!("Format: {error}"),
                     Ok(_) => "Replacement complete".into(),
                     Err(error) => format!("Replacement failed: {error}"),
                 });
@@ -1390,6 +1392,7 @@ pub(crate) fn settings_metadata_bytes(settings: &kwil_core_commands::Settings) -
         add(&mut bytes, key.capacity())?;
         add(&mut bytes, formatter.executable.capacity())?;
         strings(&mut bytes, &formatter.args)?;
+        strings(&mut bytes, &formatter.range_args)?;
     }
     Ok(bytes)
 }

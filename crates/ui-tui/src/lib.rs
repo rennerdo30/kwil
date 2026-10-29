@@ -561,6 +561,17 @@ fn run_workspace_with_terminal_init(
                             KeyResult::RetryWrap | KeyResult::BodyInvoke(_, _) | KeyResult::BodyExecute(_, _, _) => {
                                 unreachable!("body intent resolved")
                             }
+                            KeyResult::Format(selection) => {
+                                let language = highlighting
+                                    .as_ref()
+                                    .map(|host| host.language_status(view).label())
+                                    .filter(|language| *language != "Automatic")
+                                    .map(str::to_owned);
+                                if let Err(error) = view.format_command(selection, language) {
+                                    view.set_notice(format!("Format: {error}"));
+                                }
+                                true
+                            }
                             KeyResult::Search(_) => unreachable!("search intent resolved above"),
                             KeyResult::Hex(_, _) => unreachable!("hex intent resolved above"),
                             KeyResult::Language => {
@@ -1694,6 +1705,7 @@ fn combine_shutdown_results(primary: std::io::Result<()>, cleanup: std::io::Resu
 }
 
 enum KeyResult {
+    Format(bool),
     RetryWrap,
     CheckUpdate,
     BodyInvoke(kwil_core_commands::vim::Invocation, bool),
@@ -2180,6 +2192,9 @@ fn invoke(
     elapsed: std::time::Duration,
     preset: Preset,
 ) -> KeyResult {
+    if matches!(call.id, "edit.formatDocument" | "edit.formatSelection") {
+        return KeyResult::Format(call.id == "edit.formatSelection");
+    }
     if view.raw_body() && !hex_ui::chrome_command(call.id) {
         return KeyResult::Hex(call, extend);
     }
@@ -2396,6 +2411,24 @@ fn resolve_wrap(
             }
         }
         return KeyResult::Changed(true);
+    }
+    if matches!(&intent, KeyResult::Format(_)) {
+        let refusal = if view.wrap_input_blocked() {
+            Some("Wrapped body is settling; formatting was not started")
+        } else {
+            match runtime.as_ref() {
+                Some(runtime) if runtime.closed() => Some("Wrapped body is closed; formatting was not started"),
+                Some(runtime) => wrap_ui::mutation_notice(runtime.gate()),
+                None if prepared_body(view) => Some("Prepared text is starting; formatting was not started"),
+                None => None,
+            }
+        };
+        return if let Some(message) = refusal {
+            view.set_notice(message.into());
+            KeyResult::Changed(true)
+        } else {
+            intent
+        };
     }
     if !matches!(&intent, KeyResult::BodyInvoke(_, _) | KeyResult::BodyExecute(_, _, _)) {
         return intent;
@@ -3319,6 +3352,29 @@ mod tests {
             }
         }
         assert!(broken.is_empty(), "palette commands without a TUI host:\n{}", broken.join("\n"));
+    }
+
+    #[test]
+    fn formatting_keys_use_the_document_host_and_respect_prepared_body_startup() {
+        for preset in [Preset::VsCode, Preset::Vim] {
+            for (id, selection) in [("edit.formatDocument", false), ("edit.formatSelection", true)] {
+                let mut view = View::new(None);
+                let mut keys = KeymapEngine::new(preset, &[binding("f6", id)]).unwrap();
+                assert!(matches!(
+                    key(&mut view, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), Duration::ZERO, &mut keys, preset),
+                    KeyResult::Format(actual) if actual == selection
+                ));
+            }
+        }
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        view.set_body_policy(kwil_view_model::ViewBodyPolicy::Prepared);
+        view.editor_mut().unwrap().settings.editor.word_wrap = true;
+        assert!(matches!(
+            resolve_wrap(&mut view, None, KeyResult::Format(false), Duration::ZERO, Preset::VsCode),
+            KeyResult::Changed(true)
+        ));
+        assert!(view.notice().contains("formatting was not started"));
+        assert!(!view.search_replacement_pending());
     }
 
     #[test]

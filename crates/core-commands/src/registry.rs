@@ -127,8 +127,6 @@ pub const NOT_HOSTED: &[&str] = &[
     "file.keepChanges",
     "file.setEncoding",
     "file.setLineEnding",
-    "edit.formatDocument",
-    "edit.formatSelection",
     "compare.files",
     "compare.saved",
     "compare.nextChange",

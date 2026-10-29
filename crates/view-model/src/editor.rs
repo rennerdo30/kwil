@@ -17,6 +17,7 @@ use std::{
 
 mod commands;
 mod compound;
+mod formatting;
 mod hex;
 mod replacement;
 use compound::CompoundEdit;

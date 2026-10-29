@@ -596,6 +596,7 @@ impl SettingsDocument {
                 (field, &new),
                 ("executable", SettingValue::Text(_))
                     | ("args", SettingValue::Strings(_))
+                    | ("range_args", SettingValue::Strings(_))
                     | ("timeout_ms", SettingValue::Integer(_))
             )
         {

@@ -298,6 +298,13 @@ pub enum DocumentRequest {
         editor: Box<crate::Editor>,
         recipe: kwil_core_search::worker::ReplaceRecipe,
     },
+    Format {
+        key: kwil_core_search::worker::SearchKey,
+        operation: u64,
+        editor: Box<crate::Editor>,
+        selection: bool,
+        language: Option<String>,
+    },
     Prepare {
         root: Option<PathBuf>,
     },
@@ -1263,6 +1270,10 @@ impl DocumentWorker {
                             } else {
                                 editor.apply_search_replacement(recipe)
                             };
+                            complete(DocumentResult::Replaced { key, operation, editor, result });
+                        }
+                        DocumentRequest::Format { key, operation, mut editor, selection, language } => {
+                            let result = editor.apply_formatting(selection, language);
                             complete(DocumentResult::Replaced { key, operation, editor, result });
                         }
                         DocumentRequest::Prepare { root } => {
