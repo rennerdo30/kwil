@@ -31,6 +31,8 @@ pub(super) fn hold_preview_completion(
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
+    CompareOpen,
+    CompareCheck,
     MarkdownSplit,
     MarkdownSection(u64),
     MarkdownNarrow,
@@ -399,7 +401,11 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::BinaryColdCheck),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
+        let compare =
+            [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
+        let steps = if std::env::var_os("KWIL_COMPARE_PROBE").is_some() {
+            compare.as_slice()
+        } else if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
             binary_cold.as_slice()
         } else if std::env::var_os("KWIL_BINARY_OFFER_PROBE").is_some() {
             binary.as_slice()
@@ -450,6 +456,21 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::CompareOpen => {
+            assert!(app.opts.hidden);
+            app.edit(super::input::Action::Text("Edited buffer: ".into()));
+            assert!(app.dispatch_compare("compare.saved"));
+        }
+        Step::CompareCheck => {
+            let page = app.view.compare.page.as_ref().expect("comparison worker published a page");
+            assert!(page.changes > 0);
+            assert!(page.rows.iter().any(|row| row.kind == kwil_view_model::compare_session::Kind::Modify));
+            app.apply(Damage { full: true, status: true, ..Default::default() });
+            assert!(app.render());
+            capture(app, dir.as_deref(), "compare.bmp");
+            app.dispatch_compare("compare.close");
+            app.edit(super::input::Action::Command("edit.undo"));
+        }
         Step::BinaryOpen => {
             assert!(app.opts.hidden, "binary harness never admits visible OS dialogs");
             let path = PathBuf::from(

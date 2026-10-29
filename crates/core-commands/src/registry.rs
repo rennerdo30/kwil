@@ -129,13 +129,6 @@ pub const NOT_HOSTED: &[&str] = &[
     "file.setLineEnding",
     "edit.formatDocument",
     "edit.formatSelection",
-    "compare.files",
-    "compare.saved",
-    "compare.nextChange",
-    "compare.previousChange",
-    "compare.toggleIgnoreWhitespace",
-    "compare.toggleUnchanged",
-    "compare.close",
     "log.toggleFollow",
     "log.pause",
     "log.resume",
@@ -164,4 +157,14 @@ pub fn in_palette(id: &str) -> bool {
 
 pub fn command(id: &str) -> Option<&'static Command> {
     COMMANDS.iter().find(|command| command.id == id)
+}
+
+#[cfg(test)]
+mod compare_command_tests {
+    #[test]
+    fn comparison_commands_are_available() {
+        for command in super::COMMANDS.iter().filter(|command| command.id.starts_with("compare.")) {
+            assert!(super::in_palette(command.id), "{} must be available", command.id);
+        }
+    }
 }

@@ -7,6 +7,7 @@
 use kwil_core_text::TextFile;
 use std::path::PathBuf;
 
+pub mod compare_session;
 mod document;
 mod editor;
 pub mod grid;

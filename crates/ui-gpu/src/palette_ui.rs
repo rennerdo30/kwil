@@ -250,6 +250,14 @@ impl App {
         use kwil_core_commands::palette::PaletteAction;
         match action {
             PaletteAction::Command(command) => {
+                if self.dispatch_compare(command) {
+                    return;
+                }
+                if self.view.compare.open && (command.starts_with("edit.") || command.starts_with("search.")) {
+                    let damage = self.view.set_notice("Close the read-only comparison to edit or search".into());
+                    self.apply(damage);
+                    return;
+                }
                 if matches!(command, "update.check" | "update.apply") {
                     let proxy = self.proxy.clone();
                     let started = kwil_update::spawn_check(env!("CARGO_PKG_VERSION"), move |message| {

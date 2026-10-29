@@ -12,6 +12,7 @@ mod binary_offer;
 mod chrome;
 mod clipboard;
 mod close_dialog;
+mod compare_ui;
 mod context_menu;
 mod desktop;
 mod desktop_window;
@@ -1554,6 +1555,9 @@ impl App {
             self.update_file_prompt();
             return;
         }
+        if self.compare_key(ev) {
+            return;
+        }
         if self.markdown_mode() == markdown_ui::Mode::Preview
             && !self.palette_open()
             && !self.search_panel.is_open()
@@ -1805,6 +1809,7 @@ impl App {
             return;
         }
         if self.dispatch_language(id)
+            || self.dispatch_compare(id)
             || self.dispatch_logs(id)
             || self.dispatch_markdown(id)
             || self.dispatch_search(id)
@@ -1813,6 +1818,9 @@ impl App {
             || self.dispatch_zoom(id)
             || self.dispatch_file(id)
         {
+            return;
+        }
+        if self.view.compare.open {
             return;
         }
         if self.markdown_mode() == markdown_ui::Mode::Preview && id.starts_with("edit.") && id != "edit.copy" {
@@ -2022,6 +2030,7 @@ impl App {
     }
 
     fn render(&mut self) -> bool {
+        self.compare_ready();
         // WM_PAINT can arrive between every pair of WM_SIZE messages. Retain
         // damage until this one-shot deadline instead of allocating/rasterizing
         // and recreating the swapchain for every intermediate geometry.
@@ -2240,7 +2249,9 @@ impl App {
             font.invalidate_rows();
             pixels.fill(bg());
             body_pixels.fill(bg());
-            for row in (0..rows).filter(|_| !binary_blocks_paint && !projection_owns_body && !hex_active) {
+            for row in (0..rows)
+                .filter(|_| !binary_blocks_paint && !projection_owns_body && !hex_active && !self.view.compare.open)
+            {
                 if wrap_active {
                     wrapped_paint.row(
                         body_pixels,
@@ -2282,13 +2293,9 @@ impl App {
             }
             p.rows.sort_unstable();
             p.rows.dedup();
-            for row in p
-                .rows
-                .iter()
-                .copied()
-                .chain(document_rows())
-                .filter(|&r| r < rows && !binary_blocks_paint && !projection_owns_body && !hex_active)
-            {
+            for row in p.rows.iter().copied().chain(document_rows()).filter(|&r| {
+                r < rows && !binary_blocks_paint && !projection_owns_body && !hex_active && !self.view.compare.open
+            }) {
                 if wrap_active {
                     wrapped_paint.row(
                         body_pixels,
@@ -2346,6 +2353,18 @@ impl App {
             log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source);
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             damage.push(tabs::rect(body));
+        }
+        if self.view.compare.open && body_changed {
+            compare_ui::draw(&self.view.compare, body_pixels, bw, font, |row| {
+                p.full || p.rows.contains(&row) || document_rows().any(|dirty| dirty == row)
+            });
+            for row in
+                (0..rows).filter(|row| p.full || p.rows.contains(row) || document_rows().any(|dirty| dirty == *row))
+            {
+                let area = Rect { x: 0, y: row * ch, w: bw, h: ch };
+                tabs::composite(body_pixels, bw, pixels, w, body, area);
+                damage.push(tabs::translated(area, body));
+            }
         }
         let chrome_frame = self.chrome_frame.as_ref().unwrap();
         if p.full || chrome_changed {
@@ -3266,6 +3285,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        self.compare_ready();
         let d = match ev {
             UserEvent::StartupFontReady => {
                 self.try_finish_startup(el);
@@ -3375,6 +3395,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
             UserEvent::OpenExternal => self.external_open_event(),
+            UserEvent::Notice(msg) if msg.is_empty() && self.view.compare.open => Damage::default(),
             UserEvent::Notice(msg) => self.view.set_notice(msg),
             UserEvent::GlyphReady(tile, generation) => {
                 let Some(font) = self.font.as_mut().filter(|f| f.generation == generation) else {
@@ -3770,6 +3791,20 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if self.welcome_input(&ev) {
             return;
+        }
+        if self.view.compare.open && !self.palette_open() && !self.settings_open() && !self.menu.state.is_open() {
+            match &ev {
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y > 0.0,
+                        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                    };
+                    self.view.compare.action(kwil_view_model::compare_session::Action::Scroll(if up { -3 } else { 3 }));
+                    return;
+                }
+                WindowEvent::MouseInput { .. } | WindowEvent::Ime(_) => return,
+                _ => {}
+            }
         }
         match ev {
             WindowEvent::CloseRequested => self.request_close(el, false),

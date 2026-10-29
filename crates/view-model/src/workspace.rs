@@ -244,6 +244,7 @@ pub struct EditorInputTicket {
 }
 
 pub struct Workspace {
+    pub compare: crate::compare_session::Session,
     wrap: WorkspaceWrapState,
     hex: HexFlow,
     binary: BinaryFlow,
@@ -318,6 +319,7 @@ impl Workspace {
 
     fn empty() -> Self {
         Self {
+            compare: crate::compare_session::Session::default(),
             wrap: WorkspaceWrapState::default(),
             hex: HexFlow::default(),
             binary: BinaryFlow::default(),
@@ -1168,6 +1170,7 @@ impl Workspace {
         self.files.exit_without_metadata = false;
     }
     pub fn cancel_file_prompt(&mut self) {
+        self.compare.prompt = false;
         self.hex.prompt = false;
         self.files.prompt = None;
         self.files.save_all.clear();
@@ -1197,7 +1200,9 @@ impl Workspace {
         let prompt = self.files.prompt.take().unwrap();
         match prompt.kind {
             FilePromptKind::Open => {
-                if std::mem::take(&mut self.hex.prompt) {
+                if std::mem::take(&mut self.compare.prompt) {
+                    self.compare_path(prompt.text.into())?;
+                } else if std::mem::take(&mut self.hex.prompt) {
                     let (_, outcome) = self.open_hex_path(prompt.text.into(), self.rows())?;
                     if outcome == crate::hex_session::OpenOutcome::NeedsRawReopen {
                         self.set_notice("Save decoded changes before reopening physical bytes".into());
@@ -4478,7 +4483,9 @@ impl Workspace {
         }
         self.files.prompt = None;
         let hex = std::mem::take(&mut self.hex.prompt);
+        let compare = std::mem::take(&mut self.compare.prompt);
         let result = match ticket.kind {
+            FilePromptKind::Open if compare => self.compare_path(path),
             FilePromptKind::Open if hex => self.open_hex_path(path, self.rows()).map(|(_, outcome)| {
                 if outcome == crate::hex_session::OpenOutcome::NeedsRawReopen {
                     self.set_notice("Save decoded changes before reopening physical bytes".into());

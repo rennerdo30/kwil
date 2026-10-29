@@ -11,6 +11,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::VimResult};
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
 mod binary_offer;
+mod compare_ui;
 mod document_ui;
 mod file_prompt;
 mod hex_ui;
@@ -177,6 +178,10 @@ fn run_workspace_with_terminal_init(
         let budget = &startup.budget;
         let ShutdownTicket { view, document, search, wrap, highlighting, rx, .. } = &mut startup.ticket;
         let view = view.as_mut().expect("guarded original Workspace");
+        let compare_sender = tx.clone();
+        view.compare.set_wake(std::sync::Arc::new(move || {
+            let _ = compare_sender.send(Msg::Notice(String::new()));
+        }));
         let document = document.as_mut().expect("admitted startup headers");
         let search = search.as_mut().expect("original search facade");
         let rx = rx.as_ref().expect("original event receiver");
@@ -467,6 +472,7 @@ fn run_workspace_with_terminal_init(
                         settings_panel.as_ref().is_some_and(|panel| panel.is_open()),
                     ),
                     Msg::Notice(n) => {
+                        view.poll_compare();
                         view.set_notice(n);
                         true
                     }
@@ -528,6 +534,11 @@ fn run_workspace_with_terminal_init(
                             )
                         } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
                             palette_ui::key(view, host, k, &mut keys, started.elapsed(), settings.keymap)
+                        } else if view.compare.open
+                            && !(k.modifiers.contains(KeyModifiers::CONTROL)
+                                && matches!(k.code, KeyCode::Char('p' | 'P')))
+                        {
+                            compare_ui::key(view, &mut keys, k)
                         } else if view.close_pending() && k.code == KeyCode::Esc {
                             KeyResult::Cancel
                         } else if search.is_open() {
@@ -663,7 +674,9 @@ fn run_workspace_with_terminal_init(
                                 true
                             }
                             KeyResult::File(command) => {
-                                if let Err(error) = view.file_command(command) {
+                                if !view.compare_command(command)
+                                    && let Err(error) = view.file_command(command)
+                                {
                                     view.set_notice(error.to_string());
                                 }
                                 if view.wants_exit() {
@@ -680,6 +693,9 @@ fn run_workspace_with_terminal_init(
                         }
                     }
                     Msg::Input(Event::Paste(text)) => {
+                        if view.compare.open {
+                            continue;
+                        }
                         if let Some(panel) = settings_panel.as_mut().filter(|panel| panel.is_open()) {
                             let _ = panel.input(kwil_view_model::settings_session::SettingsInput::Text(&text));
                             true
@@ -749,6 +765,18 @@ fn run_workspace_with_terminal_init(
                     Msg::Input(Event::Mouse(m)) if search.is_open() && view.file_prompt().is_none() => {
                         let size = terminal.size()?;
                         search_ui::mouse(search, view, &mut keys, &m, Rect::new(0, 0, size.width, size.height))
+                    }
+                    Msg::Input(Event::Mouse(m)) if view.compare.open => {
+                        match m.kind {
+                            MouseEventKind::ScrollDown => {
+                                view.compare.action(kwil_view_model::compare_session::Action::Scroll(3))
+                            }
+                            MouseEventKind::ScrollUp => {
+                                view.compare.action(kwil_view_model::compare_session::Action::Scroll(-3))
+                            }
+                            _ => {}
+                        }
+                        true
                     }
                     Msg::Input(Event::Mouse(m))
                         if {
@@ -839,6 +867,7 @@ fn run_workspace_with_terminal_init(
             {
                 view.set_notice(format!("Palette: {error:?}"));
             }
+            changed |= view.poll_compare();
             if changed {
                 if user_input {
                     view.checkpoint_session();
@@ -914,6 +943,9 @@ fn run_workspace_with_terminal_init(
                         if let Some(host) = &highlighting {
                             draw_language_status(f, host, view);
                         }
+                    }
+                    if view.compare.open {
+                        compare_ui::draw(f, view, settings.tabs.layout);
                     }
                     search_ui::draw_prepared(
                         f,
@@ -1715,6 +1747,9 @@ enum KeyResult {
 /// Preserve Workspace's body ownership at the palette invocation boundary;
 /// existing View-only key tests retain the same text adapter.
 trait TuiTarget {
+    fn comparison_open(&self) -> bool {
+        false
+    }
     fn body_blocked(&self) -> bool {
         false
     }
@@ -1736,6 +1771,9 @@ impl TuiTarget for View {
     }
 }
 impl TuiTarget for Workspace {
+    fn comparison_open(&self) -> bool {
+        self.compare.open
+    }
     fn body_blocked(&self) -> bool {
         self.wrap_input_blocked()
     }
@@ -2180,6 +2218,13 @@ fn invoke(
     elapsed: std::time::Duration,
     preset: Preset,
 ) -> KeyResult {
+    if call.id.starts_with("compare.") {
+        return KeyResult::File(call.id);
+    }
+    if view.comparison_open() && (call.id.starts_with("edit.") || call.id.starts_with("search.")) {
+        view.text_view_mut().set_notice("Close the read-only comparison to edit or search".into());
+        return KeyResult::Changed(true);
+    }
     if view.raw_body() && !hex_ui::chrome_command(call.id) {
         return KeyResult::Hex(call, extend);
     }
