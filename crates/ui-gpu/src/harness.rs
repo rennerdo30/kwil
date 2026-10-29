@@ -32,6 +32,7 @@ pub(super) fn hold_preview_completion(
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
     FileCommand(&'static str),
+    FilePromptChoice(&'static str),
     MarkdownSplit,
     MarkdownSection(u64),
     MarkdownNarrow,
@@ -404,6 +405,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (1800, Step::DismissSetup),
             (300, Step::FileCommand("file.setEncoding")),
             (200, Step::UsabilityCapture("file-encoding.bmp")),
+            (100, Step::FilePromptChoice("2")),
+            (200, Step::UsabilityCapture("file-encoding-list.bmp")),
             (200, Step::FileCommand("file.setLineEnding")),
             (200, Step::UsabilityCapture("file-line-endings.bmp")),
             (200, Step::FileCommand("file.openFolder")),
@@ -1526,6 +1529,13 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             app.view.cancel_file_prompt();
             assert!(app.dispatch_file(command));
             assert!(app.view.file_prompt().is_some());
+        }
+        Step::FilePromptChoice(number) => {
+            app.save_path = Some(number.into());
+            app.update_file_prompt();
+            let damage = super::file_prompt::submit(&mut app.view);
+            app.sync_file_ui();
+            app.apply(damage);
         }
         Step::PaletteOpen => {
             app.dispatch_palette("view.commandPalette");
