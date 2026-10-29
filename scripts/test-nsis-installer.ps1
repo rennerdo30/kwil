@@ -34,8 +34,12 @@ Assert ($entry.InstallLocation -eq $dir) "install location $($entry.InstallLocat
 Assert (Test-Path $shortcut) 'Start menu shortcut'
 $reported = & (Join-Path $dir 'kwil.com') --version
 Assert ($reported -eq "kwil $Version") "kwil.com --version: $reported"
-$unregister = & (Join-Path $dir 'kwil.com') --unregister-file-types
-Assert ($LASTEXITCODE -eq 0) "kwil.com --unregister-file-types: $unregister"
+# Hosted runners run as an elevated admin whose profile files belong to
+# Administrators, so Kwil's registration storage check refuses there (as the
+# file-types page would). Any other outcome than success or that refusal fails.
+$unregister = & (Join-Path $dir 'kwil.com') --unregister-file-types 2>&1 | Out-String
+$refused = $unregister -match 'Registration storage is not owned by the token user'
+Assert ($LASTEXITCODE -eq 0 -or $refused) "kwil.com --unregister-file-types: $($unregister.Trim())"
 
 # The uninstaller copies itself to %TEMP% and returns at once; wait for the
 # entry to disappear instead.
