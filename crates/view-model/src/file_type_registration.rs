@@ -25,8 +25,9 @@ use std::{
     collections::BTreeMap,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 pub const MAX_NATIVE_PATH_UNITS: usize = 4096;
@@ -184,6 +185,12 @@ pub struct ExtensionStatus {
     pub before: usize,
     pub conflicts: usize,
     pub unreadable: usize,
+}
+/// What `FileTypeRegistration::remove_all_blocking` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoveAllOutcome {
+    NothingRegistered,
+    Removed,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistrationStatus {
@@ -479,6 +486,40 @@ impl FileTypeRegistration {
         let Some(journal_id) = self.state().recovery else { return Ok(()) };
         self.state_mut().chain = Chain::None;
         self.unregister(journal_id).map(drop)
+    }
+    /// "Remove all" without a window (`kwil --unregister-file-types`, run by the
+    /// Windows uninstaller): ask for the status, then undo the retained receipt.
+    /// `wake` receives this service's wake callback; `deadline` bounds both steps.
+    pub fn remove_all_blocking(
+        &mut self,
+        wake: &mpsc::Receiver<()>,
+        deadline: Instant,
+    ) -> Result<RemoveAllOutcome, String> {
+        self.status().map_err(|error| format!("{:?}", error.kind))?;
+        self.settle_before(wake, deadline)?;
+        if !self.has_registration() {
+            return match self.registration_status() {
+                RegistrationStatus::Failed { message, .. } => Err(message.clone()),
+                _ => Ok(RemoveAllOutcome::NothingRegistered),
+            };
+        }
+        self.remove_all().map_err(|error| format!("{:?}", error.kind))?;
+        self.settle_before(wake, deadline)?;
+        match self.registration_status() {
+            RegistrationStatus::Unregistered { .. } => Ok(RemoveAllOutcome::Removed),
+            RegistrationStatus::Failed { message, .. } => Err(message.clone()),
+            other => Err(format!("unexpected registration state {other:?}")),
+        }
+    }
+    fn settle_before(&mut self, wake: &mpsc::Receiver<()>, deadline: Instant) -> Result<(), String> {
+        while self.state().pending.is_some() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || wake.recv_timeout(left).is_err() {
+                return Err("the registration worker did not answer in time".into());
+            }
+            self.worker_ready();
+        }
+        Ok(())
     }
     /// Continue `apply` after a finished worker request; any other outcome ends it.
     fn continue_chain(&mut self) {

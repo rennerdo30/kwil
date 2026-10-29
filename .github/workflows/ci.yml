@@ -31,6 +31,17 @@ jobs:
       - run: rustup show active-toolchain
       - run: cargo fmt --all --check
 
+  # Every shipped dependency license must be accepted in about.toml; the
+  # release workflow generates THIRD-PARTY-NOTICES.txt the same way.
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - run: cargo about generate -o THIRD-PARTY-NOTICES.txt about.hbs && wc -c THIRD-PARTY-NOTICES.txt
+
   test:
     name: test (${{ matrix.os }})
     env:

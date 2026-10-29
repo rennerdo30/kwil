@@ -688,6 +688,29 @@ fn registration_apply_remove_all_and_reapply_show_the_real_state() {
     assert_eq!(h.open_with(), ["log"]);
 }
 #[test]
+fn registration_remove_all_blocking_is_the_uninstallers_remove_all() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    let deadline = || std::time::Instant::now() + Duration::from_secs(5);
+    let Harness { session, wake, .. } = &mut h;
+    let session = session.as_mut().unwrap();
+    assert_eq!(session.remove_all_blocking(wake, deadline()), Ok(RemoveAllOutcome::NothingRegistered));
+
+    *h.session().selection_mut() = Selection::new(Preset::PlainTextOnly);
+    h.session().apply().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    assert!(!h.fake.lock().unwrap().values.is_empty());
+    let Harness { session, wake, .. } = &mut h;
+    assert_eq!(session.as_mut().unwrap().remove_all_blocking(wake, deadline()), Ok(RemoveAllOutcome::Removed));
+    assert!(h.fake.lock().unwrap().values.is_empty(), "uninstall leaves no Kwil entries");
+    let Harness { session, wake, .. } = &mut h;
+    assert_eq!(
+        session.as_mut().unwrap().remove_all_blocking(wake, deadline()),
+        Ok(RemoveAllOutcome::NothingRegistered),
+        "running it twice is harmless"
+    );
+}
+#[test]
 fn registration_apply_adds_and_removes_single_types_of_an_existing_registration() {
     let _admission_case = registration_admission_case();
     let mut h = Harness::new();

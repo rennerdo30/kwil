@@ -22,7 +22,11 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+# Drops symbol tables from Linux and macOS binaries; Windows keeps symbols in
+# the separate .pdb either way.
+strip = true
 
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
+strip = "none"

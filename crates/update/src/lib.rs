@@ -5,8 +5,10 @@
 //!   startup checks only the local update lock and recovery journal.
 //! - Releases carry `kwil-<target>[.exe]`, Windows `.com`, and `SHA256SUMS`.
 //!   Windows installs a verified pair with backups and journal recovery;
-//!   other platforms replace one binary. The running editor keeps running;
-//!   the next start uses the new version. Unsaved work is never touched.
+//!   other platforms replace one binary. An installed Windows copy also
+//!   updates the version in its Installed apps entry. The running editor
+//!   keeps running; the next start uses the new version. Unsaved work is
+//!   never touched.
 //! - Off when `KWIL_NO_UPDATE` is set, when a `kwil.no-update` file sits next
 //!   to the executable (package managers, portable installs), in debug
 //!   builds, and for version 0.0.0.
@@ -25,6 +27,8 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(windows, test))]
+mod installed;
 #[cfg(any(windows, test))]
 mod transaction;
 
@@ -217,6 +221,11 @@ fn check_and_install_with_settings(current: &str, settings: &UpdateSettings) -> 
         }
         let dir = exe.parent().ok_or_else(|| Error("executable has no folder".into()))?;
         transaction::install(dir, [(&want, &bytes), (&console_name, &console)], &sums)?;
+        // Best effort: the update itself is complete; only the version shown in
+        // Installed apps would stay behind.
+        if let Err(error) = installed::sync_version(dir, latest) {
+            eprintln!("kwil: {error}");
+        }
     }
     #[cfg(not(windows))]
     {

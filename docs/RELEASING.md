@@ -17,9 +17,14 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
    - macOS Apple silicon and Intel;
    - Linux x64 and ARM64.
 
-   It then creates a **draft** GitHub Release with the binaries (`kwil-<target>` on Unix; `kwil-<target>.exe` and `kwil-<target>.com` on Windows) and `SHA256SUMS`.
+   It generates `THIRD-PARTY-NOTICES.txt` with cargo-about (`about.toml`; an unaccepted dependency license fails the release), embeds it in the About page, and packages:
+   - Windows: the NSIS setup and a zip per architecture (`scripts/package-windows.ps1`); the x64 setup is installed, run and uninstalled on the runner first;
+   - macOS and Linux: a tar.gz per target;
+   - the bare binaries for the updater (`kwil-<target>` on Unix; `kwil-<target>.exe` and `kwil-<target>.com` on Windows).
+
+   It then creates a **draft** GitHub Release with all of them, `THIRD-PARTY-NOTICES.txt` and `SHA256SUMS`.
 4. The owner reviews the draft and publishes it.
-5. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once. Local MSI/portable distributions contain that marker and require explicit updates instead.
+5. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once.
 
 The exact tagged commit must first pass the `CI` workflow. Release builds refuse
 to start without that successful run. A prerelease version such as
@@ -28,14 +33,7 @@ to start without that successful run. A prerelease version such as
 Review the notes for the specific prerelease before tagging. Only the owner
 publishes the resulting draft.
 
-The existing beta.1 draft assets remain raw executables, installed and replaced
-manually. Source-only schema-2 MSI/portable preparation now maps exact full
-`0.1.0-beta.N` identity to numeric MSI `0.0.N`, while stable `0.1.0`
-maps to `0.1.0`. Visible beta identity is retained; suffix stripping is forbidden.
-This prepares a future beta.2 setup path, not available or qualified setup assets.
-The release workflow still stages raw binaries; setup/publish wiring is excluded
-until exact artifacts and worker/lifecycle gates are qualified. Prereleases do not enter the stable
-updater or download installers. Builds after beta.1 can opt into prerelease
+Prereleases do not enter the stable updater or the download scripts. Builds after beta.1 can opt into prerelease
 updates and can advance from beta to stable; see [update settings](UPDATES.md).
 Frozen beta.1 copies still require manual replacement. See [beta gates and limitations](BETA.md).
 
@@ -46,6 +44,7 @@ Frozen beta.1 copies still require manual replacement. See [beta gates and limit
 - Install the Windows pair together as `kwil.exe` and `kwil.com` in the same folder. Explorer, shortcuts and Open with use `.exe`; shells resolve `.com` first with the standard `.COM;.EXE` PATHEXT order. Custom PATHEXT order is respected; use `kwil.com` explicitly if necessary.
 - The console entry point runs terminal work itself. For a GUI it forwards arguments unchanged to `kwil.exe`, waits for its first-frame acknowledgement, then returns. Before acknowledging readiness, the GUI detaches from the shell console and releases standard handles. Startup diagnostics use launcher-owned pipes, so redirected shell streams reach EOF when the launcher exits. Startup failure is handled while it still owns the terminal; CLI and TUI paths keep their console.
 - Keep the existing `.exe` asset name so older single-file updater clients can still find it.
+- The setup, zip and tar.gz assets are for people; the updater never downloads them. The NSIS setup writes the per-user Installed apps entry `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kwil`; the updater updates its `DisplayVersion` when `InstallLocation` is the updated folder.
 - `SHA256SUMS` in `sha256sum` format (`<hex>  <file name>`).
 - Drafts are never offered. Stable-channel updates exclude prereleases;
   `update.channel = "prerelease"` explicitly opts into published prereleases.
@@ -53,42 +52,7 @@ Frozen beta.1 copies still require manual replacement. See [beta gates and limit
 ## Not yet in place
 
 - Code signing (Windows Authenticode, macOS notarization) and an update signature (for example minisign). Each needs keys from the owner (KW-4, KW-5).
-- Qualified installers and packages: the local Windows MSI/portable source path below still needs integration and lifecycle acceptance; winget, dmg/Homebrew and AppImage/Flatpak remain pending (KW-31).
-
-## Local Windows distribution (not a release)
-
-`dist.bat` invokes `scripts/dist.ps1` to prepare a native x64 or ARM64 MSI and
-portable ZIP offline from committed HEAD. Schema/input/sidecar/outer manifest
-version is 2; component schema remains 1. The six backend arguments include
-`-ReleaseVersion`, replacing `-Version`. CargoVersion stays the exact full
-archived release version; Channel and MsiVersion are separately derived. See [local installation](INSTALL.md#local-windows-distribution)
-for prerequisites, the existing CLI options, installation/Explorer integration
-and the exact retained-original repair command. All intended backend, isolated
-guard and Cargo/lockfile integration must be committed first; dirty/untracked
-inputs are excluded, apart from the invoked driver itself.
-
-Successful output is an immutable
-`dist/kwil-<version>-<12-hex-commit>-<target>/` directory containing the MSI,
-portable ZIP, `<full-msi-filename>.manifest.json` sidecar, `INSTALL.txt`, outer
-`manifest.json` and `SHA256SUMS`. Retain the original MSI and sidecar together.
-The sidecar records full ReleaseVersion/channel/mapped numeric version, package identity/inventory and inspection evidence;
-`nativeLifecycle: not-run` is not native acceptance. Checksums cover the MSI,
-sidecar, ZIP, instructions and outer manifest, not themselves. Neither manifest
-nor checksums authenticate the publisher.
-
-This build does not install, run the application, sign or publish. It does not
-change the raw GitHub Release asset/updater contract above. The MSI and ZIP both
-contain `kwil.no-update`; only the ZIP contains `kwil.portable`. Their updates
-are explicit rather than the paired self-update flow below.
-
-Decision [0004](decisions/0004-windows-installer.md) and
-[`scripts/windows-installer-contract.json`](../scripts/windows-installer-contract.json)
-are jointly normative. Integration and disposable hosted Windows x64/ARM64
-lifecycle qualification remain pending: install, original-package repair,
-higher-version upgrade, rollback, uninstall, resource/in-use refusals and data
-preservation. MSI/CAB/PE inspection alone proves none of those lifecycle results.
-Local artifact preparation does not establish v1 completion or authorize a
-release/publication; owner approval remains required.
+- Packages beyond the Windows setup and archives: winget, dmg/Homebrew and AppImage/Flatpak (KW-31).
 
 ## Windows development build
 

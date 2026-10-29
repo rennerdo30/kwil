@@ -3,6 +3,10 @@ name: Release
 # Pushing a tag vX.Y.Z builds every platform and creates a DRAFT release.
 # Only the owner publishes it (docs/RELEASING.md); once published, installed
 # copies pick it up through auto-update (crates/update).
+#
+# Assets: Windows setup + zip, macOS/Linux tar.gz (for people), the bare
+# kwil-<target>[.exe|.com] binaries (for the updater; keep these names),
+# THIRD-PARTY-NOTICES.txt and SHA256SUMS over all of them.
 
 on:
   push:
@@ -31,8 +35,29 @@ jobs:
             exit 1
           fi
 
-  build:
+  notices:
     needs: candidate-ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      # Fails on any dependency license not accepted in about.toml.
+      - name: Third-party notices
+        run: |
+          mkdir -p notices
+          cargo about generate -o notices/rust.txt about.hbs
+          { cat notices/rust.txt; printf '\n\nSyntax grammars\n\n'; cat crates/core-syntax/LICENSES.txt; } > notices/THIRD-PARTY-NOTICES.txt
+          wc -c notices/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notices
+          path: notices/*
+          if-no-files-found: error
+
+  build:
+    needs: [candidate-ci, notices]
     name: build (${{ matrix.target }})
     env:
       RUSTC_WRAPPER: sccache
@@ -69,9 +94,14 @@ jobs:
           add-rust-environment-hash-key: false
           key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           cache-on-failure: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: notices
+          path: notices
       - name: Build platform entry points
         shell: bash
         env:
+          KWIL_THIRD_PARTY_NOTICES: ${{ github.workspace }}/notices/rust.txt
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
           CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
         run: |
@@ -98,14 +128,62 @@ jobs:
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp "target/${{ matrix.target }}/release/kwil-console.exe" "dist/kwil-${{ matrix.target }}.com"
           fi
+      - name: Package (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin) platform=macos-arm64 ;;
+            x86_64-apple-darwin) platform=macos-x64 ;;
+            x86_64-unknown-linux-gnu) platform=linux-x64 ;;
+            aarch64-unknown-linux-gnu) platform=linux-arm64 ;;
+          esac
+          name="kwil-${GITHUB_REF_NAME#v}-$platform"
+          mkdir -p "pkg/$name"
+          install -m 755 "target/${{ matrix.target }}/release/kwil" "pkg/$name/kwil"
+          cp LICENSE "pkg/$name/LICENSE.txt"
+          cp notices/THIRD-PARTY-NOTICES.txt "pkg/$name/"
+          tar -C pkg -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v7
         with:
           name: kwil-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
-  draft-release:
+  windows-packages:
     needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: kwil-*-windows-msvc
+          path: bin
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: notices
+          path: notices
+      - name: Setup and zip
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          foreach ($target in 'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc') {
+            ./scripts/package-windows.ps1 -Target $target -Version $version -Exe "bin/kwil-$target.exe" -Com "bin/kwil-$target.com" -Notices notices/THIRD-PARTY-NOTICES.txt -OutDir dist -InstallNsis
+          }
+      - name: Install, run and uninstall the x64 setup
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          ./scripts/test-nsis-installer.ps1 -Setup "dist/kwil-$version-windows-x64-setup.exe" -Version $version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-packages
+          path: dist/*
+          if-no-files-found: error
+
+  draft-release:
+    needs: [build, windows-packages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -117,7 +195,9 @@ jobs:
           merge-multiple: true
       - name: Checksums
         working-directory: dist
-        run: sha256sum kwil-* > SHA256SUMS && cat SHA256SUMS
+        run: |
+          rm -f rust.txt
+          sha256sum kwil-* THIRD-PARTY-NOTICES.txt > SHA256SUMS && cat SHA256SUMS
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}

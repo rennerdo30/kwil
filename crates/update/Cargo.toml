@@ -11,3 +11,6 @@ ureq = { version = "3.5.0", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.1"
 self-replace = "1.5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Registry"] }

@@ -2,10 +2,10 @@ name: Installer checks
 
 on:
   pull_request:
-    paths: ['scripts/install.*', 'scripts/test-install*', 'scripts/*static-runtime.py', '.github/workflows/install.yml', '.github/workflows/release.yml']
+    paths: ['installer/**', 'scripts/install.*', 'scripts/test-install*', 'scripts/*static-runtime.py', 'scripts/package-windows.ps1', 'scripts/test-nsis-installer.ps1', '.github/workflows/install.yml', '.github/workflows/release.yml']
   push:
     branches: [main]
-    paths: ['scripts/install.*', 'scripts/test-install*', 'scripts/*static-runtime.py', '.github/workflows/install.yml', '.github/workflows/release.yml']
+    paths: ['installer/**', 'scripts/install.*', 'scripts/test-install*', 'scripts/*static-runtime.py', 'scripts/package-windows.ps1', 'scripts/test-nsis-installer.ps1', '.github/workflows/install.yml', '.github/workflows/release.yml']
 
 permissions:
   contents: read
@@ -40,6 +40,16 @@ jobs:
         run: |
           & target/${{ matrix.target }}/release/kwil-console.exe --version
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      # Same packaging as release.yml; release builds embed the real notices.
+      - name: NSIS setup and zip
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          Set-Content notices.txt 'Third-party notices placeholder for installer checks.'
+          $release = 'target/${{ matrix.target }}/release'
+          ./scripts/package-windows.ps1 -Target ${{ matrix.target }} -Version $version -Exe "$release/kwil.exe" -Com "$release/kwil-console.exe" -Notices notices.txt -OutDir packages -InstallNsis
+          ./scripts/test-nsis-installer.ps1 -Setup "packages/kwil-$version-windows-x64-setup.exe" -Version $version
   fixtures:
     strategy:
       matrix:
