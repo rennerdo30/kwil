@@ -670,7 +670,7 @@ mod replacement_dispatch_tests {
     fn compact_folder_options_paint_their_labels() {
         let m = Metrics::new(1.5);
         let s = Sizes::new(&m);
-        let c = Colors::new(theme_ui::chrome());
+        let c = Colors::new(&theme_ui::chrome());
         let mut font = font::UiFont::load(m.text_px()).expect("Windows chrome face");
         for text in ["Aa", "Word", ".*"] {
             let rect = Rect { x: 0, y: 0, w: desktop::button_width(&mut font, text, &s), h: s.text };
@@ -792,7 +792,7 @@ mod tests {
         panel.deferred_input(SearchInput::Text("needle")).unwrap();
         let mut view = View::default();
         let mut pixels = vec![0u32; size.0 * size.1];
-        let area = draw(&panel, &mut pixels, size, &mut font, theme_ui::chrome(), &m, 60, &mut view).expect("fits");
+        let area = draw(&panel, &mut pixels, size, &mut font, &theme_ui::chrome(), &m, 60, &mut view).expect("fits");
         let x = view.hits.iter().find_map(|(r, t)| (*t == Target::Clear).then_some(*r)).expect("X is clickable");
         let field = view.hits.iter().find_map(|(r, t)| (*t == Target::Field(SearchField::Query)).then_some(*r));
         let field = field.expect("query field");
@@ -808,7 +808,7 @@ mod tests {
         assert_eq!(panel.text(SearchField::Query).0, "", "the query is empty");
         assert!(panel.is_open(), "clearing keeps the card open");
         // An empty query offers no X.
-        draw(&panel, &mut pixels, size, &mut font, theme_ui::chrome(), &m, 60, &mut view).unwrap();
+        draw(&panel, &mut pixels, size, &mut font, &theme_ui::chrome(), &m, 60, &mut view).unwrap();
         assert!(!view.hits.iter().any(|(_, t)| *t == Target::Clear));
     }
 }

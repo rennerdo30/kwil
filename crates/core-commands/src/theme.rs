@@ -205,6 +205,9 @@ impl Theme {
     pub fn ui(&self) -> &UiColors {
         &self.ui
     }
+    pub fn set_ui(&mut self, role: UiRole, color: Rgba) {
+        self.ui.set(role, color);
+    }
     pub fn syntax(&self) -> &BTreeMap<String, SyntaxStyle> {
         &self.syntax
     }
@@ -329,6 +332,9 @@ impl ThemeSession {
     }
     pub fn selection(&self) -> &ThemeSelection {
         &self.selection
+    }
+    pub fn scheme(&self) -> Scheme {
+        self.scheme
     }
     pub fn active_id(&self) -> &ThemeId {
         self.preview.as_ref().unwrap_or_else(|| self.selection.resolve(self.scheme))

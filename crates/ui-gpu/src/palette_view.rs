@@ -282,6 +282,10 @@ impl App {
 
     /// Hover repaints only the card (`Paint`, no body restore).
     pub(super) fn palette_track(&mut self) {
+        if self.themes.is_open() {
+            self.theme_pointer(false);
+            return;
+        }
         let surface = self.overlay_surface();
         let Some(palette) = &self.palette else { return };
         if self.palette_view.track(self.pointer, palette.model().rows(), surface) {
@@ -403,7 +407,7 @@ mod tests {
         let mut view = View::default();
         let mut pixels = vec![0u32; size.0 * size.1];
         let labels = HashMap::new();
-        draw(&palette, &mut pixels, size, &mut font, theme_ui::chrome(), &m, &labels, &mut view).expect("card fits");
+        draw(&palette, &mut pixels, size, &mut font, &theme_ui::chrome(), &m, &labels, &mut view).expect("card fits");
         let rect = view.hits.iter().find_map(|(rect, hit)| (*hit == Hit::Row(1)).then_some(*rect)).expect("row 1");
         let point = (rect.x + rect.w / 2, rect.y + rect.h / 2);
         let surface = Surface::new(size, &m);
@@ -413,7 +417,7 @@ mod tests {
         assert_eq!(palette.rows().len(), 3, "same count as the painted set");
         assert_eq!(click(&view, point, palette.rows(), surface), Click::Inside, "an unpainted B row never runs");
         // After the repaint the B row is what the user sees and may run.
-        draw(&palette, &mut pixels, size, &mut font, theme_ui::chrome(), &m, &labels, &mut view).unwrap();
+        draw(&palette, &mut pixels, size, &mut font, &theme_ui::chrome(), &m, &labels, &mut view).unwrap();
         assert_eq!(click(&view, point, palette.rows(), surface), Click::Row(1));
         assert_eq!(view.painted_action(1), Some(&PaletteAction::Command("view.zoomOut")));
     }
@@ -439,7 +443,7 @@ mod tests {
             let m = Metrics::new(scale);
             let mut font = font::UiFont::load(m.text_px()).expect("Windows chrome face");
             let mut pixels = vec![0u32; size.0 * size.1];
-            draw(&palette, &mut pixels, size, &mut font, theme_ui::chrome(), &m, &labels, &mut view)
+            draw(&palette, &mut pixels, size, &mut font, &theme_ui::chrome(), &m, &labels, &mut view)
                 .expect("card fits");
             let rows: Vec<usize> = view
                 .hits
@@ -465,7 +469,7 @@ mod tests {
         let palette = palette_with(commands(&["file.open", "file.save"]));
         let mut view = View::default();
         let mut pixels = vec![0u32; size.0 * size.1];
-        draw(&palette, &mut pixels, size, &mut font, theme_ui::chrome(), &m, &HashMap::new(), &mut view).unwrap();
+        draw(&palette, &mut pixels, size, &mut font, &theme_ui::chrome(), &m, &HashMap::new(), &mut view).unwrap();
         let rect = view.hits.iter().find_map(|(rect, hit)| (*hit == Hit::Row(1)).then_some(*rect)).unwrap();
         let point = (rect.x + 4, rect.y + rect.h / 2);
         let surface = Surface::new(size, &m);

@@ -30,6 +30,8 @@ pub enum ThemeRequest {
     Apply,
     Select(ThemeSelection),
     OsChanged(Scheme),
+    /// Terminal hosts refresh the OS preference on terminal focus, without polling.
+    RefreshSystem,
     /// Captured bytes only. Import never opens external source/include paths.
     /// A new ID is required; existing theme files cannot be overwritten.
     Import {
@@ -37,6 +39,12 @@ pub enum ThemeRequest {
         format: ImportFormat,
         base: Scheme,
         source: Arc<[u8]>,
+    },
+    /// Explicit user-selected source. Reading and parsing stay on this worker.
+    ImportPath {
+        id: String,
+        path: PathBuf,
+        base: Scheme,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +62,7 @@ struct Import {
     format: ImportFormat,
     base: Scheme,
     source: Arc<[u8]>,
+    path: Option<PathBuf>,
 }
 #[derive(Clone)]
 struct Desired {
@@ -61,6 +70,7 @@ struct Desired {
     reload: u64,
     session: ThemeSession,
     import: Option<Import>,
+    refresh_system: bool,
 }
 struct State {
     desired: Desired,
@@ -144,7 +154,13 @@ impl ThemeWorker {
         });
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                desired: Desired { revision: 1, reload: 1, session: session.clone(), import: None },
+                desired: Desired {
+                    revision: 1,
+                    reload: 1,
+                    session: session.clone(),
+                    import: None,
+                    refresh_system: false,
+                },
                 pending: true,
                 stop: false,
                 snapshot: Arc::new(ThemeSnapshot {
@@ -175,6 +191,12 @@ impl ThemeWorker {
                     return Err(error("theme import exceeds 1 MiB"));
                 }
             }
+            ThemeRequest::ImportPath { id, path, .. } => {
+                ThemeId::user(id)?;
+                if !path.is_absolute() || path.as_os_str().len() > 4096 {
+                    return Err(error("theme import requires a bounded absolute path"));
+                }
+            }
             _ => {}
         }
         let mut s = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -188,8 +210,18 @@ impl ThemeWorker {
             ThemeRequest::Apply => s.desired.session.apply(),
             ThemeRequest::Select(selection) => s.desired.session.select(selection),
             ThemeRequest::OsChanged(scheme) => s.desired.session.os_changed(scheme),
+            ThemeRequest::RefreshSystem => s.desired.refresh_system = true,
             ThemeRequest::Import { id, format, base, source } => {
-                s.desired.import = Some(Import { id, format, base, source })
+                s.desired.import = Some(Import { id, format, base, source, path: None })
+            }
+            ThemeRequest::ImportPath { id, path, base } => {
+                s.desired.import = Some(Import {
+                    id,
+                    path: Some(path),
+                    base,
+                    format: ImportFormat::VsCodeJson,
+                    source: Arc::from([]),
+                });
             }
         }
         s.desired.revision = s.desired.revision.wrapping_add(1);
@@ -342,10 +374,18 @@ fn run(
     // A displayed hover preview must never become the fallback for a missing
     // committed source. Seed this independently from the validated startup view.
     let mut last_committed = shared.state.lock().unwrap_or_else(|p| p.into_inner()).snapshot.active.clone();
+    // Selection is supplied by accepted settings. Never replace its persisted
+    // fallback with a default before the selected source has been resolved.
+    if let Ok(Some(cached)) = theme_cache::read_active_cache(&config.active_cache)
+        && cached.selection
+            == shared.state.lock().unwrap_or_else(|p| p.into_inner()).desired.session.selection().clone()
+    {
+        last_committed = Arc::new(cached.theme);
+    }
     let mut reload_errors = Vec::new();
     let mut import_errors = Vec::new();
     loop {
-        let wanted = {
+        let mut wanted = {
             let mut s = shared.state.lock().unwrap_or_else(|p| p.into_inner());
             while !s.pending && !s.stop {
                 s = shared.ready.wait(s).unwrap_or_else(|p| p.into_inner());
@@ -356,20 +396,41 @@ fn run(
             s.pending = false;
             let wanted = s.desired.clone();
             s.desired.import = None;
+            s.desired.refresh_system = false;
             wanted
         };
+        if wanted.refresh_system {
+            let scheme = system_scheme();
+            wanted.session.os_changed(scheme);
+            let mut s = shared.state.lock().unwrap_or_else(|p| p.into_inner());
+            if s.desired.revision == wanted.revision {
+                s.desired.session.os_changed(scheme);
+            }
+        }
         let mut diagnostics = startup_errors.clone();
         let mut import_changed = false;
         if let Some(import) = wanted.import {
             import_errors.clear();
-            let result = theme_parse::import(import.format, import.base, &import.source)
-                .and_then(|theme| theme_parse::to_toml(&theme))
-                .and_then(|source| {
-                    // Parsing is complete before creating an output. No source file
-                    // path is read, and an existing user theme is never replaced.
-                    let path = config.user_directory.join(format!("{}.toml", import.id));
-                    theme_cache::atomic_write_new(&path, source.as_bytes())
-                });
+            let result = (|| {
+                if let Some(path) = &import.path {
+                    let source = read_source(path)?;
+                    match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+                        "toml" => theme_parse::parse_toml(&source),
+                        "json" => theme_parse::import(ImportFormat::VsCodeJson, import.base, &source),
+                        "tmtheme" => theme_parse::import(ImportFormat::TextMate, import.base, &source),
+                        _ => Err(error("choose a .toml, .json or .tmTheme theme file")),
+                    }
+                } else {
+                    theme_parse::import(import.format, import.base, &import.source)
+                }
+            })()
+            .and_then(|theme| theme_parse::to_toml(&theme))
+            .and_then(|source| {
+                // Parsing is complete before creating an output. Atomic creation
+                // refuses an existing ID; user themes are never replaced.
+                let path = config.user_directory.join(format!("{}.toml", import.id));
+                theme_cache::atomic_write_new(&path, source.as_bytes())
+            });
             match result {
                 Ok(()) => import_changed = true,
                 Err(e) => diagnostic(&mut import_errors, e),
@@ -433,6 +494,42 @@ fn run(
         if published {
             wake();
         }
+    }
+}
+
+fn system_scheme() -> Scheme {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+        let key: Vec<u16> =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0".encode_utf16().collect();
+        let value: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+        let mut data = 0u32;
+        let mut size = 4u32;
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut data as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        if result == 0 {
+            return if data == 0 { Scheme::Dark } else { Scheme::Light };
+        }
+    }
+    // Terminals without an OS preference API commonly expose their background.
+    if std::env::var("COLORFGBG")
+        .ok()
+        .and_then(|v| v.rsplit(';').next().and_then(|n| n.parse::<u8>().ok()))
+        .is_some_and(|n| n >= 7)
+    {
+        Scheme::Light
+    } else {
+        Scheme::Dark
     }
 }
 

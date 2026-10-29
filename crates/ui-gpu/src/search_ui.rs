@@ -856,7 +856,7 @@ pub(super) fn draw_marks(
     view: &Workspace,
     row: usize,
 ) {
-    let color = theme_ui::rgb(theme_ui::chrome(), UiRole::SearchMatch);
+    let color = theme_ui::rgb(&theme_ui::chrome(), UiRole::SearchMatch);
     let gutter = GUTTER_COLS * font.cw;
     let max = stride.saturating_sub(gutter + BAR) / font.cw.max(1);
     for range in panel.highlight_columns(view, row, max) {
@@ -894,6 +894,8 @@ pub(crate) mod host_dispatch_tests {
         let frontend_epoch = view.input_epoch();
         (
             App {
+                themes: Default::default(),
+                theme_hits: Vec::new(),
                 startup_fonts: StartupFonts { editor_ready: true, chrome_ready: true, finished: true },
                 about: Default::default(),
                 markdown,
@@ -1458,7 +1460,7 @@ pub(crate) mod host_dispatch_tests {
             &mut pixels,
             app.size,
             &mut chrome_font,
-            theme_ui::chrome(),
+            &theme_ui::chrome(),
             &app.ui,
             app.body_area().y,
             &mut app.search_view,
