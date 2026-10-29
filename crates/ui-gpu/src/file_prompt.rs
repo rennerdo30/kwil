@@ -418,3 +418,74 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod external_change {
+    use super::*;
+
+    /// Open notes.txt, edit it, let another program overwrite it, then save:
+    /// Kwil offers the choice instead of a dead end.
+    fn conflicted(
+        name: &str,
+    ) -> (Workspace, crate::document_ui::fixtures::Lane, std::path::PathBuf, kwil_view_model::SessionDocumentId) {
+        let root = crate::test_support::directory(name).unwrap();
+        let path = root.join("notes.txt");
+        std::fs::write(&path, b"original\n").unwrap();
+        let file = kwil_core_workspace::open_for_editing(&path).unwrap();
+        file.build_index(1).unwrap();
+        let mut workspace = Workspace::new(View::new(Some((path.clone(), file)))).unwrap();
+        let lane = crate::document_ui::fixtures::Lane::start(&mut workspace, root.join("state"));
+        lane.until(&mut workspace, |w| w.recovery_ready() && w.editor().is_some());
+        let id = workspace.active_id();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("mine ".into()), ..Default::default() }, 1).unwrap();
+        std::fs::write(&path, b"changed outside\n").unwrap();
+        workspace.save_document(id, None).unwrap();
+        lane.until(&mut workspace, |w| !w.file_saves_pending());
+        assert_eq!(
+            workspace.file_prompt().map(|p| p.kind),
+            Some(kwil_view_model::FilePromptKind::SaveConflict),
+            "{}",
+            workspace.status_text()
+        );
+        assert!(workspace.status_text().contains("changed on disk"), "{}", workspace.status_text());
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed outside\n", "nothing is overwritten without asking");
+        (workspace, lane, path, id)
+    }
+
+    fn text(workspace: &Workspace) -> String {
+        let mut bytes = Vec::new();
+        workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn overwrite_with_my_version_after_an_external_change() {
+        let (mut workspace, lane, path, id) = conflicted("kwil-conflict-overwrite");
+        workspace.file_prompt_mut().unwrap().text = "1".into();
+        submit(&mut workspace);
+        assert!(workspace.file_prompt().is_none(), "{}", workspace.status_text());
+        lane.until(&mut workspace, |w| !w.file_saves_pending());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine original\n");
+        assert!(!workspace.editor().unwrap().document().is_dirty());
+        // The next normal save is ordinary again.
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("again ".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.save_document(id, None).unwrap();
+        lane.until(&mut workspace, |w| !w.file_saves_pending());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine again original\n");
+        lane.settle(workspace);
+    }
+
+    #[test]
+    fn reload_from_disk_after_an_external_change() {
+        let (mut workspace, lane, path, id) = conflicted("kwil-conflict-reload");
+        workspace.file_prompt_mut().unwrap().text = "2".into();
+        submit(&mut workspace);
+        lane.until(&mut workspace, |w| !w.document_busy(id) && w.file_prompt().is_none());
+        assert_eq!(text(&workspace), "changed outside\n");
+        assert!(!workspace.editor().unwrap().document().is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed outside\n");
+        lane.settle(workspace);
+    }
+}

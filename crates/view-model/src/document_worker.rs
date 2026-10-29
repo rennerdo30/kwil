@@ -5,6 +5,24 @@ use kwil_core_text::{decoded_backing::DecodedPreview, encoding::SavePlan};
 use provenance::journal::RecoveryPolicy;
 #[path = "binary_offer.rs"]
 pub mod binary_offer;
+
+/// A save found its file changed on disk since it was opened or last saved.
+/// The workspace answers it with a choice (overwrite, reload) instead of a
+/// dead end.
+#[derive(Debug)]
+pub struct ExternalChange;
+const EXTERNAL_CHANGE: &str = "the file changed on disk since it was opened";
+impl std::fmt::Display for ExternalChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(EXTERNAL_CHANGE)
+    }
+}
+impl std::error::Error for ExternalChange {}
+/// The result transport re-creates errors from their text, so the type alone
+/// does not survive; the fixed message identifies it.
+pub(crate) fn is_external_change(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<ExternalChange>()) || error.to_string().contains(EXTERNAL_CHANGE)
+}
 #[cfg(test)]
 mod compressed_runtime;
 mod decoded;

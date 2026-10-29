@@ -129,6 +129,8 @@ pub enum FilePromptKind {
     SaveEncoding,
     LineEnding,
     Reload,
+    /// Save found the file changed on disk since it was opened.
+    SaveConflict,
 }
 
 #[cfg(test)]
@@ -557,8 +559,12 @@ impl Workspace {
         }
         let view =
             self.views.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Search tab is closed"))?;
-        if self.files.journal_failed.contains_key(&id)
-            || (self.files.storage_ready && view.editor().is_some() && !self.files.observed.contains_key(&id))
+        // Reload replaces the document from disk and starts a fresh journal, so a
+        // journal that failed (for example on an external change) must not block it.
+        let resets = matches!(action, PendingEditorAction::File(crate::document_worker::FileAction::Reload(_)));
+        if !resets
+            && (self.files.journal_failed.contains_key(&id)
+                || (self.files.storage_ready && view.editor().is_some() && !self.files.observed.contains_key(&id)))
         {
             return Err(io::Error::other(if file {
                 "File worker is busy; retry after opening or saving completes"
@@ -1574,6 +1580,25 @@ impl Workspace {
     }
 
     pub fn save_document(&mut self, id: DocumentId, path: Option<PathBuf>) -> io::Result<()> {
+        self.save_document_with(id, path, false)
+    }
+
+    /// "Overwrite with my version" after the file changed on disk: write the
+    /// editor's content over the changed file. Only files Kwil keeps a private
+    /// copy of (below the mapping threshold) can be overwritten this way.
+    pub fn overwrite_external_change(&mut self, id: DocumentId) -> io::Result<()> {
+        let original = self.views.get(&id).and_then(View::editor).and_then(|editor| editor.document().original.clone());
+        if let Some(original) = original
+            && !original.keep_private_copy()
+        {
+            return Err(io::Error::other(
+                "This file is too large for Kwil to keep its own copy; reload it from disk or use Save As",
+            ));
+        }
+        self.save_document_with(id, None, true)
+    }
+
+    fn save_document_with(&mut self, id: DocumentId, path: Option<PathBuf>, overwrite: bool) -> io::Result<()> {
         if self.document_busy(id) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1625,6 +1650,12 @@ impl Workspace {
         let plan = editor.document().save_plan();
         let raw = editor.document().representation() == crate::hex_session::Representation::RawBytes;
         let request = match if raw { editor.raw_save_request(path) } else { editor.save_request(path) } {
+            // The kept private copy supplies every byte; the changed file on
+            // disk is replaced like a Save As target.
+            Ok(mut request) if overwrite => {
+                request.original = None;
+                request
+            }
             Ok(request) => request,
             Err(error) => {
                 self.cancel_close_intent();
@@ -2432,10 +2463,20 @@ impl Workspace {
         let mut damage = Damage { status: true, ..Default::default() };
         let mut may_close = false;
         let mut warning = false;
+        let mut conflict = false;
         let Some(view) = self.views.get_mut(&document) else { return damage };
         let notice = match result {
             Ok(result) => {
                 self.files.saves.remove(&document);
+                // The saved file is durable; a journal that failed earlier (for
+                // example on an external change) starts again from it.
+                if self.files.journal_failed.remove(&document).is_some() {
+                    self.files.observed.remove(&document);
+                    self.files.seeded.remove(&document);
+                    self.files.durable.remove(&document);
+                    self.files.replacement_journals.remove(&document);
+                    self.hex.seed.insert(document);
+                }
                 may_close = current && view.editor().is_some_and(|editor| !editor.document().is_dirty());
                 let mut notice = match result.status {
                     CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
@@ -2505,12 +2546,20 @@ impl Workspace {
                 view.set_notice(notice);
                 return damage;
             }
+            Err(error) if crate::document_worker::is_external_change(&error) => {
+                self.files.saves.remove(&document);
+                conflict = true;
+                "Not saved: the file changed on disk since it was opened".into()
+            }
             Err(error) => {
                 self.files.saves.remove(&document);
                 format!("Save failed: {error}")
             }
         };
         view.set_notice(notice.clone());
+        if conflict && self.session.active() == Some(document) && self.files.prompt.is_none() {
+            self.command_prompt(FilePromptKind::SaveConflict);
+        }
         if self.session.active() != Some(document) {
             self.set_notice(format!("Tab {}: {notice}", document.0));
         }
