@@ -60,7 +60,8 @@ sed 's/bad/good/g'
             executable: executable.into(),
             args,
             range_args: vec!["{start_line}".into(), "{end_line}".into()],
-            timeout_ms: 5000,
+            // Generous: several PowerShell starts in parallel on a busy runner.
+            timeout_ms: 60_000,
         }
     }
 }
