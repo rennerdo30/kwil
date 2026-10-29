@@ -2501,7 +2501,7 @@ mod tests {
     fn paint(source: &Fake, size: (usize, usize), scale: f64, view: &mut View) -> (Vec<u32>, Option<Rect>) {
         let mut font = font::UiFont::load(chrome::Metrics::new(scale).text_px()).expect("Windows chrome face");
         let mut pixels = vec![0u32; size.0 * size.1];
-        let area = draw(source, &mut pixels, size, &mut font, theme_ui::chrome(), &Metrics::new(scale), 7, view, None);
+        let area = draw(source, &mut pixels, size, &mut font, &theme_ui::chrome(), &Metrics::new(scale), 7, view, None);
         (pixels, area)
     }
 
@@ -3299,7 +3299,7 @@ mod tests {
         let reloaded = Fake::new(external.source());
         let mut font = font::UiFont::load(m.text_px()).expect("Windows chrome face");
         let mut pixels = vec![0u32; size.0 * size.1];
-        draw(&reloaded, &mut pixels, size, &mut font, theme_ui::chrome(), &m, epoch, &mut view, None).unwrap();
+        draw(&reloaded, &mut pixels, size, &mut font, &theme_ui::chrome(), &m, epoch, &mut view, None).unwrap();
         assert_eq!(reloaded.rows()[index].current, SettingValue::Bool(!painted), "the external value is retained");
         assert_eq!(admit(&view, epoch, surface, point), Admit::Act(Target::Toggle { index, id }));
     }

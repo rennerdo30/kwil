@@ -1300,7 +1300,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 &mut expected,
                 app.size.0,
                 app.ui_font.as_mut().unwrap(),
-                super::theme_ui::chrome(),
+                &super::theme_ui::chrome(),
                 &app.ui,
             );
             let r = dropdown.area;
