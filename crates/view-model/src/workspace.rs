@@ -70,6 +70,13 @@ pub struct TabMetrics {
 pub enum TabAction {
     Activate(DocumentId),
     Close(DocumentId),
+    /// Tab context menu: every tab except this one.
+    CloseOthers(DocumentId),
+    /// Tab context menu: the tabs after this one.
+    CloseToRight(DocumentId),
+    /// Tab context menu: every tab without unsaved changes.
+    CloseSaved,
+    CloseAll,
     PreviousPage,
     NextPage,
 }
@@ -711,6 +718,21 @@ impl Workspace {
         if dirty { format!("* {name}") } else { name }
     }
 
+    /// The tab has changes that are not saved.
+    pub fn tab_dirty(&self, id: DocumentId) -> bool {
+        self.session.tabs().iter().find(|tab| tab.id == id).is_some_and(|tab| {
+            self.views
+                .get(&id)
+                .and_then(View::editor)
+                .map_or(tab.revision != tab.saved_revision, |editor| editor.document().is_dirty())
+        })
+    }
+
+    /// The file a tab shows, if it has one on disk.
+    pub fn tab_path(&self, id: DocumentId) -> Option<PathBuf> {
+        self.session.tabs().iter().find(|tab| tab.id == id).and_then(|tab| tab.path.clone())
+    }
+
     pub fn tab_geometry(&self, metrics: TabMetrics, layout: kwil_core_commands::settings::TabLayout) -> TabGeometry {
         use kwil_core_commands::settings::TabLayout;
         let TabMetrics { width, height, cell_width, cell_height, scrollbar } = metrics;
@@ -792,6 +814,23 @@ impl Workspace {
                 self.cancel_file_prompt();
                 self.files.close = [id].into();
                 self.advance_close(false)?;
+            }
+            TabAction::CloseOthers(_) | TabAction::CloseToRight(_) | TabAction::CloseSaved | TabAction::CloseAll => {
+                let tabs: Vec<DocumentId> = self.session.tabs().iter().map(|tab| tab.id).collect();
+                let close: Vec<DocumentId> = match action {
+                    TabAction::CloseOthers(keep) => tabs.into_iter().filter(|id| *id != keep).collect(),
+                    TabAction::CloseToRight(from) => {
+                        tabs.iter().position(|id| *id == from).map_or_else(Vec::new, |at| tabs[at + 1..].to_vec())
+                    }
+                    TabAction::CloseSaved => tabs.into_iter().filter(|id| !self.tab_dirty(*id)).collect(),
+                    _ => tabs,
+                };
+                if !close.is_empty() {
+                    self.cancel_file_prompt();
+                    self.files.quit = false;
+                    self.files.close = close.into_iter().collect();
+                    self.advance_close(false)?;
+                }
             }
             TabAction::PreviousPage | TabAction::NextPage => {
                 let index = if action == TabAction::PreviousPage {
@@ -4657,6 +4696,41 @@ mod tests {
         assert!(workspace.editor().unwrap().document().snapshot().is_empty());
         assert!(workspace.close(first, false).unwrap());
         assert_eq!(workspace.active_id(), second);
+    }
+
+    #[test]
+    fn tab_menu_closes_others_to_the_right_saved_and_all() {
+        let geometry = |workspace: &Workspace| {
+            workspace.tab_geometry(
+                TabMetrics { width: 800, height: 400, cell_width: 8, cell_height: 16, scrollbar: 14 },
+                kwil_core_commands::settings::TabLayout::Horizontal,
+            )
+        };
+        let ids = |workspace: &Workspace| workspace.session().tabs().iter().map(|tab| tab.id).collect::<Vec<_>>();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let a = workspace.active_id();
+        let b = workspace.open(View::new(None)).unwrap();
+        workspace.open(View::new(None)).unwrap();
+        workspace.open(View::new(None)).unwrap();
+        workspace.tab_action(TabAction::CloseToRight(b), &geometry(&workspace)).unwrap();
+        assert_eq!(ids(&workspace), [a, b]);
+        let c = workspace.open(View::new(None)).unwrap();
+        workspace.tab_action(TabAction::CloseOthers(b), &geometry(&workspace)).unwrap();
+        assert_eq!(ids(&workspace), [b]);
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("unsaved".into()), ..Default::default() }, 1)
+            .unwrap();
+        let clean = workspace.open(View::new(None)).unwrap();
+        assert!(workspace.tab_dirty(b) && !workspace.tab_dirty(clean));
+        workspace.tab_action(TabAction::CloseSaved, &geometry(&workspace)).unwrap();
+        assert_eq!(ids(&workspace), [b], "Close Saved keeps the tab with unsaved changes");
+        assert!(!ids(&workspace).contains(&c));
+        assert!(workspace.tab_path(b).is_none());
+        // Close All asks about the unsaved tab instead of discarding it.
+        workspace.tab_action(TabAction::CloseAll, &geometry(&workspace)).unwrap();
+        assert!(workspace.close_pending());
+        assert_eq!(ids(&workspace), [b]);
+        workspace.cancel_file_prompt();
     }
 
     #[test]

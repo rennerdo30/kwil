@@ -32,6 +32,7 @@ pub(super) fn hold_preview_completion(
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
     Command(&'static str),
+    TabContextProbe,
     FileCommand(&'static str),
     FilePromptChoice(&'static str),
     CompareOpen,
@@ -446,7 +447,15 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::Command("file.save")),
             (2000, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_FORMAT_PROBE").is_some() {
+        let tab_menu = [
+            (1800, Step::DismissSetup),
+            (300, Step::TabContextProbe),
+            (400, Step::UsabilityCapture("tab-menu.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_TAB_MENU_PROBE").is_some() {
+            tab_menu.as_slice()
+        } else if std::env::var_os("KWIL_FORMAT_PROBE").is_some() {
             format.as_slice()
         } else if std::env::var_os("KWIL_LOG_COMMANDS_PROBE").is_some() {
             log_commands.as_slice()
@@ -1271,6 +1280,14 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::MarkdownSection(line) => app.markdown_probe_position(line),
         Step::MarkdownNarrow => {
             let _ = app.gfx.as_ref().unwrap().window.request_inner_size(winit::dpi::LogicalSize::new(640.0, 650.0));
+        }
+        Step::TabContextProbe => {
+            let frame = app.tab_frame();
+            let slot = frame.geometry.slots.first().expect("a tab").clone();
+            app.chrome_frame = Some(frame);
+            app.pointer = (slot.area.x + slot.area.width / 3, slot.area.y + slot.area.height / 2);
+            app.open_context();
+            assert!(app.context.is_open(), "right-click on a tab opens its menu");
         }
         Step::ContextProbe => {
             let body = app.body_area();
