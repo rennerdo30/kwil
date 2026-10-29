@@ -70,6 +70,13 @@ pub struct TabMetrics {
 pub enum TabAction {
     Activate(DocumentId),
     Close(DocumentId),
+    /// Tab context menu: every tab except this one.
+    CloseOthers(DocumentId),
+    /// Tab context menu: the tabs after this one.
+    CloseToRight(DocumentId),
+    /// Tab context menu: every tab without unsaved changes.
+    CloseSaved,
+    CloseAll,
     PreviousPage,
     NextPage,
 }
@@ -129,6 +136,8 @@ pub enum FilePromptKind {
     SaveEncoding,
     LineEnding,
     Reload,
+    /// Save found the file changed on disk since it was opened.
+    SaveConflict,
 }
 
 #[cfg(test)]
@@ -557,8 +566,12 @@ impl Workspace {
         }
         let view =
             self.views.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Search tab is closed"))?;
-        if self.files.journal_failed.contains_key(&id)
-            || (self.files.storage_ready && view.editor().is_some() && !self.files.observed.contains_key(&id))
+        // Reload replaces the document from disk and starts a fresh journal, so a
+        // journal that failed (for example on an external change) must not block it.
+        let resets = matches!(action, PendingEditorAction::File(crate::document_worker::FileAction::Reload(_)));
+        if !resets
+            && (self.files.journal_failed.contains_key(&id)
+                || (self.files.storage_ready && view.editor().is_some() && !self.files.observed.contains_key(&id)))
         {
             return Err(io::Error::other(if file {
                 "File worker is busy; retry after opening or saving completes"
@@ -705,6 +718,26 @@ impl Workspace {
         if dirty { format!("* {name}") } else { name }
     }
 
+    /// A journal result for `revision` that a later save already made durable.
+    fn journal_superseded(&self, document: DocumentId, revision: u64) -> bool {
+        self.session.tabs().iter().find(|tab| tab.id == document).is_some_and(|tab| tab.saved_revision >= revision)
+    }
+
+    /// The tab has changes that are not saved.
+    pub fn tab_dirty(&self, id: DocumentId) -> bool {
+        self.session.tabs().iter().find(|tab| tab.id == id).is_some_and(|tab| {
+            self.views
+                .get(&id)
+                .and_then(View::editor)
+                .map_or(tab.revision != tab.saved_revision, |editor| editor.document().is_dirty())
+        })
+    }
+
+    /// The file a tab shows, if it has one on disk.
+    pub fn tab_path(&self, id: DocumentId) -> Option<PathBuf> {
+        self.session.tabs().iter().find(|tab| tab.id == id).and_then(|tab| tab.path.clone())
+    }
+
     pub fn tab_geometry(&self, metrics: TabMetrics, layout: kwil_core_commands::settings::TabLayout) -> TabGeometry {
         use kwil_core_commands::settings::TabLayout;
         let TabMetrics { width, height, cell_width, cell_height, scrollbar } = metrics;
@@ -786,6 +819,23 @@ impl Workspace {
                 self.cancel_file_prompt();
                 self.files.close = [id].into();
                 self.advance_close(false)?;
+            }
+            TabAction::CloseOthers(_) | TabAction::CloseToRight(_) | TabAction::CloseSaved | TabAction::CloseAll => {
+                let tabs: Vec<DocumentId> = self.session.tabs().iter().map(|tab| tab.id).collect();
+                let close: Vec<DocumentId> = match action {
+                    TabAction::CloseOthers(keep) => tabs.into_iter().filter(|id| *id != keep).collect(),
+                    TabAction::CloseToRight(from) => {
+                        tabs.iter().position(|id| *id == from).map_or_else(Vec::new, |at| tabs[at + 1..].to_vec())
+                    }
+                    TabAction::CloseSaved => tabs.into_iter().filter(|id| !self.tab_dirty(*id)).collect(),
+                    _ => tabs,
+                };
+                if !close.is_empty() {
+                    self.cancel_file_prompt();
+                    self.files.quit = false;
+                    self.files.close = close.into_iter().collect();
+                    self.advance_close(false)?;
+                }
             }
             TabAction::PreviousPage | TabAction::NextPage => {
                 let index = if action == TabAction::PreviousPage {
@@ -1574,6 +1624,25 @@ impl Workspace {
     }
 
     pub fn save_document(&mut self, id: DocumentId, path: Option<PathBuf>) -> io::Result<()> {
+        self.save_document_with(id, path, false)
+    }
+
+    /// "Overwrite with my version" after the file changed on disk: write the
+    /// editor's content over the changed file. Only files Kwil keeps a private
+    /// copy of (below the mapping threshold) can be overwritten this way.
+    pub fn overwrite_external_change(&mut self, id: DocumentId) -> io::Result<()> {
+        let original = self.views.get(&id).and_then(View::editor).and_then(|editor| editor.document().original.clone());
+        if let Some(original) = original
+            && !original.keep_private_copy()
+        {
+            return Err(io::Error::other(
+                "This file is too large for Kwil to keep its own copy; reload it from disk or use Save As",
+            ));
+        }
+        self.save_document_with(id, None, true)
+    }
+
+    fn save_document_with(&mut self, id: DocumentId, path: Option<PathBuf>, overwrite: bool) -> io::Result<()> {
         if self.document_busy(id) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1625,6 +1694,12 @@ impl Workspace {
         let plan = editor.document().save_plan();
         let raw = editor.document().representation() == crate::hex_session::Representation::RawBytes;
         let request = match if raw { editor.raw_save_request(path) } else { editor.save_request(path) } {
+            // The kept private copy supplies every byte; the changed file on
+            // disk is replaced like a Save As target.
+            Ok(mut request) if overwrite => {
+                request.original = None;
+                request
+            }
             Ok(request) => request,
             Err(error) => {
                 self.cancel_close_intent();
@@ -2349,6 +2424,9 @@ impl Workspace {
                     damage = Damage::default();
                     self.checkpoint_session();
                 }
+                // A late failure for a revision a later save already wrote to
+                // disk (for example after an external change) changes nothing.
+                Err(_) if self.journal_superseded(document, revision) => damage = Damage::default(),
                 Err(error) => {
                     let message = format!("Tab {} revision {revision} is not journaled: {error}", document.0);
                     self.files.journal_failed.insert(document, message.clone());
@@ -2370,6 +2448,7 @@ impl Workspace {
                             ..Default::default()
                         };
                     }
+                    Err(_) if self.journal_superseded(document, revision) => damage = Damage::default(),
                     Err(error) => {
                         let message = format!("Tab {} recovery is not durable: {error}", document.0);
                         self.files.journal_failed.insert(document, message.clone());
@@ -2432,10 +2511,20 @@ impl Workspace {
         let mut damage = Damage { status: true, ..Default::default() };
         let mut may_close = false;
         let mut warning = false;
+        let mut conflict = false;
         let Some(view) = self.views.get_mut(&document) else { return damage };
         let notice = match result {
             Ok(result) => {
                 self.files.saves.remove(&document);
+                // The saved file is durable; a journal that failed earlier (for
+                // example on an external change) starts again from it.
+                if self.files.journal_failed.remove(&document).is_some() {
+                    self.files.observed.remove(&document);
+                    self.files.seeded.remove(&document);
+                    self.files.durable.remove(&document);
+                    self.files.replacement_journals.remove(&document);
+                    self.hex.seed.insert(document);
+                }
                 may_close = current && view.editor().is_some_and(|editor| !editor.document().is_dirty());
                 let mut notice = match result.status {
                     CommandStatus::Message(message) | CommandStatus::NotImplemented(message) => {
@@ -2505,12 +2594,20 @@ impl Workspace {
                 view.set_notice(notice);
                 return damage;
             }
+            Err(error) if crate::document_worker::is_external_change(&error) => {
+                self.files.saves.remove(&document);
+                conflict = true;
+                "Not saved: the file changed on disk since it was opened".into()
+            }
             Err(error) => {
                 self.files.saves.remove(&document);
                 format!("Save failed: {error}")
             }
         };
         view.set_notice(notice.clone());
+        if conflict && self.session.active() == Some(document) && self.files.prompt.is_none() {
+            self.command_prompt(FilePromptKind::SaveConflict);
+        }
         if self.session.active() != Some(document) {
             self.set_notice(format!("Tab {}: {notice}", document.0));
         }
@@ -4608,6 +4705,41 @@ mod tests {
         assert!(workspace.editor().unwrap().document().snapshot().is_empty());
         assert!(workspace.close(first, false).unwrap());
         assert_eq!(workspace.active_id(), second);
+    }
+
+    #[test]
+    fn tab_menu_closes_others_to_the_right_saved_and_all() {
+        let geometry = |workspace: &Workspace| {
+            workspace.tab_geometry(
+                TabMetrics { width: 800, height: 400, cell_width: 8, cell_height: 16, scrollbar: 14 },
+                kwil_core_commands::settings::TabLayout::Horizontal,
+            )
+        };
+        let ids = |workspace: &Workspace| workspace.session().tabs().iter().map(|tab| tab.id).collect::<Vec<_>>();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let a = workspace.active_id();
+        let b = workspace.open(View::new(None)).unwrap();
+        workspace.open(View::new(None)).unwrap();
+        workspace.open(View::new(None)).unwrap();
+        workspace.tab_action(TabAction::CloseToRight(b), &geometry(&workspace)).unwrap();
+        assert_eq!(ids(&workspace), [a, b]);
+        let c = workspace.open(View::new(None)).unwrap();
+        workspace.tab_action(TabAction::CloseOthers(b), &geometry(&workspace)).unwrap();
+        assert_eq!(ids(&workspace), [b]);
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("unsaved".into()), ..Default::default() }, 1)
+            .unwrap();
+        let clean = workspace.open(View::new(None)).unwrap();
+        assert!(workspace.tab_dirty(b) && !workspace.tab_dirty(clean));
+        workspace.tab_action(TabAction::CloseSaved, &geometry(&workspace)).unwrap();
+        assert_eq!(ids(&workspace), [b], "Close Saved keeps the tab with unsaved changes");
+        assert!(!ids(&workspace).contains(&c));
+        assert!(workspace.tab_path(b).is_none());
+        // Close All asks about the unsaved tab instead of discarding it.
+        workspace.tab_action(TabAction::CloseAll, &geometry(&workspace)).unwrap();
+        assert!(workspace.close_pending());
+        assert_eq!(ids(&workspace), [b]);
+        workspace.cancel_file_prompt();
     }
 
     #[test]

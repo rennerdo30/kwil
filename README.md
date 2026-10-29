@@ -3,7 +3,7 @@
 A plain text editor for the desktop and terminal, written in Rust. Speed and a
 quiet, responsive interface come first.
 
-**Early beta:** `0.1.0-beta.4` is published as a prerelease. The full v1
+**Early beta:** `0.1.0-beta.5` is published as a prerelease. The full v1
 specification is still in progress. See [beta status](docs/BETA.md) and
 [release notes](docs/BETA_RELEASE_NOTES.md) before evaluating it with copies of
 important files.

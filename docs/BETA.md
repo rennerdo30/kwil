@@ -6,6 +6,8 @@ changes and its known limitations.
 
 ## Published
 
+- **0.1.0-beta.4**, published 2026-10-29 from main `8ea5eab`: every palette
+  command runs; beta.3 updated itself to it.
 - **0.1.0-beta.3**, published 2026-10-29 from main `62a814e`: Windows setup and
   zip, macOS/Linux tar.gz, license notices; beta.2 updated itself to it.
 - **0.1.0-beta.2**, published as a GitHub prerelease on 2026-10-29 from main
@@ -14,10 +16,10 @@ changes and its known limitations.
   files match the published checksums.
 - **0.1.0-beta.1** was never published; its tag stays as history.
 
-## Next candidate: 0.1.0-beta.4
+## Next candidate: 0.1.0-beta.5
 
-Every palette command runs (themes, logs, compare, file encoding/line endings/
-reload/open folder, formatter, Check for Updates).
+Overwrite-or-reload choice when a save finds the file changed on disk; tab
+context menu.
 
 ## In beta.3
 

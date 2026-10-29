@@ -171,6 +171,8 @@ struct Shared {
     // Drops after the file handle and mapping, so Windows can delete backups.
     save_backing: Mutex<Option<original_save::SaveBacking>>,
     read_generation: AtomicU64,
+    /// Set by keep_private_copy(); only ever for resident bytes.
+    detached: std::sync::atomic::AtomicBool,
 }
 
 /// Weak bookkeeping never keeps an obsolete mapping/backing alive. Source
@@ -285,6 +287,7 @@ impl TextFile {
                 scanned: AtomicU64::new(0),
                 save_backing: Mutex::new(None),
                 read_generation: AtomicU64::new(0),
+                detached: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -301,13 +304,19 @@ impl TextFile {
     }
 
     fn observe_check(&self, result: io::Result<FileState>) -> io::Result<FileState> {
-        if !matches!(&result, Ok(FileState::Unchanged)) {
+        if !matches!(&result, Ok(FileState::Unchanged)) && !self.shared.detached.load(Ordering::Acquire) {
             self.shared.read_generation.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
 
     fn check_source_live(&self) -> io::Result<FileState> {
+        // After keep_private_copy(), a resident original is read as the
+        // user's version even though the path changed. check() still reports
+        // the path's state.
+        if self.shared.detached.load(Ordering::Acquire) {
+            return Ok(FileState::Unchanged);
+        }
         let pinned = self.shared.save_backing.lock().map_err(|_| io::Error::other("save pin lock poisoned"))?;
         if pinned.is_some() {
             // A save pins this exact object. Path replacement can no longer
@@ -327,6 +336,22 @@ impl TextFile {
 
     pub fn path(&self) -> &Path {
         &self.shared.path
+    }
+
+    /// The bytes were copied at open (below MAP_THRESHOLD), not mapped.
+    pub fn is_resident(&self) -> bool {
+        matches!(self.shared.bytes, Bytes::Owned(_))
+    }
+
+    /// The user chose their version over an external change ("overwrite with
+    /// my version"). A resident copy cannot be changed by external writers, so
+    /// reads continue from it instead of refusing. Mapped views can go stale
+    /// and stay refused: returns false for them.
+    pub fn keep_private_copy(&self) -> bool {
+        if self.is_resident() {
+            self.shared.detached.store(true, Ordering::Release);
+        }
+        self.is_resident()
     }
 
     pub fn resident_original_bytes(&self) -> usize {
@@ -762,6 +787,18 @@ mod tests {
         assert!(matches!(file.first_lines(1), Err(ReadError::Changed(FileState::Replaced))));
         assert!(matches!(file.lines(0, 1), Err(ReadError::Changed(FileState::Replaced))));
         assert!(matches!(file.build_index(1), Err(ReadError::Changed(FileState::Replaced))));
+    }
+
+    #[test]
+    fn kept_private_copy_reads_the_original_after_an_external_change() {
+        let dir = TempDir::new();
+        let path = dir.file(b"mine\n");
+        let file = TextFile::open(&path).unwrap();
+        std::fs::write(&path, b"changed outside\n").unwrap();
+        assert!(file.bytes().is_err(), "external changes are refused by default");
+        assert!(file.keep_private_copy(), "small files are copied at open");
+        assert_eq!(file.bytes().unwrap(), b"mine\n");
+        assert_ne!(file.check().unwrap(), FileState::Unchanged, "the path's state is still reported");
     }
 
     #[test]

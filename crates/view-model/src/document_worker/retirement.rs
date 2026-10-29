@@ -325,6 +325,9 @@ impl WorkerBackings {
         self.check_input_path(request.path.parent().ok_or_else(|| invalid("save destination has no parent"))?, 64)?;
         if let Some(original) = &request.original {
             self.check_input_path(original.path(), 0)?;
+            if original.check()? != kwil_core_text::FileState::Unchanged {
+                return Err(io::Error::other(super::ExternalChange));
+            }
             match source_format(original)? {
                 DetectedFormat::Raw => (),
                 DetectedFormat::Unsupported(format) => {
@@ -472,7 +475,7 @@ impl WorkerBackings {
 
 fn require_unchanged(file: &TextFile) -> io::Result<()> {
     if file.check()? != kwil_core_text::FileState::Unchanged {
-        return Err(io::Error::other("compressed source changed on disk"));
+        return Err(io::Error::other(super::ExternalChange));
     }
     Ok(())
 }

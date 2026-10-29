@@ -175,7 +175,8 @@ fn draw_card(
         | FilePromptKind::ReopenEncoding
         | FilePromptKind::SaveEncoding
         | FilePromptKind::LineEnding
-        | FilePromptKind::Reload => {
+        | FilePromptKind::Reload
+        | FilePromptKind::SaveConflict => {
             // Keyboard route, stated on the card: the typed number is the row.
             let (hint, color) = if !text.trim().is_empty() && chosen.is_none() {
                 (format!("No recent file {}", desktop::visible(text.trim(), 16)), c.error)

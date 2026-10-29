@@ -59,6 +59,7 @@ impl FilePromptKind {
             Self::SaveEncoding => "Save with encoding",
             Self::LineEnding => "Change Line Endings",
             Self::Reload => "Discard local edits and reload?",
+            Self::SaveConflict => "The file changed on disk since it was opened",
         }
     }
     pub fn choices(self) -> &'static [&'static str] {
@@ -67,6 +68,7 @@ impl FilePromptKind {
             Self::ReopenEncoding | Self::SaveEncoding => ENCODINGS,
             Self::LineEnding => &["LF", "CRLF"],
             Self::Reload => &["Reload from Disk (discard local edits)"],
+            Self::SaveConflict => &["Overwrite the file with my version", "Reload from disk (discard my changes)"],
             _ => &[],
         }
     }
@@ -77,7 +79,7 @@ impl Workspace {
         self.files.folder.take()
     }
 
-    fn command_prompt(&mut self, kind: FilePromptKind) {
+    pub(super) fn command_prompt(&mut self, kind: FilePromptKind) {
         self.files.next_prompt = self.files.next_prompt.wrapping_add(1);
         self.files.prompt = Some(FilePrompt {
             generation: self.files.next_prompt,
@@ -186,6 +188,8 @@ impl Workspace {
                     crate::DocumentLineEnding::CrLf
                 }),
                 FilePromptKind::Reload => FileAction::Reload(None),
+                FilePromptKind::SaveConflict if index == 0 => return self.overwrite_external_change(prompt.document),
+                FilePromptKind::SaveConflict => FileAction::Reload(None),
                 _ => unreachable!(),
             };
             self.submit_file_action(action)

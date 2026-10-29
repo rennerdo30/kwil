@@ -1,9 +1,9 @@
-# Kwil 0.1.0-beta.4
+# Kwil 0.1.0-beta.5
 
 Draft notes for the next candidate. Artifacts and packaged native gates are not yet qualified.
 
 An early beta for evaluation and feedback. This is not an RC or a claim that the
-full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.4/docs/SPEC.md)
+full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.5/docs/SPEC.md)
 is complete. Test with copies of important files.
 
 ## Downloads and installation
@@ -30,7 +30,18 @@ without independent signature verification. beta.2 copies update to
 this release by themselves; frozen beta.1 copies must be replaced manually. Stable download installers do not
 select betas.
 
-## Changes since beta.3
+## Changes since beta.4
+
+- **Saving a file another program changed** no longer ends in a dead end. Kwil
+  asks: overwrite the file with your version, or reload it from disk. Reload
+  also works when the recovery journal failed on the change. (Overwrite is
+  available for files up to 64 MiB, which Kwil keeps its own copy of.)
+- **Tab context menu** (right-click a tab): Close, Close Others, Close to the
+  Right, Close Saved, Close All, Save, Reload from Disk, Compare with Saved,
+  Copy Path, Show in File Explorer / Reveal in Finder / Open Containing Folder.
+  Closing never discards unsaved changes without asking.
+
+## Changes in beta.4
 
 Every command in the command palette now runs; none answers "command not
 implemented" any more (a contract test for GUI and TUI enforces it).
@@ -87,7 +98,7 @@ implemented" any more (a contract test for GUI and TUI enforces it).
 
 This list identifies areas to evaluate, not blanket platform or performance
 acceptance. Exact candidate checks and remaining release gates are recorded in
-[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.4/docs/BETA.md).
+[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.5/docs/BETA.md).
 
 ## Known limitations
 
