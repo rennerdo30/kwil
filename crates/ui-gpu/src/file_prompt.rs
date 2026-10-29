@@ -271,9 +271,13 @@ mod tests {
         workspace
             .execute("edit.insert", &CommandArgs { text: Some("one\ntwo\n".into()), ..Default::default() }, 1)
             .unwrap();
+        // File actions are refused while the edit is still queued for recovery.
+        workspace.checkpoint_session();
+        lane.through(&mut workspace, kwil_view_model::workspace_document::ResultKind::Persisted);
         assert!(workspace.file_command("file.setLineEnding").unwrap());
         workspace.file_prompt_mut().unwrap().text = "2".into();
         submit(&mut workspace);
+        assert!(workspace.file_prompt().is_none(), "line ending change admitted: {}", workspace.status_text());
         let id = workspace.active_id();
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         let mut bytes = Vec::new();
@@ -282,6 +286,7 @@ mod tests {
         workspace.file_command("file.setEncoding").unwrap();
         workspace.file_prompt_mut().unwrap().text = "2".into();
         submit(&mut workspace);
+        assert!(workspace.file_prompt().is_none(), "encoding change admitted: {}", workspace.status_text());
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         let path = root.join("saved.txt");
         workspace.save_document(id, Some(path.clone())).unwrap();
