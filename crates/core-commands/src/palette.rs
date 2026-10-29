@@ -589,6 +589,7 @@ fn run_index(shared: Arc<Shared>, notify: Arc<dyn Fn() + Send + Sync>) {
     // Registry metadata and the matcher itself are constructed on this worker.
     let commands: Vec<_> = COMMANDS
         .iter()
+        .filter(|c| crate::registry::in_palette(c.id))
         .map(|c| {
             (
                 format!("{} {} {}", c.id, c.title, c.category),

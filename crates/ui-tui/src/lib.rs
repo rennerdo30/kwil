@@ -576,6 +576,21 @@ fn run_workspace_with_terminal_init(
                                 }
                                 true
                             }
+                            KeyResult::CheckUpdate => {
+                                let sender = tx.clone();
+                                let started = kwil_update::spawn_check(env!("CARGO_PKG_VERSION"), move |message| {
+                                    let _ = sender.send(Msg::Notice(message));
+                                });
+                                view.set_notice(
+                                    if started {
+                                        "Checking for updates…"
+                                    } else {
+                                        "An update check is already running"
+                                    }
+                                    .into(),
+                                );
+                                true
+                            }
                             KeyResult::SettingsFile => {
                                 if let Some(panel) = &mut settings_panel {
                                     panel.open();
@@ -1680,6 +1695,7 @@ fn combine_shutdown_results(primary: std::io::Result<()>, cleanup: std::io::Resu
 
 enum KeyResult {
     RetryWrap,
+    CheckUpdate,
     BodyInvoke(kwil_core_commands::vim::Invocation, bool),
     BodyExecute(&'static str, CommandArgs, u32),
     Settings,
@@ -2177,6 +2193,13 @@ fn invoke(
     }
     if call.id == "view.settings" {
         return KeyResult::Settings;
+    }
+    if matches!(call.id, "update.check" | "update.apply") {
+        return KeyResult::CheckUpdate;
+    }
+    if call.id == "view.logFilters" || call.id.starts_with("view.markdown") || call.id == "view.toggleMarkdown" {
+        view.set_notice("Markdown preview and log filters are in the window UI (kwil --gui)".into());
+        return KeyResult::Changed(true);
     }
     if call.id == "view.settingsFile" {
         return KeyResult::SettingsFile;
@@ -3271,6 +3294,31 @@ mod tests {
             ),
             "tombstone must suppress quit fallback"
         );
+    }
+
+    /// Every command the palette offers runs in the TUI: none may answer
+    /// "command not implemented". Hide unfinished features through `NOT_HOSTED`.
+    #[test]
+    fn every_palette_command_runs_in_the_tui() {
+        let mut broken = Vec::new();
+        for command in kwil_core_commands::COMMANDS.iter().filter(|c| kwil_core_commands::in_palette(c.id)) {
+            let mut view = View::new(None);
+            view.set_rows(3);
+            execute(&mut view, "edit.insert", Some("alpha beta\n".into()), false, Duration::ZERO);
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+g", command.id)]).unwrap();
+            key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            let status = view.status_text();
+            if status.contains("not implemented") {
+                broken.push(format!("{}: {status}", command.id));
+            }
+        }
+        assert!(broken.is_empty(), "palette commands without a TUI host:\n{}", broken.join("\n"));
     }
 
     #[test]

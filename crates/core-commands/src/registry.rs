@@ -118,6 +118,50 @@ commands! {
     }
 }
 
+/// Commands whose feature no frontend runs yet. They stay bindable and in the
+/// keymap editor, but the palette hides them. Remove an id here in the change
+/// that lands its feature; the frontend palette contract tests then cover it.
+pub const NOT_HOSTED: &[&str] = &[
+    "file.openFolder",
+    "file.reload",
+    "file.keepChanges",
+    "file.setEncoding",
+    "file.setLineEnding",
+    "edit.formatDocument",
+    "edit.formatSelection",
+    "compare.files",
+    "compare.saved",
+    "compare.nextChange",
+    "compare.previousChange",
+    "compare.toggleIgnoreWhitespace",
+    "compare.toggleUnchanged",
+    "compare.close",
+    "log.toggleFollow",
+    "log.pause",
+    "log.resume",
+    "log.filter",
+    "log.clearFilter",
+    "log.toggleRegex",
+    "log.toggleLevel",
+    "log.highlightRules",
+    "log.toggleMark",
+    "log.nextMark",
+    "log.previousMark",
+    "log.goToTime",
+    "theme.select",
+    "theme.preview",
+    "theme.import",
+    "theme.followSystem",
+];
+
+/// Whether the command palette offers this command. Key-only commands
+/// (motions, operators, modes, palette navigation) and `NOT_HOSTED` are hidden,
+/// so every palette entry runs.
+pub fn in_palette(id: &str) -> bool {
+    !["motion.", "operator.", "mode.", "palette."].iter().any(|prefix| id.starts_with(prefix))
+        && !NOT_HOSTED.contains(&id)
+}
+
 pub fn command(id: &str) -> Option<&'static Command> {
     COMMANDS.iter().find(|command| command.id == id)
 }
