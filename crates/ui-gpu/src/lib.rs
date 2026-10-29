@@ -2343,7 +2343,7 @@ impl App {
             }
         }
         if projection_owns_body && body_changed {
-            log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source);
+            log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source, &self.view);
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             damage.push(tabs::rect(body));
         }
@@ -2869,7 +2869,7 @@ fn draw_row(
     fill(buf, w, Rect { x: 0, y, w: gutter.min(w), h: ch }, gutter_bg());
     fill(buf, w, Rect { x: gutter, y, w: w.saturating_sub(gutter), h: ch }, bg());
     if let Some(text) = view.line(r) {
-        let num = format!("{:>7} ", view.line_number(r));
+        let num = format!("{:>7}{}", view.line_number(r), if view.log_marked(view.line_number(r)) { '*' } else { ' ' });
         draw_text(buf, w, font, 0, y, num.as_bytes(), GUTTER_COLS, gutter_fg(), gutter_bg());
         draw_text(buf, w, font, gutter, y, text, w.saturating_sub(gutter + BAR) / cw, fg(), bg());
         if let Some(source) = view.line_source(r) {

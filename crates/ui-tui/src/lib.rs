@@ -614,7 +614,8 @@ fn run_workspace_with_terminal_init(
                                 }
                                 true
                             }
-                            KeyResult::Settings => {
+                            KeyResult::Settings | KeyResult::LogHighlights => {
+                                let log_highlights = matches!(intent, KeyResult::LogHighlights);
                                 if let Some(host) = &mut palette {
                                     let _ = host.input(kwil_view_model::palette_session::PaletteInput::Cancel);
                                 }
@@ -622,6 +623,9 @@ fn run_workspace_with_terminal_init(
                                 keys.cancel_pending();
                                 if let Some(panel) = &mut settings_panel {
                                     panel.open();
+                                    if log_highlights && let Err(error) = panel.open_log_highlights() {
+                                        view.set_notice(error);
+                                    }
                                 } else {
                                     view.set_notice("Settings are starting; try again shortly".into());
                                 }
@@ -1699,6 +1703,7 @@ enum KeyResult {
     BodyInvoke(kwil_core_commands::vim::Invocation, bool),
     BodyExecute(&'static str, CommandArgs, u32),
     Settings,
+    LogHighlights,
     SettingsFile,
     Quit,
     Save(Option<std::path::PathBuf>),
@@ -2180,7 +2185,7 @@ fn invoke(
     elapsed: std::time::Duration,
     preset: Preset,
 ) -> KeyResult {
-    if view.raw_body() && !hex_ui::chrome_command(call.id) {
+    if view.raw_body() && !hex_ui::chrome_command(call.id) && !call.id.starts_with("log.") {
         return KeyResult::Hex(call, extend);
     }
     let body_blocked = view.body_blocked();
@@ -2196,6 +2201,22 @@ fn invoke(
     }
     if matches!(call.id, "update.check" | "update.apply") {
         return KeyResult::CheckUpdate;
+    }
+    if call.id.starts_with("log.") {
+        if !view.is_log_document() {
+            view.set_notice("Open a log file first".into());
+        } else if matches!(call.id, "log.toggleMark" | "log.nextMark" | "log.previousMark") {
+            if body_blocked || prepared_body(view) {
+                view.set_notice("Open the unwrapped log text to navigate line marks".into());
+            } else if let Err(error) = view.log_mark_command(call.id, None) {
+                view.set_notice(error.to_string());
+            }
+        } else if call.id == "log.highlightRules" {
+            return KeyResult::LogHighlights;
+        } else {
+            view.set_notice("Log follow, text, level and time filters are in the window UI (kwil --gui)".into());
+        }
+        return KeyResult::Changed(true);
     }
     if call.id == "view.logFilters" || call.id.starts_with("view.markdown") || call.id == "view.toggleMarkdown" {
         view.set_notice("Markdown preview and log filters are in the window UI (kwil --gui)".into());
@@ -2501,7 +2522,10 @@ fn draw_area_highlighted(
             + view.line_offset(row);
         let selections =
             view.editor().and_then(|editor| editor.selection_ranges(view.top() + row as u64).ok()).unwrap_or_default();
-        let mut spans = vec![Span::styled(format!("{:>7} ", view.line_number(row)), gutter_style)];
+        let mut spans = vec![Span::styled(
+            format!("{:>7}{}", view.line_number(row), if view.log_marked(view.line_number(row)) { '*' } else { ' ' }),
+            gutter_style,
+        )];
         for cell in cells {
             let selected = selections.iter().any(|range| {
                 range.start < source + cell.bytes.end as u64 && source + (cell.bytes.start as u64) < range.end
@@ -3319,6 +3343,57 @@ mod tests {
             }
         }
         assert!(broken.is_empty(), "palette commands without a TUI host:\n{}", broken.join("\n"));
+    }
+
+    #[test]
+    fn log_commands_require_a_log_document() {
+        for command in kwil_core_commands::COMMANDS.iter().filter(|c| c.id.starts_with("log.")) {
+            let mut view = View::new(None);
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+g", command.id)]).unwrap();
+            key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            assert_eq!(view.notice(), "Open a log file first", "{}", command.id);
+        }
+    }
+
+    #[test]
+    fn log_commands_navigate_marks_and_explain_window_only_actions() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kwil-tui-log-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "INFO first\nERROR second\n").unwrap();
+        let file = kwil_core_workspace::open_for_editing(&path).unwrap();
+        file.build_index(1).unwrap();
+        let mut view = View::new(Some((path.clone(), file)));
+        view.set_rows(3);
+        for command in ["log.toggleMark", "log.nextMark", "log.previousMark", "log.resume", "log.highlightRules"] {
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("ctrl+g", command)]).unwrap();
+            let result = key(
+                &mut view,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            if command == "log.resume" {
+                assert!(view.notice().contains("window UI"));
+            }
+            if command == "log.highlightRules" {
+                assert!(matches!(result, KeyResult::LogHighlights));
+            }
+        }
+        assert!(view.log_marked(1));
+        assert_eq!(view.editor().unwrap().primary_cursor().head, 0);
+        drop(view);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

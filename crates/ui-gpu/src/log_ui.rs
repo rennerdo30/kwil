@@ -102,6 +102,7 @@ struct Version {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FieldId {
+    Query,
     From,
     To,
 }
@@ -116,7 +117,8 @@ enum Target {
     Hit(usize),
     Close,
 }
-const ORDER: [Target; 14] = [
+const ORDER: [Target; 15] = [
+    Target::Field(FieldId::Query),
     Target::Level(0),
     Target::Level(1),
     Target::Level(2),
@@ -146,10 +148,10 @@ impl Edit {
         }
         let old = if self.all { 0 } else { self.text.len() };
         if old.saturating_add(text.len()) > INPUT_BYTES {
-            return Err("Timestamp field is too long (256 UTF-8 bytes maximum)");
+            return Err("Log field is too long (256 UTF-8 bytes maximum)");
         }
         if text.chars().any(char::is_control) {
-            return Err("Timestamp fields accept one line of text");
+            return Err("Log fields accept one line of text");
         }
         if self.all {
             self.text.clear();
@@ -228,6 +230,10 @@ struct Retry {
 }
 
 pub(super) struct Host {
+    follow_watch: Option<kwil_view_model::log_follow::FollowWatch>,
+    follow_document: Option<kwil_view_model::SessionDocumentId>,
+    following: bool,
+    follow_reload: bool,
     session: Option<LogSession>,
     // Never replace/drop a rejected snapshot on UI. Retry this exact owner
     // before acquiring another, including after close or source changes.
@@ -240,6 +246,8 @@ pub(super) struct Host {
     serial: u64,
     input_epoch: u64,
     from: Edit,
+    query: Edit,
+    regex: bool,
     to: Edit,
     levels: u8,
     keep_unknown: bool,
@@ -281,6 +289,10 @@ impl Default for Host {
     fn default() -> Self {
         let filter = Filter::default();
         Self {
+            follow_watch: None,
+            follow_document: None,
+            following: false,
+            follow_reload: false,
             session: None,
             retry: None,
             retirement_failure: None,
@@ -291,6 +303,8 @@ impl Default for Host {
             serial: 0,
             input_epoch: 0,
             from: Edit::default(),
+            query: Edit::default(),
+            regex: false,
             to: Edit::default(),
             levels: filter.levels,
             keep_unknown: true,
@@ -357,6 +371,9 @@ impl Host {
             return Err(SettlementReason::Retirement);
         }
         self.close();
+        if let Some(watch) = &mut self.follow_watch {
+            watch.stop();
+        }
         drop(self.retry.take());
         if let Some(session) = &mut self.session {
             session.settle_until(deadline).map_err(SettlementReason::Worker)?;
@@ -471,6 +488,7 @@ impl Host {
     }
     fn edit(&mut self, field: FieldId) -> &mut Edit {
         match field {
+            FieldId::Query => &mut self.query,
             FieldId::From => &mut self.from,
             FieldId::To => &mut self.to,
         }
@@ -496,7 +514,13 @@ impl Host {
         if from.zip(to).is_some_and(|(a, b)| a > b) {
             return Err("From must be earlier than or equal to To");
         }
-        Ok(Filter { levels: self.levels & all_levels(), from, to, keep_unknown: self.keep_unknown })
+        Ok(Filter {
+            levels: self.levels & all_levels(),
+            from,
+            to,
+            keep_unknown: self.keep_unknown,
+            text: kwil_view_model::log_session::TextQuery::new(&self.query.text, self.regex)?,
+        })
     }
     fn apply(&mut self) {
         if let Some(session) = &self.session {
@@ -520,6 +544,7 @@ impl Host {
         }
     }
     fn clear(&mut self) {
+        self.query = Edit::default();
         self.from = Edit::default();
         self.to = Edit::default();
         self.levels = all_levels();
@@ -793,7 +818,11 @@ impl Host {
             return format!("Filter view · read-only · {}+ rows · indexing… · click/Enter opens original", self.total);
         }
         if self.exact {
-            return format!("Filter view · read-only · {} rows · click/Enter opens original · Esc closes", self.total);
+            return format!(
+                "Filter view · read-only · {} rows · {} · click/Enter opens original · Esc closes",
+                self.total,
+                if self.following { "Following · scroll up to pause" } else { "Follow paused" }
+            );
         }
         "Filter view · read-only · Apply to show matching lines".into()
     }
@@ -804,11 +833,10 @@ impl App {
         if let Some(language) = self.highlighting.as_ref().and_then(|host| host.detected_language(&self.view)) {
             return language == kwil_core_syntax::Language::Log;
         }
-        self.view
-            .editor()
-            .and_then(|editor| editor.document().path())
-            .and_then(|path| kwil_core_syntax::detect(path, &[]))
-            == Some(kwil_core_syntax::Language::Log)
+        self.view.is_log_document()
+            || self.view.editor().is_none()
+                && self.logs.following
+                && self.logs.follow_document == Some(self.view.active_id())
     }
 
     pub(super) fn filter_log_level(&mut self, level: Option<Level>) {
@@ -841,6 +869,7 @@ impl App {
             return;
         }
         self.logs.close();
+        self.logs.following = false;
         self.logs_cancel_input();
         self.logs_repaint();
     }
@@ -852,13 +881,52 @@ impl App {
         }
     }
     pub(super) fn dispatch_logs(&mut self, command: &str) -> bool {
-        if command != "view.logFilters" {
+        if command != "view.logFilters" && !command.starts_with("log.") {
             return false;
         }
         if !self.is_log_document() {
+            let damage = self.view.set_notice("Open a log file first".into());
+            self.apply(damage);
             return true;
         }
-        if self.logs.is_open() {
+        if command == "log.highlightRules" {
+            self.close_logs();
+            self.dispatch_settings("view.settings");
+            if let Some(panel) = &mut self.settings_panel
+                && let Err(error) = panel.open_log_highlights()
+            {
+                self.view.set_notice(error);
+            }
+            return true;
+        }
+        if matches!(command, "log.toggleMark" | "log.nextMark" | "log.previousMark") {
+            let line = self.logs.navigation(Source::capture(&self.view), self.logs.selected);
+            if self.logs.is_open() && line.is_none() {
+                let damage = self.view.set_notice("Wait for filtered log lines before marking or navigating".into());
+                self.apply(damage);
+                return true;
+            }
+            if command != "log.toggleMark" {
+                self.close_logs();
+            }
+            let damage = match self.view.log_mark_command(command, line) {
+                Ok(damage) => damage,
+                Err(error) => self.view.set_notice(error.to_string()),
+            };
+            self.apply(damage);
+            self.logs.body_paint.request();
+            self.logs_repaint();
+            return true;
+        }
+        if command == "log.pause" || command == "log.toggleFollow" && self.logs.following {
+            self.logs.following = false;
+            self.logs.notice = Some("Follow paused · Resume Follow to tail again".into());
+            let damage = self.view.set_notice("Log follow paused".into());
+            self.apply(damage);
+            self.logs_repaint();
+            return true;
+        }
+        if command == "view.logFilters" && self.logs.is_open() {
             self.close_logs();
             return true;
         }
@@ -874,17 +942,89 @@ impl App {
         self.drag = None;
         self.selecting = false;
         self.logs_cancel_input();
-        self.logs.open = true;
-        self.logs.invalidate();
-        self.logs.want = !self.logs.draft;
+        if !self.logs.open {
+            self.logs.open = true;
+            self.logs.invalidate();
+            self.logs.want = !self.logs.draft;
+        }
+        match command {
+            "log.toggleFollow" | "log.resume" => self.resume_log_follow(),
+            "log.filter" => self.logs.focus(Target::Field(FieldId::Query)),
+            "log.goToTime" => {
+                self.logs.keep_unknown = false;
+                self.logs.focus(Target::Field(FieldId::From));
+            }
+            "log.clearFilter" => self.logs.clear(),
+            "log.toggleRegex" => {
+                self.logs.regex = !self.logs.regex;
+                self.logs.apply();
+            }
+            "log.toggleLevel" => {
+                let index = match self.logs.focus {
+                    Target::Level(index @ 1..=6) => index,
+                    _ => 5,
+                };
+                self.logs.toggle_level(index);
+                self.logs.focus(Target::Level(index));
+                self.logs.apply();
+            }
+            _ => {}
+        }
         self.sync_logs();
         self.logs_repaint();
         true
+    }
+
+    fn resume_log_follow(&mut self) {
+        let path = self
+            .view
+            .editor()
+            .and_then(|e| (!e.document().is_dirty()).then(|| e.document().path()).flatten())
+            .map(|p| p.to_path_buf());
+        let Some(path) = path else {
+            self.logs.error = Some("Save log edits before following the file".into());
+            return;
+        };
+        let id = self.view.active_id();
+        let result = if let Some(watch) = &self.logs.follow_watch {
+            if self.logs.follow_document == Some(id) { Ok(()) } else { watch.watch(path) }
+        } else {
+            let proxy = self.proxy.clone();
+            kwil_view_model::log_follow::FollowWatch::start(path, move || {
+                let _ = proxy.send_event(UserEvent::LogReady);
+            })
+            .map(|watch| self.logs.follow_watch = Some(watch))
+        };
+        match result {
+            Ok(()) => {
+                self.logs.follow_document = Some(id);
+                self.logs.following = true;
+                self.logs.follow_reload = true;
+                self.logs.notice = Some("Following · scroll up to pause".into());
+                self.logs.apply();
+            }
+            Err(error) => self.logs.error = Some(format!("Cannot follow log: {error}")),
+        }
     }
     /// No polling: call on identity changes or the backend wake. At most one
     /// rejected snapshot is retained; the same owner is admitted before a new
     /// snapshot is cloned. Older accepted work retires on the backend worker.
     pub(super) fn sync_logs(&mut self) {
+        if self.logs.follow_document != Some(self.view.active_id()) {
+            self.logs.following = false;
+        }
+        if self.logs.following && self.logs.follow_reload && self.view.editor().is_some() {
+            match self.view.reload_log() {
+                Ok(()) => {
+                    self.logs.follow_reload = false;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    self.logs.following = false;
+                    self.logs.error = Some(format!("Follow paused: {error}"));
+                }
+            }
+        }
         if self.logs.open && !self.is_log_document() {
             self.close_logs();
         }
@@ -977,6 +1117,16 @@ impl App {
         }
     }
     pub(super) fn logs_ready(&mut self) {
+        if let Some(watch) = &self.logs.follow_watch {
+            if watch.take_changed() {
+                self.logs.follow_reload = true;
+            }
+            if let Some(error) = watch.take_error() {
+                self.logs.following = false;
+                self.logs.error = Some(format!("Log watcher: {error}"));
+                self.logs.paint.request();
+            }
+        }
         self.sync_logs(); // sync identity BEFORE consuming a completion.
         // A rejected snapshot is retried only on the backend wake, never by
         // frames, hover, wheel or a timer. Keep it even if the card closed.
@@ -1007,6 +1157,13 @@ impl App {
         let reports = self.logs.session.as_ref().map(LogSession::drain_viewport).unwrap_or_default();
         for report in reports {
             self.logs.receive_viewport(report);
+        }
+        if self.logs.following && self.logs.exact && !self.logs.draft {
+            let top = self.logs.total.saturating_sub(self.logs.visible as u64);
+            if self.logs.page_start != top {
+                self.logs.move_viewport(top, self.logs.horizontal);
+                self.sync_logs();
+            }
         }
         if self.logs.paint.pending() {
             self.request_frame();
@@ -1077,7 +1234,40 @@ impl App {
             return false;
         }
         self.sync_logs();
+        if self.logs.focus == Target::Results
+            && matches!(event.logical_key, Key::Named(NamedKey::ArrowUp | NamedKey::PageUp | NamedKey::Home))
+        {
+            self.logs.following = false;
+        }
         let ctrl = self.mods.control_key() || self.mods.super_key();
+        // Keep the palette and configured log shortcuts reachable while the
+        // read-only projection owns the body. All other editor input remains
+        // fenced by this host; query editing uses its existing field path.
+        if (ctrl || self.mods.alt_key() || !matches!(event.logical_key, Key::Character(_)))
+            && let Some(chord) = input::chord(&event.logical_key, self.mods)
+        {
+            if self.keys.is_none() {
+                self.keys =
+                    kwil_core_commands::keymap::KeymapEngine::new(self.settings.keymap, &self.settings.bindings).ok();
+            }
+            if let Some(keys) = &mut self.keys {
+                keys.set_context(kwil_core_commands::Context::Editor);
+                use kwil_core_commands::vim::VimResult;
+                match keys.feed(chord) {
+                    VimResult::Pending => return true,
+                    VimResult::Command(call) if call.id.starts_with("log.") => {
+                        self.dispatch_logs(call.id);
+                        return true;
+                    }
+                    VimResult::Command(call) if call.id == "view.commandPalette" => {
+                        self.dispatch_palette(call.id);
+                        return true;
+                    }
+                    VimResult::Unbound if keys.suppresses_fallback() => return true,
+                    _ => {}
+                }
+            }
+        }
         if event.repeat && matches!(event.logical_key, Key::Named(NamedKey::Escape | NamedKey::Enter)) {
             return true;
         }
@@ -1288,6 +1478,9 @@ impl App {
             return true;
         }
         if self.logs.body.contains(self.pointer) || self.logs.area.is_some_and(|r| r.contains(self.pointer)) {
+            if up {
+                self.logs.following = false;
+            }
             let top = if up { self.logs.page_start.saturating_sub(3) } else { self.logs.page_start.saturating_add(3) };
             self.logs.move_viewport(top, self.logs.horizontal);
             self.sync_logs();
@@ -1302,6 +1495,9 @@ impl App {
     pub(super) fn logs_scroll_to(&mut self, top: u64, horizontal: u64) -> bool {
         if !self.logs.open || self.logs_blocked() {
             return false;
+        }
+        if top < self.logs.total.saturating_sub(self.logs.visible as u64) {
+            self.logs.following = false;
         }
         self.logs.move_viewport(top, horizontal);
         self.sync_logs();
@@ -1329,7 +1525,7 @@ pub(super) fn layout(source: kwil_view_model::TabArea, m: &Metrics, open: bool) 
     } else {
         3
     };
-    let height = (rows * m.dip(32.0) + (rows + 2) * m.dip(4.0) + m.dip(20.0)).min(source.height);
+    let height = ((rows + 1) * m.dip(32.0) + (rows + 3) * m.dip(4.0) + m.dip(20.0)).min(source.height);
     Layout {
         bar: Some(Rect { x: source.x, y: source.y, w: source.width, h: height }),
         body: kwil_view_model::TabArea { y: source.y.saturating_add(height), height: source.height - height, ..source },
@@ -1476,6 +1672,7 @@ pub(super) fn draw(
         desktop::label(pixels, size.0, font, Rect { x, y: fields_y, w: label_w, h: s.control }, label, c.muted);
         let rect = Rect { x: x + label_w, y: fields_y, w: field_w.saturating_sub(label_w), h: s.control };
         let edit = match field {
+            FieldId::Query => &host.query,
             FieldId::From => &host.from,
             FieldId::To => &host.to,
         };
@@ -1503,7 +1700,40 @@ pub(super) fn draw(
         focus_ring(pixels, size.0, rect, focused && edit.all, &c, &s);
         host.geometry.push(rect, Target::Field(field));
     }
-    let status = clipped_row(inner, inner.y + rows * (s.control + s.gap), s.text);
+    let query_y = inner.y + rows * (s.control + s.gap);
+    let label_w = m.dip(120.0).min(inner.w);
+    desktop::label(
+        pixels,
+        size.0,
+        font,
+        Rect { x: inner.x, y: query_y, w: label_w, h: s.control },
+        if host.regex { "Filter · regex" } else { "Filter · literal" },
+        c.muted,
+    );
+    let rect = Rect { x: inner.x + label_w, y: query_y, w: inner.w.saturating_sub(label_w), h: s.control };
+    let focused = host.focus == Target::Field(FieldId::Query);
+    let caret = desktop::text_field(
+        pixels,
+        size.0,
+        font,
+        rect,
+        Field {
+            text: &host.query.text,
+            cursor: host.query.cursor,
+            placeholder: "Text · AND / OR / NOT · Enter applies",
+            focused,
+            hovered: host.hover == Some(Target::Field(FieldId::Query)),
+            search: true,
+            clear: false,
+        },
+        &c,
+        &s,
+    );
+    if focused {
+        host.caret = caret;
+    }
+    host.geometry.push(rect, Target::Field(FieldId::Query));
+    let status = clipped_row(inner, query_y + s.control + s.gap, s.text);
     desktop::label(pixels, size.0, font, status, &host.status(), if host.error.is_some() { c.error } else { c.muted });
     Some(r)
 }
@@ -1519,6 +1749,7 @@ pub(super) fn draw_body(
     stride: usize,
     font: &mut Font,
     current: Option<Source>,
+    view: &View,
 ) -> bool {
     if !host.open {
         return false;
@@ -1539,7 +1770,12 @@ pub(super) fn draw_body(
             if host.focus == Target::Results && index == host.selected { chrome::mix(bg(), fg(), 0x12) } else { bg() };
         fill(pixels, stride, Rect { x: 0, y, w: gutter, h: font.ch }, gutter_bg());
         fill(pixels, stride, Rect { x: gutter, y, w: stride - gutter, h: font.ch }, row_bg);
-        let number = format!("{:>width$} ", row.line.saturating_add(1), width = gutter_columns.saturating_sub(1));
+        let number = format!(
+            "{:>width$}{}",
+            row.line.saturating_add(1),
+            if view.log_marked(row.line + 1) { '*' } else { ' ' },
+            width = gutter_columns.saturating_sub(1)
+        );
         draw_text(pixels, stride, font, 0, y, number.as_bytes(), gutter_columns, gutter_fg(), gutter_bg());
         draw_text(pixels, stride, font, gutter, y, &row.bytes, columns, fg(), row_bg);
         if row.bytes.iter().take(columns).all(|byte| (32..127).contains(byte)) {
@@ -1677,6 +1913,65 @@ mod tests {
     use kwil_view_model::log_session::Metadata;
 
     const SOURCE: Source = Source { document: 5, revision: 7, epoch: 11 };
+
+    #[test]
+    fn log_commands_require_a_log_document() {
+        for command in kwil_core_commands::COMMANDS.iter().filter(|c| c.id.starts_with("log.")) {
+            let (mut app, _events) = crate::search_ui::host_dispatch_tests::host("plain text");
+            assert!(app.dispatch_logs(command.id), "{} needs a host", command.id);
+            assert_eq!(app.view.notice(), "Open a log file first", "{}", command.id);
+        }
+    }
+
+    #[test]
+    fn log_commands_edit_the_existing_projection_and_marks() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kwil-log-commands-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"INFO first\nERROR second\nWARN third\n").unwrap();
+        let file = kwil_core_text::TextFile::open(&path).unwrap();
+        file.build_index(1).unwrap();
+        let (mut app, events) = crate::search_ui::host_dispatch_tests::host("");
+        app.view = Workspace::new(View::new(Some((path.clone(), file)))).unwrap();
+        app.logs.admit_projection_disk(1 << 20);
+        assert!(app.dispatch_logs("log.filter"));
+        assert_eq!(app.logs.field(), Some(FieldId::Query));
+        app.logs.insert("second");
+        app.logs.apply();
+        app.sync_logs();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.logs.exact {
+            events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            app.logs_ready();
+        }
+        assert_eq!(app.logs.total, 1);
+        assert_eq!(app.logs.rows[0].line, 1);
+        app.dispatch_logs("log.toggleMark");
+        assert!(app.view.log_marked(2));
+        app.dispatch_logs("log.clearFilter");
+        assert_eq!(app.logs.filter, Filter::default());
+        app.dispatch_logs("log.toggleRegex");
+        assert!(app.logs.regex);
+        app.dispatch_logs("log.toggleLevel");
+        assert_eq!(app.logs.focus, Target::Level(5));
+        assert_eq!(app.logs.levels & Level::Error.bit(), 0);
+        app.dispatch_logs("log.goToTime");
+        assert_eq!(app.logs.field(), Some(FieldId::From));
+        assert!(!app.logs.keep_unknown);
+        app.close_logs();
+        app.dispatch_logs("log.nextMark");
+        assert!(!app.logs.is_open());
+        assert_eq!(
+            app.view.editor().unwrap().byte_position(app.view.editor().unwrap().primary_cursor().head).unwrap().0,
+            1
+        );
+        app.logs.settle_until(deadline).unwrap();
+        drop(app);
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn row(bytes: &[u8]) -> ViewportRow {
         ViewportRow {

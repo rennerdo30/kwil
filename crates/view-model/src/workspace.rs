@@ -1291,6 +1291,49 @@ impl Workspace {
         Ok(id)
     }
 
+    /// Native watch invalidation. Reuse checked open and its existing worker
+    /// disposal lane; dirty editors and all in-flight operations are preserved.
+    pub fn reload_log(&mut self) -> io::Result<()> {
+        let id = self.active_id();
+        if self.document_busy(id) || self.wrap_input_blocked() || self.files.queue.len() > 250 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Log reload waits for the current operation"));
+        }
+        let view = self.views.get(&id).ok_or_else(|| io::Error::other("Log tab closed"))?;
+        let editor = view.editor().ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "Log file is opening"))?;
+        if editor.document().is_dirty() {
+            return Err(io::Error::other("Save log edits before following the file"));
+        }
+        let path = editor
+            .document()
+            .path()
+            .ok_or_else(|| io::Error::other("Save the log file before following it"))?
+            .to_path_buf();
+        // Restore the exact editor if admission refuses, before any transfer.
+        let editor = self.views.get_mut(&id).unwrap().editor.take().unwrap();
+        let request = match self.checked_open_request(id, 0, path) {
+            Ok(request) => request,
+            Err(error) => {
+                self.views.get_mut(&id).unwrap().editor = Some(editor);
+                return Err(error);
+            }
+        };
+        self.binary.retiring.push((id, Box::new(editor)));
+        let tab = self.session.tab_mut(id).unwrap();
+        tab.revision = 0;
+        tab.saved_revision = 0;
+        self.input_epoch = self.input_epoch.wrapping_add(1);
+        // The old file must retire, never feed the new checked open.
+        if let DocumentRequest::OpenChecked { ticket, path, file } = request {
+            if let Some(file) = file {
+                self.files.queue.push_back(DocumentRequest::RetireSource { file });
+            }
+            self.files.queue.push_back(DocumentRequest::OpenChecked { ticket, path, file: None });
+        }
+        self.wrap.path_changed();
+        self.pump_files();
+        Ok(())
+    }
+
     /// App-owned CLI/IPC parsing feeds already validated native paths here.
     pub fn open_files(&mut self, request: kwil_core_workspace::instance::OpenFiles) -> io::Result<()> {
         if request.files.len() > kwil_core_workspace::instance::MAX_OPEN_FILES {
@@ -2982,6 +3025,44 @@ mod tests {
         assert!(workspace.views[&recovered].pending_goto.is_none());
     }
     use crate::CommandArgs;
+
+    #[test]
+    fn log_reload_reopens_current_path_and_preserves_dirty_edits() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kwil-log-reload-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "INFO initial\n").unwrap();
+        let file = kwil_core_text::TextFile::open(&path).unwrap();
+        file.build_index(1).unwrap();
+        let mut workspace = Workspace::new(View::new(Some((path.clone(), file)))).unwrap();
+        let id = workspace.active_id();
+        for bytes in [b"INFO initial\nERROR appended\n".as_slice(), b"WARN truncated\n", b"INFO rotated\n"] {
+            std::fs::write(&path, bytes).unwrap();
+            workspace.reload_log().unwrap();
+            assert!(workspace.editor().is_none());
+            let request = workspace.files.queue.pop_back().unwrap();
+            let DocumentRequest::OpenChecked { ticket, file, .. } = request else { panic!("checked reopen") };
+            assert!(file.is_none(), "must not reuse the invalidated file");
+            let file = kwil_core_text::TextFile::open(&path).unwrap();
+            let document = crate::Document::from_file(path.clone(), file).unwrap();
+            workspace
+                .test_document_result(DocumentResult::CheckedOpened { ticket, result: Ok(Some(Box::new(document))) });
+            assert_eq!(workspace.active_id(), id);
+            let mut current = Vec::new();
+            workspace.editor().unwrap().document().snapshot().write_to(&mut current).unwrap();
+            assert_eq!(current, bytes);
+        }
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("keep me".into()), ..Default::default() }, 1)
+            .unwrap();
+        assert!(workspace.reload_log().unwrap_err().to_string().contains("Save log edits"));
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        drop(workspace);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn file_commands_create_cycle_close_reopen_and_preserve_unsaved_tabs() {

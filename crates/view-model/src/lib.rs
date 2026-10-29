@@ -95,6 +95,7 @@ pub struct View {
     line_byte_limit: usize,
     // Worker-decoded read-only first block; never interpreted as edit bytes.
     preview: Option<Vec<u8>>,
+    log_marks: std::collections::BTreeSet<u64>,
 }
 
 impl View {
@@ -120,6 +121,7 @@ impl View {
             first_byte_column: 0,
             line_byte_limit: 16 << 10,
             preview: None,
+            log_marks: Default::default(),
         };
         if view.file.as_ref().is_some_and(|file| file.index().is_some()) {
             view.index_ready();
@@ -140,6 +142,54 @@ impl View {
 
     pub fn file(&self) -> Option<&TextFile> {
         self.file.as_ref()
+    }
+
+    pub fn is_log_document(&self) -> bool {
+        self.path.as_deref().and_then(|path| kwil_core_syntax::detect(path, &[]))
+            == Some(kwil_core_syntax::Language::Log)
+    }
+
+    pub fn log_marked(&self, line: u64) -> bool {
+        self.log_marks.contains(&line)
+    }
+
+    /// Marks belong to this tab, in one-based original line coordinates.
+    pub fn log_mark_command(&mut self, command: &str, line: Option<u64>) -> std::io::Result<Damage> {
+        let editor = self.editor.as_ref().ok_or_else(|| std::io::Error::other("Log file is still opening"))?;
+        let current = match line {
+            Some(line) => line,
+            None => editor.byte_position(editor.primary_cursor().head)?.0 + 1,
+        };
+        if command == "log.toggleMark" {
+            let added = if self.log_marks.remove(&current) { false } else { self.log_marks.insert(current) };
+            let mut damage = self.set_notice(format!("{} line {current}", if added { "Marked" } else { "Unmarked" }));
+            if current > self.top && current - self.top <= self.rows as u64 {
+                damage.rows.push((current - self.top - 1) as usize);
+            }
+            return Ok(damage);
+        }
+        let count = editor.document().snapshot().line_count();
+        self.log_marks.retain(|&line| line <= count);
+        let next = if command == "log.nextMark" {
+            self.log_marks
+                .range((std::ops::Bound::Excluded(current), std::ops::Bound::Unbounded))
+                .next()
+                .or_else(|| self.log_marks.first())
+        } else {
+            self.log_marks.range(..current).next_back().or_else(|| self.log_marks.last())
+        }
+        .copied();
+        match next {
+            Some(line) => {
+                let result = self.execute(
+                    "navigation.goToLine",
+                    &CommandArgs { line: Some(line), column: Some(1), ..Default::default() },
+                    1,
+                )?;
+                Ok(self.refresh_after_edit(result.damage))
+            }
+            None => Ok(self.set_notice("No marked log lines".into())),
+        }
     }
 
     pub fn top(&self) -> u64 {
@@ -670,6 +720,7 @@ mod cursor_cache_tests {
     }
 }
 
+pub mod log_follow;
 pub mod log_session;
 
 pub mod compare_source;

@@ -464,6 +464,17 @@ impl SettingsSession {
     pub fn is_open(&self) -> bool {
         self.open
     }
+    pub fn open_log_highlights(&mut self) -> Result<(), String> {
+        self.open();
+        if self.panel_has_draft() || self.editing.is_some() {
+            return Err("Finish the current settings edit before opening log highlights".into());
+        }
+        self.set_category(None);
+        let menu = self.menu.as_mut().ok_or("Settings are starting; try again shortly")?;
+        menu.search("log.highlight_rules");
+        self.searching = false;
+        self.activate_selected()
+    }
     pub fn rows(&self) -> Vec<SettingsRow> {
         self.menu.as_ref().map_or_else(Vec::new, |m| m.rows().collect())
     }
@@ -1096,6 +1107,14 @@ mod tests {
     fn saved(session: &mut SettingsSession, request: &(u64, Option<String>, String)) {
         session.events.push(SettingsWorkerEvent::Saved { request: request.0, source: request.2.clone() }, &|| {});
         session.worker_ready();
+    }
+
+    #[test]
+    fn log_highlights_command_opens_editable_rules_without_saving() {
+        let (mut session, requests) = fixture(None);
+        session.open_log_highlights().unwrap();
+        assert_eq!(session.panel(), Some(SettingsPanel::StringMap { id: "log.highlight_rules" }));
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     #[test]

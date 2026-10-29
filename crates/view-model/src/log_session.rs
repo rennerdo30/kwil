@@ -58,6 +58,56 @@ pub struct Filter {
     /// Known fields must still pass their constraints. With no time bounds,
     /// a missing timestamp does not itself exclude a row.
     pub keep_unknown: bool,
+    /// Text constraint for the viewport projection. Fixed-size command input;
+    /// compilation and matching remain on the log worker.
+    pub text: TextQuery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextQuery {
+    bytes: [u8; 256],
+    len: usize,
+    regex: bool,
+}
+impl Default for TextQuery {
+    fn default() -> Self {
+        Self { bytes: [0; 256], len: 0, regex: false }
+    }
+}
+impl TextQuery {
+    pub fn new(text: &str, regex: bool) -> Result<Self, &'static str> {
+        if text.len() > 256 {
+            return Err("Log filter is too long (256 UTF-8 bytes maximum)");
+        }
+        let mut query = Self { len: text.len(), regex, ..Self::default() };
+        query.bytes[..text.len()].copy_from_slice(text.as_bytes());
+        Ok(query)
+    }
+    fn patterns(self) -> io::Result<Vec<Vec<(bool, kwil_core_search::Pattern)>>> {
+        use kwil_core_search::{Options, Pattern};
+        if self.len == 0 {
+            return Ok(Vec::new());
+        }
+        // Explicit uppercase operators: AND binds more tightly than OR; NOT
+        // negates a term. Ordinary spaces and lowercase words stay literal.
+        let text = std::str::from_utf8(&self.bytes[..self.len]).map_err(io::Error::other)?;
+        text.split(" OR ")
+            .map(|group| {
+                group
+                    .split(" AND ")
+                    .map(|term| {
+                        let (negated, term) = term.strip_prefix("NOT ").map_or((false, term), |term| (true, term));
+                        let pattern = if self.regex {
+                            Pattern::regex(term, Options::default(), 1024 * 1024)?
+                        } else {
+                            Pattern::literal(term.as_bytes(), Options::default())?
+                        };
+                        Ok((negated, pattern))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
 }
 
 impl Default for Filter {
@@ -67,6 +117,7 @@ impl Default for Filter {
             from: None,
             to: None,
             keep_unknown: true,
+            text: TextQuery::default(),
         }
     }
 }
@@ -484,6 +535,9 @@ impl LogSession {
         filter: Filter,
         page_start: u64,
     ) -> Result<u64, SubmitError> {
+        if filter.text.len != 0 {
+            return Err(SubmitError { snapshot, reason: "Text filters use the log viewport API" });
+        }
         self.submit_mode(document, revision, epoch, snapshot, filter, page_start, None, false)
     }
 
@@ -1108,6 +1162,7 @@ struct ProjectionIndex {
     last: Option<u8>,
     exact: bool,
     max_line_bytes: u64,
+    patterns: Vec<Vec<(bool, kwil_core_search::Pattern)>>,
     #[cfg(test)]
     scanned_bytes: u64,
 }
@@ -1128,6 +1183,7 @@ impl ProjectionIndex {
             last: None,
             exact: false,
             max_line_bytes: 0,
+            patterns: request.filter.text.patterns()?,
             #[cfg(test)]
             scanned_bytes: 0,
         })
@@ -1146,7 +1202,46 @@ impl ProjectionIndex {
         } else {
             &self.prefix
         };
-        if self.filter.matches(&logs::metadata(prefix)) {
+        let mut matches = self.filter.matches(&logs::metadata(prefix));
+        if matches && !self.patterns.is_empty() {
+            // Do not silently miss regex matches beyond the search engine's
+            // maximum match window. Literal searches have no line-size limit.
+            if self.filter.text.regex && end - self.start > 1024 * 1024 {
+                return Err(invalid(
+                    "Regex log filtering supports lines up to 1 MiB; use a literal filter for longer lines",
+                ));
+            }
+            let line = self.snapshot.slice(self.start..end)?;
+            matches = false;
+            for group in &self.patterns {
+                let mut all = true;
+                for (negated, pattern) in group {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let mut found = false;
+                    kwil_core_search::search(
+                        &line,
+                        pattern,
+                        0..line.len(),
+                        kwil_core_search::SearchMode::Hits,
+                        &cancel,
+                        |_| {
+                            found = true;
+                            cancel.store(true, Ordering::Relaxed);
+                        },
+                        |_| {},
+                    )?;
+                    if found == *negated {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    matches = true;
+                    break;
+                }
+            }
+        }
+        if matches {
             self.spool.append(self.line, self.start, end)?;
             self.max_line_bytes = self.max_line_bytes.max(end - self.start);
         }
@@ -1482,6 +1577,32 @@ fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_projection_filters_original_lines_and_rejects_bad_regex() {
+        let source = snapshot(b"INFO a.b\nERROR axb\nWARN a.b\n");
+        for (text, regex, expected) in [
+            ("a.b", false, vec![0, 2]),
+            ("a.b", true, vec![0, 1, 2]),
+            ("^WARN", true, vec![2]),
+            ("a.b AND NOT INFO", false, vec![2]),
+            ("^INFO OR ^WARN", true, vec![0, 2]),
+        ] {
+            let filter = Filter { text: TextQuery::new(text, regex).unwrap(), ..Filter::default() };
+            let request = request(source.clone(), filter, 0);
+            let mut index = ProjectionIndex::new(&request, 1 << 20).unwrap();
+            let page = index
+                .query(Viewport { top: 0, rows: 10, horizontal: 0, row_bytes: 1024 }, &|| false, |_| {})
+                .unwrap()
+                .unwrap();
+            assert!(page.exact);
+            assert_eq!(page.rows.iter().map(|row| row.line).collect::<Vec<_>>(), expected);
+            assert_eq!(page.total, expected.len() as u64);
+            index.spool.retire().unwrap();
+        }
+        let filter = Filter { text: TextQuery::new("[", true).unwrap(), ..Filter::default() };
+        assert!(ProjectionIndex::new(&request(source, filter, 0), 1 << 20).is_err());
+    }
     use kwil_core_syntax::logs::parse_timestamp;
     use kwil_core_text::Buffer;
     use std::time::{Duration, Instant};
@@ -1502,7 +1623,13 @@ mod tests {
         let source = snapshot(bytes);
         let request = request(
             source.clone(),
-            Filter { levels: Level::Error.bit(), from: Some(time), to: Some(time), keep_unknown: false },
+            Filter {
+                levels: Level::Error.bit(),
+                from: Some(time),
+                to: Some(time),
+                keep_unknown: false,
+                ..Filter::default()
+            },
             0,
         );
         let mut index = ProjectionIndex::new(&request, 1 << 20).unwrap();
@@ -1791,6 +1918,7 @@ mod tests {
             from: Some(Timestamp(10)),
             to: Some(Timestamp(20)),
             keep_unknown: true,
+            ..Filter::default()
         };
         let known = |level, timestamp| Metadata { level, timestamp };
         assert!(filter.matches(&known(None, None)));

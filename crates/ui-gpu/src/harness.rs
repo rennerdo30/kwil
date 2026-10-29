@@ -61,6 +61,13 @@ pub(crate) enum Step {
     LogsOpen,
     LogsCheck,
     LogsClose,
+    LogCommandsOpen,
+    LogFollowStart,
+    LogFollowAppend,
+    LogFollowCheck,
+    LogFollowPause,
+    LogFollowPausedCheck,
+    LogFollowResumeCheck,
     FolderOpen,
     FolderCheck,
     FolderSelect,
@@ -399,7 +406,23 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::BinaryColdCheck),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
+        let log_commands = [
+            (1800, Step::DismissSetup),
+            (500, Step::LogCommandsOpen),
+            (400, Step::UsabilityCapture("log-text-filter.bmp")),
+            (100, Step::LogFollowStart),
+            (600, Step::LogFollowAppend),
+            (700, Step::LogFollowCheck),
+            (100, Step::UsabilityCapture("log-follow.bmp")),
+            (100, Step::LogFollowPause),
+            (400, Step::LogFollowPausedCheck),
+            (700, Step::LogFollowResumeCheck),
+            (100, Step::UsabilityCapture("log-resumed.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_LOG_COMMANDS_PROBE").is_some() {
+            log_commands.as_slice()
+        } else if std::env::var_os("KWIL_BINARY_COLD_START").is_some() {
             binary_cold.as_slice()
         } else if std::env::var_os("KWIL_BINARY_OFFER_PROBE").is_some() {
             binary.as_slice()
@@ -1112,6 +1135,51 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                     "PASS: language choice/reset; physical gzip hex; clean return to exact decoded text",
                 )
                 .unwrap();
+            }
+        }
+        Step::LogCommandsOpen => {
+            use super::{HostKey, Key, NamedKey};
+            assert!(app.dispatch_logs("log.filter"));
+            app.key_after_settings(
+                Some(el),
+                &HostKey { logical_key: Key::Character("ERROR".into()), text: Some("ERROR"), repeat: false },
+            );
+            app.key_after_settings(
+                Some(el),
+                &HostKey { logical_key: Key::Named(NamedKey::Enter), text: None, repeat: false },
+            );
+        }
+        Step::LogFollowStart => {
+            assert_eq!(app.logs.viewport_extent().0, 80);
+            assert!(app.dispatch_logs("log.resume"));
+        }
+        Step::LogFollowAppend | Step::LogFollowPause => {
+            if matches!(step, Step::LogFollowPause) {
+                assert!(app.dispatch_logs("log.pause"));
+            }
+            let path = app.view.editor().unwrap().document().path().unwrap();
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            use std::io::Write;
+            file.write_all(if matches!(step, Step::LogFollowPause) {
+                b"ERROR paused append\n"
+            } else {
+                b"ERROR followed append\n"
+            })
+            .unwrap();
+        }
+        Step::LogFollowCheck => {
+            assert_eq!(app.logs.viewport_extent().0, 81);
+            assert!(app.logs.viewport_position().0 > 0, "follow reveals the matching tail");
+            assert!(app.dispatch_logs("log.toggleMark"));
+        }
+        Step::LogFollowPausedCheck => {
+            assert_eq!(app.logs.viewport_extent().0, 81, "pause preserves the displayed page");
+            assert!(app.dispatch_logs("log.resume"));
+        }
+        Step::LogFollowResumeCheck => {
+            assert_eq!(app.logs.viewport_extent().0, 82);
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join("log-commands-result.txt"), "PASS: real palette filter input, 80 matching original lines; native append follows to 81; pause holds 81; resume catches up to 82; marked filtered source line").unwrap();
             }
         }
         Step::LogsOpen => {
