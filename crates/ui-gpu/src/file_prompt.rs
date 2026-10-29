@@ -283,6 +283,8 @@ mod tests {
         let mut bytes = Vec::new();
         workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
         assert_eq!(bytes, b"one\r\ntwo\r\n");
+        workspace.checkpoint_session();
+        lane.through(&mut workspace, kwil_view_model::workspace_document::ResultKind::Persisted);
         workspace.file_command("file.setEncoding").unwrap();
         workspace.file_prompt_mut().unwrap().text = "2".into();
         submit(&mut workspace);
