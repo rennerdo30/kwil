@@ -1065,6 +1065,21 @@ impl DocumentWorker {
                         journal_can_run(&request, &deferred, deferred.len(), storage.as_ref())
                     };
                     if !from_deferred && !can_run {
+                        if let DocumentRequest::FileAction { key, action, .. } = &request {
+                            let document = DocumentId(key.document_id);
+                            eprintln!(
+                                "KW-76 deferred {action:?}: older={} transport={} journal={:?}",
+                                deferred.len(),
+                                storage.as_ref().is_some_and(|s| s.transports.contains_key(&document)),
+                                storage.as_ref().and_then(|s| s.journals.get(&document)).map(|j| (
+                                    j.ready,
+                                    j.failed,
+                                    j.revision,
+                                    j.sequence,
+                                    j.generation
+                                )),
+                            );
+                        }
                         debug_assert!(deferred.len() < DEFERRED_REQUEST_LIMIT);
                         deferred.push_back(request);
                         complete(DocumentResult::CapacityAvailable);
@@ -1327,6 +1342,10 @@ impl DocumentWorker {
                             complete(DocumentResult::FolderReady(result));
                         }
                         DocumentRequest::FileAction { key, operation, mut editor, action, journal } => {
+                            eprintln!(
+                                "KW-76 worker file action {action:?} revision={} journal={journal}",
+                                key.revision
+                            );
                             let document = DocumentId(key.document_id);
                             let mut reseed = false;
                             let result = (|| {
@@ -1345,9 +1364,12 @@ impl DocumentWorker {
                                             .ok_or_else(|| io::Error::other("Open a file from disk first"))?
                                             .to_path_buf();
                                         let file = kwil_core_workspace::open_for_editing(&path)?;
+                                        eprintln!("KW-76 reload source opened");
                                         let prepared =
                                             state.encoding.open(path, file, encoding, &cancel, |_| Ok(()))?;
+                                        eprintln!("KW-76 reload decoded; finishing journal");
                                         finish_journal(state, document, journal)?;
+                                        eprintln!("KW-76 reload journal finished");
                                         reseed = true;
                                         editor.install_raw_reopen(prepared);
                                     }
@@ -1394,6 +1416,7 @@ impl DocumentWorker {
                                     .transports
                                     .insert(document, TransportSeed::document(editor.document()));
                             }
+                            eprintln!("KW-76 file action result: {result:?}");
                             complete(DocumentResult::Replaced { key, operation, editor, result });
                         }
                         DocumentRequest::Replace { document, operation, mut editor, recipe } => {

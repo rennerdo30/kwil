@@ -480,8 +480,10 @@ mod external_change {
     #[test]
     fn reload_from_disk_after_an_external_change() {
         let (mut workspace, lane, path, id) = conflicted("kwil-conflict-reload");
+        eprintln!("KW-76 before submit: {}", workspace.reload_diagnostics());
         workspace.file_prompt_mut().unwrap().text = "2".into();
         submit(&mut workspace);
+        eprintln!("KW-76 after submit: {}", workspace.reload_diagnostics());
         // Reload may wait in the pending slot first; wait for its result.
         // Notices can be replaced by later ones; wait for the reloaded content.
         lane.until(&mut workspace, |w| {
