@@ -596,7 +596,9 @@ impl SettingsDocument {
                     .find(|(k, _)| normalize_file_type_pattern(k).ok().as_ref() == Some(&extension))
                     .map(|(k, _)| k.to_owned())
             })
-            .unwrap_or(format!("*.{extension}"));
+            .unwrap_or_else(|| {
+                if normalize_extension(&extension).is_ok() { format!("*.{extension}") } else { extension.clone() }
+            });
         self.transaction(|doc| set_leaf(doc.as_item_mut(), &["file_types", &key], language.map(Value::from)))
     }
     /// Dynamic formatter fields use the same schema validation as Settings.

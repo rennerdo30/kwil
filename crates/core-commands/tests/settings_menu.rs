@@ -23,8 +23,10 @@ fn file_type_globs_survive_settings_parse_edit_and_round_trip() {
     assert_eq!(document.file_types()["**/special/*.rs"], "python");
     assert_eq!(document.file_types()["*.test.rs"], "plaintext");
     document.map_extension("**/special/*.rs", Some("ruby")).unwrap();
+    document.map_extension("**/generated/*.rs", Some("plaintext")).unwrap();
     let restored = SettingsDocument::parse(document.source()).unwrap();
     assert_eq!(restored.file_types()["**/special/*.rs"], "ruby");
+    assert_eq!(restored.file_types()["**/generated/*.rs"], "plaintext");
     assert!(restored.source().contains("# keep"));
     assert_eq!(restored.language_for_extension(".RS"), Some("rust"));
     assert!(normalize_extension("**/special/*.rs").is_err(), "OS registrations still require extensions");
