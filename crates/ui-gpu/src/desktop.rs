@@ -363,14 +363,18 @@ pub(super) fn text_field(
         font.draw(buf, stride, clip, left, baseline, &text, c.faint);
         return field.focused.then(|| caret(buf, stride, left, rect, c, s));
     }
+    if !field.focused {
+        // An inactive field has no caret to explain horizontal scrolling.
+        // Preserve its identifying suffix and mark any omitted prefix.
+        let text = font.fit_tail(field.text, clip.w);
+        font.draw(buf, stride, clip, left, baseline, &text, c.fg);
+        return None;
+    }
     // Cells are bounded by the widest Latin advance, so the window fits in
     // pixels too; wide CJK cells (2 columns) are narrower than two `M`s.
     let columns = (clip.w / font.width("M").max(1)).max(1);
     let window = kwil_view_model::palette_session::text_window(field.text, field.cursor, columns);
     font.draw(buf, stride, clip, left, baseline, &window.text, c.fg);
-    if !field.focused {
-        return None;
-    }
     let cells = kwil_view_model::grid::cells(window.text.as_bytes(), window.cursor, 4);
     let end = cells.last().map_or(0, |cell| cell.bytes.end).min(window.text.len());
     let offset = font.measure(&window.text[..end], clip.w);
@@ -390,6 +394,13 @@ pub(super) enum Style {
     Secondary,
     Subtle,
     Danger,
+}
+
+/// Keep the full control height for accents and descenders. Inner padding
+/// controls the label's horizontal fit, not its vertical ink bounds.
+pub(super) fn button_clip(rect: Rect, padding: usize) -> Rect {
+    let dx = padding.min(rect.w / 4);
+    Rect { x: rect.x + dx, w: rect.w - 2 * dx, ..rect }
 }
 
 pub(super) fn button_width(font: &mut font::UiFont, text: &str, s: &Sizes) -> usize {
@@ -423,7 +434,7 @@ pub(super) fn button(
         None if style == Style::Subtle && !hovered => {}
         None => chrome::round_rect(buf, stride, rect, s.radius, bg),
     }
-    let clip = inset(rect, s.inner.min(rect.w / 4));
+    let clip = button_clip(rect, s.inner);
     let fitted = font.fit(text, clip.w);
     let width = font.measure(&fitted, clip.w);
     let baseline = font.baseline(rect.y, rect.h);
@@ -580,7 +591,7 @@ pub(super) fn segmented(
             }
             c.fg
         };
-        let clip = inset(*rect, s.inner / 2);
+        let clip = button_clip(*rect, s.inner / 2);
         let text = font.fit(option, clip.w);
         let width = font.measure(&text, clip.w);
         let baseline = font.baseline(rect.y, rect.h);
@@ -803,6 +814,55 @@ mod tests {
 
     fn colors() -> Colors {
         Colors::new(&theme_ui::chrome())
+    }
+
+    #[test]
+    fn polish_unfocused_path_shows_a_leading_ellipsis_and_the_complete_tail() {
+        let Some(mut font) = font::UiFont::load(15.0) else { return };
+        let s = Sizes::new(&Metrics::new(1.0));
+        let c = colors();
+        let expected_text = "…folder";
+        let width = font.width(expected_text) + 2 * s.inner;
+        let rect = Rect { x: 0, y: 0, w: width, h: s.control };
+        let path = format!("{}folder", "W".repeat(300));
+        let mut actual = vec![c.surface; width * rect.h];
+        let mut expected = actual.clone();
+        let field = Field {
+            text: &path,
+            cursor: path.len(),
+            placeholder: "",
+            focused: false,
+            hovered: false,
+            search: false,
+            clear: false,
+        };
+        text_field(&mut actual, width, &mut font, rect, field, &c, &s);
+        text_field(&mut expected, width, &mut font, rect, Field { text: "", ..field }, &c, &s);
+        let clip = Rect { x: s.inner, w: width - 2 * s.inner, ..rect };
+        font.draw(&mut expected, width, clip, clip.x, font.baseline(0, rect.h), expected_text, c.fg);
+        assert!(actual == expected, "the omitted prefix needs a visible ellipsis and pixel-fitted suffix");
+    }
+
+    #[test]
+    fn polish_buttons_preserve_complete_label_ink_at_fractional_scales() {
+        for scale in [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0, 8.0] {
+            let m = Metrics::new(scale);
+            let s = Sizes::new(&m);
+            let Some(mut font) = font::UiFont::load(m.text_px()) else { continue };
+            let c = colors();
+            for text in
+                ["Register selected", "Unregister selected", "Register all text types", "Change", "Open settings file"]
+            {
+                let width = font.width(text) + 2 * s.pad;
+                let rect = Rect { x: 0, y: 0, w: width, h: s.control };
+                let mut actual = vec![c.surface; width * rect.h];
+                button(&mut actual, width, &mut font, rect, text, Style::Subtle, false, &c, &s);
+                let mut expected = vec![c.surface; actual.len()];
+                let text_width = font.width(text);
+                font.draw(&mut expected, width, rect, (width - text_width) / 2, font.baseline(0, rect.h), text, c.fg);
+                assert!(actual == expected, "complete label ink at scale {scale}: {text}");
+            }
+        }
     }
 
     #[test]

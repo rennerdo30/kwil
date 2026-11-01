@@ -119,6 +119,7 @@ pub(super) fn draw(
         return;
     };
     let half = width / 2;
+    let gutter = 6 * font.cw;
     for (index, row) in page.rows.iter().take(rows).enumerate().filter(|(index, _)| dirty(*index)) {
         let y = index * font.ch;
         if row.hidden > 0 {
@@ -126,10 +127,10 @@ pub(super) fn draw(
                 pixels,
                 width,
                 font,
-                0,
+                gutter,
                 y,
                 format!("… {} unchanged lines (click or Enter to expand)", row.hidden).as_bytes(),
-                width / font.cw,
+                width.saturating_sub(gutter) / font.cw,
                 gutter_fg(),
                 bg(),
             );
@@ -149,7 +150,6 @@ pub(super) fn draw(
             let number = if side == 0 { row.left } else { row.right };
             let label = number.map_or_else(|| "      ".into(), |n| format!("{:>5} ", n + 1));
             draw_text(pixels, width, font, x, y, label.as_bytes(), half / font.cw, gutter_fg(), color);
-            let gutter = 6 * font.cw;
             let columns = half.saturating_sub(gutter + font.cw) / font.cw;
             draw_text(pixels, width, font, x + gutter, y, &row.text[side], columns, fg(), color);
             for cell in text::cells(&row.text[side], columns, font.tab_size()) {
@@ -177,6 +177,39 @@ pub(super) fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn polish_collapsed_region_leaves_the_line_number_gutter_empty() {
+        use kwil_view_model::compare_session::{Page, Row};
+        let Some(mut font) = Font::load(14.0) else { return };
+        let width = 800;
+        let mut pixels = vec![0; width * font.ch];
+        let mut session = Session::default();
+        session.page.replace(Page {
+            rows: vec![Row {
+                left: None,
+                right: None,
+                kind: Kind::Equal,
+                text: Default::default(),
+                words: Default::default(),
+                hidden: 100,
+            }],
+            top: 0,
+            total: 1,
+            changes: 0,
+            ignore_whitespace: false,
+            collapsed: true,
+            right_title: String::new(),
+        });
+        draw(&session, &mut pixels, width, &mut font, |_| true);
+        for y in 0..font.ch {
+            assert!(
+                pixels[y * width..y * width + 6 * font.cw].iter().all(|p| *p == bg()),
+                "gutter contains collapsed-region ink"
+            );
+        }
+        assert!(pixels.iter().any(|p| *p != bg()));
+    }
+
     #[test]
     fn compare_gui_prompt_keeps_tab_and_body_is_read_only() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -171,10 +171,10 @@ impl SearchPanel {
             .map(|(i, row)| match row {
                 FileEvent::Hit(hit) => SearchResultRow {
                     label: format!(
-                        "[{}] {} — {} matches",
+                        "[{}] {} — {}",
                         if self.folder.excluded.contains(&(self.file_first + i as u64)) { ' ' } else { 'x' },
                         bounded_label(&self.result_path(&hit.path).to_string_lossy(), 512),
-                        hit.line_number
+                        counted(hit.line_number, "match", "matches")
                     ),
                     is_hit: true,
                 },
@@ -200,8 +200,8 @@ impl SearchPanel {
             self.folder.applying = false;
             self.pending = false;
             self.status = format!(
-                "Replacement complete: {} files applied, {} skipped, {} excluded{}",
-                self.folder.applied,
+                "Replacement complete: {} applied, {} skipped, {} excluded{}",
+                counted(self.folder.applied, "file", "files"),
                 self.folder.skipped,
                 self.folder.excluded.len(),
                 self.folder.last_error.as_ref().map_or(String::new(), |e| format!("; {e}"))
@@ -249,8 +249,9 @@ impl SearchPanel {
                 self.accept_state(session.state(), view);
                 self.folder_labels(session);
                 self.status = format!(
-                    "Preview: {} files, {} matches. Enter toggles a file; Apply replaces included files",
-                    self.files_seen, self.count
+                    "Preview: {}, {}. Enter toggles a file; Apply replaces included files",
+                    counted(self.files_seen, "file", "files"),
+                    counted(self.count, "match", "matches")
                 );
                 Ok(())
             }

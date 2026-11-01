@@ -1743,6 +1743,39 @@ pub(crate) mod host_dispatch_tests {
     }
 
     #[test]
+    fn polish_folder_replacement_counts_agree_in_preview_rows_and_completion() {
+        let (mut app, rx, root) = worker_host("retain editor");
+        let tree = root.join("singular-folder-replace");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("one.txt");
+        std::fs::write(&path, b"needle").unwrap();
+        app.set_search_root(tree);
+        app.dispatch_search("search.replaceInFiles");
+        folder_query(&mut app, "needle");
+        finish(&mut app, &rx);
+        app.search_input(SearchInput::Focus(SearchField::Replacement));
+        app.search_input(SearchInput::Text("replacement"));
+        app.search_input(SearchInput::ReplaceNext);
+        finish(&mut app, &rx);
+        let preview = app.search_panel.status().to_owned();
+        let row = app.search_panel.results()[0].label.clone();
+        let kwil_view_model::search_session::FileEvent::Hit(hit) = &app.search.as_ref().unwrap().state().files[0]
+        else {
+            panic!("preview row")
+        };
+        let summary = hit.line.clone();
+        app.search_input(SearchInput::ReplaceAll);
+        finish(&mut app, &rx);
+        let completed = app.search_panel.status().to_owned();
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+        worker_stop(app, rx, root);
+        assert!(preview.starts_with("Preview: 1 file, 1 match."), "{preview}");
+        assert!(row.ends_with("1 match"), "{row}");
+        assert_eq!(summary, b"1 match");
+        assert!(completed.starts_with("Replacement complete: 1 file applied,"), "{completed}");
+    }
+
+    #[test]
     fn actual_host_folder_replace_preview_exclude_apply() {
         let (mut app, rx, root) = worker_host("retain editor");
         let tree = root.join("folder-replace");

@@ -113,6 +113,7 @@ pub(crate) enum Step {
     /// Desktop overlays (settings, palette) captured in the hidden window.
     SettingsOpen,
     SettingsKeymap,
+    SettingsFileTypes,
     SettingsCapture,
     SettingsClose,
     PaletteOpen,
@@ -460,6 +461,27 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (200, Step::UsabilityCapture("file-folder.bmp")),
             (100, Step::End),
         ];
+        let polish = [
+            (1800, Step::WelcomeProbe),
+            (100, Step::WelcomeSkip),
+            (100, Step::SettingsOpen),
+            (200, Step::SettingsFileTypes),
+            (200, Step::UsabilityCapture("polish-file-types.bmp")),
+            (100, Step::SettingsClose),
+            (100, Step::SettingsOpen),
+            (200, Step::SettingsKeymap),
+            (200, Step::UsabilityCapture("polish-keymap.bmp")),
+            (100, Step::SettingsClose),
+            (100, Step::FolderOpen),
+            (700, Step::FolderCheck),
+            (100, Step::UsabilityCapture("polish-folder.bmp")),
+            (100, Step::FolderPreview),
+            (700, Step::FolderPreviewCheck),
+            (100, Step::UsabilityCapture("polish-replace.bmp")),
+            (100, Step::CompareOpen),
+            (1200, Step::CompareCheck),
+            (100, Step::End),
+        ];
         let compare =
             [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
         let format = [
@@ -489,6 +511,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             folder_replace.as_slice()
         } else if std::env::var_os("KWIL_TAB_MENU_PROBE").is_some() {
             tab_menu.as_slice()
+        } else if std::env::var_os("KWIL_POLISH_PROBE").is_some() {
+            polish.as_slice()
         } else if std::env::var_os("KWIL_FORMAT_PROBE").is_some() {
             format.as_slice()
         } else if std::env::var_os("KWIL_LOG_COMMANDS_PROBE").is_some() {
@@ -700,7 +724,8 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.search_panel.folder_preview());
             assert!(!app.search_panel.is_pending());
             assert_eq!(app.search_panel.count(), (1, true));
-            assert!(app.search_panel.results()[0].label.contains("1 matches"));
+            assert!(app.search_panel.results()[0].label.ends_with("1 match"));
+            assert!(app.search_panel.status().starts_with("Preview: 1 file, 1 match."));
             println!("kwil-folder-replace preview=PASS files=1 matches=1 native-hidden=true");
         }
         Step::FolderSelect => {
@@ -1670,7 +1695,14 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::SettingsOpen => {
             app.dispatch_settings("view.settings");
         }
+        Step::SettingsFileTypes => {
+            assert!(app.settings_hosted_available());
+            app.settings_view.hosted = true;
+            app.settings_hosted_opened();
+            app.palette_redraw();
+        }
         Step::SettingsKeymap => {
+            app.settings_view.hosted = false;
             // The same host calls a click on Keymap -> Custom bindings -> Edit makes.
             if let Some(host) = app.settings_panel.as_mut() {
                 host.set_category(Some(kwil_core_commands::settings_ui::Category::Keymap));

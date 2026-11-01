@@ -1200,13 +1200,14 @@ impl SearchPanel {
             self.selected = self.selected.min(self.result_rows.len().max(self.paint_hits.len()).saturating_sub(1));
         }
         self.error = state.error.clone();
-        let noun = if self.mode == SearchMode::Files { "matching lines" } else { "matches" };
+        let (singular, plural) =
+            if self.mode == SearchMode::Files { ("matching line", "matching lines") } else { ("match", "matches") };
         self.status = if self.exact {
-            format!("{} {noun}", state.count)
+            counted(state.count, singular, plural)
         } else if self.paint_key != state.key {
-            format!("Searching… previous {} {noun}", self.count)
+            format!("Searching… previous {}", counted(self.count, singular, plural))
         } else {
-            format!("≈ {} {noun}", state.count)
+            format!("≈ {}", counted(state.count, singular, plural))
         };
         if self.settings.regex && self.mode != SearchMode::Files {
             self.status.push_str("; regex matches limited to 64 KiB, completeness is not guaranteed");
@@ -1442,6 +1443,26 @@ mod tests {
             rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("bounded search panel wake");
         }
     }
+    #[test]
+    fn polish_search_counts_use_singular_and_plural() {
+        let view = workspace("");
+        for mode in [SearchMode::Find, SearchMode::Replace, SearchMode::Files] {
+            for count in [0, 1, 2] {
+                let mut panel = SearchPanel::default();
+                panel.open(mode, &SearchSettings::default()).unwrap();
+                let state = SearchState { count, status: SearchStatus::Complete, ..Default::default() };
+                panel.accept_state(&state, &view);
+                let noun = match (mode, count) {
+                    (SearchMode::Files, 1) => "matching line",
+                    (SearchMode::Files, _) => "matching lines",
+                    (_, 1) => "match",
+                    _ => "matches",
+                };
+                assert_eq!(panel.status(), format!("{count} {noun}"));
+            }
+        }
+    }
+
     #[test]
     fn bounded_unicode_inputs_keep_horizontal_caret_and_transactional_paste() {
         let mut input = TextInput::default();
