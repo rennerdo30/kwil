@@ -1739,6 +1739,20 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
     }
 }
+fn fake_journal(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(name);
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path).unwrap();
+    path
+}
+
 fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
     use kwil_core_commands::associations::{
         AssociationAdapter, AssociationError, AssociationPlatform, DefaultChoice, Location, StoredValue,
@@ -1793,7 +1807,7 @@ fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
     };
     let proxy = app.proxy.clone();
     let mut service = FileTypeRegistration::start(
-        root.join("fake-association-journal"),
+        fake_journal(&root, "fake-association-journal"),
         context,
         || Ok(NoNative),
         std::sync::Arc::new(move || {

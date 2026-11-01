@@ -45,7 +45,7 @@ pub(super) fn setup(app: &mut App) {
     assert!(root.is_absolute());
     let proxy = app.proxy.clone();
     let mut service = FileTypeRegistration::start(
-        root.join("fake-filetypes-journal"),
+        super::fake_journal(&root, "fake-filetypes-journal"),
         RegistrationContext {
             platform: AssociationPlatform::Windows,
             executable: root.join("kwil.exe"),
@@ -80,7 +80,11 @@ pub(super) fn unregister(app: &mut App) {
 
 pub(super) fn check(app: &mut App, registered: bool) {
     let service = &app.file_types.as_ref().unwrap().service;
-    assert!(!matches!(service.registration_status(), RegistrationStatus::Pending | RegistrationStatus::Failed { .. }));
+    assert!(
+        !matches!(service.registration_status(), RegistrationStatus::Pending | RegistrationStatus::Failed { .. }),
+        "{:?}",
+        service.registration_status()
+    );
     let actual = service.registered().expect("fresh OS inspection completed");
     for extension in ["txt", "text", "log"] {
         assert_eq!(actual.contains(&Extension::parse(extension).unwrap()), registered);
