@@ -128,7 +128,7 @@ pub const SCHEMA: &[SettingSpec] = &[
         "file_types",
         "Extension mappings",
         Files,
-        "Map an extension to a language. Defaults use automatic detection. OS registration is a separate explicit action.",
+        "Map an extension or glob to a language. Defaults use automatic detection. OS registration accepts extensions only.",
         SettingKind::StringMap,
         |_| SettingValue::StringMap(BTreeMap::new())
     ),
@@ -451,13 +451,13 @@ impl SettingsDocument {
         if let Some(item) = document.get("file_types") {
             let table = item.as_table_like().ok_or_else(|| error("file_types must be a string table"))?;
             for (key, item) in table.iter() {
-                let ext = normalize_extension(key)?;
+                let ext = normalize_file_type_pattern(key)?;
                 let language = item
                     .as_str()
                     .filter(|s| valid_language(s))
                     .ok_or_else(|| error("file_types language must be a nonempty identifier"))?;
                 if file_types.insert(ext, language.into()).is_some() {
-                    return Err(error("duplicate case-insensitive extension mapping"));
+                    return Err(error("duplicate case-insensitive file-type mapping"));
                 }
             }
         }
@@ -582,7 +582,7 @@ impl SettingsDocument {
         self.transaction(|doc| set_leaf(doc.as_item_mut(), &path, new.map(Value::from)))
     }
     pub fn map_extension(&mut self, extension: &str, language: Option<&str>) -> Result<(), SettingsError> {
-        let extension = normalize_extension(extension)?;
+        let extension = normalize_file_type_pattern(extension)?;
         if language.is_some_and(|s| !valid_language(s)) {
             return Err(error("language must be a nonempty identifier"));
         }
@@ -593,7 +593,7 @@ impl SettingsDocument {
             .and_then(Item::as_table_like)
             .and_then(|t| {
                 t.iter()
-                    .find(|(k, _)| normalize_extension(k).ok().as_ref() == Some(&extension))
+                    .find(|(k, _)| normalize_file_type_pattern(k).ok().as_ref() == Some(&extension))
                     .map(|(k, _)| k.to_owned())
             })
             .unwrap_or(format!("*.{extension}"));
@@ -947,6 +947,23 @@ fn set_leaf(item: &mut Item, path: &[&str], new: Option<Value>) -> Result<(), Se
 fn decor_has_comment(decor: &toml_edit::Decor) -> bool {
     [decor.prefix(), decor.suffix()].into_iter().flatten().any(|raw| raw.as_str().is_some_and(|s| s.contains('#')))
 }
+// Keep bare-extension canonicalization compatible with existing settings.
+// Glob syntax is compiled and validated on the settings worker before the
+// candidate is accepted; OS registration continues to use normalize_extension.
+fn normalize_file_type_pattern(pattern: &str) -> Result<String, SettingsError> {
+    if let Ok(extension) = normalize_extension(pattern) {
+        return Ok(extension);
+    }
+    if pattern.is_empty()
+        || pattern.len() > 1024
+        || pattern.chars().any(char::is_control)
+        || !pattern.contains(['*', '?', '[', '{'])
+    {
+        return Err(error("file type must be an extension or a glob of at most 1024 bytes"));
+    }
+    Ok(pattern.replace('\\', "/").to_ascii_lowercase())
+}
+
 pub fn normalize_extension(extension: &str) -> Result<String, SettingsError> {
     let ext = extension.strip_prefix("*.").or_else(|| extension.strip_prefix('.')).unwrap_or(extension);
     if ext.is_empty()

@@ -141,7 +141,18 @@ Restored frontend palette tests: 6 passed PID38512. Restored tab publication: 1 
 
 Four independent compiling faults were detected: oversized merged windows, all-row damage, source destruction on the caller, and missing terminal foreground styling. Proof: `E:/Development/_cache/kwil-highlight-integration-proof-92d7b5dad0514595a33c54e289520f88`, PIDs79132/50836/38616/57384, each exit101 with intended assertion; source hashes restored. An earlier malformed let-chain mutant did not compile and is not evidence. Restored session tests3 PID74700, source retirement1 PID9536, terminal rendering1 PID73636 pass. Strict three-crate Clippy PID70780 and formatting pass; the final ASCII run adjustment is a later source change awaiting native inspection.
 
-Limits remain explicit: initial wiring uses automatic detection and built-in dark syntax colours. Language picker/settings mapping and active theme application are not yet wired. Logical-cell recolouring is skipped for RTL paragraphs to preserve their existing visual shaping; full RTL editor mapping remains open. GUI native pixels, latency and cross-platform acceptance are not established by these tests.
+Both frontends now host `file.setType` (Change Language Mode), the language picker and accepted `[file_types]` extension/glob mappings, including live reload. The GUI status language field opens the picker. Auto Detect clears the document override; Plain Text disables syntax colours, while Generic retains lexical highlighting for unknown files. Syntax classes resolve through the displayed theme in both frontends, including imported themes and built-in light/dark fallbacks. Theme changes redraw retained spans without issuing a syntax request. See `docs/THEMES.md` for supported scopes and theme import formats. Logical-cell recolouring is skipped for RTL paragraphs to preserve their existing visual shaping; full RTL editor mapping remains open. Latency and cross-platform acceptance are not established by source tests.
+
+Highlighting mappings accept bare extensions (`rs`), extension forms (`.rs`, `*.rs`) and globs (`**/special/*.rs`, `*.test.rs`). Matching is case-insensitive, with the first match in sorted settings-key order winning. For example:
+
+```toml
+[file_types]
+"**/special/*.rs" = "python"
+"*.test.rs" = "plaintext"
+rs = "rust"
+```
+
+Invalid glob or language candidates retain the last accepted settings. OS file-association registration continues to accept extensions only. The picker changes only the active document; Auto Detect restores the accepted mapping and normal detection precedence. Loading additional external grammars remains separate work.
 
 ### Palette R2 corrections
 

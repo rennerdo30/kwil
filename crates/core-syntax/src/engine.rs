@@ -298,7 +298,7 @@ impl Engine {
         let mut mode = Mode::Lexical;
         // Tree-sitter offsets are u32. Huge sources never enter its parser.
         let parse = allow_parse
-            && !matches!(language, Language::Generic | Language::Log)
+            && !matches!(language, Language::PlainText | Language::Generic | Language::Log)
             && source.len() <= self.config.parse_limit
             && source.len() < u32::MAX as usize;
         if parse && self.language != Some(language) {
@@ -390,7 +390,11 @@ impl Engine {
             spans
         } else {
             self.reset_document();
-            lexer::highlight(source, language, queried.clone(), requested.clone(), cancelled)?
+            if language == Language::PlainText {
+                Vec::new()
+            } else {
+                lexer::highlight(source, language, queried.clone(), requested.clone(), cancelled)?
+            }
         };
         if cancelled() {
             return Err(Error::Cancelled);

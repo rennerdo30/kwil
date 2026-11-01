@@ -121,15 +121,21 @@ impl LanguagePicker {
     pub fn items<'a>(&'a self, query: &'a str) -> impl Iterator<Item = LanguagePickerItem> + 'a {
         let automatic = std::iter::once(LanguageChoice::Automatic);
         automatic.chain(Language::CATALOGUE.iter().copied().map(LanguageChoice::Explicit)).filter_map(move |choice| {
-            let label = choice.language().map_or("Automatic", Language::id);
+            let label = match choice {
+                LanguageChoice::Automatic => "Auto Detect",
+                LanguageChoice::Explicit(Language::PlainText) => "Plain Text",
+                LanguageChoice::Explicit(language) => language.id(),
+            };
             let query = query.trim();
             let matches = contains_ascii_case_insensitive(label, query)
+                || (choice == LanguageChoice::Automatic && contains_ascii_case_insensitive("automatic", query))
                 || choice.language().is_some_and(|language| {
-                    language
-                        .extensions()
-                        .split_whitespace()
-                        .chain(language.filenames().split_whitespace())
-                        .any(|alias| contains_ascii_case_insensitive(alias, query))
+                    contains_ascii_case_insensitive(language.id(), query)
+                        || language
+                            .extensions()
+                            .split_whitespace()
+                            .chain(language.filenames().split_whitespace())
+                            .any(|alias| contains_ascii_case_insensitive(alias, query))
                 });
             matches.then_some(LanguagePickerItem {
                 choice,
@@ -153,6 +159,18 @@ mod tests {
     use super::*;
     use crate::View;
     use crate::highlighting::DetectionOrigin;
+
+    #[test]
+    fn picker_offers_plain_text_and_auto_detect_as_distinct_choices() {
+        let view = Workspace::new(View::new(None)).unwrap();
+        let picker =
+            LanguagePicker::capture(&view, LanguageStatus { choice: LanguageChoice::Automatic, detection: None });
+        assert_eq!(picker.items("Auto Detect").next().unwrap().choice, LanguageChoice::Automatic);
+        let plain = picker.items("Plain Text").next().unwrap();
+        assert_eq!(plain.choice, LanguageChoice::Explicit(Language::from_id("plaintext").unwrap()));
+        assert_ne!(plain.choice, LanguageChoice::Explicit(Language::Generic));
+        assert!(picker.items("automatic").any(|row| row.choice == LanguageChoice::Automatic));
+    }
 
     #[test]
     fn mappings_resolve_aliases_and_preserve_detector_precedence() {

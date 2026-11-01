@@ -60,7 +60,8 @@ fn detection_precedence() {
     assert_eq!(detected("script", "#!/usr/bin/env NODE_ENV=python bash").language, Language::Bash);
     assert_eq!(Language::from_id("nonexistent"), None);
     assert_eq!(Language::ALL.len(), 32);
-    assert_eq!(Language::CATALOGUE.len(), 34);
+    assert_eq!(Language::CATALOGUE.len(), Language::ALL.len() + 3);
+    assert!(Language::CATALOGUE.contains(&Language::PlainText));
     assert!(Language::Generic.bundled().is_none());
     let bare = Detector::new(&[LanguageMapping { pattern: "foo".into(), language: Language::Json }]).unwrap();
     assert_eq!(bare.detect(Path::new("a.FOO"), None, &source, &|| false).unwrap().language, Language::Json);

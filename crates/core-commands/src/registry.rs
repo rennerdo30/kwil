@@ -25,7 +25,7 @@ commands! {
         "file.reload" => "Reload from Disk", "file.keepChanges" => "Keep Local Changes",
         "file.restoreSession" => "Restore Session", "file.setEncoding" => "Change Encoding",
         "file.setLineEnding" => "Change Line Endings", "file.openHex" => "Open as Hex",
-        "file.setType" => "Change File Type", "file.quit" => "Quit",
+        "file.setType" => "Change Language Mode", "file.quit" => "Quit",
         "file.saveAndQuit" => "Save and Quit", "file.nextTab" => "Next Tab",
         "file.previousTab" => "Previous Tab"
     },

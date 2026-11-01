@@ -295,7 +295,8 @@ fn exceptions_stack_traces_and_invalid_json_are_bounded() {
 fn log_detection_picker_mapping_and_grammar_identity() {
     assert_eq!(Language::ALL.len(), 32);
     assert!(!Language::ALL.contains(&Language::Log));
-    assert_eq!(Language::CATALOGUE.len(), 34);
+    assert_eq!(Language::CATALOGUE.len(), Language::ALL.len() + 3);
+    assert!(Language::CATALOGUE.contains(&Language::PlainText));
     assert_eq!(Language::from_id("LOG"), Some(Language::Log));
     assert!(Language::Log.bundled().is_none());
     for path in ["server.LOG", "server.log.1", "server.log.2026-10-24", "log4j", "log4j.2", "server.log4j"] {
