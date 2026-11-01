@@ -10,10 +10,12 @@ publish = false
 
 [features]
 default = []
-harness = ["dep:kwil-core-text", "dep:serde_json"]
+harness = ["dep:kwil-core-text", "dep:kwil-core-commands", "dep:kwil-core-workspace", "dep:serde_json"]
 
 [dependencies]
 kwil-core-text = { path = "../core-text", optional = true }
+kwil-core-commands = { path = "../core-commands", optional = true }
+kwil-core-workspace = { path = "../core-workspace", optional = true }
 serde_json = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]

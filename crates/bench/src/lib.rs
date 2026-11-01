@@ -3,6 +3,8 @@
 #[cfg(feature = "harness")]
 pub mod fixtures;
 #[cfg(feature = "harness")]
+pub mod palette;
+#[cfg(feature = "harness")]
 pub mod text;
 
 /// Current private memory, excluding read-only file-backed page cache.

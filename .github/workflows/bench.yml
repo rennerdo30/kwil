@@ -35,13 +35,22 @@ jobs:
           add-rust-environment-hash-key: false
           key: bench-core-${{ hashFiles('Cargo.lock', 'crates/bench/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build core-text measurement binary
+      - name: Build measurement binary
         run: cargo build --manifest-path crates/bench/Cargo.toml --release --locked -j 4 --features harness
       - name: Check the isolated benchmark workspace
         shell: bash
         run: |
           cargo fmt --manifest-path crates/bench/Cargo.toml --check
           cargo clippy --manifest-path crates/bench/Cargo.toml --all-targets --features harness --locked -j 4 -- -D warnings
+          cargo test --manifest-path crates/bench/Cargo.toml --features harness --locked -j 4 palette::tests
+      - name: Palette query over 100k files (informational)
+        id: palette
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          mkdir -p results
+          target/release/kwil-bench palette "$RUNNER_TEMP/kwil-palette-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" > results/palette-${{ matrix.os }}.json
       - name: Cache generated fixtures
         id: fixtures
         uses: actions/cache/restore@v6
@@ -108,6 +117,26 @@ jobs:
           for file in baseline/current.json baseline/reference.json baseline/commit.txt; do
             [ ! -f "$file" ] || cp "$file" results/baseline/
           done
+      - name: Summarize benchmarks
+        if: always()
+        shell: pwsh
+        run: |
+          "## Benchmarks (${{ matrix.os }})" >> $env:GITHUB_STEP_SUMMARY
+          if (Test-Path 'results/${{ matrix.os }}.json') {
+            $text = Get-Content 'results/${{ matrix.os }}.json' -Raw | ConvertFrom-Json
+            "`nCore-text medians:" >> $env:GITHUB_STEP_SUMMARY
+            $text.medians.PSObject.Properties | ForEach-Object {
+              "- $($_.Name): $($_.Value)" >> $env:GITHUB_STEP_SUMMARY
+            }
+          }
+          if ('${{ steps.palette.outcome }}' -eq 'success') {
+            $palette = Get-Content 'results/palette-${{ matrix.os }}.json' -Raw | ConvertFrom-Json
+            $comparison = if ($palette.within_target) { 'within' } else { 'MISSES' }
+            "`nPalette: **$($palette.query_results_ms) ms** query-to-fresh-results over $($palette.files) files; $comparison the 16 ms target (informational, non-blocking)." >> $env:GITHUB_STEP_SUMMARY
+            "Query: $($palette.query); matches: $($palette.matches); displayed rows: $($palette.rows). One sample, discovery excluded; no GUI/TUI presentation timing." >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            "`nPalette measurement unavailable (step: ${{ steps.palette.outcome }}); no timing acceptance claimed." >> $env:GITHUB_STEP_SUMMARY
+          }
       - name: Retain raw samples, medians and commit even on gate failure
         if: always()
         uses: actions/upload-artifact@v7

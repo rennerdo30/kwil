@@ -34,7 +34,17 @@ contract and A/A diagnostic are superseded and are not ported into the current
 app/UI. Those files remain byte-identical to main. Existing UI harness metrics
 are not claimed as keystroke-to-pixels or refresh-rate acceptance.
 
-The other §3 budgets (search, diff, palette, full-editor memory, typing, scrolling,
+An informational palette case generates a 100k-file tree in the hosted runner's
+temporary directory, discovers it through the shipped catalogue, and measures
+one `file-0000` query through the shared palette worker until fresh results are
+applied. Discovery and fixture generation are outside the timer. The job summary
+reports the elapsed time and whether it misses 16 ms, alongside core-text medians;
+the raw JSON is retained with the other results. This case is non-blocking, has
+no baseline comparison, and does not measure GUI/TUI presentation or native input.
+The `palette` command refuses to generate the full tree outside GitHub Actions.
+Local tests use a six-file tree only.
+
+The other §3 budgets (search, diff, full-editor memory, typing, scrolling,
 single-instance and remote drawing) still need their own representative
 integration measurements. KW-33 remains open for those and the startup gate.
 

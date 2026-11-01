@@ -10,7 +10,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("measure") => {
             println!("{}", kwil_bench::text::measure(Path::new(args.get(2).ok_or("log file required")?))?)
         }
-        _ => return Err("usage: kwil-bench generate <dir> [--all] | measure <log>".into()),
+        Some("palette") => {
+            // The full tree is for hosted runners only, never the owner's PC.
+            if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+                return Err("the 100k-file palette case runs only on GitHub Actions".into());
+            }
+            let root = Path::new(args.get(2).ok_or("runner temp tree directory required")?);
+            kwil_bench::fixtures::tree(root, 100, 1000)?;
+            println!("{}", kwil_bench::palette::measure(root, 100_000)?);
+        }
+        _ => return Err("usage: kwil-bench generate <dir> [--all] | measure <log> | palette <runner-temp-tree>".into()),
     }
     Ok(())
 }
