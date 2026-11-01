@@ -48,6 +48,20 @@ impl SpoolRecipe {
     }
     /// Worker-only iterator, increasing original-document coordinates. Reverse
     /// it for descending atomic application. Clones share only an immutable pin.
+    /// Worker-only native record cursor. Returned offsets are valid only for
+    /// this immutable spool; record framing and bounds are still validated.
+    pub fn record_at(&self, position: u64) -> io::Result<(Edit, u64)> {
+        self.edits().read_at(position, None)
+    }
+    pub fn record_before(&self, position: u64) -> io::Result<(Edit, u64)> {
+        if position > self.bytes() {
+            return Err(invalid("spool cursor exceeds bounds"));
+        }
+        let mut cursor = self.edits();
+        cursor.back = position;
+        let edit = cursor.next_back().ok_or_else(|| invalid("spool cursor has no previous record"))??;
+        Ok((edit, cursor.back))
+    }
     pub fn edits(&self) -> SpoolEdits {
         SpoolEdits {
             recipe: self.clone(),
@@ -617,6 +631,27 @@ mod tests {
         assert_eq!(owner.live(), 0);
         assert!(!path.exists());
     }
+    #[test]
+    fn replacement_manifest_cursors_do_not_replay_prefix() {
+        let mut owner = SpoolOwner::new(1024).unwrap();
+        let slot = owner.begin().unwrap();
+        owner.append(slot, edit(0, b"a")).unwrap();
+        owner.append(slot, edit(2, b"b")).unwrap();
+        let recipe = owner.finish(slot).unwrap();
+        let (first, next) = recipe.record_at(0).unwrap();
+        assert_eq!(first.offset, 0);
+        let mut file = OpenOptions::new().write(true).open(&recipe.data().path).unwrap();
+        file.write_all(&u64::MAX.to_le_bytes()).unwrap();
+        drop(file);
+        let (second, end) = recipe.record_at(next).unwrap();
+        assert_eq!(second.new_bytes, b"b");
+        assert_eq!(recipe.record_before(end).unwrap().0.offset, 2);
+        assert!(recipe.record_at(0).is_err());
+        assert!(recipe.record_before(recipe.bytes() + 1).is_err());
+        drop(recipe);
+        owner.retire().unwrap();
+    }
+
     #[test]
     fn spool_budget_and_count_overflow_refuse_before_growth() {
         let mut owner = SpoolOwner::new(35).unwrap();

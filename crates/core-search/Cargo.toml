@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 kwil-core-runtime = { path = "../core-runtime" }
 kwil-core-text = { path = "../core-text" }
+kwil-core-workspace = { path = "../core-workspace" }
 memchr = "2.8.3"
 regex = "1.13.1"
 regex-syntax = "0.8.11"

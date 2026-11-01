@@ -209,7 +209,7 @@ impl Read for CancelReader<'_> {
     }
 }
 
-fn globs(patterns: &[String]) -> io::Result<GlobSet> {
+pub(crate) fn globs(patterns: &[String]) -> io::Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         builder.add(Glob::new(pattern).map_err(invalid)?);
