@@ -25,7 +25,7 @@ important files.
   legacy encodings, including Shift_JIS, EUC-JP, GBK, Big5 and Windows-1252.
   Untouched encoded bytes and malformed-byte provenance are preserved by the
   shared text/save engine. Per-file pickers reopen clean files or select the next
-  save encoding, and convert LF / CRLF line endings.
+  save encoding, and convert LF / CRLF / CR line endings.
 - **Hex editing:** inspect physical bytes and edit in hex, with an explicit
   text/hex choice for binary input.
 - **Syntax highlighting:** bundled language support and a generic fallback for

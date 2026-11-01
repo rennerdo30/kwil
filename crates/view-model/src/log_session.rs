@@ -1157,6 +1157,7 @@ struct ProjectionIndex {
     spool: IndexSpool,
     prefix: Vec<u8>,
     offset: u64,
+    skip_lf: bool,
     start: u64,
     line: u64,
     last: Option<u8>,
@@ -1178,6 +1179,7 @@ impl ProjectionIndex {
             spool: IndexSpool::new(limit)?,
             prefix: Vec::with_capacity(MAX_PREFIX_BYTES),
             offset: 0,
+            skip_lf: false,
             start: 0,
             line: 0,
             last: None,
@@ -1255,7 +1257,16 @@ impl ProjectionIndex {
             self.scanned_bytes += bytes.len() as u64;
         }
         while !bytes.is_empty() {
-            let end = bytes.iter().position(|b| *b == b'\n').unwrap_or(bytes.len());
+            if self.skip_lf {
+                self.skip_lf = false;
+                if bytes[0] == b'\n' {
+                    self.offset += 1;
+                    self.start = self.offset;
+                    bytes = &bytes[1..];
+                    continue;
+                }
+            }
+            let end = bytes.iter().position(|b| matches!(b, b'\r' | b'\n')).unwrap_or(bytes.len());
             let take = end.min(MAX_PREFIX_BYTES - self.prefix.len());
             self.prefix.extend_from_slice(&bytes[..take]);
             if end != 0 {
@@ -1265,6 +1276,7 @@ impl ProjectionIndex {
             if end == bytes.len() {
                 break;
             }
+            self.skip_lf = bytes[end] == b'\r';
             self.end_line()?;
             self.offset += 1;
             self.line += 1;
@@ -1415,6 +1427,7 @@ struct Scan {
     line: u64,
     line_start: u64,
     offset: u64,
+    skip_lf: bool,
 }
 
 impl Scan {
@@ -1425,6 +1438,7 @@ impl Scan {
             line: 0,
             line_start: 0,
             offset: 0,
+            skip_lf: false,
         }
     }
 
@@ -1454,13 +1468,23 @@ impl Scan {
     fn bytes(&mut self, bytes: &[u8], filter: &Filter, page_start: u64) {
         let mut rest = bytes;
         while !rest.is_empty() {
-            let end = rest.iter().position(|&byte| byte == b'\n').unwrap_or(rest.len());
+            if self.skip_lf {
+                self.skip_lf = false;
+                if rest[0] == b'\n' {
+                    self.offset += 1;
+                    self.line_start = self.offset;
+                    rest = &rest[1..];
+                    continue;
+                }
+            }
+            let end = rest.iter().position(|&byte| matches!(byte, b'\r' | b'\n')).unwrap_or(rest.len());
             let take = end.min(MAX_PREFIX_BYTES - self.prefix.len());
             self.prefix.extend_from_slice(&rest[..take]);
             self.offset += end as u64;
             if end == rest.len() {
                 break;
             }
+            self.skip_lf = rest[end] == b'\r';
             self.end_line(filter, page_start);
             self.offset += 1;
             self.line += 1;
@@ -1580,7 +1604,7 @@ mod tests {
 
     #[test]
     fn text_projection_filters_original_lines_and_rejects_bad_regex() {
-        let source = snapshot(b"INFO a.b\nERROR axb\nWARN a.b\n");
+        let source = snapshot(b"INFO a.b\rERROR axb\r\nWARN a.b\n");
         for (text, regex, expected) in [
             ("a.b", false, vec![0, 2]),
             ("a.b", true, vec![0, 1, 2]),

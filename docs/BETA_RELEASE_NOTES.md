@@ -91,6 +91,8 @@ implemented" any more (a contract test for GUI and TUI enforces it).
 
 ## Evaluation areas
 
+- CR-only (classic Mac) files open as separate lines, retain CR on Enter and save,
+  and convert through the same line-ending command as LF and CRLF.
 - GUI and TUI text editing, tabs, undo/redo and saving.
 - File search, command palette, configurable keymaps and hex editing.
 - Shared UTF-8, UTF-16, UTF-32 and supported legacy encoding paths.
@@ -102,7 +104,6 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
 
 ## Known limitations
 
-- CR-only (classic Mac) line endings are not converted yet.
 - Any-size opening and resident index memory limits are unfinished. Mapping
   refusal does not yet have the required positioned-read fallback.
 - Complete metadata pre-growth admission is unfinished. Large or demanding

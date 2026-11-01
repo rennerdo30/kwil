@@ -28,7 +28,8 @@ fn fragmented_tree_line_rank_and_complete_terminators_are_exact() {
         LineSpan { start: 0, content_end: 1, end: 3, terminator: Terminator::CrLf },
         LineSpan { start: 3, content_end: 4, end: 5, terminator: Terminator::Lf },
         LineSpan { start: 5, content_end: 5, end: 6, terminator: Terminator::Lf },
-        LineSpan { start: 6, content_end: 8, end: 8, terminator: Terminator::None },
+        LineSpan { start: 6, content_end: 7, end: 8, terminator: Terminator::Cr },
+        LineSpan { start: 8, content_end: 8, end: 8, terminator: Terminator::None },
     ];
     for (line, expected) in expected.into_iter().enumerate() {
         let mut query = LayoutLineQuery::new(line as u64);
@@ -125,9 +126,9 @@ fn existing_byte_rank_checkpoints_bound_giant_line_seeks() {
         actual,
         LineSpan {
             start: bytes.len() as u64 - 2,
-            content_end: bytes.len() as u64,
+            content_end: bytes.len() as u64 - 1,
             end: bytes.len() as u64,
-            terminator: Terminator::None
+            terminator: Terminator::Cr
         }
     );
     let mut rank = LayoutRankQuery::new(bytes.len() as u64 - 4);

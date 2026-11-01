@@ -10,6 +10,7 @@ pub mod encoding;
 mod file;
 mod index_memory;
 mod line_index;
+mod newlines;
 mod piece_tree;
 mod recovery;
 mod undo;

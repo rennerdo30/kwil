@@ -289,6 +289,14 @@ mod tests {
         let mut bytes = Vec::new();
         workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
         assert_eq!(bytes, b"one\r\ntwo\r\n");
+        choose(&mut workspace, "file.setLineEnding", "3");
+        lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
+        bytes.clear();
+        workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"one\rtwo\r");
+        assert!(workspace.status_text().contains("  |  CR"));
+        choose(&mut workspace, "file.setLineEnding", "2");
+        lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         choose(&mut workspace, "file.setEncoding", "2");
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         let path = root.join("saved.txt");

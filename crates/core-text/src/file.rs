@@ -1,4 +1,5 @@
 use crate::line_index::{DEFAULT_EVERY, LineIndex};
+#[cfg(test)]
 use memchr::memchr_iter;
 use std::fs::{File, Metadata};
 use std::io::{self, Read};
@@ -559,12 +560,12 @@ fn looks_utf16(samples: &[&[u8]], little_endian: bool) -> bool {
 fn lines_from(bytes: &[u8], start: usize, count: usize) -> Vec<&[u8]> {
     let mut out = Vec::with_capacity(count);
     let mut at = start;
-    let mut ends = memchr_iter(b'\n', &bytes[start..]);
+    let mut ends = crate::newlines::ends(bytes, start..bytes.len());
     while out.len() < count {
         match ends.next() {
             Some(p) => {
-                out.push(trim_cr(&bytes[at..start + p]));
-                at = start + p + 1;
+                out.push(trim_cr(bytes[at..p].strip_suffix(b"\n").unwrap_or(&bytes[at..p])));
+                at = p;
             }
             None => {
                 out.push(trim_cr(&bytes[at..]));

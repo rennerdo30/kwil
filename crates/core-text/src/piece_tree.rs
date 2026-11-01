@@ -4,8 +4,8 @@
 use crate::decoded_backing::DecodedSnapshot;
 use crate::decoded_piece::IndexedDecoded;
 use crate::encoding::Encoding;
+use crate::newlines::{edges, ends, split_crlf};
 use crate::{ReadError, TextFile};
-use memchr::memchr_iter;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -522,7 +522,7 @@ impl Storage {
             }
             Self::Decoded(source) => source.index.line_of_offset(source.origin.logical_bytes(), offset).unwrap(),
             // Added pieces never scan more than ADD_BLOCK bytes.
-            _ => memchr_iter(b'\n', &self.bytes()?[..offset as usize]).count() as u64,
+            _ => ends(self.bytes()?, 0..offset as usize).count() as u64,
         })
     }
 
@@ -531,7 +531,7 @@ impl Storage {
             Self::Original(file) => file.index().unwrap().line_start(file.bytes()?, line).unwrap(),
             Self::Decoded(source) => source.index.line_start(source.origin.logical_bytes(), line).unwrap(),
             _ if line == 0 => 0,
-            _ => memchr_iter(b'\n', self.bytes()?).nth((line - 1) as usize).unwrap() as u64 + 1,
+            _ => ends(self.bytes()?, 0..self.bytes()?.len()).nth((line - 1) as usize).unwrap() as u64,
         })
     }
 
@@ -596,15 +596,35 @@ pub(crate) struct Piece {
     end: u64,
     first_line: u64,
     breaks: u64,
+    edges: (bool, bool),
 }
 
 impl Piece {
+    fn end_correction(&self) -> Result<u64, ReadError> {
+        if !self.edges.1 {
+            return Ok(0);
+        }
+        Ok(u64::from(split_crlf(self.storage.bytes()?, self.end as usize)))
+    }
     fn split(&self, at: u64) -> Result<(Self, Self), ReadError> {
         let middle = self.start + at;
         let line = self.storage.rank(middle)?;
+        let bytes = self.storage.bytes()?;
+        let correction = u64::from(split_crlf(bytes, middle as usize));
         Ok((
-            Self { end: middle, breaks: line - self.first_line, ..self.clone() },
-            Self { start: middle, first_line: line, breaks: self.first_line + self.breaks - line, ..self.clone() },
+            Self {
+                end: middle,
+                breaks: line - self.first_line + correction,
+                edges: edges(&bytes[self.start as usize..middle as usize]),
+                ..self.clone()
+            },
+            Self {
+                start: middle,
+                first_line: line,
+                breaks: self.first_line + self.breaks - line,
+                edges: edges(&bytes[middle as usize..self.end as usize]),
+                ..self.clone()
+            },
         ))
     }
 }
@@ -614,6 +634,7 @@ impl Piece {
 pub(crate) struct Metrics {
     pub bytes: u64,
     pub breaks: u64,
+    pub edges: (bool, bool),
     pub retained: usize,
     pub resources: StorageResources,
 }
@@ -658,6 +679,7 @@ fn leaf(piece: Piece) -> Arc<Node> {
         metrics: Metrics {
             bytes: piece.end - piece.start,
             breaks: piece.breaks,
+            edges: piece.edges,
             retained: std::mem::size_of::<Node>() + ARC_HEADER,
             resources: piece
                 .storage
@@ -670,11 +692,16 @@ fn leaf(piece: Piece) -> Arc<Node> {
     })
 }
 
+fn joined_crlf(left: &Node, right: &Node) -> u64 {
+    u64::from(left.metrics.edges.1 && right.metrics.edges.0)
+}
+
 fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     Arc::new(Node {
         metrics: Metrics {
             bytes: left.metrics.bytes + right.metrics.bytes,
-            breaks: left.metrics.breaks + right.metrics.breaks,
+            breaks: left.metrics.breaks + right.metrics.breaks - joined_crlf(&left, &right),
+            edges: (left.metrics.edges.0, right.metrics.edges.1),
             retained: left
                 .metrics
                 .retained
@@ -769,11 +796,13 @@ pub(crate) fn original(file: TextFile, owner: Arc<()>) -> Result<Tree, ReadError
         return Ok(None);
     }
     let len = file.len();
+    let edges = edges(file.bytes()?);
     Ok(Some(leaf(Piece {
         storage: Arc::new(Storage::Original(file)),
         owner: Some(owner),
         start: 0,
         end: len,
+        edges,
         first_line: 0,
         breaks,
     })))
@@ -784,9 +813,19 @@ pub(crate) fn added(bytes: &[u8], budget: &Arc<AddBudget>) -> io::Result<Tree> {
     for chunk in bytes.chunks(ADD_BLOCK) {
         let storage = capped_block(chunk, budget)?;
         let owner = matches!(&*storage, Storage::Memory { .. }).then(|| budget.owner.clone());
-        let breaks = memchr_iter(b'\n', chunk).count() as u64;
-        tree =
-            join(tree, Some(leaf(Piece { storage, owner, start: 0, end: chunk.len() as u64, first_line: 0, breaks })));
+        let breaks = ends(chunk, 0..chunk.len()).count() as u64;
+        tree = join(
+            tree,
+            Some(leaf(Piece {
+                storage,
+                owner,
+                start: 0,
+                end: chunk.len() as u64,
+                first_line: 0,
+                breaks,
+                edges: edges(chunk),
+            })),
+        );
     }
     Ok(tree)
 }
@@ -956,7 +995,8 @@ pub(crate) fn recovery_preserved(
         start: 0,
         end: bytes.len() as u64,
         first_line: 0,
-        breaks: memchr_iter(b'\n', bytes).count() as u64,
+        breaks: ends(bytes, 0..bytes.len()).count() as u64,
+        edges: edges(bytes),
     })))
 }
 
@@ -1059,7 +1099,8 @@ fn detached_block(
         start: 0,
         end: bytes.len() as u64,
         first_line: 0,
-        breaks: memchr_iter(b'\n', bytes).count() as u64,
+        breaks: ends(bytes, 0..bytes.len()).count() as u64,
+        edges: edges(bytes),
     })))
 }
 
@@ -1388,11 +1429,13 @@ pub(crate) fn decoded_checked<E: From<io::Error>>(
     let source = Arc::new(IndexedDecoded::new_checked(origin, check)?);
     let end = source.origin.logical_bytes().len() as u64;
     let breaks = source.index.line_count() - 1;
+    let edges = edges(source.origin.logical_bytes());
     Ok(Some(leaf(Piece {
         storage: Arc::new(Storage::Decoded(source)),
         owner: Some(owner),
         start: 0,
         end,
+        edges,
         first_line: 0,
         breaks,
     })))
@@ -2083,8 +2126,12 @@ impl WorkerAllocation {
                         .rank(piece.end)
                         .map_err(io::Error::other)?
                         .checked_sub(piece.storage.rank(piece.start).map_err(io::Error::other)?)
-                        .ok_or_else(crate::worker_edit::overflow)?;
-                    if breaks != piece.breaks {
+                        .ok_or_else(crate::worker_edit::overflow)?
+                        + piece.end_correction().map_err(io::Error::other)?;
+                    if breaks != piece.breaks
+                        || piece.edges != edges(&data[piece.start as usize..piece.end as usize])
+                        || node.metrics.edges != piece.edges
+                    {
                         return Err(crate::worker_edit::invalid("candidate line metrics"));
                     }
                     (
@@ -2096,9 +2143,12 @@ impl WorkerAllocation {
                 Kind::Branch(left, right) => {
                     let (lb, ll, lr) = visit(a, left, budget, owner, cancelled)?;
                     let (rb, rl, rr) = visit(a, right, budget, owner, cancelled)?;
+                    if node.metrics.edges != (left.metrics.edges.0, right.metrics.edges.1) {
+                        return Err(crate::worker_edit::invalid("candidate line edges"));
+                    }
                     (
                         lb.checked_add(rb).ok_or_else(crate::worker_edit::overflow)?,
-                        ll.checked_add(rl).ok_or_else(crate::worker_edit::overflow)?,
+                        ll.checked_add(rl).ok_or_else(crate::worker_edit::overflow)? - joined_crlf(left, right),
                         lr.plus(rr).plus(StorageResources { tree_nodes: 1, ..Default::default() }),
                     )
                 }
@@ -2325,7 +2375,8 @@ fn worker_added(
                 start: 0,
                 end: chunk.len() as u64,
                 first_line: 0,
-                breaks: memchr_iter(b'\n', chunk).count() as u64,
+                breaks: ends(chunk, 0..chunk.len()).count() as u64,
+                edges: edges(chunk),
             })),
         );
     }
@@ -2353,7 +2404,8 @@ fn worker_detached(
         start: 0,
         end: bytes.len() as u64,
         first_line: 0,
-        breaks: memchr_iter(b'\n', bytes).count() as u64,
+        breaks: ends(bytes, 0..bytes.len()).count() as u64,
+        edges: edges(bytes),
     })))
 }
 pub(crate) fn worker_import(
@@ -2380,7 +2432,7 @@ pub(crate) fn worker_import(
                     crate::decoded_piece::validate_range(&source.origin, piece.start..piece.end)?;
                     let storage = allocation.decoded_copy(source, cancelled)?;
                     let first_line = storage.rank(piece.start).map_err(io::Error::other)?;
-                    let breaks = storage.rank(piece.end).map_err(io::Error::other)? - first_line;
+                    let breaks = piece.breaks;
                     Ok(Some(leaf(Piece {
                         storage,
                         owner: Some(budget.owner.clone()),
@@ -2388,6 +2440,7 @@ pub(crate) fn worker_import(
                         end: piece.end,
                         first_line,
                         breaks,
+                        edges: piece.edges,
                     })))
                 }
                 Storage::Opaque { encoding, raw, offsets, .. } => {
@@ -2481,10 +2534,17 @@ pub(crate) fn after_break(mut node: &Node, mut nth: u64) -> Result<u64, ReadErro
     let mut offset = 0;
     loop {
         match &node.kind {
-            Kind::Leaf(piece) => return Ok(offset + piece.storage.line_start(piece.first_line + nth)? - piece.start),
-            Kind::Branch(left, right) if nth <= left.metrics.breaks => node = left,
+            Kind::Leaf(piece) => {
+                let start = if nth == piece.breaks && piece.end_correction()? != 0 {
+                    piece.end
+                } else {
+                    piece.storage.line_start(piece.first_line + nth)?
+                };
+                return Ok(offset + start - piece.start);
+            }
+            Kind::Branch(left, right) if nth <= left.metrics.breaks - joined_crlf(left, right) => node = left,
             Kind::Branch(left, right) => {
-                nth -= left.metrics.breaks;
+                nth -= left.metrics.breaks - joined_crlf(left, right);
                 offset += left.metrics.bytes;
                 node = right;
             }
@@ -2496,11 +2556,14 @@ pub(crate) fn rank(mut node: &Node, mut at: u64) -> Result<u64, ReadError> {
     let mut breaks = 0;
     loop {
         match &node.kind {
-            Kind::Leaf(piece) => return Ok(breaks + piece.storage.rank(piece.start + at)? - piece.first_line),
+            Kind::Leaf(piece) => {
+                return Ok(breaks + piece.storage.rank(piece.start + at)? - piece.first_line
+                    + if at == piece.end - piece.start { piece.end_correction()? } else { 0 });
+            }
             Kind::Branch(left, _) if at < left.metrics.bytes => node = left,
             Kind::Branch(left, right) => {
                 at -= left.metrics.bytes;
-                breaks += left.metrics.breaks;
+                breaks += left.metrics.breaks - joined_crlf(left, right);
                 node = right;
             }
         }
@@ -2841,13 +2904,14 @@ pub(crate) fn assert_valid(tree: &Tree) {
                 assert_eq!(
                     node.metrics.breaks,
                     piece.storage.rank(piece.end).unwrap() - piece.storage.rank(piece.start).unwrap()
+                        + piece.end_correction().unwrap()
                 );
             }
             Kind::Branch(left, right) => {
                 assert!(left.height.abs_diff(right.height) <= 1);
                 assert_eq!(node.height, 1 + left.height.max(right.height));
                 assert_eq!(node.metrics.bytes, left.metrics.bytes + right.metrics.bytes);
-                assert_eq!(node.metrics.breaks, left.metrics.breaks + right.metrics.breaks);
+                assert_eq!(node.metrics.breaks, left.metrics.breaks + right.metrics.breaks - joined_crlf(left, right));
                 assert_valid(&Some(left.clone()));
                 assert_valid(&Some(right.clone()));
             }

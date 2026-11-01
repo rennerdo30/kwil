@@ -204,6 +204,7 @@ enum Phase {
 }
 #[derive(Clone, Copy)]
 enum AfterRecord {
+    Capture,
     Scan,
     After,
 }
@@ -399,6 +400,17 @@ impl<S: SourceLease, A: Admission> InputBuild<S, A> {
                     self.cursor = 0;
                     self.scan = 0;
                     self.phase = Phase::Logical;
+                } else if self.previous_cr {
+                    self.pending_line = Some(LineSpan {
+                        start: self.line_start,
+                        content_end: self.logical_len - 1,
+                        end: self.logical_len,
+                        terminator: Terminator::Cr,
+                    });
+                    self.line_start = self.logical_len;
+                    self.previous_cr = false;
+                    self.after_record = AfterRecord::Capture;
+                    self.phase = Phase::Line;
                 } else {
                     self.pending_line = Some(LineSpan {
                         start: self.line_start,
@@ -428,6 +440,7 @@ impl<S: SourceLease, A: Admission> InputBuild<S, A> {
                         Phase::Logical => Phase::Original,
                         Phase::Original => Phase::Atom,
                         _ => match self.after_record {
+                            AfterRecord::Capture => Phase::Capture,
                             AfterRecord::Scan => Phase::Scan,
                             AfterRecord::After => Phase::After,
                         },
@@ -525,6 +538,19 @@ impl<S: SourceLease, A: Admission> InputBuild<S, A> {
                         return Step::Failed(InputError::SourceContract);
                     }
                     let at = self.logical_len + self.scan as u64;
+                    if self.previous_cr && byte != b'\n' {
+                        self.pending_line = Some(LineSpan {
+                            start: self.line_start,
+                            content_end: at - 1,
+                            end: at,
+                            terminator: Terminator::Cr,
+                        });
+                        self.line_start = at;
+                        self.previous_cr = false;
+                        self.after_record = AfterRecord::Scan;
+                        self.phase = Phase::Line;
+                        break;
+                    }
                     self.scan += 1;
                     self.scan_credit -= 1;
                     if byte == b'\n' {
@@ -603,13 +629,14 @@ pub enum Terminator {
     None = 0,
     Lf = 1,
     CrLf = 2,
+    Cr = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineSpan {
     pub start: u64,
     pub content_end: u64,
-    /// Includes terminator bytes. Literal CR at EOF or before non-LF is content.
+    /// Includes CR, LF or CRLF terminator bytes.
     pub end: u64,
     pub terminator: Terminator,
 }
@@ -999,9 +1026,19 @@ fn decode_line(bytes: &[u8; LINE_RECORD], len: u64) -> Result<LineSpan, InputErr
         0 => Terminator::None,
         1 => Terminator::Lf,
         2 => Terminator::CrLf,
+        3 => Terminator::Cr,
         _ => return Err(InputError::CorruptStore),
     };
-    if start > content_end || content_end > end || end > len || end - content_end != terminator as u64 {
+    if start > content_end
+        || content_end > end
+        || end > len
+        || end - content_end
+            != match terminator {
+                Terminator::None => 0,
+                Terminator::Cr | Terminator::Lf => 1,
+                Terminator::CrLf => 2,
+            }
+    {
         return Err(InputError::CorruptStore);
     }
     Ok(LineSpan { start, content_end, end, terminator })

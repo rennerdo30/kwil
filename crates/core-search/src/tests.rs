@@ -10,6 +10,43 @@ use std::time::Duration;
 fn token() -> Cancellation {
     Arc::new(AtomicBool::new(false))
 }
+
+#[test]
+fn classic_mac_filter_and_file_search_agree_on_mixed_line_numbers() {
+    let bytes = b"hit\rnone\r\nhit\nhit\r";
+    assert_eq!(
+        collect(bytes.as_slice(), &regex(r"(?m)^hit$"), 0..bytes.len() as u64)
+            .iter()
+            .map(|hit| hit.offset)
+            .collect::<Vec<_>>(),
+        [0, 10, 14]
+    );
+    let filter = LineFilter::new(vec![literal(b"hit")], FilterExpr::Pattern(0)).unwrap();
+    for size in [1, 2, 5, 64] {
+        let h = Chunks { bytes, size };
+        let mut runs = Vec::new();
+        let result = filter
+            .scan(&h, FilterResume::default(), true, &token(), |r| {
+                runs.push(r);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(result.matching_lines, 3);
+        assert_eq!(runs, [LineRun { start: 1, end: 2 }, LineRun { start: 3, end: 5 }]);
+    }
+    let tree = TempTree::new();
+    tree.write("classic.txt", bytes);
+    let (summary, events) = files(FileSearch::new(tree.0.clone(), "hit".into()));
+    assert_eq!(summary.errors, 0);
+    let hits: Vec<_> = events
+        .into_iter()
+        .map(|event| match event {
+            FileEvent::Hit(hit) => (hit.line_number, hit.line_offset, hit.line),
+            _ => panic!("unexpected search error"),
+        })
+        .collect();
+    assert_eq!(hits, [(1, 0, b"hit".to_vec()), (3, 10, b"hit".to_vec()), (4, 14, b"hit".to_vec())]);
+}
 fn literal(s: &[u8]) -> Pattern {
     Pattern::literal(s, Options::default()).unwrap()
 }

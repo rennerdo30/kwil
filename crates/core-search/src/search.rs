@@ -142,6 +142,7 @@ impl Pattern {
             return Err(invalid("regex match bound must be 1..=1 MiB"));
         }
         let hir = regex_syntax::ParserBuilder::new()
+            .crlf(true)
             .utf8(false)
             .case_insensitive(options.case_insensitive)
             .build()
@@ -150,6 +151,7 @@ impl Pattern {
         let newline_safe = !consumes_newline(&hir);
         let constrained = if options.whole_word { whole_word_expression(expression)? } else { expression.to_owned() };
         let re = RegexBuilder::new(&constrained)
+            .crlf(true)
             .case_insensitive(options.case_insensitive)
             .size_limit(8 << 20)
             .dfa_size_limit(2 << 20)

@@ -3131,18 +3131,7 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
         .checked_add(2)
         .ok_or_else(|| io::Error::other("Recovery revision overflow"))?;
     // Restore newline policy from a bounded sample before interactive editing.
-    let mut previous = 0;
-    'sample: for chunk in snapshot.chunks(0..snapshot.len().min(64 << 10))? {
-        for &byte in chunk.map_err(io::Error::other)? {
-            if byte == b'\n' {
-                if previous == b'\r' {
-                    document.line_ending = crate::DocumentLineEnding::CrLf;
-                }
-                break 'sample;
-            }
-            previous = byte;
-        }
-    }
+    document.line_ending = crate::DocumentLineEnding::detect(&snapshot)?;
     if !document.is_dirty()
         && let Some(path) = &tab.path
     {

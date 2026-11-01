@@ -3,7 +3,6 @@ use crate::{Cancellation, Options};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::Range;
@@ -56,7 +55,7 @@ pub struct FileHit {
     pub path: PathBuf,
     pub line_number: u64,
     pub line_offset: u64,
-    /// Preview without LF or a CR belonging to CRLF, truncated to the byte cap.
+    /// Preview without CR, LF or CRLF terminators, truncated to the byte cap.
     /// UTF-16 BOM files are decoded to UTF-8 here; other files retain raw bytes.
     pub line: Vec<u8>,
     pub line_truncated: bool,
@@ -122,13 +121,6 @@ pub fn find_in_files(
         let (files, hits, errors, disconnected, output, include, exclude) =
             (&files, &hits, &errors, &disconnected, &output, &include, &exclude);
         let matcher = matcher.clone();
-        let mut searcher = SearcherBuilder::new()
-            .line_number(true)
-            .binary_detection(BinaryDetection::quit(b'\0'))
-            .heap_limit(Some(options.heap_limit))
-            .encoding(None)
-            .bom_sniffing(false)
-            .build();
         Box::new(move |entry| {
             if cancel.load(Ordering::Relaxed) || disconnected.load(Ordering::Relaxed) {
                 return WalkState::Quit;
@@ -168,7 +160,7 @@ pub fn find_in_files(
                     reader.consume(2);
                     search_utf16(reader, little, &mut sink)
                 } else {
-                    searcher.search_reader(&matcher, reader, &mut sink)
+                    search_bytes(reader, &mut sink)
                 }
             });
             if let Err(e) = result {
@@ -253,8 +245,9 @@ struct FileSink<'a> {
 impl FileSink<'_> {
     fn line(&mut self, bytes: &[u8], line_number: u64, line_offset: u64, utf16: bool) -> io::Result<bool> {
         // Match against the original record, preserving its CR. Only the preview
-        // loses CRLF. A standalone CR in an unterminated record stays visible.
-        let preview = bytes.strip_suffix(b"\n").map_or(bytes, |line| line.strip_suffix(b"\r").unwrap_or(line));
+        // loses the CR, LF or CRLF terminator.
+        let preview = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let preview = preview.strip_suffix(b"\r").unwrap_or(preview);
         let mut ranges = Vec::new();
         let mut ranges_truncated = false;
         let text = if utf16 { std::str::from_utf8(bytes).map_err(invalid)? } else { "" };
@@ -325,6 +318,7 @@ fn search_utf16(mut reader: impl Read, little: bool, sink: &mut FileSink<'_>) ->
     let mut decoded = String::with_capacity(cap * 3);
     let mut offset = 2;
     let mut line_number = 1;
+    let mut cr = false;
     loop {
         if sink.cancel.load(Ordering::Relaxed) || sink.disconnected.load(Ordering::Relaxed) {
             return Ok(());
@@ -337,10 +331,24 @@ fn search_utf16(mut reader: impl Read, little: bool, sink: &mut FileSink<'_>) ->
         let eof = n == 0;
         if !eof {
             reader.read_exact(&mut raw[1..])?;
+            let unit = if little { u16::from_le_bytes(raw) } else { u16::from_be_bytes(raw) };
+            if cr && unit != 10 {
+                decoded.clear();
+                for scalar in char::decode_utf16(units.iter().copied()) {
+                    decoded.push(scalar.unwrap_or(char::REPLACEMENT_CHARACTER));
+                }
+                if !sink.line(decoded.as_bytes(), line_number, offset, true)? {
+                    return Ok(());
+                }
+                offset += units.len() as u64 * 2;
+                line_number += 1;
+                units.clear();
+            }
             if units.len() == cap {
                 return Err(io::Error::other("UTF-16 line exceeds file-search heap limit"));
             }
-            units.push(if little { u16::from_le_bytes(raw) } else { u16::from_be_bytes(raw) });
+            cr = unit == 13;
+            units.push(unit);
         }
         if eof || units.last() == Some(&10) {
             decoded.clear();
@@ -360,15 +368,69 @@ fn search_utf16(mut reader: impl Read, little: bool, sink: &mut FileSink<'_>) ->
     }
 }
 
-impl Sink for FileSink<'_> {
-    type Error = io::Error;
-    fn matched(&mut self, _: &Searcher, matched: &SinkMatch<'_>) -> io::Result<bool> {
-        if self.cancel.load(Ordering::Relaxed) || self.disconnected.load(Ordering::Relaxed) {
-            return Ok(false);
+/// Retain at most the configured line budget; delimiters are recognized across
+/// reader blocks without normalizing the original byte offsets or CR bytes.
+fn search_bytes(mut reader: impl BufRead, sink: &mut FileSink<'_>) -> io::Result<()> {
+    let mut line = Vec::with_capacity(sink.options.heap_limit);
+    let mut offset = 0;
+    let mut line_start = 0;
+    let mut number = 1;
+    let mut cr = false;
+    loop {
+        if sink.cancel.load(Ordering::Relaxed) || sink.disconnected.load(Ordering::Relaxed) {
+            return Ok(());
         }
-        self.line(matched.bytes(), matched.line_number().unwrap_or(1), matched.absolute_byte_offset(), false)
-    }
-    fn context(&mut self, _: &Searcher, _: &grep_searcher::SinkContext<'_>) -> io::Result<bool> {
-        Ok(!self.cancel.load(Ordering::Relaxed) && !self.disconnected.load(Ordering::Relaxed))
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            if !line.is_empty() {
+                sink.line(&line, number, line_start, false)?;
+            }
+            return Ok(());
+        }
+        let mut used = 0;
+        while used < bytes.len() {
+            if cr {
+                if bytes[used] == b'\n' {
+                    if line.len() == sink.options.heap_limit {
+                        return Err(io::Error::other("line exceeds file-search heap limit"));
+                    }
+                    line.push(b'\n');
+                    used += 1;
+                    offset += 1;
+                }
+                if !sink.line(&line, number, line_start, false)? {
+                    return Ok(());
+                }
+                line.clear();
+                number += 1;
+                line_start = offset;
+                cr = false;
+                if used == bytes.len() {
+                    break;
+                }
+            }
+            let rest = &bytes[used..];
+            let take = memchr::memchr2(b'\r', b'\n', rest).map_or(rest.len(), |at| at + 1);
+            let part = &rest[..take];
+            if memchr::memchr(0, part).is_some() {
+                return Ok(());
+            }
+            if take > sink.options.heap_limit - line.len() {
+                return Err(io::Error::other("line exceeds file-search heap limit"));
+            }
+            line.extend_from_slice(part);
+            used += take;
+            offset += take as u64;
+            cr = part.last() == Some(&b'\r');
+            if part.last() == Some(&b'\n') {
+                if !sink.line(&line, number, line_start, false)? {
+                    return Ok(());
+                }
+                line.clear();
+                number += 1;
+                line_start = offset;
+            }
+        }
+        reader.consume(used);
     }
 }

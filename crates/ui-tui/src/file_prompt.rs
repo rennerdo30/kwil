@@ -180,6 +180,13 @@ mod tests {
         key(&mut workspace, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(workspace.file_prompt().is_none());
         assert_eq!(workspace.editor().unwrap().document().snapshot().len(), 4);
+        workspace.file_command("file.setLineEnding").unwrap();
+        workspace.file_prompt_mut().unwrap().text = "3".into();
+        terminal.draw(|frame| draw_prompt(frame, &workspace)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("3: CR"));
+        assert!(!text.contains("3: CRLF"));
+        key(&mut workspace, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     }
 
     #[test]

@@ -570,7 +570,8 @@ impl View {
             }
         };
         let notice = if self.notice.is_empty() { String::new() } else { format!("  |  {}", self.notice) };
-        format!("{name}{lines}{notice}")
+        let ending = self.editor.as_ref().map_or("", |e| e.document().line_ending.label());
+        format!("{name}{lines}  |  {ending}{notice}")
     }
 }
 

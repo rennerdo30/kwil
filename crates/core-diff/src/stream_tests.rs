@@ -244,7 +244,11 @@ fn rows<L: InputSource, R: InputSource>(result: &mut DiskComparison<L, R, Budget
 fn reference(bytes: &[u8], options: StreamOptions) -> Vec<Vec<u16>> {
     let mut lines = Vec::new();
     let mut start = 0;
-    for end in bytes.iter().enumerate().filter_map(|(i, b)| (*b == b'\n').then_some(i + 1)) {
+    for end in bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| (*b == b'\n' || (*b == b'\r' && bytes.get(i + 1) != Some(&b'\n'))).then_some(i + 1))
+    {
         lines.push(&bytes[start..end]);
         start = end;
     }
@@ -252,8 +256,15 @@ fn reference(bytes: &[u8], options: StreamOptions) -> Vec<Vec<u16>> {
     lines
         .into_iter()
         .map(|line| {
-            let terminator = if line.ends_with(b"\r\n") { 2 } else { usize::from(line.ends_with(b"\n")) };
-            let mut content = &line[..line.len() - terminator];
+            let (terminator, width) = if line.ends_with(b"\r\n") {
+                (2, 2)
+            } else if line.ends_with(b"\r") {
+                (3, 1)
+            } else {
+                let n = usize::from(line.ends_with(b"\n"));
+                (n, n)
+            };
+            let mut content = &line[..line.len() - width];
             if options.whitespace == Whitespace::Trailing {
                 let end = content.iter().rposition(|b| ![b' ', b'\t', 0x0b, 0x0c].contains(b)).map_or(0, |i| i + 1);
                 content = &content[..end];
@@ -274,7 +285,7 @@ fn reference(bytes: &[u8], options: StreamOptions) -> Vec<Vec<u16>> {
                 }
                 was_space = horizontal;
             }
-            output.push(256 + if options.ignore_line_endings && terminator == 2 { 1 } else { terminator as u16 });
+            output.push(256 + if options.ignore_line_endings && terminator != 0 { 1 } else { terminator as u16 });
             output
         })
         .collect()
