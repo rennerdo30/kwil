@@ -157,6 +157,10 @@ impl App {
             "navigation.goToLine" => ":",
             _ => return false,
         };
+        // Shortcut keycaps share the menu's label table; build it now so a
+        // palette opened before any menu still shows the current bindings.
+        let mode = self.keys.as_ref().map_or(kwil_core_commands::Mode::Insert, |keys| keys.mode());
+        self.menu.refresh_labels(self.settings.keymap, &self.settings.bindings, mode);
         if command == "navigation.goToLine" {
             if self.view.file_prompt().is_some() {
                 let damage = self.view.set_notice("Finish or cancel the file prompt before Go to Line".into());
@@ -555,6 +559,14 @@ mod tests {
 #[cfg(test)]
 mod command_contract {
     use kwil_core_commands::palette::PaletteAction;
+
+    #[test]
+    fn opening_the_palette_first_still_shows_shortcut_keycaps() {
+        let (mut app, _events) = crate::search_ui::host_dispatch_tests::host("alpha\n");
+        app.menu.labels.clear(); // as at startup, before any menu opened
+        app.dispatch_palette("view.commandPalette");
+        assert_eq!(app.menu.labels.get("file.save").map(String::as_str), Some("Ctrl+S"));
+    }
 
     /// Every command the palette offers runs in the GUI: none may answer
     /// "command not implemented" or panic. Hide unfinished features through
