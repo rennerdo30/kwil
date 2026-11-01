@@ -8,6 +8,7 @@
 //! The wgpu takeover path (DX12 only on Windows) is M1 work (KW-11).
 
 mod about;
+mod accessibility;
 mod binary_offer;
 mod chrome;
 mod clipboard;
@@ -156,6 +157,7 @@ impl std::fmt::Display for GuiError {
 }
 
 enum UserEvent {
+    Accessibility(accesskit_winit::Event),
     FileDialog(notification::Receipt<file_dialog::Event>),
     CloseDialog(notification::Receipt<close_dialog::Reply>),
     HighlightsReady,
@@ -218,7 +220,8 @@ impl UserEvent {
             | Self::LogReady => Policy::Wake,
             #[cfg(windows)]
             Self::ResizeReady => Policy::Wake,
-            Self::PaletteRoot(_)
+            Self::Accessibility(_)
+            | Self::PaletteRoot(_)
             | Self::SettingsPath(_)
             | Self::Notice(_)
             | Self::WindowPlacementLoaded(_)
@@ -247,6 +250,7 @@ impl UserEvent {
     }
     fn notification_name(&self) -> &'static str {
         match self {
+            Self::Accessibility(_) => "Accessibility",
             Self::FileDialog(_) => "FileDialog",
             Self::CloseDialog(_) => "CloseDialog",
             Self::HighlightsReady => "HighlightsReady",
@@ -310,7 +314,13 @@ struct Gfx {
 }
 
 // Actual origin-only owners, moved here after dispatch and retained on failure.
-type OriginUiOwners = (Option<Gfx>, Option<desktop_window::Dialog>, file_dialog::Dialogs, Option<close_dialog::Ticket>);
+type OriginUiOwners = (
+    Option<accessibility::Host>,
+    Option<Gfx>,
+    Option<desktop_window::Dialog>,
+    file_dialog::Dialogs,
+    Option<close_dialog::Ticket>,
+);
 
 #[cfg(feature = "gpu")]
 struct GpuNotificationCallback {
@@ -486,6 +496,8 @@ struct StartupFonts {
 }
 
 struct App {
+    accessibility: Option<accessibility::Host>,
+    accessibility_dirty: bool,
     themes: kwil_view_model::theme_session::ThemeHost,
     theme_hits: Vec<(Rect, usize)>,
     startup_fonts: StartupFonts,
@@ -685,6 +697,8 @@ pub fn run_workspace_with_external_open(
             let frontend_epoch = view.input_epoch();
             let horizontal = view.horizontal_origin();
             Ok(App {
+                accessibility: None,
+                accessibility_dirty: true,
                 themes: Default::default(),
                 theme_hits: Vec::new(),
                 startup_fonts: StartupFonts::default(),
@@ -872,13 +886,14 @@ pub fn run_workspace_with_external_open(
         palette,
         #[cfg(feature = "gpu")]
         gpu,
+        accessibility,
         gfx,
         desktop_window,
         file_dialogs,
         close_dialog,
         ..
     } = std::mem::ManuallyDrop::into_inner(app);
-    origin.retain_owners((gfx, desktop_window, file_dialogs, close_dialog));
+    origin.retain_owners((accessibility, gfx, desktop_window, file_dialogs, close_dialog));
     failure.auxiliary = shutdown::AuxiliaryOwners {
         prep: registration_prep,
         welcome: welcome_worker,
@@ -1394,6 +1409,7 @@ impl App {
     }
 
     fn apply(&mut self, mut d: Damage) {
+        self.accessibility_dirty |= d != Damage::default();
         if self.document_input_blocked() {
             let rows = self.text_rows();
             if self.document.live.update.is_some() {
@@ -2095,6 +2111,7 @@ impl App {
             }
         }
         if let Some(size) = self.pending_resize.take() {
+            self.accessibility_dirty = true;
             self.size = size;
             self.resize_surface();
             let rows = self.text_rows();
@@ -2120,6 +2137,7 @@ impl App {
         self.take_overlay_paint();
         let rows = self.text_rows();
         if rows != self.view.rows() {
+            self.accessibility_dirty = true;
             self.drag = None;
             self.selecting = false;
             let damage = self.view.set_rows(rows);
@@ -3239,6 +3257,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.sync_desktop_window(el);
+        self.accessibility_sync();
         self.sync_close_dialog();
         self.resume_external_open();
         // No timer survives a consumed resize. This is a dirty-geometry wake,
@@ -3282,6 +3301,7 @@ impl ApplicationHandler<UserEvent> for App {
             window_placement::fit_window(&window, placement);
             self.window_normal = Some(placement);
         }
+        self.accessibility = Some(accessibility::Host::new(el, &window, &self.proxy));
         if !self.opts.hidden {
             window.set_visible(true);
         }
@@ -3327,8 +3347,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        self.accessibility_dirty = true;
         self.compare_ready();
         let d = match ev {
+            UserEvent::Accessibility(event) => {
+                self.accessibility_event(el, event);
+                return;
+            }
             UserEvent::StartupFontReady => {
                 self.try_finish_startup(el);
                 return;
@@ -3798,6 +3823,18 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        if !self.desktop_dispatch {
+            if let Some(dialog) = self.desktop_window.as_mut().filter(|d| d.gfx.window.id() == _id) {
+                dialog.accessibility.process(&dialog.gfx.window, &ev);
+            } else if let (Some(host), Some(gfx)) = (&mut self.accessibility, &self.gfx)
+                && gfx.window.id() == _id
+            {
+                host.process(&gfx.window, &ev);
+            }
+        }
+        if !matches!(ev, WindowEvent::RedrawRequested | WindowEvent::CursorMoved { .. }) {
+            self.accessibility_dirty = true;
+        }
         if !self.startup_fonts.finished {
             match ev {
                 WindowEvent::ModifiersChanged(modifiers) => self.mods = modifiers.state(),

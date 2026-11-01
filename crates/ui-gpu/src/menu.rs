@@ -881,6 +881,7 @@ impl App {
         if !matches!((state, self.menu.state), (State::Open { menu: a, .. }, State::Open { menu: b, .. }) if a == b) {
             self.menu.scroll = 0;
         }
+        self.accessibility_dirty = true;
         self.menu.state = state;
         self.menu.cues = cues && state.is_open();
         self.menu_dirty = true;

@@ -360,6 +360,7 @@ fn retain_host(app: crate::App) -> (Box<crate::shutdown::Failure>, crate::Origin
         window_latest,
         about,
         palette,
+        accessibility,
         gfx,
         desktop_window,
         file_dialogs,
@@ -394,7 +395,7 @@ fn retain_host(app: crate::App) -> (Box<crate::shutdown::Failure>, crate::Origin
         external_inbox,
         external_open,
     });
-    (failure, (gfx, desktop_window, file_dialogs, close_dialog))
+    (failure, (accessibility, gfx, desktop_window, file_dialogs, close_dialog))
 }
 
 fn held_font_failed_receiver(caught_panic: bool) {
