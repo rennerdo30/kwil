@@ -725,18 +725,11 @@ pub(crate) mod fixtures {
         }
         pub fn until(&self, workspace: &mut Workspace, done: impl Fn(&Workspace) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(5);
-            let mut last_result = None;
             for _ in 0..512 {
                 if done(workspace) {
                     return;
                 }
-                self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap_or_else(|error| {
-                    panic!(
-                        "real worker wake: {error:?}; last={last_result:?}; KW-76 {}",
-                        workspace.reload_diagnostics()
-                    )
-                });
-                last_result = self.transport.borrow().as_ref().unwrap().result_info();
+                self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("real worker wake");
                 let update = self
                     .transport
                     .borrow_mut()
