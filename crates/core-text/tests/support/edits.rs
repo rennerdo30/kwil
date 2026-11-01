@@ -37,9 +37,9 @@ pub fn check_snapshot(snapshot: &Snapshot, text: &str) {
 
 pub fn check_index(bytes: &[u8], every: u64, split: usize) {
     let split = split.min(bytes.len());
-    let mut index = LineIndex::build(&bytes[..split], every, 1, &AtomicU64::new(0));
-    index.extend(bytes, split as u64);
-    let fresh = LineIndex::build(bytes, every, 1, &AtomicU64::new(0));
+    let mut index = LineIndex::build(&bytes[..split], every, 1, &AtomicU64::new(0)).unwrap();
+    index.extend(bytes, split as u64).unwrap();
+    let fresh = LineIndex::build(bytes, every, 1, &AtomicU64::new(0)).unwrap();
     let lines = starts(bytes);
     assert_eq!(index.line_count(), lines.len() as u64);
     assert_eq!(fresh.line_count(), index.line_count());
