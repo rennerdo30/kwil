@@ -343,10 +343,11 @@ impl TextFile {
         matches!(self.shared.bytes, Bytes::Owned(_))
     }
 
-    /// The user chose their version over an external change ("overwrite with
-    /// my version"). A resident copy cannot be changed by external writers, so
-    /// reads continue from it instead of refusing. Mapped views can go stale
-    /// and stay refused: returns false for them.
+    /// Retain existing resident bytes independently of external writers, for
+    /// recovery snapshots or an explicit "overwrite with my version" choice.
+    /// Reads use this immutable copy; check() still checks the live path, so
+    /// this grants no permission to overwrite it. Mapped views stay guarded:
+    /// returns false for them.
     pub fn keep_private_copy(&self) -> bool {
         if self.is_resident() {
             self.shared.detached.store(true, Ordering::Release);

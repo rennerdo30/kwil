@@ -1374,6 +1374,13 @@ impl Workspace {
                     continue;
                 }
             }
+            // Recovery must finish reading an admitted resident snapshot even
+            // after an external writer changes its path. This retains existing
+            // immutable bytes only; mapped reads stay guarded and check() still
+            // detects live-path conflicts before a save.
+            if let Some(original) = &editor.document().original {
+                original.keep_private_copy();
+            }
             self.files.observed.insert(document, (next, generation));
             let seed = self.hex.seed.remove(&document)
                 || editor.document().representation() == crate::hex_session::Representation::RawBytes;
@@ -3332,6 +3339,62 @@ mod replacement_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_receipt_keeps_resident_original_after_external_change_but_refuses_changed_maps() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for mapped in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "kwil-journal-original-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("notes.txt");
+            std::fs::write(&path, b"original\n").unwrap();
+            {
+                let file = if mapped {
+                    kwil_core_text::TextFile::open_saved_version(&path).unwrap()
+                } else {
+                    kwil_core_text::TextFile::open(&path).unwrap()
+                };
+                file.build_index(1).unwrap();
+                let mut workspace = Workspace::new(View::new(Some((path.clone(), file.clone())))).unwrap();
+                let (worker, receiver) = DocumentWorker::replacement_test_channel(8);
+                workspace.files.worker = Some(worker);
+                workspace.files.storage_ready = true;
+                workspace.install_journal_observers();
+                edit(&mut workspace, "mine ");
+                let DocumentRequest::Journal { receipt, .. } = receiver.try_recv().unwrap() else {
+                    panic!("the edit must retain its original recovery snapshot")
+                };
+                // Hold the admitted receipt until the source changes: the worker
+                // must be able to finish this old base before a reload replaces it.
+                std::fs::rename(&path, root.join("previous.txt")).unwrap();
+                std::fs::write(&path, b"changed outside\n").unwrap();
+                assert_ne!(
+                    file.check().unwrap(),
+                    kwil_core_text::FileState::Unchanged,
+                    "save conflict detection must still check the live destination"
+                );
+                let mut bytes = Vec::new();
+                let result = receipt.before.write_to(&mut bytes);
+                if mapped {
+                    assert!(result.is_err(), "changed mappings must still refuse reads");
+                } else {
+                    result.expect("recovery must read the immutable resident original after the path changes");
+                    assert_eq!(bytes, b"original\n");
+                    bytes.clear();
+                    receipt.after.write_to(&mut bytes).unwrap();
+                    assert_eq!(bytes, b"mine original\n");
+                }
+            }
+            std::fs::remove_file(&path).unwrap();
+            std::fs::remove_file(root.join("previous.txt")).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
+    }
 
     #[test]
     fn recovery_merge_never_replays_text_line_navigation_into_raw_bytes() {
