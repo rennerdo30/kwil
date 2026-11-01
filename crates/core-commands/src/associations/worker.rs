@@ -71,6 +71,12 @@ pub enum Request {
         token: PlanToken,
     },
     Status,
+    /// Read complete Windows bindings, including types absent from the receipt.
+    /// Catalog, selection, previous observation and receipt rows are bounded.
+    WindowsStatus {
+        executable: PathBuf,
+        extensions: Vec<String>,
+    },
     /// Uses the durable receipt, including after restarting the service.
     Undo {
         journal_id: u64,
@@ -140,6 +146,7 @@ pub enum Response {
     Cancelled,
     Undone { journal_id: u64 },
     Status(Status),
+    WindowsStatus { status: Status, registered: Vec<String> },
 }
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -255,6 +262,13 @@ impl AssociationWorker {
     pub fn try_submit(&self, request: Request) -> Result<RequestId, SubmitError> {
         if let Request::Plan(request) = &request
             && !bounded_request(request)
+        {
+            return Err(SubmitError::TooLarge);
+        }
+        if let Request::WindowsStatus { executable, extensions } = &request
+            && (!bounded_path(executable)
+                || extensions.len() > super::MAX_TYPES * 4
+                || extensions.iter().any(|e| e.len() > crate::file_types::MAX_EXTENSION_BYTES))
         {
             return Err(SubmitError::TooLarge);
         }
@@ -440,6 +454,36 @@ impl<A: AssociationAdapter> Engine<A> {
                 self.journal.retire()?;
                 self.pending = None;
                 Ok(Response::Undone { journal_id })
+            }
+            Request::WindowsStatus { executable, extensions } => {
+                if !executable.is_absolute() || !bounded_path(&executable) || extensions.len() > super::MAX_TYPES * 4 {
+                    return Err(failure("Windows inspection exceeds bounds"));
+                }
+                // Reuse the exact registration contract without creating a plan
+                // token or changing the retained receipt. Never write native data.
+                let mut registered = Vec::new();
+                for extension in extensions {
+                    let request = AssociationRequest {
+                        platform: super::AssociationPlatform::Windows,
+                        executable: executable.clone(),
+                        default_choice: super::DefaultChoice::KeepCurrent,
+                        types: vec![super::FileType { extension: extension.clone(), content_type: None }],
+                    };
+                    let plan = super::plan(&mut self.adapter, &request)?;
+                    // A different document description cannot break Open with;
+                    // the membership and launch command are the usable binding.
+                    if !plan.changes().iter().any(|change| {
+                        matches!(
+                            &change.location,
+                            super::Location::WindowsValue { subkey, .. }
+                                if subkey.starts_with('.') || subkey.ends_with("\\command")
+                        )
+                    }) {
+                        registered.push(extension);
+                    }
+                }
+                let Response::Status(status) = self.run(Request::Status)? else { unreachable!() };
+                Ok(Response::WindowsStatus { status, registered })
             }
             Request::Status => {
                 let recovery = self.journal.active.as_ref().map(|r| RecoveryStatus {

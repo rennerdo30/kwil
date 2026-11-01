@@ -5,6 +5,53 @@ use crate::associations::{
 };
 
 #[test]
+fn file_types_windows_execution_and_system_denylist_is_explicit() {
+    let all = Selection::new(Preset::AllTextTypes);
+    // Independent of the implementation list: removing a guard must fail here.
+    for denied in [
+        "exe",
+        "com",
+        "bat",
+        "cmd",
+        "ps1",
+        "vbs",
+        "js",
+        "msi",
+        "lnk",
+        "scr",
+        "pif",
+        "cpl",
+        "reg",
+        "inf",
+        "hta",
+        "wsf",
+        "wsh",
+        "jse",
+        "vbe",
+        "application",
+        "appref-ms",
+        "search-ms",
+        "library-ms",
+        "settingcontent-ms",
+        "diagcab",
+        "msc",
+        "theme",
+        "themepack",
+        "appinstaller",
+        "msu",
+        "mst",
+        "searchconnector-ms",
+        "sct",
+        "wsc",
+        "shb",
+        "shs",
+    ] {
+        assert!(UNSAFE_REGISTRATION_EXTENSIONS.contains(&denied), "missing explicit deny: {denied}");
+        assert!(!all.contains(&Extension::parse(denied).unwrap()), "bulk selected {denied}");
+    }
+}
+
+#[test]
 fn file_types_catalog_is_broad_unique_and_contains_owner_named_extensions() {
     let _admission_case = crate::associations::test_admission_guard();
     let all = Selection::new(Preset::AllTextTypes);

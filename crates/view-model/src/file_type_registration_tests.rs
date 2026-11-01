@@ -674,6 +674,7 @@ fn registration_apply_remove_all_and_reapply_show_the_real_state() {
     h.session().remove_all().unwrap();
     assert!(matches!(h.settle(), RegistrationStatus::Unregistered { .. }));
     assert!(h.fake.lock().unwrap().values.is_empty(), "nothing of Kwil stays registered");
+    assert!(h.session().selection().extensions().is_empty(), "unregister clears stale checks immediately");
     // Reopening the page asks the worker again: it must not claim a registration.
     h.session().status().unwrap();
     assert!(matches!(h.settle(), RegistrationStatus::NoRetainedReceipt { .. }));
@@ -740,4 +741,89 @@ fn registration_status_resets_checkboxes_to_what_is_registered() {
     assert!(matches!(h.settle(), RegistrationStatus::RetainedRecovery { .. }));
     assert_eq!(names(Some(h.session().selection().extensions())), ["txt"]);
     assert!(h.session().has_registration());
+}
+
+#[test]
+fn registration_status_checks_all_bindings_even_without_a_receipt() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    // Simulate a registration from an earlier journal, without touching the OS.
+    let request = AssociationRequest {
+        platform: AssociationPlatform::Windows,
+        executable: h.journal.join("kwil-test.exe"),
+        default_choice: DefaultChoice::KeepCurrent,
+        types: vec![FileType { extension: "txt".into(), content_type: None }],
+    };
+    let mut fake = Fake(h.fake.clone());
+    let plan = kwil_core_commands::associations::plan(&mut fake, &request).unwrap();
+    let _receipt = kwil_core_commands::associations::apply(&mut fake, &plan).unwrap();
+    let writes = h.fake.lock().unwrap().writes;
+    h.session().status().unwrap();
+    h.settle();
+    assert_eq!(names(h.session().registered()), ["txt"], "status must inspect OS bindings, not receipts");
+    // Open-with alone is not enough: the command must also remain usable.
+    h.fake
+        .lock()
+        .unwrap()
+        .values
+        .retain(|(key, _)| !matches!(key, Location::WindowsValue { subkey, .. } if subkey.ends_with("\\command")));
+    h.session().status().unwrap();
+    h.settle();
+    assert!(h.session().registered().unwrap().is_empty());
+    assert_eq!(h.fake.lock().unwrap().writes, writes, "status is read-only");
+}
+
+#[test]
+fn registration_selected_actions_preserve_unselected_types_and_previous_handlers() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    let key = Location::WindowsValue { subkey: "Kwil.txt\\shell\\open\\command".into(), name: String::new() };
+    let previous = StoredValue { kind: 1, bytes: b"previous handler".to_vec() };
+    h.fake.lock().unwrap().values.push((key.clone(), previous.clone()));
+    h.session().status().unwrap();
+    h.settle();
+    *h.session().selection_mut() = Selection::new(Preset::PlainTextOnly);
+    h.session().register_checked().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+
+    let writes = h.fake.lock().unwrap().writes;
+    h.session().register_checked().unwrap();
+    h.settle();
+    assert_eq!(h.fake.lock().unwrap().writes, writes, "registering the same types is read-only");
+
+    *h.session().selection_mut() = Selection::default();
+    h.session().selection_mut().add_custom("md").unwrap();
+    h.session().register_checked().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    assert_eq!(h.open_with(), ["log", "md", "text", "txt"]);
+
+    *h.session().selection_mut() = Selection::default();
+    h.session().selection_mut().add_custom("txt").unwrap();
+    h.session().unregister_checked().unwrap();
+    h.settle();
+    assert_eq!(h.open_with(), ["log", "md", "text"]);
+    assert_eq!(names(h.session().registered()), ["log", "md", "text"]);
+    assert!(h.fake.lock().unwrap().values.contains(&(key, previous)), "exact prior handler restored");
+}
+
+#[test]
+fn registration_bulk_action_uses_only_the_safe_catalog_and_keeps_custom_types() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    h.session().state_mut().context.limits = RegistrationLimits::RootAdopted256;
+    h.session().status().unwrap();
+    h.settle();
+    h.session().selection_mut().add_custom("kwilcfg").unwrap();
+    h.session().register_checked().unwrap();
+    h.settle();
+    h.session().register_all_text().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    let registered = h.open_with();
+    assert!(registered.iter().any(|e| e == "kwilcfg"));
+    for entry in kwil_core_commands::file_types::catalog() {
+        assert!(registered.iter().any(|e| e == entry.extension));
+    }
+    for denied in kwil_core_commands::file_types::UNSAFE_REGISTRATION_EXTENSIONS {
+        assert!(!registered.iter().any(|e| e == denied), "bulk registered {denied}");
+    }
 }

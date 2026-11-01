@@ -1,7 +1,7 @@
 //! "Register file types" page inside the settings window, over the
 //! `file_type_registration` service (KW46). The checkboxes start from what is
-//! really registered; "Apply" makes the OS match them and "Remove all" undoes
-//! everything (owner, 2026-10-29, KW-72). This page never claims an
+//! really registered; explicit register/unregister actions act on the selection.
+//! This page never claims an
 //! operating-system result the service has not reported: Windows registers
 //! "Open with" only and the default app stays the user's choice in Settings.
 //!
@@ -11,9 +11,7 @@
 use super::*;
 use desktop::{Colors, Field, Hits, Sizes, Style, inset};
 use kwil_core_commands::file_types::{self, Extension, Group, Preset, Selection};
-use kwil_view_model::file_type_registration::{
-    ActionError, ActionErrorKind, ExtensionOutcome, FileTypeRegistration, RegistrationStatus,
-};
+use kwil_view_model::file_type_registration::{ActionError, ActionErrorKind, FileTypeRegistration, RegistrationStatus};
 use settings_ui::{HostedPage, Target};
 
 const PRESET: u32 = 0x1000_0000;
@@ -24,6 +22,7 @@ const PRIMARY: u32 = 1;
 const UNREGISTER: u32 = 3;
 const ADD: u32 = 4;
 const FIELD: u32 = 5;
+const REGISTER_ALL: u32 = 6;
 const MASK: u32 = 0xf000_0000;
 
 const PRESETS: [(Preset, &str); 4] = [
@@ -101,7 +100,7 @@ fn status_text(service: &FileTypeRegistration) -> (String, bool) {
     }
     match service.registered() {
         Some([]) if service.has_registration() => {
-            ("Some Kwil entries are left over. “Remove all” cleans them up.".into(), true)
+            ("Some Kwil entries need attention. Select their types and unregister to retry.".into(), true)
         }
         Some([]) => ("No file types registered.".into(), false),
         Some(types) => {
@@ -110,34 +109,18 @@ fn status_text(service: &FileTypeRegistration) -> (String, bool) {
         }
         // The receipt cannot name single types (Linux), or no status yet.
         None if service.has_registration() => ("Kwil is registered.".into(), false),
-        None => ("No file types registered.".into(), false),
+        None => ("Checking file types…".into(), false),
     }
 }
 
-/// "Apply will add 3, remove 2.", or None when the checkboxes match the real state.
-fn change_text(service: &FileTypeRegistration) -> Option<String> {
-    let (add, remove) = service.change_counts();
-    let mut parts = Vec::new();
-    if add > 0 {
-        parts.push(format!("add {add}"));
-    }
-    if remove > 0 {
-        parts.push(format!("remove {remove}"));
-    }
-    (!parts.is_empty()).then(|| format!("Apply will {}.", parts.join(", ")))
-}
-
-fn outcome_mark(outcome: ExtensionOutcome) -> Option<bool> {
-    // Some(false) = success mark, Some(true) = needs attention.
-    match outcome {
-        ExtensionOutcome::ReceiptApplied | ExtensionOutcome::UnchangedAtPreview => None,
-        ExtensionOutcome::VerificationIncomplete
-        | ExtensionOutcome::NeedsInspection
-        | ExtensionOutcome::PartiallyApplied
-        | ExtensionOutcome::Conflict
-        | ExtensionOutcome::Unreadable => Some(true),
-        ExtensionOutcome::Planned | ExtensionOutcome::RestoredVisible => None,
-    }
+fn type_label(service: &FileTypeRegistration, extension: &Extension) -> String {
+    let state =
+        match service.registered().filter(|_| !matches!(service.registration_status(), RegistrationStatus::Pending)) {
+            Some(types) if types.contains(extension) => "In Open with",
+            Some(_) => "Not registered",
+            None => "Not checked",
+        };
+    format!(".{} · {state}", extension.as_str())
 }
 
 /// Page-local state: custom-extension draft and scroll. Everything else is
@@ -194,7 +177,7 @@ fn lines(selection: &Selection, columns: usize) -> Vec<Line> {
 
 impl HostedPage for Page {
     fn title(&self) -> &'static str {
-        "Register file types"
+        "File types"
     }
     fn summary(&self) -> String {
         let (status, _) = status_text(&self.service);
@@ -270,53 +253,16 @@ impl HostedPage for Page {
         desktop::button(buf, stride, font, add, "Add", Style::Secondary, hot(ADD), c, s);
         hits.push(add, Target::Hosted(ADD));
         y += s.control + s.gap;
-        // Bottom bar: the real state and the two actions.
-        let bottom = Rect { x: area.x, y: (area.y + area.h).saturating_sub(s.control), w: area.w, h: s.control };
-        let pending = matches!(self.service.registration_status(), RegistrationStatus::Pending);
-        let changes = change_text(&self.service);
-        let mut x = bottom.x + bottom.w;
-        let mut action = |x: &mut usize, label: &str, style, code| {
-            let w = desktop::button_width(font, label, s);
-            *x = x.saturating_sub(w);
-            let r = Rect { x: *x, w, ..bottom };
-            desktop::button(buf, stride, font, r, label, style, hot(code), c, s);
-            hits.push(r, Target::Hosted(code));
-            *x = x.saturating_sub(s.gap);
-        };
-        if !pending {
-            if changes.is_some() {
-                action(&mut x, "Apply", Style::Primary, PRIMARY);
-            }
-            if self.service.has_registration() {
-                action(&mut x, "Remove all", Style::Danger, UNREGISTER);
-            }
-        }
-        let (state, attention) = status_text(&self.service);
-        let text = Rect { x: bottom.x, w: x.saturating_sub(bottom.x + s.gap), ..bottom };
-        desktop::label(buf, stride, font, text, &state, if attention { c.error } else { c.muted });
-        // What Apply will do, or an error, above the bar.
-        let mut bottom_y = bottom.y.saturating_sub(s.gap);
-        let message = self.ui.error.clone().map(|e| (e, true)).or_else(|| changes.map(|text| (text, false)));
-        if let Some((message, error)) = message {
-            let wrapped = desktop::wrap(font, &message, area.w, 2);
-            bottom_y = bottom_y.saturating_sub(wrapped.len() * s.text);
-            for (i, line) in wrapped.iter().enumerate() {
-                let r = Rect { x: area.x, y: bottom_y + i * s.text, w: area.w, h: s.text };
-                desktop::label(buf, stride, font, r, line, if error { c.error } else { c.fg });
-            }
-            bottom_y = bottom_y.saturating_sub(s.gap);
-        }
+        let bottom_y = self.draw_actions(buf, stride, font, area, c, s, hover, hits);
         // Scrollable grid of the catalog, bounded to the visible lines.
         let list = Rect { x: area.x, y, w: area.w, h: bottom_y.saturating_sub(y) };
-        let cell_w = (s.control * 4).max(1);
+        let cell_w = (s.control * 9).min(list.w.saturating_sub(s.thumb + s.gap)).max(1);
         let columns = (list.w.saturating_sub(s.thumb + s.gap) / cell_w).max(1);
         let row_h = s.nav;
         let all = lines(self.service.selection(), columns);
         let visible = (list.h / row_h).max(1);
         self.ui.scroll = self.ui.scroll.min(all.len().saturating_sub(visible));
         self.ui.rows = (visible, all.len());
-        let statuses = self.service.extension_status();
-        let registered = self.service.registered().unwrap_or_default();
         for (slot, line) in all.iter().skip(self.ui.scroll).take(visible).enumerate() {
             let r = Rect { x: list.x, y: list.y + slot * row_h, w: list.w.saturating_sub(s.thumb + s.gap), h: row_h };
             if r.y + r.h > list.y + list.h {
@@ -349,24 +295,8 @@ impl HostedPage for Page {
                         };
                         let Some(extension) = extension else { continue };
                         let checked = self.service.selection().contains(&extension);
-                        let text = format!(".{}", extension.as_str());
+                        let text = type_label(&self.service, &extension);
                         desktop::checkbox(buf, stride, font, cell, &text, checked, hot(*code), true, c, s);
-                        // Accent dot: registered right now. Error dot: needs attention.
-                        let problem = statuses
-                            .iter()
-                            .find(|status| status.extension == extension)
-                            .and_then(|status| outcome_mark(status.outcome));
-                        let mark = problem.or(registered.contains(&extension).then_some(false));
-                        if let Some(mark) = mark {
-                            let center = ((cell.x + cell.w) as f32 - s.gap as f32, cell.y as f32 + cell.h as f32 / 2.0);
-                            chrome::disc(
-                                buf,
-                                stride,
-                                center,
-                                s.gap as f32 / 3.0,
-                                if mark { c.error } else { c.accent },
-                            );
-                        }
                         hits.push(cell, Target::Hosted(*code));
                     }
                 }
@@ -386,6 +316,74 @@ impl HostedPage for Page {
 }
 
 impl Page {
+    /// Keep all three actions visible. Wrap whole buttons on narrow pages.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_actions(
+        &self,
+        buf: &mut [u32],
+        stride: usize,
+        font: &mut font::UiFont,
+        area: Rect,
+        c: &Colors,
+        s: &Sizes,
+        hover: Option<u32>,
+        hits: &mut Hits<Target>,
+    ) -> usize {
+        let actions = [
+            (PRIMARY, "Register selected", Style::Primary),
+            (UNREGISTER, "Unregister selected", Style::Danger),
+            (REGISTER_ALL, "Register all text types", Style::Secondary),
+        ];
+        let mut placed = Vec::new();
+        let (mut x, mut row) = (0, 0);
+        for (code, label, style) in actions {
+            let w = desktop::button_width(font, label, s).min(area.w);
+            if x > 0 && x + w > area.w {
+                row += 1;
+                x = 0;
+            }
+            placed.push((code, label, style, x, row, w));
+            x += w + s.gap;
+        }
+        let height = (row + 1) * (s.control + s.gap) - s.gap;
+        let y = (area.y + area.h).saturating_sub(height);
+        let ready = self.service.registered().is_some()
+            && !matches!(self.service.registration_status(), RegistrationStatus::Pending);
+        for (code, label, style, x, row, w) in placed {
+            let active = ready && (code == REGISTER_ALL || !self.service.selection().extensions().is_empty());
+            let r = Rect { x: area.x + x, y: y + row * (s.control + s.gap), w, h: s.control };
+            desktop::button(
+                buf,
+                stride,
+                font,
+                r,
+                label,
+                if active { style } else { Style::Subtle },
+                hover == Some(code),
+                c,
+                s,
+            );
+            if active {
+                hits.push(r, Target::Hosted(code));
+            }
+        }
+        let (state, attention) = status_text(&self.service);
+        let text = self.ui.error.as_deref().unwrap_or(&state);
+        let wrapped = desktop::wrap(font, text, area.w, 2);
+        let top = y.saturating_sub(s.gap + wrapped.len() * s.text);
+        for (index, line) in wrapped.iter().enumerate() {
+            let r = Rect { x: area.x, y: top + index * s.text, w: area.w, h: s.text };
+            desktop::label(
+                buf,
+                stride,
+                font,
+                r,
+                line,
+                if attention || self.ui.error.is_some() { c.error } else { c.muted },
+            );
+        }
+        top.saturating_sub(s.gap)
+    }
     /// Small windows scroll the entire form, not just the extension grid. The
     /// explicit action stays in its own reserved row and cannot cover a field.
     #[allow(clippy::too_many_arguments)]
@@ -404,9 +402,9 @@ impl Page {
         if area.h < s.control {
             return;
         }
-        let bottom = Rect { y: area.y + area.h - s.control, h: s.control, ..area };
-        let top = Rect { h: bottom.y.saturating_sub(area.y + s.hairline * 2), ..area };
-        let columns = (top.w.saturating_sub(s.thumb + s.gap) / (s.control * 3).max(1)).max(1);
+        let bottom_y = self.draw_actions(buf, stride, font, area, c, s, hover, hits);
+        let top = Rect { h: bottom_y.saturating_sub(area.y + s.hairline * 2), ..area };
+        let columns = (top.w.saturating_sub(s.thumb + s.gap) / (s.control * 9).max(1)).max(1);
         let rows = lines(self.service.selection(), columns);
         let notes = if self.service.registers_build_folder() {
             desktop::wrap(font, BUILD_NOTE, top.w.saturating_sub(s.thumb + s.gap), 4)
@@ -507,7 +505,7 @@ impl Page {
                                     stride,
                                     font,
                                     r,
-                                    &format!(".{}", extension.as_str()),
+                                    &type_label(&self.service, &extension),
                                     self.service.selection().contains(&extension),
                                     hover == Some(*code),
                                     true,
@@ -530,36 +528,6 @@ impl Page {
             total,
             c,
             s,
-        );
-        if matches!(self.service.registration_status(), RegistrationStatus::Pending) {
-            desktop::label(buf, stride, font, bottom, "Working…", c.muted);
-            return;
-        }
-        let changes = change_text(&self.service);
-        let (code, label, style) = if changes.is_some() {
-            (PRIMARY, "Apply", Style::Primary)
-        } else if self.service.has_registration() {
-            (UNREGISTER, "Remove all", Style::Danger)
-        } else {
-            (0, "", Style::Primary)
-        };
-        let mut left = bottom.x + bottom.w;
-        if !label.is_empty() {
-            let width = desktop::button_width(font, label, s).min(bottom.w);
-            let action = Rect { x: bottom.x + bottom.w - width, w: width, ..bottom };
-            desktop::button(buf, stride, font, action, label, style, hover == Some(code), c, s);
-            hits.push(action, Target::Hosted(code));
-            left = action.x;
-        }
-        let (state, attention) = status_text(&self.service);
-        let summary = self.ui.error.clone().or(changes).unwrap_or(state);
-        desktop::label(
-            buf,
-            stride,
-            font,
-            Rect { w: left.saturating_sub(bottom.x + s.gap), ..bottom },
-            &summary,
-            if self.ui.error.is_some() || attention { c.error } else { c.muted },
         );
     }
     pub(super) fn custom_focused(&self) -> bool {
@@ -618,8 +586,9 @@ impl Page {
                 Ok(())
             }
             (_, ADD) => self.add_custom(),
-            (_, PRIMARY) => self.service.apply().map_err(|e| error_text(&e)),
-            (_, UNREGISTER) => self.service.remove_all().map_err(|e| error_text(&e)),
+            (_, PRIMARY) => self.service.register_checked().map_err(|e| error_text(&e)),
+            (_, UNREGISTER) => self.service.unregister_checked().map_err(|e| error_text(&e)),
+            (_, REGISTER_ALL) => self.service.register_all_text().map_err(|e| error_text(&e)),
             _ => Ok(()),
         };
         if code != FIELD && code != ADD && code != (PRESET | 3) {
