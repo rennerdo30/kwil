@@ -43,3 +43,38 @@ The existing formatter limits apply: 16 MiB input, 64 MiB output and at most
 120 seconds per process. Invalid UTF-8, process errors, timeouts and unsupported
 selections preserve the document and undo history. Unsupported built-in ranges
 report that limitation. Settings reloads apply to the next formatting command.
+
+## YAML safety evaluation (KW-43, 2026-11-02)
+
+Keep the current byte-preserving YAML formatter. The current stable
+[`pretty_yaml` 0.6.0](https://crates.io/crates/pretty_yaml/0.6.0) is
+[MIT-licensed](https://github.com/g-plane/pretty_yaml/blob/main/LICENSE), but its
+default `format_text(input, &FormatOptions::default())` changes scalar values.
+An isolated evaluation compared all document values before and after using
+`serde_yaml` 0.9.34 (an independent libyaml parser, evaluation only):
+
+| Input (escaped newlines) | Scalar before | Scalar after |
+| --- | --- | --- |
+| `a: \|+\n  text` | `"text"` | `"text\n"` |
+| `a: \|+\n  text\n\n\n` | `"text\n\n\n"` | `"text\n"` |
+| `a: \|-\n  text  \n  more\n` | `"text  \nmore"` | `"text\nmore"` |
+| `# windows\r\na: \|+\r\n  keep  \r\n\r\n` | `"keep  \n\n"` | `"keep\n"` |
+
+Of 16 valid fixtures, 12 retained parsed values and four did not. Passing cases
+covered anchors/aliases/merge keys, multiple documents, YAML directives and
+explicit/custom tags, folded scalars, flow collections with comments, multiline
+quoted strings, implicit scalar types, explicit complex keys, comment-only and
+empty input, a root scalar, and nested mappings/sequences. All fixture comment
+texts and anchor/alias spellings were retained. Merge keys were compared as
+parsed nodes, without resolving merge semantics. This finite sample is not a
+proof for every YAML dialect or graph; the scalar counterexamples already fail
+the adoption requirement. The deprecated semantic parser stays outside the
+workspace, as does the rejected candidate; neither adds shipping dependencies.
+
+No candidate large-file benchmark was needed after semantic rejection. Existing
+formatting still runs on the document worker, checks the 16 MiB input ceiling
+before collecting text, and caps output at 64 MiB. YAML retains every input byte,
+including EOF, comments, indentation, trailing spaces and line endings, and
+reports the existing structural-formatting limitation. An explicitly configured
+external YAML formatter remains an opt-in override with the existing process
+timeout and size limits.
