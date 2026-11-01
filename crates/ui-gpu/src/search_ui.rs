@@ -138,7 +138,7 @@ pub(super) fn draw(
     let help = if panel.mode() == SearchMode::Replace {
         "Enter Next  Shift+Enter Previous  Ctrl+Enter Replace  Ctrl+Shift+Enter All  Esc Close"
     } else if panel.mode() == SearchMode::Files {
-        "Enter Open  PgUp/PgDn Results  Tab Field  Esc Close"
+        "Enter Toggle  Ctrl+Enter Preview  Ctrl+Shift+Enter Apply  PgUp/PgDn Results  Esc Close"
     } else {
         "Enter Next  Shift+Enter Previous  Ctrl+D Add cursor  Tab Field  Esc Close"
     };
@@ -164,7 +164,7 @@ fn input_for_key<'a>(
                 SearchInput::NextField
             }
         }
-        Key::Named(NamedKey::Enter) if ctrl && panel.mode() == SearchMode::Replace => {
+        Key::Named(NamedKey::Enter) if ctrl && matches!(panel.mode(), SearchMode::Replace | SearchMode::Files) => {
             if mods.shift_key() {
                 SearchInput::ReplaceAll
             } else {
@@ -510,7 +510,11 @@ impl App {
         if self.search_panel.mode() == SearchMode::Files
             && let Some(session) = &self.search
         {
-            self.search_view.sync_query(session, &self.search_panel);
+            if self.search_panel.folder_preview() {
+                self.search_view.capture_results(session, &self.search_panel);
+            } else {
+                self.search_view.sync_query(session, &self.search_panel);
+            }
         }
         if outcome.damage.status {
             self.view.set_notice(if outcome.damage.restore_editor {
@@ -545,8 +549,29 @@ impl App {
     }
     fn search_action(&mut self, action: kwil_view_model::search_session::SearchAction) {
         use kwil_view_model::search_session::{SearchAction, SelectionMode};
+        let folder_action = self.search_panel.folder_replacement_action(&action);
         self.wrap_sync_live();
         if !self.wrap_mutation_allowed() {
+            if folder_action {
+                self.search_panel
+                    .folder_failed("Folder replacement stopped while wrapping settles; preview again".into());
+            }
+            return;
+        }
+        if matches!(action, SearchAction::FolderClosed { .. })
+            && self
+                .search
+                .as_ref()
+                .is_none_or(|session| !self.search_panel.validate_action(session, &self.view, &action))
+        {
+            self.search_panel.folder_failed("Folder action changed before admission".into());
+            return;
+        }
+        if let SearchAction::FolderClosed { key, index, offset, plan, cancel } = action {
+            if let Err(error) = self.view.submit_folder_closed(key.generation, index, offset, plan, cancel) {
+                self.search_panel.folder_failed(error.to_string());
+                self.search_notice(error.to_string());
+            }
             return;
         }
         let painted_file =
@@ -556,8 +581,12 @@ impl App {
                 .search
                 .as_ref()
                 .is_none_or(|session| !self.search_panel.validate_action(session, &self.view, &action))
-            || self.search_origin.as_ref().is_none_or(|origin| !origin.matches(&self.view))
+            || (!self.search_panel.folder_replacement_action(&action)
+                && self.search_origin.as_ref().is_none_or(|origin| !origin.matches(&self.view)))
         {
+            if folder_action {
+                self.search_panel.folder_failed("Folder replacement target changed; preview again".into());
+            }
             self.search_notice("Search navigation cancelled: its document, query or cursor changed".into());
             return;
         }
@@ -588,7 +617,12 @@ impl App {
                     self.search_ime = None;
                     self.search_outcome(outcome);
                 }
-                Err(error) => self.search_notice(format!("Replacement was not admitted: {error}")),
+                Err(error) => {
+                    if folder_action {
+                        self.search_panel.folder_failed(error.to_string());
+                    }
+                    self.search_notice(format!("Replacement was not admitted: {error}"));
+                }
             }
             return;
         }
@@ -641,6 +675,7 @@ impl App {
             SearchAction::OpenFile { .. } => {
                 unreachable!("native folder action was consumed above")
             }
+            SearchAction::FolderClosed { .. } => unreachable!(),
             SearchAction::Replace(_) => {
                 unreachable!("owned recipe was consumed by worker admission")
             }
@@ -1160,8 +1195,8 @@ pub(crate) mod host_dispatch_tests {
         finish(&mut app, &rx);
         assert_eq!(app.search.as_ref().unwrap().state().file_first, first);
         assert!(app.dispatch_search("search.replaceInFiles"));
-        assert!(app.search_panel.status().contains("atomic"));
-        assert_eq!(bytes(&app), b"", "unavailable folder replacement never edits a document");
+        assert_eq!(app.search_panel.field(), SearchField::Replacement);
+        assert_eq!(bytes(&app), b"", "opening folder replacement waits for explicit preview and apply");
         app.search_input(SearchInput::Cancel);
         assert!(!app.search_panel.is_open());
         assert!(app.search_panel.results().is_empty());
@@ -1708,6 +1743,39 @@ pub(crate) mod host_dispatch_tests {
     }
 
     #[test]
+    fn actual_host_folder_replace_preview_exclude_apply() {
+        let (mut app, rx, root) = worker_host("retain editor");
+        let tree = root.join("folder-replace");
+        std::fs::create_dir(&tree).unwrap();
+        let a = tree.join("a.txt");
+        let b = tree.join("b.txt");
+        std::fs::write(&a, b"x12\r\nx34\n").unwrap();
+        std::fs::write(&b, b"x56\n").unwrap();
+        app.set_search_root(tree);
+        app.settings.search.regex = true;
+        app.dispatch_search("search.replaceInFiles");
+        folder_query(&mut app, "x([0-9]+)");
+        finish(&mut app, &rx);
+        app.search_input(SearchInput::Focus(SearchField::Replacement));
+        app.search_input(SearchInput::SelectAll);
+        app.search_input(SearchInput::Text("y${1}$$"));
+        app.search_input(SearchInput::ReplaceNext);
+        finish(&mut app, &rx);
+        assert_eq!(app.search_panel.count(), (3, true));
+        assert!(app.search_panel.folder_preview());
+        let excluded = app.search_panel.results().iter().position(|r| r.label.contains("b.txt")).unwrap();
+        app.search_view.paint_test_rows(&app.search_panel, Rect { x: 0, y: 0, w: 100, h: 100 });
+        app.search_input(SearchInput::SelectRow(excluded));
+        assert!(app.search_panel.results()[excluded].label.starts_with("[ ]"));
+        app.search_input(SearchInput::ReplaceAll);
+        finish(&mut app, &rx);
+        assert_eq!(std::fs::read(a).unwrap(), b"y12$\r\ny34$\n");
+        assert_eq!(std::fs::read(b).unwrap(), b"x56\n");
+        assert_eq!(bytes(&app), b"retain editor");
+        worker_stop(app, rx, root);
+    }
+
+    #[test]
     fn actual_host_replacement_all_worker_completion_and_one_undo_redo() {
         let original = b"one two one one";
         let (mut app, rx, root) = worker_host(std::str::from_utf8(original).unwrap());
@@ -1774,8 +1842,8 @@ pub(crate) mod host_dispatch_tests {
         assert_eq!(app.search_panel.count(), (2, true));
         assert!(!app.search_panel.status().contains("Replacement complete"));
         assert!(app.dispatch_search("search.replaceInFiles"));
-        assert!(app.search_panel.status().contains("Folder"));
-        assert_eq!(bytes(&app), b"x x", "unsupported folder replacement never edits the active file");
+        assert_eq!(app.search_panel.field(), SearchField::Replacement);
+        assert_eq!(bytes(&app), b"x x", "opening folder replacement never edits the active file");
         worker_stop(app, rx, root);
     }
 

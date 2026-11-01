@@ -170,11 +170,15 @@ impl View {
             .map(|(index, row)| match row {
                 FileEvent::Hit(hit) => FileRow {
                     ticket: session.file_action(index, 0).and_then(FileTicket::from_action),
-                    label: format!(
-                        "{}:{}",
-                        desktop::visible(&panel.result_path(&hit.path).to_string_lossy(), 256),
-                        hit.line_number
-                    ),
+                    label: if panel.folder_preview() {
+                        panel.results()[index].label.clone()
+                    } else {
+                        format!(
+                            "{}:{}",
+                            desktop::visible(&panel.result_path(&hit.path).to_string_lossy(), 256),
+                            hit.line_number
+                        )
+                    },
                     preview: desktop::visible(&String::from_utf8_lossy(&hit.line), 256),
                 },
                 FileEvent::Error { path, message } => FileRow {
@@ -270,8 +274,13 @@ pub(super) fn draw(
             controls.push(push(&mut x, button, Target::Next));
             controls.push(push(&mut x, button, Target::Previous));
         } else if field == SearchField::Replacement {
-            let all = desktop::button_width(font, "Replace all", &s);
-            let one = desktop::button_width(font, "Replace", &s);
+            let all = desktop::button_width(
+                font,
+                if panel.mode() == SearchMode::Files { "Apply" } else { "Replace all" },
+                &s,
+            );
+            let one =
+                desktop::button_width(font, if panel.mode() == SearchMode::Files { "Preview" } else { "Replace" }, &s);
             controls.push(push(&mut x, all, Target::ReplaceAll));
             controls.push(push(&mut x, one, Target::ReplaceNext));
         }
@@ -308,12 +317,28 @@ pub(super) fn draw(
                 Target::Close => desktop::icon_button(pixels, stride, rect, Icon::Close, hovered, true, &c, &s),
                 Target::Next => desktop::icon_button(pixels, stride, rect, Icon::Down, hovered, true, &c, &s),
                 Target::Previous => desktop::icon_button(pixels, stride, rect, Icon::Up, hovered, true, &c, &s),
-                Target::ReplaceNext => {
-                    replacement_button(pixels, stride, font, rect, "Replace", hovered, panel.can_replace(), &c, &s)
-                }
-                _ => {
-                    replacement_button(pixels, stride, font, rect, "Replace all", hovered, panel.can_replace(), &c, &s)
-                }
+                Target::ReplaceNext => replacement_button(
+                    pixels,
+                    stride,
+                    font,
+                    rect,
+                    if panel.mode() == SearchMode::Files { "Preview" } else { "Replace" },
+                    hovered,
+                    panel.can_replace(),
+                    &c,
+                    &s,
+                ),
+                _ => replacement_button(
+                    pixels,
+                    stride,
+                    font,
+                    rect,
+                    if panel.mode() == SearchMode::Files { "Apply" } else { "Replace all" },
+                    hovered,
+                    panel.can_replace(),
+                    &c,
+                    &s,
+                ),
             }
             if !matches!(target, Target::ReplaceNext | Target::ReplaceAll) || panel.can_replace() {
                 view.hits.push(rect, target);
@@ -366,6 +391,7 @@ fn files_layout(panel: &SearchPanel, size: (usize, usize), m: &Metrics, body_top
         vec![
             SearchField::Query,
             match panel.field() {
+                SearchField::Replacement => SearchField::Replacement,
                 SearchField::Include => SearchField::Include,
                 SearchField::Exclude => SearchField::Exclude,
                 _ => SearchField::Root,
@@ -426,7 +452,7 @@ fn draw_files(
     desktop::icon_button(pixels, stride, close, Icon::Close, view.hover == Some(Target::Close), true, &c, &s);
     view.hits.push(close, Target::Close);
     let mut x = inner.x;
-    for field in [SearchField::Root, SearchField::Include, SearchField::Exclude] {
+    for field in [SearchField::Replacement, SearchField::Root, SearchField::Include, SearchField::Exclude] {
         let target = Target::Field(field);
         let w = desktop::button_width(font, label(field), &s);
         let rect = Rect { x, y, w: w.min(close.x.saturating_sub(x + s.gap / 2)), h: s.control };
@@ -436,7 +462,42 @@ fn draw_files(
     }
     y += s.control + s.gap;
     for field in layout.fields {
-        let rect = Rect { x: inner.x, y, w: inner.w, h: s.control };
+        let mut rect = Rect { x: inner.x, y, w: inner.w, h: s.control };
+        if field == SearchField::Replacement {
+            let apply_w = desktop::button_width(font, "Apply", &s);
+            let preview_w = desktop::button_width(font, "Preview", &s);
+            let apply = Rect { x: rect.x + rect.w - apply_w, w: apply_w, ..rect };
+            let preview = Rect { x: apply.x - s.gap - preview_w, w: preview_w, ..rect };
+            replacement_button(
+                pixels,
+                stride,
+                font,
+                preview,
+                "Preview",
+                view.hover == Some(Target::ReplaceNext),
+                panel.can_replace(),
+                &c,
+                &s,
+            );
+            replacement_button(
+                pixels,
+                stride,
+                font,
+                apply,
+                "Apply",
+                view.hover == Some(Target::ReplaceAll),
+                panel.can_replace() && panel.folder_preview(),
+                &c,
+                &s,
+            );
+            if panel.can_replace() {
+                view.hits.push(preview, Target::ReplaceNext);
+                if panel.folder_preview() {
+                    view.hits.push(apply, Target::ReplaceAll);
+                }
+            }
+            rect.w = preview.x.saturating_sub(rect.x + s.gap);
+        }
         let (text, cursor) = panel.text(field);
         let clear = field == SearchField::Query && !text.is_empty();
         desktop::text_field(
@@ -554,7 +615,18 @@ fn draw_files(
     }
     let help =
         Rect { x: next.x + next.w + s.gap, y, w: inner.w.saturating_sub(2 * s.control + 2 * s.gap), h: s.control };
-    desktop::label_right(pixels, stride, font, help, "↑↓ Select · Enter Open · PgUp/PgDn · Esc Cancel", c.muted);
+    desktop::label_right(
+        pixels,
+        stride,
+        font,
+        help,
+        if panel.folder_preview() {
+            "Enter Include/Exclude · Preview · Apply · Esc Cancel"
+        } else {
+            "↑↓ Select · Enter Open · PgUp/PgDn · Esc Cancel"
+        },
+        c.muted,
+    );
     Some(r)
 }
 
@@ -642,10 +714,14 @@ pub(super) fn click(view: &View, panel: &SearchPanel, current: Option<Rect>, poi
             Click::Input(SearchInput::PagePrevious)
         }
         Some(Target::PageNext) if view.painted_revision == view.rows_revision => Click::Input(SearchInput::PageNext),
-        Some(Target::ReplaceNext) if panel.mode() == SearchMode::Replace && panel.can_replace() => {
+        Some(Target::ReplaceNext)
+            if matches!(panel.mode(), SearchMode::Replace | SearchMode::Files) && panel.can_replace() =>
+        {
             Click::Input(SearchInput::ReplaceNext)
         }
-        Some(Target::ReplaceAll) if panel.mode() == SearchMode::Replace && panel.can_replace() => {
+        Some(Target::ReplaceAll)
+            if matches!(panel.mode(), SearchMode::Replace | SearchMode::Files) && panel.can_replace() =>
+        {
             Click::Input(SearchInput::ReplaceAll)
         }
         _ => Click::Inside,

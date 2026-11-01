@@ -199,10 +199,7 @@ impl SearchHost {
                 self.input(view, keys, SearchInput::Focus(field));
             }
             if call.id == "search.replaceInFiles" {
-                self.notice(
-                    view,
-                    "Folder replacement awaits the atomic folder executor; Find in Files remains available".into(),
-                );
+                self.notice(view, "Search worker is starting; replacement input is retained".into());
             }
         }
         if call.id == "search.find"
@@ -272,13 +269,34 @@ impl SearchHost {
         self.panel.enter_context(keys);
     }
     fn action(&mut self, view: &mut Workspace, keys: &mut KeymapEngine, action: SearchAction) {
+        if matches!(action, SearchAction::FolderClosed { .. })
+            && self.session.as_ref().is_none_or(|session| !self.panel.validate_action(session, view, &action))
+        {
+            self.panel.folder_failed("Folder action changed before admission".into());
+            return;
+        }
+        if let SearchAction::FolderClosed { key, index, offset, plan, cancel } = action {
+            if let Err(error) = view.submit_folder_closed(key.generation, index, offset, plan, cancel) {
+                self.panel.folder_failed(error.to_string());
+                self.notice(view, error.to_string());
+            }
+            return;
+        }
+        let folder_action = self.panel.folder_replacement_action(&action);
         if !matches!(&action, SearchAction::OpenFile { .. }) && self.body_refused(view) {
+            if folder_action {
+                self.panel.folder_failed("Folder replacement stopped while wrapping settles; preview again".into());
+            }
             return;
         }
         let Some(session) = &mut self.session else { return };
         if !self.panel.validate_action(session, view, &action)
-            || self.origin.as_ref().is_none_or(|origin| !origin.matches(view))
+            || (!self.panel.folder_replacement_action(&action)
+                && self.origin.as_ref().is_none_or(|origin| !origin.matches(view)))
         {
+            if folder_action {
+                self.panel.folder_failed("Folder replacement target changed; preview again".into());
+            }
             self.notice(view, "Search navigation cancelled: its document, query or cursor changed".into());
             return;
         }
@@ -318,7 +336,12 @@ impl SearchHost {
                     self.origin = None;
                     self.outcome(view, keys, outcome);
                 }
-                Err(error) => self.notice(view, format!("Replacement was not admitted: {error}")),
+                Err(error) => {
+                    if folder_action {
+                        self.panel.folder_failed(error.to_string());
+                    }
+                    self.notice(view, format!("Replacement was not admitted: {error}"));
+                }
             }
             return;
         }
@@ -349,7 +372,7 @@ impl SearchHost {
                 }
             }
             SearchAction::OpenFile { .. } => unreachable!("native file action handled above"),
-            SearchAction::Replace(_) => unreachable!(),
+            SearchAction::Replace(_) | SearchAction::FolderClosed { .. } => unreachable!(),
         };
         match result {
             Ok(damage) => {
@@ -588,7 +611,11 @@ pub(super) fn key(
 fn enter(panel: &SearchPanel, event: KeyEvent) -> SearchInput<'static> {
     let shift = event.modifiers.contains(KeyModifiers::SHIFT);
     if panel.mode() == SearchMode::Files {
-        SearchInput::SelectRow(panel.selected())
+        if event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) {
+            if shift { SearchInput::ReplaceAll } else { SearchInput::ReplaceNext }
+        } else {
+            SearchInput::SelectRow(panel.selected())
+        }
     } else if event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         && panel.mode() == SearchMode::Replace
     {
@@ -841,7 +868,9 @@ pub(super) fn draw_prepared(
             on(options.in_selection)
         ),
         host.panel.status().to_owned(),
-        if host.panel.mode() == SearchMode::Replace {
+        if host.panel.mode() == SearchMode::Files {
+            "Enter toggle file  Ctrl Enter preview  Ctrl Shift Enter apply  PgUp/PgDn page  Esc cancel".into()
+        } else if host.panel.mode() == SearchMode::Replace {
             "Enter next  Shift Enter previous  Ctrl Enter replace  Ctrl Shift Enter all  Tab field  Esc close".into()
         } else {
             "Enter/F3 next  Shift Enter/F3 previous  Tab field  Esc close".into()
@@ -894,9 +923,20 @@ pub(super) fn mouse(
             } else if let Some((_, field)) = painted.fields.iter().find(|(rect, _)| rect.contains(point)) {
                 SearchInput::Focus(*field)
             } else {
-                if let Some((_, action)) = painted.rows.into_iter().find(|(rect, _)| rect.contains(point)) {
+                if let Some((index, (_, action))) =
+                    painted.rows.into_iter().enumerate().find(|(_, (rect, _))| rect.contains(point))
+                {
                     host.origin = Some(painted.origin);
-                    host.action(view, keys, action);
+                    if host.panel.folder_preview() {
+                        let row = if let SearchAction::OpenFile { path, .. } = &action {
+                            host.session.as_ref().and_then(|session| session.state().files.iter().position(|row| matches!(row, kwil_view_model::search_session::FileEvent::Hit(hit) if hit.path == *path))).unwrap_or(index)
+                        } else {
+                            index
+                        };
+                        host.input(view, keys, SearchInput::SelectRow(row));
+                    } else {
+                        host.action(view, keys, action);
+                    }
                 }
                 return true;
             }
@@ -1183,6 +1223,154 @@ mod tests {
     }
     fn binding(keys: &str, command: &str, context: Option<Context>) -> Binding {
         Binding { keys: keys.into(), command: command.into(), context, mode: None }
+    }
+
+    #[test]
+    fn folder_replace_preview_exclusion_and_atomic_closed_apply() {
+        let mut h = Harness::new("retain editor");
+        let tree = h.root.join("replace");
+        std::fs::create_dir(&tree).unwrap();
+        let a = tree.join("a.txt");
+        let b = tree.join("b.txt");
+        std::fs::write(&a, b"x12\r\nx34\n").unwrap();
+        std::fs::write(&b, b"x56\n").unwrap();
+        h.settings.search.regex = true;
+        h.files(tree, "x([0-9]+)");
+        h.field(SearchField::Replacement, "y${1}$$");
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        assert!(h.host.panel.folder_preview());
+        assert_eq!(h.host.panel.count(), (3, true));
+        let excluded = h.host.panel.results().iter().position(|r| r.label.contains("b.txt")).unwrap();
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(excluded));
+        let frame = h.render(120, 24);
+        let display: String = frame.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+        assert!(display.contains("[ ] b.txt"));
+        assert!(display.contains("matches"));
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.settle();
+        assert_eq!(std::fs::read(&a).unwrap(), b"y12$\r\ny34$\n");
+        assert_eq!(std::fs::read(&b).unwrap(), b"x56\n");
+        assert!(h.host.panel.status().contains("1 files applied"));
+        assert_eq!(h.bytes(), b"retain editor");
+        h.finish();
+    }
+    #[test]
+    fn folder_replace_changed_file_is_reported_and_cancel_stops_following_files() {
+        let mut h = Harness::new("");
+        let tree = h.root.join("changed-replace");
+        std::fs::create_dir(&tree).unwrap();
+        let a = tree.join("a.txt");
+        let b = tree.join("b.txt");
+        std::fs::write(&a, b"needle\n").unwrap();
+        std::fs::write(&b, b"needle\n").unwrap();
+        h.files(tree.clone(), "needle");
+        h.field(SearchField::Replacement, "changed");
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        std::fs::write(&b, b"new contents\n").unwrap();
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.settle();
+        assert_eq!(std::fs::read(&a).unwrap(), b"changed\n");
+        assert_eq!(std::fs::read(&b).unwrap(), b"new contents\n");
+        assert!(h.host.panel.status().contains("1 skipped"));
+        assert!(h.host.panel.status().contains("b.txt"));
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(tree.join(name), b"needle\n").unwrap();
+        }
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        assert_eq!(h.host.panel.count(), (3, true));
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.press(KeyCode::Esc, KeyModifiers::NONE);
+        // Deliver the cancelled scan's wake; cancellation cannot enqueue a second file.
+        h.command("search.find");
+        h.query("absent");
+        h.settle();
+        let written = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .filter(|name| std::fs::read(tree.join(name)).unwrap() != b"needle\n")
+            .count();
+        assert!(written <= 1);
+        h.finish();
+    }
+
+    #[test]
+    fn folder_replace_preview_shutdown_releases_manifest_without_writing() {
+        let mut h = Harness::new("");
+        let tree = h.root.join("preview-shutdown");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("a.txt");
+        std::fs::write(&path, b"needle\n").unwrap();
+        h.files(tree, "needle");
+        h.field(SearchField::Replacement, "changed");
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        assert!(h.host.panel.folder_preview());
+        assert_eq!(std::fs::read(path).unwrap(), b"needle\n");
+        h.finish();
+    }
+
+    #[test]
+    fn folder_replace_template_edit_invalidates_an_unread_preview_completion() {
+        let mut h = Harness::new("");
+        let tree = h.root.join("template-race");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("a.txt");
+        std::fs::write(&path, b"needle\n").unwrap();
+        h.files(tree, "needle");
+        h.field(SearchField::Replacement, "old");
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::ReplaceNext);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::Focus(SearchField::Replacement));
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectAll);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::Text("new"));
+        h.settle();
+        assert!(
+            !h.host.panel.folder_preview(),
+            "an old template cannot be applied under newly displayed replacement text"
+        );
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.settle();
+        assert_eq!(std::fs::read(path).unwrap(), b"new\n");
+        h.finish();
+    }
+
+    #[test]
+    fn folder_replace_open_document_stays_dirty_and_undoable() {
+        let mut h = Harness::new("");
+        let tree = h.root.join("open-replace");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("open.txt");
+        std::fs::write(&path, b"x1\n").unwrap();
+        h.view
+            .open_files(kwil_core_workspace::instance::OpenFiles {
+                files: vec![kwil_core_workspace::instance::OpenFile { path: path.clone(), line: None, column: None }],
+            })
+            .unwrap();
+        h.until(|h| h.view.editor().is_some_and(|e| e.document().path() == Some(path.as_path())));
+        h.view.execute("edit.selectAll", &CommandArgs::default(), 1).unwrap();
+        h.view.execute("edit.insert", &CommandArgs { text: Some("x2 x3\n".into()), ..Default::default() }, 1).unwrap();
+        h.view.sync_all();
+        h.receipts();
+        h.settings.search.regex = true;
+        h.files(tree, "x([0-9]+)");
+        h.field(SearchField::Replacement, "y$1");
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        assert_eq!(h.host.panel.count(), (2, true));
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.settle();
+        h.receipts();
+        assert_eq!(h.bytes(), b"y2 y3\n");
+        assert!(h.view.editor().unwrap().document().is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"x1\n");
+        h.view.execute("edit.undo", &CommandArgs::default(), 1).unwrap();
+        h.view.sync_all();
+        h.receipts();
+        assert_eq!(h.bytes(), b"x2 x3\n");
+        h.finish();
     }
 
     #[test]
@@ -1612,8 +1800,9 @@ mod tests {
             assert_eq!(h.bytes(), b"editor stays unchanged", "modal input must never fall through to the body");
         }
         h.command("search.replaceInFiles");
-        assert!(!h.host.panel.can_replace());
-        assert!(h.host.panel.status().contains("atomic folder executor"));
+        h.settle();
+        assert_eq!(h.host.panel.field(), SearchField::Replacement);
+        assert!(!h.host.panel.folder_preview(), "opening replacement requires a new explicit preview");
         assert_eq!(std::fs::read(tree.join("keep.txt")).unwrap(), b"needle\nNEEDLE\nneedles\n");
         h.finish();
     }
