@@ -295,6 +295,12 @@ mod tests {
         workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
         assert_eq!(bytes, b"one\rtwo\r");
         assert!(workspace.status_text().contains("  |  CR"));
+        assert!(
+            crate::chrome::status(&workspace, 100)
+                .1
+                .iter()
+                .any(|field| field.text == "CR" && field.command == Some("file.setLineEnding"))
+        );
         choose(&mut workspace, "file.setLineEnding", "2");
         lane.until(&mut workspace, |workspace| !workspace.document_busy(id));
         choose(&mut workspace, "file.setEncoding", "2");

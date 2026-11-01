@@ -312,6 +312,7 @@ impl App {
                 warn: true,
             });
         }
+        segments.extend(chrome::line_ending_segment(&self.view));
         (self.view.notice().into(), segments)
     }
     /// Refresh the shared scalar fence before dispatch. Source ownership and
