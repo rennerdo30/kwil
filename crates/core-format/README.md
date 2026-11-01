@@ -56,9 +56,9 @@ input ceiling; a lower output limit is checked after its serialization.
   Structural endings are restored separately from raw string content.
 - YAML reports **"tidy only, no structural YAML formatting yet"** in its result
   notice (coordinator-approved scope, 2026-10-23). No YAML dependency is added.
-  `pretty_yaml` 0.6.0 (MIT) and `yaml-edit` 0.3.5 (Apache-2.0) exist; a follow-up
-  will evaluate semantic safety on anchors, multi-documents, block scalars and
-  comments before adoption. Leading and
+  KW-43 evaluated `pretty_yaml` 0.6.0 (MIT): four of 16 valid fixtures changed
+  parsed scalar values (EOF/keep chomping and significant trailing spaces).
+  It was rejected; see `docs/FORMATTERS.md` for the counterexamples. Leading and
   trailing whitespace are preserved because indentation and block scalars are
   semantic. EOF bytes and all line endings are retained too: without a YAML
   parser there is no proof that even those tidy operations preserve scalars.
