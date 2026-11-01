@@ -57,11 +57,16 @@ impl LineIndex {
         assert!(from_len <= bytes.len() as u64, "cannot extend a truncated file");
         // Count only the append before reserving, so a refusal leaves all old
         // metrics intact. Exact reservation avoids hidden geometric growth.
-        let added = memchr_iter(b'\n', &bytes[from_len as usize..]).count() as u64;
-        let lines = self.checkpoints.len()
-            + ((self.line_count - 1 + added) / DEFAULT_EVERY - (self.line_count - 1) / DEFAULT_EVERY) as usize;
-        let last_rank = self.rank_checkpoints.last().unwrap().1 as usize;
-        let ranks = self.rank_checkpoints.len() + bytes.len().saturating_sub(last_rank + 1) / RANK_BYTES;
+        let joins_crlf = crate::newlines::split_crlf(bytes, from_len as usize);
+        let added = ends(bytes, from_len as usize..bytes.len()).count() as u64;
+        let old_breaks = self.line_count - 1 - u64::from(joins_crlf);
+        let removes_line = joins_crlf && self.checkpoints.last().is_some_and(|&(_, at)| at == from_len);
+        let lines = self.checkpoints.len() - usize::from(removes_line)
+            + ((old_breaks + added) / DEFAULT_EVERY - old_breaks / DEFAULT_EVERY) as usize;
+        let removes_rank = joins_crlf && self.rank_checkpoints.last().is_some_and(|&(_, at)| at == from_len);
+        let rank_count = self.rank_checkpoints.len() - usize::from(removes_rank);
+        let last_rank = self.rank_checkpoints[rank_count - 1].1 as usize;
+        let ranks = rank_count + bytes.len().saturating_sub(last_rank + 1) / RANK_BYTES;
         let old_lines = self.checkpoints.capacity();
         let old_ranks = self.rank_checkpoints.capacity();
         let new_lines = lines.max(old_lines);
@@ -394,7 +399,7 @@ mod tests {
 
     #[test]
     fn index_memory_limit_append_refusal_preserves_old_index() {
-        for bytes in [vec![b'\n'; 9000], vec![b'x'; 5 * RANK_BYTES]] {
+        for bytes in [vec![b'\n'; 9000], vec![b'\r'; 9000], vec![b'x'; 5 * RANK_BYTES]] {
             let mut index = LineIndex::build(b"x", DEFAULT_EVERY, 1, &AtomicU64::new(0)).unwrap();
             let previous = index.clone();
             let limit = index.memory_bytes();
