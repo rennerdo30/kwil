@@ -24,7 +24,7 @@ use windows_sys::{
             CoTaskMemFree, CoUninitialize,
         },
         UI::{
-            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SHCreateItemFromParsingName, SetWindowSubclass},
             WindowsAndMessaging::{
                 CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, IsWindow, MSG,
                 PostMessageW, TranslateMessage, WM_APP,
@@ -68,7 +68,9 @@ struct DialogVtable {
     unused4_8: [usize; 5],
     set_options: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT, // 9
     get_options: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT, // 10
-    unused11_14: [usize; 4],
+    unused11: usize,
+    set_folder: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT, // 12
+    unused13_14: [usize; 2],
     set_file_name: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT, // 15
     unused16_19: [usize; 4],
     get_result: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT, // 20
@@ -94,6 +96,7 @@ const _: () = {
     assert!(offset_of!(DialogVtable, show) == 3 * pointer);
     assert!(offset_of!(DialogVtable, set_options) == 9 * pointer);
     assert!(offset_of!(DialogVtable, get_options) == 10 * pointer);
+    assert!(offset_of!(DialogVtable, set_folder) == 12 * pointer);
     assert!(offset_of!(DialogVtable, set_file_name) == 15 * pointer);
     assert!(offset_of!(DialogVtable, get_result) == 20 * pointer);
     assert!(offset_of!(DialogVtable, close) == 23 * pointer);
@@ -382,6 +385,18 @@ fn choose_inner(request: &Request, pump: &Pump) -> Result<Outcome, String> {
     let mut flags = 0;
     check("IFileDialog::GetOptions", unsafe { (vtable.get_options)(dialog.0, &mut flags) })?;
     check("IFileDialog::SetOptions", unsafe { (vtable.set_options)(dialog.0, options(request.ticket.kind(), flags)) })?;
+    // Override Shell's persisted/cwd default on every request.
+    let mut directory: Vec<u16> = request.directory.as_os_str().encode_wide().take(MAX_PATH_UNITS).collect();
+    if directory.len() == MAX_PATH_UNITS || directory.contains(&0) {
+        return Err("save folder is invalid or too long".into());
+    }
+    directory.push(0);
+    let mut item = null_mut();
+    let iid_item = GUID::from_u128(0x43826d1e_e718_42ee_bc55_a1e261c37bfe);
+    let hr = unsafe { SHCreateItemFromParsingName(directory.as_ptr(), null_mut(), &iid_item, &mut item) };
+    let item = ComPtr(item);
+    check("SHCreateItemFromParsingName(save folder)", hr)?;
+    check("IFileDialog::SetFolder", unsafe { (vtable.set_folder)(dialog.0, item.0) })?;
     if let Some(name) = &request.suggested_name {
         let mut wide: Vec<u16> = name.encode_wide().take(MAX_PATH_UNITS).collect();
         if wide.len() == MAX_PATH_UNITS || wide.contains(&0) {
@@ -436,6 +451,9 @@ fn collect_after_show(dialog: &ComPtr, pump: &Pump, hr: HRESULT) -> Result<Outco
 
 #[cfg(test)]
 mod tests {
+    unsafe extern "system" fn folder(_: *mut std::ffi::c_void, _: *mut std::ffi::c_void) -> windows_sys::core::HRESULT {
+        0
+    }
     use super::*;
     #[test]
     fn successful_result_collects_native_path_and_releases_both_interfaces() {
@@ -516,7 +534,9 @@ mod tests {
             unused4_8: [0; 5],
             set_options: flags,
             get_options: get_flags,
-            unused11_14: [0; 4],
+            unused11: 0,
+            set_folder: folder,
+            unused13_14: [0; 2],
             set_file_name: set_name,
             unused16_19: [0; 4],
             get_result: result,
@@ -619,7 +639,9 @@ mod tests {
             unused4_8: [0; 5],
             set_options: set,
             get_options: get,
-            unused11_14: [0; 4],
+            unused11: 0,
+            set_folder: folder,
+            unused13_14: [0; 2],
             set_file_name: name,
             unused16_19: [0; 4],
             get_result: result,
