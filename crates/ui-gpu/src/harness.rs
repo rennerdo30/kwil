@@ -79,6 +79,8 @@ pub(crate) enum Step {
     LogFollowResumeCheck,
     FolderOpen,
     FolderCheck,
+    FolderPreview,
+    FolderPreviewCheck,
     FolderSelect,
     FolderOpened,
     PresenterCpu,
@@ -473,7 +475,19 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (400, Step::UsabilityCapture("tab-menu.bmp")),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_TAB_MENU_PROBE").is_some() {
+        let folder_replace = [
+            (1800, Step::DismissSetup),
+            (100, Step::RemoteOn),
+            (100, Step::FolderOpen),
+            (500, Step::FolderCheck),
+            (100, Step::FolderPreview),
+            (700, Step::FolderPreviewCheck),
+            (100, Step::UsabilityCapture("folder-replace-preview.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_FOLDER_REPLACE_PROBE").is_some() {
+            folder_replace.as_slice()
+        } else if std::env::var_os("KWIL_TAB_MENU_PROBE").is_some() {
             tab_menu.as_slice()
         } else if std::env::var_os("KWIL_FORMAT_PROBE").is_some() {
             format.as_slice()
@@ -675,6 +689,19 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(!app.search_panel.is_pending());
             assert_eq!(app.search_panel.count(), (1, true));
             assert!(app.search_area.is_some(), "folder card must have painted");
+        }
+        Step::FolderPreview => {
+            use kwil_view_model::search_panel::{SearchField, SearchInput};
+            app.search_input(SearchInput::Focus(SearchField::Replacement));
+            app.search_input(SearchInput::Text("replacement text"));
+            app.search_input(SearchInput::ReplaceNext);
+        }
+        Step::FolderPreviewCheck => {
+            assert!(app.search_panel.folder_preview());
+            assert!(!app.search_panel.is_pending());
+            assert_eq!(app.search_panel.count(), (1, true));
+            assert!(app.search_panel.results()[0].label.contains("1 matches"));
+            println!("kwil-folder-replace preview=PASS files=1 matches=1 native-hidden=true");
         }
         Step::FolderSelect => {
             app.search_input(kwil_view_model::search_panel::SearchInput::SelectRow(0));

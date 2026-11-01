@@ -251,6 +251,13 @@ impl FileAction {
 }
 
 pub enum DocumentRequest {
+    FolderApply {
+        generation: u64,
+        index: u64,
+        offset: u64,
+        plan: kwil_core_search::worker::folder_replace::Plan,
+        cancel: kwil_core_search::Cancellation,
+    },
     SetFolder {
         path: PathBuf,
     },
@@ -414,6 +421,11 @@ pub enum DocumentRequest {
 }
 
 pub enum DocumentResult {
+    FolderApplied {
+        generation: u64,
+        index: u64,
+        result: Result<(), String>,
+    },
     FolderReady(io::Result<PathBuf>),
     ResumeSaveCompletion {
         key: SaveResumeKey,
@@ -1315,6 +1327,33 @@ impl DocumentWorker {
                                     .save_raw(request, &cancel)
                             });
                             complete(DocumentResult::Saved { document, revision, result });
+                        }
+                        DocumentRequest::FolderApply { generation, index, offset, plan, cancel: folder_cancel } => {
+                            let mut reserved = destinations
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .iter()
+                                .map(|(_, path)| path.clone())
+                                .collect::<Vec<_>>();
+                            if let Some((_, _, path)) = &reopening {
+                                reserved.push(path.clone());
+                            }
+                            let result = if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                                Err(io::Error::new(io::ErrorKind::Interrupted, "Closing"))
+                            } else {
+                                kwil_core_search::worker::folder_replace::apply_closed_at(
+                                    &plan,
+                                    index,
+                                    offset,
+                                    &reserved,
+                                    &folder_cancel,
+                                )
+                            };
+                            complete(DocumentResult::FolderApplied {
+                                generation,
+                                index,
+                                result: result.map_err(|e| e.to_string()),
+                            });
                         }
                         DocumentRequest::SetFolder { path } => {
                             let result = std::fs::metadata(&path).and_then(|metadata| {

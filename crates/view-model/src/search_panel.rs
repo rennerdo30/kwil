@@ -5,6 +5,7 @@ use kwil_core_commands::settings::SearchSettings;
 use kwil_core_search::{FileEvent, FileSearch, Match};
 use std::{ops::Range, path::PathBuf};
 use unicode_segmentation::UnicodeSegmentation;
+mod folder;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchMode {
@@ -187,6 +188,7 @@ pub struct ReplacementAcknowledgement {
 }
 
 pub struct SearchPanel {
+    folder: folder::Folder,
     open: bool,
     active: bool,
     mode: SearchMode,
@@ -234,6 +236,7 @@ pub struct SearchPanel {
 impl Default for SearchPanel {
     fn default() -> Self {
         Self {
+            folder: folder::Folder::default(),
             open: false,
             active: false,
             mode: SearchMode::Find,
@@ -288,6 +291,9 @@ impl SearchPanel {
         self.pending || self.replacement_pending.is_some()
     }
     pub fn can_replace(&self) -> bool {
+        if self.mode == SearchMode::Files {
+            return !self.is_pending() && !self.query.text.is_empty();
+        }
         self.mode != SearchMode::Files
             && !self.query.text.is_empty()
             && !self.is_pending()
@@ -343,7 +349,13 @@ impl SearchPanel {
         match self.mode {
             SearchMode::Find => &[SearchField::Query],
             SearchMode::Replace => &[SearchField::Query, SearchField::Replacement],
-            SearchMode::Files => &[SearchField::Query, SearchField::Root, SearchField::Include, SearchField::Exclude],
+            SearchMode::Files => &[
+                SearchField::Query,
+                SearchField::Replacement,
+                SearchField::Root,
+                SearchField::Include,
+                SearchField::Exclude,
+            ],
         }
     }
     fn input_ref(&self, field: SearchField) -> &TextInput {
@@ -446,6 +458,7 @@ impl SearchPanel {
             .unwrap_or_default();
     }
     pub fn open(&mut self, mode: SearchMode, settings: &SearchSettings) -> Result<SearchOutcome, String> {
+        self.folder.reset();
         self.sync_settings(settings)?;
         self.open = true;
         self.active = true;
@@ -460,6 +473,7 @@ impl SearchPanel {
         Ok(SearchOutcome::panel())
     }
     pub fn close(&mut self, session: &mut SearchSession, view: &Workspace) -> SearchOutcome {
+        self.folder.reset();
         session.cancel();
         self.open = false;
         self.active = false;
@@ -503,11 +517,14 @@ impl SearchPanel {
         let open = match id {
             "search.find" => Some(SearchMode::Find),
             "search.replace" => Some(SearchMode::Replace),
-            "search.findInFiles" => Some(SearchMode::Files),
+            "search.findInFiles" | "search.replaceInFiles" => Some(SearchMode::Files),
             _ => None,
         };
         if let Some(mode) = open {
             let mut out = self.open(mode, settings)?;
+            if id == "search.replaceInFiles" {
+                self.field = SearchField::Replacement;
+            }
             self.identity = Self::active(view);
             self.identity_epoch = view.input_epoch();
             self.capture_scope(view);
@@ -528,13 +545,6 @@ impl SearchPanel {
             "search.toggleSelection" => SearchInput::ToggleSelection,
             "search.setInclude" => SearchInput::Focus(SearchField::Include),
             "search.setExclude" => SearchInput::Focus(SearchField::Exclude),
-            "search.replaceInFiles" => {
-                self.open(SearchMode::Files, settings)?;
-                self.error = Some(
-                    "Folder replacement awaits the atomic folder executor; Find in Files remains available".into(),
-                );
-                return Ok(Some(SearchOutcome::panel()));
-            }
             _ => return Ok(None),
         };
         self.sync_settings(settings)?;
@@ -558,6 +568,9 @@ impl SearchPanel {
         view: &Workspace,
         input: SearchInput<'_>,
     ) -> Result<SearchOutcome, String> {
+        if let Some(outcome) = self.folder_input(session, view, input) {
+            return outcome;
+        }
         if matches!(input, SearchInput::ReplaceNext | SearchInput::ReplaceAll) {
             if self.mode == SearchMode::Files {
                 return Err("Folder replacement awaits the atomic folder executor".into());
@@ -711,11 +724,15 @@ impl SearchPanel {
                 self.check_root_edit(field, edit)?;
                 let changed = self.input_mut(field).edit(edit)?;
                 if changed {
+                    let folder_preview = self.folder_preview() || self.folder.previewing;
+                    if folder_preview {
+                        self.folder.reset();
+                    }
                     self.followup = None;
                     if field == SearchField::Root {
                         self.root_edited = true;
                     }
-                    self.refresh_needed = field != SearchField::Replacement;
+                    self.refresh_needed = field != SearchField::Replacement || folder_preview;
                 }
             }
         }
@@ -848,6 +865,10 @@ impl SearchPanel {
         acknowledgement: ReplacementAcknowledgement,
     ) -> SearchOutcome {
         self.replacement_pending = Some(acknowledgement);
+        if self.folder.applying {
+            self.status = "Replacing open document…".into();
+            return SearchOutcome::panel();
+        }
         self.replacement_notice = None;
         self.error = None;
         self.status = "Replacing…".into();
@@ -878,6 +899,10 @@ impl SearchPanel {
             return Err("Replacement completion arrived before the editor returned".into());
         }
         self.replacement_pending = None;
+        if self.folder.applying {
+            self.folder_completed(result, session, view)?;
+            return Ok(SearchOutcome::panel());
+        }
         let current = acknowledgement.epoch == self.epoch && view.active_id().0 == key.document_id;
         let mut out = self.sync_document(session, view)?;
         out.damage.panel = self.open;
@@ -928,6 +953,7 @@ impl SearchPanel {
             return Ok(());
         }
         let result = if self.mode == SearchMode::Files {
+            self.folder.reset();
             let root = if self.root_edited {
                 PathBuf::from(&self.root_input.text)
             } else {
@@ -980,6 +1006,9 @@ impl SearchPanel {
         Ok(())
     }
     pub fn sync_document(&mut self, session: &mut SearchSession, view: &Workspace) -> Result<SearchOutcome, String> {
+        if let Some(result) = self.folder_closed_ready(session, view) {
+            return result;
+        }
         let next = Self::active(view);
         if self.replacement_pending.is_some_and(|ack| ack.key.document_id == view.active_id().0)
             && view.document_busy(view.active_id())
@@ -1045,6 +1074,12 @@ impl SearchPanel {
             }
         }
         let changed = session.worker_ready(document, revision);
+        if let Some(update) = session.take_folder_update() {
+            return self.folder_ready(update, session, view);
+        }
+        if changed && session.state().status == SearchStatus::Failed {
+            self.folder.reset();
+        }
         if self.refresh_needed
             && self.retry.is_none()
             && let Err(error) = self.refresh(session, view, None, None)
@@ -1256,6 +1291,18 @@ impl SearchPanel {
         }
     }
     pub fn validate_action(&self, session: &SearchSession, view: &Workspace, action: &SearchAction) -> bool {
+        if self.folder_replacement_action(action) {
+            return match action {
+                SearchAction::Replace(recipe) => {
+                    view.view(SessionDocumentId(recipe.key.document_id)).and_then(|v| v.editor()).is_some_and(|e| {
+                        e.document().revision() == recipe.key.revision
+                            && self.folder.action.is_some_and(|(_, epoch)| e.document().source_epoch == epoch)
+                    })
+                }
+                SearchAction::FolderClosed { key, .. } => self.request_key == Some(*key) && session.key() == Some(*key),
+                _ => false,
+            };
+        }
         if self.mode == SearchMode::Files && matches!(action, SearchAction::OpenFile { .. }) {
             // Folder results belong to their query, not the tab that launched
             // it. Hosts separately capture the current input/cursor at action
@@ -1344,6 +1391,7 @@ impl SearchPanel {
         self.retry.take()
     }
     pub fn take_shutdown(&mut self, session: &mut SearchSession) -> Result<SearchWorker, Option<Box<SearchRequest>>> {
+        self.folder.reset();
         self.open = false;
         self.active = false;
         self.followup = None;
@@ -1612,6 +1660,28 @@ mod tests {
         assert_eq!(returned.key.generation, 99);
         std::thread::spawn(move || drop(returned)).join().unwrap();
     }
+    #[test]
+    fn folder_replace_action_rejects_reloaded_source_with_same_revision() {
+        let mut view = workspace("original");
+        let (mut session, _) = session();
+        let mut panel = SearchPanel::default();
+        let document = view.editor().unwrap().document();
+        let key = SearchKey { document_id: view.active_id().0, revision: document.revision(), generation: 77 };
+        panel.folder.applying = true;
+        panel.folder.action = Some((key, document.source_epoch));
+        let action =
+            SearchAction::Replace(ReplaceRecipe { key, edits: ReplacementEdits::Inline(std::sync::Arc::new(vec![])) });
+        assert!(panel.validate_action(&session, &view, &action));
+        view.editor_mut().unwrap().document.source_epoch = crate::document::next_source_epoch();
+        assert!(
+            !panel.validate_action(&session, &view, &action),
+            "revision alone cannot bless a different loaded source"
+        );
+        panel.folder.reset();
+        let worker = session.take_shutdown().unwrap();
+        std::thread::spawn(move || worker.shutdown_bounded(Duration::from_secs(5)).unwrap()).join().unwrap();
+    }
+
     #[test]
     fn accepted_regex_capture_replacement_returns_recipe_without_mutating_document() {
         let view = workspace("x1 x2");

@@ -233,6 +233,12 @@ struct PendingEditorJob {
     action: PendingEditorAction,
 }
 
+struct FolderClosed {
+    generation: u64,
+    index: u64,
+    result: Option<Result<(), String>>,
+}
+
 #[derive(Default)]
 struct FileFlow {
     save_folder: Option<PathBuf>,
@@ -251,6 +257,7 @@ struct FileFlow {
     // the existing recovery queue and worker can admit the actual loan.
     pending_editor_jobs: HashMap<DocumentId, PendingEditorJob>,
     next_loan: u64,
+    folder_closed: Option<FolderClosed>,
     replacement_journals: HashMap<DocumentId, u64>,
     worker: Option<DocumentWorker>,
     queue: VecDeque<DocumentRequest>,
@@ -481,6 +488,55 @@ impl Workspace {
             .or_else(|| self.files.loans.get(&id).filter(|loan| loan.key == key).map(|loan| loan.operation))
     }
 
+    pub(crate) fn folder_open_documents(&self) -> Vec<kwil_core_search::worker::folder_replace::OpenDocument> {
+        self.session
+            .tabs()
+            .iter()
+            .filter_map(|tab| {
+                let path = self.tab_path(tab.id)?;
+                let editor = self.views.get(&tab.id).and_then(|view| view.editor());
+                Some(kwil_core_search::worker::folder_replace::OpenDocument {
+                    path,
+                    key: kwil_core_search::worker::SearchKey {
+                        document_id: tab.id.0,
+                        revision: editor.map_or(tab.revision, |e| e.document().revision()),
+                        generation: 0,
+                    },
+                    epoch: editor.map_or(0, |e| e.document().source_epoch),
+                    snapshot: editor
+                        .filter(|_| !self.document_busy(tab.id) && !self.hex_owns_document(tab.id))
+                        .map(|e| e.document().snapshot()),
+                })
+            })
+            .collect()
+    }
+    pub fn submit_folder_closed(
+        &mut self,
+        generation: u64,
+        index: u64,
+        offset: u64,
+        plan: kwil_core_search::worker::folder_replace::Plan,
+        cancel: kwil_core_search::Cancellation,
+    ) -> io::Result<()> {
+        if self.files.worker.is_none()
+            || self.files.document_shutdown
+            || !self.files.storage_ready
+            || self.files.folder_closed.as_ref().is_some_and(|flight| flight.result.is_none())
+        {
+            return Err(io::Error::other("Document worker unavailable or folder write pending"));
+        }
+        self.files.folder_closed = Some(FolderClosed { generation, index, result: None });
+        self.files.queue.push_back(DocumentRequest::FolderApply { generation, index, offset, plan, cancel });
+        self.pump_files();
+        Ok(())
+    }
+    pub(crate) fn folder_closed_result(&self, generation: u64, index: u64) -> Option<Result<(), String>> {
+        self.files
+            .folder_closed
+            .as_ref()
+            .filter(|flight| flight.generation == generation && flight.index == index)
+            .and_then(|flight| flight.result.clone())
+    }
     pub fn submit_search_replacement(&mut self, recipe: kwil_core_search::worker::ReplaceRecipe) -> io::Result<()> {
         let key = recipe.key;
         self.submit_editor_job(key, PendingEditorAction::Replace(recipe))
@@ -2280,6 +2336,15 @@ impl Workspace {
                     }
                 }
                 self.queue_initial_indexes();
+            }
+            DocumentResult::FolderApplied { generation, index, result } => {
+                if let Some(flight) = &mut self.files.folder_closed
+                    && flight.generation == generation
+                    && flight.index == index
+                {
+                    flight.result = Some(result);
+                }
+                damage.status = true;
             }
             DocumentResult::Persisted(result) => {
                 self.files.persist_inflight = false;

@@ -289,6 +289,7 @@ pub(crate) fn result_info(result: &DocumentResult) -> ResultInfo {
             info.kind = ResultKind::Journal;
             info.document = Some(*document);
         }
+        FolderApplied { .. } => info.kind = ResultKind::Persisted,
         Stopped(_) => info.kind = ResultKind::Stopped,
         SourceBarrier(_) => info.kind = ResultKind::Barrier,
         _ => {}

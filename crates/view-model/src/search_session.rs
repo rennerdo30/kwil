@@ -3,6 +3,7 @@
 //! parent dispatcher changes the editor or opens a native path.
 use crate::{Editor, SessionDocumentId};
 pub use kwil_core_search::FileEvent;
+pub use kwil_core_search::worker::folder_replace;
 pub use kwil_core_search::worker::{
     DocumentMatches, DocumentSearch, FileResults, INPUT_BYTES, Navigation, PAGE_HITS, Page, Query, REPLACE_BYTES,
     REPLACE_EDITS, ReplaceRecipe, ReplaceTarget, Replacement, ReplacementEdits, ReplacementIter,
@@ -57,11 +58,21 @@ pub enum SearchAction {
         line_number: u64,
     },
     Replace(ReplaceRecipe),
+    FolderClosed {
+        key: SearchKey,
+        index: u64,
+        offset: u64,
+        plan: folder_replace::Plan,
+        cancel: kwil_core_search::Cancellation,
+    },
 }
 impl SearchAction {
     pub fn key(&self) -> SearchKey {
         match self {
-            Self::Select { key, .. } | Self::OpenFile { key, .. } | Self::SeedSelections { key, .. } => *key,
+            Self::FolderClosed { key, .. }
+            | Self::Select { key, .. }
+            | Self::OpenFile { key, .. }
+            | Self::SeedSelections { key, .. } => *key,
             Self::Replace(plan) => plan.key,
         }
     }
@@ -70,6 +81,7 @@ impl SearchAction {
 /// One visible page and one replacement recipe. File pages replace previous
 /// pages instead of accumulating the entire tree/result stream on the UI.
 pub struct SearchState {
+    pub folder: Option<folder_replace::Update>,
     pub status: SearchStatus,
     pub key: Option<SearchKey>,
     pub first: u64,
@@ -90,6 +102,7 @@ pub struct SearchState {
 impl Default for SearchState {
     fn default() -> Self {
         Self {
+            folder: None,
             status: SearchStatus::Idle,
             key: None,
             first: 0,
@@ -127,6 +140,9 @@ impl SearchSession {
             replacement: None,
             files_counted_until: 0,
         })
+    }
+    pub fn take_folder_update(&mut self) -> Option<folder_replace::Update> {
+        self.state.folder.take()
     }
     pub fn state(&self) -> &SearchState {
         &self.state
@@ -282,9 +298,21 @@ impl SearchSession {
             return;
         }
         match event.update {
-            SearchUpdate::Folder(_) => {
-                self.state.status = SearchStatus::Failed;
-                self.state.error = Some("Folder replacement host is not attached".into());
+            SearchUpdate::Folder(mut update) => {
+                if let folder_replace::Update::Preview { plan, first, rows } = &mut update {
+                    self.state.files = std::mem::take(rows);
+                    self.state.file_first = *first;
+                    self.state.files_seen = plan.len();
+                    self.state.count = plan.matches;
+                    for row in &mut self.state.files {
+                        if let FileEvent::Hit(hit) = row {
+                            hit.line = format!("{} matches", hit.line_number).into_bytes();
+                            hit.match_ranges = std::iter::once(0..0).collect();
+                        }
+                    }
+                }
+                self.state.status = SearchStatus::Complete;
+                self.state.folder = Some(update);
             }
             SearchUpdate::Seed(seed) => {
                 self.state.status = SearchStatus::Complete;
@@ -357,6 +385,7 @@ impl SearchSession {
         self.state.key = None;
         self.state.hits.clear();
         self.state.files.clear();
+        self.state.folder = None;
         self.state.file_results = None;
         self.state.navigation = None;
         self.state.seed = None;
@@ -461,6 +490,7 @@ impl SearchSession {
             self.rejected = error.internal;
             return Err(error.external.map(Box::new));
         }
+        self.state.folder = None;
         self.state.file_results = None;
         self.replacement = None;
         Ok(self.worker.take().expect("search worker retained through close admission"))
