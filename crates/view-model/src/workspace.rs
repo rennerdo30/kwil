@@ -695,8 +695,15 @@ impl Workspace {
     /// Keep the policy for editors installed by later open/recovery results.
     /// Frontends retain responsibility for settings receipts and visual damage.
     pub fn set_editor_settings(&mut self, settings: &kwil_core_commands::Settings) {
-        self.wrap.settings_changed();
-        self.editor_settings = Some(settings.clone());
+        let previous = self.editor_settings.replace(settings.clone());
+        // Theme changes recolour retained spans; they must not change the
+        // wrapped layout key and force another syntax request.
+        if previous.is_none_or(|mut previous| {
+            previous.theme = settings.theme.clone();
+            previous != *settings
+        }) {
+            self.wrap.settings_changed();
+        }
         for view in self.views.values_mut().chain(self.closed_views.values_mut()) {
             if let Some(editor) = view.editor_mut() {
                 editor.settings = settings.clone();

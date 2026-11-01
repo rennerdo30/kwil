@@ -16,7 +16,7 @@ impl Language {
         let id = id.trim();
         Self::CATALOGUE.iter().copied().find(|l| l.id().eq_ignore_ascii_case(id)).or_else(|| {
             Some(match id.to_ascii_lowercase().as_str() {
-                "text" | "plain" | "plaintext" | "fundamental" => Self::Generic,
+                "text" | "plain" | "plaintext" | "fundamental" => Self::PlainText,
                 "c++" => Self::Cpp,
                 "c#" | "csharp" | "cs" => Self::CSharp,
                 "js" => Self::JavaScript,

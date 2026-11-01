@@ -27,6 +27,24 @@ pub(crate) fn settle_until(
 fn geometry() -> LayoutGeometry {
     LayoutGeometry { columns: 3, rows: 2, tab_size: 4, ..Default::default() }
 }
+
+#[test]
+fn theme_only_reload_preserves_wrapped_layout_and_syntax_identity() {
+    let (mut workspace, mut owner, host, _) = setup();
+    let mut settings = kwil_core_commands::Settings::default();
+    settings.editor.word_wrap = true;
+    workspace.set_editor_settings(&settings);
+    let before = owner.prepare_context(&workspace, geometry(), BodyOwner::Text).unwrap();
+    settings.theme.name = "light".into();
+    workspace.set_editor_settings(&settings);
+    let after = owner.prepare_context(&workspace, geometry(), BodyOwner::Text).unwrap();
+    assert_eq!(before, after, "theme colours must not invalidate wrapped syntax requests");
+    settings.editor.tab_size += 1;
+    workspace.set_editor_settings(&settings);
+    assert_ne!(after, owner.prepare_context(&workspace, geometry(), BodyOwner::Text).unwrap());
+    std::thread::scope(|scope| scope.spawn(|| stop(&mut workspace, owner, host)).join().unwrap());
+}
+
 fn setup() -> (Workspace, WorkspaceWrap, WrapHost, Receiver<()>) {
     let mut workspace = Workspace::new(View::new(None)).unwrap();
     let editor = workspace.editor_mut().unwrap();

@@ -17,6 +17,22 @@ fn compare_context_is_configurable_searchable_and_lossless() {
 }
 
 #[test]
+fn file_type_globs_survive_settings_parse_edit_and_round_trip() {
+    let source = "[file_types]\n'**/special/*.rs' = 'python' # keep\n'*.test.rs' = 'plaintext'\nrs = 'rust'\n";
+    let mut document = SettingsDocument::parse(source).unwrap();
+    assert_eq!(document.file_types()["**/special/*.rs"], "python");
+    assert_eq!(document.file_types()["*.test.rs"], "plaintext");
+    document.map_extension("**/special/*.rs", Some("ruby")).unwrap();
+    document.map_extension("**/generated/*.rs", Some("plaintext")).unwrap();
+    let restored = SettingsDocument::parse(document.source()).unwrap();
+    assert_eq!(restored.file_types()["**/special/*.rs"], "ruby");
+    assert_eq!(restored.file_types()["**/generated/*.rs"], "plaintext");
+    assert!(restored.source().contains("# keep"));
+    assert_eq!(restored.language_for_extension(".RS"), Some("rust"));
+    assert!(normalize_extension("**/special/*.rs").is_err(), "OS registrations still require extensions");
+}
+
+#[test]
 fn update_channel_shows_effective_default_and_preserves_explicit_choices() {
     let expected =
         if env!("CARGO_PKG_VERSION").split('+').next().unwrap().contains('-') { "prerelease" } else { "stable" };
