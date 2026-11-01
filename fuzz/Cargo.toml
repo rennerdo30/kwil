@@ -1,0 +1,39 @@
+[package]
+name = "kwil-core-text-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone: normal workspace builds neither resolve libFuzzer nor need nightly.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+kwil-core-text = { path = "../crates/core-text" }
+encoding_rs = "0.8.42"
+
+[[bin]]
+name = "edits"
+path = "fuzz_targets/edits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "line_index"
+path = "fuzz_targets/line_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encodings"
+path = "fuzz_targets/encodings.rs"
+test = false
+doc = false
+bench = false

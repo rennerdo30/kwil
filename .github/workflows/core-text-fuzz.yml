@@ -1,0 +1,43 @@
+name: Core text scheduled fuzzing
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: target
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  core-text:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Properties on pinned stable
+        env:
+          PROPTEST_CASES: 256
+        run: cargo test -p kwil-core-text --test properties --locked -j 4
+      - name: Install nightly for fuzz targets only
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz edits
+        run: cargo +nightly fuzz run edits -- -max_total_time=60 -max_len=768
+      - name: Fuzz line index
+        if: success() || failure()
+        run: cargo +nightly fuzz run line_index -- -max_total_time=60 -max_len=4099
+      - name: Fuzz encodings
+        if: success() || failure()
+        run: cargo +nightly fuzz run encodings -- -max_total_time=60 -max_len=513
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: core-text-fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
