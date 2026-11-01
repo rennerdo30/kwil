@@ -285,6 +285,7 @@ struct FileFlow {
     journal_failed: HashMap<DocumentId, String>,
     metadata_durable: bool,
     restore_session: Option<bool>,
+    transient_root: Option<PathBuf>,
     hot_exit: bool,
     manual_guard: bool,
     history_wait: Option<DocumentId>,
@@ -1283,7 +1284,7 @@ impl Workspace {
             .worker
             .as_ref()
             .unwrap()
-            .try_submit(DocumentRequest::Prepare { root })
+            .try_submit(DocumentRequest::Prepare { root: self.files.transient_root.clone().or(root) })
             .map_err(|_| io::Error::other("Recovery admission failed"))?;
         self.files.preparing = true;
         Ok(())
@@ -1402,12 +1403,30 @@ impl Workspace {
                 tab.recovery_path = None;
             }
         }
-        self.files.queue.push_back(DocumentRequest::Persist(snapshot));
+        self.files.queue.push_back(if self.files.transient_root.is_some() {
+            DocumentRequest::PersistTransient(snapshot)
+        } else {
+            DocumentRequest::Persist(snapshot)
+        });
         self.pump_files();
     }
 
+    /// Separate windows own temporary worker storage and never join the primary
+    /// recovery store. Settings reload cannot enable hot exit in these windows.
+    pub fn use_transient_session(&mut self) {
+        assert!(!self.files.document_started, "session policy must precede worker startup");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        self.files.transient_root = Some(std::env::temp_dir().join(format!(
+            "kwil-window-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        self.files.restore_session = Some(false);
+    }
+
     pub fn set_session_restore(&mut self, enabled: bool) {
-        self.files.restore_session = Some(enabled);
+        self.files.restore_session = Some(enabled && self.files.transient_root.is_none());
     }
 
     fn install_journal_observers(&mut self) {
@@ -1487,6 +1506,11 @@ impl Workspace {
     }
     pub fn close_pending(&self) -> bool {
         self.files.quit || !self.files.close.is_empty()
+    }
+    /// A durable hot exit is cancellable, but must not offer to discard work
+    /// while its journal flush is in progress.
+    pub fn close_confirmation_pending(&self) -> bool {
+        self.close_pending() && !self.files.hot_exit
     }
     pub fn cancel_close_intent(&mut self) {
         self.files.close.clear();
@@ -3642,6 +3666,39 @@ mod tests {
     }
 
     #[test]
+    fn transient_window_never_hot_exits_or_persists_and_guards_dirty_close() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.use_transient_session();
+        let root = workspace.files.transient_root.clone().unwrap();
+        assert!(root.is_absolute());
+        let mut other = Workspace::new(View::new(None)).unwrap();
+        other.use_transient_session();
+        assert_ne!(other.files.transient_root.as_ref(), Some(&root));
+        workspace.set_session_restore(true); // a late settings reload
+        workspace.files.storage_ready = true;
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("unsaved".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.checkpoint_session();
+        workspace.persist_snapshot();
+        assert!(matches!(workspace.files.queue.back(), Some(DocumentRequest::PersistTransient(_))));
+        workspace.files.queue.clear();
+        workspace.test_document_result(DocumentResult::Persisted(Ok(())));
+        workspace.request_window_close(false).unwrap();
+        assert!(workspace.close_pending());
+        assert!(!workspace.files.hot_exit);
+        assert!(workspace.close_confirmation_pending());
+        assert!(!workspace.wants_exit());
+        workspace.cancel_close_intent();
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        workspace.request_window_close(false).unwrap();
+        workspace.discard_pending_close().unwrap();
+        workspace.test_document_result(DocumentResult::Persisted(Ok(())));
+        assert!(workspace.wants_exit(), "only explicit discard permits quitting unsaved work");
+        assert!(!root.exists(), "policy construction performs no filesystem work");
+    }
+
+    #[test]
     fn confirmed_window_close_keeps_dirty_work_pending_even_with_session_restore() {
         let make = || {
             let mut workspace = Workspace::new(View::new(None)).unwrap();
@@ -3669,6 +3726,7 @@ mod tests {
         let mut terminal = make();
         terminal.request_window_close(false).unwrap();
         assert!(terminal.files.hot_exit, "the terminal's existing recovery policy is preserved");
+        assert!(!terminal.close_confirmation_pending(), "a primary hot exit must not open a dirty-close dialog");
     }
 
     #[test]

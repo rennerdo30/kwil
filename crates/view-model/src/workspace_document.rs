@@ -1207,6 +1207,7 @@ impl Workspace {
     where
         W: Fn() -> io::Result<()> + Send + Sync + 'static,
     {
+        let root = self.files.transient_root.clone().or(root);
         if self.files.worker.is_some() {
             return Err(WorkspaceDocumentStartFailure::NotStarted {
                 root,

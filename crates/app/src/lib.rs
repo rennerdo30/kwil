@@ -25,6 +25,7 @@ Usage: kwil [options] [file[:line[:column]] ...]
 Options:
   --gui        Force the window UI
   --tui        Force the terminal UI
+  --new-window Open a separate window without session restore
   --renderer auto|cpu|gpu  Select the GUI rendering backend (overrides settings)
   --update     Check for an update now and install it
   --unregister-file-types  Remove Kwil from \"Open with\" (Windows; the uninstaller runs this)
@@ -41,10 +42,29 @@ struct Args {
     gui: bool,
     tui: bool,
     hidden: bool,
+    new_window: bool,
     update: bool,
     unregister_file_types: bool,
     renderer: Option<kwil_ui_gpu::RenderBackend>,
     files: Vec<FileArgument>,
+}
+
+fn join_primary_instance(
+    hidden: bool,
+    new_window: bool,
+    namespace: Option<&std::ffi::OsStr>,
+) -> Result<bool, &'static str> {
+    if new_window {
+        return Ok(false);
+    }
+    if !hidden {
+        return Ok(true);
+    }
+    match namespace {
+        None => Ok(false),
+        Some(namespace) if namespace.to_str().is_some_and(|value| value.starts_with("kwil-test-")) => Ok(true),
+        Some(_) => Err("hidden IPC requires a kwil-test- namespace"),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -88,6 +108,7 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
             }
             // Agent and test runs: window composed but never shown (Windows).
             Some("--hidden") => a.hidden = true,
+            Some("--new-window") => a.new_window = true,
             Some("--update") => a.update = true,
             Some("--unregister-file-types") => a.unregister_file_types = true,
             Some("--version" | "-V") => {
@@ -244,8 +265,20 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
     #[allow(unused_mut)]
     let mut use_gui = frontend == Frontend::Gui;
-    // Hidden verification runs never join or claim the owner's live instance.
-    let endpoint = if args.hidden {
+    // Hidden IPC checks require an explicit test namespace; default hidden runs
+    // never join or claim the owner's live instance.
+    let join_primary = match join_primary_instance(
+        args.hidden,
+        args.new_window,
+        std::env::var_os("KWIL_INSTANCE_NAMESPACE").as_deref(),
+    ) {
+        Ok(join) => join,
+        Err(error) => {
+            eprintln!("kwil: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let endpoint = if !join_primary {
         None
     } else {
         match instance::endpoint() {
@@ -325,7 +358,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let workspace = match Workspace::try_new(view) {
+    let mut workspace = match Workspace::try_new(view) {
         ControlFlow::Continue(workspace) => workspace,
         ControlFlow::Break(refusal) => {
             // Fatal process exit retains the original input or partial
@@ -335,6 +368,9 @@ fn run_app(console_launcher: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if args.new_window {
+        workspace.use_transient_session();
+    }
     let budget = AllocationBudget::default();
     let (workspace, budget) = if use_gui {
         let opts = kwil_ui_gpu::GuiOptions { hidden: args.hidden, renderer: args.renderer };
@@ -493,6 +529,24 @@ mod isolation_tests {
             receiver.recv_timeout(remaining).expect("initial delivery worker wake");
             transport.receive(workspace, true).expect("sealed initial delivery");
         }
+    }
+
+    #[test]
+    fn hidden_ipc_requires_an_explicit_isolated_namespace_and_new_window_bypasses_it() {
+        assert!(!join_primary_instance(true, false, None).unwrap());
+        assert!(join_primary_instance(true, false, Some(std::ffi::OsStr::new("kwil"))).is_err());
+        assert!(join_primary_instance(true, false, Some(std::ffi::OsStr::new("kwil-test-123"))).unwrap());
+        assert!(!join_primary_instance(true, true, Some(std::ffi::OsStr::new("kwil-test-123"))).unwrap());
+        assert!(join_primary_instance(false, false, None).unwrap());
+    }
+
+    #[test]
+    fn new_window_flag_is_distinct_from_a_literal_file_name() {
+        let args = parse_args_values(["--new-window".into(), "file.txt".into()].into_iter()).unwrap();
+        assert!(args.new_window);
+        assert_eq!(args.files.len(), 1);
+        let literal = parse_args_values(["--".into(), "--new-window".into()].into_iter()).unwrap();
+        assert_eq!(literal.files.len(), 1);
     }
 
     #[test]

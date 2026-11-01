@@ -508,6 +508,12 @@ impl<'a> ReplayRevision<'a> {
         self.checked(result)
     }
 
+    pub fn checkpoint_undo(&mut self, revisions: Option<(u64, u64)>) -> io::Result<()> {
+        let cancel = self.cancel;
+        let result = self.core()?.checkpoint_undo(revisions, || cancelled(cancel));
+        self.checked(result)
+    }
+
     pub fn commit(self) -> io::Result<()> {
         let cancel = self.cancel;
         self.commit_checked(|| cancelled(cancel))
