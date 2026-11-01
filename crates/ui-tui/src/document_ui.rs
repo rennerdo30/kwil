@@ -33,6 +33,7 @@ impl StartupOwner {
             ticket: ShutdownTicket {
                 document: None,
                 highlighting: None,
+                content: content_ui::Host::default(),
                 search_binding: None,
                 search_release_refusal: None,
                 terminal_panic: None,

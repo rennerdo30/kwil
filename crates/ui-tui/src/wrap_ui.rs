@@ -872,6 +872,7 @@ mod tests {
             // arms this bounded teardown backoff.
             let Self { view, search, document, runtime, events, root, .. } = self;
             let ticket = crate::ShutdownTicket {
+                content: crate::content_ui::Host::default(),
                 document: Some(document),
                 highlighting: None,
                 search_binding: None,

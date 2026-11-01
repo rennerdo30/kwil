@@ -12,6 +12,7 @@ use kwil_core_commands::{Preset, keymap::KeymapEngine, settings::Settings, vim::
 use kwil_view_model::{CommandArgs, CommandStatus, Notify, View, Workspace};
 mod binary_offer;
 mod compare_ui;
+mod content_ui;
 mod document_ui;
 mod file_prompt;
 mod hex_ui;
@@ -36,6 +37,7 @@ use std::sync::mpsc;
 use std::{ops::ControlFlow, time::Duration};
 
 enum Msg {
+    ContentReady,
     WrapReady,
     SearchReady,
     HighlightsReady,
@@ -180,7 +182,7 @@ fn run_workspace_with_terminal_init(
         )?;
         let terminal = terminal.as_mut().expect("initialized terminal");
         let budget = &startup.budget;
-        let ShutdownTicket { view, document, search, wrap, highlighting, rx, .. } = &mut startup.ticket;
+        let ShutdownTicket { view, document, search, wrap, highlighting, content, rx, .. } = &mut startup.ticket;
         let view = view.as_mut().expect("guarded original Workspace");
         let compare_sender = tx.clone();
         view.compare.set_wake(std::sync::Arc::new(move || {
@@ -262,6 +264,10 @@ fn run_workspace_with_terminal_init(
                 .and_then(|exe| Settings::path(&exe).map_err(|error| error.to_string()));
             let _ = settings_sender.send(Msg::SettingsPath(path));
         });
+        let content_sender = tx.clone();
+        content.start(std::sync::Arc::new(move || {
+            let _ = content_sender.send(Msg::ContentReady);
+        }));
         let started = std::time::Instant::now();
         let mut horizontal = 0u64;
         let mut settings = Settings::default();
@@ -281,7 +287,7 @@ fn run_workspace_with_terminal_init(
             };
             let user_input = matches!(&msg, Msg::Input(_));
             let size = terminal.size()?;
-            let body = wrap_body_rect(view, size.width, size.height, settings.tabs.layout);
+            let body = content.source_body(wrap_body_rect(view, size.width, size.height, settings.tabs.layout), view);
             let blocked = wrap_modal(
                 view,
                 search,
@@ -312,6 +318,7 @@ fn run_workspace_with_terminal_init(
                         }
                         update.is_some() || document.wrap_failed()
                     }
+                    Msg::ContentReady => true,
                     Msg::WrapReady => wrap.as_mut().is_some_and(|host| host.ready(view)),
                     Msg::SearchReady => !exiting && search.ready(view, &mut keys),
                     Msg::HighlightsReady => {
@@ -576,6 +583,10 @@ fn run_workspace_with_terminal_init(
                             )
                         } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
                             palette_ui::key(view, host, k, &mut keys, started.elapsed(), settings.keymap)
+                        } else if content.key(view, k) {
+                            KeyResult::Changed(true)
+                        } else if content.captures_body(view) {
+                            content_ui::chrome_key(view, k, &mut keys, started.elapsed(), settings.keymap)
                         } else if view.compare.open
                             && !(k.modifiers.contains(KeyModifiers::CONTROL)
                                 && matches!(k.code, KeyCode::Char('p' | 'P')))
@@ -590,6 +601,9 @@ fn run_workspace_with_terminal_init(
                         } else {
                             search_ui::key(search, view, k, &mut keys, &settings, started.elapsed())
                         };
+                        if matches!(&intent, KeyResult::Search(_)) {
+                            content.close();
+                        }
                         let intent = hex_ui::resolve(view, &mut keys, intent);
                         let intent = search_ui::resolve(search, view, &mut keys, &settings, intent);
                         let blocked = wrap_modal(
@@ -602,6 +616,16 @@ fn run_workspace_with_terminal_init(
                         if let Some(host) = wrap {
                             host.sync(view, body, blocked);
                         }
+                        let intent = if content.captures_body(view)
+                            && matches!(
+                                &intent,
+                                KeyResult::BodyExecute(_, _, _) | KeyResult::BodyInvoke(_, _) | KeyResult::Format(_)
+                            ) {
+                            view.set_notice("Close the read-only content view to edit".into());
+                            KeyResult::Changed(true)
+                        } else {
+                            intent
+                        };
                         let intent = resolve_bounded_wrap(
                             document,
                             view,
@@ -611,6 +635,26 @@ fn run_workspace_with_terminal_init(
                             settings.keymap,
                         );
                         match intent {
+                            KeyResult::Content(command) => {
+                                if matches!(command, "log.toggleMark" | "log.nextMark" | "log.previousMark") {
+                                    let line = content.mark_line(view);
+                                    if content.captures_body(view) && line.is_none() {
+                                        view.set_notice(
+                                            "Wait for filtered log lines before marking or navigating".into(),
+                                        );
+                                    } else {
+                                        if command != "log.toggleMark" {
+                                            content.close_logs();
+                                        }
+                                        if let Err(e) = view.log_mark_command(command, line) {
+                                            view.set_notice(e.to_string());
+                                        }
+                                    }
+                                } else {
+                                    content.command(view, command);
+                                }
+                                true
+                            }
                             KeyResult::RetryWrap | KeyResult::BodyInvoke(_, _) | KeyResult::BodyExecute(_, _, _) => {
                                 unreachable!("body intent resolved")
                             }
@@ -699,6 +743,9 @@ fn run_workspace_with_terminal_init(
                             }
                             KeyResult::Settings | KeyResult::LogHighlights => {
                                 let log_highlights = matches!(intent, KeyResult::LogHighlights);
+                                if log_highlights {
+                                    content.close_logs();
+                                }
                                 if let Some(host) = &mut palette {
                                     let _ = host.input(kwil_view_model::palette_session::PaletteInput::Cancel);
                                 }
@@ -787,6 +834,11 @@ fn run_workspace_with_terminal_init(
                             }
                             view.prompt_notice();
                             true
+                        } else if content.editing() {
+                            content.paste(&text);
+                            true
+                        } else if content.captures_body(view) {
+                            true
                         } else if let Some(menu) = &mut language_menu {
                             menu.text(view, &text);
                             true
@@ -851,6 +903,17 @@ fn run_workspace_with_terminal_init(
                     Msg::Input(Event::Mouse(m)) if search.is_open() && view.file_prompt().is_none() => {
                         let size = terminal.size()?;
                         search_ui::mouse(search, view, &mut keys, &m, Rect::new(0, 0, size.width, size.height))
+                    }
+                    Msg::Input(Event::Mouse(m))
+                        if (content.captures_body(view)
+                            || content.preview_point(
+                                view,
+                                &m,
+                                wrap_body_rect(view, size.width, size.height, settings.tabs.layout),
+                            ))
+                            && view.file_prompt().is_none() =>
+                    {
+                        tabs::mouse(view, &m, size.width, size.height, settings.tabs.layout) || content.mouse(view, &m)
                     }
                     Msg::Input(Event::Mouse(m)) if view.compare.open => {
                         let size = terminal.size()?;
@@ -964,19 +1027,20 @@ fn run_workspace_with_terminal_init(
                     // Resize and scroll submit the latest bounded page through
                     // Workspace. Editor-bearing requests never live in the UI.
                     let _ = view.submit_hex_page();
-                } else if !wrap.as_ref().is_some_and(|host| host.owns_body(view))
+                } else if !content.captures_body(view)
+                    && !wrap.as_ref().is_some_and(|host| host.owns_body(view))
                     && !palette.as_ref().is_some_and(|host| host.model().is_open())
                 {
-                    keep_visible(
-                        view,
-                        &mut horizontal,
-                        geometry.body.width.saturating_sub(8),
-                        settings.editor.tab_size as usize,
-                    );
+                    let columns = content
+                        .source_body(Rect::new(0, 0, geometry.body.width as u16, 1), view)
+                        .width
+                        .saturating_sub(8) as usize;
+                    keep_visible(view, &mut horizontal, columns, settings.editor.tab_size as usize);
                 }
                 // ratatui diffs against the previous frame and writes only
                 // the changed cells.
-                let body = wrap_body_rect(view, size.width, size.height, settings.tabs.layout);
+                let full_body = wrap_body_rect(view, size.width, size.height, settings.tabs.layout);
+                let body = content.source_body(full_body, view);
                 let blocked = wrap_modal(
                     view,
                     search,
@@ -992,6 +1056,7 @@ fn run_workspace_with_terminal_init(
                 {
                     prepare_highlighting_wrapped(host, view, wrap.as_mut());
                 }
+                content.sync(view, body.height.saturating_sub(1) as usize);
                 let prepared = wrap.as_ref().is_some_and(|host| host.owns_body(view));
                 let spans: Vec<_> = if prepared {
                     if let Some((page, context)) = wrap
@@ -1034,6 +1099,9 @@ fn run_workspace_with_terminal_init(
                         if let Some(host) = &highlighting {
                             draw_language_status(f, host, view);
                         }
+                    }
+                    if !view.wrap_input_blocked() {
+                        content.draw(f, view, full_body);
                     }
                     if view.compare.open {
                         compare_ui::draw(f, view, settings.tabs.layout);
@@ -1177,6 +1245,7 @@ fn shutdown_bounded_workspace(
     let ticket = ShutdownTicket {
         document: Some(document),
         highlighting,
+        content: content_ui::Host::default(),
         search_binding: None,
         search_release_refusal: None,
         terminal_panic: None,
@@ -1291,6 +1360,7 @@ fn finish_bounded_shutdown(ticket: &mut ShutdownTicket, timeout: Duration, expli
         }
         // Frontend layout roots retire on this existing executor before the
         // sealed bundle can release Workspace/document roots.
+        ticket.content.settle(deadline)?;
         drop(ticket.wrap.take());
         if let Some(highlighting) = &mut ticket.highlighting {
             highlighting
@@ -1468,6 +1538,7 @@ fn receive_bounded_document(
 /// One retained shutdown owner per process. A failed drain never destroys the
 /// actual Workspace, channel results or search facade on the input thread.
 struct ShutdownTicket {
+    content: content_ui::Host,
     document: Option<DocumentLane>,
     highlighting: Option<kwil_view_model::highlight_session::HighlightSession>,
     search_binding: Option<kwil_view_model::workspace_document::DocumentSearchBinding>,
@@ -1820,6 +1891,7 @@ fn combine_shutdown_results(primary: std::io::Result<()>, cleanup: std::io::Resu
 }
 
 enum KeyResult {
+    Content(&'static str),
     Format(bool),
     Theme(&'static str),
     RetryWrap,
@@ -1845,6 +1917,9 @@ enum KeyResult {
 /// Preserve Workspace's body ownership at the palette invocation boundary;
 /// existing View-only key tests retain the same text adapter.
 trait TuiTarget {
+    fn workspace_target(&self) -> bool {
+        false
+    }
     fn comparison_open(&self) -> bool {
         false
     }
@@ -1869,6 +1944,9 @@ impl TuiTarget for View {
     }
 }
 impl TuiTarget for Workspace {
+    fn workspace_target(&self) -> bool {
+        true
+    }
     fn comparison_open(&self) -> bool {
         self.compare.open
     }
@@ -2344,6 +2422,10 @@ fn invoke(
     if view.raw_body() && !hex_ui::chrome_command(call.id) && !call.id.starts_with("log.") {
         return KeyResult::Hex(call, extend);
     }
+    let workspace = view.workspace_target();
+    if call.id.starts_with("view.markdown") || call.id == "view.toggleMarkdown" || call.id == "view.logFilters" {
+        return KeyResult::Content(call.id);
+    }
     let body_blocked = view.body_blocked();
     let view = view.text_view_mut();
     if call.id == "file.setType" {
@@ -2362,6 +2444,9 @@ fn invoke(
         if !view.is_log_document() {
             view.set_notice("Open a log file first".into());
         } else if matches!(call.id, "log.toggleMark" | "log.nextMark" | "log.previousMark") {
+            if workspace {
+                return KeyResult::Content(call.id);
+            }
             if body_blocked || prepared_body(view) {
                 view.set_notice("Open the unwrapped log text to navigate line marks".into());
             } else if let Err(error) = view.log_mark_command(call.id, None) {
@@ -2370,12 +2455,8 @@ fn invoke(
         } else if call.id == "log.highlightRules" {
             return KeyResult::LogHighlights;
         } else {
-            view.set_notice("Log follow, text, level and time filters are in the window UI (kwil --gui)".into());
+            return KeyResult::Content(call.id);
         }
-        return KeyResult::Changed(true);
-    }
-    if call.id == "view.logFilters" || call.id.starts_with("view.markdown") || call.id == "view.toggleMarkdown" {
-        view.set_notice("Markdown preview and log filters are in the window UI (kwil --gui)".into());
         return KeyResult::Changed(true);
     }
     if call.id == "view.settingsFile" {
@@ -2423,7 +2504,7 @@ fn invoke(
     ) {
         return KeyResult::File(call.id);
     }
-    if body_blocked || prepared_body(view) {
+    if workspace || body_blocked || prepared_body(view) {
         return KeyResult::BodyInvoke(call, extend);
     }
     invoke_body(view, call, extend, elapsed, preset)
@@ -2986,6 +3067,7 @@ mod tests {
             ticket: Some(ShutdownTicket {
                 document: None,
                 highlighting: None,
+                content: content_ui::Host::default(),
                 search_binding: None,
                 search_release_refusal: None,
                 terminal_panic: None,
@@ -3044,6 +3126,7 @@ mod tests {
         let mut ticket = ShutdownTicket {
             document: None,
             highlighting: None,
+            content: content_ui::Host::default(),
             search_binding: None,
             search_release_refusal: None,
             terminal_panic: None,
@@ -3167,6 +3250,7 @@ mod tests {
             let mut ticket = ShutdownTicket {
                 document: None,
                 highlighting: None,
+                content: content_ui::Host::default(),
                 search_binding: None,
                 search_release_refusal: None,
                 terminal_panic: None,
@@ -3207,6 +3291,7 @@ mod tests {
         let ticket = ShutdownTicket {
             document: None,
             highlighting: None,
+            content: content_ui::Host::default(),
             search_binding: None,
             search_release_refusal: None,
             terminal_panic: None,
@@ -3565,6 +3650,23 @@ mod tests {
     }
 
     #[test]
+    fn markdown_commands_dispatch_to_terminal_preview() {
+        let mut view = View::new(None);
+        for id in ["view.markdownText", "view.markdownPreview", "view.markdownSplit"] {
+            let mut keys = KeymapEngine::new(Preset::VsCode, &[binding("f6", id)]).unwrap();
+            let result = key(
+                &mut view,
+                KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+                Duration::ZERO,
+                &mut keys,
+                Preset::VsCode,
+            );
+            assert!(!view.notice().contains("window UI"), "{id} must have a terminal host");
+            assert!(!matches!(result, KeyResult::Changed(_)), "{id} must reach the terminal host");
+        }
+    }
+
+    #[test]
     fn log_commands_require_a_log_document() {
         for command in kwil_core_commands::COMMANDS.iter().filter(|c| c.id.starts_with("log.")) {
             let mut view = View::new(None);
@@ -3581,7 +3683,7 @@ mod tests {
     }
 
     #[test]
-    fn log_commands_navigate_marks_and_explain_window_only_actions() {
+    fn log_commands_navigate_marks_and_dispatch_terminal_actions() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "kwil-tui-log-{}-{}.log",
@@ -3603,7 +3705,7 @@ mod tests {
                 Preset::VsCode,
             );
             if command == "log.resume" {
-                assert!(view.notice().contains("window UI"));
+                assert!(!matches!(result, KeyResult::Changed(_)), "follow must reach the terminal host");
             }
             if command == "log.highlightRules" {
                 assert!(matches!(result, KeyResult::LogHighlights));

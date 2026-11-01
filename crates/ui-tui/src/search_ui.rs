@@ -2273,6 +2273,7 @@ mod tests {
         let pinned =
             worker.shutdown_bounded(Duration::ZERO).expect_err("actual replacement history must pin search retirement");
         let ticket = crate::ShutdownTicket {
+            content: crate::content_ui::Host::default(),
             document: Some(document),
             highlighting: None,
             search_binding: Some(binding),
