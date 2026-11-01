@@ -1724,8 +1724,11 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::SettingsClose => {
             if let Some(host) = app.settings_panel.as_mut() {
                 // Cancel the capture, leave the page, then close: no edit is applied.
-                let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
-                let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
+                for _ in 0..2 {
+                    if host.panel().is_some() {
+                        let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
+                    }
+                }
                 host.close();
             }
             app.settings_epoch = app.settings_epoch.wrapping_add(1);
