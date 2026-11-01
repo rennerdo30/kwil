@@ -36,7 +36,7 @@ pub(super) const MENUS: &[Menu] = &[
             Separator,
             Item("&Save", "file.save"),
             Item("Save &As\u{2026}", "file.saveAs"),
-            Item("Save uncompressed as\u{2026}", "file.saveUncompressedAs"),
+            Item("Save &uncompressed as\u{2026}", "file.saveUncompressedAs"),
             Item("Save A&ll", "file.saveAll"),
             Item("Change File T&ype\u{2026}", "file.setType"),
             Separator,
