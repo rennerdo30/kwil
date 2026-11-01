@@ -479,16 +479,11 @@ mod external_change {
 
     #[test]
     fn reload_from_disk_after_an_external_change() {
-        // Owner decision 2026-10-30 (KW-76): the reload never arrives on the
-        // hosted Windows runner (3 runs) but passes locally on Windows, macOS
-        // and Linux. Skipped only there until KW-76 finds the cause.
-        if cfg!(windows) && std::env::var_os("GITHUB_ACTIONS").is_some() {
-            eprintln!("skipped on the hosted Windows runner, see KW-76");
-            return;
-        }
         let (mut workspace, lane, path, id) = conflicted("kwil-conflict-reload");
+        eprintln!("KW-76 before submit: {}", workspace.reload_diagnostics());
         workspace.file_prompt_mut().unwrap().text = "2".into();
         submit(&mut workspace);
+        eprintln!("KW-76 after submit: {}", workspace.reload_diagnostics());
         // Reload may wait in the pending slot first; wait for its result.
         // Notices can be replaced by later ones; wait for the reloaded content.
         lane.until(&mut workspace, |w| {
