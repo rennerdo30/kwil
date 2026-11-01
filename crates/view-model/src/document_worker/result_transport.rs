@@ -418,6 +418,7 @@ impl DocumentContinuationPermit {
                 | DocumentRequest::Save { .. }
                 | DocumentRequest::SaveRaw { .. }
                 | DocumentRequest::Persist(_)
+                | DocumentRequest::PersistTransient(_)
                 | DocumentRequest::SeedJournal { .. }
                 | DocumentRequest::FinishJournal { .. }
                 | DocumentRequest::FlushJournals

@@ -208,6 +208,7 @@ impl EncodingRuntime {
             let journal = recovery.recover_owned(path, tab.id, cancel)?;
             let summary = recovery.summary().ok_or_else(|| io::Error::other("recovery summary missing"))?;
             let revision = summary.journal.revision;
+            let highest_revision = summary.highest_revision;
             let base = summary.base.clone();
             let policy = summary.policy;
             let count = recovery.accepted_origin_count();
@@ -259,6 +260,7 @@ impl EncodingRuntime {
             document.saved_revision = tab.saved_revision;
             document.next_revision = revision
                 .max(tab.saved_revision)
+                .max(highest_revision)
                 .checked_add(2)
                 .ok_or_else(|| io::Error::other("Recovery revision overflow"))?;
             // Only metadata naming this exact revision as saved can regain a

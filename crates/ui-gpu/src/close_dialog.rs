@@ -13,9 +13,7 @@ pub(super) enum Ticket {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Choice {
-    #[cfg_attr(not(windows), expect(dead_code, reason = "Only constructed by the Windows dirty-close dialog"))]
     Save,
-    #[cfg_attr(not(windows), expect(dead_code, reason = "Only constructed by the Windows dirty-close dialog"))]
     Discard,
     Cancel,
     Hex,
@@ -88,7 +86,7 @@ impl CloseTicket {
         if editor.has_pending_edit_receipt() || editor.has_pending_save_completion() {
             return None;
         }
-        (view.close_pending()
+        (view.close_confirmation_pending()
             && editor.document().is_dirty()
             && !view.file_saves_pending()
             && view.file_prompt().is_none())
@@ -167,9 +165,6 @@ impl App {
             }
             return;
         }
-        if !cfg!(windows) {
-            return;
-        }
         let Some(ticket) = Ticket::capture(&self.view) else {
             return;
         };
@@ -177,7 +172,7 @@ impl App {
             return;
         } // Never open a visible system dialog in an agent harness.
         let owner = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
-        if owner == 0 {
+        if cfg!(windows) && owner == 0 {
             return;
         }
         let label = self
@@ -344,8 +339,20 @@ fn show(owner: isize, label: &str, purpose: &Ticket) -> Result<Choice, String> {
     })
 }
 #[cfg(not(windows))]
-fn show(_: isize, _: &str, _: &Ticket) -> Result<Choice, String> {
-    Err("native confirmation unavailable; use the owned prompt".into())
+fn show(_: isize, label: &str, purpose: &Ticket) -> Result<Choice, String> {
+    if matches!(purpose, Ticket::Binary(_)) {
+        return Err("use the owned binary prompt".into());
+    }
+    let result = rfd::MessageDialog::new()
+        .set_title("Kwil")
+        .set_description(format!("Save changes to {label}?\nYour changes will be lost if you don't save them."))
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom("Save".into(), "Don't Save".into(), "Cancel".into()))
+        .show();
+    Ok(match result {
+        rfd::MessageDialogResult::Custom(label) if label == "Save" => Choice::Save,
+        rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => Choice::Discard,
+        _ => Choice::Cancel,
+    })
 }
 #[cfg(test)]
 mod tests {

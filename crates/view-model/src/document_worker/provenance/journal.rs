@@ -155,6 +155,7 @@ pub struct JournalRecoverySummary {
     /// Original path/identity are informational; never open or attach that path.
     pub base: JournalBase,
     pub policy: RecoveryPolicy,
+    pub highest_revision: u64,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct JournalRetirementStatus {
@@ -177,6 +178,7 @@ pub struct JournalRecovery {
     parent: PathBuf,
     limits: ConsumerLimits,
     phase: Phase,
+    retain_undo: bool,
     summary: Option<JournalRecoverySummary>,
     // Construct on the worker; never accidentally transfer cleanup ownership
     // in a frontend completion. Buffer alone may cross that boundary.
@@ -218,9 +220,15 @@ impl JournalRecovery {
             parent: private_parent,
             limits: consumer,
             phase: Phase::Fresh,
+            retain_undo: false,
             summary: None,
             _worker: PhantomData,
         })
+    }
+
+    /// Restore complete journal transitions under the core undo cap.
+    pub fn retain_undo_history(&mut self) {
+        self.retain_undo = true;
     }
 
     /// One-shot, including failure and cancellation. Retry cleanup on this
@@ -288,10 +296,12 @@ impl JournalRecovery {
                 base_complete: false,
                 logical: 0,
                 revision_id: 0,
+                highest_revision: 0,
                 batch: None,
                 replacement: None,
                 batches: 0,
                 replacements: 0,
+                retain_undo: self.retain_undo,
             };
             let (journal, value) = run(&mut |event| events.event(event))?;
             Ok((events.finish(journal)?, value))
@@ -423,10 +433,12 @@ struct Consumer<'a, 'r, 'state, F> {
     base_complete: bool,
     logical: u64,
     revision_id: u64,
+    highest_revision: u64,
     batch: Option<Batch>,
     replacement: Option<Replacement>,
     batches: u64,
     replacements: u64,
+    retain_undo: bool,
 }
 impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
     fn admit_payload(&mut self, physical: u64, logical: u64) -> io::Result<()> {
@@ -464,6 +476,7 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
                 self.policy = Some(policy);
                 self.logical = logical_len;
                 self.revision_id = base.revision;
+                self.highest_revision = base.revision;
             }
             RecoveryEvent::BaseBytes(bytes) => {
                 if self.base.is_none() || self.base_complete {
@@ -478,6 +491,9 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
                 let physical = self.base.as_ref().ok_or_else(|| invalid("recovery missing base"))?.byte_len;
                 self.apply(physical, self.logical, 0..0)?;
                 self.base_complete = true;
+                if self.retain_undo {
+                    self.revision.checkpoint_undo(None)?;
+                }
             }
             RecoveryEvent::BeginBatch(header) => {
                 if !self.base_complete
@@ -543,6 +559,10 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
                     return Err(invalid("recovery incomplete batch"));
                 }
                 self.revision_id = batch.header.to_revision;
+                self.highest_revision = self.highest_revision.max(batch.header.to_revision);
+                if self.retain_undo {
+                    self.revision.checkpoint_undo(Some((batch.header.from_revision, batch.header.to_revision)))?;
+                }
             }
             RecoveryEvent::Base(_) => {
                 return Err(io::Error::new(
@@ -574,6 +594,7 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
             journal,
             base: self.base.ok_or_else(|| invalid("recovery missing base metadata"))?,
             policy: self.policy.ok_or_else(|| invalid("recovery missing policy"))?,
+            highest_revision: self.highest_revision,
         })
     }
 }
