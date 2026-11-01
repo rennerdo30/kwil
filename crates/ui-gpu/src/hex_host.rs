@@ -209,6 +209,8 @@ mod tests {
         assert!(app.dispatch_hex("edit.undo"));
         idle(&mut app, &rx, "ASCII undo");
         assert_eq!(data(&app), original);
+        app.edit(input::Action::Command("file.save"));
+        until(&mut app, &rx, "cleanup/save restored original", |a| !a.view.file_saves_pending());
         stop(app, rx, root);
     }
     #[test]

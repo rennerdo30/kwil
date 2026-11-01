@@ -122,10 +122,10 @@ pub(super) fn host_key(
     if event.kind == KeyEventKind::Release {
         return super::KeyResult::Changed(false);
     }
-    if workspace.hex_session().is_some_and(|s| s.prompt_open()) {
-        if let Some(outcome) = workspace.hex_session_mut().and_then(|session| key(session, event)) {
-            return super::KeyResult::Changed(submit(workspace, outcome));
-        }
+    if workspace.hex_session().is_some_and(|s| s.prompt_open())
+        && let Some(outcome) = workspace.hex_session_mut().and_then(|session| key(session, event))
+    {
+        return super::KeyResult::Changed(submit(workspace, outcome));
     }
     keys.set_context(kwil_core_commands::Context::Hex);
     if let Some(chord) = super::chord(event) {
@@ -277,7 +277,7 @@ pub(super) fn key(session: &mut Session, event: KeyEvent) -> Option<Result<Outco
         KeyCode::Home => Some(Input::Home { document: command, extend }),
         KeyCode::End => Some(Input::End { document: command, extend }),
         KeyCode::Tab | KeyCode::BackTab => Some(Input::ToggleColumn),
-        KeyCode::Enter => Some(Input::Accept),
+        KeyCode::Enter if session.prompt_open() => Some(Input::Accept),
         KeyCode::Insert => Some(Input::ToggleInsert),
         KeyCode::Delete => Some(Input::Delete { backwards: false }),
         KeyCode::Backspace => Some(Input::Delete { backwards: true }),
@@ -728,6 +728,8 @@ mod tests {
             TabLayout::Horizontal,
         );
         assert_eq!(host.workspace.hex_session().unwrap().view().cursor(), 49);
+        // ASCII clicks now select ASCII entry; this existing regression tests hex nibble/paste cancellation.
+        host.press(KeyCode::Tab, KeyModifiers::NONE);
         host.press(KeyCode::Char('f'), KeyModifiers::NONE);
         host.workspace.cancel_hex_input(); // same FocusLost/IME-cancel route as run
         assert!(host.workspace.hex_session().unwrap().view().pending_high_nibble().is_none());

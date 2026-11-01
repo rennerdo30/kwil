@@ -54,7 +54,7 @@ pub(super) fn key(session: &mut Session, key: &Key, mods: ModifiersState) -> Opt
         Key::Named(NamedKey::Home) => Some(Input::Home { document: command, extend }),
         Key::Named(NamedKey::End) => Some(Input::End { document: command, extend }),
         Key::Named(NamedKey::Tab) => Some(Input::ToggleColumn),
-        Key::Named(NamedKey::Enter) => Some(Input::Accept),
+        Key::Named(NamedKey::Enter) if session.prompt_open() => Some(Input::Accept),
         Key::Named(NamedKey::Insert) => Some(Input::ToggleInsert),
         Key::Named(NamedKey::Delete) => Some(Input::Delete { backwards: false }),
         Key::Named(NamedKey::Backspace) => Some(Input::Delete { backwards: true }),
