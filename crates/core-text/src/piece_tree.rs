@@ -1375,7 +1375,7 @@ fn feed_detached(
     Ok(())
 }
 
-pub(crate) fn decoded_checked<E>(
+pub(crate) fn decoded_checked<E: From<io::Error>>(
     origin: DecodedSnapshot,
     owner: Arc<()>,
     check: &mut impl FnMut() -> Result<(), E>,

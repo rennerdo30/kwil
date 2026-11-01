@@ -1986,7 +1986,7 @@ mod tests {
             &cancel,
         )
         .unwrap();
-        let buffer = Buffer::from_decoded(owner.snapshot());
+        let buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         let mut request =
             SeedRequest { snapshot: buffer.snapshot(), cursors: vec![caret(0)], primary: 0, allow_raw_utf8: false };
         let alias = run_seed(&request, &cancel).unwrap().unwrap();
@@ -2011,7 +2011,7 @@ mod tests {
             &cancel,
         )
         .unwrap();
-        let buffer = Buffer::from_decoded(owner.snapshot());
+        let buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         let request = SeedRequest {
             snapshot: buffer.snapshot(),
             cursors: vec![SeedCursor { anchor: 0, head: 3 }],
@@ -2065,7 +2065,7 @@ mod tests {
             &cancel,
         )
         .unwrap();
-        let source = Buffer::from_decoded(owner.snapshot());
+        let source = Buffer::from_decoded(owner.snapshot()).unwrap();
         let target = Buffer::with_add_memory_limit(400_000);
         let snapshot = target.snapshot_importer().prepare(&source.snapshot(), 0..source.len()).unwrap();
         drop(source);

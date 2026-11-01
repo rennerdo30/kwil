@@ -790,7 +790,7 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        let buffer = Buffer::from_decoded(owner.snapshot());
+        let buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         (path, owner, buffer)
     }
 
@@ -798,7 +798,7 @@ mod tests {
     fn worker_edit_decoded_alias_copy_deduplicates_origin_and_holds_only_private_pins() {
         let encoding = Encoding::for_label("big5").unwrap();
         let (path, owner, foreign) = decoded_fixture(b"\x88\x62Z", encoding, 0);
-        let second_view = Buffer::from_decoded(owner.snapshot());
+        let second_view = Buffer::from_decoded(owner.snapshot()).unwrap();
         let buffer = Buffer::with_add_memory_limit(0);
         let mut depot = depot();
         let mut op = operation(&buffer, &mut depot);
@@ -1889,7 +1889,7 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-            let foreign = Buffer::from_decoded(owner.snapshot());
+            let foreign = Buffer::from_decoded(owner.snapshot()).unwrap();
             let mut buffer = Buffer::with_add_memory_limit(0);
             let mut depot = depot();
             let mut op = operation(&buffer, &mut depot);

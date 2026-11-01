@@ -840,7 +840,7 @@ mod tests {
         pack(registry, plan)
     }
     fn seed(registry: &mut OriginRegistry, origin: DecodedSnapshot) -> Capsule {
-        let snapshot = Buffer::from_decoded(origin.clone()).snapshot();
+        let snapshot = Buffer::from_decoded(origin.clone()).unwrap().snapshot();
         let plan = registry.plan_seed(snapshot, origin, Arc::new(AtomicBool::new(false))).unwrap();
         pack(registry, plan)
     }
@@ -884,7 +884,7 @@ mod tests {
         let fixture = Fixture::new();
         let encoding = Encoding::for_label("Big5").unwrap();
         let origin = fixture.origin(b"\x88\x62Z", encoding, 0);
-        let source = Buffer::from_decoded(origin).snapshot();
+        let source = Buffer::from_decoded(origin).unwrap().snapshot();
         let mut imported = Buffer::empty();
         imported.insert_snapshot_range(0, &source, 0..source.len()).unwrap();
         drop(source);
@@ -975,7 +975,7 @@ mod tests {
     fn replacement_replay_text_accumulator_respects_origin_and_opaque_boundaries() {
         let fixture = Fixture::new();
         let origin = fixture.origin(b"\xff\xfeA\0\0\xd8", Encoding::UTF16_LE, 2);
-        let source = Buffer::from_decoded(origin);
+        let source = Buffer::from_decoded(origin).unwrap();
         let mut foreign = Buffer::empty();
         foreign.insert_snapshot_range(0, &source.snapshot(), 1..2).unwrap();
         let mixed = literal(b"L\xff")
@@ -1074,7 +1074,7 @@ mod tests {
         state.abandon().unwrap();
         fixture.assert_empty();
         let origin = fixture.origin(b"\xff\xfeA\0\0\xd8B\0\xff", Encoding::UTF16_LE, 2);
-        let source = Buffer::from_decoded(origin.clone());
+        let source = Buffer::from_decoded(origin.clone()).unwrap();
         let mut foreign = Buffer::empty();
         foreign.insert_snapshot_range(0, &source.snapshot(), 0..source.len()).unwrap();
         let opaque = foreign.snapshot().slice(1..2).unwrap().concat(&foreign.snapshot().slice(3..4).unwrap()).unwrap();
@@ -1100,7 +1100,7 @@ mod tests {
     fn replay_partial_big5_aliases_and_stateless_origins_keep_exact_raw_provenance() {
         let fixture = Fixture::new();
         let big5 = fixture.origin(b"\x88\x62\xa4\x40", Encoding::for_label("big5").unwrap(), 0);
-        let source = Buffer::from_decoded(big5);
+        let source = Buffer::from_decoded(big5).unwrap();
         let snapshot = source.snapshot();
         let selected = snapshot.slice(2..4).unwrap().concat(&snapshot.slice(0..2).unwrap()).unwrap();
         let mut registry = registry();
@@ -1145,7 +1145,7 @@ mod tests {
     fn replay_saved_generations_old_clipboard_and_repeat_refs_reuse_private_origins() {
         let fixture = Fixture::new();
         let first = fixture.origin(b"\xff\xfeA\0", Encoding::UTF16_LE, 2);
-        let mut source = Buffer::from_decoded(first.clone());
+        let mut source = Buffer::from_decoded(first.clone()).unwrap();
         let clipboard = source.snapshot();
         let mut registry = registry();
         let mut state = fixture.state();
@@ -1153,7 +1153,7 @@ mod tests {
         source.insert(1, b"x").unwrap();
         accepted(&mut state, &capsule(&mut registry, source.snapshot(), 1..2), 1..1);
         let second = fixture.origin(b"\xff\xfeA\0x\0", Encoding::UTF16_LE, 2);
-        source.checkpoint_current(Buffer::from_decoded(second).snapshot()).unwrap();
+        source.checkpoint_current(Buffer::from_decoded(second).unwrap().snapshot()).unwrap();
         let mixed = source.snapshot().concat(&clipboard).unwrap();
         accepted(&mut state, &capsule(&mut registry, mixed, 0..3), 0..2);
         assert_eq!(state.accepted_origin_count(), 2);

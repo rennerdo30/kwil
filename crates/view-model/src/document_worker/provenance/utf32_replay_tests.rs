@@ -13,7 +13,7 @@ fn utf32_replay_origins_detached_malformed_tail_and_failed_revision_are_lossless
         ),
     ] {
         let fixture = Fixture::new();
-        let source = Buffer::from_decoded(fixture.origin(original, encoding, 4));
+        let source = Buffer::from_decoded(fixture.origin(original, encoding, 4)).unwrap();
         let mut foreign = Buffer::empty();
         foreign.insert_snapshot_range(0, &source.snapshot(), 0..source.len()).unwrap();
         let detached =

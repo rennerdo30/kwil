@@ -316,7 +316,7 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-            let buffer = Buffer::from_decoded(decoded.snapshot());
+            let buffer = Buffer::from_decoded(decoded.snapshot()).unwrap();
             self.opened.borrow_mut().push(CompressedCheckpointOwners { body, decoded });
             buffer
         }

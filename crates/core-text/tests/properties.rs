@@ -55,7 +55,7 @@ proptest! {
         let mut buffer = kwil_core_text::Buffer::empty();
         buffer.insert(0, text.as_bytes()).unwrap();
         prop_assert_eq!(buffer.line_count(), rows.len() as u64);
-        let index = kwil_core_text::LineIndex::build(text.as_bytes(), 1, 1, &std::sync::atomic::AtomicU64::new(0));
+        let index = kwil_core_text::LineIndex::build(text.as_bytes(), 1, 1, &std::sync::atomic::AtomicU64::new(0)).unwrap();
         prop_assert_eq!(index.line_count(), rows.len() as u64);
     }
 }

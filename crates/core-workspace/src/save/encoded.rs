@@ -438,7 +438,7 @@ mod tests {
         let pin = owner.snapshot();
         let directory = pin.paths().directory.clone();
         let prepared = PreparedCheckpoint {
-            snapshot: Some(Buffer::from_decoded(owner.snapshot()).snapshot()),
+            snapshot: Some(Buffer::from_decoded(owner.snapshot()).unwrap().snapshot()),
             backing: owner,
             logical_coordinates_changed: false,
             normalized: false,
@@ -487,7 +487,7 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-            let buffer = Buffer::from_decoded(backing.snapshot());
+            let buffer = Buffer::from_decoded(backing.snapshot()).unwrap();
             self.owners.borrow_mut().push(backing);
             buffer
         }

@@ -47,6 +47,41 @@ fn encode(text: &str, encoding: Encoding, bom: bool) -> Vec<u8> {
     out
 }
 
+#[test]
+fn index_memory_limit_decode_refuses_without_publishing_and_can_retry() {
+    let dir = TempDir::new();
+    let file = dir.open("small-utf16", &encode("one\ntwo", Encoding::UTF16_LE, true));
+    let encoded = EncodedFile::new(file).unwrap();
+    let error = encoded.build_index_with_memory_limit(1).unwrap_err();
+    assert!(error.to_string().contains("1-byte memory limit"));
+    assert!(encoded.index().is_none());
+    assert_eq!(encoded.progress().scanned, 0);
+    assert_eq!(encoded.build_index_with_memory_limit(256).unwrap().line_count(), 2);
+}
+
+#[test]
+fn index_memory_limit_decode_bounds_checkpoint_growth() {
+    let dir = TempDir::new();
+    let file = dir.open("small-legacy", &vec![b'x'; STRIDE * 5]);
+    let encoded = EncodedFile::new_with_encoding(file, Encoding::for_label("windows-1252").unwrap()).unwrap();
+    assert!(encoded.build_index_with_memory_limit(128).is_err());
+    assert!(encoded.index().is_none());
+    let index = encoded.build_index_with_memory_limit(512).unwrap();
+    assert_eq!(index.line_count(), 1);
+    assert!(index.allocated_bytes() <= 512);
+}
+
+#[test]
+fn index_memory_limit_file_error_reaches_caller_without_partial_index() {
+    let dir = TempDir::new();
+    let file = dir.open("small-utf8", b"one\ntwo");
+    let error = file.build_index_with_memory_limit(4, 1).unwrap_err();
+    assert!(error.to_string().contains("1-byte memory limit"));
+    assert!(file.index().is_none());
+    assert_eq!(file.progress().scanned, 0);
+    assert_eq!(file.build_index_with_memory_limit(4, 4096).unwrap().line_count(), 2);
+}
+
 fn text(range: &DecodedRange<'_>) -> String {
     range
         .segments

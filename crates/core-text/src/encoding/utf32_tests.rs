@@ -55,7 +55,7 @@ impl Fixture {
         snapshot
     }
     pub(crate) fn buffer(&self, bytes: &[u8], encoding: Encoding, bom: usize) -> Buffer {
-        Buffer::from_decoded(self.origin(bytes, encoding, bom))
+        Buffer::from_decoded(self.origin(bytes, encoding, bom)).unwrap()
     }
 }
 impl Drop for Fixture {
