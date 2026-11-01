@@ -107,7 +107,19 @@ pub(super) fn draw_prompt(frame: &mut ratatui::Frame, workspace: &Workspace) {
     let bounds = frame.area();
     let width = bounds.width.min(72);
     let choices = prompt.kind.choices();
-    let height = bounds.height.min((choices.len() + 5).min(16) as u16).max(1);
+    let target = (prompt.kind == kwil_view_model::FilePromptKind::SaveAs && !prompt.text.is_empty()).then(|| {
+        match workspace.resolve_typed_save_path(std::path::Path::new(&prompt.text)) {
+            Ok(path) => format!("Target: {}", path.display()),
+            Err(error) => format!("Target: {error}"),
+        }
+    });
+    let target_rows = target
+        .as_ref()
+        .map_or(0, |text| ratatui::text::Line::from(text.as_str()).width().div_ceil(width.max(1) as usize));
+    let input_rows = ratatui::text::Line::from(format!("> {}", prompt.text)).width().div_ceil(width.max(1) as usize);
+    let desired_height =
+        if target.is_some() { 5 + target_rows + input_rows.saturating_sub(1) } else { (choices.len() + 5).min(16) };
+    let height = bounds.height.min(desired_height.min(u16::MAX as usize) as u16).max(1);
     let area =
         Rect { x: bounds.x + (bounds.width - width) / 2, y: bounds.y + (bounds.height - height) / 3, width, height };
     let selected = prompt.text.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
@@ -118,14 +130,40 @@ pub(super) fn draw_prompt(frame: &mut ratatui::Frame, workspace: &Workspace) {
     lines.extend(choices.iter().enumerate().skip(first).take(visible).map(|(i, choice)| {
         ratatui::text::Line::from(format!("{} {}: {choice}", if selected == Some(i) { ">" } else { " " }, i + 1))
     }));
+    if let Some(target) = target {
+        lines.push(ratatui::text::Line::from(target));
+    }
     lines.push(ratatui::text::Line::from("↑ ↓ or number / path  Enter: apply  Esc: cancel"));
     frame.render_widget(ratatui::widgets::Clear, area);
-    frame.render_widget(Paragraph::new(lines).style(Style::default().fg(Color::White).bg(Color::Rgb(8, 13, 24))), area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(8, 13, 24))),
+        area,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untitled_save_displays_absolute_target_and_cancel_preserves_dirty_buffer() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1).unwrap();
+        workspace.file_command("file.save").unwrap();
+        workspace.file_prompt_mut().unwrap().text = "kw56-relative.txt".into();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|frame| draw_prompt(frame, &workspace)).unwrap();
+        let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Target:"), "save prompt must show the resolved destination: {text}");
+        let target = workspace.resolve_typed_save_path(std::path::Path::new("kw56-relative.txt")).unwrap();
+        assert!(target.is_absolute());
+        assert!(text.contains(&target.display().to_string()), "full destination must be visible before Enter");
+        key(&mut workspace, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(workspace.editor().unwrap().document().path().is_none());
+        assert!(workspace.editor().unwrap().document().is_dirty());
+    }
 
     #[test]
     fn file_commands_picker_keys_and_terminal_card_preserve_document_text() {

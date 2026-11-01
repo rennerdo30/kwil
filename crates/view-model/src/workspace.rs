@@ -24,6 +24,7 @@ pub mod workspace_document;
 
 #[path = "file_commands.rs"]
 mod file_commands;
+mod save_location;
 
 enum BinaryPhase {
     Opening,
@@ -234,6 +235,7 @@ struct PendingEditorJob {
 
 #[derive(Default)]
 struct FileFlow {
+    save_folder: Option<PathBuf>,
     folder: Option<PathBuf>,
     live_document_metadata: Option<crate::visual_rows::MetadataReservation>,
     document_budget: Option<crate::visual_rows::AllocationBudget>,
@@ -1494,7 +1496,9 @@ impl Workspace {
                     self.cancel_close_intent();
                     return Err(io::Error::other("Document changed while naming it; save again"));
                 }
-                self.save_document(prompt.document, Some(prompt.text.into()))?;
+                let path = self.resolve_typed_save_path(std::path::Path::new(&prompt.text))?;
+                self.save_document(prompt.document, Some(path.clone()))?;
+                self.remember_file_folder(&path);
             }
             _ => unreachable!(),
         }
@@ -4942,6 +4946,7 @@ impl Workspace {
         self.files.prompt = None;
         let hex = std::mem::take(&mut self.hex.prompt);
         let compare = std::mem::take(&mut self.compare.prompt);
+        let folder_path = path.clone();
         let result = match ticket.kind {
             FilePromptKind::Open if compare => self.compare_path(path),
             FilePromptKind::Open if hex => self.open_hex_path(path, self.rows()).map(|(_, outcome)| {
@@ -4955,6 +4960,9 @@ impl Workspace {
                 unreachable!("native_file_prompt excludes recent-number prompts")
             }
         };
+        if result.is_ok() {
+            self.remember_file_folder(&folder_path);
+        }
         if result.is_err() {
             // A failed Save As cannot leave a close or Save All continuation.
             self.files.save_all.clear();

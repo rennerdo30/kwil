@@ -1,16 +1,14 @@
 //! GUI-only chooser coordination. No save writer, disk access or path text conversion.
 //! A native receipt is valid only for the exact Workspace prompt it captured.
 use kwil_view_model::{NativeFilePrompt, Workspace};
-#[cfg(not(windows))]
-use std::io;
 use std::path::PathBuf;
 
 pub(crate) const fn native_supported() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, target_os = "macos", target_os = "linux"))
 }
 
 #[derive(Debug)]
-// Completion variants are produced only by the Windows STA or injected tests.
+// Completion variants are produced by a native adapter or injected tests.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum Outcome {
     Accepted(PathBuf),
@@ -30,7 +28,7 @@ pub(crate) struct Request {
     /// Native owner handle only, never a COM pointer. Owner must outlive Stopped.
     #[cfg(windows)]
     pub owner: isize,
-    #[cfg(windows)]
+    pub directory: PathBuf,
     pub suggested_name: Option<std::ffi::OsString>,
 }
 
@@ -74,7 +72,14 @@ impl Gate {
         let Some(ticket) = workspace.native_file_prompt() else {
             return;
         };
-        #[cfg(windows)]
+        let directory = match workspace.native_file_directory() {
+            Ok(directory) => directory,
+            Err(error) => {
+                workspace.cancel_native_file_prompt(&ticket);
+                workspace.set_notice(format!("File dialog: {error}"));
+                return;
+            }
+        };
         let suggested_name = workspace
             .view(ticket.document())
             .and_then(|view| view.editor())
@@ -85,7 +90,7 @@ impl Gate {
             ticket: Box::new(ticket.clone()),
             #[cfg(windows)]
             owner: _owner,
-            #[cfg(windows)]
+            directory,
             suggested_name,
         };
         match port.submit(request) {
@@ -163,31 +168,11 @@ impl Gate {
 #[cfg(windows)]
 pub(crate) use crate::platform::file_dialog_windows::Worker;
 
-#[cfg(not(windows))]
-pub(crate) struct Worker;
-
-#[cfg(not(windows))]
-impl Worker {
-    pub fn spawn(_complete: impl Fn(Event) + Send + 'static) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            if cfg!(target_os = "macos") {
-                "macOS chooser gate: ROOT must approve AppKit bindings for NSOpenPanel/NSSavePanel and main-thread sheet integration"
-            } else {
-                "Linux chooser gate: ROOT must approve an xdg-desktop-portal D-Bus binding (or platform-native GTK integration)"
-            },
-        ))
-    }
-}
-
-#[cfg(not(windows))]
-impl Port for Worker {
-    fn submit(&mut self, request: Request) -> Result<(), (Request, String)> {
-        Err((request, "native file chooser unavailable on this platform".into()))
-    }
-    fn cancel(&mut self) {}
-    fn shutdown(&mut self) {}
-}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[path = "file_dialog_unix.rs"]
+mod unix;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) use unix::Worker;
 
 /// App-owned lifetime, created lazily on the first chooser request. Failed
 /// initialization is latched; a command cannot silently fall back to inline UI.
@@ -224,10 +209,15 @@ impl Dialogs {
         &mut self,
         workspace: &mut Workspace,
         owner: isize,
+        _parent: Option<&winit::window::Window>,
         hidden: bool,
         complete: impl Fn(Event) + Send + 'static,
     ) {
-        if self.exiting || !native_supported() || owner == 0 {
+        if self.exiting
+            || !native_supported()
+            || (cfg!(windows) && owner == 0)
+            || (cfg!(not(windows)) && _parent.is_none())
+        {
             return;
         }
         if let Some(error) = &self.failure {
@@ -239,7 +229,9 @@ impl Dialogs {
         }
         if workspace.native_file_prompt().is_some() && self.worker.is_none() {
             if hidden && self.failure.is_none() {
-                self.failure = Some("native chooser disabled in hidden harness; ROOT must supply an STA dialog-cloaking hook for native proof".into());
+                self.failure = Some(
+                    "native chooser disabled in hidden harness; use a fake dialog for automated verification".into(),
+                );
             }
             if self.failure.is_none() {
                 match Worker::spawn(complete) {
@@ -256,6 +248,10 @@ impl Dialogs {
             }
         }
         if let Some(worker) = &mut self.worker {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Some(parent) = _parent {
+                worker.set_parent(parent);
+            }
             self.gate.sync(workspace, owner, worker);
         }
     }
@@ -374,6 +370,7 @@ mod tests {
             gate.sync(&mut workspace, 1, &mut fake);
         }
         assert_eq!(fake.submits, 1);
+        assert_eq!(fake.request.as_ref().unwrap().directory, workspace.native_file_directory().unwrap());
         assert!(workspace.editor().unwrap().document().is_dirty());
         assert!(workspace.editor().unwrap().document().path().is_none());
         let request = fake.request.take().unwrap();
@@ -632,6 +629,7 @@ mod tests {
         drain_until(&mut workspace, &rx, |workspace| workspace.file_prompt().is_some());
         gate.sync(&mut workspace, 1, &mut fake);
         let second = fake.request.take().unwrap();
+        assert_eq!(second.directory, root, "next chooser uses the accepted folder");
         assert_ne!(first_id, second.ticket.document());
         assert_eq!(std::fs::read(root.join("one.txt")).unwrap(), b"one");
         gate.event(&mut workspace, Event::Completed { ticket: *second.ticket, outcome: Outcome::Cancelled });

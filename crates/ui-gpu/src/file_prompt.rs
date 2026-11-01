@@ -162,7 +162,7 @@ impl App {
             self.apply(Damage { status: true, ..Default::default() });
             return true;
         }
-        let outcome = if command == "file.quit" && file_dialog::native_supported() {
+        let outcome = if command == "file.quit" && cfg!(windows) {
             self.view.request_window_close_with_prompt().map(|()| true)
         } else {
             self.view.file_command(command)
@@ -219,7 +219,13 @@ impl App {
                 }
             };
             let callback = FileDialogNotificationCallback { proxy, endpoint };
-            self.file_dialogs.sync(&mut self.view, owner, self.opts.hidden, move |event| callback.send(event));
+            self.file_dialogs.sync(
+                &mut self.view,
+                owner,
+                self.gfx.as_ref().map(|gfx| gfx.window.as_ref()),
+                self.opts.hidden,
+                move |event| callback.send(event),
+            );
         }
         self.save_path = self
             .view
@@ -314,7 +320,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn existing_explicit_path_submission_survives_until_native_backend_is_available() {
+    fn native_platforms_never_submit_the_inline_path() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         workspace.execute("edit.insert", &CommandArgs { text: Some("keep".into()), ..Default::default() }, 1).unwrap();
         workspace.file_command("file.save").unwrap();
@@ -325,9 +331,9 @@ mod tests {
         ));
         workspace.file_prompt_mut().unwrap().text = target.to_str().unwrap().into();
         submit(&mut workspace);
-        assert!(workspace.file_prompt().is_none());
-        assert!(workspace.file_saves_pending());
-        assert!(!target.exists(), "without a worker no write has been admitted to the filesystem");
+        assert!(workspace.file_prompt().is_some());
+        assert!(!workspace.file_saves_pending());
+        assert!(!target.exists(), "only an accepted native receipt can save");
     }
 
     #[test]
