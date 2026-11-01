@@ -369,6 +369,9 @@ mod tests {
                         hex_ui::draw_workspace(frame, &self.view, TabLayout::Horizontal);
                     }
                     self.modal.draw(frame, &self.view);
+                    if self.view.file_prompt().is_some() {
+                        file_prompt::draw_prompt(frame, &self.view);
+                    }
                 })
                 .unwrap();
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
