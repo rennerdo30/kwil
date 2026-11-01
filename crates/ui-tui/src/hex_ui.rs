@@ -393,6 +393,31 @@ pub(super) fn status(frame: &mut ratatui::Frame<'_>, area: Rect, session: &Sessi
     frame.render_widget(Paragraph::new(session.status()).style(Style::default().fg(Color::Cyan)), area);
 }
 
+/// OSC 52 uses only base64 ASCII, so neither binary bytes nor terminal control
+/// sequences from the file can escape into terminal commands.
+pub(super) fn copy_ready(workspace: &mut Workspace) {
+    use std::io::Write;
+    let Some(text) = workspace.hex_session_mut().and_then(|session| session.take_copy()) else { return };
+    let encoded = base64(text.as_bytes());
+    let result = write!(std::io::stdout().lock(), "\x1b]52;c;{encoded}\x07");
+    workspace.set_notice(
+        result.map_or_else(|error| error.to_string(), |_| "Hex selection sent to terminal clipboard (OSC 52)".into()),
+    );
+}
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let bits = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i > chunk.len() { '=' } else { TABLE[((bits >> (18 - i * 6)) & 63) as usize] as char });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,29 +881,4 @@ mod tests {
             .unwrap();
         assert!(terminal.backend().buffer().content.iter().all(|cell| cell.symbol() == " "));
     }
-}
-
-/// OSC 52 uses only base64 ASCII, so neither binary bytes nor terminal control
-/// sequences from the file can escape into terminal commands.
-pub(super) fn copy_ready(workspace: &mut Workspace) {
-    use std::io::Write;
-    let Some(text) = workspace.hex_session_mut().and_then(|session| session.take_copy()) else { return };
-    let encoded = base64(text.as_bytes());
-    let result = write!(std::io::stdout().lock(), "\x1b]52;c;{encoded}\x07");
-    workspace.set_notice(
-        result.map_or_else(|error| error.to_string(), |_| "Hex selection sent to terminal clipboard (OSC 52)".into()),
-    );
-}
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let bits = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        for i in 0..4 {
-            out.push(if i > chunk.len() { '=' } else { TABLE[((bits >> (18 - i * 6)) & 63) as usize] as char });
-        }
-    }
-    out
 }
