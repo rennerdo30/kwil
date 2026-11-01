@@ -122,6 +122,11 @@ pub(super) fn host_key(
     if event.kind == KeyEventKind::Release {
         return super::KeyResult::Changed(false);
     }
+    if workspace.hex_session().is_some_and(|s| s.prompt_open()) {
+        if let Some(outcome) = workspace.hex_session_mut().and_then(|session| key(session, event)) {
+            return super::KeyResult::Changed(submit(workspace, outcome));
+        }
+    }
     keys.set_context(kwil_core_commands::Context::Hex);
     if let Some(chord) = super::chord(event) {
         match keys.feed(chord) {
@@ -256,6 +261,9 @@ pub(super) fn key(session: &mut Session, event: KeyEvent) -> Option<Result<Outco
             'z' => Some(Input::Undo),
             'y' => Some(Input::Redo),
             'a' => Some(Input::SelectAll),
+            'g' => Some(Input::BeginGoto),
+            'f' => Some(Input::BeginFind),
+            'c' => Some(Input::Copy),
             's' | 'o' | 'n' | 'w' | 'p' | 'q' => return None,
             _ => None,
         },
@@ -268,11 +276,13 @@ pub(super) fn key(session: &mut Session, event: KeyEvent) -> Option<Result<Outco
         KeyCode::PageDown => Some(Input::Move { bytes: session.view().rows().max(1) as i64 * 16, extend }),
         KeyCode::Home => Some(Input::Home { document: command, extend }),
         KeyCode::End => Some(Input::End { document: command, extend }),
+        KeyCode::Tab | KeyCode::BackTab => Some(Input::ToggleColumn),
+        KeyCode::Enter => Some(Input::Accept),
         KeyCode::Insert => Some(Input::ToggleInsert),
         KeyCode::Delete => Some(Input::Delete { backwards: false }),
         KeyCode::Backspace => Some(Input::Delete { backwards: true }),
         KeyCode::Esc => Some(Input::Cancel),
-        KeyCode::Char(c) if !command && !event.modifiers.contains(KeyModifiers::ALT) && c.is_ascii_hexdigit() => {
+        KeyCode::Char(c) if !command && !event.modifiers.contains(KeyModifiers::ALT) && c.is_ascii() => {
             Some(Input::Digit(c))
         }
         _ => None,
@@ -358,8 +368,12 @@ pub(super) fn draw(
     if current == session.source() {
         let view = session.view();
         if let Some(row) = (view.cursor() / 16).checked_sub(view.top()).filter(|&row| row < body.height as u64) {
-            let column = hex_column((view.cursor() % 16) as usize);
-            if column + 2 <= body.width as usize {
+            let column = if session.ascii_column() {
+                ASCII_COLUMN + (view.cursor() % 16) as usize
+            } else {
+                hex_column((view.cursor() % 16) as usize)
+            };
+            if column + if session.ascii_column() { 1 } else { 2 } <= body.width as usize {
                 if let Some(high) = view.pending_high_nibble() {
                     frame.render_widget(
                         Paragraph::new(format!("{high:X}_")).style(normal),
@@ -598,6 +612,41 @@ mod tests {
         format!("{:?}", std::mem::discriminant(message))
     }
     #[test]
+    fn actual_tui_hex_ascii_offset_find_copy_and_exact_save() {
+        let mut host = Host::new();
+        let original = b"\xff\xfeA\0B\0\r\0\n\0";
+        let path = host.open_raw("actions.bin", original);
+        host.press(KeyCode::Tab, KeyModifiers::NONE);
+        host.press(KeyCode::Char('Z'), KeyModifiers::NONE);
+        host.until("ASCII overwrite", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        assert_eq!(host.bytes(), b"Z\xfeA\0B\0\r\0\n\0");
+        host.named("navigation.goToLine");
+        assert!(host.paint().contains("Go to offset"));
+        for c in "0x2".chars() {
+            host.press(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        host.press(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(host.workspace.hex_session().unwrap().view().cursor(), 2);
+        host.named("search.find");
+        for c in "42 00".chars() {
+            host.press(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        host.press(KeyCode::Enter, KeyModifiers::NONE);
+        host.until("byte find", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        assert_eq!(host.workspace.hex_session().unwrap().view().selection(), 4..6);
+        host.named("edit.copy");
+        host.until("hex copy", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        assert_eq!(host.workspace.hex_session_mut().unwrap().take_copy().unwrap(), "42 00");
+        assert_eq!(base64(b"42 00"), "NDIgMDA=");
+        host.named("file.save");
+        host.until("exact save", |h| !h.workspace.file_saves_pending());
+        assert_eq!(std::fs::read(path).unwrap(), host.bytes());
+        host.named("edit.undo");
+        host.until("ASCII undo", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        assert_eq!(host.bytes(), original);
+        host.finish();
+    }
+    #[test]
     fn actual_tui_hex_dispatch_edit_loan_keeps_cache_blocks_text_and_shares_undo_raw_save() {
         let mut host = Host::new();
         let physical = b"\xff\xfeA\0B\0\r\0\n\0";
@@ -805,4 +854,29 @@ mod tests {
             .unwrap();
         assert!(terminal.backend().buffer().content.iter().all(|cell| cell.symbol() == " "));
     }
+}
+
+/// OSC 52 uses only base64 ASCII, so neither binary bytes nor terminal control
+/// sequences from the file can escape into terminal commands.
+pub(super) fn copy_ready(workspace: &mut Workspace) {
+    use std::io::Write;
+    let Some(text) = workspace.hex_session_mut().and_then(|session| session.take_copy()) else { return };
+    let encoded = base64(text.as_bytes());
+    let result = write!(std::io::stdout().lock(), "\x1b]52;c;{encoded}\x07");
+    workspace.set_notice(
+        result.map_or_else(|error| error.to_string(), |_| "Hex selection sent to terminal clipboard (OSC 52)".into()),
+    );
+}
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let bits = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i > chunk.len() { '=' } else { TABLE[((bits >> (18 - i * 6)) & 63) as usize] as char });
+        }
+    }
+    out
 }

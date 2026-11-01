@@ -43,7 +43,13 @@ impl HexRuntime {
         self.release(document, epoch);
     }
 
-    pub(super) fn edit(&mut self, document: DocumentId, editor: &mut Editor, request: &EditRequest) -> EditCompletion {
+    pub(super) fn edit(
+        &mut self,
+        document: DocumentId,
+        editor: &mut Editor,
+        request: &EditRequest,
+        cancel: &AtomicBool,
+    ) -> EditCompletion {
         let current = editor.document().hex_source(document.0);
         let index = self
             .fences
@@ -57,6 +63,7 @@ impl HexRuntime {
                 operation: request.operation,
                 input_epoch: request.input_epoch,
                 result: Err("raw tab replay-fence capacity retained".into()),
+                answer: None,
             };
         };
         let tab = self.fences[index].get_or_insert_with(|| TabFence {
@@ -68,7 +75,7 @@ impl HexRuntime {
         if current == request.source {
             tab.epoch = current.epoch;
         }
-        hex_session::apply_edit(editor, current, request, &mut tab.fence)
+        hex_session::apply_edit_cancellable(editor, current, request, &mut tab.fence, || cancel.load(Ordering::Relaxed))
     }
 }
 
@@ -342,7 +349,7 @@ mod tests {
             input_epoch: 1,
             mutation: Mutation::Replace { range: 0..1, bytes: vec![0x80] },
         };
-        assert!(hex.edit(DocumentId(3), &mut editor, &request).result.is_ok());
+        assert!(hex.edit(DocumentId(3), &mut editor, &request, &AtomicBool::new(false)).result.is_ok());
         assert!(hex.fences.iter().any(|slot| slot.as_ref().is_some_and(|f| f.document == DocumentId(3))));
         assert_eq!(backings.retire().live, 1);
         hex.discard(DocumentId(3), editor);

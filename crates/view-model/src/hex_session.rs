@@ -79,9 +79,14 @@ pub struct Page {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mutation {
-    Replace { range: Range<u64>, bytes: Vec<u8> },
+    Replace {
+        range: Range<u64>,
+        bytes: Vec<u8>,
+    },
     Undo,
     Redo,
+    /// Read-only operation on the same bounded worker loan, without an edit receipt.
+    Query(crate::hex_actions::Query),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditRequest {
@@ -97,6 +102,7 @@ pub struct EditCompletion {
     pub operation: u64,
     pub input_epoch: u64,
     pub result: Result<(), String>,
+    pub answer: Option<crate::hex_actions::Answer>,
 }
 /// Retained by the existing worker per raw tab. Revision can go backwards on
 /// undo; monotonic operation admission prevents replay even after revision ABA.
@@ -108,6 +114,11 @@ pub struct EditFence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Input<'a> {
     Digit(char),
+    ToggleColumn,
+    BeginGoto,
+    BeginFind,
+    Accept,
+    Copy,
     Paste(&'a str),
     Move { bytes: i64, extend: bool },
     Home { document: bool, extend: bool },
@@ -123,12 +134,17 @@ pub enum Input<'a> {
     Cancel,
 }
 /// Commands whose meaning is defined in byte coordinates in both frontends.
-/// This is deliberately the existing TUI allowlist: word/text-object motions,
-/// Go To Line and text transforms must never reach an ordinary Editor here.
+/// Text motions and transforms must never reach an ordinary Editor here.
+/// Go To Line and Find open byte-oriented prompts instead.
 /// `extend` is captured from the invoking shortcut, including configured keys.
 pub fn command_input(id: &str, rows: usize, extend: bool) -> Option<Input<'static>> {
     let page = rows.clamp(1, MAX_ROWS) as i64 * BYTES_PER_ROW as i64;
     Some(match id {
+        "navigation.goToLine" => Input::BeginGoto,
+        "search.find" => Input::BeginFind,
+        "edit.copy" => Input::Copy,
+        "edit.indent" | "edit.outdent" => Input::ToggleColumn,
+        "edit.newline" => Input::Accept,
         "edit.undo" => Input::Undo,
         "edit.redo" => Input::Redo,
         "edit.selectAll" => Input::SelectAll,
@@ -169,6 +185,10 @@ pub struct Session {
     operation: u64,
     page: Option<Page>,
     pending: Option<Pending>,
+    ascii: bool,
+    prompt: Option<(bool, String)>,
+    message: String,
+    copied: Option<String>,
 }
 impl Session {
     pub fn new(rows: usize) -> Self {
@@ -180,10 +200,23 @@ impl Session {
             operation: 0,
             page: None,
             pending: None,
+            ascii: false,
+            prompt: None,
+            message: String::new(),
+            copied: None,
         }
     }
     pub fn source(&self) -> Option<Source> {
         self.source
+    }
+    pub fn ascii_column(&self) -> bool {
+        self.ascii
+    }
+    pub fn prompt_open(&self) -> bool {
+        self.prompt.is_some()
+    }
+    pub fn take_copy(&mut self) -> Option<String> {
+        self.copied.take()
     }
     pub fn view(&self) -> &HexView {
         &self.view
@@ -209,6 +242,12 @@ impl Session {
         let cursor = if same { self.view.cursor() } else { 0 };
         self.source = Some(source);
         self.pending = None;
+        self.prompt = None;
+        self.copied = None;
+        self.message.clear();
+        if !same {
+            self.ascii = false;
+        }
         self.view.set_cursor(cursor, source.len, false);
         if !same {
             self.view.set_top(0, source.len);
@@ -218,6 +257,8 @@ impl Session {
     }
     pub fn close(&mut self) {
         self.source = None;
+        self.prompt = None;
+        self.copied = None;
         self.pending = None;
         self.view.cancel_nibble();
         self.invalidate();
@@ -232,6 +273,8 @@ impl Session {
     }
     /// Focus loss/IME cancellation fence; does not discard an accepted edit.
     pub fn cancel_input(&mut self) {
+        self.prompt = None;
+        self.copied = None;
         self.view.cancel_nibble();
         Self::next(&mut self.input_epoch);
     }
@@ -286,13 +329,26 @@ impl Session {
         let Some(source) = self.source else {
             return "Raw byte reopen required".into();
         };
+        if let Some((find, text)) = &self.prompt {
+            return format!(
+                "{}: {}_  [Enter / Esc]",
+                if *find { "Find hex bytes" } else { "Go to offset (decimal or 0x hex)" },
+                text
+            );
+        }
         format!(
-            "HEX {}  {:016X} / {:016X}{}{}",
+            "HEX {} {}  {:016X} / {:016X}{}{}  {}",
             if self.view.insert_mode() { "INS" } else { "OVR" },
+            if self.ascii { "ASCII" } else { "BYTES" },
             self.view.cursor(),
             source.len,
             if self.busy() { "  Editing..." } else { "" },
-            self.view.pending_high_nibble().map_or(String::new(), |n| format!("  {n:X}_"))
+            self.view.pending_high_nibble().map_or(String::new(), |n| format!("  {n:X}_")),
+            if self.message.is_empty() {
+                "Tab: column  Ctrl+G: offset  Ctrl+F: find  Ctrl+C: hex copy"
+            } else {
+                &self.message
+            }
         )
     }
     /// Input must carry the captured origin identity/epoch, including IME/paste.
@@ -303,13 +359,51 @@ impl Session {
         if self.busy() {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "hex edit awaiting worker"));
         }
+        if let Some((_, text)) = &mut self.prompt {
+            let append = match input {
+                Input::Digit(c) => Some(c.to_string()),
+                Input::Paste(text) => {
+                    if text.len() > crate::hex_actions::MAX_PATTERN * 3 {
+                        return Err(invalid_edit());
+                    }
+                    Some(text.to_owned())
+                }
+                _ => None,
+            };
+            if let Some(append) = append {
+                if text.len() + append.len() > crate::hex_actions::MAX_PATTERN * 3
+                    || !append.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+                {
+                    return Err(io::Error::other("Hex prompt is limited to 768 ASCII characters"));
+                }
+                text.push_str(&append);
+                Self::next(&mut self.input_epoch);
+                return Ok(Outcome { damage: Damage { status: true, ..Default::default() }, edit: None });
+            }
+            if matches!(input, Input::Delete { backwards: true }) {
+                text.pop();
+                Self::next(&mut self.input_epoch);
+                return Ok(Outcome { damage: Damage { status: true, ..Default::default() }, edit: None });
+            }
+            if !matches!(input, Input::Accept | Input::Cancel | Input::BeginFind | Input::BeginGoto) {
+                return Ok(Outcome::default());
+            }
+        }
         let old = self.view.clone();
         let old_selection = old.selection();
         let mut mutation = None;
         let mut cursor = self.view.cursor();
         match input {
             Input::Digit(digit) => {
-                if let Some(byte) = self.view.input_digit(digit)? {
+                let byte = if self.ascii {
+                    if !digit.is_ascii() || digit.is_ascii_control() {
+                        return Err(io::Error::other("Enter a printable ASCII byte"));
+                    }
+                    Some(digit as u8)
+                } else {
+                    self.view.input_digit(digit)?
+                };
+                if let Some(byte) = byte {
                     let range = replacement_range(&self.view, source.len, 1);
                     let Some(after) = range.start.checked_add(1) else {
                         self.view = old;
@@ -322,7 +416,14 @@ impl Session {
             Input::Paste(text) => {
                 // Parse all before changing anything; malformed/odd/oversize
                 // paste must never commit a prefix or complete a pending nibble.
-                let bytes = parse_hex(text)?;
+                let bytes = if self.ascii {
+                    if !text.is_ascii() || text.len() > MAX_EDIT_BYTES {
+                        return Err(invalid_edit());
+                    }
+                    text.as_bytes().to_vec()
+                } else {
+                    parse_hex(text)?
+                };
                 if bytes.is_empty() {
                     return Ok(Outcome::default());
                 }
@@ -330,6 +431,43 @@ impl Session {
                 cursor = range.start.checked_add(bytes.len() as u64).ok_or_else(invalid_edit)?;
                 self.view.cancel_nibble();
                 mutation = Some(Mutation::Replace { range, bytes });
+            }
+            Input::ToggleColumn => {
+                self.ascii = !self.ascii;
+                self.view.cancel_nibble();
+            }
+            Input::BeginGoto | Input::BeginFind => {
+                self.view.cancel_nibble();
+                self.prompt = Some((matches!(input, Input::BeginFind), String::new()));
+                self.message.clear();
+            }
+            Input::Accept => {
+                if let Some((find, text)) = &self.prompt {
+                    if *find {
+                        let bytes = parse_hex(text)?;
+                        let query = crate::hex_actions::Query::Find { bytes, start: cursor };
+                        crate::hex_actions::validate(&query, source.len)?;
+                        mutation = Some(Mutation::Query(query));
+                    } else {
+                        let text = text.trim();
+                        let offset = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                            u64::from_str_radix(hex, 16)
+                        } else {
+                            text.parse()
+                        }
+                        .map_err(|_| io::Error::other("Enter a decimal or 0x hexadecimal byte offset"))?;
+                        if offset > source.len {
+                            return Err(invalid_edit());
+                        }
+                        self.view.set_cursor(offset, source.len, false);
+                    }
+                    self.prompt = None;
+                }
+            }
+            Input::Copy => {
+                let query = crate::hex_actions::Query::Copy(self.view.selection());
+                crate::hex_actions::validate(&query, source.len)?;
+                mutation = Some(Mutation::Query(query));
             }
             Input::Delete { backwards } => {
                 if self.view.pending_high_nibble().is_some() {
@@ -375,6 +513,7 @@ impl Session {
                     .and_then(|row| row.checked_mul(16))
                     .and_then(|at| at.checked_add(byte as u64));
                 if let Some(at) = at.filter(|&at| at <= source.len) {
+                    self.ascii = column >= crate::hex::ASCII_COLUMN;
                     self.view.set_cursor(at, source.len, extend);
                 }
             }
@@ -392,7 +531,10 @@ impl Session {
                 self.view.cancel_nibble();
                 mutation = Some(Mutation::Redo);
             }
-            Input::Cancel => self.view.cancel_nibble(),
+            Input::Cancel => {
+                self.prompt = None;
+                self.view.cancel_nibble();
+            }
         }
         if let Some(mutation) = &mutation
             && let Err(error) = validate_mutation(mutation, source.len)
@@ -489,6 +631,7 @@ impl Session {
         {
             return Ok(None);
         }
+        let query_current = self.input_epoch == completion.input_epoch;
         let pending = self.pending.take().expect("matched pending hex edit");
         let old_cursor = self.view.cursor();
         let old_top = self.view.top();
@@ -506,6 +649,24 @@ impl Session {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "hex worker returned a different source"));
         }
         self.source = Some(completion.after);
+        if let Some(answer) = completion.answer {
+            if query_current {
+                match answer {
+                    crate::hex_actions::Answer::Found(Some(range)) => {
+                        self.view.set_cursor(range.start, completion.after.len, false);
+                        self.view.set_cursor(range.end, completion.after.len, true);
+                        self.message = format!("Found at 0x{:X}", range.start);
+                    }
+                    crate::hex_actions::Answer::Found(None) => self.message = "Byte sequence not found".into(),
+                    crate::hex_actions::Answer::Copied(text) => {
+                        self.message = "Hex selection ready for clipboard".into();
+                        self.copied = Some(text);
+                    }
+                }
+            }
+            self.page = cached;
+            return Ok(Some(body_damage()));
+        }
         self.view.set_cursor(pending.cursor, completion.after.len, false);
         // A successful equal-length overwrite leaves every other byte exact.
         // Patch only the bounded display copy AFTER worker acknowledgement;
@@ -564,6 +725,9 @@ fn replacement_range(view: &HexView, len: u64, bytes: u64) -> Range<u64> {
     start..if view.insert_mode() { start } else { start.saturating_add(bytes).min(len) }
 }
 fn validate_mutation(mutation: &Mutation, len: u64) -> io::Result<()> {
+    if let Mutation::Query(query) = mutation {
+        return crate::hex_actions::validate(query, len);
+    }
     if let Mutation::Replace { range, bytes } = mutation
         && (range.start > range.end
             || range.end > len
@@ -658,6 +822,16 @@ pub fn apply_edit(
     request: &EditRequest,
     fence: &mut EditFence,
 ) -> EditCompletion {
+    apply_edit_cancellable(editor, current, request, fence, || false)
+}
+pub fn apply_edit_cancellable(
+    editor: &mut Editor,
+    current: Source,
+    request: &EditRequest,
+    fence: &mut EditFence,
+    cancelled: impl FnMut() -> bool,
+) -> EditCompletion {
+    let mut answer = None;
     let result = (|| -> io::Result<()> {
         if current != request.source
             || current.representation != Representation::RawBytes
@@ -685,6 +859,9 @@ pub fn apply_edit(
             Mutation::Redo => {
                 editor.redo()?;
             }
+            Mutation::Query(query) => {
+                answer = Some(crate::hex_actions::run(&editor.document().snapshot(), query, cancelled)?);
+            }
         }
         Ok(())
     })();
@@ -695,6 +872,7 @@ pub fn apply_edit(
         operation: request.operation,
         input_epoch: request.input_epoch,
         result: result.map_err(|e| e.to_string()),
+        answer,
     }
 }
 
@@ -761,6 +939,55 @@ mod tests {
         let mut bytes = Vec::new();
         editor.document().snapshot().write_to(&mut bytes).unwrap();
         bytes
+    }
+    #[test]
+    fn hex_actions_offset_query_copy_and_stale_completions_preserve_bytes() {
+        let original = [0xff, 0, 0xfe, b'A'];
+        let (mut editor, mut session, mut fence) = fixture(&original);
+        input(&mut session, Input::BeginGoto);
+        input(&mut session, Input::Paste("0x1"));
+        input(&mut session, Input::Accept);
+        assert_eq!(session.view().cursor(), 1);
+        input(&mut session, Input::BeginFind);
+        input(&mut session, Input::Paste("00 FE"));
+        let revision = editor.document().revision();
+        commit(&mut editor, &mut session, &mut fence, Input::Accept);
+        assert_eq!(session.view().selection(), 1..3);
+        assert_eq!(editor.document().revision(), revision);
+        commit(&mut editor, &mut session, &mut fence, Input::Copy);
+        assert_eq!(session.take_copy().unwrap(), "00 FE");
+        let request = input(&mut session, Input::Copy).edit.unwrap();
+        let current = source(&editor);
+        let completion = apply_edit(&mut editor, current, &request, &mut fence);
+        session.cancel_input();
+        assert!(session.complete_edit(completion).unwrap());
+        assert!(session.take_copy().is_none(), "late clipboard result must not escape after tab/focus cancellation");
+        assert_eq!(bytes(&editor), original);
+        assert_eq!(editor.document().revision(), revision);
+        input(&mut session, Input::BeginGoto);
+        input(&mut session, Input::Paste("18446744073709551616"));
+        assert!(session.input(session.source().unwrap(), session.input_epoch(), Input::Accept).is_err());
+        assert_eq!(session.view().selection(), 1..3);
+        input(&mut session, Input::Cancel);
+        assert!(!session.prompt_open());
+        input(&mut session, Input::BeginFind);
+        input(&mut session, Input::Paste("FF"));
+        let request = input(&mut session, Input::Accept).edit.unwrap();
+        let current = source(&editor);
+        let completion = apply_edit(&mut editor, current, &request, &mut fence);
+        session.cancel_input();
+        assert!(session.complete_edit(completion).unwrap());
+        assert_eq!(session.view().selection(), 1..3, "late find must not move the cursor after cancellation");
+    }
+    #[test]
+    fn ascii_column_overwrites_one_byte_and_undo_preserves_binary() {
+        let original = [0xff, 0, 0xfe, b'A'];
+        let (mut editor, mut session, mut fence) = fixture(&original);
+        input(&mut session, Input::Click { row: 0, column: crate::hex::ASCII_COLUMN + 1, extend: false });
+        commit(&mut editor, &mut session, &mut fence, Input::Digit('Z'));
+        assert_eq!(bytes(&editor), [0xff, b'Z', 0xfe, b'A']);
+        commit(&mut editor, &mut session, &mut fence, Input::Undo);
+        assert_eq!(bytes(&editor), original);
     }
     #[test]
     fn invalid_binary_overwrite_insert_delete_share_undo_and_receipts() {
@@ -901,6 +1128,7 @@ mod tests {
             operation: request.operation,
             input_epoch: request.input_epoch,
             result: Ok(()),
+            answer: None,
         };
         assert!(!session.complete_edit(duplicate).unwrap());
         assert_eq!(session.view().cursor(), 1);

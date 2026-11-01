@@ -991,6 +991,7 @@ impl Workspace {
                         operation: completion.operation,
                         input_epoch: completion.input_epoch,
                         result: Ok(()),
+                        answer: None,
                     };
                     let completion = std::mem::replace(completion, placeholder);
                     commit.damage = self.hex_edit_installed(*document, completion);

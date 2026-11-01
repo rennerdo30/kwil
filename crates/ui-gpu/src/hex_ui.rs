@@ -33,6 +33,9 @@ pub(super) fn key(session: &mut Session, key: &Key, mods: ModifiersState) -> Opt
             "z" => Some(Input::Undo),
             "y" => Some(Input::Redo),
             "a" => Some(Input::SelectAll),
+            "g" => Some(Input::BeginGoto),
+            "f" => Some(Input::BeginFind),
+            "c" => Some(Input::Copy),
             // ROOT handles save/open/new/close, palette and tab switching.
             // Ctrl+V/C require explicit ROOT hex clipboard hooks; otherwise
             // consume them here, never fall through to hidden text clipboard.
@@ -50,6 +53,8 @@ pub(super) fn key(session: &mut Session, key: &Key, mods: ModifiersState) -> Opt
         Key::Named(NamedKey::PageDown) => Some(Input::Move { bytes: session.view().rows().max(1) as i64 * 16, extend }),
         Key::Named(NamedKey::Home) => Some(Input::Home { document: command, extend }),
         Key::Named(NamedKey::End) => Some(Input::End { document: command, extend }),
+        Key::Named(NamedKey::Tab) => Some(Input::ToggleColumn),
+        Key::Named(NamedKey::Enter) => Some(Input::Accept),
         Key::Named(NamedKey::Insert) => Some(Input::ToggleInsert),
         Key::Named(NamedKey::Delete) => Some(Input::Delete { backwards: false }),
         Key::Named(NamedKey::Backspace) => Some(Input::Delete { backwards: true }),
@@ -57,7 +62,7 @@ pub(super) fn key(session: &mut Session, key: &Key, mods: ModifiersState) -> Opt
         Key::Character(text) if !command && !mods.alt_key() => {
             let mut chars = text.chars();
             match (chars.next(), chars.next()) {
-                (Some(digit), None) if digit.is_ascii_hexdigit() => Some(Input::Digit(digit)),
+                (Some(digit), None) if digit.is_ascii() => Some(Input::Digit(digit)),
                 _ => None,
             }
         }
@@ -213,11 +218,19 @@ pub(super) fn draw_borrowed(
     if !read_only && current == session.source() {
         let view = session.view();
         if let Some(row) = (view.cursor() / 16).checked_sub(view.top()).filter(|&r| r < view.rows() as u64) {
-            let Some(column) = hex_column((view.cursor() % 16) as usize).checked_sub(horizontal) else {
+            let caret = if session.ascii_column() {
+                ASCII_COLUMN + (view.cursor() % 16) as usize
+            } else {
+                hex_column((view.cursor() % 16) as usize)
+            };
+            let Some(column) = caret.checked_sub(horizontal) else {
                 return true;
             };
             let y = row as usize * ch;
-            if y + ch <= height && column + 2 <= columns && (full || dirty(row as usize)) {
+            if y + ch <= height
+                && column + if session.ascii_column() { 1 } else { 2 } <= columns
+                && (full || dirty(row as usize))
+            {
                 if let Some(high) = view.pending_high_nibble() {
                     let text = format!("{high:X}_");
                     fill(pixels, stride, Rect { x: column * cw, y, w: 2 * cw, h: ch }, bg());

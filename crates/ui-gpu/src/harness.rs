@@ -50,6 +50,10 @@ pub(crate) enum Step {
     LanguageOpen,
     LanguageChoose,
     LanguageReset,
+    HexAscii,
+    HexGoto,
+    HexFind,
+    HexVerify,
     HexOpen,
     HexCheck,
     HexClose,
@@ -485,7 +489,22 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::UsabilityCapture("folder-replace-preview.bmp")),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_FOLDER_REPLACE_PROBE").is_some() {
+        let hex_editor = [
+            (1800, Step::DismissSetup),
+            (100, Step::BinaryOpen),
+            (500, Step::BinaryOffer),
+            (100, Step::BinaryHex),
+            (500, Step::BinaryHexCheck),
+            (100, Step::HexAscii),
+            (500, Step::HexGoto),
+            (300, Step::HexFind),
+            (500, Step::HexVerify),
+            (500, Step::UsabilityCapture("hex-editor.bmp")),
+            (100, Step::End),
+        ];
+        let steps = if std::env::var_os("KWIL_HEX_EDITOR_PROBE").is_some() {
+            hex_editor.as_slice()
+        } else if std::env::var_os("KWIL_FOLDER_REPLACE_PROBE").is_some() {
             folder_replace.as_slice()
         } else if std::env::var_os("KWIL_TAB_MENU_PROBE").is_some() {
             tab_menu.as_slice()
@@ -569,6 +588,30 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             capture(app, dir.as_deref(), "compare.bmp");
             app.dispatch_compare("compare.close");
             app.edit(super::input::Action::Command("edit.undo"));
+        }
+        Step::HexAscii => {
+            hex_key(app, el, super::Key::Named(super::NamedKey::Tab));
+            hex_key(app, el, super::Key::Character("Z".into()));
+        }
+        Step::HexGoto => {
+            assert_eq!(app.view.hex_session().unwrap().row(app.view.hex_source(), 0).unwrap().bytes[0], b'Z');
+            app.edit(super::input::Action::Command("navigation.goToLine"));
+            for c in "0x2".chars() {
+                hex_key(app, el, super::Key::Character(c.to_string().into()));
+            }
+            hex_key(app, el, super::Key::Named(super::NamedKey::Enter));
+            assert_eq!(app.view.hex_session().unwrap().view().cursor(), 2);
+        }
+        Step::HexFind => {
+            app.edit(super::input::Action::Command("search.find"));
+            for c in "FE FF".chars() {
+                hex_key(app, el, super::Key::Character(c.to_string().into()));
+            }
+            hex_key(app, el, super::Key::Named(super::NamedKey::Enter));
+        }
+        Step::HexVerify => {
+            assert_eq!(app.view.hex_session().unwrap().view().selection(), 2..4);
+            app.edit(super::input::Action::Command("file.save"));
         }
         Step::BinaryOpen => {
             assert!(app.opts.hidden, "binary harness never admits visible OS dialogs");
@@ -2253,4 +2296,9 @@ fn write_pixels(path: &Path, size: (usize, usize), pixels: &[u32]) -> std::io::R
         file.extend_from_slice(&pixel.to_le_bytes());
     }
     std::fs::write(path, file)
+}
+
+fn hex_key(app: &mut App, el: &ActiveEventLoop, key: super::Key) {
+    app.mods = super::ModifiersState::empty();
+    app.key_after_settings(Some(el), &super::HostKey { logical_key: key, text: None, repeat: false });
 }

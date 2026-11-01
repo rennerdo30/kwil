@@ -172,6 +172,46 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn actual_gui_hex_ascii_offset_find_and_exact_save() {
+        let (mut app, rx, root, path) = host();
+        let original = data(&app);
+        let key = |app: &mut App, logical_key| {
+            app.key_after_settings(None, &HostKey { logical_key, text: None, repeat: false })
+        };
+        key(&mut app, Key::Named(NamedKey::Tab));
+        key(&mut app, Key::Character("Z".into()));
+        idle(&mut app, &rx, "ASCII overwrite");
+        assert_eq!(data(&app)[0], b'Z');
+        assert!(app.dispatch_hex("navigation.goToLine"));
+        for c in "0x1".chars() {
+            key(&mut app, Key::Character(c.to_string().into()));
+        }
+        key(&mut app, Key::Named(NamedKey::Enter));
+        assert_eq!(app.view.hex_session().unwrap().view().cursor(), 1);
+        assert!(app.dispatch_hex("search.find"));
+        for c in "FF 00".chars() {
+            key(&mut app, Key::Character(c.to_string().into()));
+        }
+        key(&mut app, Key::Named(NamedKey::Enter));
+        idle(&mut app, &rx, "byte find");
+        assert_eq!(app.view.hex_session().unwrap().view().selection(), 1..3);
+        let session = app.view.hex_session_mut().unwrap();
+        let request = hex_ui::command(session, "edit.copy", false).unwrap().unwrap().edit.unwrap();
+        assert_eq!(
+            request.mutation,
+            kwil_view_model::hex_session::Mutation::Query(kwil_view_model::hex_actions::Query::Copy(1..3))
+        );
+        assert!(session.reject_edit(&request)); // Keep the native clipboard isolated in this unit fixture.
+        app.edit(input::Action::Command("file.save"));
+        until(&mut app, &rx, "exact save", |a| !a.view.file_saves_pending());
+        assert_eq!(std::fs::read(path).unwrap(), data(&app));
+        assert_eq!(&data(&app)[1..], &original[1..]);
+        assert!(app.dispatch_hex("edit.undo"));
+        idle(&mut app, &rx, "ASCII undo");
+        assert_eq!(data(&app), original);
+        stop(app, rx, root);
+    }
+    #[test]
     fn actual_gui_byte_keys_hold_cached_raw_body_during_worker_loan_and_share_undo() {
         let (mut app, rx, root, _) = host();
         let original = data(&app);
@@ -555,6 +595,12 @@ impl App {
             || self.view.hex_session().is_none_or(|s| !s.is_open() || s.busy())
     }
     pub(super) fn sync_hex_host(&mut self) -> Damage {
+        if let Some(text) = self.view.hex_session_mut().and_then(|session| session.take_copy()) {
+            let hwnd = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
+            let result = kwil_view_model::ClipboardData::text(text.as_bytes())
+                .and_then(|data| kwil_view_model::Clipboard::set(&mut clipboard::SystemClipboard(hwnd), data));
+            self.view.set_notice(result.map_or_else(|error| error.to_string(), |_| "Copied selection as hex".into()));
+        }
         let active = self.view.hex_active();
         let identity = (self.view.active_id(), self.view.input_epoch(), active);
         let changed = self.hex.identity != Some(identity);
