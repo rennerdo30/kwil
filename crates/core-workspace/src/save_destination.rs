@@ -65,6 +65,12 @@ impl SaveDestination {
         matches!(self.identity, DestinationIdentity::Existing(_))
     }
 
+    /// Authoritative existing-file identity for routing a worker result to an
+    /// open editor. Conservative name overlap alone must never select an editor.
+    pub fn same_existing_file(&self, other: &Self) -> bool {
+        matches!((&self.identity, &other.identity), (DestinationIdentity::Existing(a), DestinationIdentity::Existing(b)) if a == b)
+    }
+
     /// Conservative reservation conflict, using already resolved observations.
     /// No filesystem access. Both observations must obey the refresh contract.
     pub fn equivalent(&self, other: &Self) -> bool {

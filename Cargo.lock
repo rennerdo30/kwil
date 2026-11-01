@@ -2001,6 +2001,7 @@ dependencies = [
  "ignore",
  "kwil-core-runtime",
  "kwil-core-text",
+ "kwil-core-workspace",
  "memchr",
  "regex",
  "regex-syntax",

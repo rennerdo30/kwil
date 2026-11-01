@@ -212,55 +212,53 @@ impl Pattern {
                 if !self.captures {
                     return Ok(replacement.to_vec());
                 }
-                let mut out = Vec::new();
-                // Implement regex's documented $name/${name}/$$ interpolation,
-                // checking BEFORE each append so repeated captures cannot grow
-                // a Vec to template_size * match_size.
-                let mut i = 0;
-                while i < replacement.len() {
-                    if replacement[i] != b'$' {
-                        append(&mut out, &replacement[i..i + 1])?;
-                        i += 1;
-                        continue;
-                    }
-                    if replacement.get(i + 1) == Some(&b'$') {
-                        append(&mut out, b"$")?;
-                        i += 2;
-                        continue;
-                    }
-                    let braced = replacement.get(i + 1) == Some(&b'{');
-                    let start = i + if braced { 2 } else { 1 };
-                    let end = if braced {
-                        replacement[start..].iter().position(|b| *b == b'}').map(|n| start + n)
-                    } else {
-                        Some(
-                            start
-                                + replacement[start..]
-                                    .iter()
-                                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
-                                    .count(),
-                        )
-                    };
-                    let Some(end) = end.filter(|e| braced || *e > start) else {
-                        append(&mut out, b"$")?;
-                        i += 1;
-                        continue;
-                    };
-                    if let Ok(name) = std::str::from_utf8(&replacement[start..end]) {
-                        let capture = match name.parse::<usize>() {
-                            Ok(n) => caps.get(n),
-                            Err(_) => caps.name(name),
-                        };
-                        if let Some(capture) = capture {
-                            append(&mut out, capture.as_bytes())?;
-                        }
-                    }
-                    i = end + usize::from(braced);
-                }
-                Ok(out)
+                expand_captures(&caps, replacement)
             }
         }
     }
+}
+
+pub(crate) fn expand_captures(caps: &regex::bytes::Captures<'_>, replacement: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    // Implement regex's documented $name/${name}/$$ interpolation,
+    // checking BEFORE each append so repeated captures cannot grow
+    // a Vec to template_size * match_size.
+    let mut i = 0;
+    while i < replacement.len() {
+        if replacement[i] != b'$' {
+            append(&mut out, &replacement[i..i + 1])?;
+            i += 1;
+            continue;
+        }
+        if replacement.get(i + 1) == Some(&b'$') {
+            append(&mut out, b"$")?;
+            i += 2;
+            continue;
+        }
+        let braced = replacement.get(i + 1) == Some(&b'{');
+        let start = i + if braced { 2 } else { 1 };
+        let end = if braced {
+            replacement[start..].iter().position(|b| *b == b'}').map(|n| start + n)
+        } else {
+            Some(start + replacement[start..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count())
+        };
+        let Some(end) = end.filter(|e| braced || *e > start) else {
+            append(&mut out, b"$")?;
+            i += 1;
+            continue;
+        };
+        if let Ok(name) = std::str::from_utf8(&replacement[start..end]) {
+            let capture = match name.parse::<usize>() {
+                Ok(n) => caps.get(n),
+                Err(_) => caps.name(name),
+            };
+            if let Some(capture) = capture {
+                append(&mut out, capture.as_bytes())?;
+            }
+        }
+        i = end + usize::from(braced);
+    }
+    Ok(out)
 }
 
 fn whole_word_expression(expression: &str) -> io::Result<String> {

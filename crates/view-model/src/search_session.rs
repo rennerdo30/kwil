@@ -282,6 +282,10 @@ impl SearchSession {
             return;
         }
         match event.update {
+            SearchUpdate::Folder(_) => {
+                self.state.status = SearchStatus::Failed;
+                self.state.error = Some("Folder replacement host is not attached".into());
+            }
             SearchUpdate::Seed(seed) => {
                 self.state.status = SearchStatus::Complete;
                 self.state.seed = seed;

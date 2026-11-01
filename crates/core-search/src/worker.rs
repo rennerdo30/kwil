@@ -19,6 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "worker/folder_replace.rs"]
+pub mod folder_replace;
+
 pub const INPUT_BYTES: usize = 64 << 10;
 pub const PAGE_HITS: usize = 256;
 pub const REPLACE_EDITS: usize = 4096;
@@ -112,6 +115,7 @@ pub struct SeedResult {
     pub from_selection: bool,
 }
 pub enum SearchTask {
+    Folder(folder_replace::Task),
     Document(DocumentSearch),
     SeedSelectionOrWord(SeedRequest),
     Files(FileSearch),
@@ -324,6 +328,7 @@ pub struct DocumentMatches {
 }
 #[derive(Debug)]
 pub enum SearchUpdate {
+    Folder(folder_replace::Update),
     Seed(Option<SeedResult>),
     Progress(Progress),
     Hits {
@@ -720,6 +725,7 @@ impl SearchWorker {
                     Ok(())
                 } else {
                     match &job.request.task {
+                        SearchTask::Folder(task) => folder_replace::run(key, task, &job.cancel, &emit, &mut spools),
                         SearchTask::Document(request) => run_document(key, request, &job.cancel, &emit, &mut spools),
                         SearchTask::SeedSelectionOrWord(request) => run_seed(request, &job.cancel).map(|seed| {
                             emit(SearchUpdate::Seed(seed));
@@ -781,7 +787,9 @@ impl SearchWorker {
         state.events.clear();
         match &request.task {
             SearchTask::Files(_) => state.results_session = Some(request.key),
-            SearchTask::Document(_) | SearchTask::SeedSelectionOrWord(_) => state.results_session = None,
+            SearchTask::Document(_) | SearchTask::SeedSelectionOrWord(_) | SearchTask::Folder(_) => {
+                state.results_session = None
+            }
             SearchTask::FilePage { .. } => {}
         }
         state.pending = Some(Job { request, cancel: Arc::new(AtomicBool::new(false)) });
@@ -1123,6 +1131,7 @@ mod bounded_settlement_tests;
 
 fn validate(request: &SearchRequest) -> Result<(), &'static str> {
     match &request.task {
+        SearchTask::Folder(task) => folder_replace::validate(task)?,
         SearchTask::SeedSelectionOrWord(seed) => {
             if seed.cursors.is_empty() || seed.cursors.len() > REPLACE_EDITS || seed.primary >= seed.cursors.len() {
                 return Err("seed cursor metadata exceeds cap or has no primary");
