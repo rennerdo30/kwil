@@ -81,6 +81,11 @@ commands! {
         "view.toggleMarkdown" => "Toggle Markdown Preview", "view.settings" => "Open Settings",
         "view.settingsFile" => "Open Settings File"
     },
+    "Keymap" => {
+        "settings.keymapVsCode" => "Keymap: Use VS Code Preset",
+        "settings.keymapNotepadPlusPlus" => "Keymap: Use Notepad++ Preset",
+        "settings.keymapVim" => "Keymap: Use Vim Preset"
+    },
     "Search" => {
         "search.find" => "Find", "search.findNext" => "Find Next",
         "search.findPrevious" => "Find Previous", "search.replace" => "Replace",

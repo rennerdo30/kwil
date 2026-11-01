@@ -25,6 +25,9 @@ fn dispatch(session: &mut Session, input: Input<'_>) -> Result<Outcome, String> 
 /// Everything else, including palette-selected text/search/format commands,
 /// is resolved here before a Workspace can coerce into its hidden text View.
 pub(super) fn chrome_command(id: &str) -> bool {
+    if Preset::from_command(id).is_some() {
+        return true;
+    }
     matches!(
         id,
         "file.new"

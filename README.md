@@ -74,6 +74,31 @@ updates itself: beta builds follow betas, stable builds follow stable releases
 To build from source, use `scripts/run.bat` on Windows or `scripts/run.sh`
 elsewhere. Add `--release` for an optimized build or `--tui` for terminal mode.
 
+## Keymaps
+
+In Settings → Keymap, choose **Preset**, or run **Keymap: Use VS Code Preset**,
+**Keymap: Use Notepad++ Preset** or **Keymap: Use Vim Preset** from the command
+palette. Changes apply live in both interfaces. The settings file accepts:
+
+```toml
+keymap.preset = "vscode" # default; also "notepad++" or "vim"
+
+[[bindings]]
+keys = "ctrl+s"
+command = "" # unbind a preset shortcut
+
+[[bindings]]
+keys = "ctrl+alt+s"
+command = "file.save"
+# Optional selectors: context = "editor", mode = "insert"
+```
+
+Overrides remain in effect when switching presets. Invalid keys or command ids
+show a settings error and leave the last accepted settings active. Existing
+`keymap = "vscode"` files are still supported. Palette shortcut labels follow
+the active editor mode and user overrides; commands without an effective
+shortcut have no binding label.
+
 ## Screenshots
 
 Actual beta TUI sessions captured through a hidden Windows ConPTY and rendered

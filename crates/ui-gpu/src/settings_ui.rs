@@ -2193,6 +2193,17 @@ impl App {
     }
 
     pub(super) fn dispatch_settings(&mut self, id: &str) -> bool {
+        if let Some(preset) = kwil_core_commands::Preset::from_command(id) {
+            if let Some(panel) = &mut self.settings_panel {
+                if let Err(error) = panel.select_keymap_preset(preset) {
+                    self.view.set_notice(format!("Keymap: {error}"));
+                }
+            } else {
+                self.view.set_notice("Settings are starting; try again shortly".into());
+            }
+            self.palette_redraw();
+            return true;
+        }
         if !matches!(id, "view.settings" | "view.settingsFile") {
             return false;
         }

@@ -141,7 +141,7 @@ pub const SCHEMA: &[SettingSpec] = &[
         |s| SettingValue::Formatters(s.formatters.clone())
     ),
     spec!(
-        "keymap",
+        "keymap.preset",
         "Preset",
         Keymap,
         "Choose VS Code, Notepad++ or Vim shortcuts. Custom bindings remain in effect.",
@@ -465,6 +465,7 @@ impl SettingsDocument {
         &self.report
     }
     pub fn current_value(&self, id: &str) -> Result<SettingValue, SettingsError> {
+        let id = if id == "keymap" { "keymap.preset" } else { id };
         let spec = SCHEMA.iter().find(|s| s.id == id).ok_or_else(|| error("unknown settings field"))?;
         Ok(if id == "file_types" {
             SettingValue::StringMap(self.file_types.clone())
@@ -488,6 +489,7 @@ impl SettingsDocument {
         Ok(())
     }
     pub fn edit(&mut self, id: &str, new: SettingValue) -> Result<(), SettingsError> {
+        let id = if id == "keymap" { "keymap.preset" } else { id };
         let spec = SCHEMA.iter().find(|s| s.id == id).ok_or_else(|| error("unknown settings field"))?;
         if let SettingValue::StringMap(new) = &new
             && matches!(id, "theme.colors" | "log.highlight_rules" | "file_types")
@@ -533,13 +535,15 @@ impl SettingsDocument {
         if !valid {
             return Err(error(format!("{id}: incorrect value type or unsupported choice")));
         }
-        let path: Vec<_> = id.split('.').collect();
+        let legacy_preset = id == "keymap.preset" && self.document.get("keymap").is_some_and(Item::is_str);
+        let path: Vec<_> = if legacy_preset { vec!["keymap"] } else { id.split('.').collect() };
         let new = value(new)?;
         self.transaction(|doc| set_leaf(doc.as_item_mut(), &path, Some(new)))
     }
     /// Reset writes the schema default while retaining the field's comments.
     /// Compound maps are edited entrywise; refusing a destructive reset is explicit.
     pub fn reset(&mut self, id: &str) -> Result<(), SettingsError> {
+        let id = if id == "keymap" { "keymap.preset" } else { id };
         if id == "bindings" || id == "formatters" {
             let comments = self.source.contains('#');
             let unknown = self

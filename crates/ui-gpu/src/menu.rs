@@ -4,7 +4,7 @@
 //! click outside dismisses it. Drawing is damage-only like the palette card.
 use super::*;
 use chrome::{Hover, Metrics};
-use kwil_core_commands::{Binding, Context, KeyChord, KeySequence, Keymap, Mode, Preset, Resolution};
+use kwil_core_commands::{Binding, Context, KeyChord, Keymap, Mode, Preset, Resolution};
 use kwil_view_model::TabArea;
 use std::collections::HashMap;
 
@@ -317,37 +317,13 @@ impl Keys {
         }
     }
 
-    /// Shortcut label for each menu command that a key actually reaches.
+    /// Shortcut labels for all commands, shared by menus and the palette.
     pub fn labels(&mut self, preset: Preset, bindings: &[Binding], mode: Mode) -> HashMap<&'static str, String> {
         let mut labels = HashMap::new();
         let Some(keymap) = self.keymap(preset, bindings) else { return labels };
-        for menu in MENUS {
-            for entry in menu.entries {
-                let Item(_, command) = *entry else { continue };
-                let best = keymap
-                    .bindings()
-                    .filter(|b| b.command == command)
-                    .filter(|b| b.context.is_none_or(|c| c == Context::Editor) && b.mode.is_none_or(|m| m == mode))
-                    .filter_map(|b| Some((b, b.keys.parse::<KeySequence>().ok()?)))
-                    .filter(|(_, sequence)| {
-                        keymap.resolve(&sequence.0, Context::Editor, mode) == Resolution::Command(command)
-                    })
-                    .min_by_key(|(b, sequence)| {
-                        let modifiers = sequence
-                            .0
-                            .iter()
-                            .map(|c| {
-                                c.modifiers.ctrl as usize
-                                    + c.modifiers.alt as usize
-                                    + c.modifiers.shift as usize
-                                    + c.modifiers.super_key as usize
-                            })
-                            .sum::<usize>();
-                        (sequence.0.len(), b.keys.to_ascii_lowercase().contains("plus"), modifiers)
-                    });
-                if let Some((binding, _)) = best {
-                    labels.insert(command, pretty(&binding.keys));
-                }
+        for command in kwil_core_commands::COMMANDS {
+            if let Some(binding) = keymap.command_binding(command.id, Context::Editor, mode) {
+                labels.insert(command.id, pretty(&binding.keys));
             }
         }
         labels
@@ -1399,6 +1375,13 @@ mod tests {
         assert!(enabled(&none, "file.new") && enabled(&none, "file.quit") && enabled(&none, ABOUT));
         let zoomed = Available { zoom_out: true, zoom_reset: true, ..none };
         assert!(!enabled(&zoomed, "view.zoomIn") && enabled(&zoomed, "view.zoomReset"));
+    }
+
+    #[test]
+    fn palette_labels_include_bound_commands_absent_from_menus() {
+        let binding = Binding { keys: "f6".into(), command: "settings.keymapVim".into(), context: None, mode: None };
+        let labels = Keys::default().labels(Preset::VsCode, &[binding], Mode::Insert);
+        assert_eq!(labels.get("settings.keymapVim").map(String::as_str), Some("F6"));
     }
 
     #[test]
