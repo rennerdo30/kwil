@@ -51,6 +51,7 @@ pub(crate) enum Step {
     LanguageChoose,
     LanguageReset,
     HexAscii,
+    HexType,
     HexGoto,
     HexFind,
     HexVerify,
@@ -496,6 +497,7 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::BinaryHex),
             (500, Step::BinaryHexCheck),
             (100, Step::HexAscii),
+            (500, Step::HexType),
             (500, Step::HexGoto),
             (300, Step::HexFind),
             (500, Step::HexVerify),
@@ -590,11 +592,43 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             app.edit(super::input::Action::Command("edit.undo"));
         }
         Step::HexAscii => {
+            assert!(
+                !app.hex_body_blocked(),
+                "hex probe body blocked: welcome={:?}, file_modal={}, menu={:?}, composing={}, notice={}",
+                app.welcome.stage(),
+                app.file_modal(),
+                app.menu.state,
+                app.composing,
+                app.view.notice()
+            );
             hex_key(app, el, super::Key::Named(super::NamedKey::Tab));
+            assert!(
+                app.view.hex_session().unwrap().ascii_column(),
+                "Tab did not select ASCII: composing={}, blocked={}, notice={}",
+                app.composing,
+                app.document_input_blocked(),
+                app.view.notice()
+            );
+        }
+        Step::HexType => {
+            assert!(!app.view.document_busy(app.view.active_id()), "hex probe type arrived while worker pending");
             hex_key(app, el, super::Key::Character("Z".into()));
+            assert!(
+                app.view.hex_session().unwrap().busy(),
+                "ASCII key was not admitted: composing={}, blocked={}, preset={:?}, notice={}",
+                app.composing,
+                app.document_input_blocked(),
+                app.settings.keymap,
+                app.view.notice()
+            );
         }
         Step::HexGoto => {
-            assert_eq!(app.view.hex_session().unwrap().row(app.view.hex_source(), 0).unwrap().bytes[0], b'Z');
+            assert_eq!(
+                app.view.hex_session().unwrap().row(app.view.hex_source(), 0).unwrap().bytes[0],
+                b'Z',
+                "ASCII worker result: {}",
+                app.view.notice()
+            );
             app.edit(super::input::Action::Command("navigation.goToLine"));
             for c in "0x2".chars() {
                 hex_key(app, el, super::Key::Character(c.to_string().into()));
