@@ -68,17 +68,13 @@ pub fn generate(dir: &Path, all: bool) -> io::Result<()> {
     std::fs::write(enc.join("utf16le.txt"), [0xff, 0xfe, b'h', 0, b'i', 0, 10, 0])?;
     std::fs::write(enc.join("windows1252.txt"), b"caf\xe9\r\n\x80\n")?;
     std::fs::write(enc.join("mixed-invalid.txt"), b"utf8\n\xff\xfe\x82\xa0\r\n")?;
-    tree(&dir.join("tree-100k"), 100, 1000)?;
-    std::fs::write(stamp, VERSION)
-}
-
-pub fn tree(tree: &Path, shards: usize, files_per_shard: usize) -> io::Result<()> {
-    for shard in 0..shards {
+    let tree = dir.join("tree-100k");
+    for shard in 0..100 {
         let d = tree.join(format!("{shard:03}"));
         std::fs::create_dir_all(&d)?;
-        for i in 0..files_per_shard {
+        for i in 0..1000 {
             std::fs::write(d.join(format!("file-{i:04}.txt")), b"small fixture\n")?;
         }
     }
-    Ok(())
+    std::fs::write(stamp, VERSION)
 }

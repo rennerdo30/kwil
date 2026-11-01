@@ -41,11 +41,12 @@ applied. Discovery and fixture generation are outside the timer. The job summary
 reports the elapsed time and whether it misses 16 ms, alongside core-text medians;
 the raw JSON is retained with the other results. This case is non-blocking, has
 no baseline comparison, and does not measure GUI/TUI presentation or native input.
-The separate `kwil-palette-bench` executable requires `palette-harness` and
-refuses to generate the full tree outside GitHub Actions. Core-text measurements
-use `kwil-bench` built with only `harness`, excluding palette code and its
-command/catalogue dependencies from the measured process. Local tests use a
-six-file tree only.
+The `kwil-palette-bench` executable lives in its own `crates/bench-palette`
+workspace with its own lockfile and CI target directory. It refuses to generate
+the full tree outside GitHub Actions. The original `crates/bench` workspace,
+including its sources, manifest, features and lockfile, stays unchanged; palette
+dependencies cannot affect its resolution or measured process. Local tests use
+a six-file tree only.
 
 The other §3 budgets (search, diff, full-editor memory, typing, scrolling,
 single-instance and remote drawing) still need their own representative

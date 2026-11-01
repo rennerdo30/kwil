@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "kwil-bench-palette"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[dependencies]
+kwil-core-commands = { path = "../core-commands" }
+kwil-core-workspace = { path = "../core-workspace" }
+serde_json = "1"
+
+[[bin]]
+name = "kwil-palette-bench"
+path = "src/main.rs"
