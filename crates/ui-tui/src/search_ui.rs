@@ -1251,7 +1251,7 @@ mod tests {
         h.settle();
         assert_eq!(std::fs::read(&a).unwrap(), b"y12$\r\ny34$\n");
         assert_eq!(std::fs::read(&b).unwrap(), b"x56\n");
-        assert!(h.host.panel.status().contains("1 files applied"));
+        assert!(h.host.panel.status().contains("1 file applied"));
         assert_eq!(h.bytes(), b"retain editor");
         h.finish();
     }
