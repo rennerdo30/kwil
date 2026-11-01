@@ -464,6 +464,15 @@ impl SettingsSession {
     pub fn is_open(&self) -> bool {
         self.open
     }
+    /// Palette and settings edits share the same validated, optimistic save path.
+    pub fn select_keymap_preset(&mut self, preset: kwil_core_commands::Preset) -> Result<(), String> {
+        if self.panel_has_draft() || self.editing.is_some() || self.has_conflict() {
+            return self.finish_action(Err(
+                "Finish the current settings edit or resolve its conflict before changing the keymap".into(),
+            ));
+        }
+        self.edit_document(|doc| doc.edit("keymap.preset", SettingValue::Text(preset.as_str().into())))
+    }
     pub fn open_log_highlights(&mut self) -> Result<(), String> {
         self.open();
         if self.panel_has_draft() || self.editing.is_some() {
@@ -1107,6 +1116,38 @@ mod tests {
     fn saved(session: &mut SettingsSession, request: &(u64, Option<String>, String)) {
         session.events.push(SettingsWorkerEvent::Saved { request: request.0, source: request.2.clone() }, &|| {});
         session.worker_ready();
+    }
+
+    #[test]
+    fn keymap_palette_selection_publishes_only_acknowledged_preset_and_retains_overrides() {
+        use kwil_core_commands::{Preset, keymap::KeymapEngine, vim::VimResult};
+        let source = "# owner\n[[bindings]]\nkeys='ctrl+s'\ncommand=''\n";
+        let (mut session, requests) = fixture(Some(source));
+        for preset in [Preset::NotepadPlusPlus, Preset::Vim, Preset::VsCode] {
+            session.select_keymap_preset(preset).unwrap();
+            assert!(session.take_applied().is_none());
+            let request = requests.lock().unwrap().last().unwrap().clone();
+            saved(&mut session, &request);
+            let accepted = session.take_applied().unwrap().settings;
+            assert_eq!(accepted.keymap, preset);
+            assert_eq!(accepted.bindings.len(), 1);
+            let mut keys = KeymapEngine::new(accepted.keymap, &accepted.bindings).unwrap();
+            assert_eq!(keys.feed("ctrl+s".parse().unwrap()), VimResult::Unbound);
+            assert!(keys.suppresses_fallback());
+            let result = keys.feed("ctrl+d".parse().unwrap());
+            if preset != Preset::Vim {
+                assert!(
+                    matches!(result, VimResult::Command(call) if call.id == if preset == Preset::VsCode { "edit.selectNextMatch" } else { "edit.duplicateLine" })
+                );
+            }
+        }
+        // External invalid candidates never replace the accepted settings.
+        session
+            .events
+            .push(SettingsWorkerEvent::Error { request: None, message: "unknown command: bad.id".into() }, &|| {});
+        session.worker_ready();
+        assert!(session.take_applied().is_none());
+        assert!(session.status().contains("bad.id"));
     }
 
     #[test]

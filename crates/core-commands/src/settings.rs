@@ -13,10 +13,10 @@ use std::{
 };
 
 macro_rules! group {
-    ($name:ident { $($field:ident : $ty:ty = $default:expr),* $(,)? }) => {
+    ($name:ident { $( $(#[$attr:meta])* $field:ident : $ty:ty = $default:expr),* $(,)? }) => {
         #[derive(Clone, Debug, PartialEq, Deserialize)]
         #[serde(default)]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $( $(#[$attr])* pub $field: $ty),* }
         impl Default for $name { fn default() -> Self { Self { $($field: $default),* } } }
     };
 }
@@ -122,7 +122,24 @@ group!(Formatter {
     executable: String = String::new(), args: Vec<String> = Vec::new(),
     range_args: Vec<String> = Vec::new(), timeout_ms: u32 = 5000
 });
+// Keep the original scalar form readable while exposing keymap.preset in new files.
+fn deserialize_keymap_preset<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Preset, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Preference {
+        Legacy(Preset),
+        Group {
+            #[serde(default)]
+            preset: Preset,
+        },
+    }
+    Ok(match Preference::deserialize(deserializer)? {
+        Preference::Legacy(preset) | Preference::Group { preset } => preset,
+    })
+}
+
 group!(Settings {
+    #[serde(deserialize_with = "deserialize_keymap_preset")]
     keymap: Preset = Preset::VsCode, bindings: Vec<Binding> = Vec::new(),
     tabs: TabsSettings = TabsSettings::default(),
     render: RenderSettings = RenderSettings::default(), update: UpdateSettings = UpdateSettings::default(),
@@ -415,6 +432,7 @@ fn known(path: &str) -> &'static [&'static str] {
         "compare" => &["ignore_whitespace", "collapse_unchanged", "context_lines"],
         "syntax" => &["full_parse_limit_bytes"],
         "log" => &["follow", "detect_levels", "highlight_rules"],
+        "keymap" => &["preset"],
         "bindings[]" => &["keys", "command", "context", "mode"],
         "formatters.*" => &["executable", "args", "range_args", "timeout_ms"],
         _ => &[],

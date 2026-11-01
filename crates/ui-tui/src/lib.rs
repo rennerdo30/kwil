@@ -687,6 +687,16 @@ fn run_workspace_with_terminal_init(
                                 }
                                 true
                             }
+                            KeyResult::KeymapPreset(preset) => {
+                                if let Some(panel) = &mut settings_panel {
+                                    if let Err(error) = panel.select_keymap_preset(preset) {
+                                        view.set_notice(error);
+                                    }
+                                } else {
+                                    view.set_notice("Settings are starting; try again shortly".into());
+                                }
+                                true
+                            }
                             KeyResult::Settings | KeyResult::LogHighlights => {
                                 let log_highlights = matches!(intent, KeyResult::LogHighlights);
                                 if let Some(host) = &mut palette {
@@ -1037,7 +1047,7 @@ fn run_workspace_with_terminal_init(
                         prepared,
                     );
                     if let Some(host) = &palette {
-                        palette_ui::draw(f, host.model());
+                        palette_ui::draw(f, host.model(), &keys);
                     }
                     if let Some(menu) = &language_menu {
                         draw_language(f, menu);
@@ -1817,6 +1827,7 @@ enum KeyResult {
     BodyInvoke(kwil_core_commands::vim::Invocation, bool),
     BodyExecute(&'static str, CommandArgs, u32),
     Settings,
+    KeymapPreset(Preset),
     LogHighlights,
     SettingsFile,
     Quit,
@@ -2314,6 +2325,9 @@ fn invoke(
     elapsed: std::time::Duration,
     preset: Preset,
 ) -> KeyResult {
+    if let Some(preset) = Preset::from_command(call.id) {
+        return KeyResult::KeymapPreset(preset);
+    }
     if matches!(call.id, "edit.formatDocument" | "edit.formatSelection") {
         return KeyResult::Format(call.id == "edit.formatSelection");
     }

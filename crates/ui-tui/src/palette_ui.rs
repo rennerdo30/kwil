@@ -225,7 +225,7 @@ pub(super) fn panel(area: Rect) -> Option<Rect> {
     Some(Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 3, width, height })
 }
 
-pub(super) fn draw(frame: &mut ratatui::Frame, palette: &Palette) {
+pub(super) fn draw(frame: &mut ratatui::Frame, palette: &Palette, keys: &KeymapEngine) {
     if !palette.is_open() {
         return;
     }
@@ -254,9 +254,21 @@ pub(super) fn draw(frame: &mut ratatui::Frame, palette: &Palette) {
         };
         let row_area = Rect { x: area.x, y: area.y + (row - first + 1) as u16, width: area.width, height: 1 };
         frame.render_widget(Paragraph::new("").style(style.bg(bg)), row_area);
+        let binding = match item.action {
+            kwil_core_commands::palette::PaletteAction::Command(id) => {
+                keys.command_binding(id, kwil_core_commands::Context::Editor)
+            }
+            _ => None,
+        };
+        let label = binding.map(|b| display_text(&b.keys)).unwrap_or_default();
+        let key_width = ratatui::text::Line::from(label.as_str()).width().min(columns / 2);
         frame.render_widget(
             Paragraph::new(display_text(&item.title)).style(style.bg(bg)),
-            Rect { x: area.x + 1, width: columns as u16, ..row_area },
+            Rect { x: area.x + 1, width: columns.saturating_sub(key_width + 1) as u16, ..row_area },
+        );
+        frame.render_widget(
+            Paragraph::new(label).alignment(ratatui::layout::Alignment::Right).style(style.bg(bg)),
+            Rect { x: area.x + 1 + (columns - key_width) as u16, width: key_width as u16, ..row_area },
         );
     }
     let footer = if palette.results_are_fresh() { "Enter: open   Esc: cancel" } else { "Searching...   Esc: cancel" };
@@ -270,6 +282,40 @@ pub(super) fn draw(frame: &mut ratatui::Frame, palette: &Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn palette_draws_current_binding_and_unbind_removes_it() {
+        use kwil_core_commands::palette::{PaletteAction, PaletteMode, PaletteResults, PaletteRow};
+        use std::sync::Arc;
+        let mut palette = Palette::new(16);
+        let request = palette.open(">").unwrap().unwrap();
+        assert!(
+            palette.apply_results(Arc::new(PaletteResults {
+                generation: request.generation,
+                query: request.query,
+                mode: PaletteMode::Commands,
+                rows: vec![PaletteRow {
+                    title: "Save".into(),
+                    category: "File".into(),
+                    action: PaletteAction::Command("file.save")
+                }]
+                .into(),
+                total: 1,
+            }))
+        );
+        for (command, present) in [("file.save", true), ("", false)] {
+            let bindings = [
+                kwil_core_commands::Binding { keys: "f6".into(), command: command.into(), context: None, mode: None },
+                kwil_core_commands::Binding { keys: "ctrl+s".into(), command: "".into(), context: None, mode: None },
+            ];
+            let keys = KeymapEngine::new(Preset::VsCode, &bindings).unwrap();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 22)).unwrap();
+            terminal.draw(|frame| draw(frame, &palette, &keys)).unwrap();
+            let screen: String = terminal.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+            assert!(screen.contains("Save"));
+            assert_eq!(screen.contains("f6"), present);
+        }
+    }
+
     #[test]
     fn named_vim_command_clears_old_operator_and_changes_mode() {
         let mut keys = KeymapEngine::new(Preset::Vim, &[]).unwrap();

@@ -109,6 +109,21 @@ pub enum Preset {
 }
 
 impl Preset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VsCode => "vscode",
+            Self::NotepadPlusPlus => "notepad++",
+            Self::Vim => "vim",
+        }
+    }
+    pub fn from_command(id: &str) -> Option<Self> {
+        match id {
+            "settings.keymapVsCode" => Some(Self::VsCode),
+            "settings.keymapNotepadPlusPlus" => Some(Self::NotepadPlusPlus),
+            "settings.keymapVim" => Some(Self::Vim),
+            _ => None,
+        }
+    }
     pub fn source(self) -> &'static str {
         match self {
             Self::VsCode => include_str!("../presets/vscode.toml"),
@@ -190,6 +205,34 @@ impl Keymap {
         Ok(result)
     }
 
+    /// A displayed shortcut must be reachable, including every chord prefix.
+    /// Pick a short, simple effective binding in the caller's editor mode.
+    pub fn command_binding(&self, id: &str, context: Context, mode: Mode) -> Option<&Binding> {
+        self.entries
+            .iter()
+            .filter(|e| e.binding.command == id && Self::applicable(e, context, mode))
+            .filter(|e| {
+                self.resolve(&e.sequence.0, context, mode) == Resolution::Command(id)
+                    && (1..e.sequence.0.len())
+                        .all(|n| self.resolve(&e.sequence.0[..n], context, mode) == Resolution::Pending)
+            })
+            .min_by_key(|e| {
+                let modifiers: usize = e
+                    .sequence
+                    .0
+                    .iter()
+                    .map(|c| {
+                        c.modifiers.ctrl as usize
+                            + c.modifiers.alt as usize
+                            + c.modifiers.shift as usize
+                            + c.modifiers.super_key as usize
+                    })
+                    .sum();
+                (e.sequence.0.len(), e.binding.keys.to_ascii_lowercase().contains("plus"), modifiers)
+            })
+            .map(|e| &e.binding)
+    }
+
     pub fn bindings(&self) -> impl Iterator<Item = &Binding> {
         self.entries.iter().map(|entry| &entry.binding)
     }
@@ -260,6 +303,10 @@ impl KeymapEngine {
             pending: Vec::new(),
             fallback_suppressed: false,
         })
+    }
+    /// Palette labels describe the editor destination, not its query context.
+    pub fn command_binding(&self, id: &str, context: Context) -> Option<&Binding> {
+        self.keymap.command_binding(id, context, self.mode())
     }
     pub fn mode(&self) -> Mode {
         self.vim.as_ref().map_or(Mode::Insert, crate::vim::Vim::mode)
