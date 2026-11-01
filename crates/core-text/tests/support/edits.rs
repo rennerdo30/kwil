@@ -3,7 +3,9 @@ use std::sync::atomic::AtomicU64;
 
 pub fn starts(bytes: &[u8]) -> Vec<u64> {
     std::iter::once(0)
-        .chain(bytes.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| i as u64 + 1))
+        .chain(bytes.iter().enumerate().filter_map(|(i, &byte)| {
+            (byte == b'\n' || (byte == b'\r' && bytes.get(i + 1) != Some(&b'\n'))).then_some(i as u64 + 1)
+        }))
         .collect()
 }
 
@@ -30,8 +32,16 @@ pub fn check_snapshot(snapshot: &Snapshot, text: &str) {
         .lines(0, lines.len() + 1)
         .map(|line| line.unwrap().flat_map(|chunk| chunk.unwrap().to_vec()).collect())
         .collect();
-    let expected: Vec<Vec<u8>> =
-        text.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line).as_bytes().to_vec()).collect();
+    let expected: Vec<Vec<u8>> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = lines.get(i + 1).copied().unwrap_or(text.len() as u64);
+            let line = &text.as_bytes()[start as usize..end as usize];
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            line.strip_suffix(b"\r").unwrap_or(line).to_vec()
+        })
+        .collect();
     assert_eq!(actual, expected);
 }
 

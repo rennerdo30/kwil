@@ -318,6 +318,7 @@ fn visit_trimmed(
     let mut offset = 0_u64;
     let mut from = 0;
     let mut row = 0;
+    let mut previous_cr = false;
     let mut changed: Option<Range<u64>> = None;
     let mut emit_trim = |start: u64, end: u64, line_end: u64, row: u64, from: &mut u64| -> io::Result<()> {
         if start < end {
@@ -345,20 +346,22 @@ fn visit_trimmed(
                         if let Some(start) = trail.take() {
                             emit_trim(start, offset, offset + 1, row, &mut from)?;
                         }
+                        row += 1;
                     }
                     b'\n' => {
                         if let Some(start) = trail {
                             emit_trim(start, offset, offset + 1, row, &mut from)?;
                         }
                         trail = None;
-                        // Snapshot/receipt row coordinates count logical LF bytes.
-                        // A lone CR is an ending for trimming, but not another row.
-                        row += 1;
+                        if !previous_cr {
+                            row += 1;
+                        }
                     }
                     _ => {
                         trail = None;
                     }
                 }
+                previous_cr = byte == b'\r';
                 offset += 1;
             }
         }
@@ -644,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_trim_streams_original_coordinates_and_lf_receipt_rows() {
+    fn raw_trim_streams_original_coordinates_and_mixed_receipt_rows() {
         let f = Fixture::new();
         fs::write(f.path(), b"a \t\r\nb  \rc\t\n \t").unwrap();
         let original = open_for_editing(&f.path()).unwrap();
@@ -653,7 +656,7 @@ mod tests {
         request.trim_trailing_whitespace = true;
         let saved = save_snapshot(request).unwrap();
         assert_eq!(fs::read(f.path()).unwrap(), b"a\r\nb\rc\n");
-        assert_eq!(saved.trimmed_rows, Some(0..3));
+        assert_eq!(saved.trimmed_rows, Some(0..4));
         assert_eq!(
             saved.trim_deletions.unwrap().ranges().unwrap().collect::<io::Result<Vec<_>>>().unwrap(),
             [1..3, 6..8, 10..11, 12..14]

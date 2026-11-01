@@ -727,15 +727,23 @@ mod tests {
     #[test]
     fn decoded_newline_normalization_preserves_opaque_and_split_crlf() {
         let fixture = Fixture::new();
-        let mut buffer = fixture.decoded(b"\xff\xfeA\0\r\0\n\0\0\xd8B\0\r\0C\0\n\0", Encoding::UTF16_LE, 2);
+        let original = b"\xff\xfeA\0\r\0\n\0\0\xd8B\0\r\0C\0\n\0";
+        let mut buffer = fixture.decoded(original, Encoding::UTF16_LE, 2);
         // Split CRLF across immutable pieces without changing its text.
         let suffix = buffer.snapshot().slice(2..buffer.len()).unwrap();
         buffer.delete(2..buffer.len()).unwrap();
         buffer.insert_snapshot_range(buffer.len(), &suffix, 0..suffix.len()).unwrap();
+        assert_eq!(
+            saved(&buffer.snapshot(), plan(Encoding::UTF16_LE, true)),
+            original,
+            "Without conversion, lone CR and opaque UTF-16 units remain byte-exact"
+        );
         let mut target = plan(Encoding::UTF16_LE, true);
         target.line_ending = Some(LineEnding::Lf);
         assert_eq!(saved(&buffer.snapshot(), target), b"\xff\xfeA\0\n\0\0\xd8B\0\n\0C\0\n\0");
-        assert_eq!(buffer.line_count(), 3);
+        // Saving does not mutate the source: CRLF, CR and LF are three
+        // terminators, including the final empty fourth line.
+        assert_eq!(buffer.line_count(), 4);
         assert_eq!(buffer.offset_to_line_col(5).unwrap(), Some((1, 2)));
     }
 

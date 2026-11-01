@@ -276,7 +276,13 @@ impl Equality {
         }
         if self.prepared == 2 {
             gate!(work.debit(1, 0, cancel));
-            let normalize = |e| if options.ignore_line_endings && e == Terminator::CrLf { Terminator::Lf } else { e };
+            let normalize = |e| {
+                if options.ignore_line_endings && matches!(e, Terminator::CrLf | Terminator::Cr) {
+                    Terminator::Lf
+                } else {
+                    e
+                }
+            };
             if normalize(self.endings[0]) != normalize(self.endings[1]) {
                 return Step::Ready(false);
             }

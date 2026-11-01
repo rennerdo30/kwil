@@ -135,7 +135,7 @@ impl Snapshot {
         Ok(crate::piece_tree::SourceChunks::new(&self.root, range))
     }
 
-    /// Borrow each viewport line as chunks, without LF or a trailing CR.
+    /// Borrow each viewport line as chunks, without its CR, LF or CRLF terminator.
     /// Even a single giant line is never joined into an owned buffer.
     /// Both line and chunk iterator items can report ReadError.
     pub fn lines(&self, start_line: u64, count: usize) -> Lines<'_> {
@@ -1481,7 +1481,6 @@ mod editing_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memchr::memchr_iter;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
@@ -1591,7 +1590,11 @@ mod tests {
     fn check(buffer: &Buffer, model: &[u8], step: usize) {
         assert_eq!(bytes(&buffer.snapshot()), model, "bytes at step {step}");
         assert_eq!(buffer.len(), model.len() as u64, "length at step {step}");
-        let starts: Vec<_> = std::iter::once(0).chain(memchr_iter(b'\n', model).map(|at| at as u64 + 1)).collect();
+        let starts: Vec<_> = std::iter::once(0)
+            .chain(model.iter().enumerate().filter_map(|(at, &b)| {
+                (b == b'\n' || (b == b'\r' && model.get(at + 1) != Some(&b'\n'))).then_some(at as u64 + 1)
+            }))
+            .collect();
         assert_eq!(buffer.line_count(), starts.len() as u64, "line count at step {step}");
         for (line, &start) in starts.iter().enumerate() {
             assert_eq!(buffer.line_start(line as u64).unwrap(), Some(start), "line {line}, step {step}");
@@ -1818,7 +1821,8 @@ mod tests {
         buffer.insert(2, b"\xff").unwrap();
         let lines: Vec<Vec<u8>> =
             buffer.lines(0, 10).map(|line| line.unwrap().flat_map(Result::unwrap).copied().collect()).collect();
-        assert_eq!(lines, [b"on\xffe\rtwo".to_vec(), vec![], b"last".to_vec(), vec![]]);
+        // Line views split lone CR too; raw chunk ranges below keep its byte.
+        assert_eq!(lines, [b"on\xffe".to_vec(), b"two".to_vec(), vec![], b"last".to_vec(), vec![]]);
         let middle: Vec<_> = buffer.chunks(3..12).unwrap().flat_map(Result::unwrap).copied().collect();
         assert_eq!(middle, b"e\rtwo\r\n\nl");
         assert_eq!(buffer.chunks(2..2).unwrap().count(), 0);
@@ -1904,9 +1908,14 @@ mod tests {
             check(&buffer, &model, step);
         }
         for at in 0..=model.len() {
-            let line = memchr_iter(b'\n', &model[..at]).count() as u64;
-            let col = model[..at].iter().rposition(|&byte| byte == b'\n').map_or(at, |p| at - p - 1);
-            assert_eq!(buffer.offset_to_line_col(at as u64).unwrap(), Some((line, col as u64)));
+            let starts: Vec<_> = std::iter::once(0)
+                .chain(model.iter().enumerate().filter_map(|(at, &b)| {
+                    (b == b'\n' || (b == b'\r' && model.get(at + 1) != Some(&b'\n'))).then_some(at + 1)
+                }))
+                .collect();
+            let line = starts.partition_point(|&start| start <= at) - 1;
+            let col = at - starts[line];
+            assert_eq!(buffer.offset_to_line_col(at as u64).unwrap(), Some((line as u64, col as u64)));
         }
     }
 

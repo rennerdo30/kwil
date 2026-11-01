@@ -1,4 +1,6 @@
 use crate::index_memory::{INDEX_MEMORY_BYTES, IndexMemory, IndexVec};
+use crate::newlines::ends;
+#[cfg(test)]
 use memchr::memchr_iter;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -55,11 +57,16 @@ impl LineIndex {
         assert!(from_len <= bytes.len() as u64, "cannot extend a truncated file");
         // Count only the append before reserving, so a refusal leaves all old
         // metrics intact. Exact reservation avoids hidden geometric growth.
-        let added = memchr_iter(b'\n', &bytes[from_len as usize..]).count() as u64;
-        let lines = self.checkpoints.len()
-            + ((self.line_count - 1 + added) / DEFAULT_EVERY - (self.line_count - 1) / DEFAULT_EVERY) as usize;
-        let last_rank = self.rank_checkpoints.last().unwrap().1 as usize;
-        let ranks = self.rank_checkpoints.len() + bytes.len().saturating_sub(last_rank + 1) / RANK_BYTES;
+        let joins_crlf = crate::newlines::split_crlf(bytes, from_len as usize);
+        let added = ends(bytes, from_len as usize..bytes.len()).count() as u64;
+        let old_breaks = self.line_count - 1 - u64::from(joins_crlf);
+        let removes_line = joins_crlf && self.checkpoints.last().is_some_and(|&(_, at)| at == from_len);
+        let lines = self.checkpoints.len() - usize::from(removes_line)
+            + ((old_breaks + added) / DEFAULT_EVERY - old_breaks / DEFAULT_EVERY) as usize;
+        let removes_rank = joins_crlf && self.rank_checkpoints.last().is_some_and(|&(_, at)| at == from_len);
+        let rank_count = self.rank_checkpoints.len() - usize::from(removes_rank);
+        let last_rank = self.rank_checkpoints[rank_count - 1].1 as usize;
+        let ranks = rank_count + bytes.len().saturating_sub(last_rank + 1) / RANK_BYTES;
         let old_lines = self.checkpoints.capacity();
         let old_ranks = self.rank_checkpoints.capacity();
         let new_lines = lines.max(old_lines);
@@ -81,6 +88,16 @@ impl LineIndex {
             .try_reserve_exact(ranks.saturating_sub(self.rank_checkpoints.len()))
             .map_err(io::Error::other)?;
         let mut start = from_len as usize;
+        if start < bytes.len() && crate::newlines::split_crlf(bytes, start) {
+            self.line_count -= 1;
+            // Only an EOF checkpoint can move when CR grows into CRLF.
+            if self.checkpoints.last().is_some_and(|&(_, at)| at == from_len) {
+                self.checkpoints.pop();
+            }
+            if self.rank_checkpoints.last().is_some_and(|&(_, at)| at == from_len) {
+                self.rank_checkpoints.pop();
+            }
+        }
         while start < bytes.len() {
             let last_rank = self.rank_checkpoints.last().unwrap().1;
             if start as u64 - last_rank == RANK_BYTES as u64 {
@@ -88,12 +105,12 @@ impl LineIndex {
             }
             let next_rank = self.rank_checkpoints.last().unwrap().1 + RANK_BYTES as u64;
             let end = bytes.len().min(next_rank as usize);
-            for pos in memchr_iter(b'\n', &bytes[start..end]) {
+            for pos in ends(bytes, start..end) {
                 // The old final (possibly partial or empty) line already counts.
                 self.line_count += 1;
                 let line = self.line_count - 1;
                 if line.is_multiple_of(DEFAULT_EVERY) {
-                    self.checkpoints.push((line, start as u64 + pos as u64 + 1));
+                    self.checkpoints.push((line, pos as u64));
                 }
             }
             start = end;
@@ -179,10 +196,10 @@ impl LineIndex {
                     rank_checkpoints.push((lines_before + newlines, block_start as u64))?;
                 }
                 let block_end = block_start.saturating_add(RANK_BYTES).min(end);
-                for pos in memchr_iter(b'\n', &bytes[block_start..block_end]) {
+                for pos in ends(bytes, block_start..block_end) {
                     newlines += 1;
                     if newlines.is_multiple_of(every) {
-                        checkpoints.push((lines_before + newlines, (block_start + pos + 1) as u64))?;
+                        checkpoints.push((lines_before + newlines, pos as u64))?;
                     }
                 }
                 progress.fetch_add((block_end - block_start) as u64, Ordering::Relaxed);
@@ -244,10 +261,10 @@ impl LineIndex {
                             for block_start in (start..end).step_by(RANK_BYTES) {
                                 ranks.push((newlines, block_start as u64))?;
                                 let block_end = (block_start + RANK_BYTES).min(end);
-                                for pos in memchr_iter(b'\n', &bytes[block_start..block_end]) {
+                                for pos in ends(bytes, block_start..block_end) {
                                     newlines += 1;
                                     if newlines.is_multiple_of(every) {
-                                        local.push((newlines, (block_start + pos + 1) as u64))?;
+                                        local.push((newlines, pos as u64))?;
                                     }
                                 }
                             }
@@ -317,7 +334,7 @@ impl LineIndex {
             self.rank_checkpoints[j]
         };
         scanned((offset - at) as usize);
-        Some(line + memchr_iter(b'\n', &bytes[at as usize..offset as usize]).count() as u64)
+        Some(line + ends(bytes, at as usize..offset as usize).count() as u64)
     }
 
     /// Byte offset where `line` starts, or `None` past the end.
@@ -346,7 +363,7 @@ impl LineIndex {
         let skip = line - cl;
         let tail = &bytes[off as usize..end as usize];
         scanned(tail.len());
-        memchr_iter(b'\n', tail).nth((skip - 1) as usize).map(|p| off + p as u64 + 1)
+        ends(bytes, off as usize..end as usize).nth((skip - 1) as usize).map(|p| p as u64)
     }
 }
 
@@ -382,7 +399,7 @@ mod tests {
 
     #[test]
     fn index_memory_limit_append_refusal_preserves_old_index() {
-        for bytes in [vec![b'\n'; 9000], vec![b'x'; 5 * RANK_BYTES]] {
+        for bytes in [vec![b'\n'; 9000], vec![b'\r'; 9000], vec![b'x'; 5 * RANK_BYTES]] {
             let mut index = LineIndex::build(b"x", DEFAULT_EVERY, 1, &AtomicU64::new(0)).unwrap();
             let previous = index.clone();
             let limit = index.memory_bytes();
@@ -396,6 +413,32 @@ mod tests {
             assert_eq!(index.len, bytes.len() as u64);
             assert!(index.memory_bytes() <= 4096);
         }
+    }
+
+    #[test]
+    fn classic_mac_and_mixed_breaks_cross_chunks_and_appends() {
+        let bytes = b"a\r\nb\rc\n\r\rd\r";
+        let starts = [0, 3, 5, 7, 8, 9, 11];
+        for chunk in [1, 2, 3, 7] {
+            for every in [1, 3, DEFAULT_EVERY] {
+                let index = LineIndex::build_chunked(bytes, every, chunk, 2, &AtomicU64::new(0)).unwrap();
+                assert_eq!(index.line_count(), starts.len() as u64);
+                for (line, &at) in starts.iter().enumerate() {
+                    assert_eq!(index.line_start(bytes, line as u64), Some(at));
+                }
+                for at in 0..=bytes.len() {
+                    assert_eq!(
+                        index.line_of_offset(bytes, at as u64),
+                        Some((starts.partition_point(|&s| s <= at as u64) - 1) as u64)
+                    );
+                }
+            }
+        }
+        let mut index = LineIndex::build(b"a\r", 1, 1, &AtomicU64::new(0)).unwrap();
+        index.extend(b"a\r\nb\r", 2).unwrap();
+        assert_eq!(index.line_count(), 3);
+        assert_eq!(index.line_start(b"a\r\nb\r", 1), Some(3));
+        assert_eq!(index.line_start(b"a\r\nb\r", 2), Some(5));
     }
 
     #[test]
@@ -447,7 +490,7 @@ mod tests {
         for at in [65_535, 120_001] {
             bytes[at] = b'\r';
         }
-        let starts: Vec<_> = std::iter::once(0).chain(memchr_iter(b'\n', &bytes).map(|at| at as u64 + 1)).collect();
+        let starts: Vec<_> = std::iter::once(0).chain(ends(&bytes, 0..bytes.len()).map(|at| at as u64)).collect();
         for every in [0, 1, 3, DEFAULT_EVERY] {
             for chunk in [65_535, 100_003, CHUNK] {
                 let old = LineIndex::build_chunked(&bytes, every, chunk, 2, &AtomicU64::new(0)).unwrap();

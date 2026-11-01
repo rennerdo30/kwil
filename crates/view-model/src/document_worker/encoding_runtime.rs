@@ -210,12 +210,6 @@ impl EncodingRuntime {
             let revision = summary.journal.revision;
             let base = summary.base.clone();
             let policy = summary.policy;
-            if policy.preferred_ending == LineEnding::Cr {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "CR-only editing requires CR line-index support; recovery retained",
-                ));
-            }
             let count = recovery.accepted_origin_count();
             if count > max_origins {
                 return Err(io::Error::other("recovery origin admission limit"));
@@ -256,10 +250,10 @@ impl EncodingRuntime {
             };
             document.bom = policy.bom;
             document.compression = policy.compression;
-            document.line_ending = if policy.preferred_ending == LineEnding::CrLf {
-                DocumentLineEnding::CrLf
-            } else {
-                DocumentLineEnding::Lf
+            document.line_ending = match policy.preferred_ending {
+                LineEnding::Lf => DocumentLineEnding::Lf,
+                LineEnding::CrLf => DocumentLineEnding::CrLf,
+                LineEnding::Cr => DocumentLineEnding::Cr,
             };
             document.revision = revision;
             document.saved_revision = tab.saved_revision;
@@ -371,6 +365,7 @@ pub(crate) fn document_policy(document: &Document) -> RecoveryPolicy {
         preferred_ending: match document.line_ending {
             DocumentLineEnding::Lf => LineEnding::Lf,
             DocumentLineEnding::CrLf => LineEnding::CrLf,
+            DocumentLineEnding::Cr => LineEnding::Cr,
         },
     }
 }

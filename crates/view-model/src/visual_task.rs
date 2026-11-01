@@ -96,8 +96,8 @@ pub struct Provenance {
 /// poll_read leaves output untouched on Pending, cancellation AND error. A
 /// ReadLease adapter must stage its OS read before publishing; ReadLease's raw
 /// read_at only promises this for Pending/cancellation. Ready returns a nonzero
-/// short prefix unless at EOF. LineSpan carries the complete terminator, with
-/// literal CR at EOF remaining content. An ordinary byte source must explicitly
+/// short prefix unless at EOF. LineSpan carries the complete CR, LF or CRLF
+/// terminator. An ordinary byte source must explicitly
 /// return nonopaque provenance, never infer it from a display marker's bytes.
 pub trait CooperativeSource {
     type LineQuery;
@@ -315,7 +315,7 @@ impl<S: CooperativeSource> ReaderContinuation<S> {
         let span = ready!(source.poll_line(query, work, cancel));
         let terminator = match span.terminator {
             Terminator::None => 0,
-            Terminator::Lf => 1,
+            Terminator::Lf | Terminator::Cr => 1,
             Terminator::CrLf => 2,
         };
         if span.start > span.content_end

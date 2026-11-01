@@ -166,13 +166,13 @@ impl TreeLookup {
                 Kind::Branch(left, right) => {
                     let rightward = match self.target {
                         TreeTarget::Byte(at) => at >= self.base + left.metrics.bytes,
-                        TreeTarget::Break(nth) => nth > left.metrics.breaks,
+                        TreeTarget::Break(nth) => nth > left.metrics.breaks - super::joined_crlf(left, right),
                     };
                     if rightward {
                         self.base += left.metrics.bytes;
-                        self.breaks += left.metrics.breaks;
+                        self.breaks += left.metrics.breaks - super::joined_crlf(left, right);
                         if let TreeTarget::Break(nth) = &mut self.target {
-                            *nth -= left.metrics.breaks;
+                            *nth -= left.metrics.breaks - super::joined_crlf(left, right);
                         }
                         self.node = Some(right.clone());
                     } else {
@@ -364,7 +364,8 @@ impl StorageLookup {
                     let n = (end - self.at).min(super::ADD_BLOCK as u64);
                     // One complete bounded map/check/scan. Credits accumulate
                     // before access; no borrowed mapped slice survives Pending.
-                    ready!(self.credit.poll(n, source_operations(storage) + 1, work, cancel));
+                    let lookahead = u64::from(self.at + n < storage_len(storage));
+                    ready!(self.credit.poll(n + lookahead, source_operations(storage) + 1, work, cancel));
                     let bytes = match worker_bytes(storage) {
                         Ok(bytes) => bytes,
                         Err(error) => return Step::Failed(error),
@@ -373,7 +374,7 @@ impl StorageLookup {
                     while self.at < stop {
                         let byte = bytes[self.at as usize];
                         self.at += 1;
-                        if byte == b'\n' {
+                        if byte == b'\n' || (byte == b'\r' && bytes.get(self.at as usize) != Some(&b'\n')) {
                             self.count += 1;
                         }
                         if let StorageTarget::Start(line) = self.target
@@ -418,6 +419,9 @@ impl LayoutStartQuery {
         let Some(node) = self.walk.node.as_ref() else { return Step::Failed(InputError::CorruptStore) };
         let Kind::Leaf(piece) = &node.kind else { unreachable!() };
         let TreeTarget::Break(nth) = self.walk.target else { unreachable!() };
+        if nth == piece.breaks && piece.edges.1 {
+            return Step::Ready(self.walk.base + piece.end - piece.start);
+        }
         let query =
             self.storage.get_or_insert_with(|| StorageLookup::new(StorageTarget::Start(piece.first_line + nth)));
         let start = ready!(query.poll(&piece.storage, work, cancel));
@@ -461,11 +465,23 @@ pub struct LayoutLineQuery {
     start: Option<u64>,
     end: Option<u64>,
     cr: Option<ByteQuery>,
+    last: Option<ByteQuery>,
+    last_byte: Option<u8>,
     result: Option<LineSpan>,
 }
 impl LayoutLineQuery {
     pub fn new(line: u64) -> Self {
-        Self { line, first: LayoutStartQuery::new(line), next: None, start: None, end: None, cr: None, result: None }
+        Self {
+            line,
+            first: LayoutStartQuery::new(line),
+            next: None,
+            start: None,
+            end: None,
+            cr: None,
+            last: None,
+            last_byte: None,
+            result: None,
+        }
     }
     pub fn poll(&mut self, snapshot: &Snapshot, work: &mut ReadWork, cancel: &AtomicBool) -> Step<LineSpan> {
         ready!(check(work, cancel));
@@ -491,7 +507,12 @@ impl LayoutLineQuery {
         if end <= start {
             return Step::Failed(InputError::CorruptStore);
         }
-        let cr = if end > start + 1 {
+        if self.last_byte.is_none() {
+            self.last_byte =
+                ready!(self.last.get_or_insert_with(|| ByteQuery::new(end - 1)).poll(snapshot, work, cancel));
+        }
+        let last = self.last_byte;
+        let cr = if last == Some(b'\n') && end > start + 1 {
             let query = self.cr.get_or_insert_with(|| ByteQuery::new(end - 2));
             ready!(query.poll(snapshot, work, cancel)) == Some(b'\r')
         } else {
@@ -501,7 +522,13 @@ impl LayoutLineQuery {
             start,
             content_end: end - if cr { 2 } else { 1 },
             end,
-            terminator: if cr { Terminator::CrLf } else { Terminator::Lf },
+            terminator: if cr {
+                Terminator::CrLf
+            } else if last == Some(b'\r') {
+                Terminator::Cr
+            } else {
+                Terminator::Lf
+            },
         };
         self.result = Some(result);
         Step::Ready(result)
@@ -529,11 +556,13 @@ impl LayoutRankQuery {
             ready!(self.walk.poll(snapshot, work, cancel));
             self.line = if let Some(node) = &self.walk.node {
                 let Kind::Leaf(piece) = &node.kind else { unreachable!() };
-                let query = self.storage.get_or_insert_with(|| {
-                    StorageLookup::new(StorageTarget::Rank(piece.start + self.at - self.walk.base))
-                });
+                let at = piece.start + self.at - self.walk.base;
+                let final_cr = at == piece.end && piece.edges.1;
+                let query = self
+                    .storage
+                    .get_or_insert_with(|| StorageLookup::new(StorageTarget::Rank(at - u64::from(final_cr))));
                 let rank = ready!(query.poll(&piece.storage, work, cancel));
-                Some(self.walk.breaks + rank - piece.first_line)
+                Some(self.walk.breaks + rank - piece.first_line + u64::from(final_cr))
             } else {
                 Some(0)
             };

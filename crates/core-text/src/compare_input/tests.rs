@@ -192,34 +192,36 @@ fn payload(store: &mut InputStore<Budget>, space: PayloadSpace, at: u64, out: &m
 }
 
 #[test]
-fn short_chunks_preserve_crlf_full_span_literal_cr_and_final_empty_line() {
+fn short_chunks_preserve_crlf_full_span_classic_cr_and_final_empty_line() {
     let (mut store, source) = build(Text::new(b"a\r\nb\rX\n\nlast\r\n", 1));
     assert_eq!(source.validations, 2);
     assert_eq!(store.byte_len(), 14);
-    assert_eq!(store.line_count(), 5);
+    assert_eq!(store.line_count(), 6);
     assert_eq!(line(&store, 0), LineSpan { start: 0, content_end: 1, end: 3, terminator: Terminator::CrLf });
-    assert_eq!(line(&store, 1), LineSpan { start: 3, content_end: 6, end: 7, terminator: Terminator::Lf });
-    assert_eq!(line(&store, 2), LineSpan { start: 7, content_end: 7, end: 8, terminator: Terminator::Lf });
-    assert_eq!(line(&store, 3), LineSpan { start: 8, content_end: 12, end: 14, terminator: Terminator::CrLf });
-    assert_eq!(line(&store, 4), LineSpan { start: 14, content_end: 14, end: 14, terminator: Terminator::None });
+    assert_eq!(line(&store, 1), LineSpan { start: 3, content_end: 4, end: 5, terminator: Terminator::Cr });
+    assert_eq!(line(&store, 3), LineSpan { start: 7, content_end: 7, end: 8, terminator: Terminator::Lf });
+    assert_eq!(line(&store, 4), LineSpan { start: 8, content_end: 12, end: 14, terminator: Terminator::CrLf });
+    assert_eq!(line(&store, 5), LineSpan { start: 14, content_end: 14, end: 14, terminator: Terminator::None });
+    assert_eq!(line(&store, 2), LineSpan { start: 5, content_end: 6, end: 7, terminator: Terminator::Lf });
     let mut out = [0; 32];
     let n = payload(&mut store, PayloadSpace::Logical, 0, &mut out);
     assert_eq!(&out[..n], b"a\r\nb\rX\n\nlast\r\n");
     for at in 0..=store.byte_len() {
         let rank = ready(store.rank(&mut RankLookup::new(at), &mut work(), &cancel()));
-        let expected = [0, 3, 7, 8, 14].iter().rposition(|start| *start <= at).unwrap();
-        assert_eq!(rank, Rank { line: expected as u64, column: at - [0, 3, 7, 8, 14][expected] });
+        let expected = [0, 3, 5, 7, 8, 14].iter().rposition(|start| *start <= at).unwrap();
+        assert_eq!(rank, Rank { line: expected as u64, column: at - [0, 3, 5, 7, 8, 14][expected] });
     }
     retire(store.into_retirement());
 }
 
 #[test]
-fn empty_and_final_literal_cr_are_real_lines() {
+fn empty_and_final_classic_cr_are_real_lines() {
     for text in [b"".as_slice(), b"\r".as_slice(), b"a\n".as_slice()] {
         let (store, _) = build(Text::new(text, 1));
         assert_eq!(line(&store, 0).start, 0);
         if text == b"\r" {
-            assert_eq!(line(&store, 0).content_end, 1);
+            assert_eq!(line(&store, 0).content_end, 0);
+            assert_eq!(store.line_count(), 2);
         }
         if text == b"a\n" {
             assert_eq!(store.line_count(), 2);

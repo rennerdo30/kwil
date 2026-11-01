@@ -47,9 +47,7 @@ proptest! {
         encodings::preserve_utf8(&bytes);
     }
 
-    // CR-only line semantics are owned by the separate CR-line-ending job.
     #[test]
-    #[ignore = "CR-only line indexing is a known gap; separate job owns the fix"]
     fn cr_only_lines(rows in prop::collection::vec("[a-z]{0,12}", 2..16)) {
         let text = rows.join("\r");
         let mut buffer = kwil_core_text::Buffer::empty();

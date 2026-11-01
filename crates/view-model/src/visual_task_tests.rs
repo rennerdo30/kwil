@@ -76,7 +76,9 @@ struct Bytes {
 impl Bytes {
     fn new(key: LayoutKey, text: &[u8], short: usize) -> Self {
         let mut starts = vec![0];
-        starts.extend(text.iter().enumerate().filter_map(|(i, b)| (*b == b'\n').then_some(i as u64 + 1)));
+        starts.extend(text.iter().enumerate().filter_map(|(i, b)| {
+            (*b == b'\n' || (*b == b'\r' && text.get(i + 1) != Some(&b'\n'))).then_some(i as u64 + 1)
+        }));
         Self {
             key,
             text: text.to_vec(),
@@ -92,14 +94,16 @@ impl Bytes {
         let end = self.starts.get(line + 1).copied().unwrap_or(self.text.len() as u64);
         let terminator = if self.starts.get(line + 1).is_none() {
             Terminator::None
-        } else if end > start + 1 && self.text[end as usize - 2] == b'\r' {
+        } else if end > start + 1 && self.text[end as usize - 1] == b'\n' && self.text[end as usize - 2] == b'\r' {
             Terminator::CrLf
+        } else if self.text[end as usize - 1] == b'\r' {
+            Terminator::Cr
         } else {
             Terminator::Lf
         };
         let count = match terminator {
             Terminator::None => 0,
-            Terminator::Lf => 1,
+            Terminator::Lf | Terminator::Cr => 1,
             Terminator::CrLf => 2,
         };
         LineSpan { start, end, content_end: end - count, terminator }
@@ -313,7 +317,7 @@ fn deep_locate_and_backward_context_resume_without_restarting() {
 }
 
 #[test]
-fn complete_terminator_metadata_preserves_literal_cr_at_eof() {
+fn complete_terminator_metadata_handles_classic_cr_at_eof() {
     let key = key(20, 4);
     let task = begin(
         Bytes::new(key, b"A\r\nB\r", 1),
@@ -323,9 +327,9 @@ fn complete_terminator_metadata_preserves_literal_cr_at_eof() {
     );
     let (_, _, _, output) = run(task, ReadWork::new(1, 1));
     let actual = page(output);
-    assert_eq!(ranges(&actual), vec![0..1, 3..5]);
-    assert_eq!(actual.atoms(1).last().unwrap().text(), "\\x0D");
-    assert_eq!(actual.atoms(1).last().unwrap().source, 4..5);
+    assert_eq!(ranges(&actual), vec![0..1, 3..4, 5..5]);
+    assert_eq!(actual.atoms(1).last().unwrap().text(), "B");
+    assert_eq!(actual.atoms(1).last().unwrap().source, 3..4);
     assert!(actual.at_end);
 }
 

@@ -109,7 +109,7 @@ impl LineFilter {
     pub fn scan<H: Haystack + ?Sized>(
         &self,
         source: &H,
-        start: FilterResume,
+        mut start: FilterResume,
         include_unterminated: bool,
         cancel: &Cancellation,
         mut emit: impl FnMut(LineRun) -> io::Result<()>,
@@ -120,7 +120,14 @@ impl LineFilter {
         if start.offset > 0 {
             let mut previous = Vec::with_capacity(1);
             copy_range(source, start.offset - 1..start.offset, &mut previous)?;
-            if previous != b"\n" {
+            if previous == b"\r" && start.offset < source.len() {
+                let mut next = Vec::with_capacity(1);
+                copy_range(source, start.offset..start.offset + 1, &mut next)?;
+                if next == b"\n" {
+                    start.offset += 1;
+                }
+            }
+            if previous != b"\n" && previous != b"\r" {
                 return Err(invalid("filter must resume at a line start"));
             }
         }
@@ -173,14 +180,34 @@ impl LineFilter {
             Ok(true)
         };
         let mut expected = start.offset;
+        let mut cr = None;
         'chunks: for chunk in source.chunks(start.offset..source.len())? {
             let (at, bytes) = chunk?;
             if at != expected || bytes.len() as u64 > source.len() - expected {
                 return Err(invalid("invalid haystack chunks"));
             }
             expected += bytes.len() as u64;
-            for n in memchr::memchr_iter(b'\n', bytes) {
-                if !process(at + n as u64, at + n as u64 + 1)? {
+            if let Some(end) = cr.take() {
+                if bytes.is_empty() || bytes.first() == Some(&b'\n') {
+                    cr = Some(end);
+                } else if !process(end, end + 1)? {
+                    break 'chunks;
+                }
+            }
+            for n in memchr::memchr2_iter(b'\r', b'\n', bytes) {
+                let end = at + n as u64;
+                if let Some(previous) = cr.take() {
+                    let paired = end == previous + 1 && bytes[n] == b'\n';
+                    if !process(previous, previous + if paired { 2 } else { 1 })? {
+                        break 'chunks;
+                    }
+                    if paired {
+                        continue;
+                    }
+                }
+                if bytes[n] == b'\r' {
+                    cr = Some(end);
+                } else if !process(end, end + 1)? {
                     break 'chunks;
                 }
             }
@@ -191,6 +218,9 @@ impl LineFilter {
         if !cancel.load(Ordering::Relaxed) {
             if expected != source.len() {
                 return Err(invalid("incomplete haystack chunks"));
+            }
+            if let Some(end) = cr {
+                process(end, end + 1)?;
             }
             if include_unterminated {
                 process(source.len(), source.len())?;

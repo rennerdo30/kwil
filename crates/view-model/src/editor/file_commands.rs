@@ -21,11 +21,20 @@ impl Editor {
         let last = source.line_count().saturating_sub(1);
         let edits = (0..last).map(move |row| {
             let end = source.line_start(row + 1).map_err(io::Error::other)?.unwrap();
-            let crlf = end >= 2 && text::byte(&source, end - 2)? == Some(b'\r');
-            if crlf == (ending == DocumentLineEnding::CrLf) {
+            let last = text::byte(&source, end - 1)?;
+            let crlf = end >= 2 && last == Some(b'\n') && text::byte(&source, end - 2)? == Some(b'\r');
+            let current = if crlf {
+                DocumentLineEnding::CrLf
+            } else if last == Some(b'\r') {
+                DocumentLineEnding::Cr
+            } else {
+                DocumentLineEnding::Lf
+            };
+            let start = end - if crlf { 2 } else { 1 };
+            if current == ending {
                 return Ok(None);
             }
-            Ok(Some(Edit::bytes(end - if crlf { 2 } else { 1 }..end, ending.bytes())))
+            Ok(Some(Edit::bytes(start..end, ending.bytes())))
         });
         let damage = self.apply_descending_with_recipe(edits.rev(), None, Some(0))?;
         self.document.line_ending = ending;

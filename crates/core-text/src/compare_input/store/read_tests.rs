@@ -517,15 +517,15 @@ fn cancellation_between_clones_returns_partial_owner_without_closing_or_releasin
 }
 
 #[test]
-fn literal_cr_at_eof_is_content_and_not_a_reconstructed_terminator() {
+fn classic_cr_at_eof_completes_a_line_without_changing_payload() {
     let (store, budget) = fixture(b"last\r");
     let read = lease(&store, &budget);
-    assert_eq!(read.line_count(), 1);
+    assert_eq!(read.line_count(), 2);
     assert_eq!(
         ready(read.line_span(&mut LineLookup::new(0), &mut work(), &cancel())),
-        LineSpan { start: 0, content_end: 5, end: 5, terminator: super::super::Terminator::None }
+        LineSpan { start: 0, content_end: 4, end: 5, terminator: super::super::Terminator::Cr }
     );
-    assert_eq!(ready(read.rank(&mut RankLookup::new(5), &mut work(), &cancel())), Rank { line: 0, column: 5 });
+    assert_eq!(ready(read.rank(&mut RankLookup::new(5), &mut work(), &cancel())), Rank { line: 1, column: 0 });
     let mut out = [0; 5];
     ready(read.read_at(PayloadSpace::Logical, 0, &mut out, &mut work(), &cancel()));
     assert_eq!(&out, b"last\r");

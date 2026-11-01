@@ -278,6 +278,14 @@ pub(super) fn language_segment(status: kwil_view_model::language_selection::Lang
     Segment { text: status.label().into(), command: Some("file.setType"), warn: false }
 }
 
+pub(super) fn line_ending_segment(view: &Workspace) -> Option<Segment> {
+    view.editor().map(|editor| Segment {
+        text: editor.document().line_ending.label().into(),
+        command: Some("file.setLineEnding"),
+        warn: false,
+    })
+}
+
 /// Left notice plus right-aligned fields, left to right. Every field comes
 /// from a typed accessor; file paths never pass through this text.
 pub(super) fn status(view: &Workspace, zoom: u32) -> (String, Vec<Segment>) {
@@ -305,6 +313,7 @@ pub(super) fn status(view: &Workspace, zoom: u32) -> (String, Vec<Segment>) {
         let text = format!("Ln {}, Col {}", row.saturating_add(1), column.saturating_add(1));
         segments.push(segment(text, Some("navigation.goToLine"), false));
     }
+    segments.extend(line_ending_segment(view));
     (view.notice().to_owned(), segments)
 }
 
@@ -608,7 +617,7 @@ mod tests {
             let (notice, segments) = status(&workspace, 100);
             assert_eq!(notice, text, "the whole notice stays a notice");
             let fields: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
-            assert_eq!(fields, ["1 line", "Ln 1, Col 2"], "fields reflect the document only");
+            assert_eq!(fields, ["1 line", "Ln 1, Col 2", "LF"], "fields reflect the document only");
             assert!(segments.iter().all(|s| !s.warn), "no forged recovery warning");
         }
     }

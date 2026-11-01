@@ -1125,3 +1125,15 @@ fn kw48_unicode_column_window_rejects_unresolved_giant_lines() {
     let e = editor(source.as_bytes());
     assert!(e.offset_at(0, 65_536).is_err());
 }
+#[test]
+fn classic_mac_lines_render_and_move_consistently() {
+    let mut e = editor(b"one\rtwo\r\nthree\nfour\r");
+    let s = e.document.snapshot();
+    assert_eq!(s.line_count(), 5);
+    assert_eq!(text::line(&s, 1).unwrap(), 4..7);
+    assert_eq!(text::row(&s, 9).unwrap(), 2);
+    e.document.buffer.insert(4, b"\n").unwrap();
+    assert_eq!(e.document.snapshot().line_count(), 5, "CRLF across pieces is one break");
+    e.document.buffer.delete(4..5).unwrap();
+    assert_eq!(e.document.snapshot().line_count(), 5);
+}

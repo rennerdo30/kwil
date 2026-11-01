@@ -39,6 +39,7 @@ pub enum DocumentLineEnding {
     #[default]
     Lf,
     CrLf,
+    Cr,
 }
 
 impl DocumentLineEnding {
@@ -46,7 +47,42 @@ impl DocumentLineEnding {
         match self {
             Self::Lf => b"\n",
             Self::CrLf => b"\r\n",
+            Self::Cr => b"\r",
         }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "LF",
+            Self::CrLf => "CRLF",
+            Self::Cr => "CR",
+        }
+    }
+    pub(crate) fn detect(snapshot: &Snapshot) -> io::Result<Self> {
+        let mut previous = 0;
+        for chunk in snapshot.chunks(0..snapshot.len().min(64 << 10))? {
+            for &byte in chunk.map_err(io::Error::other)? {
+                if byte == b'\n' {
+                    return Ok(if previous == b'\r' { Self::CrLf } else { Self::Lf });
+                }
+                previous = byte;
+            }
+        }
+        // A giant first line may put every terminator beyond the sample.
+        // The already-built sparse index finds its end with a bounded lookup.
+        if let Some(end) = snapshot.line_start(1).map_err(io::Error::other)? {
+            let mut last = [0, 0];
+            for chunk in snapshot.chunks(end.saturating_sub(2)..end)? {
+                for &byte in chunk.map_err(io::Error::other)? {
+                    last = [last[1], byte];
+                }
+            }
+            return Ok(match last {
+                [b'\r', b'\n'] => Self::CrLf,
+                [_, b'\r'] => Self::Cr,
+                _ => Self::Lf,
+            });
+        }
+        Ok(Self::Lf)
     }
 }
 
@@ -167,20 +203,7 @@ impl Document {
     }
 
     fn attach(path: PathBuf, file: TextFile, buffer: Buffer) -> io::Result<Self> {
-        let mut ending = DocumentLineEnding::Lf;
-        let snapshot = buffer.snapshot();
-        let mut previous = 0;
-        'sample: for chunk in snapshot.chunks(0..snapshot.len().min(64 << 10))? {
-            for &byte in chunk.map_err(io::Error::other)? {
-                if byte == b'\n' {
-                    if previous == b'\r' {
-                        ending = DocumentLineEnding::CrLf;
-                    }
-                    break 'sample;
-                }
-                previous = byte;
-            }
-        }
+        let ending = DocumentLineEnding::detect(&buffer.snapshot())?;
         Ok(Self { buffer, original: Some(file), path: Some(path), line_ending: ending, ..Self::new() })
     }
 

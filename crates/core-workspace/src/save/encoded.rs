@@ -571,7 +571,9 @@ mod tests {
             logical(&saved.snapshot),
             "Ê\u{304}".as_bytes().iter().copied().chain([0xff, b'\r', b'\n', b'Z', b'\r', b'Q']).collect::<Vec<_>>()
         );
-        assert_eq!(saved.trimmed_rows, Some(0..2));
+        // CRLF, lone CR and EOF delimit three trimmed logical rows.
+        // Serialized bytes and original-coordinate deletion ranges stay exact.
+        assert_eq!(saved.trimmed_rows, Some(0..3));
         let ranges = saved.trim_deletions.as_ref().unwrap().ranges().unwrap().collect::<io::Result<Vec<_>>>().unwrap();
         assert_eq!(ranges, [5..7, 10..12, 14..15]);
         joined.install_worker_edit(saved.snapshot).unwrap();

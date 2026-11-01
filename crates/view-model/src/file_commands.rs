@@ -66,7 +66,7 @@ impl FilePromptKind {
         match self {
             Self::Encoding => &["Reopen with encoding (clean document)", "Save with encoding (next save)"],
             Self::ReopenEncoding | Self::SaveEncoding => ENCODINGS,
-            Self::LineEnding => &["LF", "CRLF"],
+            Self::LineEnding => &["LF", "CRLF", "CR"],
             Self::Reload => &["Reload from Disk (discard local edits)"],
             Self::SaveConflict => &["Overwrite the file with my version", "Reload from disk (discard my changes)"],
             _ => &[],
@@ -182,10 +182,10 @@ impl Workspace {
                 FilePromptKind::SaveEncoding => {
                     FileAction::Encoding(Encoding::for_label(ENCODINGS[index]).map_err(io::Error::other)?)
                 }
-                FilePromptKind::LineEnding => FileAction::LineEnding(if index == 0 {
-                    crate::DocumentLineEnding::Lf
-                } else {
-                    crate::DocumentLineEnding::CrLf
+                FilePromptKind::LineEnding => FileAction::LineEnding(match index {
+                    0 => crate::DocumentLineEnding::Lf,
+                    1 => crate::DocumentLineEnding::CrLf,
+                    _ => crate::DocumentLineEnding::Cr,
                 }),
                 FilePromptKind::Reload => FileAction::Reload(None),
                 FilePromptKind::SaveConflict if index == 0 => return self.overwrite_external_change(prompt.document),
@@ -248,6 +248,104 @@ mod tests {
         let mut bytes = Vec::new();
         workspace.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
         bytes
+    }
+    #[test]
+    fn classic_mac_large_open_is_published_by_document_worker() {
+        use std::io::Write;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("cr-open-{}-{}.txt", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let mut fixture = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        // Put the first terminator beyond the bounded newline sample.
+        fixture.write_all(&vec![b'x'; 64 << 10]).unwrap();
+        let block = b"x\r".repeat(32768);
+        for _ in 0..32 {
+            fixture.write_all(&block).unwrap();
+        }
+        drop(fixture);
+        let state = std::env::temp_dir().join(format!(
+            "kwil-cr-open-state-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (tx, rx) = mpsc::channel();
+        let ui = std::thread::current().id();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace
+            .start_document_worker_at(Some(state.clone()), move |result| {
+                assert_ne!(std::thread::current().id(), ui);
+                tx.send(result).unwrap();
+            })
+            .unwrap();
+        drive(&mut workspace, &rx, Workspace::recovery_ready);
+        let id = workspace.open_path(path.clone()).unwrap();
+        assert!(workspace.editor().is_none(), "opening only queues work before publication");
+        drive(&mut workspace, &rx, |w| w.editor().is_some() && !w.document_busy(id));
+        let document = workspace.editor().unwrap().document();
+        assert_eq!(document.line_ending.label(), "CR");
+        assert_eq!(document.snapshot().line_count(), 1_048_577);
+        assert_eq!(document.snapshot().line_start(1_048_576).unwrap(), Some((2 << 20) + (64 << 10)));
+        drop(workspace);
+        while !matches!(rx.recv_timeout(Duration::from_secs(15)).unwrap(), DocumentResult::Stopped(Ok(()))) {}
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn classic_mac_open_edit_save_convert_round_trip() {
+        fn retire_fixture_save(workspace: &mut Workspace) {
+            let editor = workspace.editor_mut().unwrap();
+            if editor.has_completed_save_completion() {
+                let mut retirement = None;
+                editor.take_completed_save_completion(&mut retirement).unwrap();
+                drop(retirement);
+            }
+        }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "kwil-cr-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("classic.txt");
+        std::fs::write(&path, b"one\rtwo\r").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace
+            .start_document_worker_at(Some(root.join("state")), move |result| {
+                tx.send(result).unwrap();
+            })
+            .unwrap();
+        drive(&mut workspace, &rx, Workspace::recovery_ready);
+        let id = workspace.open_path(path.clone()).unwrap();
+        drive(&mut workspace, &rx, |w| w.editor().is_some() && !w.document_busy(id));
+        assert_eq!(workspace.editor().unwrap().document().line_ending.label(), "CR");
+        assert!(workspace.status_text().contains("  |  CR"));
+        assert_eq!(workspace.editor().unwrap().document().snapshot().line_count(), 3);
+        workspace.save_document(id, None).unwrap();
+        drive(&mut workspace, &rx, |w| !w.file_saves_pending());
+        retire_fixture_save(&mut workspace);
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\rtwo\r");
+        workspace.editor_mut().unwrap().newline().unwrap();
+        workspace.save_document(id, None).unwrap();
+        drive(&mut workspace, &rx, |w| !w.file_saves_pending());
+        retire_fixture_save(&mut workspace);
+        assert_eq!(std::fs::read(&path).unwrap(), b"\rone\rtwo\r");
+        for (choice, expected) in [("1", "\none\ntwo\n"), ("2", "\r\none\r\ntwo\r\n"), ("3", "\rone\rtwo\r")] {
+            workspace.file_command("file.setLineEnding").unwrap();
+            choose(&mut workspace, choice);
+            drive(&mut workspace, &rx, |w| !w.document_busy(id));
+            assert_eq!(bytes(&workspace), expected.as_bytes());
+            workspace.save_document(id, None).unwrap();
+            drive(&mut workspace, &rx, |w| !w.file_saves_pending());
+            retire_fixture_save(&mut workspace);
+            assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+        }
+        drop(workspace);
+        while !matches!(rx.recv_timeout(Duration::from_secs(15)).unwrap(), DocumentResult::Stopped(Ok(()))) {}
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn file_commands_use_shared_encoding_save_reload_keep_and_folder_workers() {
@@ -354,11 +452,11 @@ mod tests {
     }
 
     #[test]
-    fn file_commands_picker_lists_supported_encodings_and_no_cr_or_iso2022jp() {
+    fn file_commands_picker_lists_supported_endings_and_encodings_without_iso2022jp() {
         for label in ENCODINGS {
             Encoding::for_label(label).unwrap();
         }
         assert!(!ENCODINGS.iter().any(|label| label.eq_ignore_ascii_case("ISO-2022-JP")));
-        assert_eq!(FilePromptKind::LineEnding.choices(), &["LF", "CRLF"]);
+        assert_eq!(FilePromptKind::LineEnding.choices(), &["LF", "CRLF", "CR"]);
     }
 }
