@@ -2,7 +2,7 @@
 
 #[cfg(feature = "harness")]
 pub mod fixtures;
-#[cfg(feature = "harness")]
+#[cfg(feature = "palette-harness")]
 pub mod palette;
 #[cfg(feature = "harness")]
 pub mod text;
