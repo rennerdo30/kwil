@@ -1,3 +1,4 @@
+use crate::index_memory::{INDEX_MEMORY_BYTES, IndexMemory, IndexVec};
 use memchr::memchr_iter;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -23,8 +24,8 @@ const RANK_BYTES: usize = 64 << 10;
 struct ChunkResult {
     newlines: u64,
     /// (local newline count, byte offset after that newline)
-    local: Vec<(u64, u64)>,
-    ranks: Vec<(u64, u64)>,
+    local: IndexVec<(u64, u64)>,
+    ranks: IndexVec<(u64, u64)>,
 }
 
 impl LineIndex {
@@ -45,9 +46,40 @@ impl LineIndex {
     /// `bytes` is the complete new view; only `bytes[from_len..]` is scanned.
     /// The caller must ensure the old prefix is unchanged. Truncation or
     /// replacement requires a fresh build. New checkpoints use DEFAULT_EVERY.
-    pub fn extend(&mut self, bytes: &[u8], from_len: u64) {
+    pub fn extend(&mut self, bytes: &[u8], from_len: u64) -> io::Result<()> {
+        self.extend_with_memory_limit(bytes, from_len, INDEX_MEMORY_BYTES)
+    }
+
+    pub fn extend_with_memory_limit(&mut self, bytes: &[u8], from_len: u64, limit: usize) -> io::Result<()> {
         assert_eq!(from_len, self.len, "extension must start at the indexed length");
         assert!(from_len <= bytes.len() as u64, "cannot extend a truncated file");
+        // Count only the append before reserving, so a refusal leaves all old
+        // metrics intact. Exact reservation avoids hidden geometric growth.
+        let added = memchr_iter(b'\n', &bytes[from_len as usize..]).count() as u64;
+        let lines = self.checkpoints.len()
+            + ((self.line_count - 1 + added) / DEFAULT_EVERY - (self.line_count - 1) / DEFAULT_EVERY) as usize;
+        let last_rank = self.rank_checkpoints.last().unwrap().1 as usize;
+        let ranks = self.rank_checkpoints.len() + bytes.len().saturating_sub(last_rank + 1) / RANK_BYTES;
+        let old_lines = self.checkpoints.capacity();
+        let old_ranks = self.rank_checkpoints.capacity();
+        let new_lines = lines.max(old_lines);
+        let new_ranks = ranks.max(old_ranks);
+        // Reserve one vector at a time; charge old+new during reallocation.
+        let peak_lines = new_lines.checked_add(if lines > old_lines { old_lines } else { 0 });
+        let peak_ranks = new_ranks.checked_add(if ranks > old_ranks { old_ranks } else { 0 });
+        let needed = peak_lines
+            .and_then(|n| n.checked_add(old_ranks))
+            .zip(peak_ranks.and_then(|n| n.checked_add(new_lines)))
+            .map(|(a, b)| a.max(b))
+            .and_then(|n| n.checked_mul(std::mem::size_of::<(u64, u64)>()))
+            .ok_or_else(|| IndexMemory::new(limit).error())?;
+        if needed > limit {
+            return Err(IndexMemory::new(limit).error());
+        }
+        self.checkpoints.try_reserve_exact(lines.saturating_sub(self.checkpoints.len())).map_err(io::Error::other)?;
+        self.rank_checkpoints
+            .try_reserve_exact(ranks.saturating_sub(self.rank_checkpoints.len()))
+            .map_err(io::Error::other)?;
         let mut start = from_len as usize;
         while start < bytes.len() {
             let last_rank = self.rank_checkpoints.last().unwrap().1;
@@ -67,12 +99,25 @@ impl LineIndex {
             start = end;
         }
         self.len = bytes.len() as u64;
+        Ok(())
     }
 
-    /// Builds the index with up to `threads` worker threads. `progress`
+    /// Builds the index with up to `threads` worker threads (at most four). `progress`
     /// receives the number of bytes scanned so far.
-    pub fn build(bytes: &[u8], every: u64, threads: usize, progress: &AtomicU64) -> Self {
+    pub fn build(bytes: &[u8], every: u64, threads: usize, progress: &AtomicU64) -> io::Result<Self> {
         Self::build_chunked(bytes, every, CHUNK, threads, progress)
+    }
+
+    /// Bounds the combined allocations of workers, intermediate results and
+    /// final indexes. A refusal publishes no partial index.
+    pub fn build_with_memory_limit(
+        bytes: &[u8],
+        every: u64,
+        threads: usize,
+        progress: &AtomicU64,
+        limit: usize,
+    ) -> io::Result<Self> {
+        Self::build_chunked_with_limit(bytes, every, CHUNK, threads, progress, limit)
     }
 
     /// Sequential worker builder. Cancellation is checked before/after every
@@ -90,9 +135,7 @@ impl LineIndex {
         })
     }
 
-    /// Shared fallible/infallible construction avoids introducing an unwrap
-    /// or panic in the existing Self-returning decoded buffer constructor.
-    pub(crate) fn build_checked<E>(
+    pub(crate) fn build_checked<E: From<io::Error>>(
         bytes: &[u8],
         every: u64,
         progress: &AtomicU64,
@@ -101,17 +144,31 @@ impl LineIndex {
         Self::build_checked_chunked(bytes, every, CHUNK, progress, check)
     }
 
-    fn build_checked_chunked<E>(
+    fn build_checked_chunked<E: From<io::Error>>(
         bytes: &[u8],
         every: u64,
         chunk: usize,
         progress: &AtomicU64,
         check: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Self, E> {
+        Self::build_checked_with_limit(bytes, every, chunk, progress, check, INDEX_MEMORY_BYTES)
+    }
+
+    fn build_checked_with_limit<E: From<io::Error>>(
+        bytes: &[u8],
+        every: u64,
+        chunk: usize,
+        progress: &AtomicU64,
+        check: &mut impl FnMut() -> Result<(), E>,
+        limit: usize,
+    ) -> Result<Self, E> {
         check()?;
         let every = every.max(1);
-        let mut checkpoints = vec![(0, 0)];
-        let mut rank_checkpoints = vec![(0, 0)];
+        let memory = IndexMemory::new(limit);
+        let mut checkpoints = IndexVec::new(&memory);
+        let mut rank_checkpoints = IndexVec::new(&memory);
+        checkpoints.push((0, 0))?;
+        rank_checkpoints.push((0, 0))?;
         let mut lines_before = 0_u64;
         for start in (0..bytes.len()).step_by(chunk) {
             let end = start.saturating_add(chunk).min(bytes.len());
@@ -119,13 +176,13 @@ impl LineIndex {
             for block_start in (start..end).step_by(RANK_BYTES) {
                 check()?;
                 if block_start != 0 {
-                    rank_checkpoints.push((lines_before + newlines, block_start as u64));
+                    rank_checkpoints.push((lines_before + newlines, block_start as u64))?;
                 }
                 let block_end = block_start.saturating_add(RANK_BYTES).min(end);
                 for pos in memchr_iter(b'\n', &bytes[block_start..block_end]) {
                     newlines += 1;
                     if newlines.is_multiple_of(every) {
-                        checkpoints.push((lines_before + newlines, (block_start + pos + 1) as u64));
+                        checkpoints.push((lines_before + newlines, (block_start + pos + 1) as u64))?;
                     }
                 }
                 progress.fetch_add((block_end - block_start) as u64, Ordering::Relaxed);
@@ -134,21 +191,46 @@ impl LineIndex {
             lines_before += newlines;
         }
         check()?;
-        Ok(Self { checkpoints, rank_checkpoints, line_count: lines_before + 1, len: bytes.len() as u64 })
+        Ok(Self {
+            checkpoints: checkpoints.into_vec(),
+            rank_checkpoints: rank_checkpoints.into_vec(),
+            line_count: lines_before + 1,
+            len: bytes.len() as u64,
+        })
     }
 
-    pub(crate) fn build_chunked(bytes: &[u8], every: u64, chunk: usize, threads: usize, progress: &AtomicU64) -> Self {
+    pub(crate) fn build_chunked(
+        bytes: &[u8],
+        every: u64,
+        chunk: usize,
+        threads: usize,
+        progress: &AtomicU64,
+    ) -> io::Result<Self> {
+        Self::build_chunked_with_limit(bytes, every, chunk, threads, progress, INDEX_MEMORY_BYTES)
+    }
+
+    fn build_chunked_with_limit(
+        bytes: &[u8],
+        every: u64,
+        chunk: usize,
+        threads: usize,
+        progress: &AtomicU64,
+        limit: usize,
+    ) -> io::Result<Self> {
         let every = every.max(1);
         let chunks = bytes.len().div_ceil(chunk).max(1);
         let next = AtomicUsize::new(0);
-        let mut results: Vec<Option<ChunkResult>> = (0..chunks).map(|_| None).collect();
-        let threads = threads.clamp(1, chunks);
+        let memory = IndexMemory::new(limit);
+        let mut results = IndexVec::new(&memory);
+        results.reserve(chunks)?;
+        results.items.resize_with(chunks, || None);
+        let threads = threads.clamp(1, chunks.min(4));
 
-        std::thread::scope(|s| {
+        std::thread::scope(|s| -> io::Result<()> {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
-                    s.spawn(|| {
-                        let mut out = Vec::new();
+                    s.spawn(|| -> io::Result<_> {
+                        let mut out = IndexVec::new(&memory);
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             if i >= chunks {
@@ -157,42 +239,54 @@ impl LineIndex {
                             let start = i * chunk;
                             let end = (start + chunk).min(bytes.len());
                             let mut newlines = 0u64;
-                            let mut local = Vec::new();
-                            let mut ranks = Vec::new();
+                            let mut local = IndexVec::new(&memory);
+                            let mut ranks = IndexVec::new(&memory);
                             for block_start in (start..end).step_by(RANK_BYTES) {
-                                ranks.push((newlines, block_start as u64));
+                                ranks.push((newlines, block_start as u64))?;
                                 let block_end = (block_start + RANK_BYTES).min(end);
                                 for pos in memchr_iter(b'\n', &bytes[block_start..block_end]) {
                                     newlines += 1;
                                     if newlines.is_multiple_of(every) {
-                                        local.push((newlines, (block_start + pos + 1) as u64));
+                                        local.push((newlines, (block_start + pos + 1) as u64))?;
                                     }
                                 }
                             }
                             progress.fetch_add((end - start) as u64, Ordering::Relaxed);
-                            out.push((i, ChunkResult { newlines, local, ranks }));
+                            out.push((i, ChunkResult { newlines, local, ranks }))?;
                         }
-                        out
+                        Ok(out)
                     })
                 })
                 .collect();
             for h in handles {
-                for (i, r) in h.join().expect("line index worker panicked") {
-                    results[i] = Some(r);
+                let mut out = h.join().map_err(|_| io::Error::other("line index worker panicked"))??;
+                for (i, r) in out.items.drain(..) {
+                    results.items[i] = Some(r);
                 }
             }
-        });
+            Ok(())
+        })?;
 
-        let mut checkpoints = vec![(0u64, 0u64)];
-        let mut rank_checkpoints = vec![(0u64, 0u64)];
+        let mut checkpoints = IndexVec::new(&memory);
+        let mut rank_checkpoints = IndexVec::new(&memory);
+        checkpoints.push((0, 0))?;
+        rank_checkpoints.push((0, 0))?;
         let mut lines_before = 0u64;
-        for r in results.into_iter().map(|r| r.expect("chunk not scanned")) {
-            checkpoints.extend(r.local.iter().map(|&(n, off)| (lines_before + n, off)));
-            rank_checkpoints
-                .extend(r.ranks.iter().filter(|&&(_, off)| off != 0).map(|&(n, off)| (lines_before + n, off)));
+        for r in results.items.iter_mut().map(|r| r.take().expect("chunk not scanned")) {
+            for &(n, off) in &r.local.items {
+                checkpoints.push((lines_before + n, off))?;
+            }
+            for &(n, off) in r.ranks.items.iter().filter(|&&(_, off)| off != 0) {
+                rank_checkpoints.push((lines_before + n, off))?;
+            }
             lines_before += r.newlines;
         }
-        LineIndex { checkpoints, rank_checkpoints, line_count: lines_before + 1, len: bytes.len() as u64 }
+        Ok(LineIndex {
+            checkpoints: checkpoints.into_vec(),
+            rank_checkpoints: rank_checkpoints.into_vec(),
+            line_count: lines_before + 1,
+            len: bytes.len() as u64,
+        })
     }
 
     /// Lines in the file: newline count + 1 (an empty last line counts).
@@ -261,6 +355,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn index_memory_limit_covers_parallel_results_and_checkpoint_growth() {
+        let bytes = vec![b'\n'; 1024];
+        let progress = AtomicU64::new(0);
+        let error = LineIndex::build_with_memory_limit(&bytes, 1, 4, &progress, 4096).unwrap_err();
+        assert!(error.to_string().contains("4096-byte memory limit"));
+        let index = LineIndex::build_with_memory_limit(&bytes, 1, 4, &progress, 128 << 10).unwrap();
+        assert_eq!(index.line_count(), 1025);
+        assert_eq!(index.line_start(&bytes, 1024), Some(1024));
+        // The result directory itself must be admitted before scanning.
+        progress.store(0, Ordering::Relaxed);
+        assert!(LineIndex::build_chunked_with_limit(&bytes, 1024, 1, 4, &progress, 128).is_err());
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn index_memory_limit_covers_checked_decoded_builder() {
+        let bytes = [b'\n'; 256];
+        let progress = AtomicU64::new(0);
+        let error =
+            LineIndex::build_checked_with_limit(&bytes, 1, CHUNK, &progress, &mut || Ok::<(), io::Error>(()), 128)
+                .unwrap_err();
+        assert!(error.to_string().contains("128-byte memory limit"));
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn index_memory_limit_append_refusal_preserves_old_index() {
+        for bytes in [vec![b'\n'; 9000], vec![b'x'; 5 * RANK_BYTES]] {
+            let mut index = LineIndex::build(b"x", DEFAULT_EVERY, 1, &AtomicU64::new(0)).unwrap();
+            let previous = index.clone();
+            let limit = index.memory_bytes();
+            assert!(index.extend_with_memory_limit(&bytes, 1, limit).is_err());
+            assert_eq!(index.len, previous.len);
+            assert_eq!(index.line_count, previous.line_count);
+            assert_eq!(index.checkpoints, previous.checkpoints);
+            assert_eq!(index.rank_checkpoints, previous.rank_checkpoints);
+            assert_eq!(index.memory_bytes(), limit);
+            index.extend_with_memory_limit(&bytes, 1, 4096).unwrap();
+            assert_eq!(index.len, bytes.len() as u64);
+            assert!(index.memory_bytes() <= 4096);
+        }
+    }
+
+    #[test]
     fn cancellable_build_stops_after_first_rank_block_without_result() {
         let bytes = vec![b'x'; 128 << 10];
         let progress = AtomicU64::new(0);
@@ -312,7 +450,7 @@ mod tests {
         let starts: Vec<_> = std::iter::once(0).chain(memchr_iter(b'\n', &bytes).map(|at| at as u64 + 1)).collect();
         for every in [0, 1, 3, DEFAULT_EVERY] {
             for chunk in [65_535, 100_003, CHUNK] {
-                let old = LineIndex::build_chunked(&bytes, every, chunk, 2, &AtomicU64::new(0));
+                let old = LineIndex::build_chunked(&bytes, every, chunk, 2, &AtomicU64::new(0)).unwrap();
                 let progress = AtomicU64::new(0);
                 let new =
                     LineIndex::build_checked_chunked(&bytes, every, chunk, &progress, &mut || Ok::<(), io::Error>(()))
@@ -350,8 +488,8 @@ mod tests {
         // Exercise rank boundaries, duplicate counts, sparse checkpoints,
         // non-grid chunk borders and append-created checkpoints.
         for every in [1, 3, DEFAULT_EVERY] {
-            let mut index = LineIndex::build_chunked(&bytes[..500_000], every, 100_003, 2, &AtomicU64::new(0));
-            index.extend(&bytes, 500_000);
+            let mut index = LineIndex::build_chunked(&bytes[..500_000], every, 100_003, 2, &AtomicU64::new(0)).unwrap();
+            index.extend(&bytes, 500_000).unwrap();
             for (line, at) in std::iter::once(0).chain(memchr_iter(b'\n', &bytes).map(|p| p as u64 + 1)).enumerate() {
                 let mut scanned = 0;
                 assert_eq!(index.line_start_observed(&bytes, line as u64, |n| scanned = n), Some(at));
@@ -389,7 +527,7 @@ mod tests {
         }
         // SAFETY: this test owns the file and does not resize it while mapped.
         let map = unsafe { memmap2::Mmap::map(&file).unwrap() };
-        let index = LineIndex::build(&map, DEFAULT_EVERY, 2, &AtomicU64::new(0));
+        let index = LineIndex::build(&map, DEFAULT_EVERY, 2, &AtomicU64::new(0)).unwrap();
         for offset in [65_535, 65_536, 65_537, 16_777_217, 99_999_999, 100_000_000] {
             let mut scanned = 0;
             let expected = newlines.iter().filter(|&&at| at < offset).count() as u64;
@@ -411,11 +549,11 @@ mod tests {
         bytes[10] = b'\n';
         // A chunk boundary off the byte interval exercises continuation
         // from the last existing rank checkpoint, not a new global grid.
-        let mut index = LineIndex::build_chunked(&bytes, DEFAULT_EVERY, 100_000, 2, &AtomicU64::new(0));
+        let mut index = LineIndex::build_chunked(&bytes, DEFAULT_EVERY, 100_000, 2, &AtomicU64::new(0)).unwrap();
         for append in [vec![b'x'; 300_000], b"\n".to_vec(), vec![], vec![b'y'; 200_000]] {
             let from = bytes.len() as u64;
             bytes.extend_from_slice(&append);
-            index.extend(&bytes, from);
+            index.extend(&bytes, from).unwrap();
             for offset in [from, from + append.len() as u64 / 2, bytes.len() as u64] {
                 let expected = memchr_iter(b'\n', &bytes[..offset as usize]).count() as u64;
                 let mut scanned = 0;
@@ -429,13 +567,13 @@ mod tests {
     fn extend_matches_fresh_after_appends() {
         for initial in [b"".as_slice(), b"partial", b"one\n", b"one\r\npartial"] {
             let mut bytes = initial.to_vec();
-            let mut index = LineIndex::build_chunked(&bytes, 3, 7, 2, &AtomicU64::new(0));
+            let mut index = LineIndex::build_chunked(&bytes, 3, 7, 2, &AtomicU64::new(0)).unwrap();
             let original = index.checkpoints.clone();
             for append in [b" suffix".as_slice(), b"\r", b"\nnext\n", b"", &b"row\n".repeat(4097), b"end"] {
                 let from = bytes.len() as u64;
                 bytes.extend_from_slice(append);
-                index.extend(&bytes, from);
-                let fresh = LineIndex::build(&bytes, DEFAULT_EVERY, 2, &AtomicU64::new(0));
+                index.extend(&bytes, from).unwrap();
+                let fresh = LineIndex::build(&bytes, DEFAULT_EVERY, 2, &AtomicU64::new(0)).unwrap();
                 assert_eq!(index.line_count(), fresh.line_count());
                 for line in 0..=fresh.line_count() {
                     assert_eq!(index.line_start(&bytes, line), fresh.line_start(&bytes, line), "line {line}");
@@ -449,7 +587,7 @@ mod tests {
             bytes.fill(b'x');
             bytes.push(b'\n');
             let count = index.line_count();
-            index.extend(&bytes, old_len);
+            index.extend(&bytes, old_len).unwrap();
             assert_eq!(index.line_count(), count + 1);
         }
     }
@@ -457,14 +595,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "extension must start at the indexed length")]
     fn extend_rejects_wrong_offset() {
-        let mut index = LineIndex::build(b"a", 1024, 1, &AtomicU64::new(0));
-        index.extend(b"ab", 0);
+        let mut index = LineIndex::build(b"a", 1024, 1, &AtomicU64::new(0)).unwrap();
+        index.extend(b"ab", 0).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "cannot extend a truncated file")]
     fn extend_rejects_truncation() {
-        let mut index = LineIndex::build(b"abc", 1024, 1, &AtomicU64::new(0));
-        index.extend(b"a", 3);
+        let mut index = LineIndex::build(b"abc", 1024, 1, &AtomicU64::new(0)).unwrap();
+        index.extend(b"a", 3).unwrap();
     }
 }

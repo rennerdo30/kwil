@@ -8,6 +8,7 @@ pub mod decoded_backing;
 mod decoded_piece;
 pub mod encoding;
 mod file;
+mod index_memory;
 mod line_index;
 mod piece_tree;
 mod recovery;
@@ -18,6 +19,7 @@ pub use buffer::{Buffer, Lines, PreparedSavedInstall, Snapshot, SnapshotImporter
 pub use file::with_checked_read_batch;
 pub use file::{FileKind, FileState, IndexProgress, OpenError, ReadError, TextFile};
 pub use file::{OriginalSavePin, cleanup_stale_save_backups};
+pub use index_memory::INDEX_MEMORY_BYTES;
 pub use line_index::LineIndex;
 pub use piece_tree::Chunks;
 pub use piece_tree::worker_layout;

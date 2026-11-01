@@ -1434,7 +1434,7 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-            let buffer = Buffer::from_decoded(backing.snapshot());
+            let buffer = Buffer::from_decoded(backing.snapshot()).unwrap();
             let snapshot = buffer.snapshot();
             drop(buffer);
             (backing, snapshot, root)

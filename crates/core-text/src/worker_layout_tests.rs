@@ -194,7 +194,7 @@ fn detached_and_decoded_opaque_provenance_resume_without_style_fabrication() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    let buffer = Buffer::from_decoded(backing.snapshot());
+    let buffer = Buffer::from_decoded(backing.snapshot()).unwrap();
     let snapshot = buffer.snapshot();
     for (at, range, opaque) in [(1, 1..5, false), (3, 1..5, false), (5, 5..6, true)] {
         let mut query = LayoutProvenanceQuery::new(at);

@@ -16,13 +16,14 @@
 //! representation (known limitation KW-45). UTF-32 LE/BE use the same bounded
 //! codec, backing and provenance contracts; no encoding replays the whole file.
 
+use crate::index_memory::{INDEX_MEMORY_BYTES, IndexMemory, IndexVec};
 use crate::{IndexProgress, ReadError, Snapshot, SourceChunk, TextFile};
 use encoding_rs::{DecoderResult, EncoderResult};
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod codec;
 pub(crate) use codec::{Decoder, Encoder};
@@ -485,6 +486,7 @@ impl DecodeIndex {
 
 struct SharedIndex {
     ready: OnceLock<DecodeIndex>,
+    build: Mutex<()>,
     scanned: AtomicU64,
 }
 
@@ -507,7 +509,11 @@ impl EncodedFile {
         Ok(Self::with_detection(file, detection))
     }
     fn with_detection(file: TextFile, detection: Detection) -> Self {
-        Self { file, detection, index: Arc::new(SharedIndex { ready: OnceLock::new(), scanned: AtomicU64::new(0) }) }
+        Self {
+            file,
+            detection,
+            index: Arc::new(SharedIndex { ready: OnceLock::new(), build: Mutex::new(()), scanned: AtomicU64::new(0) }),
+        }
     }
     pub fn detection(&self) -> Detection {
         self.detection
@@ -537,17 +543,27 @@ impl EncodedFile {
 
     /// Worker entry point. The scratch buffer is 16 KiB, independent of input.
     pub fn build_index(&self) -> Result<&DecodeIndex, EncodingError> {
+        self.build_index_with_memory_limit(INDEX_MEMORY_BYTES)
+    }
+
+    pub fn build_index_with_memory_limit(&self, limit: usize) -> Result<&DecodeIndex, EncodingError> {
         let bytes = self.file.bytes()?;
         if let Some(index) = self.index() {
             return Ok(index);
         }
+        let _build = self.index.build.lock().map_err(|_| io::Error::other("encoding index lock poisoned"))?;
+        if let Some(index) = self.index() {
+            return Ok(index);
+        }
         let encoding = self.detection.encoding;
+        self.index.scanned.store(0, Ordering::Relaxed);
         let mut decoder = encoding.decoder();
-        let mut checkpoints = vec![Checkpoint {
+        let mut checkpoints = IndexVec::new(&IndexMemory::new(limit));
+        checkpoints.push(Checkpoint {
             offset: self.detection.bom_len as u64,
             line: 0,
             line_start: self.detection.bom_len as u64,
-        }];
+        })?;
         let mut line_count = 1;
         let mut line_start = self.detection.bom_len as u64;
         let mut at = self.detection.bom_len;
@@ -590,12 +606,12 @@ impl EncodedFile {
             });
             at = end;
             if at < bytes.len() {
-                checkpoints.push(Checkpoint { offset: at as u64, line: line_count - 1, line_start });
+                checkpoints.push(Checkpoint { offset: at as u64, line: line_count - 1, line_start })?;
             }
             self.index.scanned.store(at as u64, Ordering::Relaxed);
         }
         self.index.scanned.store(self.file.len(), Ordering::Relaxed);
-        let _ = self.index.ready.set(DecodeIndex { checkpoints, line_count });
+        let _ = self.index.ready.set(DecodeIndex { checkpoints: checkpoints.into_vec(), line_count });
         Ok(self.index().unwrap())
     }
 

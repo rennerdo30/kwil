@@ -802,7 +802,7 @@ fn sealed_store_releases_all_snapshot_provenance_pins_with_the_returned_lease() 
         &cancel(),
     )
     .unwrap();
-    let buffer = crate::Buffer::from_decoded(owner.snapshot());
+    let buffer = crate::Buffer::from_decoded(owner.snapshot()).unwrap();
     let snapshot = buffer.snapshot();
     let a = admission();
     let source = match SnapshotLease::try_new(snapshot, 0..2, InputIdentity([80, 0, 0, 0]), a.aggregate.clone()) {

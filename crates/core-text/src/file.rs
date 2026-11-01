@@ -167,6 +167,7 @@ struct Shared {
     bytes: Bytes,
     kind: OnceLock<FileKind>,
     index: OnceLock<LineIndex>,
+    index_build: Mutex<()>,
     scanned: AtomicU64,
     // Drops after the file handle and mapping, so Windows can delete backups.
     save_backing: Mutex<Option<original_save::SaveBacking>>,
@@ -266,7 +267,8 @@ impl TextFile {
         let stamp = Stamp::read(&f)?;
         let len = stamp.len;
         let bytes = if len == 0 || !map_small && len < MAP_THRESHOLD {
-            let mut v = Vec::with_capacity(len as usize);
+            let mut v = Vec::new();
+            v.try_reserve_exact(len as usize).map_err(io::Error::other)?;
             // Bound the read even if the file grows after metadata was read.
             (&mut f).take(len).read_to_end(&mut v)?;
             Bytes::Owned(v)
@@ -284,6 +286,7 @@ impl TextFile {
                 bytes,
                 kind: OnceLock::new(),
                 index: OnceLock::new(),
+                index_build: Mutex::new(()),
                 scanned: AtomicU64::new(0),
                 save_backing: Mutex::new(None),
                 read_generation: AtomicU64::new(0),
@@ -383,7 +386,7 @@ impl TextFile {
         }
         if let Some(index) = self.index() {
             let mut index = index.clone();
-            index.extend(next.bytes().map_err(io::Error::other)?, self.len());
+            index.extend(next.bytes().map_err(io::Error::other)?, self.len())?;
             let _ = next.shared.index.set(index);
             next.shared.scanned.store(next.len(), Ordering::Relaxed);
         }
@@ -457,9 +460,25 @@ impl TextFile {
 
     /// Builds the line index on the calling thread (no-op when built).
     pub fn build_index(&self, threads: usize) -> Result<&LineIndex, ReadError> {
+        self.build_index_with_memory_limit(threads, crate::INDEX_MEMORY_BYTES)
+    }
+
+    /// Worker admission override, useful on constrained hosts. A failed build
+    /// retains no partial index and can be retried with a different limit.
+    pub fn build_index_with_memory_limit(&self, threads: usize, limit: usize) -> Result<&LineIndex, ReadError> {
         let bytes = self.bytes()?;
         let s = &self.shared;
-        Ok(s.index.get_or_init(|| LineIndex::build(bytes, DEFAULT_EVERY, threads, &s.scanned)))
+        if let Some(index) = s.index.get() {
+            return Ok(index);
+        }
+        let _build = s.index_build.lock().map_err(|_| ReadError::Io(io::Error::other("line index lock poisoned")))?;
+        if s.index.get().is_none() {
+            s.scanned.store(0, Ordering::Relaxed);
+            let index = LineIndex::build_with_memory_limit(bytes, DEFAULT_EVERY, threads, &s.scanned, limit)
+                .map_err(ReadError::Io)?;
+            let _ = s.index.set(index);
+        }
+        Ok(s.index.get().unwrap())
     }
 
     pub fn index(&self) -> Option<&LineIndex> {
@@ -858,7 +877,7 @@ mod tests {
 
         let naive: Vec<u64> = std::iter::once(0).chain(memchr_iter(b'\n', &text).map(|p| p as u64 + 1)).collect();
         for (every, chunk) in [(1, 1 << 20), (7, 4096), (64, 1000), (1024, 1000), (1024, 16 << 20)] {
-            let idx = LineIndex::build_chunked(&text, every, chunk, 4, &AtomicU64::new(0));
+            let idx = LineIndex::build_chunked(&text, every, chunk, 4, &AtomicU64::new(0)).unwrap();
             assert_eq!(idx.line_count(), naive.len() as u64);
             for (line, &start) in naive.iter().enumerate() {
                 assert_eq!(

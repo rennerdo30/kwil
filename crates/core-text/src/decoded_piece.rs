@@ -14,7 +14,10 @@ pub(crate) struct IndexedDecoded {
 }
 
 impl IndexedDecoded {
-    pub fn new_checked<E>(origin: DecodedSnapshot, check: &mut impl FnMut() -> Result<(), E>) -> Result<Self, E> {
+    pub fn new_checked<E: From<io::Error>>(
+        origin: DecodedSnapshot,
+        check: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
         let index = LineIndex::build_checked(
             origin.logical_bytes(),
             crate::line_index::DEFAULT_EVERY,

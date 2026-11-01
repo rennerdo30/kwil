@@ -805,7 +805,7 @@ mod tests {
         pack(registry, plan)
     }
     fn seed(registry: &mut OriginRegistry, origin: DecodedSnapshot) -> Capsule {
-        let snapshot = Buffer::from_decoded(origin.clone()).snapshot();
+        let snapshot = Buffer::from_decoded(origin.clone()).unwrap().snapshot();
         let plan = registry.plan_seed(snapshot, origin, Arc::new(AtomicBool::new(false))).unwrap();
         pack(registry, plan)
     }
@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(origins[1].1.raw_bytes(), b"\x88\x62");
         assert_eq!(state.retained_origin_resources(), before);
         assert_eq!(state.accepted_origin_count(), 2);
-        let snapshot = Buffer::from_decoded(origins[1].1.clone()).snapshot();
+        let snapshot = Buffer::from_decoded(origins[1].1.clone()).unwrap().snapshot();
         let mut adopted = OriginRegistry::from_recovered(8, 8192, origins, &cancel).unwrap();
         let plan = adopted.plan(snapshot, 0..4, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(plan.new_origin_count(), 0, "resumed writer reuses recovered exact ID without raw re-embedding");
@@ -1276,7 +1276,8 @@ mod tests {
         let raw = b"\xff\xfeA\0\0\xd8B\0\xff";
         let base = seed(&mut registry, fixture.original(raw, Encoding::UTF16_LE, 2));
         assert_eq!(base.logical, 4);
-        let big5 = Buffer::from_decoded(fixture.original(b"\x88\x62\xa4\x40", Encoding::for_label("big5").unwrap(), 0));
+        let big5 = Buffer::from_decoded(fixture.original(b"\x88\x62\xa4\x40", Encoding::for_label("big5").unwrap(), 0))
+            .unwrap();
         let first = capsule(&mut registry, big5.snapshot());
         let reference = capsule(
             &mut registry,
@@ -1630,7 +1631,7 @@ mod tests {
     fn journal_replay_detached_opaque_and_ordinary_invalid_bytes_keep_distinct_provenance() {
         let fixture = Fixture::new();
         let mut registry = registry();
-        let origin = Buffer::from_decoded(fixture.original(b"\xff\xfeA\0\0\xd8B\0", Encoding::UTF16_LE, 2));
+        let origin = Buffer::from_decoded(fixture.original(b"\xff\xfeA\0\0\xd8B\0", Encoding::UTF16_LE, 2)).unwrap();
         let mut foreign = Buffer::empty();
         foreign.insert_snapshot_range(0, &origin.snapshot(), 0..origin.len()).unwrap();
         let opaque = foreign.snapshot().slice(1..2).unwrap();

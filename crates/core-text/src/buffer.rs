@@ -411,9 +411,8 @@ impl Buffer {
     /// Attach an immutable worker-prepared decoded generation. Builds sparse
     /// logical UTF-8 line metrics on the calling worker, without copying text.
     /// Keep its DecodedBacking owner on the worker retirement queue.
-    pub fn from_decoded(origin: crate::decoded_backing::DecodedSnapshot) -> Self {
-        Self::from_decoded_checked(origin, &mut || Ok::<(), std::convert::Infallible>(()))
-            .unwrap_or_else(|never| match never {})
+    pub fn from_decoded(origin: crate::decoded_backing::DecodedSnapshot) -> io::Result<Self> {
+        Self::from_decoded_checked(origin, &mut || Ok::<(), io::Error>(()))
     }
 
     /// Worker-only cancellable logical index construction. Cancellation is
@@ -429,7 +428,7 @@ impl Buffer {
         })
     }
 
-    fn from_decoded_checked<E>(
+    fn from_decoded_checked<E: From<io::Error>>(
         origin: crate::decoded_backing::DecodedSnapshot,
         check: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Self, E> {
@@ -974,7 +973,7 @@ mod editing_contract_tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        let foreign = Buffer::from_decoded(owner.snapshot());
+        let foreign = Buffer::from_decoded(owner.snapshot()).unwrap();
         let mut target = Buffer::with_add_memory_limit(31);
         target.set_undo_memory_limit(0);
         target.insert_snapshot_range(0, &foreign.snapshot(), 0..foreign.len()).unwrap();
@@ -1173,7 +1172,7 @@ mod editing_contract_tests {
                 polls == 2
             });
             assert!(matches!(cancelled, Err(ref error) if error.kind() == io::ErrorKind::Interrupted));
-            let old = Buffer::from_decoded(owner.snapshot());
+            let old = Buffer::from_decoded(owner.snapshot()).unwrap();
             let new = Buffer::from_decoded_cancellable(owner.snapshot(), || false).unwrap();
             let mut old_bytes = Vec::new();
             let mut new_bytes = Vec::new();
@@ -1208,7 +1207,7 @@ mod editing_contract_tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        let mut buffer = Buffer::from_decoded(owner.snapshot());
+        let mut buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         let initial = buffer.snapshot();
         let cost = initial.originals.values().next().unwrap().0.retained_bytes();
         assert!(cost > 1000, "logical sparse index must be accounted");

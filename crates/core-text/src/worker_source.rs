@@ -713,7 +713,7 @@ mod tests {
         let mut raw = vec![b'x'; 128];
         raw.extend_from_slice(b"\x88\x62\xffZ");
         let owner = directory.decoded(&raw, encoding);
-        let buffer = Buffer::from_decoded(owner.snapshot());
+        let buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         let snapshot = buffer.snapshot();
         let mut source = cursor(snapshot.clone(), 128..134);
         assert_eq!(
@@ -743,7 +743,7 @@ mod tests {
         use crate::decoded_backing::RetirementError;
         let directory = PrivateDirectory::new();
         let owner = directory.decoded(b"a\xe2\x82Z\xff", Encoding::UTF8);
-        let buffer = Buffer::from_decoded(owner.snapshot());
+        let buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         let mut source = cursor(buffer.snapshot(), 0..4);
         assert_eq!(
             one_visit(&mut source),
@@ -982,7 +982,7 @@ mod tests {
     fn io_terminal_keeps_decoded_owner_until_explicit_worker_return() {
         let directory = PrivateDirectory::new();
         let owner = directory.decoded(b"abc", Encoding::UTF8);
-        let buffer = Buffer::from_decoded(owner.snapshot());
+        let buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         let mut source = cursor(buffer.snapshot(), 0..3);
         drop(buffer);
         let mut logical = [0xa5; 8];

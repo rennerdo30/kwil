@@ -287,7 +287,7 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-            let buffer = Buffer::from_decoded(owner.snapshot());
+            let buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
             self.owners.borrow_mut().push(owner);
             buffer
         }
