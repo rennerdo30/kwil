@@ -10,7 +10,7 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 
 ## Steps
 
-1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`), run `cargo build` so `Cargo.lock` follows, and commit.
+1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`), run `cargo build` so `Cargo.lock` follows, run `cargo update -w --offline` in `crates/bench` (its separate lock file pins `kwil-core-text`; a stale one fails the Bench budgets workflow), and commit both lock files.
 2. Tag and push the tag: `git tag vX.Y.Z && git push origin refs/tags/vX.Y.Z`.
 3. The **Release** workflow (`.github/workflows/release.yml`) checks that the tag matches the version, builds `kwil` for:
    - Windows x64 and ARM64;
