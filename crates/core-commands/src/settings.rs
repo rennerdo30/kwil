@@ -114,7 +114,7 @@ group!(FilesSettings {
 group!(UndoSettings { memory_limit_bytes: u64 = 64 * 1024 * 1024, persist: bool = false });
 group!(SearchSettings { regex: bool = false, case_sensitive: bool = false, whole_word: bool = false,
     in_selection: bool = false, include: Vec<String> = Vec::new(), exclude: Vec<String> = Vec::new() });
-group!(CompareSettings { ignore_whitespace: bool = false, collapse_unchanged: bool = true });
+group!(CompareSettings { ignore_whitespace: bool = false, collapse_unchanged: bool = true, context_lines: u32 = 3 });
 group!(SyntaxSettings { full_parse_limit_bytes: u64 = 20 * 1024 * 1024 });
 group!(LogSettings { follow: bool = false, detect_levels: bool = true,
     highlight_rules: BTreeMap<String, String> = BTreeMap::new() });
@@ -412,7 +412,7 @@ fn known(path: &str) -> &'static [&'static str] {
         "files" => &["small_file_threshold_bytes", "backup", "restore_session", "journal_interval_seconds"],
         "undo" => &["memory_limit_bytes", "persist"],
         "search" => &["regex", "case_sensitive", "whole_word", "in_selection", "include", "exclude"],
-        "compare" => &["ignore_whitespace", "collapse_unchanged"],
+        "compare" => &["ignore_whitespace", "collapse_unchanged", "context_lines"],
         "syntax" => &["full_parse_limit_bytes"],
         "log" => &["follow", "detect_levels", "highlight_rules"],
         "bindings[]" => &["keys", "command", "context", "mode"],

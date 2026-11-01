@@ -545,6 +545,11 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             let page = app.view.compare.page.as_ref().expect("comparison worker published a page");
             assert!(page.changes > 0);
             assert!(page.rows.iter().any(|row| row.kind == kwil_view_model::compare_session::Kind::Modify));
+            assert!(page.rows.iter().any(|row| row.hidden > 0), "fixture must contain collapsed unchanged regions");
+            assert!(
+                page.rows.iter().any(|row| row.words.iter().any(|side| !side.is_empty())),
+                "visible word highlights"
+            );
             app.apply(Damage { full: true, status: true, ..Default::default() });
             assert!(app.render());
             capture(app, dir.as_deref(), "compare.bmp");

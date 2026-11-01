@@ -34,7 +34,7 @@ not run (no ARM64 NSIS runner check).
 
 ## Known incomplete areas
 
-- Comparison session/panes, unchanged-region collapse and final word-refinement qualification.
+- Any-size comparison integration and final word-refinement qualification.
 - Complete any-size opening/indexing and regex/long-line paths, and folder replacement.
 - Formatter, log-watcher, custom theme and TUI integration.
 - Further save/recovery qualification and complete metadata pre-growth admission.

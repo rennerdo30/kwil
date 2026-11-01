@@ -4,6 +4,13 @@ use kwil_view_model::compare_session::{Action, Kind, Session};
 use std::sync::Arc;
 
 impl App {
+    pub(super) fn compare_click(&mut self) {
+        let body = self.body_area();
+        if body.contains(self.pointer.0, self.pointer.1) {
+            let ch = self.font.as_ref().map_or(1, |font| font.ch);
+            self.view.compare.expand_row((self.pointer.1 - body.y) / ch);
+        }
+    }
     pub(super) fn compare_ready(&mut self) {
         let previous = self.view.compare.page.as_ref().map(|p| (p.top, p.total, p.ignore_whitespace, p.collapsed));
         if !self.view.poll_compare() {
@@ -83,6 +90,8 @@ impl App {
             Key::Named(NamedKey::PageUp) => {
                 self.view.compare.action(Action::Scroll(-(self.view.rows().saturating_sub(2) as i64)))
             }
+            Key::Named(NamedKey::Enter | NamedKey::Space) => self.view.compare.expand_row(0),
+            Key::Character(c) if c == " " => self.view.compare.expand_row(0),
             _ => {}
         }
         self.apply(Damage { full: !self.view.compare.open, status: true, ..Default::default() });
@@ -119,7 +128,7 @@ pub(super) fn draw(
                 font,
                 0,
                 y,
-                format!("… {} unchanged lines …", row.hidden).as_bytes(),
+                format!("… {} unchanged lines (click or Enter to expand)", row.hidden).as_bytes(),
                 width / font.cw,
                 gutter_fg(),
                 bg(),
@@ -144,7 +153,11 @@ pub(super) fn draw(
             let columns = half.saturating_sub(gutter + font.cw) / font.cw;
             draw_text(pixels, width, font, x + gutter, y, &row.text[side], columns, fg(), color);
             for cell in text::cells(&row.text[side], columns, font.tab_size()) {
-                if row.words[side].iter().any(|r| r.start < cell.bytes.end && cell.bytes.start < r.end) {
+                let words = &row.words[side];
+                if words
+                    .get(words.partition_point(|r| r.end <= cell.bytes.start))
+                    .is_some_and(|r| r.start < cell.bytes.end)
+                {
                     let word_bg = match (light, side) {
                         (true, 0) => 0xf0a9b7,
                         (true, _) => 0xade1b7,
@@ -172,8 +185,10 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::write(&path, b"disk\n").unwrap();
-        let (mut app, events) = crate::search_ui::host_dispatch_tests::host("buffer\n");
+        let disk = (0..40).map(|n| format!("disk word {n}\n")).collect::<String>();
+        let buffer = disk.replace("disk word 0\n", "buffer word 0\n").replace("disk word 30\n", "buffer word 30\n");
+        std::fs::write(&path, disk).unwrap();
+        let (mut app, events) = crate::search_ui::host_dispatch_tests::host(&buffer);
         let document = app.view.active_id();
         let revision = app.view.editor().unwrap().document().revision();
         app.palette_action(kwil_core_commands::palette::PaletteAction::Command("compare.files"));
@@ -183,7 +198,28 @@ mod tests {
         events.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         app.compare_ready();
         assert_eq!(app.view.active_id(), document);
-        assert_eq!(app.view.compare.page.as_ref().unwrap().changes, 1);
+        assert_eq!(app.view.compare.page.as_ref().unwrap().changes, 2);
+        for (shift, expected) in [(false, 30), (true, 0)] {
+            app.mods = if shift { ModifiersState::SHIFT } else { ModifiersState::empty() };
+            assert!(app.compare_key(&HostKey { logical_key: Key::Named(NamedKey::F7), text: None, repeat: false }));
+            events.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            app.compare_ready();
+            assert_eq!(app.view.compare.page.as_ref().unwrap().rows[0].left, Some(expected));
+        }
+        for (command, expected) in [("compare.nextChange", 30), ("compare.previousChange", 0)] {
+            app.palette_action(kwil_core_commands::palette::PaletteAction::Command(command));
+            events.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            app.compare_ready();
+            assert_eq!(app.view.compare.page.as_ref().unwrap().rows[0].left, Some(expected));
+        }
+        let hidden = app.view.compare.page.as_ref().unwrap().rows.iter().position(|r| r.hidden > 0).unwrap();
+        let body = app.body_area();
+        let ch = app.font.as_ref().map_or(1, |font| font.ch);
+        app.pointer = (body.x, body.y + hidden * ch);
+        app.compare_click();
+        events.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        app.compare_ready();
+        assert_eq!(app.view.compare.page.as_ref().unwrap().rows[hidden].hidden, 0);
         app.edit(input::Action::Text("must not insert".into()));
         app.palette_action(kwil_core_commands::palette::PaletteAction::Command("edit.deleteLine"));
         assert_eq!(app.view.editor().unwrap().document().revision(), revision);

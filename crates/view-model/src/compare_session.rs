@@ -1,6 +1,7 @@
 //! Read-only comparison. A single worker owns inputs, diff and on-demand word
 //! refinement; the UI retains at most one capped page, never file text.
 use crate::Workspace;
+use kwil_core_commands::settings::CompareSettings;
 use kwil_core_diff::{self as diff, LineSource};
 use kwil_core_text::{Snapshot, TextFile};
 use std::{
@@ -47,7 +48,7 @@ pub struct Row {
     pub hidden: usize,
 }
 enum Request {
-    Start(Snapshot, PathBuf),
+    Start(Snapshot, PathBuf, CompareSettings),
     Action(Action),
     Close,
 }
@@ -58,6 +59,8 @@ pub enum Action {
     Previous,
     Whitespace,
     Unchanged,
+    /// Display position of a collapsed row in the currently published page.
+    Expand(usize),
 }
 struct Worker {
     tx: mpsc::SyncSender<Request>,
@@ -103,6 +106,7 @@ struct State {
     segments: Vec<diff::DisplaySegment>,
     options: diff::Options,
     collapsed: bool,
+    context: usize,
     top: usize,
     title: String,
 }
@@ -133,6 +137,7 @@ impl State {
         path: PathBuf,
         cancel: &diff::CancellationToken,
         stop: &AtomicBool,
+        settings: &CompareSettings,
     ) -> Result<Self, String> {
         if left.len() > diff::MAX_SCANNED_BYTES as u64 || left.line_count() > diff::MAX_LINES as u64 {
             return Err(failure(diff::DiffError::TooLarge));
@@ -156,13 +161,18 @@ impl State {
             backing: Some(prepared),
             model: diff::Comparison::default(),
             segments: Vec::new(),
-            options: diff::Options::default(),
-            collapsed: false,
+            options: diff::Options {
+                whitespace: if settings.ignore_whitespace { diff::Whitespace::All } else { diff::Whitespace::Exact },
+                ..Default::default()
+            },
+            collapsed: settings.collapse_unchanged,
+            context: settings.context_lines as usize,
             top: 0,
             title: path.file_name().unwrap_or_default().to_string_lossy().chars().take(100).collect(),
         };
         state.recompute(cancel)?;
-        state.top = state.model.hunks.first().map_or(0, |h| h.rows.start.saturating_sub(3));
+        state.top =
+            state.display_index(state.model.hunks.first().map_or(0, |h| h.rows.start.saturating_sub(state.context)));
         Ok(state)
     }
     fn recompute(&mut self, cancel: &diff::CancellationToken) -> Result<(), String> {
@@ -172,7 +182,7 @@ impl State {
     }
     fn rebuild(&mut self) {
         self.segments = if self.collapsed {
-            self.model.collapsed(3)
+            self.model.collapsed(self.context)
         } else {
             vec![diff::DisplaySegment::Rows(0..self.model.row_count())]
         };
@@ -243,6 +253,18 @@ impl State {
                 self.rebuild();
                 self.top = self.display_index(row);
             }
+            Action::Expand(index) => {
+                let (row, hidden) = self.display_row(index);
+                // Expansion changes only the projection of immutable alignment.
+                if hidden > 0
+                    && let Some(segment) = self
+                        .segments
+                        .iter_mut()
+                        .find(|segment| matches!(segment, diff::DisplaySegment::Collapsed(r) if r.start == row))
+                {
+                    *segment = diff::DisplaySegment::Rows(row..row + hidden);
+                }
+            }
         }
         Ok(())
     }
@@ -309,9 +331,9 @@ impl Session {
                         break;
                     }
                     let result = match request {
-                        Request::Start(snapshot, path) => {
+                        Request::Start(snapshot, path, settings) => {
                             state = None;
-                            State::open(snapshot, path, &cancelled, &stopped).map(|s| state = Some(s))
+                            State::open(snapshot, path, &cancelled, &stopped, &settings).map(|s| state = Some(s))
                         }
                         Request::Action(action) => state.as_mut().map_or(Ok(()), |s| s.action(action, &cancelled)),
                         Request::Close => {
@@ -341,6 +363,15 @@ impl Session {
     pub fn action(&mut self, action: Action) {
         if let Err(e) = self.send(Request::Action(action)) {
             self.notice = e.to_string();
+        }
+    }
+    /// Expand a page-relative row. Busy requests are rejected rather than
+    /// applying coordinates from an old page to a newer projection.
+    pub fn expand_row(&mut self, index: usize) {
+        if let Some(page) = &self.page
+            && page.rows.get(index).is_some_and(|row| row.hidden > 0)
+        {
+            self.action(Action::Expand(page.top + index));
         }
     }
     pub fn close(&mut self) {
@@ -405,7 +436,8 @@ impl Workspace {
         let source =
             self.compare_identity().ok_or_else(|| io::Error::other("Wait for the current tab to finish opening"))?;
         let snapshot = self.editor().unwrap().document().snapshot();
-        self.compare.send(Request::Start(snapshot, path))?;
+        let settings = self.editor().unwrap().settings.compare.clone();
+        self.compare.send(Request::Start(snapshot, path, settings))?;
         self.compare.open = true;
         self.compare.source = Some(source);
         self.compare.page = None;
@@ -480,6 +512,59 @@ mod tests {
         view
     }
     #[test]
+    fn compare_defaults_collapse_with_context_and_navigation_stays_on_changes() {
+        let text = (0..40).map(|n| format!("line {n}\n")).collect::<String>();
+        let fixture = Fixture::new(text.as_bytes());
+        let view = workspace(&text.replace("line 2\n", "changed two\n").replace("line 30\n", "changed thirty\n"));
+        let cancel = diff::CancellationToken::default();
+        let mut state = State::open(
+            view.editor().unwrap().document().snapshot(),
+            fixture.0.clone(),
+            &cancel,
+            &AtomicBool::new(false),
+            &CompareSettings::default(),
+        )
+        .unwrap();
+        let page = state.page(&cancel).unwrap();
+        assert!(page.collapsed, "compare settings default to collapsed unchanged regions");
+        assert!(page.rows.iter().any(|r| r.hidden == 21));
+        let index = page.rows.iter().position(|r| r.hidden == 21).unwrap();
+        let before = page.total;
+        let hunks = state.model.hunks.clone();
+        state.action(Action::Expand(page.top + index), &cancel).unwrap();
+        let expanded = state.page(&cancel).unwrap();
+        assert_eq!(expanded.total, before + 20);
+        assert_eq!(expanded.rows[index].left, Some(6));
+        assert_eq!(expanded.rows[index + 20].left, Some(26));
+        assert!(expanded.rows.iter().any(|r| r.hidden > 0), "other collapsed regions stay closed");
+        assert_eq!(state.model.hunks, hunks, "projection changes preserve alignment");
+        state.action(Action::Next, &cancel).unwrap();
+        assert_eq!(state.display_row(state.top).0, 2);
+        state.action(Action::Next, &cancel).unwrap();
+        assert_eq!(state.display_row(state.top).0, 30);
+        state.action(Action::Previous, &cancel).unwrap();
+        assert_eq!(state.display_row(state.top).0, 2);
+        let settings = CompareSettings { context_lines: 1, ..Default::default() };
+        let compact = State::open(
+            view.editor().unwrap().document().snapshot(),
+            fixture.0.clone(),
+            &cancel,
+            &AtomicBool::new(false),
+            &settings,
+        )
+        .unwrap();
+        assert!(compact.page(&cancel).unwrap().rows.iter().any(|r| r.hidden == 25));
+        let shown = State::open(
+            view.editor().unwrap().document().snapshot(),
+            fixture.0.clone(),
+            &cancel,
+            &AtomicBool::new(false),
+            &CompareSettings { collapse_unchanged: false, ..settings },
+        )
+        .unwrap();
+        assert!(shown.page(&cancel).unwrap().rows.iter().all(|r| r.hidden == 0));
+    }
+    #[test]
     fn compare_page_aligns_words_and_navigates_collapsed_changes() {
         let fixture = Fixture::new(b"head\nold word\n2\n3\n4\n5\n6\n7\n8\n9\nold tail\n");
         let view = workspace("head\nnew word\n2\n3\n4\n5\n6\n7\n8\n9\nnew tail\n");
@@ -489,6 +574,7 @@ mod tests {
             fixture.0.clone(),
             &cancel,
             &AtomicBool::new(false),
+            &CompareSettings::default(),
         )
         .unwrap();
         let page = state.page(&cancel).unwrap();
@@ -499,9 +585,11 @@ mod tests {
         state.action(Action::Next, &cancel).unwrap();
         assert_eq!(state.top, 1);
         state.action(Action::Next, &cancel).unwrap();
-        assert_eq!(state.top, 10);
+        assert_eq!(state.display_row(state.top).0, 10);
         state.action(Action::Previous, &cancel).unwrap();
         assert_eq!(state.top, 1);
+        state.action(Action::Unchanged, &cancel).unwrap();
+        assert!(state.page(&cancel).unwrap().rows.iter().all(|r| r.hidden == 0));
         state.action(Action::Unchanged, &cancel).unwrap();
         assert!(state.page(&cancel).unwrap().rows.iter().any(|r| r.hidden > 0));
         state.action(Action::Next, &cancel).unwrap();
@@ -513,7 +601,14 @@ mod tests {
         let view = workspace("same   word\n");
         let snapshot = view.editor().unwrap().document().snapshot();
         let cancel = diff::CancellationToken::default();
-        let mut state = State::open(snapshot.clone(), fixture.0.clone(), &cancel, &AtomicBool::new(false)).unwrap();
+        let mut state = State::open(
+            snapshot.clone(),
+            fixture.0.clone(),
+            &cancel,
+            &AtomicBool::new(false),
+            &CompareSettings::default(),
+        )
+        .unwrap();
         assert_eq!(state.model.hunks.len(), 1);
         state.action(Action::Whitespace, &cancel).unwrap();
         assert!(state.model.hunks.is_empty());
@@ -529,7 +624,8 @@ mod tests {
                 oversized.editor().unwrap().document().snapshot(),
                 fixture.0.clone(),
                 &cancel,
-                &AtomicBool::new(false)
+                &AtomicBool::new(false),
+                &CompareSettings::default()
             )
             .err()
             .unwrap()
