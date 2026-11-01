@@ -6,6 +6,8 @@ changes and its known limitations.
 
 ## Published
 
+- **0.1.0-beta.5**, published 2026-10-31 from main `1044fc3`: overwrite or
+  reload after an external change, tab context menu; beta.4 updated itself to it.
 - **0.1.0-beta.4**, published 2026-10-29 from main `8ea5eab`: every palette
   command runs; beta.3 updated itself to it.
 - **0.1.0-beta.3**, published 2026-10-29 from main `62a814e`: Windows setup and
@@ -16,10 +18,11 @@ changes and its known limitations.
   files match the published checksums.
 - **0.1.0-beta.1** was never published; its tag stays as history.
 
-## Next candidate: 0.1.0-beta.5
+## Next candidate: 0.1.0-beta.6
 
-Overwrite-or-reload choice when a save finds the file changed on disk; tab
-context menu.
+Replace in files, native Save As, compare folding and word highlights,
+language mode and theme syntax colours, keymap presets, CR-only line endings,
+file types page, large-file memory limits.
 
 ## In beta.3
 

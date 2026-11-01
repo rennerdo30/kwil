@@ -1,9 +1,9 @@
-# Kwil 0.1.0-beta.5
+# Kwil 0.1.0-beta.6
 
 Draft notes for the next candidate. Artifacts and packaged native gates are not yet qualified.
 
 An early beta for evaluation and feedback. This is not an RC or a claim that the
-full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.5/docs/SPEC.md)
+full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.6/docs/SPEC.md)
 is complete. Test with copies of important files.
 
 ## Downloads and installation
@@ -30,7 +30,39 @@ without independent signature verification. beta.2 copies update to
 this release by themselves; frozen beta.1 copies must be replaced manually. Stable download installers do not
 select betas.
 
-## Changes since beta.4
+## Changes since beta.5
+
+- **Replace in files:** enter a replacement in Find in Files, preview the
+  affected files with match counts, untick files, then apply. Open files change
+  in their tab (undoable, unsaved); closed files are saved with their encoding
+  and line endings kept; files changed on disk since the preview are skipped.
+- **Save As uses the system dialog.** Saving an untitled file opens the native
+  Save dialog in the last-used folder or Documents, never the working folder.
+  The TUI shows the full target path before writing.
+- **Compare:** long unchanged regions fold into one expandable row (context
+  lines configurable, default 3); changed words are highlighted in GUI and TUI;
+  F7 / Shift+F7 jump between changes.
+- **Language mode:** "Change Language Mode" with Plain Text and Auto Detect;
+  map extensions or globs (`*.conf`) to languages in settings. Syntax colours
+  follow the active theme and recolour without re-parsing.
+- **Keymap presets:** VS Code (default), Notepad++ or Vim, switchable in
+  Settings or the palette, with your overrides on top. The palette shows each
+  command's current shortcut.
+- **Classic Mac (CR-only) line endings:** such files open as separate lines,
+  keep CR when editing and saving, show "CR" in the status bar and convert
+  between LF, CRLF and CR.
+- **File types page:** shows the real state right after unregistering; Register
+  selected / Unregister selected / Register all text types. Bulk registration
+  never includes executables, scripts or system-managed types.
+- **Memory on large files:** the line index is capped (64 MiB, enough for
+  files well over 100 GB); compare and very large clipboard copies refuse with
+  a clear message instead of exhausting memory.
+- Reload after an external change no longer falls back to the old text on
+  Windows, and quitting after "Overwrite" no longer stalls.
+- Randomized tests for text editing, line counting and 40 encodings, plus a
+  weekly fuzz run.
+
+## Changes in beta.5
 
 - **Saving a file another program changed** no longer ends in a dead end. Kwil
   asks: overwrite the file with your version, or reload it from disk. Reload
@@ -100,12 +132,12 @@ implemented" any more (a contract test for GUI and TUI enforces it).
 
 This list identifies areas to evaluate, not blanket platform or performance
 acceptance. Exact candidate checks and remaining release gates are recorded in
-[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.5/docs/BETA.md).
+[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.6/docs/BETA.md).
 
 ## Known limitations
 
-- Any-size opening and resident index memory limits are unfinished. Mapping
-  refusal does not yet have the required positioned-read fallback.
+- Mapping refusal does not yet have a positioned-read fallback; real low-RAM
+  machines and multi-GB files have not been measured.
 - Complete metadata pre-growth admission is unfinished. Large or demanding
   editing workloads have not received bounded-memory acceptance.
 - Complete regex/long-line search and folder
