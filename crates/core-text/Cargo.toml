@@ -12,5 +12,8 @@ simdutf8 = "0.1.5"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 
+[dev-dependencies]
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
