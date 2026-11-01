@@ -373,6 +373,14 @@ pub const SCHEMA: &[SettingSpec] = &[
         |s| SettingValue::Bool(s.compare.collapse_unchanged)
     ),
     spec!(
+        "compare.context_lines",
+        "Comparison context lines",
+        Advanced,
+        "Keep this many unchanged lines beside each change when collapsing regions.",
+        SettingKind::Integer,
+        |s| SettingValue::Integer(s.compare.context_lines.into())
+    ),
+    spec!(
         "syntax.full_parse_limit_bytes",
         "Full parse limit",
         Advanced,

@@ -843,15 +843,8 @@ fn run_workspace_with_terminal_init(
                         search_ui::mouse(search, view, &mut keys, &m, Rect::new(0, 0, size.width, size.height))
                     }
                     Msg::Input(Event::Mouse(m)) if view.compare.open => {
-                        match m.kind {
-                            MouseEventKind::ScrollDown => {
-                                view.compare.action(kwil_view_model::compare_session::Action::Scroll(3))
-                            }
-                            MouseEventKind::ScrollUp => {
-                                view.compare.action(kwil_view_model::compare_session::Action::Scroll(-3))
-                            }
-                            _ => {}
-                        }
+                        let size = terminal.size()?;
+                        compare_ui::mouse(view, &m, Rect::new(0, 0, size.width, size.height), settings.tabs.layout);
                         true
                     }
                     Msg::Input(Event::Mouse(m))

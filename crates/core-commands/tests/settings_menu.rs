@@ -1,6 +1,22 @@
 use kwil_core_commands::{settings_ui::*, *};
 
 #[test]
+fn compare_context_is_configurable_searchable_and_lossless() {
+    let mut menu = SettingsMenu::new(SettingsDocument::parse("[compare]\ncontext_lines = 7 # keep\n").unwrap());
+    assert!(menu.document().report().unknown_keys.is_empty());
+    menu.search("comparison context lines");
+    assert_eq!(menu.selected().unwrap().spec.id, "compare.context_lines");
+    assert_eq!(menu.selected().unwrap().current, SettingValue::Integer(7));
+    assert_eq!(menu.selected().unwrap().default, SettingValue::Integer(3));
+    menu.edit_selected(SettingValue::Integer(0)).unwrap();
+    assert_eq!(menu.selected().unwrap().current, SettingValue::Integer(0));
+    assert!(menu.edit_selected(SettingValue::Integer(-1)).is_err());
+    menu.reset_selected().unwrap();
+    assert_eq!(menu.selected().unwrap().current, SettingValue::Integer(3));
+    assert!(menu.document().source().contains("# keep"));
+}
+
+#[test]
 fn update_channel_shows_effective_default_and_preserves_explicit_choices() {
     let expected =
         if env!("CARGO_PKG_VERSION").split('+').next().unwrap().contains('-') { "prerelease" } else { "stable" };
