@@ -272,6 +272,7 @@ pub(crate) fn result_info(result: &DocumentResult) -> ResultInfo {
         | Preview { document, revision, .. }
         | RawPreview { document, revision, .. }
         | Saved { document, revision, .. }
+        | ExportedUncompressed { document, revision, .. }
         | JournalQueued { document, revision, .. }
         | JournalDurable { document, revision, .. } => {
             info.document = Some(*document);
@@ -282,6 +283,7 @@ pub(crate) fn result_info(result: &DocumentResult) -> ResultInfo {
                 Opened { .. } => ResultKind::Opened,
                 Preview { .. } | RawPreview { .. } => ResultKind::Preview,
                 Saved { .. } => ResultKind::Saved,
+                ExportedUncompressed { .. } => ResultKind::Persisted,
                 _ => ResultKind::Journal,
             };
         }

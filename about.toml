@@ -27,3 +27,8 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 # Kwil's own crates are covered by LICENSE.
 private = { ignore = true }
+
+# Rust bzip2 backend retains the permissive upstream bzip2 notice.
+# Keep this acceptance scoped to the backend; CI still checks every dependency.
+[libbz2-rs-sys]
+accepted = ["bzip2-1.0.6"]

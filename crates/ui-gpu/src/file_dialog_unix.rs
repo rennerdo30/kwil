@@ -66,7 +66,7 @@ impl Port for Worker {
         // rfd constructs the AppKit sheet here, on winit's main thread. Its
         // future is awaited on the worker so the GUI keeps pumping events.
         let future: Reply = match request.ticket.kind() {
-            FilePromptKind::SaveAs => Box::pin(dialog.save_file()),
+            FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs => Box::pin(dialog.save_file()),
             FilePromptKind::Open => Box::pin(dialog.pick_file()),
             _ => unreachable!("native ticket is Open or SaveAs"),
         };

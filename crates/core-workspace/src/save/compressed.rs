@@ -1,7 +1,7 @@
-//! Atomic gzip saves of encoded logical snapshots. All work runs on a worker.
+//! Atomic compressed saves of encoded logical snapshots. All work runs on a worker.
 use super::encoded::{bom_len, same_after_trim, same_logical, stream, validate_encoded_snapshot};
 use super::*;
-use crate::compressed::{PreparedFile, prepare_gzip_payload, recompress_payload};
+use crate::compressed::{PreparedFile, prepare_payload, recompress_format_payload};
 use kwil_core_text::decoded_backing::{BackingError, DecodedBacking, Interpretation, RetirementError};
 use kwil_core_text::encoding::SavePlan;
 use std::sync::{Mutex, atomic::AtomicBool};
@@ -141,7 +141,7 @@ fn cancelled(cancel: &AtomicBool) -> io::Result<()> {
     }
 }
 
-/// Streams the exact encoded payload into a finalized gzip temp. Decompresses,
+/// Streams the exact encoded payload into a finalized container temp. Decompresses,
 /// decodes and indexes the logical checkpoint BEFORE replacement. Cancellation
 /// after replacement never turns a committed write into a retryable save.
 pub fn save_compressed_snapshot(
@@ -177,11 +177,14 @@ fn save_with_operations(
     let submitted = request.snapshot.clone();
     let destination = std::path::absolute(&request.path)?;
     let mut prepared = PreparedCheckpoint::default();
+    let format = request.compression;
     let committed = commit_with_operations(
         request,
         |snapshot, file| {
-            recompress_payload(file, cancel, |mut writer| stream(snapshot, spool.as_ref(), plan, &mut writer, cancel))
-                .map_err(crate::compressed::CompressionError::into_io_error)?;
+            recompress_format_payload(format, file, cancel, |mut writer| {
+                stream(snapshot, spool.as_ref(), plan, &mut writer, cancel)
+            })
+            .map_err(crate::compressed::CompressionError::into_io_error)?;
             Ok(trimmed_rows)
         },
         |temp| {
@@ -244,7 +247,15 @@ fn prepare_checkpoint(
     cancelled(cancel)?;
     // This reader closes before Windows attempts replacement. Both retained
     // owners refer exclusively to different private files.
-    let body = prepare_gzip_payload(destination, &mut File::open(temp)?, private_parent, cancel)
+    let mut input = File::open(temp)?;
+    let mut prefix = [0; 8];
+    std::io::Read::read_exact(&mut input, &mut prefix)?;
+    std::io::Seek::rewind(&mut input)?;
+    let format = crate::compressed::detect_magic(&prefix)
+        .supported()
+        .filter(|format| *format != crate::compressed::CompressionFormat::Raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing compressed save signature"))?;
+    let body = prepare_payload(destination, &mut input, format, private_parent, cancel)
         .map_err(crate::compressed::CompressionError::into_io_error)?;
     prepared.body = Some(body);
     let decoded = DecodedBacking::prepare(
@@ -347,6 +358,31 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn every_container_atomic_save_preserves_format_and_encoded_edits() {
+        for format in
+            [CompressionFormat::Gzip, CompressionFormat::Zstd, CompressionFormat::Bzip2, CompressionFormat::Xz]
+        {
+            let f = Fixture::new();
+            let buffer = plain("edited é\r\n".as_bytes());
+            let mut request = f.request(&buffer, false);
+            request.compression = format;
+            let result =
+                save_compressed_snapshot(request, plan(Encoding::UTF16_LE, true), &f.root, &AtomicBool::new(false))
+                    .unwrap();
+            assert_eq!(logical(&result.saved.snapshot), "edited é\r\n".as_bytes());
+            assert_eq!(result.owners.body.format(), format);
+            assert_eq!(crate::compressed::detect_magic(&fs::read(f.path()).unwrap()).supported(), Some(format));
+            assert_eq!(result.owners.body.text_file().unwrap().resident_original_bytes(), 0);
+            drop(result.saved);
+            assert!(result.owners.try_retire().is_ok());
+            let owner = prepare_file(&f.path(), CompressionMode::Auto, &f.root, &AtomicBool::new(false)).unwrap();
+            assert_eq!(owner.text_file().unwrap().bytes().unwrap(), b"\xff\xfee\0d\0i\0t\0e\0d\0 \0\xe9\0\r\0\n\0");
+            assert!(owner.try_finish().is_ok());
+            f.only_destination();
+        }
     }
     fn unzip(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();

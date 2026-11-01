@@ -2412,6 +2412,7 @@ fn invoke(
             | "file.openHex"
             | "view.toggleHex"
             | "file.saveAs"
+            | "file.saveUncompressedAs"
             | "file.saveAll"
             | "file.close"
             | "file.closeAll"

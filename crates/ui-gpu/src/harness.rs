@@ -485,7 +485,10 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::UsabilityCapture("folder-replace-preview.bmp")),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_FOLDER_REPLACE_PROBE").is_some() {
+        let gzip = [(1800, Step::DismissSetup), (100, Step::GzipOpen), (1000, Step::GzipCheck), (100, Step::End)];
+        let steps = if std::env::var_os("KWIL_GZIP_PROBE").is_some() {
+            gzip.as_slice()
+        } else if std::env::var_os("KWIL_FOLDER_REPLACE_PROBE").is_some() {
             folder_replace.as_slice()
         } else if std::env::var_os("KWIL_TAB_MENU_PROBE").is_some() {
             tab_menu.as_slice()
@@ -1183,6 +1186,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             let mut bytes = Vec::new();
             document.snapshot().write_to(&mut bytes).unwrap();
             assert_eq!(bytes, include_bytes!("../../../examples/smoke/example.log"));
+            assert!(super::chrome::status(&app.view, 100).1.iter().any(|segment| segment.text.contains("gzip")));
+            assert!(app.render());
+            capture(app, dir.as_deref(), "gzip-open.bmp");
             if let Some(dir) = &dir {
                 std::fs::write(
                     dir.join("gzip-result.txt"),

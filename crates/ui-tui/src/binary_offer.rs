@@ -652,6 +652,46 @@ mod tests {
     }
 
     #[test]
+    fn compressed_terminal_badge_and_uncompressed_prompt_are_visible() {
+        let mut gzip = Vec::new();
+        kwil_core_workspace::compressed::recompress_format_payload(
+            kwil_core_workspace::compressed::CompressionFormat::Gzip,
+            &mut gzip,
+            &std::sync::atomic::AtomicBool::new(false),
+            |writer| std::io::Write::write_all(writer, b"hello compressed text\n"),
+        )
+        .unwrap();
+        let mut f = Fixture::new();
+        let id = f.open("log.gz", &gzip);
+        f.until("gzip editor", |f| f.view.editor().is_some());
+        f.settled(id);
+        assert_eq!(f.bytes(), b"hello compressed text\n");
+        assert!(f.paint().contains("gzip"));
+        assert!(kwil_core_commands::registry::COMMANDS.iter().any(|command| command.id == "file.saveUncompressedAs"));
+        f.view.file_command("file.saveUncompressedAs").unwrap();
+        assert_eq!(f.view.file_prompt().unwrap().kind, kwil_view_model::FilePromptKind::SaveUncompressedAs);
+        assert!(f.paint().contains("Save uncompressed as"));
+        f.view.file_prompt_mut().unwrap().text = f.root.join("log.gz").to_string_lossy().into();
+        f.press(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(f.view.notice().contains("Choose a different path"));
+        assert!(!f.view.file_saves_pending());
+        assert_eq!(std::fs::read(f.root.join("log.gz")).unwrap(), gzip);
+        f.view.file_command("file.saveUncompressedAs").unwrap();
+        let target = f.root.join("plain.txt");
+        f.view.file_prompt_mut().unwrap().text = target.to_string_lossy().into();
+        f.press(KeyCode::Enter, KeyModifiers::NONE);
+        f.until("uncompressed copy", |f| !f.view.file_saves_pending());
+        assert_eq!(std::fs::read(target).unwrap(), b"hello compressed text\n");
+        assert_eq!(std::fs::read(f.root.join("log.gz")).unwrap(), gzip);
+        assert_eq!(
+            f.view.editor().unwrap().document().compression,
+            kwil_core_workspace::compressed::CompressionFormat::Gzip
+        );
+        assert!(f.view.notice().contains("original document retained"));
+        f.finish();
+    }
+
+    #[test]
     fn binary_offer_terminal_detection_defers_to_current_file_settings_and_close_prompts() {
         let mut f = Fixture::new();
         f.view.set_session_restore(false);

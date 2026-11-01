@@ -223,7 +223,7 @@ impl WorkerBackings {
                     format!("unsupported compressed format: {format}"),
                 ));
             }
-            DetectedFormat::Gzip => return self.open_compressed(path, file, interpretation, cancel, publish),
+            _ => return self.open_compressed(path, file, interpretation, cancel, publish),
         }
         self.prepare(|parent| {
             let prepared = prepare_decoded_document(path, file, interpretation, parent, cancel, publish)?;
@@ -255,7 +255,7 @@ impl WorkerBackings {
             let mut document = prepared.document;
             // Save/watch/journal identity always names the compressed source.
             document.original = Some(original.clone());
-            document.compression = CompressionFormat::Gzip;
+            document.compression = owners.body.as_ref().unwrap().format();
             require_unchanged(&original)?;
             Ok(document)
         })();
@@ -283,7 +283,7 @@ impl WorkerBackings {
         let detected = source_format(original)?;
         match (compression, detected) {
             (CompressionFormat::Raw, DetectedFormat::Raw) => return compare(original),
-            (CompressionFormat::Gzip, DetectedFormat::Gzip) => (),
+            (format, detected) if detected.supported() == Some(format) => (),
             _ => return Ok(false),
         }
         let slot =
@@ -293,7 +293,7 @@ impl WorkerBackings {
         let mut owners = CompressedSaveRetirement { body: None, decoded: None };
         let result = (|| {
             owners.body = Some(
-                prepare_file(original.path(), CompressionMode::Gzip, &self.parent, cancel)
+                prepare_file(original.path(), compression.mode(), &self.parent, cancel)
                     .map_err(kwil_core_workspace::compressed::CompressionError::into_io_error)?,
             );
             require_unchanged(original)?;
@@ -336,17 +336,17 @@ impl WorkerBackings {
                         format!("unsupported compressed save format: {format}"),
                     ));
                 }
-                DetectedFormat::Gzip if request.compression == CompressionFormat::Raw => {
+                _ if request.compression == CompressionFormat::Raw => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "gzip original requires explicit gzip output policy",
+                        "compressed original requires explicit compressed output policy",
                     ));
                 }
-                DetectedFormat::Gzip => (),
+                _ => (),
             }
         }
         match request.compression {
-            CompressionFormat::Gzip => {
+            CompressionFormat::Gzip | CompressionFormat::Zstd | CompressionFormat::Bzip2 | CompressionFormat::Xz => {
                 let slot = self.slots.iter_mut().find(|slot| slot.is_none()).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::WouldBlock, "compressed checkpoint capacity retained")
                 })?;

@@ -385,6 +385,12 @@ pub enum DocumentRequest {
         request: SaveRequest,
         plan: SavePlan,
     },
+    /// Export an uncompressed copy; retain the source document's output policy.
+    ExportUncompressed {
+        document: DocumentId,
+        request: SaveRequest,
+        plan: SavePlan,
+    },
     ValidateReopen {
         document: DocumentId,
         generation: u64,
@@ -421,6 +427,11 @@ pub enum DocumentRequest {
 }
 
 pub enum DocumentResult {
+    ExportedUncompressed {
+        document: DocumentId,
+        revision: u64,
+        result: io::Result<()>,
+    },
     FolderApplied {
         generation: u64,
         index: u64,
@@ -1554,6 +1565,43 @@ impl DocumentWorker {
                                 None => Err(io::Error::other("Workspace storage is not prepared")),
                             };
                             complete(DocumentResult::Indexed { document, revision, result: result.map(Box::new) });
+                        }
+                        DocumentRequest::ExportUncompressed { document, request, plan } => {
+                            let revision = request.revision;
+                            let mut reserved =
+                                destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if let Some((owner, _, path)) = &reopening {
+                                reserved.push((*owner, path.clone()));
+                            }
+                            let result = validate_save_destination(document, &request.path, &reserved)
+                                .and_then(|()| {
+                                    if request.compression != kwil_core_workspace::compressed::CompressionFormat::Raw
+                                        || request.original.is_some()
+                                    {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidInput,
+                                            "uncompressed export requires an independent raw destination",
+                                        ));
+                                    }
+                                    let state = storage
+                                        .as_mut()
+                                        .ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
+                                    // Both the saved snapshot and its replaced source owners are
+                                    // dropped here on the worker, never on the frontend.
+                                    state.encoding.save(request, plan, &cancel).and_then(|saved| {
+                                        if saved.warnings.is_empty() {
+                                            Ok(())
+                                        } else {
+                                            Err(io::Error::other(format!(
+                                                "file committed at {} with warnings: {}",
+                                                saved.path.display(),
+                                                saved.warnings.join("; ")
+                                            )))
+                                        }
+                                    })
+                                })
+                                .map_err(|error| io::Error::new(error.kind(), error.to_string()));
+                            complete(DocumentResult::ExportedUncompressed { document, revision, result });
                         }
                         DocumentRequest::Save { document, request, plan } => {
                             let revision = request.revision;
