@@ -132,6 +132,9 @@ jobs:
 
   build-metrics:
     name: build metrics (${{ matrix.os }})
+    # Measure main, the weekly sample and manual runs; pull requests skip the
+    # extra clean builds so they never wait on them.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
