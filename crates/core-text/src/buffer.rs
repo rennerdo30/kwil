@@ -1821,7 +1821,8 @@ mod tests {
         buffer.insert(2, b"\xff").unwrap();
         let lines: Vec<Vec<u8>> =
             buffer.lines(0, 10).map(|line| line.unwrap().flat_map(Result::unwrap).copied().collect()).collect();
-        assert_eq!(lines, [b"on\xffe\rtwo".to_vec(), vec![], b"last".to_vec(), vec![]]);
+        // Line views split lone CR too; raw chunk ranges below keep its byte.
+        assert_eq!(lines, [b"on\xffe".to_vec(), b"two".to_vec(), vec![], b"last".to_vec(), vec![]]);
         let middle: Vec<_> = buffer.chunks(3..12).unwrap().flat_map(Result::unwrap).copied().collect();
         assert_eq!(middle, b"e\rtwo\r\n\nl");
         assert_eq!(buffer.chunks(2..2).unwrap().count(), 0);
