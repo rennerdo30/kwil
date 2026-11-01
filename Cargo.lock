@@ -2109,6 +2109,10 @@ version = "0.1.0-beta.6"
 dependencies = [
  "crossterm",
  "kwil-core-commands",
+ "kwil-core-markdown",
+ "kwil-core-runtime",
+ "kwil-core-syntax",
+ "kwil-core-text",
  "kwil-core-workspace",
  "kwil-update",
  "kwil-view-model",
