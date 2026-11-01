@@ -3519,6 +3519,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RegistrationReady => {
                 self.welcome_view.hits = Default::default();
+                self.settings_epoch = self.settings_epoch.wrapping_add(1);
                 if let Some(page) = &mut self.file_types {
                     page.service.worker_ready();
                 }

@@ -7,6 +7,9 @@ use std::{
 use winit::application::ApplicationHandler;
 use winit::event_loop::ActiveEventLoop;
 
+#[path = "harness_filetypes.rs"]
+mod filetypes;
+
 pub(super) fn hold_preview_completion(
     metrics: &mut Metrics,
     info: Option<kwil_view_model::workspace_document::ResultInfo>,
@@ -113,6 +116,10 @@ pub(crate) enum Step {
     PaletteOpen,
     PaletteClose,
     WelcomeProbe,
+    FileTypesSetup,
+    FileTypesRegister,
+    FileTypesCheck(bool),
+    FileTypesUnregister,
     WelcomeNext,
     WelcomeKeyboard,
     WelcomeScrollDamage,
@@ -232,6 +239,19 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::WelcomeLateInput),
             (100, Step::RecentMiddleClick),
             (200, Step::UsabilityCapture("welcome-complete.bmp")),
+            (100, Step::End),
+        ];
+        let file_types = [
+            (1800, Step::DismissSetup),
+            (100, Step::FileTypesSetup),
+            (600, Step::FileTypesCheck(false)),
+            (200, Step::UsabilityCapture("file-types-before.bmp")),
+            (100, Step::FileTypesRegister),
+            (800, Step::FileTypesCheck(true)),
+            (200, Step::UsabilityCapture("file-types-registered.bmp")),
+            (100, Step::FileTypesUnregister),
+            (800, Step::FileTypesCheck(false)),
+            (200, Step::UsabilityCapture("file-types-unregistered.bmp")),
             (100, Step::End),
         ];
         let resize = [
@@ -483,6 +503,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             daily.as_slice()
         } else if std::env::var_os("KWIL_RESIZE_PROBE").is_some() {
             resize.as_slice()
+        } else if std::env::var_os("KWIL_FILETYPES_PROBE").is_some() {
+            file_types.as_slice()
         } else if std::env::var_os("KWIL_WELCOME_PROBE").is_some() {
             welcome.as_slice()
         } else if std::env::var_os("KWIL_UI_USABILITY_CAPTURE").is_some() {
@@ -1033,6 +1055,10 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.view.editor().unwrap().document().revision() > revision);
         }
         Step::WelcomeProbe => welcome_probe(app, el),
+        Step::FileTypesSetup => filetypes::setup(app),
+        Step::FileTypesRegister => filetypes::register(app),
+        Step::FileTypesUnregister => filetypes::unregister(app),
+        Step::FileTypesCheck(registered) => filetypes::check(app, registered),
         Step::WelcomeNext => {
             app.welcome_action(super::welcome_ui::Action::Next);
             assert_eq!(app.welcome.stage(), super::welcome::Stage::FileTypes);
@@ -1713,6 +1739,20 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
     }
 }
+fn fake_journal(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(name);
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path).unwrap();
+    path
+}
+
 fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
     use kwil_core_commands::associations::{
         AssociationAdapter, AssociationError, AssociationPlatform, DefaultChoice, Location, StoredValue,
@@ -1767,7 +1807,7 @@ fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
     };
     let proxy = app.proxy.clone();
     let mut service = FileTypeRegistration::start(
-        root.join("fake-association-journal"),
+        fake_journal(&root, "fake-association-journal"),
         context,
         || Ok(NoNative),
         std::sync::Arc::new(move || {
@@ -1777,6 +1817,7 @@ fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
     .unwrap();
     *service.selection_mut() =
         kwil_core_commands::file_types::Selection::new(kwil_core_commands::file_types::Preset::CommonTextConfig);
+    service.status().unwrap();
     app.file_types = Some(super::filetypes_ui::Page { service, ui: Default::default() });
     app.apply(Damage { full: true, ..Default::default() });
     println!(

@@ -272,6 +272,8 @@ struct Resources {
     /// `None` until known (or when the platform's receipt cannot name them).
     registered: Option<Vec<Extension>>,
     chain: Chain,
+    refresh_after_action: bool,
+    after_refresh: Option<RegistrationStatus>,
     #[cfg(test)]
     submit_error: Option<SubmitError>,
 }
@@ -374,6 +376,8 @@ impl FileTypeRegistration {
                 status: RegistrationStatus::Idle,
                 registered: None,
                 chain: Chain::None,
+                refresh_after_action: false,
+                after_refresh: None,
                 #[cfg(test)]
                 submit_error: None,
             }),
@@ -459,6 +463,49 @@ impl FileTypeRegistration {
             None => (selected.len(), 0),
         }
     }
+    /// Register checked types while preserving every other current type.
+    pub fn register_checked(&mut self) -> Result<(), ActionError> {
+        self.update_checked(false, false)
+    }
+    /// Unregister only checked types, using the retained reversible receipt.
+    pub fn unregister_checked(&mut self) -> Result<(), ActionError> {
+        self.update_checked(true, false)
+    }
+    /// The catalog is filtered by the backend denylist as well as admission.
+    pub fn register_all_text(&mut self) -> Result<(), ActionError> {
+        self.update_checked(false, true)
+    }
+    fn update_checked(&mut self, remove: bool, all: bool) -> Result<(), ActionError> {
+        let action = RegistrationAction::Status;
+        if self.state().pending.is_some() || self.registered().is_none() {
+            return Err(ActionError { kind: ActionErrorKind::Busy, action });
+        }
+        let checked = if all {
+            Selection::new(kwil_core_commands::file_types::Preset::AllTextTypes)
+        } else {
+            self.selection().clone()
+        };
+        if checked.extensions().is_empty() {
+            return Err(ActionError { kind: ActionErrorKind::EmptySelection, action });
+        }
+        let mut target = Selection::from_extensions(self.registered().unwrap().iter().cloned());
+        for extension in checked.extensions() {
+            target
+                .toggle(extension.clone(), !remove)
+                .map_err(|error| ActionError { kind: ActionErrorKind::Extension(error), action: action.clone() })?;
+        }
+        if !remove && target.extensions() == self.registered().unwrap() {
+            // Repeated registration is a read-only refresh, not another undo
+            // and receipt consuming the finite transaction history.
+            return self.status().map(drop);
+        }
+        let before = std::mem::replace(self.selection_mut(), target);
+        if let Err(error) = self.apply() {
+            *self.selection_mut() = before;
+            return Err(error);
+        }
+        Ok(())
+    }
     /// Make the operating system match the checked types: one click, no review.
     pub fn apply(&mut self) -> Result<(), ActionError> {
         if self.state().pending.is_some() {
@@ -478,6 +525,8 @@ impl FileTypeRegistration {
         };
         if result.is_err() {
             self.state_mut().chain = Chain::None;
+        } else {
+            self.state_mut().refresh_after_action = self.state().pending.is_some();
         }
         result
     }
@@ -485,7 +534,9 @@ impl FileTypeRegistration {
     pub fn remove_all(&mut self) -> Result<(), ActionError> {
         let Some(journal_id) = self.state().recovery else { return Ok(()) };
         self.state_mut().chain = Chain::None;
-        self.unregister(journal_id).map(drop)
+        self.unregister(journal_id)?;
+        self.state_mut().refresh_after_action = true;
+        Ok(())
     }
     /// "Remove all" without a window (`kwil --unregister-file-types`, run by the
     /// Windows uninstaller): ask for the status, then undo the retained receipt.
@@ -543,6 +594,19 @@ impl FileTypeRegistration {
                 kind => format!("Applying stopped: {kind:?}"),
             };
             state.status = RegistrationStatus::Failed { message, recovery: state.recovery };
+        }
+        if self.state().pending.is_none() && std::mem::take(&mut self.state_mut().refresh_after_action) {
+            let finished = self.state().status.clone();
+            self.state_mut().after_refresh = Some(finished);
+            if let Err(error) = self.status() {
+                let state = self.state_mut();
+                state.after_refresh = None;
+                state.registered = None;
+                state.status = RegistrationStatus::Failed {
+                    message: format!("Cannot refresh file types: {:?}", error.kind),
+                    recovery: state.recovery,
+                };
+            }
         }
     }
     fn submit(&mut self, action: RegistrationAction) -> Result<RequestId, ActionError> {
@@ -650,7 +714,25 @@ impl FileTypeRegistration {
                 let reviewed = state.review.as_ref().ok_or(ActionErrorKind::StaleReview)?;
                 Ok((Request::Cancel { token: reviewed.token }, PendingKind::Cancel))
             }
-            RegistrationAction::Status => Ok((Request::Status, PendingKind::Status)),
+            RegistrationAction::Status => {
+                let request = if matches!(state.context.platform, AssociationPlatform::Windows) {
+                    let extensions: std::collections::BTreeSet<_> = kwil_core_commands::file_types::catalog()
+                        .iter()
+                        .map(|entry| entry.extension.to_owned())
+                        .chain(state.selection.extensions().iter().map(|e| e.as_str().to_owned()))
+                        .chain(state.registered.iter().flatten().map(|e| e.as_str().to_owned()))
+                        .chain(state.rows.iter().map(|row| row.extension.as_str().to_owned()))
+                        .filter(|e| kwil_core_commands::file_types::registration_allowed(e))
+                        .collect();
+                    Request::WindowsStatus {
+                        executable: state.context.executable.clone(),
+                        extensions: extensions.into_iter().collect(),
+                    }
+                } else {
+                    Request::Status
+                };
+                Ok((request, PendingKind::Status))
+            }
             RegistrationAction::Unregister { journal_id } => {
                 Ok((Request::Undo { journal_id: *journal_id }, PendingKind::Undo))
             }
@@ -685,6 +767,8 @@ impl FileTypeRegistration {
         }
         match &event.result {
             Err(error) => {
+                state.registered = None;
+                state.after_refresh = None;
                 state.recovery = error.recovery.or(state.recovery);
                 if matches!(pending.kind, PendingKind::Apply | PendingKind::Undo) {
                     for row in &mut state.rows {
@@ -765,6 +849,9 @@ impl FileTypeRegistration {
                 state.preview = None;
                 state.recovery = None;
                 state.registered = Some(Vec::new());
+                if matches!(state.chain, Chain::None) {
+                    state.selection = Selection::default();
+                }
                 for row in &mut state.rows {
                     row.outcome = ExtensionOutcome::RestoredVisible;
                     row.before = row.changed_values;
@@ -772,7 +859,21 @@ impl FileTypeRegistration {
                 }
                 state.status = RegistrationStatus::Unregistered { journal_id: *journal_id };
             }
-            Ok(Response::Status(status)) => inspect(state, status),
+            Ok(Response::Status(status)) => {
+                inspect(state, status);
+                if let Some(finished) = state.after_refresh.take() {
+                    state.status = finished;
+                }
+            }
+            Ok(Response::WindowsStatus { status, registered }) => {
+                inspect(state, status);
+                let registered: Vec<_> = registered.iter().filter_map(|e| Extension::parse(e).ok()).collect();
+                state.selection = Selection::from_extensions(registered.iter().cloned());
+                state.registered = Some(registered);
+                if let Some(finished) = state.after_refresh.take() {
+                    state.status = finished;
+                }
+            }
         }
         true
     }
