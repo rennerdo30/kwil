@@ -576,19 +576,22 @@ pub(crate) fn start(proxy: super::HostProxy) {
         let compare =
             [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
         let format = [
+            // The existing journal timer settles editor receipts after ~3 s.
+            // Give each mutation its finite worker window before asserting
+            // full idle; keep the complete script below the 45 s launch bound.
             (1800, Step::DismissSetup),
             (300, Step::FormatBefore(false)),
             (300, Step::Command("edit.formatDocument")),
-            (2500, Step::FormatAfter(false)),
+            (5000, Step::FormatAfter(false)),
             (100, Step::Command("edit.undo")),
-            (500, Step::FormatBefore(true)),
+            (4000, Step::FormatBefore(true)),
             (100, Step::Command("edit.formatSelection")),
-            (2500, Step::FormatAfter(true)),
+            (5000, Step::FormatAfter(true)),
             (100, Step::Command("edit.undo")),
-            (500, Step::FormatUndo),
+            (4000, Step::FormatUndo),
             (100, Step::Command("edit.redo")),
-            (500, Step::Command("file.save")),
-            (1000, Step::FormatSaved),
+            (4000, Step::Command("file.save")),
+            (4000, Step::FormatSaved),
             (2000, Step::End),
         ];
         let tab_menu = [
