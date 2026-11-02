@@ -64,7 +64,7 @@ pub(super) fn input(
                 view.set_notice("Wrap shutdown is pending; file input was not applied".into());
                 return KeyResult::Changed(true);
             }
-            if let Err(error) = view.open_path(path.with_file_name("missing-palette-file.txt")) {
+            if let Err(error) = view.open_path(path) {
                 view.set_notice(error.to_string());
             }
             KeyResult::Changed(true)
