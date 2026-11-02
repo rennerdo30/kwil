@@ -1439,9 +1439,6 @@ impl Workspace {
         restore: impl FnOnce(&std::path::Path, Vec<String>) -> io::Result<()> + Send + 'static,
     ) {
         assert!(!self.files.document_started, "session policy must precede worker startup");
-        if matches!(window, kwil_core_workspace::window_session::WindowSession::New) {
-            self.use_transient_session();
-        }
         self.files.window_session = Some((window, Box::new(restore)));
     }
 
