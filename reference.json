@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "source_head": "2a297eb814064f68144c91a8df665855fe1eace2",
-  "source_merge": "75cbc9e7ab5029b8b0c3dee0b57ff91ef243f784",
-  "run": "https://github.com/rennerdo30/kwil/actions/runs/39834499282",
-  "note": "Parent-approved reviewed-main baseline after KW-16/KW-25 integration; all hard limits and the >10% rule unchanged."
+  "source_head": "af0bb5ebb13212e6733da91e33a70f6f9140bebe",
+  "source_merge": "af0bb5ebb13212e6733da91e33a70f6f9140bebe",
+  "run": "https://github.com/rennerdo30/kwil/actions/runs/41455882338",
+  "note": "Owner decision 2026-11-02 (KW-9), coordinator-approved refresh: exact Linux result from main after #84; accepted stored-memory regression only. Windows result retained unchanged from run 39834499282. All hard limits and the >10% rule unchanged."
 }
