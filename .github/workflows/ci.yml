@@ -99,6 +99,26 @@ jobs:
           [ -f "$exe.exe" ] && exe="$exe.exe"
           "$exe" --version
           "$exe" --help > /dev/null
+      - name: Real process-kill recovery (Windows and Linux)
+        if: runner.os != 'macOS'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          exe=target/debug/kwil
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a python3 scripts/test-crash-recovery.py "$exe" target/crash-recovery
+          else
+            python scripts/test-crash-recovery.py "$exe" target/crash-recovery
+          fi
+      - name: Recovery captures, PID receipts and isolated profiles
+        if: always() && runner.os != 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: crash-recovery-${{ matrix.os }}
+          path: target/crash-recovery/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Compiler cache statistics
         if: always() && steps.sccache.outcome == 'success'
         run: sccache --show-stats
