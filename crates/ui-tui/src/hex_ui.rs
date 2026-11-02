@@ -397,13 +397,17 @@ pub(super) fn status(frame: &mut ratatui::Frame<'_>, area: Rect, session: &Sessi
 /// OSC 52 uses only base64 ASCII, so neither binary bytes nor terminal control
 /// sequences from the file can escape into terminal commands.
 pub(super) fn copy_ready(workspace: &mut Workspace) {
-    use std::io::Write;
     let Some(text) = workspace.hex_session_mut().and_then(|session| session.take_copy()) else { return };
-    let encoded = base64(text.as_bytes());
-    let result = write!(std::io::stdout().lock(), "\x1b]52;c;{encoded}\x07");
+    let result = write_clipboard(&mut std::io::stdout().lock(), &text);
     workspace.set_notice(
         result.map_or_else(|error| error.to_string(), |_| "Hex selection sent to terminal clipboard (OSC 52)".into()),
     );
+}
+/// Shared terminal transport; callers validate the copied content in the model.
+pub(super) fn write_clipboard(output: &mut impl std::io::Write, text: &str) -> std::io::Result<()> {
+    let encoded = base64(text.as_bytes());
+    write!(output, "\x1b]52;c;{encoded}\x07")?;
+    output.flush()
 }
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
