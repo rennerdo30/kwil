@@ -2,6 +2,8 @@
 //! Escape strings here are presentation only, never editable model storage.
 
 use super::*;
+#[path = "decoded_preview_iso.rs"]
+mod iso;
 
 pub struct DecodedPreview {
     pub text: Vec<u8>,
@@ -17,6 +19,9 @@ pub fn decode_preview(
     interpretation: Interpretation,
     cancel: &AtomicBool,
 ) -> Result<DecodedPreview, BackingError> {
+    if interpretation.encoding.iso2022() {
+        return iso::iso_preview(source, cancel);
+    }
     cancelled(cancel)?;
     Interpretation::new(interpretation.encoding, interpretation.bom_len as usize)?;
     check_source(source)?;

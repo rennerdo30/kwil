@@ -42,6 +42,8 @@ mod utf32_tests;
 pub const CHECKPOINT_RAW_BYTES: usize = 64 << 10;
 const SCRATCH: usize = 16 << 10;
 const RECORD: usize = 16;
+#[path = "decoded_backing_iso.rs"]
+mod iso;
 const OPAQUE: u8 = 0xff;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -385,7 +387,7 @@ impl DecodedBacking {
     /// it; externally mutable pages never become the immutable origin.
     /// Source checks remain enabled and run before/after the bounded copy.
     /// Interpretation is explicit and immutable, including UTF-32 endianness.
-    /// ISO-2022-JP remains unsupported; no stateful replay is introduced.
+    /// ISO-2022-JP records the active charset at sparse complete-character checkpoints.
     pub fn prepare(
         source: &TextFile,
         interpretation: Interpretation,
@@ -537,11 +539,11 @@ impl DecodedSnapshot {
         Arc::ptr_eq(&self.storage, &other.storage)
     }
     pub fn checkpoint_count(&self) -> usize {
-        self.storage.checkpoints.len() / RECORD
+        self.storage.checkpoints.len() / self.record_size()
     }
 
     fn checkpoint(&self, i: usize) -> (u64, u64) {
-        let record = &self.storage.checkpoints[i * RECORD..(i + 1) * RECORD];
+        let record = &self.storage.checkpoints[i * self.record_size()..i * self.record_size() + RECORD];
         (u64::from_le_bytes(record[..8].try_into().unwrap()), u64::from_le_bytes(record[8..].try_into().unwrap()))
     }
     fn floor(&self, position: u64, logical: bool) -> usize {
@@ -567,6 +569,9 @@ impl DecodedSnapshot {
         self.resolve(position, false)
     }
     fn resolve(&self, position: u64, logical: bool) -> Result<Boundary, BackingError> {
+        if self.interpretation().encoding.iso2022() {
+            return self.iso_resolve(position, logical);
+        }
         let raw_bytes = self.raw_bytes();
         if position > if logical { self.logical_bytes().len() as u64 } else { raw_bytes.len() as u64 } {
             return Err(BackingError::InvalidRange);
@@ -606,7 +611,21 @@ impl DecodedSnapshot {
                 if logical == self.logical_bytes().len() as u64 {
                     return Ok(None);
                 }
-                let atom = next_atom(self.interpretation().encoding, &self.raw_bytes()[raw as usize..])?;
+                let atom = if self.interpretation().encoding.iso2022() {
+                    let state = self.iso_state_at(raw)?;
+                    let atom = crate::encoding::iso2022::atom(&self.raw_bytes()[raw as usize..], state, true)?;
+                    AtomSize {
+                        raw: atom.raw,
+                        logical: atom.len,
+                        kind: if state == crate::encoding::iso2022::State::Raw {
+                            AtomKind::Opaque
+                        } else {
+                            AtomKind::Text
+                        },
+                    }
+                } else {
+                    next_atom(self.interpretation().encoding, &self.raw_bytes()[raw as usize..])?
+                };
                 (logical..logical + atom.logical as u64, raw..raw + atom.raw as u64, atom.kind)
             }
             Boundary::Bom { .. } => return Err(BackingError::DecoderContract),
@@ -629,7 +648,9 @@ impl DecodedSnapshot {
     /// the requested range. Retains no per-character collection.
     pub fn atoms(&self, logical: Range<u64>) -> Result<Atoms<'_>, BackingError> {
         let raw = self.raw_range(logical.clone())?;
-        Ok(Atoms { origin: self, logical: logical.start, raw: raw.start, end: raw.end })
+        let iso_state =
+            if self.interpretation().encoding.iso2022() { Some(self.iso_state_at(raw.start)?) } else { None };
+        Ok(Atoms { origin: self, logical: logical.start, raw: raw.start, end: raw.end, iso_state })
     }
 
     /// Validates BOTH endpoints before any output. Interior endpoints return
@@ -687,6 +708,14 @@ impl DecodedSnapshot {
         cancel: &AtomicBool,
         admit: &mut impl FnMut(usize) -> io::Result<()>,
     ) -> Result<Boundary, BackingError> {
+        if self.interpretation().encoding.iso2022() {
+            return ResumeBoundary::new(self, position)
+                .poll(self, cancel, &mut |n| {
+                    admit(n)?;
+                    Ok(true)
+                })?
+                .ok_or(BackingError::DecoderContract);
+        }
         cancelled(cancel)?;
         if position > self.logical_bytes().len() as u64 {
             return Err(BackingError::InvalidRange);
@@ -757,6 +786,7 @@ pub struct Atoms<'a> {
     logical: u64,
     raw: u64,
     end: u64,
+    iso_state: Option<crate::encoding::iso2022::State>,
 }
 impl<'a> Iterator for Atoms<'a> {
     type Item = Result<Atom<'a>, BackingError>;
@@ -764,10 +794,28 @@ impl<'a> Iterator for Atoms<'a> {
         if self.raw == self.end {
             return None;
         }
-        let size = match next_atom(
-            self.origin.interpretation().encoding,
-            &self.origin.raw_bytes()[self.raw as usize..self.end as usize],
-        ) {
+        let result = if let Some(state) = self.iso_state {
+            crate::encoding::iso2022::atom(&self.origin.raw_bytes()[self.raw as usize..], state, true)
+                .map(|atom| {
+                    self.iso_state = Some(atom.state);
+                    AtomSize {
+                        raw: atom.raw,
+                        logical: atom.len,
+                        kind: if state == crate::encoding::iso2022::State::Raw {
+                            AtomKind::Opaque
+                        } else {
+                            AtomKind::Text
+                        },
+                    }
+                })
+                .map_err(BackingError::from)
+        } else {
+            next_atom(
+                self.origin.interpretation().encoding,
+                &self.origin.raw_bytes()[self.raw as usize..self.end as usize],
+            )
+        };
+        let size = match result {
             Ok(size) => size,
             Err(e) => {
                 self.raw = self.end;
@@ -934,6 +982,9 @@ fn build(
     index: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<(), BackingError> {
+    if interpretation.encoding.iso2022() {
+        return iso::build_iso(raw, logical, index, cancel);
+    }
     let mut at = interpretation.bom_len as usize;
     let mut length = 0;
     checkpoint(index, at, length)?;
@@ -979,18 +1030,31 @@ pub(crate) struct AtomSize {
     pub(crate) kind: AtomKind,
 }
 
-/// Fixed-size worker replay state. No source owner is cloned here: the source
-/// cursor pins the immutable generation and lends it for each admitted step.
+/// Fixed-size worker replay state. ISO replay retains the immutable origin
+/// while seeking from its sparse checkpoint; other codecs borrow caller bytes.
 /// A denied byte visit retains the actual decoder, including pending lead bytes.
 pub(crate) struct ResumeAtom {
     decoder: Decoder,
     encoding: Encoding,
     consumed: usize,
     text: [u8; 8],
+    iso: Option<iso::Replay>,
 }
 impl ResumeAtom {
     pub(crate) fn new(encoding: Encoding) -> Self {
-        Self { decoder: encoding.decoder(), encoding, consumed: 0, text: [0; 8] }
+        Self { decoder: encoding.decoder(), encoding, consumed: 0, text: [0; 8], iso: None }
+    }
+
+    pub(crate) fn at(origin: &DecodedSnapshot, raw: u64, state: Option<crate::encoding::iso2022::State>) -> Self {
+        let encoding = origin.interpretation().encoding;
+        let mut atom = Self::new(encoding);
+        if encoding.iso2022() {
+            atom.iso = Some(iso::Replay::new(origin, raw, state));
+        }
+        atom
+    }
+    pub(crate) fn iso_state(&self) -> Option<crate::encoding::iso2022::State> {
+        self.iso.as_ref().map(|replay| replay.state)
     }
 
     pub(crate) fn poll(
@@ -999,6 +1063,14 @@ impl ResumeAtom {
         cancel: &AtomicBool,
         admit: &mut impl FnMut(usize) -> io::Result<bool>,
     ) -> Result<Option<AtomSize>, BackingError> {
+        if let Some(replay) = &mut self.iso {
+            return replay.poll(cancel, admit).map(|result| {
+                result.map(|(size, text)| {
+                    self.text = text;
+                    size
+                })
+            });
+        }
         loop {
             if self.consumed >= raw.len() || self.consumed == 4 {
                 return Err(BackingError::DecoderContract);
@@ -1075,6 +1147,7 @@ pub(crate) struct ResumeBoundary {
     raw: u64,
     logical: u64,
     atom: Option<ResumeAtom>,
+    iso_state: Option<crate::encoding::iso2022::State>,
 }
 impl ResumeBoundary {
     pub(crate) fn new(origin: &DecodedSnapshot, position: u64) -> Self {
@@ -1088,6 +1161,7 @@ impl ResumeBoundary {
             raw: 0,
             logical: 0,
             atom: None,
+            iso_state: None,
         }
     }
     pub(crate) fn poll(
@@ -1103,7 +1177,7 @@ impl ResumeBoundary {
         while self.low < self.high {
             let mid = self.low + (self.high - self.low) / 2;
             cancelled(cancel)?;
-            if !admit(RECORD)? {
+            if !admit(origin.record_size())? {
                 return Ok(None);
             }
             cancelled(cancel)?;
@@ -1129,7 +1203,7 @@ impl ResumeBoundary {
                 return Err(BackingError::DecoderContract);
             }
             cancelled(cancel)?;
-            if !admit(RECORD)? {
+            if !admit(origin.record_size())? {
                 return Ok(None);
             }
             cancelled(cancel)?;
@@ -1140,10 +1214,11 @@ impl ResumeBoundary {
             if self.raw >= end {
                 return Err(BackingError::DecoderContract);
             }
-            let atom = self.atom.get_or_insert_with(|| ResumeAtom::new(origin.interpretation().encoding));
+            let atom = self.atom.get_or_insert_with(|| ResumeAtom::at(origin, self.raw, self.iso_state));
             let Some(size) = atom.poll(&origin.raw_bytes()[self.raw as usize..end as usize], cancel, admit)? else {
                 return Ok(None);
             };
+            self.iso_state = self.atom.as_ref().and_then(ResumeAtom::iso_state);
             self.atom = None;
             let next_raw = self.raw + size.raw as u64;
             let next_logical = self.logical + size.logical as u64;
@@ -1963,7 +2038,7 @@ mod tests {
         ));
         assert_eq!(fs::read_dir(&fixture.directory).unwrap().count(), 1);
         assert_eq!(fs::read(&fixture.source).unwrap(), b"changed source length");
-        for label in ["iso-2022-jp", "utf-32", "replacement"] {
+        for label in ["utf-32", "replacement"] {
             assert!(Encoding::for_label(label).is_err(), "{label}");
         }
         assert_eq!(Encoding::for_label("utf-32le").unwrap(), Encoding::UTF32_LE);

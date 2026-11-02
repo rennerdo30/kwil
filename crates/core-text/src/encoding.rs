@@ -11,9 +11,9 @@
 //! indexing nor saving retains decoded text. TextFile's mapped-read contract,
 //! including its external-truncation caveat, also applies here.
 //!
-//! V1 supports all stateless encoding_rs encodings. ISO-2022-JP returns an
-//! explicit `UnsupportedEncoding`: its shifted state needs a future checkpoint
-//! representation (known limitation KW-45). UTF-32 LE/BE use the same bounded
+//! ISO-2022-JP stores its active charset at sparse complete-character
+//! checkpoints. Malformed stateful input falls back to lossless opaque bytes.
+//! UTF-32 LE/BE use the same bounded
 //! codec, backing and provenance contracts; no encoding replays the whole file.
 
 use crate::index_memory::{INDEX_MEMORY_BYTES, IndexMemory, IndexVec};
@@ -26,6 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod codec;
+pub(crate) mod iso2022;
+mod iso_file;
 pub(crate) use codec::{Decoder, Encoder};
 
 #[cfg(test)]
@@ -58,6 +60,7 @@ enum Codec {
 }
 
 impl Encoding {
+    pub const ISO2022_JP: Self = Self(Codec::Rs(encoding_rs::ISO_2022_JP));
     pub const UTF8: Self = Self(Codec::Rs(encoding_rs::UTF_8));
     pub const UTF16_LE: Self = Self(Codec::Rs(encoding_rs::UTF_16LE));
     pub const UTF16_BE: Self = Self(Codec::Rs(encoding_rs::UTF_16BE));
@@ -65,8 +68,7 @@ impl Encoding {
     pub const UTF32_BE: Self = Self(Codec::Utf32Be);
 
     /// WHATWG labels, including Windows-1252, Shift_JIS, EUC-JP, GB18030,
-    /// GBK, Big5 and KOI8-R. Stateful ISO-2022-JP requires a different checkpoint
-    /// representation and is explicitly refused rather than replaying a file.
+    /// GBK, Big5, KOI8-R and checkpointed ISO-2022-JP.
     pub fn for_label(label: &str) -> Result<Self, EncodingError> {
         let trimmed = label.trim_matches(&['\t', '\n', '\x0c', '\r', ' '][..]);
         if trimmed.eq_ignore_ascii_case("utf-32le") {
@@ -81,7 +83,7 @@ impl Encoding {
     }
 
     fn checked(encoding: &'static encoding_rs::Encoding) -> Result<Self, EncodingError> {
-        if encoding == encoding_rs::ISO_2022_JP || encoding == encoding_rs::REPLACEMENT {
+        if encoding == encoding_rs::REPLACEMENT {
             Err(EncodingError::UnsupportedEncoding(encoding.name().to_owned()))
         } else {
             Ok(Self(Codec::Rs(encoding)))
@@ -94,6 +96,10 @@ impl Encoding {
             Codec::Utf32Le => "UTF-32LE",
             Codec::Utf32Be => "UTF-32BE",
         }
+    }
+
+    pub(crate) fn iso2022(self) -> bool {
+        self == Self::ISO2022_JP
     }
 
     fn utf16(self) -> bool {
@@ -133,7 +139,7 @@ impl Encoding {
     }
 
     pub(crate) fn ascii_compatible(self) -> bool {
-        self.fixed_width() == 1
+        self.fixed_width() == 1 && !self.iso2022()
     }
 
     pub(crate) fn unit(self, bytes: &[u8], at: usize) -> Option<u32> {
@@ -182,9 +188,6 @@ impl std::fmt::Display for EncodingError {
         match self {
             Self::Read(e) => e.fmt(f),
             Self::Io(e) => e.fmt(f),
-            Self::UnsupportedEncoding(name) if name == "ISO-2022-JP" => {
-                f.write_str("ISO-2022-JP is not supported yet (known limitation, KW-45)")
-            }
             Self::UnsupportedEncoding(name) => write!(f, "unsupported encoding: {name}"),
             Self::InvalidRange => f.write_str("byte range outside source"),
             Self::ViewportTooLarge => f.write_str("viewport exceeds 1 MiB; request a column range or stream"),
@@ -332,6 +335,11 @@ fn detect_bytes(bytes: &[u8], chosen: Option<Encoding>) -> Result<Detection, Enc
         Encoding::UTF16_LE
     } else if looks_utf16(bytes, &ranges, false) {
         Encoding::UTF16_BE
+    } else if ranges
+        .iter()
+        .any(|r| bytes[r.clone()].windows(3).any(|s| matches!(s, b"\x1b$B" | b"\x1b$@" | b"\x1b(J" | b"\x1b(I")))
+    {
+        Encoding::ISO2022_JP
     } else if sample_is_utf8 && !ranges.iter().any(|range| memchr::memchr(0x1b, &bytes[range.clone()]).is_some()) {
         Encoding::UTF8
     } else {
@@ -468,9 +476,10 @@ pub struct DecodedRange<'a> {
 
 #[derive(Debug)]
 pub struct DecodeIndex {
-    /// Known neutral decoder states at original source byte offsets.
+    /// Restartable decoder states at original source byte offsets.
     checkpoints: Vec<Checkpoint>,
     line_count: u64,
+    raw_mode: bool,
 }
 
 #[derive(Debug)]
@@ -478,6 +487,7 @@ struct Checkpoint {
     offset: u64,
     line: u64,
     line_start: u64,
+    iso: iso2022::State,
 }
 
 impl DecodeIndex {
@@ -567,6 +577,13 @@ impl EncodedFile {
             return Ok(index);
         }
         let encoding = self.detection.encoding;
+        if encoding.iso2022() {
+            self.index.scanned.store(0, Ordering::Relaxed);
+            let index = self.build_iso_index(limit)?;
+            self.index.scanned.store(self.file.len(), Ordering::Relaxed);
+            let _ = self.index.ready.set(index);
+            return Ok(self.index().unwrap());
+        }
         self.index.scanned.store(0, Ordering::Relaxed);
         let mut decoder = encoding.decoder();
         let mut checkpoints = IndexVec::new(&IndexMemory::new(limit));
@@ -574,6 +591,7 @@ impl EncodedFile {
             offset: self.detection.bom_len as u64,
             line: 0,
             line_start: self.detection.bom_len as u64,
+            iso: iso2022::State::Ascii,
         })?;
         let mut line_count = 1;
         let mut line_start = self.detection.bom_len as u64;
@@ -619,13 +637,18 @@ impl EncodedFile {
             });
             offset = base + end as u64;
             if offset < self.file.len() {
-                checkpoints.push(Checkpoint { offset, line: line_count - 1, line_start })?;
+                checkpoints.push(Checkpoint {
+                    offset,
+                    line: line_count - 1,
+                    line_start,
+                    iso: iso2022::State::Ascii,
+                })?;
             }
             self.index.scanned.store(offset, Ordering::Relaxed);
         }
         self.file.validate_source()?;
         self.index.scanned.store(self.file.len(), Ordering::Relaxed);
-        let _ = self.index.ready.set(DecodeIndex { checkpoints: checkpoints.into_vec(), line_count });
+        let _ = self.index.ready.set(DecodeIndex { checkpoints: checkpoints.into_vec(), line_count, raw_mode: false });
         Ok(self.index().unwrap())
     }
 
@@ -677,6 +700,9 @@ impl EncodedFile {
         self.check_range(&range)?;
         if range.len_u64() > MAX_VIEWPORT_BYTES as u64 {
             return Err(EncodingError::ViewportTooLarge);
+        }
+        if self.detection.encoding.iso2022() {
+            return self.decode_iso_range(range);
         }
         let start = (range.start as usize).max(self.detection.bom_len);
         let end = (range.end as usize).max(start);
@@ -987,6 +1013,9 @@ impl EncodedFile {
     }
 
     fn stream_save(&self, snapshot: &Snapshot, plan: SavePlan, writer: &mut impl Write) -> Result<(), EncodingError> {
+        if self.detection.encoding.iso2022() {
+            return self.stream_iso_save(snapshot, plan, writer);
+        }
         if plan.bom && plan.encoding.bom_bytes().is_empty() {
             return Err(EncodingError::UnsupportedEncoding(format!("BOM for {}", plan.encoding.name())));
         }
@@ -1021,7 +1050,7 @@ impl EncodedFile {
                     }
                     let bytes = &bytes[(start - range.start) as usize..];
                     if preserve {
-                        output.writer.write_all(bytes)?;
+                        output.write_bytes(bytes)?;
                     } else if plan.encoding == self.detection.encoding {
                         output.copy_raw(bytes, self.detection.encoding)?;
                     } else {
@@ -1139,11 +1168,20 @@ struct TextOutput<'a, W> {
     encoder: Encoder,
     writer: &'a mut W,
     pending_cr: bool,
+    iso_raw_state: Option<iso2022::State>,
+    iso_pending: Vec<u8>,
 }
 
 impl<'a, W: Write> TextOutput<'a, W> {
     fn new(plan: SavePlan, writer: &'a mut W) -> Self {
-        Self { plan, encoder: plan.encoding.encoder(), writer, pending_cr: false }
+        Self {
+            plan,
+            encoder: plan.encoding.encoder(),
+            writer,
+            pending_cr: false,
+            iso_raw_state: None,
+            iso_pending: Vec::new(),
+        }
     }
     fn feed(&mut self, text: &str) -> Result<(), EncodingError> {
         let Some(ending) = self.plan.line_ending else {
@@ -1187,7 +1225,7 @@ impl<'a, W: Write> TextOutput<'a, W> {
                     self.encode(ending.text())?;
                     self.pending_cr = false;
                 }
-                self.writer.write_all(&bytes[start..at])?;
+                self.write_bytes(&bytes[start..at])?;
             }
             if self.pending_cr {
                 self.encode(ending.text())?;
@@ -1219,15 +1257,95 @@ impl<'a, W: Write> TextOutput<'a, W> {
                 self.encode(ending.text())?;
                 self.pending_cr = false;
             }
-            self.writer.write_all(&bytes[start..])?;
+            self.write_bytes(&bytes[start..])?;
         }
         Ok(())
     }
+    fn flush_iso_pending(&mut self) -> Result<(), EncodingError> {
+        if !self.iso_pending.is_empty() {
+            self.writer.write_all(&self.iso_pending)?;
+        }
+        self.iso_pending.clear();
+        Ok(())
+    }
+    fn write_bytes(&mut self, mut bytes: &[u8]) -> Result<(), EncodingError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !self.plan.encoding.iso2022() || self.iso_raw_state == Some(iso2022::State::Raw) {
+            self.writer.write_all(bytes)?;
+            return Ok(());
+        }
+        while !bytes.is_empty() {
+            if !self.iso_pending.is_empty() {
+                if self.iso_pending.len() < 3 {
+                    let n = (3 - self.iso_pending.len()).min(bytes.len());
+                    self.iso_pending.extend_from_slice(&bytes[..n]);
+                    bytes = &bytes[n..];
+                    continue;
+                }
+                // A designation following another supersedes it. Keep the
+                // last one without introducing a WHATWG output-flag error.
+                if bytes[0] == 0x1b {
+                    self.iso_pending.clear();
+                } else {
+                    self.flush_iso_pending()?;
+                }
+            }
+            let n = memchr::memchr(0x1b, bytes).unwrap_or(bytes.len());
+            self.writer.write_all(&bytes[..n])?;
+            bytes = &bytes[n..];
+            if !bytes.is_empty() {
+                self.iso_pending.push(0x1b);
+                bytes = &bytes[1..];
+            }
+        }
+        Ok(())
+    }
+    fn iso_begin(&mut self, state: iso2022::State) -> Result<(), EncodingError> {
+        if self.pending_cr {
+            self.encode(self.plan.line_ending.unwrap().text())?;
+            self.pending_cr = false;
+        }
+        let current = match self.iso_raw_state {
+            Some(current) => current,
+            None => {
+                self.flush_encoder()?;
+                iso2022::State::Ascii
+            }
+        };
+        if state != iso2022::State::Raw && current != state {
+            self.write_bytes(state.escape())?;
+        }
+        if state == iso2022::State::Raw {
+            self.flush_iso_pending()?;
+        }
+        self.iso_raw_state = Some(state);
+        Ok(())
+    }
+    fn flush_encoder(&mut self) -> Result<(), EncodingError> {
+        let mut scratch = [0; 32];
+        let (result, _, written) = self.encoder.encode_from_utf8_without_replacement("", &mut scratch, true);
+        if result != EncoderResult::InputEmpty {
+            return Err(EncodingError::MalformedSource);
+        }
+        self.write_bytes(&scratch[..written])?;
+        Ok(())
+    }
     fn encode(&mut self, mut text: &str) -> Result<(), EncodingError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if let Some(state) = self.iso_raw_state.take() {
+            if state != iso2022::State::Ascii {
+                self.write_bytes(iso2022::State::Ascii.escape())?;
+            }
+            self.encoder = self.plan.encoding.encoder();
+        }
         let mut scratch = [0u8; SCRATCH];
         loop {
             let (result, read, written) = self.encoder.encode_from_utf8_without_replacement(text, &mut scratch, false);
-            self.writer.write_all(&scratch[..written])?;
+            self.write_bytes(&scratch[..written])?;
             text = &text[read..];
             match result {
                 EncoderResult::InputEmpty => return Ok(()),
@@ -1243,6 +1361,9 @@ impl<'a, W: Write> TextOutput<'a, W> {
             self.encode(self.plan.line_ending.unwrap().text())?;
             self.pending_cr = false;
         }
-        Ok(()) // Supported encoders have no final shift sequence.
+        if self.iso_raw_state.is_none() {
+            self.flush_encoder()?;
+        }
+        self.flush_iso_pending()
     }
 }

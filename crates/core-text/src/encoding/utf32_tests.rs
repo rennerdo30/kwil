@@ -93,7 +93,7 @@ fn utf32_labels_boms_binary_classification_and_utf16_override() {
     let view = source.decode_range(0..6).unwrap();
     assert_eq!(view.segments, vec![DisplaySegment::Text(Cow::Borrowed("\0A"))]);
     assert!(Encoding::for_label("utf-32").is_err());
-    assert!(Encoding::for_label("iso-2022-jp").is_err());
+    assert_eq!(Encoding::for_label("iso-2022-jp").unwrap(), Encoding::ISO2022_JP);
 }
 
 #[test]

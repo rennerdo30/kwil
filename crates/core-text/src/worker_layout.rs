@@ -732,7 +732,7 @@ impl LayoutProvenanceQuery {
                             self.decoded = Some(Decode::Atom {
                                 at: logical,
                                 raw,
-                                decoder: ResumeAtom::new(source.origin.interpretation().encoding),
+                                decoder: ResumeAtom::at(&source.origin, raw, None),
                             })
                         }
                         other => break other,

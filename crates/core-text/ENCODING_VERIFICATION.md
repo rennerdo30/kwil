@@ -46,10 +46,11 @@ Starting base: `778e875098a04badc3c4e3d14afefecd5cf5301c`.
   Same-encoding ending normalization changes only newline bytes; explicit
   encoding conversion refuses malformed input rather than replacing it.
   Atomic destination replacement, fsync and attributes remain KW-19.
-- **Known v1 limitation (KW-45): ISO-2022-JP is unsupported.** Opening a detected
-  ISO-2022-JP file or choosing its label returns
-  `ISO-2022-JP is not supported yet (known limitation, KW-45)`. The fixture test
-  asserts this rather than accepting garbled ASCII/UTF-8.
+- **KW-45: ISO-2022-JP read/save** resumes from sparse charset checkpoints,
+  including long shifted runs. Same-encoding saves preserve source bytes and
+  restore the source charset around inserted text. Malformed ISO input uses
+  opaque raw bytes; cross-encoding conversion refuses it before output.
+  ISO-2022-KR, ISO-2022-CN and HZ-GB-2312 remain out of scope.
 
 ## KW-64 UTF-32 candidate
 

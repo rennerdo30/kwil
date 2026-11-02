@@ -1255,6 +1255,11 @@ impl<'a> ImportBuilder<'a> {
     /// Keep only noncanonical valid atoms. The common canonical path retains
     /// its existing add-byte accounting; comparison uses fixed scalar scratch.
     fn original_text(&mut self, text: &str, raw: &[u8]) -> io::Result<()> {
+        // Detached ISO text is encoded in its destination context. Its source
+        // charset lives in the origin checkpoints, not in this raw fragment.
+        if self.encoding.iso2022() {
+            return self.text(text.as_bytes());
+        }
         let mut scratch = [0u8; 32];
         let canonical = if self.encoding == Encoding::UTF8 || text.is_ascii() && self.encoding.ascii_compatible() {
             text.as_bytes() == raw
