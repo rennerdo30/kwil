@@ -107,9 +107,9 @@ jobs:
           exe=target/debug/kwil
           [ -f "$exe.exe" ] && exe="$exe.exe"
           if [ "$RUNNER_OS" = Linux ]; then
-            xvfb-run -a python3 scripts/test-crash-recovery.py "$exe" target/crash-recovery
+            xvfb-run -a python3 scripts/test-crash-recovery.py "$exe" target/crash-recovery --negative-control
           else
-            python scripts/test-crash-recovery.py "$exe" target/crash-recovery
+            python scripts/test-crash-recovery.py "$exe" target/crash-recovery --negative-control
           fi
       - name: Recovery captures, PID receipts and isolated profiles
         if: always() && runner.os != 'macOS'
