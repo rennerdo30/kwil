@@ -1,7 +1,7 @@
 use crate::line_index::{DEFAULT_EVERY, LineIndex};
 #[cfg(test)]
 use memchr::memchr_iter;
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,9 +106,38 @@ struct Stamp {
 }
 
 impl Stamp {
+    #[cfg(unix)]
     fn read(file: &File) -> io::Result<Self> {
-        let metadata = file.metadata()?;
-        Ok(Self { len: metadata.len(), modified: metadata.modified()?, identity: identity(file, &metadata)? })
+        Self::from_metadata(file.metadata()?)
+    }
+
+    #[cfg(unix)]
+    fn from_metadata(metadata: std::fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self { len: metadata.len(), modified: metadata.modified()?, identity: (metadata.dev(), metadata.ino()) })
+    }
+
+    #[cfg(windows)]
+    fn read(file: &File) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // One handle query supplies identity, length and mtime together.
+        // SAFETY: file owns a live handle and info is writable for this call.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ticks = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32) | info.ftLastWriteTime.dwLowDateTime as u64;
+        let epoch = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(11_644_473_600);
+        let modified = epoch + std::time::Duration::new(ticks / 10_000_000, (ticks % 10_000_000) as u32 * 100);
+        Ok(Self {
+            len: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            modified,
+            identity: (
+                info.dwVolumeSerialNumber as u64,
+                ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            ),
+        })
     }
 
     fn state(&self, now: &Self) -> FileState {
@@ -124,24 +153,6 @@ impl Stamp {
             FileState::Unchanged
         }
     }
-}
-
-#[cfg(unix)]
-fn identity(_: &File, metadata: &Metadata) -> io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(windows)]
-fn identity(file: &File, _: &Metadata) -> io::Result<(u64, u64)> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: the file owns a live handle and info is writable for the call.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((info.dwVolumeSerialNumber as u64, ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64))
 }
 
 enum Bytes {
@@ -317,8 +328,12 @@ impl TextFile {
     }
 
     fn check_path_live(&self) -> io::Result<FileState> {
-        match File::open(&self.shared.path) {
-            Ok(file) => Ok(self.shared.stamp.state(&Stamp::read(&file)?)),
+        #[cfg(unix)]
+        let stamp = std::fs::metadata(&self.shared.path).and_then(Stamp::from_metadata);
+        #[cfg(windows)]
+        let stamp = File::open(&self.shared.path).and_then(|file| Stamp::read(&file));
+        match stamp {
+            Ok(stamp) => Ok(self.shared.stamp.state(&stamp)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(FileState::Replaced),
             Err(e) => Err(e),
         }
@@ -508,20 +523,49 @@ impl TextFile {
     }
 
     pub fn lines(&self, line: u64, count: usize) -> Result<Option<Vec<Vec<u8>>>, ReadError> {
-        if self.index().is_none() {
+        let Some(index) = self.index() else {
             self.validate_source()?;
             return Ok(None);
+        };
+        let Some((range, skip)) = index.start_window(line) else {
+            self.validate_source()?;
+            return Ok(None);
+        };
+        // Read the rank scan and the following screen together. The copied
+        // bytes cannot change between finding the start and collecting lines.
+        let end = self.len().min(range.end.saturating_add(16 << 10));
+        let (start, lines) = self.with_cached_range(range.start..end, |bytes| {
+            let local = if skip == 0 {
+                Some(0)
+            } else {
+                crate::newlines::ends(bytes, 0..(range.end - range.start) as usize).nth((skip - 1) as usize)
+            };
+            let start = local.map(|at| range.start + at as u64);
+            let lines = local.and_then(|at| {
+                (end == self.len() || crate::newlines::ends(bytes, at..bytes.len()).take(count).count() >= count)
+                    .then(|| lines_from(bytes, at, count).into_iter().map(<[u8]>::to_vec).collect())
+            });
+            (start, lines)
+        })?;
+        if let Some(lines) = lines {
+            return Ok(Some(lines));
         }
-        let Some(start) = self.line_start(line)? else { return Ok(None) };
-        self.lines_at(start, count).map(Some)
+        match start {
+            Some(start) => self.lines_at(start, count).map(Some),
+            None => Ok(None),
+        }
     }
 
     fn lines_at(&self, start: u64, count: usize) -> Result<Vec<Vec<u8>>, ReadError> {
         let end = self.len().min(start.saturating_add(16 << 10));
-        let mut bytes = self.cached_range(start..end)?;
-        if end < self.len() && crate::newlines::ends(&bytes, 0..bytes.len()).take(count).count() < count {
-            bytes = self.read_range(start..self.len().min(start.saturating_add(READ_CHUNK as u64)))?.into_owned();
+        let lines = self.with_cached_range(start..end, |bytes| {
+            (end == self.len() || crate::newlines::ends(bytes, 0..bytes.len()).take(count).count() >= count)
+                .then(|| lines_from(bytes, 0, count).into_iter().map(<[u8]>::to_vec).collect())
+        })?;
+        if let Some(lines) = lines {
+            return Ok(lines);
         }
+        let bytes = self.read_range(start..self.len().min(start.saturating_add(READ_CHUNK as u64)))?;
         Ok(lines_from(&bytes, 0, count).into_iter().map(<[u8]>::to_vec).collect())
     }
 }

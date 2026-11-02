@@ -408,21 +408,31 @@ impl LineIndex {
         line: u64,
         read: impl FnOnce(std::ops::Range<u64>) -> io::Result<Vec<u8>>,
     ) -> io::Result<Option<u64>> {
+        let Some((range, skip)) = self.start_window(line) else { return Ok(None) };
+        if skip == 0 {
+            return Ok(Some(range.start));
+        }
+        let bytes = read(range.start..(range.end + 1).min(self.len))?;
+        Ok(ends(&bytes, 0..(range.end - range.start) as usize).nth((skip - 1) as usize).map(|p| range.start + p as u64))
+    }
+
+    /// Bounded scan and number of terminators preceding a requested line.
+    /// Readers include one extra byte for CRLF context at the block boundary.
+    pub(crate) fn start_window(&self, line: u64) -> Option<(std::ops::Range<u64>, u64)> {
         if line >= self.line_count {
-            return Ok(None);
+            return None;
         }
         let i = self.checkpoints.partition_point(|&(l, _)| l <= line) - 1;
         let (mut cl, mut off) = self.checkpoints[i];
         if cl == line {
-            return Ok(Some(off));
+            return Some((off..off, 0));
         }
         let j = self.rank_checkpoints.partition_point(|&(count, _)| count < line) - 1;
         if self.rank_checkpoints[j].1 > off {
             (cl, off) = self.rank_checkpoints[j];
         }
         let end = self.rank_checkpoints.get(j + 1).map_or(self.len, |&(_, at)| at);
-        let bytes = read(off..(end + 1).min(self.len))?;
-        Ok(ends(&bytes, 0..(end - off) as usize).nth((line - cl - 1) as usize).map(|p| off + p as u64))
+        Some((off..end, line - cl))
     }
 
     /// Byte offset where `line` starts, or `None` past the end.

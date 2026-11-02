@@ -15,6 +15,19 @@ impl TextFile {
     }
 
     pub(super) fn cached_range(&self, range: Range<u64>) -> Result<Vec<u8>, ReadError> {
+        self.with_cached_range(range, <[u8]>::to_vec)
+    }
+
+    /// Consume a validated copied window in place, without a second allocation.
+    pub(super) fn with_cached_range<R>(
+        &self,
+        range: Range<u64>,
+        use_bytes: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, ReadError> {
+        if let Bytes::Owned(bytes) = &self.shared.bytes {
+            self.validate_source()?;
+            return Ok(use_bytes(&bytes[range.start as usize..range.end as usize]));
+        }
         let mut cache = self
             .shared
             .read_window
@@ -22,13 +35,12 @@ impl TextFile {
             .map_err(|_| ReadError::Io(io::Error::other("source window lock poisoned")))?;
         if range.start >= cache.0 && range.end <= cache.0 + cache.1.len() as u64 {
             self.validate_source()?;
-            return Ok(cache.1[(range.start - cache.0) as usize..(range.end - cache.0) as usize].to_vec());
+            return Ok(use_bytes(&cache.1[(range.start - cache.0) as usize..(range.end - cache.0) as usize]));
         }
-        let end = (range.end + (16 << 10)).min(self.len());
+        let end = range.end;
         if end - range.start > VIEW_CACHE_BYTES as u64 {
-            return self.read_range(range).map(|b| b.into_owned());
+            return self.read_range(range).map(|b| use_bytes(&b));
         }
-        cache.0 = range.start;
         let size = (end - range.start) as usize;
         let extra = size.saturating_sub(cache.1.len());
         cache.1.try_reserve_exact(extra).map_err(|error| ReadError::Io(io::Error::other(error)))?;
@@ -37,7 +49,8 @@ impl TextFile {
             cache.1.clear();
             return Err(error);
         }
-        Ok(cache.1[..(range.end - range.start) as usize].to_vec())
+        cache.0 = range.start;
+        Ok(use_bytes(&cache.1))
     }
 
     pub fn same_source(&self, other: &Self) -> bool {
