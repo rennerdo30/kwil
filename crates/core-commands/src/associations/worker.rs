@@ -4,13 +4,15 @@
 //!
 //! Review the immutable `Response::Planned` snapshot, then submit only its token.
 //! Tokens are local to this worker incarnation; restart never resumes Apply.
-//! An immutable, synced full receipt precedes every backend write. Until Undo
-//! retires it, even a failed/interrupted Apply prevents another transaction.
+//! An immutable, synced full receipt precedes every backend write. A completed
+//! registration can be updated by a new immutable successor preserving Before.
+//! Failed/interrupted Apply or Undo still blocks updates until recovery.
 //! Undo preserves the original Before bytes. Append-only repair records durably
 //! update owned After signatures before writes, so interrupted repair/Undo retry.
 //! Native restoration must pass the backend durability barrier before retirement;
 //! a failed/unsupported barrier retains that full receipt even if reads show Before.
-//! Records are never replaced, renamed or deleted. History has a finite limit;
+//! Published records are never replaced or deleted; private staging files are
+//! atomically published. History has a finite limit;
 //! reaching it requires explicit host maintenance while the service is stopped.
 //!
 //! Like the backend, checks are optimistic, not an OS-wide compare-and-swap.
@@ -18,6 +20,7 @@
 //! On Windows the host must supply an application-data directory with a private
 //! per-user ACL. Unix additionally enforces ownership and private permissions.
 
+use super::SharedChanges;
 use super::{AssociationAdapter, AssociationError, AssociationPlan, AssociationReceipt, AssociationRequest};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,7 +39,7 @@ use std::{
 pub const QUEUE_CAPACITY: usize = 8;
 pub const MAX_JOURNAL_TRANSACTIONS: u64 = 32;
 pub const MAX_REPAIR_RECORDS: usize = 32;
-pub const MAX_JOURNAL_ENTRIES: usize = MAX_JOURNAL_TRANSACTIONS as usize * 2 + MAX_REPAIR_RECORDS + 1;
+pub const MAX_JOURNAL_ENTRIES: usize = MAX_JOURNAL_TRANSACTIONS as usize * 4 + MAX_REPAIR_RECORDS + 1;
 
 /// Background startup entry point; the host verifies and guards this directory.
 pub fn repair_startup<A: AssociationAdapter, F: FnOnce() -> Result<A, AssociationError>>(
@@ -353,17 +356,22 @@ pub(super) fn bounded_request(request: &AssociationRequest) -> bool {
 struct Engine<A> {
     adapter: A,
     journal: Journal,
-    pending: Option<(PlanToken, AssociationPlan)>,
+    pending: Option<(PlanToken, super::updates::Update)>,
     identity: PlanToken,
+    update_ready: bool,
 }
 impl<A: AssociationAdapter> Engine<A> {
     fn new(mut adapter: A, mut journal: Journal) -> Result<Self, WorkerError> {
+        let _work = super::Admission::acquire(super::WORKSPACE_BYTES)?;
         if journal.active.as_ref().is_some_and(|r| r.receipt.owner() != adapter.owner()) {
             return Err(failure("journal belongs to another user/backend; refusing recovery"));
         }
-        if let Some(executable) = adapter.repair_executable() {
+        let removals_ready = journal.finish_removals(&mut adapter).is_ok();
+        if removals_ready && let Some(executable) = adapter.repair_executable() {
             journal.repair_owned(&mut adapter, &executable)?;
         }
+        // A crash can leave only a subset of the selected removals restored.
+        // Keep its full receipt if retry fails, so Status/Undo remain available.
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let identity = PlanToken {
             epoch: SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| failure(e.to_string()))?.as_nanos(),
@@ -371,7 +379,14 @@ impl<A: AssociationAdapter> Engine<A> {
             process: std::process::id(),
             generation: 0,
         };
-        Ok(Self { adapter, journal, pending: None, identity })
+        let update_ready = journal.active.as_ref().is_none_or(|active| {
+            active.removed.is_empty()
+                && active.receipt.pending().iter().all(|change| {
+                    super::read_one(&mut adapter, &change.location)
+                        .is_ok_and(|current| super::same_owned_value(&current, &change.after))
+                })
+        });
+        Ok(Self { adapter, journal, pending: None, identity, update_ready })
     }
     fn execute(&mut self, request: Request) -> Result<Response, WorkerError> {
         // Includes temporary native reads, bounded request/response metadata and
@@ -388,18 +403,24 @@ impl<A: AssociationAdapter> Engine<A> {
         match request {
             Request::Plan(request) => {
                 self.pending = None;
-                if self.journal.active.is_some() {
-                    return Err(failure("Undo pending receipt before planning another transaction"));
+                if self.journal.poisoned || (self.journal.active.is_some() && !self.update_ready) {
+                    return Err(failure("unfinished registration recovery must be resolved before updating"));
                 }
+                self.journal.finish_removals(&mut self.adapter)?;
                 if !bounded_request(&request) {
                     return Err(failure("association request exceeds bounds"));
                 }
                 self.identity.generation =
                     self.identity.generation.checked_add(1).ok_or_else(|| failure("plan generation exhausted"))?;
-                let plan = super::plan(&mut self.adapter, &request)?;
-                validate_plan(&plan)?;
+                let update = super::updates::prepare(
+                    &mut self.adapter,
+                    &request,
+                    self.journal.active.as_ref().map(|r| &r.receipt),
+                )?;
+                validate_plan(&update.plan)?;
                 let token = self.identity;
-                self.pending = Some((token, plan.clone()));
+                let plan = update.plan.clone();
+                self.pending = Some((token, update));
                 Ok(Response::Planned { token, plan })
             }
             Request::Cancel { token } => {
@@ -408,11 +429,9 @@ impl<A: AssociationAdapter> Engine<A> {
                 Ok(Response::Cancelled)
             }
             Request::Apply { token } => {
-                let plan = self.reviewed(token)?.clone();
-                self.pending = None; // Every apply attempt consumes review, including failure.
-                if self.journal.active.is_some() {
-                    return Err(failure("Undo pending receipt before Apply"));
-                }
+                self.reviewed(token)?;
+                let (_, update) = self.pending.take().unwrap();
+                let plan = update.plan;
                 if self.adapter.owner() != plan.owner {
                     return Err(failure("association backend identity changed"));
                 }
@@ -423,13 +442,25 @@ impl<A: AssociationAdapter> Engine<A> {
                         return Err(failure("association state changed; review a new plan"));
                     }
                 }
-                let id = self
-                    .journal
-                    .begin(AssociationReceipt { owner: plan.owner.clone(), remaining: plan.changes.clone() })?;
+                if plan.changes.is_empty()
+                    && update.removed.is_empty()
+                    && let Some(active) = &self.journal.active
+                    && update.receipt.pending() == active.receipt.pending()
+                {
+                    return Ok(Response::Applied { journal_id: active.id });
+                }
+                self.update_ready = false;
+                let id = if self.journal.active.is_some() {
+                    self.journal.replace(update.receipt, update.removed, plan.changes.clone())?
+                } else {
+                    self.journal.begin(update.receipt)?
+                };
                 // Keep the ORIGINAL full receipt even if backend apply attempts
                 // automatic rollback. Its in-memory partial receipt is not a
                 // substitute for a synced journal after a crash.
                 super::apply(&mut self.adapter, &plan).map_err(|e| WorkerError::from(e.error))?;
+                self.journal.finish_removals(&mut self.adapter)?;
+                self.update_ready = true;
                 Ok(Response::Applied { journal_id: id })
             }
             Request::Undo { journal_id } => {
@@ -442,7 +473,14 @@ impl<A: AssociationAdapter> Engine<A> {
                     .as_ref()
                     .filter(|r| r.id == journal_id)
                     .ok_or_else(|| failure("no matching pending journal receipt"))?;
-                let mut receipt = record.receipt.clone();
+                let complete = super::updates::undo_receipt(
+                    &mut self.adapter,
+                    &record.receipt,
+                    &record.removed,
+                    &record.mutations,
+                )?;
+                self.update_ready = false;
+                let mut receipt = complete.clone();
                 let errors = super::rollback(&mut self.adapter, &mut receipt);
                 if !errors.is_empty() || !receipt.is_rolled_back() {
                     return Err(failure(format!(
@@ -450,7 +488,7 @@ impl<A: AssociationAdapter> Engine<A> {
                         errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
                     )));
                 }
-                self.adapter.sync_restored(record.receipt.pending())?;
+                self.adapter.sync_restored(complete.pending())?;
                 self.journal.retire()?;
                 self.pending = None;
                 Ok(Response::Undone { journal_id })
@@ -458,6 +496,22 @@ impl<A: AssociationAdapter> Engine<A> {
             Request::WindowsStatus { executable, extensions } => {
                 if !executable.is_absolute() || !bounded_path(&executable) || extensions.len() > super::MAX_TYPES * 4 {
                     return Err(failure("Windows inspection exceeds bounds"));
+                }
+                let mut extensions: std::collections::BTreeSet<_> = extensions.into_iter().collect();
+                if let Some(active) = &self.journal.active {
+                    for change in active.receipt.pending().iter().chain(active.removed.iter()) {
+                        if let super::Location::WindowsValue { subkey, name } = &change.location
+                            && let Some(extension) =
+                                subkey.strip_prefix('.').and_then(|s| s.strip_suffix("\\OpenWithProgids"))
+                            && name.eq_ignore_ascii_case(&format!("Kwil.{extension}"))
+                            && crate::file_types::registration_allowed(extension)
+                        {
+                            extensions.insert(extension.to_owned());
+                        }
+                    }
+                }
+                if extensions.len() > super::MAX_TYPES * 4 {
+                    return Err(failure("combined Windows inspection exceeds bounds"));
                 }
                 // Reuse the exact registration contract without creating a plan
                 // token or changing the retained receipt. Never write native data.
@@ -486,11 +540,15 @@ impl<A: AssociationAdapter> Engine<A> {
                 Ok(Response::WindowsStatus { status, registered })
             }
             Request::Status => {
-                let recovery = self.journal.active.as_ref().map(|r| RecoveryStatus {
+                let full = self
+                    .journal
+                    .active
+                    .as_ref()
+                    .map(|r| super::updates::recovery_receipt(&r.receipt, &r.removed))
+                    .transpose()?;
+                let recovery = self.journal.active.as_ref().zip(full).map(|(r, receipt)| RecoveryStatus {
                     journal_id: r.id,
-                    receipt: r.receipt.clone(),
-                    current: r
-                        .receipt
+                    current: receipt
                         .pending()
                         .iter()
                         .map(|c| match super::read_one(&mut self.adapter, &c.location) {
@@ -500,6 +558,7 @@ impl<A: AssociationAdapter> Engine<A> {
                             Err(e) => CurrentState::Unreadable(e.to_string()),
                         })
                         .collect(),
+                    receipt,
                 });
                 Ok(Response::Status(Status {
                     pending_plan: self.pending.as_ref().map(|(t, _)| *t),
@@ -513,7 +572,7 @@ impl<A: AssociationAdapter> Engine<A> {
         self.pending
             .as_ref()
             .filter(|(t, _)| *t == token)
-            .map(|(_, p)| p)
+            .map(|(_, p)| &p.plan)
             .ok_or_else(|| failure("review token is stale, cancelled, consumed or belongs to another worker"))
     }
 }
@@ -524,6 +583,14 @@ struct Intent {
     version: u32,
     id: u64,
     receipt: AssociationReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<u64>,
+    #[serde(default, skip_serializing_if = "SharedChanges::is_empty")]
+    removed: super::SharedChanges,
+    /// Old owned After signatures remain available if a shared-file update
+    /// crashes between publication and a native write (notably XDG files).
+    #[serde(default, skip_serializing_if = "SharedChanges::is_empty")]
+    mutations: super::SharedChanges,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -574,6 +641,7 @@ impl Journal {
         };
         let mut ids = Vec::new();
         let mut retired = Vec::new();
+        let mut updated = Vec::new();
         for (count, entry) in fs::read_dir(&journal.directory)?.enumerate() {
             if count >= MAX_JOURNAL_ENTRIES {
                 return Err(failure("journal directory exceeds record limit"));
@@ -595,6 +663,13 @@ impl Journal {
             journal.last = journal.last.max(id);
             match suffix {
                 "intent" => ids.push(id),
+                "pending" => {
+                    read_record(&entry.path(), MAX_RECORD_BYTES)?;
+                }
+                "updated" => {
+                    read_record(&entry.path(), 0)?;
+                    updated.push(id);
+                }
                 "retired" => {
                     let bytes = read_record(&entry.path(), 0)?;
                     debug_assert!(bytes.is_empty());
@@ -630,10 +705,20 @@ impl Journal {
             let bytes = read_record(&journal.path(id, "intent"), MAX_RECORD_BYTES)?;
             let mut intent: Intent =
                 serde_json::from_slice(&bytes).map_err(|e| failure(format!("invalid journal intent {id}: {e}")))?;
-            if intent.version != 1 || intent.id != id {
+            if !matches!(intent.version, 1 | 2)
+                || intent.id != id
+                || (intent.version == 2 && intent.previous.is_none())
+                || (intent.version == 1
+                    && (intent.previous.is_some() || !intent.removed.is_empty() || !intent.mutations.is_empty()))
+            {
                 return Err(failure("journal version/id mismatch"));
             }
             validate_receipt(&intent.receipt)?;
+            validate_receipt(&AssociationReceipt {
+                owner: intent.receipt.owner.clone(),
+                remaining: intent.mutations.clone(),
+            })?;
+            validate_receipt(&super::updates::recovery_receipt(&intent.receipt, &intent.removed)?)?;
             for (index, (_, sequence)) in journal.repairs.iter().filter(|(owner, _)| *owner == id).enumerate() {
                 if *sequence != index as u64 + 1 {
                     return Err(failure("repair history has a gap"));
@@ -641,11 +726,24 @@ impl Journal {
                 let repair = journal.read_repair(id, *sequence)?;
                 advance_receipt(&mut intent.receipt, &repair)?;
             }
-            if !retired.contains(&id) {
-                if journal.active.is_some() {
-                    return Err(failure("multiple pending receipts; refusing ambiguous recovery"));
+            if let Some(previous) = intent.previous {
+                let old = journal
+                    .active
+                    .as_ref()
+                    .filter(|old| old.id == previous)
+                    .ok_or_else(|| failure("update predecessor is not the active receipt"))?;
+                if !old.removed.is_empty() {
+                    return Err(failure("update supersedes unfinished removals"));
                 }
-                journal.active = Some(intent);
+                super::updates::validate_successor(&old.receipt, &intent.receipt, &intent.removed, &intent.mutations)?;
+            } else if !retired.contains(&id) && journal.active.is_some() {
+                return Err(failure("multiple pending receipts; refusing ambiguous recovery"));
+            }
+            if updated.contains(&id) {
+                intent.removed = Default::default();
+            }
+            if intent.previous.is_some() || !retired.contains(&id) {
+                journal.active = (!retired.contains(&id)).then_some(intent);
             }
         }
         Ok(journal)
@@ -732,6 +830,71 @@ impl Journal {
         super::windows_paths::repair(adapter, executable)?;
         Ok(())
     }
+    fn replace(
+        &mut self,
+        receipt: AssociationReceipt,
+        removed: SharedChanges,
+        mutations: SharedChanges,
+    ) -> Result<u64, WorkerError> {
+        if self.poisoned {
+            return Err(failure("journal requires restart before update"));
+        }
+        let old = self.active.as_ref().ok_or_else(|| failure("no receipt to update"))?;
+        if !old.removed.is_empty() {
+            return Err(failure("previous removal is not durable"));
+        }
+        super::updates::validate_successor(&old.receipt, &receipt, &removed, &mutations)?;
+        let id = self
+            .last
+            .checked_add(1)
+            .filter(|id| *id <= MAX_JOURNAL_TRANSACTIONS)
+            .ok_or_else(|| failure("journal history is full"))?;
+        let intent = Intent { version: 2, id, receipt, previous: Some(old.id), removed, mutations };
+        validate_receipt(&super::updates::recovery_receipt(&intent.receipt, &intent.removed)?)?;
+        let bytes = bounded_json(&intent)?;
+        self.last = id;
+        self.poisoned = true;
+        // Publish a complete immutable record atomically. An interrupted staging
+        // file never supersedes the previous durable receipt on restart.
+        let staging = self.path(id, "pending");
+        let mut file = private_new(&staging)?;
+        file.write_all(&bytes)?;
+        #[cfg(test)]
+        if self.fail_sync {
+            return Err(failure("injected update sync failure"));
+        }
+        file.sync_all()?;
+        drop(file);
+        publish_update(&staging, &self.path(id, "intent"))?;
+        self.active = Some(intent);
+        sync_directory(&self.directory)?;
+        self.poisoned = false;
+        Ok(id)
+    }
+    fn finish_removals(&mut self, adapter: &mut impl AssociationAdapter) -> Result<(), WorkerError> {
+        let Some(active) = &self.active else { return Ok(()) };
+        if active.removed.is_empty() {
+            return Ok(());
+        }
+        if self.poisoned {
+            return Err(failure("journal requires restart before removing types"));
+        }
+        let mut receipt = AssociationReceipt { owner: active.receipt.owner.clone(), remaining: active.removed.clone() };
+        let complete = receipt.clone();
+        let errors = super::rollback(adapter, &mut receipt);
+        if !errors.is_empty() || !receipt.is_rolled_back() {
+            return Err(failure("selected type removal is incomplete; receipt retained"));
+        }
+        adapter.sync_restored(complete.pending())?;
+        let id = active.id;
+        self.poisoned = true;
+        let marker = private_new(&self.path(id, "updated"))?;
+        marker.sync_all()?;
+        sync_directory(&self.directory)?;
+        self.active.as_mut().unwrap().removed = Default::default();
+        self.poisoned = false;
+        Ok(())
+    }
     fn begin(&mut self, receipt: AssociationReceipt) -> Result<u64, WorkerError> {
         if self.poisoned || self.active.is_some() {
             return Err(failure("journal needs recovery before another Apply"));
@@ -741,7 +904,14 @@ impl Journal {
             .checked_add(1)
             .filter(|id| *id <= MAX_JOURNAL_TRANSACTIONS)
             .ok_or_else(|| failure("journal history is full; stopped-service maintenance required"))?;
-        let intent = Intent { version: 1, id, receipt };
+        let intent = Intent {
+            version: 1,
+            id,
+            receipt,
+            previous: None,
+            removed: Default::default(),
+            mutations: Default::default(),
+        };
         let bytes = bounded_json(&intent)?;
         self.poisoned = true; // Any partial publication requires restart/inspection.
         self.last = id;
@@ -784,6 +954,45 @@ impl Journal {
         sync_directory(&self.directory)?;
         self.active = None;
         Ok(())
+    }
+}
+
+fn publish_update(staging: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+        let from: Vec<u16> = staging.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+        // No REPLACE_EXISTING: never overwrite a journal record, even on a race.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from = CString::new(staging.as_os_str().as_bytes()).map_err(|_| invalid("journal path contains NUL"))?;
+        let to = CString::new(destination.as_os_str().as_bytes()).map_err(|_| invalid("journal path contains NUL"))?;
+        // Move in one operation: link/unlink would expose a two-link intent on
+        // interruption, which the journal correctly refuses to read on restart.
+        // Both APIs refuse an existing destination, including on a race.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staging, destination);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "atomic exclusive journal publication is unavailable"))
     }
 }
 
@@ -1067,6 +1276,7 @@ mod tests {
         writes: usize,
         reads: usize,
         expected_changes: Option<usize>,
+        expected_barrier: Option<usize>,
         fail_from: Option<usize>,
         panic_at: Option<usize>,
         durable: Option<PathBuf>,
@@ -1104,10 +1314,24 @@ mod tests {
             if let Some(path) = &s.durable {
                 let bytes =
                     read_record(path, MAX_RECORD_BYTES).expect("intent must be readable before EVERY native write");
-                let intent: Intent = serde_json::from_slice(&bytes).unwrap();
-                assert!(intent.receipt.pending().iter().any(|c| c.location == *location));
+                #[derive(Deserialize)]
+                struct ProofChange {
+                    location: Location,
+                }
+                #[derive(Deserialize)]
+                struct ProofReceipt {
+                    remaining: Vec<ProofChange>,
+                }
+                #[derive(Deserialize)]
+                struct Proof {
+                    receipt: ProofReceipt,
+                    #[serde(default)]
+                    removed: Vec<ProofChange>,
+                }
+                let intent: Proof = serde_json::from_slice(&bytes).unwrap();
+                assert!(intent.receipt.remaining.iter().chain(intent.removed.iter()).any(|c| c.location == *location));
                 assert_eq!(
-                    intent.receipt.pending().len(),
+                    intent.receipt.remaining.len() + intent.removed.len(),
                     s.expected_changes.unwrap_or(3),
                     "full planned receipt, not a partial result"
                 );
@@ -1129,7 +1353,11 @@ mod tests {
         fn sync_restored(&mut self, changes: &[super::super::Change]) -> Result<(), AssociationError> {
             let mut s = self.0.lock().unwrap();
             s.barriers += 1;
-            assert_eq!(changes.len(), s.expected_changes.unwrap_or(3), "barrier must cover the original full receipt");
+            assert_eq!(
+                changes.len(),
+                s.expected_barrier.or(s.expected_changes).unwrap_or(3),
+                "barrier must cover the complete restored receipt"
+            );
             for change in changes {
                 assert_eq!(
                     s.values.iter().find(|(l, _)| *l == change.location).map(|(_, v)| v),
@@ -1158,6 +1386,261 @@ mod tests {
     }
     fn engine(scratch: &Scratch, fake: &Fake) -> Engine<Fake> {
         Engine::new(fake.clone(), Journal::open(scratch.0.clone()).unwrap()).unwrap()
+    }
+    fn update_plan(engine: &mut Engine<Fake>, types: &[&str]) -> PlanToken {
+        let mut request = request();
+        request.types = types.iter().map(|ext| FileType { extension: (*ext).into(), content_type: None }).collect();
+        let Response::Planned { token, .. } = engine.execute(Request::Plan(request)).unwrap() else { panic!() };
+        token
+    }
+    fn update_apply(engine: &mut Engine<Fake>, types: &[&str]) -> u64 {
+        let token = update_plan(engine, types);
+        let Response::Applied { journal_id } = engine.execute(Request::Apply { token }).unwrap() else { panic!() };
+        journal_id
+    }
+    #[test]
+    fn kw46_update_publication_moves_private_record_without_clobbering() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let staging = scratch.0.join("update.pending");
+        let destination = scratch.0.join("update.intent");
+        private_new(&staging).unwrap().write_all(b"complete successor").unwrap();
+        publish_update(&staging, &destination).unwrap();
+        assert!(!staging.exists(), "publication must leave no hard-linked staging alias");
+        assert_eq!(&*read_record(&destination, 64).unwrap(), b"complete successor");
+        private_new(&staging).unwrap().write_all(b"later attempt").unwrap();
+        assert_eq!(publish_update(&staging, &destination).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(&*read_record(&destination, 64).unwrap(), b"complete successor");
+        assert_eq!(&*read_record(&staging, 64).unwrap(), b"later attempt");
+    }
+    #[test]
+    fn kw46_update_extends_only_new_values_and_preserves_original_receipt_after_restart() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let location = Location::WindowsValue { subkey: ".txt\\OpenWithProgids".into(), name: "Kwil.txt".into() };
+        let original = StoredValue { kind: 7, bytes: vec![0, 255, 0, 17] };
+        fake.0.lock().unwrap().values.push((location.clone(), original.clone()));
+        let mut service = engine(&scratch, &fake);
+        let first = update_apply(&mut service, &["txt"]);
+        let bytes = fs::read(service.journal.path(first, "intent")).unwrap();
+        let writes = fake.0.lock().unwrap().writes;
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.durable = Some(service.journal.path(first + 1, "intent"));
+            state.expected_changes = Some(6);
+        }
+        let second = update_apply(&mut service, &["txt", "log"]);
+        assert_eq!(fake.0.lock().unwrap().writes - writes, 3, "surviving types are never unregistered or rewritten");
+        assert_eq!(fs::read(service.journal.path(first, "intent")).unwrap(), bytes);
+        drop(service);
+        let mut service = engine(&scratch, &fake);
+        let receipt = status(&mut service).recovery.unwrap();
+        assert_eq!(receipt.journal_id, second);
+        assert_eq!(receipt.receipt.pending().len(), 6);
+        assert_eq!(
+            receipt.receipt.pending().iter().find(|c| c.location == location).unwrap().before,
+            Some(original.clone())
+        );
+        service.execute(Request::Undo { journal_id: second }).unwrap();
+        assert_eq!(fake.0.lock().unwrap().values, vec![(location, original)]);
+        drop(service);
+        assert!(
+            status(&mut engine(&scratch, &fake)).recovery.is_none(),
+            "superseded receipts do not reappear after Undo"
+        );
+    }
+    #[test]
+    fn kw46_update_subset_shrinks_after_durability_and_never_rewrites_survivors() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut service = engine(&scratch, &fake);
+        let first = update_apply(&mut service, &["txt", "log"]);
+        let original = fs::read(service.journal.path(first, "intent")).unwrap();
+        let writes = fake.0.lock().unwrap().writes;
+        {
+            let mut state = fake.0.lock().unwrap();
+            state.expected_changes = Some(6);
+            state.expected_barrier = Some(3);
+            state.durable = Some(service.journal.path(first + 1, "intent"));
+        }
+        let second = update_apply(&mut service, &["txt"]);
+        assert_eq!(fake.0.lock().unwrap().writes - writes, 3);
+        assert!(service.journal.path(second, "updated").is_file());
+        assert_eq!(status(&mut service).recovery.unwrap().receipt.pending().len(), 3);
+        assert_eq!(fs::read(service.journal.path(first, "intent")).unwrap(), original);
+        drop(service);
+        let mut service = engine(&scratch, &fake);
+        assert_eq!(status(&mut service).recovery.unwrap().receipt.pending().len(), 3);
+        let foreign = (
+            Location::WindowsValue { subkey: ".log\\OpenWithProgids".into(), name: "Kwil.log".into() },
+            StoredValue { kind: 7, bytes: b"later foreign change".to_vec() },
+        );
+        fake.0.lock().unwrap().values.push(foreign.clone());
+        service.execute(Request::Undo { journal_id: second }).unwrap();
+        assert_eq!(
+            fake.0.lock().unwrap().values,
+            vec![foreign],
+            "a completed subset is no longer owned by the receipt"
+        );
+    }
+    #[test]
+    fn kw46_update_interrupted_publication_leaves_the_previous_receipt_and_values() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut service = engine(&scratch, &fake);
+        let first = update_apply(&mut service, &["txt"]);
+        let token = update_plan(&mut service, &["txt", "log"]);
+        let writes = fake.0.lock().unwrap().writes;
+        service.journal.fail_sync = true;
+        assert!(service.execute(Request::Apply { token }).is_err());
+        assert_eq!(fake.0.lock().unwrap().writes, writes);
+        assert!(!service.journal.path(first + 1, "intent").exists());
+        drop(service);
+        let mut service = engine(&scratch, &fake);
+        assert_eq!(status(&mut service).recovery.unwrap().journal_id, first);
+        service.execute(Request::Undo { journal_id: first }).unwrap();
+        assert!(fake.0.lock().unwrap().values.is_empty());
+    }
+    #[test]
+    fn kw46_update_partial_add_and_remove_crashes_keep_complete_recovery() {
+        let _guard = crate::associations::test_admission_guard();
+        for removing in [false, true] {
+            let scratch = Scratch::new();
+            let fake = Fake::default();
+            let mut service = engine(&scratch, &fake);
+            let first = update_apply(&mut service, if removing { &["txt", "log"] } else { &["txt"] });
+            let token = update_plan(&mut service, if removing { &["txt"] } else { &["txt", "log"] });
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.expected_changes = Some(6);
+                state.expected_barrier = Some(if removing { 3 } else { 6 });
+                state.durable = Some(service.journal.path(first + 1, "intent"));
+                state.panic_at = Some(state.writes + 2);
+            }
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| service.execute(Request::Apply { token })))
+                    .is_err()
+            );
+            drop(service);
+            fake.0.lock().unwrap().panic_at = None;
+            let mut service = engine(&scratch, &fake);
+            let active = status(&mut service).recovery.unwrap();
+            assert_eq!(active.receipt.pending().len(), if removing { 3 } else { 6 });
+            service.execute(Request::Undo { journal_id: active.journal_id }).unwrap();
+            assert!(fake.0.lock().unwrap().values.is_empty());
+        }
+    }
+    #[test]
+    fn kw46_update_foreign_change_refuses_before_writes_and_preserves_history() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut service = engine(&scratch, &fake);
+        let first = update_apply(&mut service, &["txt"]);
+        let before = fs::read(service.journal.path(first, "intent")).unwrap();
+        let writes = fake.0.lock().unwrap().writes;
+        fake.0.lock().unwrap().values[0].1 = StoredValue { kind: 7, bytes: b"foreign".to_vec() };
+        let mut request = request();
+        request.types.push(FileType { extension: "log".into(), content_type: None });
+        assert!(service.execute(Request::Plan(request)).is_err());
+        assert_eq!(fake.0.lock().unwrap().writes, writes);
+        assert_eq!(fs::read(service.journal.path(first, "intent")).unwrap(), before);
+    }
+    #[test]
+    fn kw46_update_already_restored_subset_still_shrinks_without_native_rewrites() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut service = engine(&scratch, &fake);
+        let first = update_apply(&mut service, &["txt", "log"]);
+        fake.0.lock().unwrap().values.retain(|(l, _)| !matches!(l, Location::WindowsValue { subkey, .. } if subkey.starts_with("Kwil.log") || subkey.starts_with(".log\\")));
+        let writes = fake.0.lock().unwrap().writes;
+        let second = update_apply(&mut service, &["txt"]);
+        assert!(second > first);
+        assert_eq!(fake.0.lock().unwrap().writes, writes);
+        assert_eq!(status(&mut service).recovery.unwrap().receipt.pending().len(), 3);
+    }
+    #[test]
+    fn kw46_update_restart_status_discovers_owned_custom_types_outside_catalog() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut service = engine(&scratch, &fake);
+        update_apply(&mut service, &["ownerlog46"]);
+        drop(service);
+        let mut service = engine(&scratch, &fake);
+        let writes = fake.0.lock().unwrap().writes;
+        let Response::WindowsStatus { registered, .. } = service
+            .execute(Request::WindowsStatus { executable: request().executable, extensions: vec!["txt".into()] })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(registered, ["ownerlog46"], "durable custom types must survive a controller restart");
+        assert_eq!(fake.0.lock().unwrap().writes, writes, "status is read-only");
+    }
+    #[test]
+    fn kw46_update_shared_linux_files_keep_intermediate_undo_signatures_and_subset_mimes() {
+        let _guard = crate::associations::test_admission_guard();
+        for interrupt in [false, true] {
+            let scratch = Scratch::new();
+            let fake = Fake::default();
+            let mut service = engine(&scratch, &fake);
+            let mimeapps = Location::UserFile(scratch.0.join("config/mimeapps.list"));
+            let original = StoredValue::text("# owner comment\n[Added Associations]\ntext/plain=other.desktop;\n");
+            fake.0.lock().unwrap().values.push((mimeapps.clone(), original.clone()));
+            fake.0.lock().unwrap().expected_changes = Some(2);
+            let mut request = request();
+            request.platform =
+                AssociationPlatform::Linux { data_home: scratch.0.join("data"), config_home: scratch.0.join("config") };
+            request.types[0].content_type = Some("text/plain".into());
+            let Response::Planned { token, .. } = service.execute(Request::Plan(request.clone())).unwrap() else {
+                panic!()
+            };
+            service.execute(Request::Apply { token }).unwrap();
+            request.types.push(FileType { extension: "log".into(), content_type: Some("application/x-log".into()) });
+            let Response::Planned { token, .. } = service.execute(Request::Plan(request.clone())).unwrap() else {
+                panic!()
+            };
+            let id = if interrupt {
+                let (_, update) = service.pending.take().unwrap();
+                service.journal.replace(update.receipt, update.removed, update.plan.changes).unwrap()
+            } else {
+                let Response::Applied { journal_id } = service.execute(Request::Apply { token }).unwrap() else {
+                    panic!()
+                };
+                assert!(journal_id > 1);
+                request.types.pop();
+                let Response::Planned { token, .. } = service.execute(Request::Plan(request)).unwrap() else {
+                    panic!()
+                };
+                let Response::Applied { journal_id } = service.execute(Request::Apply { token }).unwrap() else {
+                    panic!()
+                };
+                assert!(
+                    !fake
+                        .0
+                        .lock()
+                        .unwrap()
+                        .values
+                        .iter()
+                        .find(|(l, _)| l == &mimeapps)
+                        .unwrap()
+                        .1
+                        .as_text()
+                        .unwrap()
+                        .contains("application/x-log")
+                );
+                journal_id
+            };
+            drop(service);
+            let mut service = engine(&scratch, &fake);
+            service.execute(Request::Undo { journal_id: id }).unwrap();
+            assert_eq!(fake.0.lock().unwrap().values, vec![(mimeapps, original)]);
+        }
     }
     #[test]
     fn explorer_worker_startup_repairs_legacy_receipt_and_unregisters_after_restart() {

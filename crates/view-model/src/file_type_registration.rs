@@ -143,7 +143,6 @@ pub enum ActionErrorKind {
     EmptySelection,
     UnadoptedCapacity { selected: usize, limit: usize },
     MissingContentTypes(Vec<Extension>),
-    ExtendNotAdopted { journal_id: u64 },
     StaleReview,
     StaleCurrentFile,
     InvalidNativePath,
@@ -252,8 +251,6 @@ enum Chain {
     None,
     /// Plan done -> apply it at once (no separate review click).
     ApplyAfterPlan,
-    /// Undo done -> plan and apply these types.
-    PlanAfterUndo(Vec<Extension>),
 }
 struct Resources {
     worker: AssociationWorker,
@@ -512,16 +509,14 @@ impl FileTypeRegistration {
             return Err(ActionError { kind: ActionErrorKind::Busy, action: RegistrationAction::Status });
         }
         let target = self.selection().extensions().to_vec();
-        let result = match self.state().recovery {
-            Some(journal_id) => {
-                self.state_mut().chain = if target.is_empty() { Chain::None } else { Chain::PlanAfterUndo(target) };
-                self.unregister(journal_id).map(drop)
+        let result = if target.is_empty() {
+            match self.state().recovery {
+                Some(id) => self.unregister(id).map(drop),
+                None => Ok(()),
             }
-            None if target.is_empty() => Ok(()),
-            None => {
-                self.state_mut().chain = Chain::ApplyAfterPlan;
-                self.preview().map(drop)
-            }
+        } else {
+            self.state_mut().chain = Chain::ApplyAfterPlan;
+            self.preview().map(drop)
         };
         if result.is_err() {
             self.state_mut().chain = Chain::None;
@@ -580,10 +575,6 @@ impl FileTypeRegistration {
             (Chain::ApplyAfterPlan, RegistrationStatus::Ready { review }) => {
                 self.register_selected(review, None).map(drop)
             }
-            (Chain::PlanAfterUndo(extensions), RegistrationStatus::Unregistered { .. }) => {
-                self.state_mut().chain = Chain::ApplyAfterPlan;
-                self.submit(RegistrationAction::Preview { extensions, current: None }).map(drop)
-            }
             _ => Ok(()),
         };
         if let Err(error) = result {
@@ -641,16 +632,17 @@ impl FileTypeRegistration {
         }
         match action {
             RegistrationAction::Preview { extensions, current } => {
-                if let Some(journal_id) = state.recovery {
-                    if state
-                        .review
-                        .as_ref()
-                        .is_some_and(|review| review.selected == *extensions && review.current == *current)
-                    {
-                        return Ok((Request::Status, PendingKind::Status));
+                let mut selected = extensions.clone();
+                if current.is_some() && state.recovery.is_some() {
+                    let registered = state.registered.as_ref().ok_or(ActionErrorKind::Busy)?;
+                    for extension in registered {
+                        if !selected.contains(extension) {
+                            selected.push(extension.clone());
+                        }
                     }
-                    return Err(ActionErrorKind::ExtendNotAdopted { journal_id });
+                    selected.sort();
                 }
+                let extensions = &selected;
                 if extensions.is_empty() {
                     return Err(ActionErrorKind::EmptySelection);
                 }
@@ -701,12 +693,9 @@ impl FileTypeRegistration {
                 if reviewed.current.is_none() && reviewed.selected != state.selection.extensions() {
                     return Err(ActionErrorKind::StaleReview);
                 }
-                // Repeated explicit acceptance reports recovery/status, no second write.
-                if state.recovery.is_some() {
-                    return Ok((Request::Status, PendingKind::Status));
-                }
+                // A consumed review is idempotent; a new review can extend the receipt.
                 if reviewed.accepted {
-                    return Err(ActionErrorKind::StaleReview);
+                    return Ok((Request::Status, PendingKind::Status));
                 }
                 Ok((Request::Apply { token: reviewed.token }, PendingKind::Apply))
             }
