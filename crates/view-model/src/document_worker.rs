@@ -1535,12 +1535,11 @@ impl DocumentWorker {
                             complete(DocumentResult::Prepared(prepared));
                         }
                         DocumentRequest::PrepareWindow { root, window, restore } => {
-                            let prepared =
-                                prepare_window(root, window, restore, preferences).map(|(prepared, state)| {
-                                    *worker_preferences.lock().unwrap_or_else(|e| e.into_inner()) = state.preferences;
-                                    storage = Some(state);
-                                    prepared
-                                });
+                            let prepared = prepare_window(root, window, restore).map(|(prepared, state)| {
+                                *worker_preferences.lock().unwrap_or_else(|e| e.into_inner()) = state.preferences;
+                                storage = Some(state);
+                                prepared
+                            });
                             complete(DocumentResult::Prepared(prepared));
                         }
                         DocumentRequest::Persist(session) | DocumentRequest::PersistTransient(session) => {
@@ -2145,14 +2144,14 @@ fn prepare_with_settings(
     prepare_root_configured(root, preferences)
 }
 
-fn prepare_preferences(root: &Option<PathBuf>, mut preferences: WorkerSettings) -> io::Result<WorkerSettings> {
-    if root.is_none() {
-        let exe = std::env::current_exe()?;
-        let path = kwil_core_commands::Settings::path(&exe).map_err(io::Error::other)?;
-        preferences =
-            WorkerSettings::from(&kwil_core_commands::Settings::load(&path).map(|r| r.settings).unwrap_or_default());
-    }
-    Ok(preferences)
+fn prepare_preferences(root: &Option<PathBuf>, preferences: WorkerSettings) -> io::Result<WorkerSettings> {
+    if root.is_none() { profile_preferences() } else { Ok(preferences) }
+}
+
+fn profile_preferences() -> io::Result<WorkerSettings> {
+    let exe = std::env::current_exe()?;
+    let path = kwil_core_commands::Settings::path(&exe).map_err(io::Error::other)?;
+    Ok(WorkerSettings::from(&kwil_core_commands::Settings::load(&path).map(|r| r.settings).unwrap_or_default()))
 }
 
 fn resolve_root(root: Option<PathBuf>, override_root: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
@@ -2190,10 +2189,11 @@ fn prepare_window(
     root: Option<PathBuf>,
     window: kwil_core_workspace::window_session::WindowSession,
     restore: Option<WindowRestore>,
-    preferences: WorkerSettings,
 ) -> io::Result<(PreparedWorkspace, Storage)> {
     use kwil_core_workspace::window_session::{WindowSession, claim_window, restorable_windows};
-    let preferences = prepare_preferences(&root, preferences)?;
+    // A persistent application window always follows its profile settings.
+    // An isolated recovery root changes storage, not journal/undo preferences.
+    let preferences = profile_preferences()?;
     let base = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
     let claim = claim_window(&base, &window)?;
     let windows =

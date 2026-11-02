@@ -48,3 +48,5 @@ Hidden verification runs bypass the primary instance by default. Native IPC
 checks may explicitly set `KWIL_INSTANCE_NAMESPACE` to a unique `kwil-test-...`
 value; other namespaces are refused in hidden mode. These checks also require an
 isolated absolute `KWIL_WORKSPACE_ROOT` and disable updates with `KWIL_NO_UPDATE=1`.
+Persistent windows still read journal/undo preferences from their settings
+profile when the recovery root is overridden; hidden checks isolate that profile too.
