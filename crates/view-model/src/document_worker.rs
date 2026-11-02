@@ -38,6 +38,7 @@ pub(crate) use encoding_runtime::document_policy;
 pub mod provenance;
 pub mod retirement;
 pub use decoded::{PreparedDecodedDocument, prepare_decoded_document};
+pub type WindowRestore = Box<dyn FnOnce(&std::path::Path, Vec<String>) -> io::Result<()> + Send>;
 use kwil_core_text::{Buffer, TextFile};
 use kwil_core_workspace::{SaveRequest, SavedSnapshot, session::DocumentId};
 use kwil_core_workspace::{
@@ -363,6 +364,11 @@ pub enum DocumentRequest {
     },
     Prepare {
         root: Option<PathBuf>,
+    },
+    PrepareWindow {
+        root: Option<PathBuf>,
+        window: kwil_core_workspace::window_session::WindowSession,
+        restore: Option<WindowRestore>,
     },
     Persist(Session),
     /// Checkpoint separate-window bookkeeping without writing session metadata.
@@ -1516,6 +1522,13 @@ impl DocumentWorker {
                             });
                             complete(DocumentResult::Prepared(prepared));
                         }
+                        DocumentRequest::PrepareWindow { root, window, restore } => {
+                            let prepared = prepare_window(root, window, restore).map(|(prepared, state)| {
+                                storage = Some(state);
+                                prepared
+                            });
+                            complete(DocumentResult::Prepared(prepared));
+                        }
                         DocumentRequest::Persist(session) | DocumentRequest::PersistTransient(session) => {
                             if let Some(storage) = &mut storage {
                                 storage.order.retain(|id, _| {
@@ -2151,6 +2164,31 @@ fn prepare_root_configured(root: PathBuf, preferences: WorkerSettings) -> io::Re
         .truncate(false)
         .open(root.join("workspace.lock"))?;
     ownership.try_lock().map_err(io::Error::other)?;
+    prepare_owned_root(root, ownership)
+}
+
+fn prepare_window(
+    root: Option<PathBuf>,
+    window: kwil_core_workspace::window_session::WindowSession,
+    restore: Option<WindowRestore>,
+) -> io::Result<(PreparedWorkspace, Storage)> {
+    use kwil_core_workspace::window_session::{WindowSession, claim_window, restorable_windows};
+    let base = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
+    let claim = claim_window(&base, &window)?;
+    let windows =
+        if window == WindowSession::Primary && restore.is_some() { restorable_windows(&claim)? } else { Vec::new() };
+    let (root, ownership) = claim.into_parts();
+    let prepared = prepare_owned_root(root, ownership)?;
+    if let Some(restore) = restore
+        && !windows.is_empty()
+        && let Err(error) = restore(&base, windows)
+    {
+        eprintln!("kwil: some saved windows could not be reopened: {error}; recovery retained");
+    }
+    Ok(prepared)
+}
+
+fn prepare_owned_root(root: PathBuf, ownership: std::fs::File) -> io::Result<(PreparedWorkspace, Storage)> {
     // Reserve owner/path bookkeeping before opening any decoded document.
     // This is a metadata admission ceiling, not a resident allocation or a
     // file-size limit. Registry slots retain owners until snapshots retire.
