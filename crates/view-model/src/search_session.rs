@@ -337,6 +337,7 @@ impl SearchSession {
             }
             SearchUpdate::Document(result) => {
                 self.state.status = SearchStatus::Complete;
+                self.state.error = result.warning;
                 self.state.first = result.first;
                 self.state.hits = result.hits;
                 self.state.count = result.count;

@@ -207,9 +207,13 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
   editing workloads have not received bounded-memory acceptance.
 - In-file search covers chunk boundaries, very long lines and large-file tails.
   Finite regexes use their computed maximum match length (up to 1 MiB).
-  Unbounded regexes (`.*`, `+`, etc.) require a document of at most 64 KiB
-  with the default search settings; larger inputs show a limit error. Use
-  bounded repetitions such as `.{0,4096}` for larger documents.
+  Unbounded regexes that cannot consume a line ending (e.g. `\d+`, `\w+`,
+  `foo.*bar`) search any-size files with a 64 KiB per-line cap by default.
+  Overlong lines are skipped with an actionable warning; other lines are
+  still searched. Their anchors default to multiline mode. Unbounded regexes
+  that can consume a line ending (e.g. `(?s).*`, `[\s\S]*`, `\n+`) retain a
+  64 KiB whole-document cap and show an error on larger inputs. Use bounded
+  repetitions such as `.{0,4096}` to search beyond these limits.
 - Folder replacement skips binary files and files with lines above the folder
   search memory limit, and reports skipped files and failures in its result.
 - The TUI supports text-only Markdown preview and log follow, text/regex,

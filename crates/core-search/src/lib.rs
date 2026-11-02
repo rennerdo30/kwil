@@ -7,9 +7,11 @@
 //! and translates hits back to original-file byte offsets.
 //!
 //! Finite regexes derive their window overlap from their maximum match length
-//! (up to 1 MiB), independent of file or line size. Unbounded regexes require
-//! the complete source to fit the caller's input cap (UI default 64 KiB), or
-//! return an actionable limit error before emitting hits. See [`Pattern::regex`].
+//! (up to 1 MiB), independent of file or line size. Newline-safe unbounded regexes
+//! search capped lines (UI default 64 KiB), reporting skipped long lines while
+//! retaining the other results. Newline-consuming unbounded regexes cap the
+//! complete source instead, returning an actionable error on larger inputs.
+//! See [`Pattern::regex`] and [`SearchSummary::warning`].
 
 mod files;
 mod filter;

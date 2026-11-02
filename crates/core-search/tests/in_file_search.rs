@@ -76,7 +76,7 @@ fn unbounded_regex_reports_input_cap_before_emitting_partial_results() {
     let fixture =
         Fixture::new(2 * MIB, MIB - 32, b"startxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxend");
     let source = kwil_core_text::TextFile::open(&fixture.0).unwrap();
-    let pattern = Pattern::regex("start.*end|missing", Options::default(), 32).unwrap();
+    let pattern = Pattern::regex("(?s:start.*end|missing)", Options::default(), 32).unwrap();
     let mut hits = 0;
     let error = search_default(&source, &pattern, 0..source.len(), SearchMode::Hits, &cancel(), |_| hits += 1, |_| {})
         .unwrap_err();
@@ -109,12 +109,13 @@ fn unbounded_regex_preserves_greedy_lazy_alternative_and_selection_semantics_und
         .unwrap();
         assert_eq!(hits, expected);
     }
-    // A larger file with a small selection still needs global anchor/greediness context.
+    // A small selection in an overlong line is skipped and reported.
     let pattern = Pattern::regex("start.*end", Options::default(), 8).unwrap();
-    assert!(
+    let summary =
         kwil_core_search::search(bytes.as_slice(), &pattern, 0..5, SearchMode::Count, &cancel(), |_| {}, |_| {})
-            .is_err()
-    );
+            .unwrap();
+    assert!(summary.skipped_long_lines);
+    assert!(summary.warning().unwrap().contains("8 bytes"));
 }
 
 #[test]
@@ -173,6 +174,9 @@ fn unbounded_line_cap_keeps_hits_before_and_after_an_oversized_line() {
     assert_eq!(hits, [Match { offset: 0, len: 3 }, Match { offset, len: 3 }]);
     assert_eq!(summary.count, 2);
     assert_eq!(summary.scanned, bytes.len() as u64);
+    assert!(summary.skipped_long_lines);
+    let warning = summary.warning().unwrap();
+    assert!(warning.contains("skipped") && warning.contains("8 bytes") && warning.contains("bounded repetition"));
 }
 
 #[test]

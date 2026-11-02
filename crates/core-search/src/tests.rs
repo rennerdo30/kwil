@@ -104,6 +104,47 @@ fn tiny_chunks_and_work_windows_match_reference() {
 }
 
 #[test]
+fn capped_line_search_preserves_context_across_tiny_chunks_and_selections() {
+    let bytes = b"foo 12 bar\r\nfoo 3 bar\rfoo 4 bar\n";
+    for expression in [r"\d+", r"^foo.*bar$", r"(?-m:^foo.*bar$)", r"\Afoo.*bar", r"foo.*bar\z", r"a*"] {
+        let pattern = Pattern::regex(expression, Options::default(), 16).unwrap();
+        let reference = regex::bytes::RegexBuilder::new(expression).multi_line(true).crlf(true).build().unwrap();
+        for size in [1, 2, 3, 7, 128] {
+            let source = Chunks { bytes, size };
+            for range in [0..source.len(), 12..source.len() - 1, source.len()..source.len()] {
+                let expected: Vec<_> = reference
+                    .find_iter(bytes)
+                    .filter(|m| m.start() as u64 >= range.start && m.end() as u64 <= range.end)
+                    .map(|m| Match { offset: m.start() as u64, len: m.len() as u64 })
+                    .collect();
+                assert_eq!(collect(&source, &pattern, range.clone()), expected, "{expression}, {size}, {range:?}");
+                let count =
+                    search(&source, &pattern, range, SearchMode::Count, &token(), |_| panic!(), |_| {}).unwrap();
+                assert_eq!(count.count as usize, expected.len());
+                assert!(!count.skipped_long_lines);
+            }
+        }
+    }
+    let cancel = token();
+    let mut hits = 0;
+    let summary = search(
+        bytes.as_slice(),
+        &Pattern::regex(r"\d+", Options::default(), 16).unwrap(),
+        0..bytes.len() as u64,
+        SearchMode::Hits,
+        &cancel,
+        |_| {
+            hits += 1;
+            cancel.store(true, Ordering::Relaxed);
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(hits, 1);
+    assert!(summary.cancelled);
+}
+
+#[test]
 fn case_word_selection_and_invalid_bytes() {
     let text = "cat CAT scatter cat_ 猫cat cat猫 cat écat caté K k".as_bytes();
     let p = Pattern::literal(b"cat", Options { case_insensitive: true, whole_word: true }).unwrap();
