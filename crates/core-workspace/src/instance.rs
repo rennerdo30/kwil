@@ -631,9 +631,8 @@ mod platform {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
             };
-            // Accepted sockets can inherit the listener's nonblocking mode on
-            // BSD/macOS. All frame I/O below uses blocking, deadline-bound calls.
-            stream.set_nonblocking(false)?;
+            // Use readiness and one absolute deadline for every frame operation.
+            stream.set_nonblocking(true)?;
             let deadline = Instant::now() + IO_TIMEOUT;
             let _ = (|| {
                 authenticate(stream.as_raw_fd())?;
@@ -727,8 +726,16 @@ mod platform {
     fn read_deadline(s: &mut UnixStream, b: &mut [u8], deadline: Instant) -> io::Result<()> {
         let mut p = 0;
         while p < b.len() {
-            stage("set read timeout", s.set_read_timeout(Some(remaining(deadline)?)))?;
-            let n = stage("read", s.read(&mut b[p..]))?;
+            remaining(deadline)?;
+            let n = match s.read(&mut b[p..]) {
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_ready(s, 1, deadline)?;
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return stage("read", Err(error)),
+            };
             if n == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "IPC closed"));
             }
@@ -739,8 +746,16 @@ mod platform {
     fn write_deadline(s: &mut UnixStream, b: &[u8], deadline: Instant) -> io::Result<()> {
         let mut p = 0;
         while p < b.len() {
-            stage("set write timeout", s.set_write_timeout(Some(remaining(deadline)?)))?;
-            let n = stage("write", s.write(&b[p..]))?;
+            remaining(deadline)?;
+            let n = match s.write(&b[p..]) {
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_ready(s, 4, deadline)?;
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return stage("write", Err(error)),
+            };
             if n == 0 {
                 return Err(io::Error::new(io::ErrorKind::WriteZero, "IPC closed"));
             }
@@ -748,8 +763,28 @@ mod platform {
         }
         Ok(())
     }
+    fn wait_ready(s: &UnixStream, events: i16, deadline: Instant) -> io::Result<()> {
+        let mut fd = PollFd { fd: s.as_raw_fd(), events, revents: 0 };
+        loop {
+            let ms = remaining(deadline)?.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let result = unsafe { poll(&mut fd, 1, ms) };
+            if result > 0 {
+                // Read even on hangup: the peer may have queued its ACK before
+                // closing. macOS rejects setsockopt on that disconnected socket.
+                return Ok(());
+            }
+            if result == 0 {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC I/O deadline"));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
     // A blocking UnixStream::connect can hang on a full accept backlog. Create
-    // nonblocking, wait only to the caller's deadline, then restore blocking I/O.
+    // nonblocking and wait only to the caller's deadline. Frame I/O stays nonblocking.
     fn connect(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
         use std::os::unix::ffi::OsStrExt;
         unsafe extern "C" {
@@ -818,7 +853,36 @@ mod platform {
                 return stage("pending connect error", Err(io::Error::from_raw_os_error(error)));
             }
         }
-        stage("restore blocking", stream.set_nonblocking(false))?;
         Ok(stream)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ipc_reads_queued_ack_after_peer_disconnects() {
+            let (mut client, mut peer) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            peer.write_all(&[1]).unwrap();
+            drop(peer);
+            let mut ack = [0];
+            read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(ack, [1]);
+            assert_eq!(
+                read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_secs(2)).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+
+        #[test]
+        fn ipc_read_waits_only_until_its_absolute_deadline() {
+            let (mut client, _peer) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            let mut ack = [0];
+            assert_eq!(
+                read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_millis(10)).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
     }
 }
