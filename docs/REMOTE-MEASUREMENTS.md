@@ -22,11 +22,20 @@ two RFB Escape keys before sampling (advance About, then skip registration).
 After initial pixels settle, the client measures idle, one typed character,
 one wheel notch, opening a file through the running instance, and post-action
 idle. Typing is checked by saving and comparing exact bytes; the IPC-open check
-uses the existing first-content trace. Save/setup traffic is excluded from action
-samples. Each sample has a fixed duration, so late work is also visible in the
+uses the known-file worker acknowledgement, changed received framebuffer and
+an exact edit/save of the requested document after sampling. Save/setup traffic
+is excluded from action samples. Each sample has a fixed duration, so late work is also visible in the
 following idle sample. These are individual samples, not statistical budgets.
 
-Artifacts retain `result.json`, every rectangle in `rectangles.json`, process
+Before readiness checks, the client saves `setup-window.png` and `setup.png` from
+the received framebuffer. The always-run artifact upload retains them on failure.
+Readiness uses `file content ready` / `forward content ready`, the existing general
+content-presented diagnostic, and changed received pixels. The startup benchmark's
+fixture-specific presented trace can be fenced by document/overlay ownership and
+is not an interactive readiness acknowledgement. Timeouts are unchanged.
+
+Artifacts retain `result.json`, each completed sample immediately in `actions.json`,
+every rectangle in `rectangles.json` (including on failure), process
 logs, the isolated profile, and lossless PNGs reconstructed from received pixels.
 The Actions summary contains the numbers and commit SHA. Logs start with that SHA.
 

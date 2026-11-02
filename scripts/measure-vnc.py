@@ -197,6 +197,14 @@ def wait_for(predicate, description):
     raise RuntimeError(f"timed out waiting for {description}")
 
 
+def file_ready(log, mark):
+    # The fixture-specific *presented* mark is a startup-benchmark paint fence,
+    # not an acknowledgement of a normal interactive document. Use the known
+    # row's worker acknowledgement, received pixels, and exact-save checks here.
+    text = log.read_text()
+    return f"kwil-startup {mark} " in text and "kwil-startup first content presented " in text
+
+
 def measure(binary, output, commit):
     output.mkdir(parents=True, exist_ok=False)
     profile = output / "profile"
@@ -233,10 +241,17 @@ def measure(binary, output, commit):
         run(["xdotool", "getdisplaygeometry"], env, stdout=subprocess.DEVNULL)
         connection = stack.enter_context(socket.create_connection(("127.0.0.1", 5999), timeout=5))
         client = RFB(connection)
+        stack.callback(client.capture, output / "last-frame.png")
+        stack.callback(lambda: (output / "rectangles.json").write_text(json.dumps(client.rectangles, indent=2) + "\n"))
         client.collect("desktop_setup", 1)
+        desktop_frame = bytes(client.frame)
         app = stack.enter_context(owned([str(binary), "--gui", str(fixture)], env, output, "kwil", commit,
                                        cwd=profile))
         log = output / "kwil.log"
+        # Drain the real connection and preserve its pixels BEFORE readiness.
+        # The workflow uploads these even if any later acknowledgement fails.
+        client.collect("app_setup", 3)
+        client.capture(output / "setup-window.png")
         wait_for(lambda: "first frame presented" in log.read_text(), "initial window frame")
         windows = run(["xdotool", "search", "--onlyvisible", "--pid", str(app.pid), "--name", "Kwil"],
                       env, capture_output=True, text=True).stdout.splitlines()
@@ -247,46 +262,65 @@ def measure(binary, output, commit):
         wait_for(lambda: "session_detected=true remote=true blink=false" in log.read_text(),
                  "automatic remote policy diagnostic")
         client.socket.sendall(struct.pack("!BBHH", 5, 0, 500, 400))
-        client.collect("app_setup", 3)
         # Debug builds intentionally show onboarding even with a seen marker.
         # Escape advances About, then explicitly skips file registration. Both
         # inputs travel over RFB and their traffic belongs only to setup.
         for _ in range(2):
             client.press(0xFF1B)
             client.collect("dismiss_welcome", 0.5)
-        wait_for(lambda: "file content presented" in log.read_text(), "initial file pixels")
+        client.capture(output / "setup.png")
+        if client.frame == desktop_frame:
+            raise RuntimeError("setup framebuffer has not changed from the empty desktop; see setup.png")
+        wait_for(lambda: file_ready(log, "file content ready"), "known initial file ready with received pixels")
         client.capture(output / "initial.png")
-        records = [client.collect("idle", 3)]
+        records = []
+
+        def sample(action, seconds):
+            record = client.collect(action, seconds)
+            records.append(record)
+            (output / "actions.json").write_text(json.dumps(dict(commit=commit, actions=records), indent=2) + "\n")
+            print(json.dumps(record), flush=True)
+            return record
+
+        sample("idle", 3)
         client.press(ord("x"))
-        records.append(client.collect("type_one_character", 3))
+        sample("type_one_character", 3)
         client.capture(output / "typing.png")
         # Save is outside the typing sample; exact bytes prove input reached the document.
         client.press(ord("s"), control=True)
         client.collect("save_verification", 2)
         wait_for(lambda: fixture.read_bytes() == b"x" + original, "exact typed/saved bytes")
         client.wheel()
-        records.append(client.collect("scroll_one_wheel_notch", 3))
+        sample("scroll_one_wheel_notch", 3)
         client.capture(output / "scroll.png")
-        records.append(client.collect("idle_after_scroll", 2))
+        sample("idle_after_scroll", 2)
+        before_open = bytes(client.frame)
         run([str(binary), "--gui", str(opened)], env, cwd=profile, stdout=subprocess.DEVNULL)
-        records.append(client.collect("open_file_via_ipc", 4))
-        wait_for(lambda: "forward content presented" in log.read_text(), "opened file pixels")
+        sample("open_file_via_ipc", 4)
         client.capture(output / "opened.png")
-        records.append(client.collect("idle_after_open", 2))
+        if client.frame == before_open:
+            raise RuntimeError("IPC open did not change the received framebuffer; see opened.png")
+        wait_for(lambda: file_ready(log, "forward content ready"), "known IPC file ready with received pixels")
+        sample("idle_after_open", 2)
+        # Outside all action samples, prove IPC selected the requested document.
+        client.press(ord("y"))
+        client.press(ord("s"), control=True)
+        client.collect("open_save_verification", 2)
+        wait_for(lambda: opened.read_bytes() == b"ykwil-speed-forward\nOpened through the running instance.\n",
+                 "exact IPC document edit/save bytes")
         result = dict(commit=commit, desktop=client.desktop, geometry=[client.width, client.height],
                       encoding="Raw + CopyRect (uncompressed, 32bpp)",
                       remote_detected=True, remote_override="auto", session_hint={"VNCDESKTOP": env["VNCDESKTOP"]},
-                      exact_typing_save_verified=True, forwarded_content_verified=True, actions=records,
+                      exact_typing_save_verified=True, forwarded_file_save_verified=True, actions=records,
                       measurement="Received RFB FramebufferUpdate bytes including headers; excludes TCP/IP, handshake and client requests. Pixel areas include overlap across rectangles/updates, not unique damage or app presents.")
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-        (output / "rectangles.json").write_text(json.dumps(client.rectangles, indent=2) + "\n")
         summary = [f"## TigerVNC informational measurement\n\nCommit `{commit}`; desktop 1400x1000; Raw + CopyRect, 32bpp.",
                    "\nAuto remote detection: **true** (`VNCDESKTOP` supplied by the hosted VNC session launcher; `render.remote=auto`, blink disabled).",
                    "\n| Action | Seconds | Update bytes | Updates | Rectangles | Raw pixels | Copy rects | Copy pixels |",
                    "|---|---:|---:|---:|---:|---:|---:|---:|"]
         for row in records:
             summary.append("| {action} | {seconds} | {update_bytes} | {updates} | {rectangles} | {raw_pixels} | {copy_rectangles} | {copy_pixels} |".format(**row))
-        summary.extend(["\nTyping verified by exact saved bytes; IPC open verified by the existing content-presented trace.",
+        summary.extend(["\nTyping and IPC file selection verified by exact edited/saved bytes. Readiness requires known-file ready diagnostics and changed received framebuffer pixels; setup/open PNGs retain the actual pixels.",
                         "\nBytes are server-to-client RFB updates including headers, excluding TCP/IP, handshake, input and request messages. Raw is intentionally uncompressed. Pixel sums can overlap; updates are not app presents.",
                         "\nNo performance gates. Xvnc may compare/coalesce damage; zero wire updates do not prove zero app presents. One wheel notch uses the editor's configured line increment.",
                         "\nStill needed: a separate real RDP host/client with per-action transport counters, live local/RDP switching, compressed VNC codecs, physical machines and WAN latency/bandwidth. Windows stretch skipped: no validated headless FreeRDP byte/rectangle instrument or disposable RDP logon setup in this package; feasibility was not proven. No owner-desktop connection."])
