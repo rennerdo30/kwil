@@ -107,6 +107,8 @@ jobs:
           exe=target/debug/kwil
           [ -f "$exe.exe" ] && exe="$exe.exe"
           if [ "$RUNNER_OS" = Linux ]; then
+            # winit loads libxkbcommon-x11 at runtime; the hosted image lacks it.
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libxkbcommon-x11-0
             xvfb-run -a python3 scripts/test-crash-recovery.py "$exe" target/crash-recovery
           else
             python scripts/test-crash-recovery.py "$exe" target/crash-recovery
