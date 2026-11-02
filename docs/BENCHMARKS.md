@@ -74,7 +74,17 @@ Production builds contain neither these counters nor clocks. macOS reports the
 same 100k-file query in the informational startup job; the existing Linux and
 Windows core-text gates retain their original processes and target directories.
 
-The other §3 budgets (search, diff, full-editor memory, typing, scrolling,
+The isolated `crates/bench/compare` workspace adds Linux/Windows measurements
+of disk-backed compare on generated 1 GiB and 2 GiB file pairs with sixteen
+scattered substitutions. It reports fresh-process peak RSS, Windows peak
+private committed bytes, scratch disk and wall time including immutable input
+capture. Fixture generation is excluded. Large cases are initially
+informational: an incomplete ten-minute sample is recorded explicitly, never
+accepted as a completed comparison. See its README for scope and memory
+definitions. The existing source-fence tests run in this job too. These numbers
+do not establish GUI/TUI damage or the separate 100k-line timing budget.
+
+The other §3 budgets (search, 100k-line diff, full-editor memory, typing, scrolling,
 remote drawing) still need their own representative integration measurements.
 KW-33 remains open for those and for promoting informational budgets to gates.
 
