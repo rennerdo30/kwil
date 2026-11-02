@@ -104,8 +104,10 @@ enum Engine {
 pub struct Pattern {
     engine: Engine,
     max_len: usize,
+    source_limit: Option<usize>,
     captures: bool,
     pub(crate) newline_safe: bool,
+    cr_safe: bool,
 }
 
 impl Pattern {
@@ -124,6 +126,14 @@ impl Pattern {
             // assertions let regex retry in one scan, emitting non-overlapping
             // accepted hits. Ordinary exact literals keep the memmem fast path.
             let expression = if options.whole_word { whole_word_expression(&escaped)? } else { escaped };
+            let hir = regex_syntax::ParserBuilder::new()
+                .utf8(false)
+                .unicode(unicode)
+                .case_insensitive(options.case_insensitive)
+                .build()
+                .parse(&expression)
+                .map_err(invalid)?;
+            let max_len = supported_match_len(hir.properties().maximum_len().unwrap_or(0))?;
             let re = RegexBuilder::new(&expression)
                 .unicode(unicode)
                 .case_insensitive(options.case_insensitive)
@@ -131,33 +141,35 @@ impl Pattern {
                 .map_err(invalid)?;
             Ok(Self {
                 engine: Engine::Regex(re),
-                max_len: if options.case_insensitive {
-                    needle.len().saturating_mul(4).min(MAX_PATTERN)
-                } else {
-                    needle.len()
-                },
+                max_len,
+                source_limit: None,
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
+                cr_safe: !needle.contains(&b'\r'),
             })
         } else {
             Ok(Self {
                 engine: Engine::Literal(needle.to_vec()),
                 max_len: needle.len(),
+                source_limit: None,
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
+                cr_safe: !needle.contains(&b'\r'),
             })
         }
     }
 
-    /// Regex search uses overlap, never a whole-file or whole-line buffer.
+    /// Finite regexes derive their overlap from the maximum possible match
+    /// length in bytes, including Unicode case folding. Maxima above 1 MiB
+    /// return a limit error; the caller's bound never truncates finite matches.
     ///
-    /// Contract: every possible match must fit `max_match_bytes` (1..=1 MiB).
-    /// 64 KiB is a useful UI default. Unbounded expressions such as `.*` are
-    /// supported only when the caller can guarantee this bound for its input.
-    /// Longer matches are outside this API's contract. Detected overlong matches
-    /// return an error, but matches longer than the bound may be missed silently
-    /// across window borders. Callers must not assume every violation errors.
-    /// Use line-oriented find-in-files when complete bounded lines are needed.
+    /// Unbounded expressions that cannot consume LF search capped lines.
+    /// CR also ends a capped line when the pattern cannot consume CR.
+    /// Lines exceeding `max_match_bytes` (1..=1 MiB) are skipped, with an
+    /// actionable warning in SearchSummary; other lines are still searched.
+    /// Newline-consuming unbounded expressions instead cap the entire source,
+    /// including selection searches, and return an error on larger sources.
+    /// Line-capped anchors default to multiline mode; explicit flags and \A/\z are retained.
     /// Anchors, captures, Unicode and zero-width matches retain regex semantics
     /// within this contract. The range restricts matches, not anchor context.
     pub fn regex(expression: &str, options: Options, max_match_bytes: usize) -> io::Result<Self> {
@@ -171,16 +183,25 @@ impl Pattern {
             .build()
             .parse(expression)
             .map_err(invalid)?;
-        let newline_safe = !consumes_newline(&hir);
+        let maximum = if hir.properties().minimum_len().is_none() {
+            Some(0) // The expression matches nothing, rather than an unbounded string.
+        } else {
+            hir.properties().maximum_len()
+        };
+        let source_limit = maximum.is_none().then_some(max_match_bytes);
+        let max_len = supported_match_len(maximum.unwrap_or(max_match_bytes))?;
+        let newline_safe = !consumes_delimiter(&hir, b'\n');
+        let cr_safe = !consumes_delimiter(&hir, b'\r');
         let constrained = if options.whole_word { whole_word_expression(expression)? } else { expression.to_owned() };
         let re = RegexBuilder::new(&constrained)
             .crlf(true)
+            .multi_line(source_limit.is_some() && newline_safe)
             .case_insensitive(options.case_insensitive)
             .size_limit(8 << 20)
             .dfa_size_limit(2 << 20)
             .build()
             .map_err(invalid)?;
-        Ok(Self { engine: Engine::Regex(re), max_len: max_match_bytes, captures: true, newline_safe })
+        Ok(Self { engine: Engine::Regex(re), max_len, source_limit, captures: true, newline_safe, cr_safe })
     }
 
     pub(crate) fn visit(
@@ -286,6 +307,13 @@ pub(crate) fn expand_captures(caps: &regex::bytes::Captures<'_>, replacement: &[
     Ok(out)
 }
 
+fn supported_match_len(len: usize) -> io::Result<usize> {
+    if len > MAX_PATTERN {
+        return Err(invalid("regex maximum match length exceeds 1 MiB; use a smaller bounded repetition"));
+    }
+    Ok(len.max(1))
+}
+
 fn whole_word_expression(expression: &str) -> io::Result<String> {
     // AST serialization removes comments while retaining capture syntax and
     // inline flags. HIR serialization would drop groups under {0} and renumber
@@ -295,16 +323,18 @@ fn whole_word_expression(expression: &str) -> io::Result<String> {
     Ok(format!(r"(?u:\b)(?:{ast})(?u:\b)"))
 }
 
-fn consumes_newline(hir: &regex_syntax::hir::Hir) -> bool {
+fn consumes_delimiter(hir: &regex_syntax::hir::Hir, byte: u8) -> bool {
     use regex_syntax::hir::{Class, HirKind};
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => false,
-        HirKind::Literal(lit) => lit.0.contains(&b'\n'),
-        HirKind::Class(Class::Unicode(c)) => c.iter().any(|r| r.start() <= '\n' && r.end() >= '\n'),
-        HirKind::Class(Class::Bytes(c)) => c.iter().any(|r| r.start() <= b'\n' && r.end() >= b'\n'),
-        HirKind::Repetition(r) => consumes_newline(&r.sub),
-        HirKind::Capture(c) => consumes_newline(&c.sub),
-        HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().any(consumes_newline),
+        HirKind::Literal(lit) => lit.0.contains(&byte),
+        HirKind::Class(Class::Unicode(c)) => {
+            c.iter().any(|r| r.start() <= char::from(byte) && r.end() >= char::from(byte))
+        }
+        HirKind::Class(Class::Bytes(c)) => c.iter().any(|r| r.start() <= byte && r.end() >= byte),
+        HirKind::Repetition(r) => consumes_delimiter(&r.sub, byte),
+        HirKind::Capture(c) => consumes_delimiter(&c.sub, byte),
+        HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().any(|h| consumes_delimiter(h, byte)),
     }
 }
 
@@ -326,6 +356,18 @@ pub struct SearchSummary {
     pub scanned: u64,
     pub cancelled: bool,
     pub workers: usize,
+    /// At least one capped line was skipped. Counts/hits cover the other lines.
+    pub skipped_long_lines: bool,
+    pub line_limit: usize,
+}
+
+impl SearchSummary {
+    pub fn warning(&self) -> Option<String> {
+        self.skipped_long_lines.then(|| format!(
+            "Search incomplete: lines longer than {} bytes were skipped for this unbounded regex; use a bounded repetition such as .{{0,4096}}",
+            self.line_limit
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -347,6 +389,19 @@ pub fn search<H: Haystack + ?Sized>(
     mut on_hit: impl FnMut(Match),
     mut progress: impl FnMut(Progress),
 ) -> io::Result<SearchSummary> {
+    if range.start > range.end || range.end > source.len() {
+        return Err(invalid("invalid search range"));
+    }
+    if let Some(limit) = pattern.source_limit {
+        if pattern.newline_safe {
+            return search_lines(source, pattern, range, mode, cancel, on_hit, progress);
+        }
+        if source.len() > limit as u64 {
+            return Err(invalid(format!(
+                "newline-consuming unbounded regex requires a source of at most {limit} bytes; use a bounded repetition such as .{{0,4096}} for larger files"
+            )));
+        }
+    }
     let mut result = SearchSummary { workers: 1, ..SearchSummary::default() };
     let mut next = range.start;
     let mut last_end = None;
@@ -389,6 +444,158 @@ pub fn search<H: Haystack + ?Sized>(
     })?;
     result.cancelled = cancel.load(Ordering::Relaxed);
     Ok(result)
+}
+
+// One capped content line plus its preceding and following CR/LF delimiters.
+// Delimiter context prevents artificial \A/\z and word-boundary matches.
+struct LineSearch<'a, F> {
+    pattern: &'a Pattern,
+    range: Range<u64>,
+    mode: SearchMode,
+    cancel: &'a Cancellation,
+    on_hit: F,
+    result: SearchSummary,
+    start: u64,
+    len: u64,
+    prefix: usize,
+    bytes: Vec<u8>,
+}
+
+impl<F: FnMut(Match)> LineSearch<'_, F> {
+    fn append(&mut self, bytes: &[u8]) {
+        self.len += bytes.len() as u64;
+        if self.len <= self.result.line_limit as u64 {
+            self.bytes.extend_from_slice(bytes);
+        } else {
+            self.bytes.truncate(self.prefix);
+        }
+    }
+
+    fn finish(&mut self, delimiter: &[u8], final_line: bool) -> io::Result<()> {
+        let next = self.start + self.len + delimiter.len() as u64;
+        if self.start <= self.range.end && (next > self.range.start || final_line && next == self.range.start) {
+            if self.len > self.result.line_limit as u64 {
+                self.result.skipped_long_lines = true;
+            } else {
+                self.bytes.extend_from_slice(delimiter);
+                let base = self.start - self.prefix as u64;
+                let from = (self.range.start.max(self.start) - base) as usize;
+                self.pattern.visit(&self.bytes, from, |m| {
+                    let offset = base + m.start as u64;
+                    let end = base + m.end as u64;
+                    if offset > self.range.end || offset >= next && !(final_line && offset == next) {
+                        return Ok(false);
+                    }
+                    if self.cancel.load(Ordering::Relaxed) {
+                        return Ok(false);
+                    }
+                    if end <= self.range.end {
+                        self.result.count += 1;
+                        if self.mode == SearchMode::Hits {
+                            (self.on_hit)(Match { offset, len: end - offset });
+                        }
+                    }
+                    Ok(true)
+                })?;
+            }
+        }
+        self.start = next;
+        self.len = 0;
+        self.prefix = delimiter.len();
+        self.bytes.clear();
+        self.bytes.extend_from_slice(delimiter);
+        Ok(())
+    }
+}
+
+fn search_lines<H: Haystack + ?Sized>(
+    source: &H,
+    pattern: &Pattern,
+    range: Range<u64>,
+    mode: SearchMode,
+    cancel: &Cancellation,
+    on_hit: impl FnMut(Match),
+    mut progress: impl FnMut(Progress),
+) -> io::Result<SearchSummary> {
+    let limit = pattern.source_limit.expect("line search requires an unbounded pattern");
+    // At most limit+4 outside either selection edge is enough to find the
+    // complete intersecting line, or prove it exceeds the cap. No prefix replay.
+    let lo = range.start.saturating_sub(limit as u64 + 4);
+    let hi = range.end.saturating_add(limit as u64 + 4).min(source.len());
+    let total = range.end - range.start;
+    let mut state = LineSearch {
+        pattern,
+        range,
+        mode,
+        cancel,
+        on_hit,
+        result: SearchSummary { workers: 1, line_limit: limit, ..SearchSummary::default() },
+        start: lo,
+        len: 0,
+        prefix: 0,
+        bytes: Vec::with_capacity(limit + 4),
+    };
+    let mut expected = lo;
+    let mut cr = false;
+    for chunk in source.chunks(lo..hi)? {
+        let (at, bytes) = chunk?;
+        if at != expected || bytes.len() as u64 > hi - expected {
+            return Err(invalid("invalid haystack chunks"));
+        }
+        expected += bytes.len() as u64;
+        for part in bytes.chunks(BLOCK) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut cursor = 0;
+            if cr {
+                let paired = part.first() == Some(&b'\n');
+                state.finish(if paired { b"\r\n" } else { b"\r" }, false)?;
+                cursor = usize::from(paired);
+                cr = false;
+            }
+            for n in memchr::memchr2_iter(b'\r', b'\n', part) {
+                if n < cursor || part[n] == b'\r' && !pattern.cr_safe {
+                    continue;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                state.append(&part[cursor..n]);
+                if part[n] == b'\r' && n + 1 == part.len() {
+                    cr = true;
+                    cursor = n + 1;
+                    break;
+                }
+                let delimiter: &[u8] =
+                    if part[n] == b'\r' && part.get(n + 1) == Some(&b'\n') { b"\r\n" } else { &part[n..n + 1] };
+                state.finish(delimiter, false)?;
+                cursor = n + delimiter.len();
+            }
+            if !cancel.load(Ordering::Relaxed) {
+                state.append(&part[cursor..]);
+            }
+            state.result.scanned =
+                (state.start + state.len + u64::from(cr)).saturating_sub(state.range.start).min(total);
+            progress(Progress { scanned: state.result.scanned, total, count: state.result.count });
+        }
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    if !cancel.load(Ordering::Relaxed) {
+        if expected != hi {
+            return Err(invalid("incomplete haystack chunks"));
+        }
+        if cr {
+            state.finish(b"\r", false)?;
+        }
+        state.finish(b"", hi == source.len())?;
+        state.result.scanned = total;
+        progress(Progress { scanned: total, total, count: state.result.count });
+    }
+    state.result.cancelled = cancel.load(Ordering::Relaxed);
+    Ok(state.result)
 }
 
 /// Each edit is against the same snapshot. The editor applies this ordered

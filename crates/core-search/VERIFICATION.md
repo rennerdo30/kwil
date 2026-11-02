@@ -215,17 +215,50 @@ not a passing measurement for this commit. No second timing was taken under
 the one-run budget. Parent owns any decision about further measurement and
 performance acceptance, plus final-head hosted CI and independent review.
 
-## Regex match-bound limitation
+## In-file regex completeness policy
 
-The in-buffer regex engine requires every possible match to fit the declared
-`max_match_bytes`. A match longer than this bound may be **missed silently across
-window borders**: for example, `x{200}` with a bound of 2 can return no match
-without an error. Only overlong matches that the windows actually expose can
-produce a bound error. Callers must not assume every violation errors, even
-when a small-input probe does error. This limitation also applies to line filters
-using the bounded window engine. Prefer the line-oriented `find_in_files` mode
-where completeness matters: it searches complete lines and reports an error if
-a line exceeds its configured heap cap. It does not support multiline matches.
+Finite expressions derive their maximum match length in bytes from
+`regex-syntax` HIR, including Unicode case folding and alternations. Windows
+retain that much overlap plus assertion context; caller-supplied bounds never
+truncate finite matches. A computed maximum above 1 MiB is rejected before
+matching, with a limit error. Window storage is at most one 1 MiB work block
+plus the computed overlap and eight context bytes, independent of file/line size.
+
+Unbounded expressions have no finite safe overlap. Patterns proven unable to
+consume LF (e.g. `\d+`, `\w+`, `foo.*bar`, `[^\n]+`) stream through any-size files,
+retaining one line capped at `max_match_bytes` (1..=1 MiB; UI default 64 KiB)
+plus up to four delimiter-context bytes. LF ends a capped region; CR also ends
+one when the pattern cannot consume CR. This preserves CR-consuming classes
+such as `[^\n]+` and `\r+`. CR, LF and CRLF delimiters may cross source chunks.
+Only overlong regions are skipped. `SearchSummary::warning()`
+reports incomplete coverage with the cap and bounded-repetition guidance;
+the document worker retains the other hits/count/navigation and passes that
+warning to the shared GUI/TUI search state. Replacement recipes are withheld
+for incomplete searches. Line filters retain their explicit limit error.
+
+Line-capped regexes default to multiline `^`/`$`; explicit `(?-m)` flags and
+document-only `\A`/`\z` retain their meaning. Line-ending context prevents
+artificial document anchors. Selection edges read at most the cap plus four
+bytes beyond each edge, enough to admit the complete intersecting line or
+prove it overlong. No scan from the beginning of the file is needed.
+
+Unbounded patterns that can consume LF (e.g. `(?s).*`, `[\s\S]*`,
+`\n+`, `\s+$`) retain the whole-source cap, including selection searches;
+larger sources return an actionable error before matching or emitting hits.
+For inputs beyond either cap use finite repetitions, e.g. `.{0,4096}`.
+No match is silently truncated. Folder search and replacement are unchanged.
+
+Before this change, `x{256}` with a declared bound of 16 could silently miss a
+chunk-boundary match, including in a 51 MiB line and at the tail of a file
+larger than 65 MiB. All six new regressions failed on `af0bb5e` before the fix.
+The focused `tests/in_file_search.rs` fixtures generate sparse
+files under ignored `fixtures/`, with unique PID/counter names and bounded writes.
+
+PR #110 fix round 1 adds three regressions for multi-MiB numeric search,
+retaining hits around an overlong line, and CR/LF anchor semantics. All three
+failed on pre-fix commit `574eeca` (2 earlier cap tests passed). Additional tiny
+chunk/selection/count/cancellation and document-warning transport checks cover
+the line scanner and incomplete-search result path.
 
 ## Focused checks
 

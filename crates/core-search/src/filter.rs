@@ -152,8 +152,11 @@ impl LineFilter {
             }
             let line = LineSource { source, range: cursor.offset..line_end };
             for (i, pattern) in self.patterns.iter().enumerate() {
-                values[i] =
-                    search(&line, pattern, 0..line.len(), SearchMode::Count, cancel, |_| {}, |_| {})?.count != 0;
+                let summary = search(&line, pattern, 0..line.len(), SearchMode::Count, cancel, |_| {}, |_| {})?;
+                if let Some(warning) = summary.warning() {
+                    return Err(invalid(warning));
+                }
+                values[i] = summary.count != 0;
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(false);
                 }

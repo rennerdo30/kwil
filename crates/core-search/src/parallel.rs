@@ -87,6 +87,8 @@ pub fn search_with_threads<H: Haystack + Sync + ?Sized>(
                     CountEvent::Done(i, Ok(s)) => {
                         latest[i] = (s.count, s.scanned);
                         result.cancelled |= s.cancelled;
+                        result.skipped_long_lines |= s.skipped_long_lines;
+                        result.line_limit = result.line_limit.max(s.line_limit);
                     }
                     CountEvent::Done(_, Err(e)) => {
                         if error.is_none() {
@@ -164,6 +166,8 @@ pub fn search_with_threads<H: Haystack + Sync + ?Sized>(
                         result.count += s.count;
                         result.scanned += s.scanned;
                         result.cancelled |= s.cancelled;
+                        result.skipped_long_lines |= s.skipped_long_lines;
+                        result.line_limit = result.line_limit.max(s.line_limit);
                     }
                     HitEvent::Done(Err(e)) => {
                         if error.is_none() {

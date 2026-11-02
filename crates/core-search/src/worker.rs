@@ -45,7 +45,8 @@ pub struct Query {
     pub expression: String,
     pub literal: bool,
     pub options: Options,
-    /// Engine completeness contract: every match must fit this declared bound.
+    /// Unbounded regex cap (UI default 64 KiB): per line when newline-safe,
+    /// otherwise for the complete source. Finite maxima are derived, up to 1 MiB.
     pub max_match_bytes: usize,
 }
 impl Query {
@@ -325,6 +326,7 @@ pub struct DocumentMatches {
     pub navigation: Option<Match>,
     pub signal: [u64; SIGNAL_BINS],
     pub replacement: Option<ReplaceRecipe>,
+    pub warning: Option<String>,
 }
 #[derive(Debug)]
 pub enum SearchUpdate {
@@ -1599,6 +1601,7 @@ fn run_document(
     let spool = if replace_all { Some(spools.begin()?) } else { None };
     let mut plan_error = None;
     let mut scan_error = None;
+    let mut warning = None;
     let mut page_sent = false;
     for range in &ranges {
         let prior_count = count;
@@ -1671,6 +1674,9 @@ fn run_document(
             }
         };
         scanned += summary.scanned;
+        if let Some(message) = summary.warning() {
+            warning = Some(message);
+        }
         if cancel.load(Ordering::Acquire) {
             break;
         }
@@ -1686,7 +1692,12 @@ fn run_document(
         Some(Navigation::Previous { .. }) => last,
         None => None,
     });
-    let replacement = if let Some(slot) = spool {
+    let replacement = if warning.is_some() {
+        if let Some(slot) = spool {
+            spools.abandon(slot);
+        }
+        None
+    } else if let Some(slot) = spool {
         match spools.finish(slot) {
             Ok(recipe) => Some(ReplaceRecipe { key, edits: ReplacementEdits::Spool(recipe) }),
             Err(error) => {
@@ -1727,6 +1738,7 @@ fn run_document(
             navigation,
             signal,
             replacement,
+            warning,
         })));
     }
     Ok(())
@@ -2339,6 +2351,43 @@ mod tests {
         doc.ranges = vec![0..3, 3..6];
         let error = run_document(request.key, doc, &cancel, &|_| true, &mut spools).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn capped_document_search_retains_other_hits_and_reports_skipped_lines() {
+        let bytes = b"123\nthis line exceeds eight bytes\n456\n";
+        let mut request = request(1, bytes, r"\d+");
+        let SearchTask::Document(doc) = &mut request.task else { unreachable!() };
+        doc.query.literal = false;
+        doc.query.max_match_bytes = 8;
+        doc.replacement = Some(Replacement { template: b"x".to_vec(), target: ReplaceTarget::All });
+        let output = Mutex::new(Vec::new());
+        let mut spools = SpoolOwner::new(4096).unwrap();
+        run_document(
+            request.key,
+            doc,
+            &Arc::new(AtomicBool::new(false)),
+            &|event| {
+                output.lock().unwrap().push(event);
+                true
+            },
+            &mut spools,
+        )
+        .unwrap();
+        let result = output
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event {
+                SearchUpdate::Document(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(result.count, 2);
+        assert_eq!(result.hits.len(), 2);
+        assert_eq!(result.scanned, bytes.len() as u64);
+        assert!(result.warning.unwrap().contains("8 bytes"));
+        assert!(result.replacement.is_none(), "incomplete coverage must not produce a replace-all recipe");
     }
     #[test]
     fn file_spool_revisits_first_native_page_after_ninety_rows() {
