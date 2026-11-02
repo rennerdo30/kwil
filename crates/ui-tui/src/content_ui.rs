@@ -6,6 +6,7 @@ use kwil_view_model::log_session::{Filter, Level, LogSession, TextQuery, Viewpor
 use std::{sync::Arc, time::Instant};
 
 type Source = (u64, u64, u64);
+type MarkdownRequest = (Source, u64, kwil_core_text::Snapshot);
 fn source(view: &Workspace) -> Option<Source> {
     if view.document_busy(view.active_id()) {
         return None;
@@ -20,27 +21,33 @@ enum Mode {
     Split,
 }
 struct MarkdownWorker {
-    send: Option<mpsc::SyncSender<(Source, kwil_core_text::Snapshot)>>,
-    receive: mpsc::Receiver<(Source, Result<Model, String>)>,
+    send: Option<mpsc::SyncSender<MarkdownRequest>>,
+    receive: mpsc::Receiver<(Source, u64, Result<Model, String>)>,
     thread: Option<std::thread::JoinHandle<()>>,
     native: Arc<NativeExitObservation>,
 }
 impl MarkdownWorker {
     fn start(wake: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Self> {
-        let (send, requests) = mpsc::sync_channel::<(Source, kwil_core_text::Snapshot)>(1);
+        let (send, requests) = mpsc::sync_channel::<MarkdownRequest>(1);
         let (results, receive) = mpsc::sync_channel(1);
         let native = Arc::new(NativeExitObservation::default());
         let observation = native.clone();
         let thread = std::thread::Builder::new().name("kwil-tui-markdown".into()).spawn(move || {
             let registration = observation.register_current();
-            while let Ok((key, snapshot)) = requests.recv() {
+            let mut pager = None;
+            let mut pager_source = None;
+            while let Ok((key, top, snapshot)) = requests.recv() {
+                if pager_source != Some((key.0, key.1)) {
+                    pager = None;
+                    pager_source = Some((key.0, key.1));
+                }
                 let result = if registration.is_err() {
                     Err("Markdown worker registration failed".into())
                 } else {
-                    parse(&snapshot)
+                    parse_page(&snapshot, top, &mut pager)
                 };
                 drop(snapshot);
-                if results.try_send((key, result)).is_err() {
+                if results.try_send((key, top, result)).is_err() {
                     break;
                 }
                 wake();
@@ -74,13 +81,36 @@ fn parse(snapshot: &kwil_core_text::Snapshot) -> Result<Model, String> {
     let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
     kwil_core_markdown::bounded::preview_model(text, &|| false).map_err(|e| format!("Markdown preview: {e:?}"))
 }
+fn parse_page(
+    snapshot: &kwil_core_text::Snapshot,
+    top: u64,
+    pager: &mut Option<kwil_core_markdown::paged::Pager>,
+) -> Result<Model, String> {
+    if snapshot.len() <= kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64 {
+        return parse(snapshot);
+    }
+    let mut read = |range: std::ops::Range<u64>, out: &mut Vec<u8>| {
+        out.clear();
+        for chunk in snapshot.chunks(range).map_err(|e| e.to_string())? {
+            out.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+        }
+        Ok(())
+    };
+    if pager.is_none() {
+        *pager = Some(kwil_core_markdown::paged::Pager::build(snapshot.len(), &mut read, &|| false)?);
+    }
+    pager.as_mut().unwrap().page(top, 64, &mut read, &|| false).map(|page| page.model)
+}
 #[derive(Default)]
 pub(super) struct Host {
     mode: Mode,
     document: Option<u64>,
     markdown: Option<MarkdownWorker>,
     in_flight: bool,
-    markdown_retry: Option<(Source, kwil_core_text::Snapshot)>,
+    markdown_retry: Option<MarkdownRequest>,
+    large_markdown: bool,
+    model_top: Option<u64>,
+    rendered_top: usize,
     model: Option<Model>,
     model_source: Option<Source>,
     markdown_top: usize,
@@ -302,6 +332,23 @@ impl Host {
             KeyCode::PageUp => -(view.rows() as i64),
             _ => 0,
         };
+        if self.large_markdown && self.mode != Mode::Text {
+            match key.code {
+                KeyCode::Home => {
+                    view.scroll_to_start();
+                    return true;
+                }
+                KeyCode::End => {
+                    view.scroll_to_end();
+                    return true;
+                }
+                _ if delta != 0 => {
+                    view.scroll(delta);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Text;
@@ -389,7 +436,9 @@ impl Host {
             MouseEventKind::ScrollDown => KeyCode::Down,
             _ => return true,
         };
-        if self.mode == Mode::Split {
+        if self.large_markdown && self.mode != Mode::Text {
+            view.scroll(if code == KeyCode::Up { -1 } else { 1 });
+        } else if self.mode == Mode::Split {
             self.markdown_top = if code == KeyCode::Up {
                 self.markdown_top.saturating_sub(1)
             } else {
@@ -464,11 +513,16 @@ impl Host {
             }
         }
         let current = source(view);
+        self.large_markdown = view
+            .editor()
+            .is_some_and(|e| e.document().buffer().len() > kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64);
+        let markdown_top = if self.large_markdown { view.top() } else { 0 };
         if let Some(worker) = &self.markdown {
-            while let Ok((key, result)) = worker.receive.try_recv() {
+            while let Ok((key, top, result)) = worker.receive.try_recv() {
                 self.in_flight = false;
-                if current == Some(key) && self.mode != Mode::Text {
+                if current == Some(key) && top == markdown_top && self.mode != Mode::Text {
                     self.model_source = Some(key);
+                    self.model_top = Some(top);
                     match result {
                         Ok(model) => {
                             self.model = Some(model);
@@ -483,7 +537,10 @@ impl Host {
                 }
             }
         }
-        if self.mode != Mode::Text && current != self.model_source && !self.in_flight {
+        if self.mode != Mode::Text
+            && (current != self.model_source || self.model_top != Some(markdown_top))
+            && !self.in_flight
+        {
             if self.markdown.is_none() {
                 match MarkdownWorker::start(self.wake.clone().unwrap()) {
                     Ok(worker) => self.markdown = Some(worker),
@@ -491,7 +548,8 @@ impl Host {
                 }
             }
             if let (Some(worker), Some(key), Some(editor)) = (&self.markdown, current, view.editor()) {
-                let request = self.markdown_retry.take().unwrap_or_else(|| (key, editor.document().snapshot()));
+                let request =
+                    self.markdown_retry.take().unwrap_or_else(|| (key, markdown_top, editor.document().snapshot()));
                 match worker.send.as_ref().unwrap().try_send(request) {
                     Ok(()) => self.in_flight = true,
                     Err(e) => {
@@ -589,8 +647,23 @@ impl Host {
                 preview.width -= left.width;
             }
             if self.rendered_width != preview.width as usize {
-                self.rendered =
-                    self.model.as_ref().map(|model| markdown_lines(model, preview.width as usize)).unwrap_or_default();
+                self.rendered.clear();
+                self.rendered_top = 0;
+                if let Some(model) = &self.model {
+                    let top = self.model_top.unwrap_or(0) as usize;
+                    for block in &model.blocks {
+                        if self.large_markdown && block.source_lines.end <= top {
+                            continue;
+                        }
+                        let single = Model { blocks: vec![block.clone()], source_bytes: model.source_bytes.clone() };
+                        let lines = markdown_lines(&single, preview.width as usize);
+                        if self.large_markdown && block.source_lines.contains(&top) {
+                            self.rendered_top = lines.len().saturating_mul(top - block.source_lines.start)
+                                / block.source_lines.len().max(1);
+                        }
+                        self.rendered.extend(lines);
+                    }
+                }
                 self.rendered_width = preview.width as usize;
             }
             self.markdown_top = self.markdown_top.min(self.rendered.len().saturating_sub(preview.height as usize));
@@ -599,7 +672,12 @@ impl Host {
             } else if self.model_source != source(view) {
                 vec![Line::from("Preparing Markdown preview...")]
             } else {
-                self.rendered.iter().skip(self.markdown_top).take(preview.height as usize).cloned().collect()
+                self.rendered
+                    .iter()
+                    .skip(if self.large_markdown { self.rendered_top } else { self.markdown_top })
+                    .take(preview.height as usize)
+                    .cloned()
+                    .collect()
             };
             frame.render_widget(Paragraph::new(text).style(theme_ui::base()), preview);
         }
@@ -976,6 +1054,28 @@ mod tests {
         assert!(host.following);
         host.command(&mut view, "log.pause");
         assert!(!host.following);
+        stop(&mut host);
+    }
+    #[test]
+    fn large_markdown_worker_tracks_deep_editor_scroll() {
+        let text = (0..24_000).map(|i| format!("# Section {i:06}\n\nA **bold** paragraph.\n\n")).collect::<String>();
+        let (_file, mut view) = Fixture::view("md", &text);
+        let (mut host, rx) = host();
+        host.command(&mut view, "view.markdownSplit");
+        view.scroll(48_000);
+        let expected = source(&view);
+        wait(&mut host, &mut view, &rx, |h| h.model_source == expected && h.model_top == Some(48_000));
+        assert!(host.large_markdown);
+        assert!(host.model.as_ref().unwrap().blocks[0].source_lines.contains(&48_000));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| host.draw(f, &view, f.area())).unwrap();
+        let screen = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(screen.contains("Section 012000"), "{screen}");
+        host.mouse(
+            &mut view,
+            &event::MouseEvent { kind: MouseEventKind::ScrollDown, column: 80, row: 5, modifiers: KeyModifiers::NONE },
+        );
+        assert_eq!(view.top(), 48_001);
         stop(&mut host);
     }
     #[test]

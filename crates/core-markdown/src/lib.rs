@@ -2,6 +2,7 @@
 
 pub mod bounded;
 pub mod image_decode;
+pub mod paged;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::{ops::Range, sync::Arc};

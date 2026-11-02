@@ -44,6 +44,7 @@ pub(super) struct Key {
     revision: u64,
     epoch: u64,
     base: u64,
+    top: u64,
 }
 struct Work {
     key: Key,
@@ -114,7 +115,7 @@ pub(super) fn notification_fixture_completion(document: kwil_view_model::Session
     // A completed value with no Snapshot/worker capability, as after run's
     // existing explicit Snapshot drop. No source extraction is used by tests.
     Completion {
-        key: Key { document, revision: 0, epoch: 0, base: 0 },
+        key: Key { document, revision: 0, epoch: 0, base: 0, top: 0 },
         result: Err("original computed completion".into()),
         images: Default::default(),
         diagrams: Default::default(),
@@ -173,6 +174,8 @@ pub(super) struct Host {
     error: Option<String>,
     admission_notice: Option<&'static str>,
     scroll: usize,
+    large: bool,
+    heights: std::collections::HashMap<usize, usize>,
     #[cfg(feature = "frame-harness")]
     probe_target: Option<u64>,
     // Last: source/path owners must be destroyed before fixed metadata credit.
@@ -544,6 +547,32 @@ fn parse(snapshot: &kwil_core_text::Snapshot, stop: &AtomicBool) -> Result<Model
         .map_err(|_| "Preview unavailable: malformed or opaque text cannot be interpreted as Markdown".to_owned())?;
     preview_model(text, &|| stop.load(Ordering::Acquire)).map_err(|e| format!("Preview unavailable: {e:?}"))
 }
+fn parse_page(
+    snapshot: &kwil_core_text::Snapshot,
+    stop: &AtomicBool,
+    top: u64,
+    pager: &mut Option<kwil_core_markdown::paged::Pager>,
+) -> Result<kwil_core_markdown::paged::Page, String> {
+    if snapshot.len() <= kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64 {
+        return parse(snapshot, stop).map(|model| kwil_core_markdown::paged::Page {
+            model,
+            total_lines: snapshot.line_count(),
+            parsed_bytes: snapshot.len() as usize,
+        });
+    }
+    let mut read = |range: std::ops::Range<u64>, out: &mut Vec<u8>| {
+        out.clear();
+        for chunk in snapshot.chunks(range).map_err(|e| e.to_string())? {
+            out.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+        }
+        Ok(())
+    };
+    let cancelled = || stop.load(Ordering::Acquire);
+    if pager.is_none() {
+        *pager = Some(kwil_core_markdown::paged::Pager::build(snapshot.len(), &mut read, &cancelled)?);
+    }
+    pager.as_mut().unwrap().page(top, 64, &mut read, &cancelled)
+}
 impl App {
     // Menus keep the Text escape available after Save As changes the suffix.
     pub(super) fn is_markdown_document(&self) -> bool {
@@ -581,6 +610,13 @@ impl App {
     /// then starts exactly at this source section using the production layout.
     #[cfg(feature = "frame-harness")]
     pub(super) fn markdown_probe_position(&mut self, source_line: u64) {
+        if self.markdown.large {
+            let delta = source_line as i64 - self.view.top() as i64;
+            self.view.scroll(delta);
+            self.markdown.scroll = 0;
+            self.apply(Damage { full: true, ..Default::default() });
+            return;
+        }
         self.markdown.probe_target = Some(source_line);
         self.markdown.scroll = 0;
         self.apply(Damage { full: true, ..Default::default() });
@@ -628,11 +664,18 @@ impl App {
         let Some(editor) = self.view.editor() else {
             return;
         };
+        self.markdown.large =
+            editor.document().buffer().len() > kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64;
         let key = Key {
             document: self.view.active_id(),
             revision: editor.document().revision(),
             epoch: self.view.input_epoch(),
             base: self.markdown.path_generation,
+            top: if editor.document().buffer().len() > kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64 {
+                editor.top()
+            } else {
+                0
+            },
         };
         if self.markdown.lane.is_none() {
             let Some(terminal) = self.markdown.terminal.clone() else {
@@ -657,11 +700,18 @@ impl App {
                         }
                         return;
                     }
+                    let mut pager = None;
+                    let mut pager_source = None;
                     while let Ok(work) = rx.recv() {
                         if stop.load(Ordering::Acquire) {
                             break;
                         }
-                        let result = parse(&work.snapshot, &stop);
+                        let source = (work.key.document, work.key.revision, work.key.base);
+                        if pager_source != Some(source) {
+                            pager = None; // Index cleanup stays on this worker.
+                            pager_source = Some(source);
+                        }
+                        let result = parse_page(&work.snapshot, &stop, work.key.top, &mut pager).map(|page| page.model);
                         let images = result.as_ref().map_or_else(
                             |_| Default::default(),
                             |model| {
@@ -722,14 +772,24 @@ impl App {
         preview_area(self).is_some_and(|area| area.contains(self.pointer))
     }
     pub(super) fn markdown_scroll_key(&mut self, delta: i64) {
-        self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
+        if self.markdown.large {
+            self.view.scroll(delta);
+            self.markdown.scroll = 0;
+        } else {
+            self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
+        }
         self.apply(Damage { full: true, ..Default::default() });
     }
     pub(super) fn markdown_wheel(&mut self, delta: i64) -> bool {
         if self.markdown_mode() == Mode::Text || !preview_area(self).is_some_and(|area| area.contains(self.pointer)) {
             return false;
         }
-        self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
+        if self.markdown.large {
+            self.view.scroll(delta);
+            self.markdown.scroll = 0;
+        } else {
+            self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
+        }
         self.apply(Damage { full: true, ..Default::default() });
         true
     }
@@ -1199,7 +1259,7 @@ pub(super) fn draw(
         right: pane.x + pane.w.saturating_sub(pad),
         origin: pane.y + pad,
         line: 0,
-        skip: host.scroll,
+        skip: if host.large { 0 } else { host.scroll },
         height: ui.dip(25.0).max(1),
         step: 1,
         heading: false,
@@ -1224,7 +1284,7 @@ pub(super) fn draw(
         flow.skip = 0;
         flow.text(host.notice().unwrap(), &Default::default(), false);
     } else if let Some(model) = &host.model {
-        let anchor = if mode == Mode::Split { top as usize } else { 0 };
+        let anchor = if host.large || mode == Mode::Split { top as usize } else { 0 };
         for (index, block) in model.blocks.iter().enumerate() {
             if block.source_lines.end <= anchor {
                 continue;
@@ -1238,6 +1298,17 @@ pub(super) fn draw(
                 flow.skip = flow.line;
                 host.probe_target = None;
                 flow.paint = true;
+            }
+            let begin = flow.line;
+            if host.large && block.source_lines.contains(&anchor) {
+                let columns = (flow.right - flow.left) / flow.unit.max(1);
+                let estimate = host
+                    .heights
+                    .get(&block.source_bytes.start)
+                    .copied()
+                    .unwrap_or_else(|| kwil_core_markdown::paged::estimated_rows(block, columns));
+                flow.skip =
+                    estimate.saturating_mul(anchor - block.source_lines.start) / block.source_lines.len().max(1);
             }
             flow.heading = matches!(block.kind, BlockKind::Heading(1 | 2));
             flow.step = if flow.heading { 2 } else { 1 };
@@ -1354,8 +1425,14 @@ pub(super) fn draw(
             if !compact {
                 flow.next();
             }
+            if host.large && !flow.done() {
+                if host.heights.len() >= 512 {
+                    host.heights.clear();
+                }
+                host.heights.insert(block.source_bytes.start, flow.line.saturating_sub(begin));
+            }
         }
-        if !flow.done() {
+        if !host.large && !flow.done() {
             let visible = pane.h.saturating_sub(pad) / flow.height;
             let last = flow.line.saturating_sub(visible.saturating_sub(1));
             if host.scroll > last {
@@ -1379,7 +1456,7 @@ mod tests {
     };
 
     fn request_key() -> Key {
-        Key { document: kwil_view_model::SessionDocumentId(71), revision: 1, epoch: 1, base: 0 }
+        Key { document: kwil_view_model::SessionDocumentId(71), revision: 1, epoch: 1, base: 0, top: 0 }
     }
     // A real channel, held without a consumer, makes Full independent of
     // scheduling. Disconnected is established before any source capture.
@@ -2005,9 +2082,9 @@ mod tests {
             assert_eq!(pixels[30 * 540 + x], border, "column edge {x}");
         }
     }
-    // Replaced by the paged worker entry once the fail-first run is recorded.
-    fn large_page(snapshot: &kwil_core_text::Snapshot, _line: u64) -> (Model, usize) {
-        (parse(snapshot, &AtomicBool::new(false)).unwrap(), snapshot.len() as usize)
+    fn large_page(snapshot: &kwil_core_text::Snapshot, line: u64) -> (Model, usize) {
+        let page = parse_page(snapshot, &AtomicBool::new(false), line, &mut None).unwrap();
+        (page.model, page.parsed_bytes)
     }
     fn large_snapshot() -> kwil_core_text::Buffer {
         let mut buffer = kwil_core_text::Buffer::default();
@@ -2087,7 +2164,7 @@ mod tests {
     }
     #[test]
     fn stale_completion_never_replaces_current_tab() {
-        let key = Key { document: kwil_view_model::SessionDocumentId(1), revision: 1, epoch: 1, base: 0 };
+        let key = Key { document: kwil_view_model::SessionDocumentId(1), revision: 1, epoch: 1, base: 0, top: 0 };
         let mut host = Host { desired: Some(Key { revision: 2, ..key }), busy: true, ..Default::default() };
         host.receive(Completion {
             key,
