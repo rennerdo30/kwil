@@ -61,9 +61,8 @@ pub(crate) fn recover<E: std::fmt::Display>(
     stderr: impl FnOnce(&str),
     dialog: impl FnOnce(&str),
 ) -> Result<(), ExitCode> {
-    let presentation = presentation();
     recovery().map_err(|e| {
-        presentation.report(&format!("kwil: {e}"), stderr, dialog);
+        presentation().report(&format!("kwil: {e}"), stderr, dialog);
         ExitCode::FAILURE
     })
 }
