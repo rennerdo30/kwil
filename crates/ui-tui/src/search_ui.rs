@@ -278,7 +278,7 @@ impl SearchHost {
         if let SearchAction::FolderClosed { key, index, offset, plan, cancel } = action {
             if let Err(error) = view.submit_folder_closed(key.generation, index, offset, plan, cancel) {
                 self.panel.folder_failed(error.to_string());
-                self.notice(view, error.to_string());
+                self.notice(view, self.panel.status().to_owned());
             }
             return;
         }
@@ -296,8 +296,10 @@ impl SearchHost {
         {
             if folder_action {
                 self.panel.folder_failed("Folder replacement target changed; preview again".into());
+                self.notice(view, self.panel.status().to_owned());
+            } else {
+                self.notice(view, "Search navigation cancelled: its document, query or cursor changed".into());
             }
-            self.notice(view, "Search navigation cancelled: its document, query or cursor changed".into());
             return;
         }
         if let SearchAction::OpenFile { path, line_number, .. } = action {
@@ -339,8 +341,10 @@ impl SearchHost {
                 Err(error) => {
                     if folder_action {
                         self.panel.folder_failed(error.to_string());
+                        self.notice(view, self.panel.status().to_owned());
+                    } else {
+                        self.notice(view, format!("Replacement was not admitted: {error}"));
                     }
-                    self.notice(view, format!("Replacement was not admitted: {error}"));
                 }
             }
             return;
@@ -610,6 +614,9 @@ pub(super) fn key(
 }
 fn enter(panel: &SearchPanel, event: KeyEvent) -> SearchInput<'static> {
     let shift = event.modifiers.contains(KeyModifiers::SHIFT);
+    if event.modifiers.contains(KeyModifiers::ALT) && panel.folder_preview() {
+        return SearchInput::FolderDetails;
+    }
     if panel.mode() == SearchMode::Files {
         if event.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) {
             if shift { SearchInput::ReplaceAll } else { SearchInput::ReplaceNext }
@@ -840,7 +847,9 @@ pub(super) fn draw_prepared(
                 ));
             }
         }
-        let hint = if area.width < 24 {
+        let hint = if host.panel.folder_preview() && area.width >= 40 {
+            "Enter toggle  Alt+Enter matches/files  Ctrl+Shift+Enter apply  Esc cancel"
+        } else if area.width < 24 {
             "Esc cancel  Tab field"
         } else if area.width < 40 {
             "Esc cancel  Enter open  PgUp/Dn"
@@ -1385,19 +1394,32 @@ mod tests {
         let path = tree.join("utf16.txt");
         let encoded =
             |text: &str| [vec![0xff, 0xfe], text.encode_utf16().flat_map(u16::to_le_bytes).collect()].concat();
-        std::fs::write(&path, encoded("needle\r\nneedle\n")).unwrap();
+        let original = format!("{}needle\n", "needle\r\n".repeat(33));
+        std::fs::write(&path, encoded(&original)).unwrap();
         h.files(tree, "needle");
         h.field(SearchField::Replacement, "changed");
         h.press(KeyCode::Enter, KeyModifiers::CONTROL);
         h.settle();
         h.press(KeyCode::Enter, KeyModifiers::ALT);
         h.settle();
-        assert_eq!(h.host.panel.results().len(), 2, "preview each match in the selected file");
-        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(1));
+        assert_eq!(h.host.panel.results().len(), 32, "preview a bounded page of matches");
+        h.press(KeyCode::PageDown, KeyModifiers::NONE);
+        h.settle();
+        assert_eq!(h.host.panel.results().len(), 2);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(0));
+        h.press(KeyCode::PageUp, KeyModifiers::NONE);
+        h.settle();
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(0));
+        h.press(KeyCode::Enter, KeyModifiers::ALT);
+        h.settle();
+        assert_eq!(h.host.panel.results().len(), 1, "return to the file list with exclusions retained");
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(0));
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(0));
         h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         h.settle();
-        assert_eq!(std::fs::read(path).unwrap(), encoded("changed\r\nneedle\n"));
-        assert!(h.host.panel.status().contains("1 match excluded"));
+        let expected = format!("needle\r\n{}needle\r\nchanged\n", "changed\r\n".repeat(31));
+        assert_eq!(std::fs::read(path).unwrap(), encoded(&expected));
+        assert!(h.host.panel.status().contains("2 matches excluded"));
         h.finish();
     }
 
@@ -1422,6 +1444,14 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"externally changed");
         assert!(h.host.panel.status().contains("1 skipped"));
         assert!(h.host.panel.status().contains("changed.txt"));
+        std::fs::write(&path, b"needle needle").unwrap();
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.press(KeyCode::Esc, KeyModifiers::NONE);
+        h.settle();
+        assert!(h.host.panel.status().contains("Replacement cancelled"));
+        assert!(h.host.panel.status().contains("applied"), "cancellation reports partial apply counts");
         h.finish();
     }
 

@@ -7,6 +7,7 @@ use kwil_core_text::{
     encoding::{EncodedFile, SavePlan},
 };
 use std::{
+    collections::BTreeSet,
     hash::Hasher,
     io::Read,
     path::{Path, PathBuf},
@@ -28,6 +29,8 @@ pub struct Plan {
     pub matches: u64,
     page_index: u64,
     page_offset: u64,
+    pub detail: Option<(u64, u64)>,
+    excluded_matches: BTreeSet<(u64, u64)>,
 }
 impl Plan {
     pub fn len(&self) -> u64 {
@@ -36,10 +39,35 @@ impl Plan {
     pub fn is_empty(&self) -> bool {
         self.manifest.is_empty()
     }
+    pub fn row_count(&self) -> u64 {
+        self.detail.map_or(self.len(), |(_, count)| count)
+    }
+    pub fn match_excluded(&self, file: u64, ordinal: u64) -> bool {
+        self.excluded_matches.contains(&(file, ordinal))
+    }
+    pub fn excluded_in_file(&self, file: u64) -> usize {
+        self.excluded_matches.range((file, 0)..=(file, u64::MAX)).count()
+    }
+    pub fn include_matches(&mut self, file: u64) {
+        self.excluded_matches.retain(|&(index, _)| index != file);
+    }
+    pub fn excluded_match_count(&self) -> usize {
+        self.excluded_matches.len()
+    }
+    pub fn toggle_match(&mut self, file: u64, ordinal: u64) -> Result<(), &'static str> {
+        if !self.excluded_matches.remove(&(file, ordinal)) {
+            if self.excluded_matches.len() >= INPUT_BYTES / 16 {
+                return Err("Too many match exclusions; narrow the folder globs");
+            }
+            self.excluded_matches.insert((file, ordinal));
+        }
+        Ok(())
+    }
 }
 pub enum Task {
     Preview { search: FileSearch, template: Vec<u8>, open: Vec<OpenDocument> },
     Page { plan: Plan, page: Page },
+    Matches { plan: Plan, index: u64, page: Page, open: Vec<OpenDocument> },
     Apply { plan: Plan, index: u64, cursor: u64, open: Vec<OpenDocument> },
 }
 #[derive(Debug)]
@@ -81,7 +109,7 @@ pub(super) fn validate(task: &Task) -> Result<(), &'static str> {
             })?;
             return Ok(());
         }
-        Task::Page { plan, page } => {
+        Task::Page { plan, page } | Task::Matches { plan, page, .. } => {
             if page.len == 0 || page.len > FILE_PAGE {
                 return Err("folder preview page exceeds cap");
             }
@@ -94,7 +122,12 @@ pub(super) fn validate(task: &Task) -> Result<(), &'static str> {
             plan
         }
     };
-    if plan.template.len() > INPUT_BYTES {
+    if let Task::Matches { index, open, .. } = task
+        && (*index >= plan.len() || open.len() > REPLACE_EDITS)
+    {
+        return Err("folder match preview exceeds cap");
+    }
+    if plan.template.len() > INPUT_BYTES || plan.excluded_matches.len() > INPUT_BYTES / 16 {
         return Err("folder template exceeds cap");
     }
     Ok(())
@@ -262,8 +295,116 @@ fn manifest_record(plan: &Plan, index: u64, mut cursor: u64, cancel: &Cancellati
         }
     }
 }
+fn selected_recipe(
+    snapshot: &Snapshot,
+    plan: &Plan,
+    index: u64,
+    key: SearchKey,
+    cancel: &Cancellation,
+    spools: &mut SpoolOwner,
+) -> io::Result<ReplaceRecipe> {
+    let all = recipe(snapshot, &plan.search, &plan.template, key, cancel, spools)?;
+    if plan.excluded_matches.range((index, 0)..=(index, u64::MAX)).next().is_none() {
+        return Ok(all);
+    }
+    if plan.excluded_in_file(index) as u64 == all.edits.len() {
+        return Err(io::Error::other("All matches excluded; file skipped"));
+    }
+    let slot = spools.begin()?;
+    let result = (|| {
+        for (ordinal, edit) in all.edits.iter().enumerate() {
+            cancelled(cancel)?;
+            let edit = edit?;
+            if !plan.match_excluded(index, ordinal as u64) {
+                spools.append(slot, edit)?;
+            }
+        }
+        Ok(ReplaceRecipe { key, edits: ReplacementEdits::Spool(spools.finish(slot)?) })
+    })();
+    if result.is_err() {
+        spools.abandon(slot);
+    }
+    result
+}
+fn match_page(
+    plan: &Plan,
+    index: u64,
+    page: Page,
+    open: &[OpenDocument],
+    cancel: &Cancellation,
+    spools: &mut SpoolOwner,
+) -> io::Result<(Plan, Vec<FileEvent>)> {
+    let (record, _, _) = manifest_record(plan, index, 0, cancel)?;
+    let FileEvent::Hit(hit) = decode_file_event(&record.new_bytes)? else {
+        return Err(io::Error::other("Cannot preview matches for a skipped file"));
+    };
+    let opened = opened(open, &resolve_open(open), &hit.path);
+    if hit.line[..32] != fingerprint(&hit.path, cancel)? || hit.line[32..] != identity(opened) {
+        return Err(io::Error::other("File or open document changed since preview; preview again"));
+    }
+    let mut collect = |snapshot: &Snapshot| -> io::Result<Vec<FileEvent>> {
+        let all = recipe(
+            snapshot,
+            &plan.search,
+            &plan.template,
+            SearchKey { document_id: 0, revision: 0, generation: 0 },
+            cancel,
+            spools,
+        )?;
+        let mut rows = Vec::new();
+        for (ordinal, edit) in all.edits.iter().enumerate() {
+            cancelled(cancel)?;
+            let edit = edit?;
+            let ordinal = ordinal as u64;
+            if ordinal < page.first {
+                continue;
+            }
+            if rows.len() == page.len {
+                break;
+            }
+            let mut old = Vec::new();
+            for chunk in snapshot.chunks(edit.offset..edit.offset + edit.len.min(120))? {
+                old.extend_from_slice(&chunk.map_err(io::Error::other)?);
+            }
+            let old = String::from_utf8_lossy(&old);
+            let new = String::from_utf8_lossy(&edit.new_bytes[..edit.new_bytes.len().min(120)]);
+            let (line, _) = snapshot.offset_to_line_col(edit.offset).map_err(io::Error::other)?.unwrap_or((0, 0));
+            rows.push(FileEvent::Hit(crate::FileHit {
+                path: hit.path.clone(),
+                line_number: ordinal + 1,
+                line_offset: edit.offset,
+                line: format!(
+                    "L{} byte {}: {}{} → {}{}",
+                    line + 1,
+                    edit.offset,
+                    old.escape_debug(),
+                    if edit.len > 120 { "…" } else { "" },
+                    new.escape_debug(),
+                    if edit.new_bytes.len() > 120 { "…" } else { "" }
+                )
+                .into_bytes(),
+                line_truncated: edit.len > 120 || edit.new_bytes.len() > 120,
+                match_ranges: vec![],
+                ranges_truncated: false,
+            }));
+        }
+        Ok(rows)
+    };
+    let rows = if let Some(opened) = opened {
+        collect(opened.snapshot.as_ref().ok_or_else(|| io::Error::other("Open document is busy"))?)?
+    } else {
+        with_disk(&hit.path, cancel, |buffer, _, _| collect(&buffer.snapshot()))?
+    };
+    if hit.line[..32] != fingerprint(&hit.path, cancel)? {
+        return Err(io::Error::other("File changed during match preview; preview again"));
+    }
+    let mut plan = plan.clone();
+    plan.detail = Some((index, hit.line_number));
+    Ok((plan, rows))
+}
 fn page(plan: &Plan, page: Page, cancel: &Cancellation) -> io::Result<(Plan, Vec<FileEvent>)> {
     let mut plan = plan.clone();
+    plan.detail = None;
     let mut index = plan.page_index;
     let mut cursor = plan.page_offset;
     while index < page.first {
@@ -379,6 +520,8 @@ pub(super) fn run(
                     matches,
                     page_index: 0,
                     page_offset: 0,
+                    detail: None,
+                    excluded_matches: BTreeSet::new(),
                 };
                 let (plan, rows) = page(&plan, Page { first: 0, len: FILE_PAGE }, cancel)?;
                 emit(SearchUpdate::Folder(Update::Preview { plan, first: 0, rows }));
@@ -394,20 +537,28 @@ pub(super) fn run(
             emit(SearchUpdate::Folder(Update::Preview { plan, first: p.first, rows }));
             Ok(())
         }
+        Task::Matches { plan, index, page, open } => {
+            let (plan, rows) = match_page(plan, *index, *page, open, cancel, spools)?;
+            emit(SearchUpdate::Folder(Update::Preview { plan, first: page.first, rows }));
+            Ok(())
+        }
         Task::Apply { plan, index, cursor, open } => {
             let (record, offset, next_offset) = manifest_record(plan, *index, *cursor, cancel)?;
             let row = decode_file_event(&record.new_bytes)?;
             let closed = std::cell::Cell::new(false);
             let source_epoch = std::cell::Cell::new(0);
-            let FileEvent::Hit(hit) = row else {
-                emit(SearchUpdate::Folder(Update::Applied {
-                    source_epoch: 0,
-                    next_offset,
-                    index: *index,
-                    path: PathBuf::new(),
-                    result: Err("Preview error; file skipped".into()),
-                }));
-                return Ok(());
+            let hit = match row {
+                FileEvent::Hit(hit) => hit,
+                FileEvent::Error { path, message } => {
+                    emit(SearchUpdate::Folder(Update::Applied {
+                        source_epoch: 0,
+                        next_offset,
+                        index: *index,
+                        result: Err(format!("{}: {message}; skipped", path.display())),
+                        path,
+                    }));
+                    return Ok(());
+                }
             };
             let result = (|| {
                 let opened = opened(open, &resolve_open(open), &hit.path);
@@ -418,10 +569,10 @@ pub(super) fn run(
                     source_epoch.set(opened.epoch);
                     let mut k = opened.key;
                     k.generation = key.generation;
-                    return recipe(
+                    return selected_recipe(
                         opened.snapshot.as_ref().ok_or_else(|| io::Error::other("Open document is busy; skipped"))?,
-                        &plan.search,
-                        &plan.template,
+                        plan,
+                        *index,
                         k,
                         cancel,
                         spools,
@@ -481,7 +632,7 @@ pub fn apply_closed_at(
     let mut spools = SpoolOwner::new(512 << 20)?;
     let key = SearchKey { document_id: 0, revision: 0, generation: 0 };
     let result = with_disk(&hit.path, cancel, |mut buffer, file, save_plan| {
-        let edits = recipe(&buffer.snapshot(), &plan.search, &plan.template, key, cancel, &mut spools)?;
+        let edits = selected_recipe(&buffer.snapshot(), plan, index, key, cancel, &mut spools)?;
         buffer.set_undo_memory_limit(0);
         buffer.begin();
         for edit in edits.edits.iter().rev() {
