@@ -525,6 +525,7 @@ fn harness_with_budget(
     let (shared, receiver) = Shared::new(budget, wake).unwrap();
     let (sender, inbox) = mpsc::sync_channel(16);
     let worker = DocumentWorker {
+        preferences: Default::default(),
         tx: RequestSender::new(sender, Some(&shared)),
         journal_capacity: Arc::new(AtomicUsize::new(16)),
         journal_controls: Arc::new(super::super::JournalControlCredits::new()),
@@ -794,6 +795,7 @@ fn result_transport_successful_live_retirement_fence_returns_exact_full_but_fail
     let (shared, receiver) = Shared::new(&budget, || Ok(())).unwrap();
     let (sender, inbox) = mpsc::sync_channel(16);
     let worker = DocumentWorker {
+        preferences: Default::default(),
         tx: RequestSender::new(sender, Some(&shared)),
         journal_capacity: Arc::new(AtomicUsize::new(16)),
         journal_controls: Arc::new(super::super::JournalControlCredits::new()),
@@ -1394,6 +1396,7 @@ fn result_transport_sealed_journal_admits_recipe_before_moving_pending_owner() {
     let (shared, receiver) = Shared::new(&budget, || Ok(())).unwrap();
     let (sender, inbox) = mpsc::sync_channel(16);
     let worker = DocumentWorker {
+        preferences: Default::default(),
         tx: RequestSender::new(sender, Some(&shared)),
         journal_capacity: Arc::new(AtomicUsize::new(16)),
         journal_controls: Arc::new(super::super::JournalControlCredits::new()),
@@ -1489,6 +1492,7 @@ fn result_transport_live_journal_fence_preserves_receipt_then_retries_once_and_d
     let (shared, receiver) = Shared::new(&budget, || Ok(())).unwrap();
     let (sender, inbox) = mpsc::sync_channel(16);
     let worker = DocumentWorker {
+        preferences: Default::default(),
         tx: RequestSender::new(sender, Some(&shared)),
         journal_capacity: Arc::new(AtomicUsize::new(16)),
         journal_controls: Arc::new(super::super::JournalControlCredits::new()),

@@ -25,6 +25,7 @@ fn settle(session: &mut LogSession, deadline: Instant) -> Result<(), LogSettleme
 fn shared() -> Arc<Shared> {
     let (signal, _) = mpsc::sync_channel(1);
     Arc::new(Shared {
+        preferences: Mutex::new(Arc::new(Default::default())),
         mailbox: Mutex::new(Mailbox::default()),
         latest: AtomicU64::new(0),
         closed: AtomicBool::new(false),

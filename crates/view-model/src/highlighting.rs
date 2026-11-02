@@ -178,6 +178,7 @@ pub struct HighlightKey {
 /// Metadata and handles only. The caller prepares paths/settings on their
 /// existing workers; submitting does not inspect them or touch source bytes.
 pub struct HighlightRequest {
+    pub parse_limit: usize,
     pub key: HighlightKey,
     pub source: Arc<dyn TextSource>,
     pub path: Arc<PathBuf>,
@@ -462,6 +463,7 @@ impl HighlightWorker {
                         continue;
                     }
                     let request = &job.request;
+                    engine.set_parse_limit(request.parse_limit);
                     let key = request.key;
                     let result = (|| {
                         // Reset independently of revision. Tab A rev 0 and tab B rev
@@ -613,6 +615,9 @@ impl HighlightWorker {
         request: HighlightRequest,
         context_margin: Option<usize>,
     ) -> Result<u64, Box<HighlightSubmitError>> {
+        if request.parse_limit > 20 * 1024 * 1024 {
+            return Err(Box::new(HighlightSubmitError { request, error: Error::InvalidConfig }));
+        }
         let mut state = self.shared.state.lock().unwrap();
         if state.stopped {
             return Err(Box::new(HighlightSubmitError { request, error: Error::Closed }));
@@ -958,6 +963,7 @@ mod tests {
     }
     fn request(key: HighlightKey, source: Arc<dyn TextSource>) -> HighlightRequest {
         HighlightRequest {
+            parse_limit: 20 * 1024 * 1024,
             key,
             visible: 0..source.len(),
             source,

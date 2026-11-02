@@ -1015,6 +1015,13 @@ impl Editor {
         self.trim_history();
     }
 
+    pub fn apply_settings(&mut self, settings: &Settings) {
+        if self.document.buffer().undo_memory_limit() != settings.undo.memory_limit_bytes as usize {
+            self.set_undo_memory_limit(settings.undo.memory_limit_bytes as usize);
+        }
+        self.settings = settings.clone();
+    }
+
     pub fn insert_text(&mut self, text: &str, at: Duration) -> io::Result<Damage> {
         kwil_core_text::with_checked_read_batch(|| self.insert_bytes(text.as_bytes(), Some(at)))
     }

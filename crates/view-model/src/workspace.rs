@@ -753,6 +753,9 @@ impl Workspace {
     /// Keep the policy for editors installed by later open/recovery results.
     /// Frontends retain responsibility for settings receipts and visual damage.
     pub fn set_editor_settings(&mut self, settings: &kwil_core_commands::Settings) {
+        if let Some(worker) = &self.files.worker {
+            worker.configure(settings);
+        }
         let previous = self.editor_settings.replace(settings.clone());
         // Theme changes recolour retained spans; they must not change the
         // wrapped layout key and force another syntax request.
@@ -764,7 +767,7 @@ impl Workspace {
         }
         for view in self.views.values_mut().chain(self.closed_views.values_mut()) {
             if let Some(editor) = view.editor_mut() {
-                editor.settings = settings.clone();
+                editor.apply_settings(settings);
             }
         }
     }
@@ -963,7 +966,7 @@ impl Workspace {
         if let Some(settings) = &self.editor_settings
             && let Some(editor) = view.editor_mut()
         {
-            editor.settings = settings.clone();
+            editor.apply_settings(settings);
         }
         let previous = self.session.active();
         let id = self.session.open(view.path.clone())?;
@@ -1278,6 +1281,9 @@ impl Workspace {
             return Ok(());
         }
         self.files.worker = Some(DocumentWorker::spawn(complete)?);
+        if let Some(settings) = &self.editor_settings {
+            self.files.worker.as_ref().unwrap().configure(settings);
+        }
         self.files.document_started = true;
         self.refresh_save_destinations();
         self.files
@@ -1803,7 +1809,7 @@ impl Workspace {
             .and_then(View::editor_mut)
             .ok_or_else(|| io::Error::other("Indexing: editing will be available when ready"))?;
         if let Some(settings) = &self.editor_settings {
-            editor.settings = settings.clone();
+            editor.apply_settings(settings);
         }
         if path.is_none() && editor.document().path().is_none() {
             self.files.next_prompt = self.files.next_prompt.wrapping_add(1);
@@ -2330,7 +2336,7 @@ impl Workspace {
                 // viewport read or notice formatting can unwind.
                 let editor = view.editor.as_mut().unwrap();
                 if let Some(settings) = &self.editor_settings {
-                    editor.settings = settings.clone();
+                    editor.apply_settings(settings);
                 }
                 let sequence = editor.next_edit_sequence().saturating_sub(1);
                 if editor.document().revision() != key.revision {
@@ -2457,7 +2463,7 @@ impl Workspace {
                             }
                             let mut editor = Editor::new(*document);
                             if let Some(settings) = &self.editor_settings {
-                                editor.settings = settings.clone();
+                                editor.apply_settings(settings);
                             }
                             let raw =
                                 editor.document().representation() == crate::hex_session::Representation::RawBytes;
@@ -2533,7 +2539,7 @@ impl Workspace {
                             let raw = document.representation() == crate::hex_session::Representation::RawBytes;
                             let mut editor = Editor::new(*document);
                             if let Some(settings) = &self.editor_settings {
-                                editor.settings = settings.clone();
+                                editor.apply_settings(settings);
                             }
                             if raw {
                                 view.file = editor.document().original.clone();
@@ -2929,7 +2935,7 @@ impl Workspace {
                     }
                     let mut editor = Editor::new(document);
                     if let Some(settings) = &self.editor_settings {
-                        editor.settings = settings.clone();
+                        editor.apply_settings(settings);
                     }
                     let raw = editor.document().representation() == crate::hex_session::Representation::RawBytes;
                     let len = editor.document().hex_source(id.0).len;
@@ -4245,6 +4251,20 @@ mod tests {
             std::fs::remove_file(root.join(name)).unwrap();
         }
         std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn kw46_runtime_undo_memory_reaches_live_and_future_editors() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let mut settings = kwil_core_commands::Settings::default();
+        settings.undo.memory_limit_bytes = 1;
+        workspace.set_editor_settings(&settings);
+        edit(&mut workspace, "one");
+        edit(&mut workspace, "two");
+        assert!(workspace.editor().unwrap().document().buffer().undo_memory_bytes() <= 1);
+        workspace.file_command("file.new").unwrap();
+        edit(&mut workspace, "three");
+        edit(&mut workspace, "four");
+        assert!(workspace.editor().unwrap().document().buffer().undo_memory_bytes() <= 1);
     }
 
     #[test]

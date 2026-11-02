@@ -38,6 +38,7 @@ struct Identity {
 }
 
 pub struct HighlightSession {
+    parse_limit: usize,
     worker: Option<HighlightWorker>,
     identity: Option<Identity>,
     generation: u64,
@@ -93,6 +94,7 @@ impl std::error::Error for HighlightSessionShutdownError {
 impl HighlightSession {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Result<Self, kwil_core_syntax::Error> {
         Ok(Self {
+            parse_limit: 20 * 1024 * 1024,
             worker: Some(HighlightWorker::new(Default::default(), wake)?),
             identity: None,
             generation: 0,
@@ -125,6 +127,15 @@ impl HighlightSession {
         self.mappings = mappings.shared();
         self.settings_generation = self.settings_generation.checked_add(1).expect("syntax settings identity exhausted");
         true
+    }
+
+    pub fn configure(&mut self, settings: &kwil_core_commands::settings::SyntaxSettings) {
+        let next = settings.full_parse_limit_bytes as usize;
+        if self.parse_limit != next {
+            self.parse_limit = next;
+            self.settings_generation =
+                self.settings_generation.checked_add(1).expect("syntax settings identity exhausted");
+        }
     }
 
     pub fn language_choice(&self, document: DocumentId) -> LanguageChoice {
@@ -473,6 +484,7 @@ impl HighlightSession {
         }
         let request = self.rejected.take().or_else(|| {
             Some(HighlightRequest {
+                parse_limit: self.parse_limit,
                 key: self.key?,
                 source: self.source.as_ref()?.clone(),
                 path: self.path.clone(),
@@ -654,6 +666,22 @@ impl HighlightSession {
     pub const fn shutdown_metadata_bytes() -> Option<usize> {
         std::mem::size_of::<HighlightSessionShutdownError>()
             .checked_add(std::mem::size_of::<ControlFlow<HighlightSessionShutdownError, ()>>())
+    }
+}
+
+#[cfg(test)]
+mod runtime_preferences_tests {
+    use super::*;
+    #[test]
+    fn kw46_runtime_syntax_parse_limit_is_carried_to_worker_requests() {
+        let mut host = HighlightSession::new(|| {}).unwrap();
+        let generation = host.settings_generation;
+        host.configure(&kwil_core_commands::settings::SyntaxSettings { full_parse_limit_bytes: 1234 });
+        assert_eq!(host.parse_limit, 1234);
+        assert!(host.settings_generation > generation);
+        // No document or source is required to update this worker policy.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        assert!(host.shutdown_until(deadline).is_continue());
     }
 }
 impl Drop for HighlightSession {

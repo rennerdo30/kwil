@@ -1,5 +1,39 @@
 use kwil_core_commands::settings::{Remote, RenderSettings};
 
+#[derive(Default)]
+pub(crate) struct SmoothScroll {
+    remaining: i64,
+    pub next: Option<std::time::Instant>,
+    context: (u64, u64),
+}
+impl SmoothScroll {
+    pub fn push(&mut self, context: (u64, u64), delta: i64, now: std::time::Instant) {
+        if self.context != context {
+            self.clear();
+            self.context = context;
+        }
+        self.remaining = self.remaining.saturating_add(delta).clamp(-120, 120);
+        self.next = (self.remaining != 0).then_some(now);
+    }
+    pub fn clear(&mut self) {
+        self.remaining = 0;
+        self.next = None;
+    }
+    pub fn take(&mut self, context: (u64, u64), allowed: bool, now: std::time::Instant) -> i64 {
+        if !allowed || self.context != context {
+            self.clear();
+            return 0;
+        }
+        if self.next.is_none_or(|next| next > now) {
+            return 0;
+        }
+        let step = self.remaining.signum() * ((self.remaining.abs() + 3) / 4);
+        self.remaining -= step;
+        self.next = (self.remaining != 0).then_some(now + std::time::Duration::from_millis(16));
+        step
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderPolicy {
     settings: RenderSettings,
@@ -61,6 +95,23 @@ pub(crate) fn detect() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn kw46_runtime_smooth_scrolling_uses_policy_and_stops_without_idle_wakes() {
+        let now = std::time::Instant::now();
+        let mut scroll = SmoothScroll::default();
+        let policy = RenderPolicy::new(RenderSettings { smooth_scrolling: true, ..Default::default() }, false);
+        scroll.push((1, 2), 3, now);
+        assert_eq!(scroll.take((1, 2), policy.smooth_scrolling_allowed(), now), 1);
+        assert!(scroll.next.is_some());
+        let mut remote = policy.clone();
+        remote.session_changed(true);
+        assert_eq!(scroll.take((1, 2), remote.smooth_scrolling_allowed(), now), 0);
+        assert!(scroll.next.is_none());
+        scroll.push((1, 2), 3, now);
+        let sum: i64 = (0..4).map(|i| scroll.take((1, 2), true, now + std::time::Duration::from_millis(i * 16))).sum();
+        assert_eq!(sum, 3);
+        assert!(scroll.next.is_none());
+    }
     #[test]
     fn overrides_and_live_session_change() {
         for (setting, detected, expected) in [

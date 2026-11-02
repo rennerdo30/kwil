@@ -53,11 +53,15 @@ pub(super) enum Detection {
 /// Fixed slots admit the owner before opening/sniffing. There is at most one
 /// pending physical source per tab; refusal never evicts an earlier ticket.
 pub(super) struct Runtime {
+    pub threshold: u64,
     slots: [Option<(Ticket, Pending)>; session::MAX_TABS],
 }
 impl Runtime {
     pub fn new() -> Self {
-        Self { slots: std::array::from_fn(|_| None) }
+        Self {
+            threshold: kwil_core_commands::Settings::default().files.small_file_threshold_bytes,
+            slots: std::array::from_fn(|_| None),
+        }
     }
 
     pub fn detect(&mut self, ticket: Ticket, path: PathBuf, file: Option<TextFile>) -> io::Result<Detection> {
@@ -79,7 +83,7 @@ impl Runtime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "binary offer capacity retained"))?;
         let file = match file {
             Some(file) => file,
-            None => kwil_core_workspace::open_for_editing(&path)?,
+            None => kwil_core_workspace::open_for_editing_with_threshold(&path, self.threshold)?,
         };
         if file.path() != path || file.path().as_os_str().as_encoded_bytes().len() > session::MAX_PATH_BYTES {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "binary source/path mismatch"));

@@ -25,6 +25,7 @@ impl MarkerLane {
         let (shared, receiver) = Shared::new(&budget, || Ok(())).unwrap();
         let (sender, inbox) = mpsc::sync_channel(16);
         let worker = DocumentWorker {
+            preferences: Default::default(),
             tx: RequestSender::new(sender, Some(&shared)),
             journal_capacity: Arc::new(std::sync::atomic::AtomicUsize::new(16)),
             journal_controls: Arc::new(JournalControlCredits::new()),
@@ -71,7 +72,7 @@ fn seeded_storage(root: &std::path::Path, deadline: Instant) -> (PreparedWorkspa
         handle.ready.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap().unwrap(),
         REVISION
     );
-    let mut journal = JournalState::new(handle, REVISION, 0, document_policy(&Document::new()));
+    let mut journal = JournalState::new(handle, REVISION, 0, document_policy(&Document::new()), Duration::from_secs(2));
     journal.ready = true;
     journal.needs_flush = false;
     journal.generation = GENERATION;
