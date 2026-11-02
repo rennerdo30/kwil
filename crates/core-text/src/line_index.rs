@@ -255,7 +255,7 @@ impl LineIndex {
         progress: &AtomicU64,
         limit: usize,
     ) -> io::Result<Self> {
-        Self::build_reader(bytes.len() as u64, every, chunk, threads, progress, limit, |range| {
+        Self::build_reader(bytes.len() as u64, every, chunk, threads, progress, limit, |range, _scratch| {
             Ok(std::borrow::Cow::Borrowed(&bytes[range.start as usize..range.end as usize]))
         })
     }
@@ -268,7 +268,7 @@ impl LineIndex {
         threads: usize,
         progress: &AtomicU64,
         limit: usize,
-        read: impl Fn(std::ops::Range<u64>) -> io::Result<std::borrow::Cow<'a, [u8]>> + Sync,
+        read: impl Fn(std::ops::Range<u64>, &mut IndexVec<u8>) -> io::Result<std::borrow::Cow<'a, [u8]>> + Sync,
     ) -> io::Result<Self> {
         let every = every.max(1);
         let chunks = usize::try_from(len.div_ceil(chunk as u64).max(1)).map_err(io::Error::other)?;
@@ -284,6 +284,7 @@ impl LineIndex {
                 .map(|_| {
                     s.spawn(|| -> io::Result<_> {
                         let mut out = IndexVec::new(&memory);
+                        let mut scratch = IndexVec::new(&memory);
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             if i >= chunks {
@@ -294,15 +295,24 @@ impl LineIndex {
                             let mut newlines = 0u64;
                             let mut local = IndexVec::new(&memory);
                             let mut ranks = IndexVec::new(&memory);
-                            for block_start in (start..end).step_by(RANK_BYTES) {
-                                ranks.push((newlines, block_start))?;
-                                let block_end = (block_start + RANK_BYTES as u64).min(end);
-                                let bytes = read(block_start..(block_end + 1).min(len))?;
-                                for pos in ends(&bytes, 0..(block_end - block_start) as usize) {
-                                    newlines += 1;
-                                    if newlines.is_multiple_of(every) {
-                                        local.push((newlines, block_start + pos as u64))?;
+                            for window_start in (start..end).step_by(4 << 20) {
+                                let window_end = (window_start + (4 << 20)).min(end);
+                                let bytes = read(window_start..(window_end + 1).min(len), &mut scratch)?;
+                                for block_start in (window_start..window_end).step_by(RANK_BYTES) {
+                                    ranks.push((newlines, block_start))?;
+                                    let block_end = (block_start + RANK_BYTES as u64).min(window_end);
+                                    for pos in ends(
+                                        &bytes,
+                                        (block_start - window_start) as usize..(block_end - window_start) as usize,
+                                    ) {
+                                        newlines += 1;
+                                        if newlines.is_multiple_of(every) {
+                                            local.push((newlines, window_start + pos as u64))?;
+                                        }
                                     }
+                                }
+                                if let std::borrow::Cow::Owned(bytes) = bytes {
+                                    scratch.items = bytes;
                                 }
                             }
                             progress.fetch_add(end - start, Ordering::Relaxed);

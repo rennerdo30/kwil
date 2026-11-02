@@ -165,6 +165,8 @@ struct Shared {
     _file: File,
     stamp: Stamp,
     bytes: Bytes,
+    // At most 96 KiB of copied viewport/rank data, revalidated on every hit.
+    read_window: Mutex<(u64, Vec<u8>)>,
     kind: OnceLock<FileKind>,
     index: OnceLock<LineIndex>,
     index_build: Mutex<()>,
@@ -268,6 +270,7 @@ impl TextFile {
                 _file: f,
                 stamp,
                 bytes,
+                read_window: Mutex::new((0, Vec::new())),
                 kind: OnceLock::new(),
                 index: OnceLock::new(),
                 index_build: Mutex::new(()),
@@ -354,6 +357,7 @@ impl TextFile {
         // versions are mapped; their sparse index/handles/path are charged
         // once per snapshot, not once per piece of that same original.
         let cost = std::mem::size_of::<Shared>()
+            + source::VIEW_CACHE_BYTES
             + self.shared.path.as_os_str().len() * 4
             + self.index().map_or(0, LineIndex::memory_bytes);
         OriginalRef { file: Arc::downgrade(&self.shared), cost }
@@ -452,10 +456,20 @@ impl TextFile {
         let _build = s.index_build.lock().map_err(|_| ReadError::Io(io::Error::other("line index lock poisoned")))?;
         if s.index.get().is_none() {
             s.scanned.store(0, Ordering::Relaxed);
-            let result =
-                LineIndex::build_reader(self.len(), DEFAULT_EVERY, 16 << 20, threads, &s.scanned, limit, |r| {
-                    self.read_range(r).map_err(io::Error::other)
-                });
+            let result = LineIndex::build_reader(
+                self.len(),
+                DEFAULT_EVERY,
+                16 << 20,
+                threads,
+                &s.scanned,
+                limit,
+                |r, scratch| {
+                    scratch.reserve((r.end - r.start) as usize)?;
+                    scratch.items.resize((r.end - r.start) as usize, 0);
+                    self.read_into(r.start, &mut scratch.items).map_err(io::Error::other)?;
+                    Ok(std::borrow::Cow::Owned(std::mem::take(&mut scratch.items)))
+                },
+            );
             self.validate_source()?;
             let index = result.map_err(ReadError::Io)?;
             let _ = s.index.set(index);
@@ -481,7 +495,7 @@ impl TextFile {
         self.validate_source()?;
         self.index()
             .expect("indexed original")
-            .start_reader(line, |r| self.read_range(r).map(|b| b.into_owned()).map_err(io::Error::other))
+            .start_reader(line, |r| self.cached_range(r).map_err(io::Error::other))
             .map_err(ReadError::Io)
     }
 
@@ -489,13 +503,13 @@ impl TextFile {
         self.validate_source()?;
         self.index()
             .expect("indexed original")
-            .rank_reader(at, |r| self.read_range(r).map(|b| b.into_owned()).map_err(io::Error::other))
+            .rank_reader(at, |r| self.cached_range(r).map_err(io::Error::other))
             .map_err(ReadError::Io)
     }
 
     pub fn lines(&self, line: u64, count: usize) -> Result<Option<Vec<Vec<u8>>>, ReadError> {
-        self.validate_source()?;
         if self.index().is_none() {
+            self.validate_source()?;
             return Ok(None);
         }
         let Some(start) = self.line_start(line)? else { return Ok(None) };
@@ -503,7 +517,11 @@ impl TextFile {
     }
 
     fn lines_at(&self, start: u64, count: usize) -> Result<Vec<Vec<u8>>, ReadError> {
-        let bytes = self.read_range(start..self.len().min(start.saturating_add(READ_CHUNK as u64)))?;
+        let end = self.len().min(start.saturating_add(16 << 10));
+        let mut bytes = self.cached_range(start..end)?;
+        if end < self.len() && crate::newlines::ends(&bytes, 0..bytes.len()).take(count).count() < count {
+            bytes = self.read_range(start..self.len().min(start.saturating_add(READ_CHUNK as u64)))?.into_owned();
+        }
         Ok(lines_from(&bytes, 0, count).into_iter().map(<[u8]>::to_vec).collect())
     }
 }
