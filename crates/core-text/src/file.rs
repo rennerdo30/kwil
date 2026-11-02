@@ -15,8 +15,8 @@ pub use read_batch::with_checked_read_batch;
 mod source;
 pub use source::READ_CHUNK;
 
-/// Files below this size are read into memory; larger ones are mapped
-/// (spec Â§5, "mmap safety").
+/// Files below this size are read into memory; larger originals use bounded
+/// positioned reads, so opening never depends on mmap availability.
 pub const MAP_THRESHOLD: u64 = 64 << 20;
 
 /// Opening never falls back to a file-sized allocation above MAP_THRESHOLD.
