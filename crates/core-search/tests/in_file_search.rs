@@ -76,14 +76,17 @@ fn unbounded_regex_reports_input_cap_before_emitting_partial_results() {
     let fixture =
         Fixture::new(2 * MIB, MIB - 32, b"startxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxend");
     let source = kwil_core_text::TextFile::open(&fixture.0).unwrap();
-    let pattern = Pattern::regex("(?s:start.*end|missing)", Options::default(), 32).unwrap();
-    let mut hits = 0;
-    let error = search_default(&source, &pattern, 0..source.len(), SearchMode::Hits, &cancel(), |_| hits += 1, |_| {})
-        .unwrap_err();
-    assert_eq!(hits, 0);
-    assert!(error.to_string().contains("unbounded regex"), "{error}");
-    assert!(error.to_string().contains("32 bytes"), "{error}");
-    assert!(error.to_string().contains("bounded repetition"), "{error}");
+    for expression in ["(?s:start.*end|missing)", r"[\s\S]*", r"\n+"] {
+        let pattern = Pattern::regex(expression, Options::default(), 32).unwrap();
+        let mut hits = 0;
+        let error =
+            search_default(&source, &pattern, 0..source.len(), SearchMode::Hits, &cancel(), |_| hits += 1, |_| {})
+                .unwrap_err();
+        assert_eq!(hits, 0);
+        assert!(error.to_string().contains("unbounded regex"), "{error}");
+        assert!(error.to_string().contains("32 bytes"), "{error}");
+        assert!(error.to_string().contains("bounded repetition"), "{error}");
+    }
 }
 
 #[test]
@@ -135,24 +138,27 @@ fn unbounded_digits_find_every_number_in_a_multi_mib_file() {
     drop(file);
     let source = kwil_core_text::TextFile::open(&fixture.0).unwrap();
     assert!(source.len() > 3 * MIB);
-    let pattern = Pattern::regex(r"\d+", Options::default(), 64 << 10).unwrap();
-    let mut count = 0;
-    let summary = search_default(
-        &source,
-        &pattern,
-        0..source.len(),
-        SearchMode::Hits,
-        &cancel(),
-        |hit| {
-            assert_eq!(hit, Match { offset: count * 9 + 3, len: 5 });
-            count += 1;
-        },
-        |_| {},
-    )
-    .unwrap();
-    assert_eq!(count, 96 * 4096);
-    assert_eq!(summary.count, count);
-    assert_eq!(summary.scanned, source.len());
+    for (expression, within, len) in [(r"\d+", 3, 5), (r"[^\n]+", 0, 8)] {
+        let pattern = Pattern::regex(expression, Options::default(), 64 << 10).unwrap();
+        let mut count = 0;
+        let summary = search_default(
+            &source,
+            &pattern,
+            0..source.len(),
+            SearchMode::Hits,
+            &cancel(),
+            |hit| {
+                assert_eq!(hit, Match { offset: count * 9 + within, len });
+                count += 1;
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(count, 96 * 4096);
+        assert_eq!(summary.count, count);
+        assert_eq!(summary.scanned, source.len());
+        assert!(!summary.skipped_long_lines, "{expression}");
+    }
 }
 
 #[test]

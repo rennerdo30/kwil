@@ -107,6 +107,7 @@ pub struct Pattern {
     source_limit: Option<usize>,
     captures: bool,
     pub(crate) newline_safe: bool,
+    cr_safe: bool,
 }
 
 impl Pattern {
@@ -144,6 +145,7 @@ impl Pattern {
                 source_limit: None,
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
+                cr_safe: !needle.contains(&b'\r'),
             })
         } else {
             Ok(Self {
@@ -152,6 +154,7 @@ impl Pattern {
                 source_limit: None,
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
+                cr_safe: !needle.contains(&b'\r'),
             })
         }
     }
@@ -160,7 +163,8 @@ impl Pattern {
     /// length in bytes, including Unicode case folding. Maxima above 1 MiB
     /// return a limit error; the caller's bound never truncates finite matches.
     ///
-    /// Unbounded expressions that cannot consume CR/LF search capped lines.
+    /// Unbounded expressions that cannot consume LF search capped lines.
+    /// CR also ends a capped line when the pattern cannot consume CR.
     /// Lines exceeding `max_match_bytes` (1..=1 MiB) are skipped, with an
     /// actionable warning in SearchSummary; other lines are still searched.
     /// Newline-consuming unbounded expressions instead cap the entire source,
@@ -186,7 +190,8 @@ impl Pattern {
         };
         let source_limit = maximum.is_none().then_some(max_match_bytes);
         let max_len = supported_match_len(maximum.unwrap_or(max_match_bytes))?;
-        let newline_safe = !consumes_newline(&hir);
+        let newline_safe = !consumes_delimiter(&hir, b'\n');
+        let cr_safe = !consumes_delimiter(&hir, b'\r');
         let constrained = if options.whole_word { whole_word_expression(expression)? } else { expression.to_owned() };
         let re = RegexBuilder::new(&constrained)
             .crlf(true)
@@ -196,7 +201,7 @@ impl Pattern {
             .dfa_size_limit(2 << 20)
             .build()
             .map_err(invalid)?;
-        Ok(Self { engine: Engine::Regex(re), max_len, source_limit, captures: true, newline_safe })
+        Ok(Self { engine: Engine::Regex(re), max_len, source_limit, captures: true, newline_safe, cr_safe })
     }
 
     pub(crate) fn visit(
@@ -318,20 +323,18 @@ fn whole_word_expression(expression: &str) -> io::Result<String> {
     Ok(format!(r"(?u:\b)(?:{ast})(?u:\b)"))
 }
 
-fn consumes_newline(hir: &regex_syntax::hir::Hir) -> bool {
+fn consumes_delimiter(hir: &regex_syntax::hir::Hir, byte: u8) -> bool {
     use regex_syntax::hir::{Class, HirKind};
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => false,
-        HirKind::Literal(lit) => lit.0.iter().any(|b| matches!(*b, b'\r' | b'\n')),
+        HirKind::Literal(lit) => lit.0.contains(&byte),
         HirKind::Class(Class::Unicode(c)) => {
-            c.iter().any(|r| ['\r', '\n'].iter().any(|ch| r.start() <= *ch && r.end() >= *ch))
+            c.iter().any(|r| r.start() <= char::from(byte) && r.end() >= char::from(byte))
         }
-        HirKind::Class(Class::Bytes(c)) => {
-            c.iter().any(|r| [b'\r', b'\n'].iter().any(|ch| r.start() <= *ch && r.end() >= *ch))
-        }
-        HirKind::Repetition(r) => consumes_newline(&r.sub),
-        HirKind::Capture(c) => consumes_newline(&c.sub),
-        HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().any(consumes_newline),
+        HirKind::Class(Class::Bytes(c)) => c.iter().any(|r| r.start() <= byte && r.end() >= byte),
+        HirKind::Repetition(r) => consumes_delimiter(&r.sub, byte),
+        HirKind::Capture(c) => consumes_delimiter(&c.sub, byte),
+        HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().any(|h| consumes_delimiter(h, byte)),
     }
 }
 
@@ -552,7 +555,7 @@ fn search_lines<H: Haystack + ?Sized>(
                 cr = false;
             }
             for n in memchr::memchr2_iter(b'\r', b'\n', part) {
-                if n < cursor {
+                if n < cursor || part[n] == b'\r' && !pattern.cr_safe {
                     continue;
                 }
                 if cancel.load(Ordering::Relaxed) {

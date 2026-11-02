@@ -225,10 +225,12 @@ matching, with a limit error. Window storage is at most one 1 MiB work block
 plus the computed overlap and eight context bytes, independent of file/line size.
 
 Unbounded expressions have no finite safe overlap. Patterns proven unable to
-consume CR or LF (e.g. `\d+`, `\w+`, `foo.*bar`) stream through any-size files,
+consume LF (e.g. `\d+`, `\w+`, `foo.*bar`, `[^\n]+`) stream through any-size files,
 retaining one line capped at `max_match_bytes` (1..=1 MiB; UI default 64 KiB)
-plus up to four delimiter-context bytes. CR, LF and CRLF delimiters may cross
-source chunks. Only overlong lines are skipped. `SearchSummary::warning()`
+plus up to four delimiter-context bytes. LF ends a capped region; CR also ends
+one when the pattern cannot consume CR. This preserves CR-consuming classes
+such as `[^\n]+` and `\r+`. CR, LF and CRLF delimiters may cross source chunks.
+Only overlong regions are skipped. `SearchSummary::warning()`
 reports incomplete coverage with the cap and bounded-repetition guidance;
 the document worker retains the other hits/count/navigation and passes that
 warning to the shared GUI/TUI search state. Replacement recipes are withheld
@@ -240,7 +242,7 @@ artificial document anchors. Selection edges read at most the cap plus four
 bytes beyond each edge, enough to admit the complete intersecting line or
 prove it overlong. No scan from the beginning of the file is needed.
 
-Unbounded patterns that can consume line endings (e.g. `(?s).*`, `[\s\S]*`,
+Unbounded patterns that can consume LF (e.g. `(?s).*`, `[\s\S]*`,
 `\n+`, `\s+$`) retain the whole-source cap, including selection searches;
 larger sources return an actionable error before matching or emitting hits.
 For inputs beyond either cap use finite repetitions, e.g. `.{0,4096}`.

@@ -207,11 +207,11 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
   editing workloads have not received bounded-memory acceptance.
 - In-file search covers chunk boundaries, very long lines and large-file tails.
   Finite regexes use their computed maximum match length (up to 1 MiB).
-  Unbounded regexes that cannot consume a line ending (e.g. `\d+`, `\w+`,
-  `foo.*bar`) search any-size files with a 64 KiB per-line cap by default.
+  Unbounded regexes that cannot consume LF (e.g. `\d+`, `\w+`, `foo.*bar`,
+  `[^\n]+`) search any-size files with a 64 KiB per-line cap by default.
   Overlong lines are skipped with an actionable warning; other lines are
   still searched. Their anchors default to multiline mode. Unbounded regexes
-  that can consume a line ending (e.g. `(?s).*`, `[\s\S]*`, `\n+`) retain a
+  that can consume LF (e.g. `(?s).*`, `[\s\S]*`, `\n+`) retain a
   64 KiB whole-document cap and show an error on larger inputs. Use bounded
   repetitions such as `.{0,4096}` to search beyond these limits.
 - Folder replacement skips binary files and files with lines above the folder

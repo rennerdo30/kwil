@@ -106,8 +106,10 @@ fn tiny_chunks_and_work_windows_match_reference() {
 #[test]
 fn capped_line_search_preserves_context_across_tiny_chunks_and_selections() {
     let bytes = b"foo 12 bar\r\nfoo 3 bar\rfoo 4 bar\n";
-    for expression in [r"\d+", r"^foo.*bar$", r"(?-m:^foo.*bar$)", r"\Afoo.*bar", r"foo.*bar\z", r"a*"] {
-        let pattern = Pattern::regex(expression, Options::default(), 16).unwrap();
+    for expression in
+        [r"\d+", r"[^\n]+", r"\r+", r"^foo.*bar$", r"(?-m:^foo.*bar$)", r"\Afoo.*bar", r"foo.*bar\z", r"a*"]
+    {
+        let pattern = Pattern::regex(expression, Options::default(), 64).unwrap();
         let reference = regex::bytes::RegexBuilder::new(expression).multi_line(true).crlf(true).build().unwrap();
         for size in [1, 2, 3, 7, 128] {
             let source = Chunks { bytes, size };
