@@ -1,0 +1,71 @@
+name: Remote desktop measurements
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/remote.yml'
+      - 'scripts/measure-vnc.py'
+      - 'docs/REMOTE-MEASUREMENTS.md'
+      - 'crates/app/**'
+      - 'crates/ui-gpu/**'
+      - 'crates/view-model/**'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TARGET_DIR: target
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  vnc:
+    name: TigerVNC (informational)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # Measurements are not a merge gate. A broken probe is still visible in
+    # its step outcome, logs and artifact; no byte/rectangle budget is enforced.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install isolated-display tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends tigervnc-standalone-server xdotool fonts-dejavu-core
+      - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          key: remote-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build with existing policy/startup diagnostics
+        run: cargo build --locked -p kwil --features kwil-ui-gpu/frame-harness -j 4
+      - name: Python environment
+        run: python3 -m venv .remote-venv
+      - name: Measure a real Xvnc connection
+        timeout-minutes: 3
+        run: |
+          timeout 150s .remote-venv/bin/python scripts/measure-vnc.py --executable target/debug/kwil --output target/remote-results --commit "$(git rev-parse HEAD)"
+      - name: Publish measurement summary
+        if: always()
+        run: |
+          if [ -f target/remote-results/summary.md ]; then
+            cat target/remote-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'VNC probe did not produce numbers; inspect the failed step and artifact. No performance verdict.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: remote-vnc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/remote-results/
+          if-no-files-found: warn
+          retention-days: 30
