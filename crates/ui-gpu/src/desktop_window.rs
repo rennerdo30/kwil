@@ -142,6 +142,8 @@ impl App {
             Ok::<_, String>(Dialog {
                 accessibility,
                 gfx: Gfx {
+                    #[cfg(target_os = "macos")]
+                    macos_presenter: Default::default(),
                     #[cfg(all(windows, feature = "gpu"))]
                     gpu_canvas: None,
                     native: None,
