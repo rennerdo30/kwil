@@ -45,6 +45,7 @@ pub(super) struct Key {
     epoch: u64,
     base: u64,
     top: u64,
+    source: u64,
 }
 struct Work {
     key: Key,
@@ -115,7 +116,7 @@ pub(super) fn notification_fixture_completion(document: kwil_view_model::Session
     // A completed value with no Snapshot/worker capability, as after run's
     // existing explicit Snapshot drop. No source extraction is used by tests.
     Completion {
-        key: Key { document, revision: 0, epoch: 0, base: 0, top: 0 },
+        key: Key { document, revision: 0, epoch: 0, base: 0, top: 0, source: 0 },
         result: Err("original computed completion".into()),
         images: Default::default(),
         diagrams: Default::default(),
@@ -279,6 +280,11 @@ impl Host {
         }
         self.admission_notice = None;
         if self.desired != Some(key) {
+            if self.desired.is_none_or(|old| {
+                old.document != key.document || old.revision != key.revision || old.source != key.source
+            }) {
+                self.heights.clear();
+            }
             if self.desired.is_none_or(|old| old.document != key.document) {
                 self.scroll = 0;
             }
@@ -670,6 +676,7 @@ impl App {
             document: self.view.active_id(),
             revision: editor.document().revision(),
             epoch: self.view.input_epoch(),
+            source: editor.document().hex_source(self.view.active_id().0).epoch,
             base: self.markdown.path_generation,
             top: if editor.document().buffer().len() > kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64 {
                 editor.top()
@@ -706,7 +713,7 @@ impl App {
                         if stop.load(Ordering::Acquire) {
                             break;
                         }
-                        let source = (work.key.document, work.key.revision, work.key.base);
+                        let source = (work.key.document, work.key.revision, work.key.source, work.key.base);
                         if pager_source != Some(source) {
                             pager = None; // Index cleanup stays on this worker.
                             pager_source = Some(source);
@@ -773,7 +780,9 @@ impl App {
     }
     pub(super) fn markdown_scroll_key(&mut self, delta: i64) {
         if self.markdown.large {
-            self.view.scroll(delta);
+            if !self.wrap_scroll_rows(delta, 0) {
+                self.view.scroll(delta);
+            }
             self.markdown.scroll = 0;
         } else {
             self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
@@ -785,7 +794,9 @@ impl App {
             return false;
         }
         if self.markdown.large {
-            self.view.scroll(delta);
+            if !self.wrap_scroll_rows(delta, 0) {
+                self.view.scroll(delta);
+            }
             self.markdown.scroll = 0;
         } else {
             self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
@@ -1456,7 +1467,7 @@ mod tests {
     };
 
     fn request_key() -> Key {
-        Key { document: kwil_view_model::SessionDocumentId(71), revision: 1, epoch: 1, base: 0, top: 0 }
+        Key { document: kwil_view_model::SessionDocumentId(71), revision: 1, epoch: 1, base: 0, top: 0, source: 0 }
     }
     // A real channel, held without a consumer, makes Full independent of
     // scheduling. Disconnected is established before any source capture.
@@ -2164,7 +2175,8 @@ mod tests {
     }
     #[test]
     fn stale_completion_never_replaces_current_tab() {
-        let key = Key { document: kwil_view_model::SessionDocumentId(1), revision: 1, epoch: 1, base: 0, top: 0 };
+        let key =
+            Key { document: kwil_view_model::SessionDocumentId(1), revision: 1, epoch: 1, base: 0, top: 0, source: 0 };
         let mut host = Host { desired: Some(Key { revision: 2, ..key }), busy: true, ..Default::default() };
         host.receive(Completion {
             key,

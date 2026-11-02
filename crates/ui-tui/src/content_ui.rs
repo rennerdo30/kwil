@@ -6,7 +6,7 @@ use kwil_view_model::log_session::{Filter, Level, LogSession, TextQuery, Viewpor
 use std::{sync::Arc, time::Instant};
 
 type Source = (u64, u64, u64);
-type MarkdownRequest = (Source, u64, kwil_core_text::Snapshot);
+type MarkdownRequest = (Source, u64, u64, kwil_core_text::Snapshot);
 fn source(view: &Workspace) -> Option<Source> {
     if view.document_busy(view.active_id()) {
         return None;
@@ -36,10 +36,10 @@ impl MarkdownWorker {
             let registration = observation.register_current();
             let mut pager = None;
             let mut pager_source = None;
-            while let Ok((key, top, snapshot)) = requests.recv() {
-                if pager_source != Some((key.0, key.1)) {
+            while let Ok((key, top, incarnation, snapshot)) = requests.recv() {
+                if pager_source != Some((key.0, key.1, incarnation)) {
                     pager = None;
-                    pager_source = Some((key.0, key.1));
+                    pager_source = Some((key.0, key.1, incarnation));
                 }
                 let result = if registration.is_err() {
                     Err("Markdown worker registration failed".into())
@@ -548,8 +548,9 @@ impl Host {
                 }
             }
             if let (Some(worker), Some(key), Some(editor)) = (&self.markdown, current, view.editor()) {
-                let request =
-                    self.markdown_retry.take().unwrap_or_else(|| (key, markdown_top, editor.document().snapshot()));
+                let request = self.markdown_retry.take().unwrap_or_else(|| {
+                    (key, markdown_top, editor.document().hex_source(key.0).epoch, editor.document().snapshot())
+                });
                 match worker.send.as_ref().unwrap().try_send(request) {
                     Ok(()) => self.in_flight = true,
                     Err(e) => {
