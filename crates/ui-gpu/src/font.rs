@@ -60,6 +60,8 @@ impl Font {
         #[cfg(feature = "frame-harness")]
         crate::trace::mark("editor font parsed");
         let px = size.recv().ok()?;
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        crate::trace::mark("editor font scale received");
         let font = Self::from_face(prepared.face, px, &prepared.family);
         #[cfg(feature = "frame-harness")]
         crate::trace::mark("editor font rasterized");
@@ -378,6 +380,8 @@ impl UiFont {
         #[cfg(feature = "frame-harness")]
         crate::trace::mark("chrome fonts parsed");
         let px = px.recv().ok()?;
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        crate::trace::mark("chrome font scale received");
         let mut font = Self::from_face(face, px)?;
         font.monospace = mono.and_then(|face| Self::single_face(face, px)).map(Box::new);
         #[cfg(feature = "frame-harness")]

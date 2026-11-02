@@ -638,6 +638,9 @@ pub fn run_workspace_with_external_open(
         std::ops::ControlFlow::Break(refusal) => return std::ops::ControlFlow::Break(refusal),
         std::ops::ControlFlow::Continue(prepared) => prepared,
     };
+
+    #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+    trace::mark("event loop built");
     let proxy = match HostProxy::admit(event_loop.create_proxy(), &budget) {
         Ok(proxy) => proxy,
         Err(error) => {
@@ -956,6 +959,19 @@ pub fn run_workspace_with_external_open(
 }
 
 impl App {
+    fn start_startup_fonts(&mut self, window: &Window) {
+        if let Some(font_size) = self.font_size.take() {
+            let _ =
+                zoom::start_font_rasterization(font_size, self.settings.font.size, window.scale_factor(), self.zoom);
+        }
+        self.ui = chrome::Metrics::new(window.scale_factor());
+        if let Some(ui_font_size) = self.ui_font_size.take() {
+            let _ = ui_font_size.try_send(self.ui.text_px());
+        }
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("font scale sent");
+    }
+
     #[cfg(feature = "frame-harness")]
     fn content_trace_paint_allowed(&self) -> bool {
         // A checked preview is paint authority while binary/open ownership is
@@ -3365,6 +3381,8 @@ impl ApplicationHandler<UserEvent> for App {
         el.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window resume entered");
         if self.gfx.is_some() {
             return;
         }
@@ -3387,6 +3405,9 @@ impl ApplicationHandler<UserEvent> for App {
                 attrs = attrs.with_active(false).with_skip_taskbar(true);
             }
         }
+
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window creation entered");
         let window = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -3395,18 +3416,35 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window created");
+        // AppKit already reports this window's monitor scale. Rasterize on the
+        // existing workers while placement and native surface setup finish.
+        // Placement below stays on the window's current monitor.
+        #[cfg(target_os = "macos")]
+        self.start_startup_fonts(&window);
         if let Some(monitor) = window.current_monitor().or_else(|| el.primary_monitor()) {
             let placement =
                 window_placement::Placement::centered(window_placement::work(&monitor), None, (1280.0, 840.0));
             window_placement::fit_window(&window, placement);
             self.window_normal = Some(placement);
         }
+
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window placed");
         self.accessibility = Some(accessibility::Host::new(el, &window, &self.proxy));
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("accessibility attached");
         if !self.opts.hidden {
             window.set_visible(true);
         }
         window.set_ime_allowed(true);
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("IME enabled");
         let surface = Context::new(window.clone()).and_then(|c| Surface::new(&c, window.clone()));
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("CPU surface created");
         let surface = match surface {
             Ok(s) => s,
             Err(e) => {
@@ -3424,14 +3462,8 @@ impl ApplicationHandler<UserEvent> for App {
         if self.opts.hidden {
             cloak_and_show(hwnd);
         }
-        if let Some(font_size) = self.font_size.take() {
-            let _ =
-                zoom::start_font_rasterization(font_size, self.settings.font.size, window.scale_factor(), self.zoom);
-        }
-        self.ui = chrome::Metrics::new(window.scale_factor());
-        if let Some(ui_font_size) = self.ui_font_size.take() {
-            let _ = ui_font_size.try_send(self.ui.text_px());
-        }
+        #[cfg(not(target_os = "macos"))]
+        self.start_startup_fonts(&window);
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
         self.gfx = Some(Gfx {
