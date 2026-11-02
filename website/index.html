@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kwil: a fast plain text editor for the desktop and the terminal</title>
+  <meta name="description" content="Kwil is a free, open-source plain text editor written in Rust. It opens gigabyte files at once, keeps their encoding and line endings, and runs as a desktop app or in the terminal on Windows, macOS and Linux.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f4f7fb" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a101c" media="(prefers-color-scheme: dark)">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src https://api.github.com; base-uri 'none'; form-action 'none'">
+  <link rel="canonical" href="https://kwil.renner.dev/">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="assets/kwil-icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="site.webmanifest">
+  <meta property="og:title" content="Kwil">
+  <meta property="og:description" content="A fast plain text editor for the desktop and the terminal. Free and open source, written in Rust.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://kwil.renner.dev/">
+  <meta property="og:image" content="https://kwil.renner.dev/assets/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="stylesheet" href="style.css">
+  <script src="site.js" defer></script>
+  <script src="releases.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <div class="night">
+    <header class="top">
+      <a class="brand" href="#top" aria-label="Kwil home">
+        <img src="assets/kwil-icon.svg" width="30" height="30" alt="">
+        <span>Kwil</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="#speed">Speed</a>
+        <a href="#features">Features</a>
+        <a href="#terminal">Terminal</a>
+        <a href="#download">Download</a>
+        <a class="nav-gh" href="https://github.com/rennerdo30/kwil">GitHub</a>
+      </nav>
+    </header>
+
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="kicker"><span class="pill">Beta</span> Free and open source, written in Rust</p>
+        <h1 id="hero-title">Open the gigabyte log. <em>Start reading.</em></h1>
+        <p class="lede">Kwil is a plain text editor for the desktop and the terminal. It opens huge files without waiting, keeps every byte you did not touch, and draws only what changed, so it stays quiet on a laptop battery and over a remote desktop.</p>
+        <div class="cta">
+          <a class="btn btn-primary" href="#download" data-release="latest" data-field="hero-label">Download Kwil</a>
+          <a class="btn btn-ghost" href="https://github.com/rennerdo30/kwil">View the source</a>
+        </div>
+        <p class="platforms">Windows, macOS and Linux, on x64 and ARM64.</p>
+      </div>
+
+      <figure class="viewer" aria-labelledby="viewer-caption">
+        <div class="viewer-bar">
+          <div class="views" role="group" aria-label="Show Kwil's">
+            <button type="button" data-view="editor" aria-pressed="true">Find</button>
+            <button type="button" data-view="palette" aria-pressed="false">Command palette</button>
+            <button type="button" data-view="markdown" aria-pressed="false">Markdown</button>
+            <button type="button" data-view="settings" aria-pressed="false">Settings</button>
+          </div>
+          <div class="themes" role="group" aria-label="Kwil theme">
+            <button type="button" data-theme="dark" aria-pressed="false" title="Dark theme">Dark</button>
+            <button type="button" data-theme="light" aria-pressed="false" title="Light theme">Light</button>
+          </div>
+        </div>
+        <div class="window">
+          <picture>
+            <source media="(prefers-color-scheme: light)" srcset="assets/shots/editor-light.webp">
+            <img data-shot src="assets/shots/editor-dark.webp" width="1600" height="1015" alt="Kwil editing a Rust file with the Find bar open and four matches of “value” highlighted.">
+          </picture>
+        </div>
+        <figcaption id="viewer-caption">Find highlights every match as you type, with case, whole-word, regex and in-selection options.</figcaption>
+      </figure>
+    </section>
+  </div>
+
+  <main id="main">
+    <section class="band" id="speed" aria-labelledby="speed-title">
+      <div class="split">
+        <div class="prose">
+          <h2 id="speed-title">Big files are just files</h2>
+          <p>Kwil does not load a file into memory before it shows you the first screen. It reads the part you can see, draws it, and builds the line index in the background on several cores. You can scroll, search and jump while it works.</p>
+          <p>The index has a fixed memory budget of 64 MiB, which covers files well beyond 100 GB. Things that would need the whole file in memory, such as comparing two huge files or copying gigabytes to the clipboard, stop with a clear message instead of freezing your machine.</p>
+          <p>The numbers on the right come from the benchmark workflow on GitHub's hosted runners, measured on every change to main.</p>
+        </div>
+        <div class="gauges" role="group" aria-labelledby="gauges-title">
+          <p class="gauges-title" id="gauges-title">A 1 GiB log file, median of eight fresh processes</p>
+          <div class="gauge">
+            <h3>Open and show the first screen</h3>
+            <div class="track" aria-hidden="true">
+              <span class="tick tick-target x-90-1"><b>target 40 ms</b></span>
+              <span class="dot dot-win x-32-9"></span>
+              <span class="dot dot-linux x-21-0"></span>
+            </div>
+            <p class="readout"><span class="os os-win">Windows <b>0.21 ms</b></span><span class="os os-linux">Linux <b>0.07 ms</b></span></p>
+          </div>
+          <div class="gauge">
+            <h3>Jump to line 15,000,000</h3>
+            <div class="track" aria-hidden="true">
+              <span class="tick tick-target x-80-1"><b>one frame, 16 ms</b></span>
+              <span class="dot dot-win x-27-5"></span>
+              <span class="dot dot-linux x-7-0"></span>
+            </div>
+            <p class="readout"><span class="os os-win">Windows <b>0.13 ms</b></span><span class="os os-linux">Linux <b>0.02 ms</b></span></p>
+          </div>
+          <div class="gauge">
+            <h3>Private memory after opening and indexing</h3>
+            <div class="track" aria-hidden="true">
+              <span class="tick tick-target x-77-8"><b>target 64 MiB</b></span>
+              <span class="dot dot-win x-35-8"></span>
+              <span class="dot dot-linux x-16-2"></span>
+            </div>
+            <p class="readout"><span class="os os-win">Windows <b>4.7 MiB</b></span><span class="os os-linux">Linux <b>1.4 MiB</b></span></p>
+          </div>
+          <p class="gauges-foot">Logarithmic scales. Measured on 2 November 2026 on the <code>windows-2025</code> and <code>ubuntu-24.04</code> runners. These time Kwil's text core, not the whole window from launch; see <a href="https://github.com/rennerdo30/kwil/blob/main/docs/BENCHMARKS.md">how it is measured</a>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="features" aria-labelledby="features-title">
+      <h2 id="features-title">Everything a text editor needs, nothing it does not</h2>
+      <p class="intro">No project system, no extension store, no account. Tabs, search, compare and the tools you reach for when a file is strange, large or not quite text.</p>
+      <dl class="spec">
+        <div><dt>Encodings</dt><dd>UTF-8, UTF-16, UTF-32 and legacy encodings such as Shift_JIS, EUC-JP, GBK, Big5 and Windows-1252. Bytes you did not edit are saved exactly as they were, even malformed ones.</dd></div>
+        <div><dt>Line endings</dt><dd>LF, CRLF and classic Mac CR are kept when you edit and save, shown in the status bar, and converted on request.</dd></div>
+        <div><dt>Find and replace</dt><dd>Case, whole word, regex and in-selection. Find in Files searches a folder; replace in files shows a preview first, and you untick the files you want to leave alone.</dd></div>
+        <div><dt>Compare</dt><dd>Two files, or a file against its saved version, side by side with word highlights. Unchanged regions fold away; F7 jumps to the next change.</dd></div>
+        <div><dt>Hex editor</dt><dd>Edit bytes in the hex or text column, go to an offset, search for a byte sequence and copy as hex, with undo, in both the desktop app and the terminal.</dd></div>
+        <div><dt>Compressed files</dt><dd>gzip, zstd, bzip2 and xz files open as text and save back in the same format. Kwil decompresses to disk, not into memory.</dd></div>
+        <div><dt>Log files</dt><dd>Follow a growing log, filter by text, regex or level, mark lines, go to a time range and add your own highlight rules.</dd></div>
+        <div><dt>Markdown</dt><dd>Text, preview or split view, with headings, lists, tables, code and local images.</dd></div>
+        <div><dt>Sessions</dt><dd>Quit with unsaved changes and untitled tabs; they come back on the next start. Opening a file while Kwil runs adds a tab to the open window.</dd></div>
+        <div><dt>Keymaps</dt><dd>VS Code, Notepad++ or Vim presets, your own bindings on top, and a command palette that shows every shortcut.</dd></div>
+        <div><dt>Formatting</dt><dd>Built-in formatters for JSON, XML, HTML, YAML, TOML, CSS and SQL, and rustfmt, black or prettier when they are installed.</dd></div>
+        <div><dt>Screen readers</dt><dd>Menus, tabs, palette, dialogs, settings, the status bar and the visible text with caret and selection are exposed to assistive technology.</dd></div>
+      </dl>
+    </section>
+
+    <section class="band" id="quiet" aria-labelledby="quiet-title">
+      <div class="split split-rev">
+        <figure class="shot">
+          <picture>
+            <source media="(prefers-color-scheme: light)" srcset="assets/shots/markdown-light.webp">
+            <img src="assets/shots/markdown-dark.webp" width="1600" height="1015" loading="lazy" alt="A Markdown note in split view: source with line numbers on the left, the rendered preview with headings, lists, a quote and a table on the right.">
+          </picture>
+        </figure>
+        <div class="prose">
+          <h2 id="quiet-title">Draws only what changed</h2>
+          <p>Kwil has no frame loop. When you type a letter, it redraws that line and the status bar, and nothing else. When nothing changes, it does no work at all.</p>
+          <p>That keeps the fans off on a laptop, and it is why Kwil stays responsive over Remote Desktop and VNC, where every redrawn pixel has to cross the network. Remote mode goes further: no cursor blinking, no smooth scrolling, and a CPU renderer that does not need a GPU.</p>
+          <p>Work that takes time, such as indexing, searching a folder or syntax highlighting, runs in the background. Typing never waits for the disk.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="terminal" aria-labelledby="terminal-title">
+      <div class="split">
+        <div class="prose">
+          <h2 id="terminal-title">The same editor in your terminal</h2>
+          <p>One program, two front ends. Start Kwil from a desktop shortcut and you get a native window; start it over SSH, or with <code>--tui</code>, and you get a keyboard-driven terminal editor with the same files, settings, keymaps, search, compare, hex and log tools.</p>
+          <p>Settings live in one TOML file and apply live in both, and every command in the palette works in both.</p>
+        </div>
+        <div class="term" role="group" aria-label="Starting Kwil">
+          <div class="term-bar" aria-hidden="true"><span></span><span></span><span></span></div>
+<pre><code><span class="c"># Open in a window</span>
+kwil notes.txt
+
+<span class="c"># Open in this terminal</span>
+kwil --tui server.log
+
+<span class="c"># A second window instead of a new tab</span>
+kwil --new-window draft.md</code></pre>
+          <p class="term-note">Your settings file, for example:</p>
+<pre><code><span class="k">keymap.preset</span> = <span class="s">"vim"</span>   <span class="c"># or "vscode", "notepad++"</span>
+
+[[<span class="k">bindings</span>]]
+<span class="k">keys</span> = <span class="s">"ctrl+alt+s"</span>
+<span class="k">command</span> = <span class="s">"file.save"</span></code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="settings" aria-labelledby="settings-title">
+      <div class="pair">
+        <figure class="shot">
+          <picture>
+            <source media="(prefers-color-scheme: light)" srcset="assets/shots/palette-light.webp">
+            <img src="assets/shots/palette-dark.webp" width="1600" height="1015" loading="lazy" alt="The command palette over a Rust file, listing file commands with their keyboard shortcuts.">
+          </picture>
+          <figcaption>The command palette finds any command and shows its shortcut in your keymap.</figcaption>
+        </figure>
+        <figure class="shot">
+          <picture>
+            <source media="(prefers-color-scheme: light)" srcset="assets/shots/settings-light.webp">
+            <img src="assets/shots/settings-dark.webp" width="1598" height="1114" loading="lazy" alt="The Settings page with categories on the left and searchable settings such as tabs layout, keymap preset, word wrap and tab size.">
+          </picture>
+          <figcaption>Settings are searchable and save as you change them; the TOML file is one click away.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="band trio" aria-label="Safety, updates and privacy">
+      <article>
+        <h2>Your work is not lost</h2>
+        <p>Unsaved changes are written to a recovery journal every few seconds, saves are atomic, and a crash handler flushes the journal. Quit or crash, and your tabs come back on the next start. When another program changes a file you are editing, Kwil asks whether to keep your version or reload.</p>
+      </article>
+      <article>
+        <h2>Updates itself, carefully</h2>
+        <p>Kwil checks GitHub for new releases and verifies every download against its SHA-256 checksum before it replaces itself. Betas follow betas and stable releases; stable copies only take stable releases. One setting turns the check off.</p>
+      </article>
+      <article>
+        <h2>Nothing phones home</h2>
+        <p>No account, no telemetry. The update check is the only thing Kwil fetches from the network, and Markdown previews show local images only.</p>
+      </article>
+    </section>
+
+    <section class="band download" id="download" aria-labelledby="download-title">
+      <h2 id="download-title">Get Kwil</h2>
+      <p class="intro">Kwil is in beta: it is usable every day, but not every part of the <a href="https://github.com/rennerdo30/kwil/blob/main/docs/SPEC.md">v1 specification</a> is done yet. Try it with copies of important files first, and <a href="https://github.com/rennerdo30/kwil/issues">tell us</a> what breaks.</p>
+      <div class="dl-grid">
+        <div class="dl">
+          <h3>Newest release</h3>
+          <p class="dl-version" data-release="latest" data-field="found" hidden>Kwil <strong data-release="latest" data-field="version"></strong><span data-release="latest" data-field="kind"></span>, released <span data-release="latest" data-field="date"></span>.</p>
+          <p class="dl-version" data-release="latest" data-field="missing">Downloads are on the GitHub releases page.</p>
+          <ul class="assets">
+            <li data-os="windows">
+              <span class="asset-os">Windows 10 and 11</span>
+              <span class="asset-links">
+                <a class="btn btn-primary btn-small" data-asset="windows-x64-setup.exe" href="https://github.com/rennerdo30/kwil/releases">Installer x64</a>
+                <a class="btn btn-small" data-asset="windows-arm64-setup.exe" href="https://github.com/rennerdo30/kwil/releases">Installer ARM64</a>
+                <a class="btn btn-small" data-asset="windows-x64.zip" href="https://github.com/rennerdo30/kwil/releases">Portable zip</a>
+              </span>
+            </li>
+            <li data-os="mac">
+              <span class="asset-os">macOS</span>
+              <span class="asset-links">
+                <a class="btn btn-small" data-asset="macos-arm64.tar.gz" href="https://github.com/rennerdo30/kwil/releases">Apple silicon</a>
+                <a class="btn btn-small" data-asset="macos-x64.tar.gz" href="https://github.com/rennerdo30/kwil/releases">Intel</a>
+              </span>
+            </li>
+            <li data-os="linux">
+              <span class="asset-os">Linux</span>
+              <span class="asset-links">
+                <a class="btn btn-small" data-asset="linux-x64.tar.gz" href="https://github.com/rennerdo30/kwil/releases">x64</a>
+                <a class="btn btn-small" data-asset="linux-arm64.tar.gz" href="https://github.com/rennerdo30/kwil/releases">ARM64</a>
+              </span>
+            </li>
+          </ul>
+          <p class="dl-sub">The Windows installer needs no admin rights and adds a Start menu entry and an uninstaller. The builds are not signed yet, so SmartScreen and Gatekeeper warn on the first start. Check downloads against <a data-asset="SHA256SUMS" href="https://github.com/rennerdo30/kwil/releases">SHA256SUMS</a>; the <a href="https://github.com/rennerdo30/kwil/blob/main/docs/INSTALL.md">installation guide</a> has the details.</p>
+        </div>
+        <div class="dl">
+          <h3>Build from source</h3>
+          <p>Needs a Rust toolchain; <code>rustup</code> picks the right version from the repository.</p>
+<pre><code>git clone https://github.com/rennerdo30/kwil
+cd kwil
+scripts/run.sh --release      <span class="c"># Windows: scripts\run.bat</span></code></pre>
+          <p class="cta"><a class="btn" href="https://github.com/rennerdo30/kwil">Source code</a> <a class="btn" href="https://github.com/rennerdo30/kwil/releases">All releases</a></p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <p><img src="assets/kwil-icon.svg" width="20" height="20" alt=""> Kwil, a project by <a href="https://github.com/rennerdo30">rennerdo30</a>. MIT licensed.</p>
+    <p><a href="https://github.com/rennerdo30/kwil/blob/main/docs/BETA.md">Beta status</a> <a href="https://github.com/rennerdo30/kwil/blob/main/docs/BETA_RELEASE_NOTES.md">Release notes</a> <a href="privacy.html">Privacy</a> <a href="https://github.com/rennerdo30/kwil/issues">Report an issue</a></p>
+  </footer>
+</body>
+</html>
