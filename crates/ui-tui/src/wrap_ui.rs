@@ -903,6 +903,106 @@ mod tests {
         }
     }
 
+    /// Exercise the real terminal key routing, format host, bounded document
+    /// lane and cached-cell drawing. No installed formatter is consulted.
+    fn format_json(selection: bool) {
+        const ORIGINAL: &str = "[\n{  \"keep\": [3,2] },\n{  \"target\": [1,2] }\n]\n";
+        const DOCUMENT: &str = "[\n  {\n    \"keep\": [\n      3,\n      2\n    ]\n  },\n  {\n    \"target\": [\n      1,\n      2\n    ]\n  }\n]\n";
+        const SELECTION: &str = "[\n{  \"keep\": [3,2] },\n{\n  \"target\": [\n    1,\n    2\n  ]\n}]\n";
+        let mut fixture = BoundedFrontend::new();
+        let path = fixture.root.join("messy.json");
+        std::fs::write(&path, ORIGINAL).unwrap();
+        fixture.view.open_path(path.clone()).unwrap();
+        fixture.until(|f| f.view.editor().is_some() && !f.view.file_saves_pending());
+        fixture.view.set_rows(22);
+        fixture.view.editor_mut().unwrap().settings.editor.tab_size = 2;
+        let original_cursors = if selection {
+            let start = ORIGINAL.find("{  \"target\"").unwrap() as u64;
+            let end = ORIGINAL.rfind(']').unwrap() as u64;
+            let damage = fixture
+                .view
+                .editor_mut()
+                .unwrap()
+                .set_cursors(vec![Cursor { anchor: start, head: end, desired_column: None }], 0)
+                .unwrap();
+            fixture.view.refresh_after_cursor(damage);
+            fixture.view.editor().unwrap().cursors().to_vec()
+        } else {
+            fixture.view.editor().unwrap().cursors().to_vec()
+        };
+        let bytes = |view: &kwil_view_model::Workspace| {
+            let mut bytes = Vec::new();
+            view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+            bytes
+        };
+        let capture = |view: &kwil_view_model::Workspace, stage: &str| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| crate::draw_area_highlighted(frame, view, frame.area(), true, &[])).unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..24 {
+                for x in 0..80 {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            if let Some(root) = std::env::var_os("KWIL_FORMAT_TUI_CAPTURE_DIR") {
+                let root = std::path::PathBuf::from(root);
+                assert!(root.is_absolute());
+                let mode = if selection { "selection" } else { "document" };
+                std::fs::write(root.join(format!("tui-{mode}-{stage}.txt")), &text).unwrap();
+            }
+            text
+        };
+        let before = capture(&fixture.view, "before");
+        assert!(before.contains("{  \"keep\": [3,2] }"));
+        let command = if selection { "edit.formatSelection" } else { "edit.formatDocument" };
+        fixture.keys = kwil_core_commands::keymap::KeymapEngine::new(
+            kwil_core_commands::Preset::VsCode,
+            &[kwil_core_commands::Binding { keys: "f6".into(), command: command.into(), context: None, mode: None }],
+        )
+        .unwrap();
+        let intent = crate::key(
+            &mut fixture.view,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            Duration::ZERO,
+            &mut fixture.keys,
+            kwil_core_commands::Preset::VsCode,
+        );
+        let intent =
+            crate::resolve_wrap(&mut fixture.view, None, intent, Duration::ZERO, kwil_core_commands::Preset::VsCode);
+        let crate::KeyResult::Format(actual) = intent else { panic!("format must reach the terminal document host") };
+        crate::format_document(&mut fixture.view, None, actual);
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+        let expected = if selection { SELECTION } else { DOCUMENT };
+        assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        assert_eq!(fixture.view.notice(), "Formatting complete");
+        let after = capture(&fixture.view, "after");
+        assert_ne!(before, after);
+        assert!(after.contains("\"target\": ["));
+        if selection {
+            assert!(after.contains("{  \"keep\": [3,2] }"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), ORIGINAL.as_bytes(), "formatting does not save implicitly");
+        fixture.view.execute("edit.undo", &Default::default(), 1).unwrap();
+        assert_eq!(bytes(&fixture.view), ORIGINAL.as_bytes(), "one Undo restores every byte");
+        assert_eq!(fixture.view.editor().unwrap().cursors(), original_cursors);
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+        fixture.view.execute("edit.redo", &Default::default(), 1).unwrap();
+        assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        fixture.finish();
+    }
+
+    #[test]
+    fn format_json_document_through_terminal_host_and_test_backend() {
+        format_json(false);
+    }
+
+    #[test]
+    fn format_json_selection_through_terminal_host_and_test_backend() {
+        format_json(true);
+    }
+
     #[test]
     fn wrap_tui_bounded_actual_worker_one_slot_event_only_and_exception_preadmission() {
         let mut fixture = BoundedFrontend::starting();
