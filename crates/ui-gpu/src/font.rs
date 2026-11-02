@@ -610,6 +610,54 @@ impl UiFont {
         out
     }
 
+    /// Fit a bounded suffix with a leading ellipsis when a prefix is omitted.
+    /// Reverse iteration keeps work bounded even for very long field values.
+    pub fn fit_tail(&mut self, text: &str, max: usize) -> String {
+        use unicode_segmentation::UnicodeSegmentation;
+        let ellipsis = self.advance('…');
+        let start = text.char_indices().rev().nth(UI_SCALARS - 1).map_or(0, |(byte, _)| byte);
+        let tail = &text[start..];
+        let mut used = 0.0f32;
+        let mut suffix = Vec::new();
+        let mut cut = start != 0;
+        let mut scalars = 0;
+        for (byte, cluster) in tail.grapheme_indices(true).rev() {
+            // The bounded slice may begin inside a cluster from the original
+            // input. Omit that first cluster rather than expose a broken mark.
+            if start != 0 && byte == 0 {
+                break;
+            }
+            let display = kwil_view_model::palette_session::display_text(cluster);
+            scalars += display.chars().count();
+            if scalars >= UI_SCALARS {
+                cut = true;
+                break;
+            }
+            let advance: f32 = display.chars().map(|c| self.advance(c)).sum();
+            if (used + advance).ceil() as usize > max {
+                cut = true;
+                break;
+            }
+            used += advance;
+            suffix.push((display, advance));
+        }
+        if cut {
+            while (used + ellipsis).ceil() as usize > max
+                && let Some((_, advance)) = suffix.pop()
+            {
+                used -= advance;
+            }
+        }
+        let mut out = String::new();
+        if cut && (used + ellipsis).ceil() as usize <= max {
+            out.push('…');
+        }
+        for (display, _) in suffix.into_iter().rev() {
+            out.push_str(&display);
+        }
+        out
+    }
+
     /// Baseline that centres capital letters in a box of `height` at `top`.
     pub fn baseline(&self, top: usize, height: usize) -> usize {
         top + ((height as f32 + self.cap) / 2.0).round() as usize
