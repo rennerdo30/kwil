@@ -12,6 +12,8 @@ mod original_save;
 pub use original_save::{OriginalSavePin, cleanup_stale_save_backups};
 mod read_batch;
 pub use read_batch::with_checked_read_batch;
+mod source;
+pub use source::READ_CHUNK;
 
 /// Files below this size are read into memory; larger ones are mapped
 /// (spec §5, "mmap safety").
