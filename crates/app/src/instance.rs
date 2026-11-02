@@ -160,9 +160,11 @@ impl Owner {
                 eprintln!("kwil: initial file delivery failed: {error}");
             }
             route.install(open);
+            crate::speed_mark("IPC UI ready");
             if let Some(requests) = requests.borrow_mut().take() {
                 let result = std::thread::Builder::new().name("kwil-open-relay".into()).spawn(move || {
                     for request in requests {
+                        crate::speed_mark("IPC relay received");
                         if !deliver(&route, &stopped, request) {
                             break;
                         }

@@ -132,6 +132,8 @@ impl App {
         if requests.is_empty() {
             return Damage::default();
         }
+        #[cfg(feature = "frame-harness")]
+        trace::mark("IPC UI received");
         for request in requests {
             if let Err(error) = self.view.open_files(request) {
                 self.view.set_notice(format!("Open failed: {error}"));

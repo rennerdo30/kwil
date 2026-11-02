@@ -39,17 +39,22 @@ pub(super) fn prepare_with_index_check(
     publish: impl FnOnce(DecodedPreview) -> io::Result<()>,
     mut index_cancelled: impl FnMut() -> bool,
 ) -> io::Result<PreparedDecodedDocument> {
+    super::startup_stage("decoded open entered");
     let encoded = match interpretation {
         Some(encoding) => EncodedFile::new_with_encoding(file.clone(), encoding),
         None => EncodedFile::new(file.clone()),
     }
     .map_err(io::Error::other)?;
     let detection = encoded.detection();
+    super::startup_stage("encoding detected");
     let interpretation = Interpretation::new(detection.encoding, detection.bom_len).map_err(io::Error::other)?;
     let preview = decode_preview(&file, interpretation, cancel).map_err(BackingError::into_io_error)?;
+    super::startup_stage("preview decoded");
     publish(preview)?;
+    super::startup_stage("preview acknowledged");
     let backing =
         DecodedBacking::prepare(&file, interpretation, private_parent, cancel).map_err(BackingError::into_io_error)?;
+    super::startup_stage("backing prepared");
     match Document::from_decoded_file_cancellable(path, file, backing.snapshot(), || {
         cancel.load(std::sync::atomic::Ordering::Relaxed) || index_cancelled()
     }) {

@@ -219,7 +219,10 @@ fn every_approved_value_intent_and_private_wake_is_explicitly_classified() {
         UserEvent::DiagnosticsReady("original diagnostics".into()),
         UserEvent::FontReady(None),
         UserEvent::UiFontReady(None),
-        UserEvent::UiFallbackReady(901, Some((vec![1, 2, 3], 7))),
+        UserEvent::UiFallbackReady(
+            901,
+            crate::font::UiFallback { text: Some((vec![1, 2, 3], 7)), symbols: Some((vec![4, 5, 6], 0)) },
+        ),
         UserEvent::GlyphReady(
             shaping::Tile {
                 key: shaping::TileKey { text: "original tile".into(), columns: 2, fg: 3, bg: 4 },

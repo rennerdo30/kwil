@@ -659,6 +659,12 @@ mod tests {
                 "actual GUI body paint permits the vetted first screen before completion"
             );
             assert!(app.binary_pending(), "preview never releases ownership/input fences");
+            #[cfg(feature = "frame-harness")]
+            assert_eq!(
+                app.content_trace_paint_allowed(),
+                choice != Some(Choice::Hex),
+                "startup timing must recognize vetted text paint while the final open is held"
+            );
             assert!(app.binary_owns_input());
             assert!(app.view.document_busy(id));
             assert!(app.view.editor().is_none(), "held completion still owns the full document");
