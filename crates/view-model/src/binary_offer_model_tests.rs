@@ -193,7 +193,7 @@ fn offered_channel(capacity: usize) -> (Workspace, mpsc::Receiver<DocumentReques
     workspace.views.get_mut(&id).unwrap().editor = None;
     workspace.views.get_mut(&id).unwrap().path = Some(path.clone());
     workspace.session.tab_mut(id).unwrap().path = Some(path.clone());
-    let ticket = Ticket { document: id, revision: 0, generation: 1 };
+    let ticket = Ticket { document: id, revision: 0, generation: 1, follow: false };
     let offer = Offer { ticket, len: 16 };
     workspace.binary.flights.insert(
         id,

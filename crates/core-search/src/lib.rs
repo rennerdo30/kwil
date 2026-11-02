@@ -16,8 +16,11 @@ mod files;
 mod filter;
 mod parallel;
 mod search;
+mod stream_regex;
 pub mod worker;
 pub mod worker_spool;
+
+pub use stream_regex::StreamRegex;
 
 pub use files::{FileEvent, FileHit, FileSearch, FileSearchSummary, find_in_files, worker_count};
 pub use filter::{FilterExpr, FilterResume, FilterSummary, LineFilter, LineRun, LineRuns};
