@@ -2465,6 +2465,7 @@ name = "kwil-ui-gpu"
 version = "0.1.0-beta.8"
 dependencies = [
  "accesskit",
+ "accesskit_consumer",
  "accesskit_winit",
  "fontdb",
  "fontdue",

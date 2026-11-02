@@ -50,6 +50,17 @@ mod tests {
     }
 
     #[test]
+    fn complete_visible_document_has_no_synthetic_final_newline() {
+        for text in ["Accessible first line\n日本語 second line", "日本語\n", ""] {
+            let app = start(text);
+            let snapshot = app.accessibility_snapshot(false);
+            let exposed: String = snapshot.text.keys().map(|id| snapshot.nodes[id].value().unwrap()).collect();
+            assert_eq!(exposed, text, "TextPattern must preserve the document's final newline state");
+            document_ui::fixtures::settle_app(app);
+        }
+    }
+
+    #[test]
     fn caret_change_updates_editor_without_resending_text_and_idle_is_empty() {
         let mut app = start("日本語 first\nsecond");
         let before = app.accessibility_snapshot(false);
@@ -100,6 +111,60 @@ mod tests {
         assert_eq!(snapshot.nodes[&children[0]].role(), Role::TextRun);
         assert_eq!(snapshot.nodes[&children[0]].value(), Some(""));
         assert!(snapshot.nodes[&EDITOR].text_selection().is_some());
+        document_ui::fixtures::settle_app(app);
+    }
+
+    #[test]
+    fn prepared_reflow_keeps_live_document_range_until_replacement() {
+        struct Changes;
+        impl accesskit_consumer::TreeChangeHandler for Changes {
+            fn node_added(&mut self, _: &accesskit_consumer::NodeRef) {}
+            fn node_updated(&mut self, _: &accesskit_consumer::NodeRef, _: &accesskit_consumer::NodeRef) {}
+            fn focus_moved(
+                &mut self,
+                _: Option<&accesskit_consumer::NodeRef>,
+                _: Option<&accesskit_consumer::NodeRef>,
+            ) {
+            }
+            fn node_removed(&mut self, _: &accesskit_consumer::NodeRef) {}
+        }
+        let text = "Accessible first line\n日本語 second line";
+        let mut app = start(text);
+        app.settings.editor.word_wrap = true;
+        let before = app.accessibility_snapshot(false);
+        let mut consumer = accesskit_consumer::Tree::new(before.delta(None).unwrap(), true);
+        let range = consumer
+            .state()
+            .root()
+            .children()
+            .find(|node| node.role() == Role::MultilineTextInput)
+            .unwrap()
+            .document_range()
+            .downgrade();
+        assert_eq!(range.upgrade(consumer.state()).unwrap().text(), text);
+
+        // Reflow clears the legacy viewport before the worker publishes a page.
+        // A UIA range already returned to the reader must still be readable.
+        app.view.set_body_policy(kwil_view_model::ViewBodyPolicy::Prepared);
+        let pending = app.accessibility_snapshot_with_previous(false, Some(&before));
+        if let Some(update) = pending.delta(Some(&before)) {
+            consumer.update_and_process_changes(update, &mut Changes);
+        }
+        assert_eq!(range.upgrade(consumer.state()).expect("reflow must not invalidate a live UIA range").text(), text);
+        assert_eq!(pending.text, before.text, "source mappings remain valid for the unchanged revision");
+
+        app.view.set_body_policy(kwil_view_model::ViewBodyPolicy::LogicalLines);
+        let ready = app.accessibility_snapshot_with_previous(false, Some(&pending));
+        if let Some(update) = ready.delta(Some(&pending)) {
+            consumer.update_and_process_changes(update, &mut Changes);
+        }
+        assert_eq!(range.upgrade(consumer.state()).unwrap().text(), text);
+
+        // A new document revision cannot reuse retained text from before an edit.
+        app.view.execute("edit.insert", &CommandArgs { text: Some("new ".into()), ..Default::default() }, 1).unwrap();
+        app.view.set_body_policy(kwil_view_model::ViewBodyPolicy::Prepared);
+        let changed = app.accessibility_snapshot_with_previous(false, Some(&ready));
+        assert!(changed.nodes[&NodeId(ROW)].value().unwrap().is_empty());
         document_ui::fixtures::settle_app(app);
     }
 }
@@ -281,6 +346,9 @@ impl App {
         } else {
             self.accessibility.as_ref().and_then(|host| host.previous.as_ref())
         };
+        self.accessibility_snapshot_with_previous(dialog, previous)
+    }
+    fn accessibility_snapshot_with_previous(&self, dialog: bool, previous: Option<&Snapshot>) -> Snapshot {
         let mut tree = Snapshot {
             next_tab: previous.map_or(TAB, |old| old.next_tab),
             identity: Some((
@@ -373,7 +441,9 @@ impl App {
                         }
                     }
                     positions.push(line.source_coverage.end);
-                    if line.hard_line_end {
+                    // A hard line end also describes EOF. Only actual line
+                    // separators belong in TextPattern's document text.
+                    if line.hard_line_end && !(page.at_end && row + 1 == page.rows().len()) {
                         text.push('\n');
                         positions.push(line.source_coverage.end);
                     }
@@ -391,8 +461,10 @@ impl App {
                         }
                     }
                     positions.push(end);
-                    text.push('\n');
-                    positions.push(end);
+                    if self.view.line_count().is_none_or(|count| self.view.line_number(row) < count) {
+                        text.push('\n');
+                        positions.push(end);
+                    }
                 }
                 let bounds = accesskit::Rect::new(
                     body.x as f64,
@@ -401,6 +473,24 @@ impl App {
                     (body.y + (row + 1) * self.ch()) as f64,
                 );
                 lines.push(tree.line(row, text, positions, bounds));
+            }
+            if lines.is_empty()
+                && self.settings.editor.word_wrap
+                && self.view.body_policy() == kwil_view_model::ViewBodyPolicy::Prepared
+                && self.view.editor().is_some()
+                && let Some(old) = previous.filter(|old| old.identity == tree.identity)
+                && let Some(editor) = old.nodes.get(&EDITOR)
+            {
+                // A temporary empty run would invalidate ranges already handed
+                // to a reader (missing runs or out-of-bounds character indices).
+                // Retain only this unchanged document's last bounded viewport.
+                for id in editor.children() {
+                    if let Some(positions) = old.text.get(id) {
+                        tree.nodes.insert(*id, old.nodes[id].clone());
+                        tree.text.insert(*id, positions.clone());
+                        lines.push(*id);
+                    }
+                }
             }
             if lines.is_empty() {
                 // Keep TextPattern available while the prepared viewport is

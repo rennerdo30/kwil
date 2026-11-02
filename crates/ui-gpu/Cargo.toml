@@ -32,6 +32,8 @@ unicode-bidi = "0.3.18"
 pollster = "1.0.1"
 
 [dev-dependencies]
+# Already used by the platform adapters; exercises the same live range contract.
+accesskit_consumer = "0.39.2"
 # Compare grid metrics with the previous ASCII rasterizer.
 fontdue = "0.9.5"
 
