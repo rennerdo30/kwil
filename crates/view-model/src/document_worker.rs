@@ -888,6 +888,12 @@ fn journal_can_run(
     before: usize,
     storage: Option<&Storage>,
 ) -> bool {
+    // An explicit flush covers every earlier admitted journal operation,
+    // including receipts deferred until their asynchronous seed is ready.
+    // Flushing the seed first would leave those receipts on the normal debounce.
+    if matches!(request, DocumentRequest::FlushJournals) {
+        return !deferred.iter().take(before).any(|older| journal_document(older).is_some());
+    }
     let Some(document) = journal_document(request) else { return true };
     if deferred.iter().take(before).any(|older| journal_document(older) == Some(document)) {
         return false;

@@ -626,14 +626,14 @@ impl WrapSession {
         self.shared.changed.notify_one();
         ControlFlow::Continue(())
     }
-    /// Stale ready owners retire on the fixed worker. Saturation retains the
-    /// ready slot intact, instead of dropping its last source on the UI.
     #[cfg(test)]
     pub(crate) fn before_idle_for_test(&self, action: impl FnOnce() + Send + 'static) {
         let _state = self.shared.state.lock().unwrap();
         *self.shared.before_idle.lock().unwrap() = Some(Box::new(action));
         self.shared.changed.notify_one();
     }
+    /// Stale ready owners retire on the fixed worker. Saturation retains the
+    /// ready slot intact, instead of dropping its last source on the UI.
     pub fn take_update(&mut self, current: NavigationFence) -> Option<LayoutUpdate> {
         self.consume_update(Some(current))
     }
@@ -913,6 +913,13 @@ fn worker_loop(shared: &Arc<Shared>, budget: AllocationBudget) -> WrapResult<()>
                 action();
                 state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             }
+        }
+        // Retirement can arrive after drain_retired released this mutex.
+        // Recheck its predicate under the same lock as the idle/stop decision;
+        // its notification may already have happened before we acquired it.
+        if state.retired.iter().any(Option::is_some) {
+            drop(state);
+            continue;
         }
         if shared.stop.load(Ordering::Acquire) {
             if state.retirement_reserved.iter().any(|reserved| *reserved) {

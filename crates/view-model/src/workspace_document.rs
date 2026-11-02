@@ -590,7 +590,12 @@ impl WorkspaceDocumentShutdown {
                         self.durability_targets = targets;
                         self.flush_requested = false;
                     }
-                    if needs_flush && !self.flush_requested && workspace.files.queue.len() < 256 {
+                    let receipts_submitted = workspace
+                        .views
+                        .values()
+                        .chain(workspace.closed_views.values())
+                        .all(|view| view.editor().is_none_or(|editor| !editor.has_pending_edit_receipt()));
+                    if needs_flush && receipts_submitted && !self.flush_requested && workspace.files.queue.len() < 256 {
                         workspace.files.queue.push_back(DocumentRequest::FlushJournals);
                         self.flush_requested = true;
                     }
