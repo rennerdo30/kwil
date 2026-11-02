@@ -156,7 +156,10 @@ fn theme_import_path_enters_catalogue_and_saved_selection_survives_missing_sourc
 fn theme_follow_system_saves_toggle_and_cancel_resolves_latest_os_side() {
     let mut f = Fixture::new();
     f.command("theme.followSystem");
-    f.wait(|f| f.saved().theme.follow_os && f.themes.settings.follow_os);
+    // The Saved receipt follows atomic replacement. Reading the path while
+    // that write is pending races ReplaceFileW's exclusive destination handle.
+    f.wait(|f| !f.settings.is_saving() && f.themes.settings.follow_os);
+    assert!(f.saved().theme.follow_os);
     f.themes.os_changed(Scheme::Light);
     assert_eq!(f.themes.active(false).scheme(), Scheme::Light);
     f.command("theme.select");
@@ -166,7 +169,8 @@ fn theme_follow_system_saves_toggle_and_cancel_resolves_latest_os_side() {
     f.input(PaletteInput::Cancel);
     assert_eq!(f.themes.active(false).scheme(), Scheme::Light);
     f.command("theme.followSystem");
-    f.wait(|f| !f.saved().theme.follow_os && !f.themes.settings.follow_os);
+    f.wait(|f| !f.settings.is_saving() && !f.themes.settings.follow_os);
+    assert!(!f.saved().theme.follow_os);
 }
 
 #[test]

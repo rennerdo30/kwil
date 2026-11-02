@@ -1569,16 +1569,23 @@ mod tests {
         }
     }
 
+    fn worker_event(app: &mut App, event: UserEvent) {
+        match event {
+            UserEvent::WrapReady => app.wrap_ready(),
+            // Split/preview shares the App proxy with the Markdown worker.
+            // Its completion cannot satisfy wrap retirement or layout readiness.
+            UserEvent::MarkdownReady(completion) => app.markdown_ready(*completion),
+            _ => panic!("unexpected wake in wrap App test"),
+        }
+    }
+
     fn until(app: &mut App, rx: &mpsc::Receiver<UserEvent>, done: impl Fn(&App) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done(app) {
             let event = rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .expect("actual worker must wake actual App within five seconds");
-            match event {
-                UserEvent::WrapReady => app.wrap_ready(),
-                _ => panic!("unexpected wake in wrap-only App test"),
-            }
+            worker_event(app, event);
             if app.wrap.cursor_damage.is_some() {
                 paint(app);
             }
@@ -1591,13 +1598,10 @@ mod tests {
             match app.wrap_sync(context) {
                 Ok(sync) => return sync,
                 Err(WrapError::Busy) => {
-                    match rx
+                    let event = rx
                         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .expect("retirement must wake busy synchronization")
-                    {
-                        UserEvent::WrapReady => app.wrap_ready(),
-                        _ => panic!("unexpected synchronization wake"),
-                    }
+                        .expect("retirement must wake busy synchronization");
+                    worker_event(app, event);
                 }
                 Err(error) => panic!("unexpected synchronization failure: {error}"),
             }
@@ -1858,6 +1862,19 @@ mod tests {
         fill(&mut app, &rx);
         let full = app.wrap_page().unwrap().key.geometry.columns;
         assert!(app.dispatch_markdown("view.markdownSplit"));
+        // Exercise the shared wait dispatcher with a real Markdown completion
+        // on every run, even when wrap retirement happens to finish first.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("split preview worker completion");
+            let markdown = matches!(&event, UserEvent::MarkdownReady(_));
+            worker_event(&mut app, event);
+            if markdown {
+                break;
+            }
+        }
         let mut split = app.wrap.context.unwrap();
         split.key.layout_generation += 1;
         sync(&mut app, &rx, split);

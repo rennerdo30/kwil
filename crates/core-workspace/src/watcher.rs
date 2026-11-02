@@ -153,6 +153,7 @@ impl FileWatcher {
                 let ready: Vec<_> = pending.iter().filter(|(_, (d, _))| *d <= now).map(|(p, _)| p.clone()).collect();
                 for path in ready {
                     let (_, kind) = pending.remove(&path).expect("pending path");
+                    let kind = delivery_kind(&path, kind, directories);
                     callback(Ok(FileEvent { path, kind }));
                 }
             }
@@ -170,6 +171,17 @@ impl Drop for FileWatcher {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+fn delivery_kind(path: &Path, kind: FileEventKind, directory: bool) -> FileEventKind {
+    // FSEvents can report removal followed by metadata for the same directory.
+    // Debouncing may retain that later Modified kind, but the stable watched
+    // path is still absent. Check once at delivery, never with an idle poll.
+    if directory && std::fs::symlink_metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+        FileEventKind::Removed
+    } else {
+        kind
     }
 }
 
@@ -468,24 +480,54 @@ mod tests {
         drop(watcher);
     }
     #[test]
+    fn watcher_directory_absence_overrides_late_metadata_at_delivery() {
+        let dir = TempDir::new();
+        let root = dir.0.join("themes");
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(delivery_kind(&root, FileEventKind::Modified, true), FileEventKind::Modified);
+        std::fs::remove_dir(&root).unwrap();
+        assert_eq!(delivery_kind(&root, FileEventKind::Modified, true), FileEventKind::Removed);
+        assert_eq!(delivery_kind(&root, FileEventKind::Modified, false), FileEventKind::Modified);
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(delivery_kind(&root, FileEventKind::Modified, true), FileEventKind::Modified);
+    }
+
+    #[test]
     fn watcher_directory_native_rearms_after_parent_observes_recreation() {
         let dir = TempDir::new();
         let root = dir.0.canonicalize().unwrap().join("themes");
         std::fs::create_dir(&root).unwrap();
         let (tx, rx) = mpsc::channel();
+        // Reproduce the macOS ordering without relying on its native batching:
+        // an earlier metadata invalidation is already queued before removal.
+        tx.send(Ok(FileEvent { path: root.clone(), kind: FileEventKind::Modified })).unwrap();
         let watcher = FileWatcher::directory(&root, Duration::from_millis(10), move |e| {
             let _ = tx.send(e);
         })
         .unwrap();
+        let wait_for = |kind, message| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let event =
+                    rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect(message).unwrap();
+                assert_eq!(event.path, root);
+                // Native backends can deliver an earlier directory metadata
+                // invalidation first. Only the requested lifecycle signal
+                // authorizes the next filesystem operation.
+                if event.kind == kind {
+                    return event;
+                }
+            }
+        };
         std::fs::remove_dir(&root).unwrap();
-        let removed = rx.recv_timeout(Duration::from_secs(5)).expect("parent sees directory removal").unwrap();
+        let removed = wait_for(FileEventKind::Removed, "parent sees directory removal");
         assert_eq!(removed, FileEvent { path: root.clone(), kind: FileEventKind::Removed });
         std::fs::create_dir(&root).unwrap();
-        let created = rx.recv_timeout(Duration::from_secs(5)).expect("parent sees directory recreation").unwrap();
+        let created = wait_for(FileEventKind::Modified, "parent sees directory recreation");
         assert_eq!(created, FileEvent { path: root.clone(), kind: FileEventKind::Modified });
         while rx.try_recv().is_ok() {}
         fs_write_fixture(&root.join("after-recreation.toml"));
-        let child = rx.recv_timeout(Duration::from_secs(5)).expect("recreated directory sees child create").unwrap();
+        let child = wait_for(FileEventKind::Modified, "recreated directory sees child create");
         assert_eq!(child, FileEvent { path: root, kind: FileEventKind::Modified });
         drop(watcher);
     }
