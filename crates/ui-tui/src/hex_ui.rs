@@ -545,7 +545,10 @@ mod tests {
                     && !status.retry_pending
                     && !status.retry_acknowledgement_required
                     && !h.workspace.document_busy(h.workspace.active_id())
-                    && h.workspace.editor().is_some_and(|editor| !editor.has_pending_edit_receipt())
+                    && !h.workspace.file_saves_pending()
+                    && h.workspace.editor().is_some_and(|editor| {
+                        !editor.has_pending_edit_receipt() && !editor.has_pending_save_completion()
+                    })
                     && h.workspace.recovery_notice().is_none()
             });
         }
@@ -644,7 +647,7 @@ mod tests {
         let path = host.open_raw("actions.bin", original);
         host.press(KeyCode::Tab, KeyModifiers::NONE);
         host.press(KeyCode::Char('Z'), KeyModifiers::NONE);
-        host.until("ASCII overwrite", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        host.idle("ASCII overwrite and result retirement");
         assert_eq!(host.bytes(), b"Z\xfeA\0B\0\r\0\n\0");
         host.named("navigation.goToLine");
         assert!(host.paint().contains("Go to offset"));
@@ -658,17 +661,19 @@ mod tests {
             host.press(KeyCode::Char(c), KeyModifiers::NONE);
         }
         host.press(KeyCode::Enter, KeyModifiers::NONE);
-        host.until("byte find", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        // Returning the editor does not retire the bounded result slot. A
+        // following query can still be refused until its capacity wake arrives.
+        host.idle("byte find and result retirement");
         assert_eq!(host.workspace.hex_session().unwrap().view().selection(), 4..6);
         host.named("edit.copy");
-        host.until("hex copy", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        host.idle("hex copy and result retirement");
         assert_eq!(host.workspace.hex_session_mut().unwrap().take_copy().unwrap(), "42 00");
         assert_eq!(base64(b"42 00"), "NDIgMDA=");
         host.named("file.save");
-        host.until("exact save", |h| !h.workspace.file_saves_pending());
+        host.idle("exact save and result retirement");
         assert_eq!(std::fs::read(path).unwrap(), host.bytes());
         host.named("edit.undo");
-        host.until("ASCII undo", |h| !h.workspace.document_busy(h.workspace.active_id()));
+        host.idle("ASCII undo and result retirement");
         assert_eq!(host.bytes(), original);
         host.finish();
     }
