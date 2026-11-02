@@ -38,6 +38,18 @@ pub(crate) use encoding_runtime::document_policy;
 pub mod provenance;
 pub mod retirement;
 pub use decoded::{PreparedDecodedDocument, prepare_decoded_document};
+
+fn startup_stage(_label: &'static str) {
+    #[cfg(feature = "startup-bench")]
+    if let Some(path) = std::env::var_os("KWIL_WORKER_TRACE").map(std::path::PathBuf::from)
+        && path.is_absolute()
+        && let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path)
+    {
+        use std::io::Write;
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let _ = writeln!(file, "kwil-speed\t{}\t{ns}\t{_label}", std::process::id());
+    }
+}
 use kwil_core_text::{Buffer, TextFile};
 use kwil_core_workspace::{SaveRequest, SavedSnapshot, session::DocumentId};
 use kwil_core_workspace::{

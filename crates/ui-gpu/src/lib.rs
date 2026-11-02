@@ -195,7 +195,7 @@ enum UserEvent {
     FontReady(Option<Box<Font>>),
     UiFontReady(Option<Box<font::UiFont>>),
     /// Wide-coverage face read for the chrome face with this id.
-    UiFallbackReady(u64, Option<(Vec<u8>, usize)>),
+    UiFallbackReady(u64, font::UiFallback),
     SessionChanged(bool),
     DroppedFile(std::path::PathBuf),
     #[cfg(feature = "gpu")]
@@ -2307,7 +2307,7 @@ impl App {
         #[cfg(feature = "frame-harness")]
         let content_mark = trace::content_mark(
             self.view.line(0),
-            body_changed,
+            p.full || p.rows.contains(&0) || document_rows().any(|row| row == 0),
             binary_blocks_paint || projection_owns_body || hex_active || wrap_active || palette_open || menu_list,
         );
         if p.full {

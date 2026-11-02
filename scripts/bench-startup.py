@@ -18,10 +18,13 @@ class Editor:
         self.log = (output / f"{name}.log").open("w", encoding="utf-8")
         self.log.write(f"commit={os.environ.get('GITHUB_SHA', 'local')} case={name}\n")
         self.log.flush()
+        worker_trace = output / f"{name}-worker.log"
+        worker_trace.write_text(f"commit={os.environ.get('GITHUB_SHA', 'local')} case={name}\n", encoding="utf-8")
         env = dict(os.environ, KWIL_NO_UPDATE="1", KWIL_TRACE_STARTUP="1",
                    KWIL_WORKSPACE_ROOT=str(root), XDG_RUNTIME_DIR=str(root),
                    XDG_CONFIG_HOME=str(root / "config"), APPDATA=str(root / "config"),
                    HOME=str(root), KWIL_INSTANCE_NAMESPACE="kwil-test-" + root.parent.name[-8:] + "-" + root.name)
+        env["KWIL_WORKER_TRACE"] = str(worker_trace)
         self.started = time.time_ns()
         self.process = subprocess.Popen([str(binary), "--hidden", "--gui", "--renderer", "cpu", *map(str, files)],
                                         env=env, cwd=root, stdin=subprocess.DEVNULL,

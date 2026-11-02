@@ -675,8 +675,7 @@ fn match_files(
     }
     let mut rows = Vec::new();
     let mut total = 0;
-    #[cfg(feature = "palette-profile")]
-    let mut scored = 0usize;
+    let mut scoring = FileScorer::new(&query.query, matcher);
     if query.query.is_empty() {
         rows.extend(paths.iter().take(limit).map(|path| (0, path.clone())));
         total = paths.len();
@@ -685,11 +684,7 @@ fn match_files(
             if cancelled() {
                 return None;
             }
-            #[cfg(feature = "palette-profile")]
-            {
-                scored += 1;
-            }
-            if let Some(score) = matcher.fuzzy_match(&path.label, &query.query) {
+            if let Some(score) = scoring.score(&path.label) {
                 total += 1;
                 keep_best(&mut rows, score, path.clone(), limit);
             }
@@ -698,8 +693,9 @@ fn match_files(
     #[cfg(feature = "palette-profile")]
     if !query.query.is_empty() && std::env::var_os("KWIL_PALETTE_PROFILE").is_some() {
         eprintln!(
-            "kwil-palette-profile candidates={} scored={scored} matching_ms={:.3}",
+            "kwil-palette-profile candidates={} scored={} matching_ms={:.3}",
             paths.len(),
+            scoring.scored,
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -717,6 +713,52 @@ fn match_files(
             .collect(),
         total,
     })
+}
+
+/// Skim converts both strings to chars and allocates match positions even for
+/// rejected labels. Reject impossible ASCII subsequences directly from UTF-8
+/// bytes first. Non-ASCII queries retain the original matcher path, and every
+/// surviving label keeps its exact original score and stable discovery order.
+struct FileScorer<'a> {
+    query: &'a str,
+    matcher: &'a SkimMatcherV2,
+    ascii: bool,
+    sensitive: bool,
+    #[cfg(any(test, feature = "palette-profile"))]
+    scored: usize,
+}
+impl<'a> FileScorer<'a> {
+    fn new(query: &'a str, matcher: &'a SkimMatcherV2) -> Self {
+        Self {
+            query,
+            matcher,
+            ascii: query.is_ascii(),
+            // Skim's smart-case policy recognizes ASCII uppercase only.
+            sensitive: query.bytes().any(|b| b.is_ascii_uppercase()),
+            #[cfg(any(test, feature = "palette-profile"))]
+            scored: 0,
+        }
+    }
+    fn score(&mut self, label: &str) -> Option<i64> {
+        if self.ascii {
+            let mut needle = self.query.as_bytes().iter();
+            let mut wanted = needle.next();
+            for byte in label.bytes() {
+                let Some(&next) = wanted else { break };
+                if if self.sensitive { byte == next } else { byte.eq_ignore_ascii_case(&next) } {
+                    wanted = needle.next();
+                }
+            }
+            if wanted.is_some() {
+                return None;
+            }
+        }
+        #[cfg(any(test, feature = "palette-profile"))]
+        {
+            self.scored += 1;
+        }
+        self.matcher.fuzzy_match(label, self.query)
+    }
 }
 
 fn empty_results(mode: PaletteMode) -> PaletteResults {
@@ -778,6 +820,40 @@ fn match_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_prefilter_avoids_scoring_impossible_subsequences() {
+        let matcher = matcher();
+        let mut scoring = FileScorer::new("file-0000", &matcher);
+        for label in ["000/file-0001.txt", "001/file-0002.txt", "002/file-0000.txt", "no-file.txt"] {
+            assert_eq!(scoring.score(label), matcher.fuzzy_match(label, "file-0000"));
+        }
+        assert_eq!(scoring.scored, 1, "rejected labels must not enter the allocating fuzzy scorer");
+    }
+
+    #[test]
+    fn file_prefilter_preserves_smart_case_unicode_and_original_scores() {
+        let matcher = matcher();
+        for query in ["", "f", "fi", "file-0000", "F", "fI", "ft", "ff", "é", "É", "世", "f世", "k", "K"] {
+            let mut scoring = FileScorer::new(query, &matcher);
+            for label in [
+                "",
+                "file.txt",
+                "FILE.txt",
+                "FiLe.txt",
+                "000/file-0000.txt",
+                "aaa/file-0001.txt",
+                "folder/other.rs",
+                "f世界ile.txt",
+                "café.txt",
+                "CAFÉ.txt",
+                "K.txt",
+                "k.txt",
+                "ffile",
+            ] {
+                assert_eq!(scoring.score(label), matcher.fuzzy_match(label, query), "{query:?} in {label:?}");
+            }
+        }
+    }
     #[test]
     fn cancellation_during_matching_discards_partial_snapshot() {
         let paths: Vec<_> =

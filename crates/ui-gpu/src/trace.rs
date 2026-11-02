@@ -70,15 +70,27 @@ pub(super) fn content_mark(row: Option<&[u8]>, drawn: bool, blocked: bool) -> Op
 
 #[cfg(feature = "frame-harness")]
 pub(super) fn presented(label: Option<&'static str>) {
+    if let Some(label) = label {
+        let bit = if label == "file content presented" { 1 } else { 2 };
+        once(bit, label);
+    }
+}
+
+#[cfg(feature = "frame-harness")]
+pub(super) fn content_ready(row: Option<&[u8]>) {
+    match content_mark(row, true, false) {
+        Some("file content presented") => once(4, "file content ready"),
+        Some("forward content presented") => once(8, "forward content ready"),
+        _ => {}
+    }
+}
+
+#[cfg(feature = "frame-harness")]
+fn once(bit: u8, label: &'static str) {
     use std::sync::atomic::{AtomicU8, Ordering};
     static SEEN: AtomicU8 = AtomicU8::new(0);
-    if std::env::var_os("KWIL_TRACE_STARTUP").is_some()
-        && let Some(label) = label
-    {
-        let bit = if label == "file content presented" { 1 } else { 2 };
-        if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-            mark(label);
-        }
+    if std::env::var_os("KWIL_TRACE_STARTUP").is_some() && SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        mark(label);
     }
 }
 

@@ -38,7 +38,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Linux desktop build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libvulkan-dev libegl1-mesa-dev xvfb
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libvulkan-dev libegl1-mesa-dev xvfb
       - name: Build the release app with opt-in startup trace
         run: cargo build --release --locked -j 4 -p kwil --features startup-bench
       - name: First frame, file content and second-launch display (informational)
