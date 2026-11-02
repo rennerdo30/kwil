@@ -189,8 +189,12 @@ impl Replay {
                 return Ok(None);
             }
             cancelled(cancel)?;
-            let raw = &self.origin.raw_bytes()[at as usize..end];
-            let atom = iso2022::atom(raw, self.state, end == self.origin.raw_bytes().len())?;
+            // Read the admitted mapped bytes once. Framing and decoder replay
+            // may revisit their input, so keep those visits on fixed scratch.
+            let mut raw = [0; 8];
+            let count = end - at as usize;
+            raw[..count].copy_from_slice(&self.origin.raw_bytes()[at as usize..end]);
+            let atom = iso2022::atom(&raw[..count], self.state, end == self.origin.raw_bytes().len())?;
             let kind = if self.state == State::Raw { AtomKind::Opaque } else { AtomKind::Text };
             self.state = atom.state;
             self.at = Some(at + atom.raw as u64);
