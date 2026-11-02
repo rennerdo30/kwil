@@ -154,17 +154,23 @@ pub fn run_console() -> ExitCode {
 
 fn run_app(console_launcher: bool) -> ExitCode {
     speed_mark("app entry");
-    let platform = current_platform();
-    #[cfg(windows)]
-    let streams = windows::standard_streams();
-    #[cfg(not(windows))]
-    let streams = if std::io::stderr().is_terminal() {
-        startup::StandardStreams::Terminal
-    } else {
-        startup::StandardStreams::Redirected
+    let presentation = || {
+        #[cfg(windows)]
+        let streams = windows::standard_streams();
+        #[cfg(not(windows))]
+        let streams = if std::io::stderr().is_terminal() {
+            startup::StandardStreams::Terminal
+        } else {
+            startup::StandardStreams::Redirected
+        };
+        startup::error_presentation(
+            std::env::args_os().skip(1),
+            console_launcher,
+            streams,
+            &ProcessEnv,
+            current_platform(),
+        )
     };
-    let presentation =
-        startup::error_presentation(std::env::args_os().skip(1), console_launcher, streams, &ProcessEnv, platform);
     let dialog = |message: &str| {
         #[cfg(windows)]
         windows::show_error(message);
@@ -258,15 +264,6 @@ fn run_app(console_launcher: bool) -> ExitCode {
             kwil_update::spawn_background(VERSION, notify);
         })
     };
-    let in_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-
-    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, platform);
-    if let Frontend::Error(e) = frontend {
-        eprintln!("kwil: {e}");
-        return ExitCode::from(2);
-    }
-    #[allow(unused_mut)]
-    let mut use_gui = frontend == Frontend::Gui;
     // Hidden IPC checks require an explicit test namespace; default hidden runs
     // never join or claim the owner's live instance.
     let join_primary = match join_primary_instance(
@@ -297,7 +294,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             Ok(true) => {
                 speed_mark("IPC acknowledged");
                 #[cfg(windows)]
-                if use_gui && !console_launcher {
+                if !console_launcher && windows::gui_child() {
                     // The existing UI accepted the request. Complete the console
                     // launch handshake without constructing a second window.
                     windows::first_frame();
@@ -311,6 +308,16 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         }
     }
+    // An accepted handoff needs no desktop, terminal or renderer. Select a
+    // frontend only when this process must actually start one.
+    let in_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, current_platform());
+    if let Frontend::Error(e) = frontend {
+        eprintln!("kwil: {e}");
+        return ExitCode::from(2);
+    }
+    #[allow(unused_mut)]
+    let mut use_gui = frontend == Frontend::Gui;
     #[cfg(windows)]
     if console_launcher && use_gui {
         match windows::launch_gui() {
@@ -321,7 +328,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
             Err(e) => {
                 let message = format!("{e}; no interactive terminal is attached");
-                presentation.report(&format!("kwil: {message}"), |message| eprintln!("{message}"), dialog);
+                presentation().report(&format!("kwil: {message}"), |message| eprintln!("{message}"), dialog);
                 return ExitCode::FAILURE;
             }
         }
@@ -369,7 +376,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             // Fatal process exit retains the original input or partial
             // workspace. This is not successful source retirement.
             let retained = std::mem::ManuallyDrop::new(refusal);
-            presentation.report(&format!("kwil: {}", retained.error), |message| eprintln!("{message}"), dialog);
+            presentation().report(&format!("kwil: {}", retained.error), |message| eprintln!("{message}"), dialog);
             return ExitCode::FAILURE;
         }
     };
@@ -403,7 +410,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
             ControlFlow::Break(refusal) => {
                 let retained = std::mem::ManuallyDrop::new(refusal);
-                presentation.report(
+                presentation().report(
                     &format!("kwil: GUI startup retained: {:?}", retained.reason),
                     |message| eprintln!("{message}"),
                     dialog,
@@ -417,7 +424,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
                         ControlFlow::Continue(original) => original,
                         ControlFlow::Break(failure) => {
                             let retained = std::mem::ManuallyDrop::new(failure);
-                            presentation.report(
+                            presentation().report(
                                 &format!("kwil: {}", **retained),
                                 |message| eprintln!("{message}"),
                                 dialog,
@@ -427,7 +434,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
                     }
                 } else {
                     let retained = std::mem::ManuallyDrop::new(failure);
-                    presentation.report(&format!("kwil: {}", **retained), |message| eprintln!("{message}"), dialog);
+                    presentation().report(&format!("kwil: {}", **retained), |message| eprintln!("{message}"), dialog);
                     return ExitCode::FAILURE;
                 }
             }
@@ -435,7 +442,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
                 // Unexpected legacy startup refusals may also retain sources.
                 // Never reopen a file or fall back after losing its owner.
                 let retained = std::mem::ManuallyDrop::new(error);
-                presentation.report(&format!("kwil: {}", *retained), |message| eprintln!("{message}"), dialog);
+                presentation().report(&format!("kwil: {}", *retained), |message| eprintln!("{message}"), dialog);
                 return ExitCode::FAILURE;
             }
         }
