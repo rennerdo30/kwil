@@ -10,6 +10,15 @@ import threading
 import time
 import uuid
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+    import _winapi
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+
 
 class Editor:
     def __init__(self, binary, root, output, name, files=()):
@@ -25,11 +34,39 @@ class Editor:
                    XDG_CONFIG_HOME=str(root / "config"), APPDATA=str(root / "config"),
                    HOME=str(root), KWIL_INSTANCE_NAMESPACE="kwil-test-" + root.parent.name[-8:] + "-" + root.name)
         env["KWIL_WORKER_TRACE"] = str(worker_trace)
-        self.started = time.time_ns()
-        self.process = subprocess.Popen([str(binary), "--hidden", "--gui", "--renderer", "cpu", *map(str, files)],
+        self.spawn = {}
+        if os.name == "nt":
+            original_create = _winapi.CreateProcess
+
+            def timed_create(*args, **kwargs):
+                self.spawn["create_process_enter_ns"] = time.time_ns()
+                try:
+                    return original_create(*args, **kwargs)
+                finally:
+                    self.spawn["create_process_return_ns"] = time.time_ns()
+
+            # Only this harness's main thread spawns. Restore the native API
+            # before starting its trace-reader thread, including on failure.
+            _winapi.CreateProcess = timed_create
+        try:
+            self.started = time.time_ns()
+            self.process = subprocess.Popen([str(binary), "--hidden", "--gui", "--renderer", "cpu", *map(str, files)],
                                         env=env, cwd=root, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                         text=True, encoding="utf-8", errors="replace")
+            self.spawn["popen_return_ns"] = time.time_ns()
+        finally:
+            if os.name == "nt":
+                _winapi.CreateProcess = original_create
+        self.spawn["popen_enter_ns"] = self.started
+        if os.name == "nt":
+            created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            if kernel32.GetProcessTimes(int(self.process._handle), ctypes.byref(created), ctypes.byref(exited),
+                                       ctypes.byref(kernel), ctypes.byref(user)):
+                ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                self.spawn["native_process_created_ns"] = (ticks - 116444736000000000) * 100
+        self.log.write("kwil-spawn " + json.dumps(self.spawn) + "\n")
+        self.log.flush()
         print(f"case={name} pid={self.process.pid} timeout=30s", flush=True)
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
@@ -105,6 +142,7 @@ def measure(binary, output):
             record = {"first_frame_ms": (first - editor.started) / 1e6,
                       "content_ms": None,
                       "file_bytes": files[0].stat().st_size if files else 0,
+                      "spawn": editor.spawn,
                       "stages": editor.events}
             records[name] = record
             content = editor.wait("file content presented") if files else None
@@ -123,6 +161,7 @@ def measure(binary, output):
                 records["second-launch"] = {
                     "acknowledged_ms": (acknowledged - second.started) / 1e6,
                     "content_ms": (shown - second.started) / 1e6,
+                    "spawn": second.spawn,
                     "stages": second.events,
                 }
                 second.close()

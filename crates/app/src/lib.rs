@@ -156,37 +156,42 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
 }
 
 pub fn run() -> ExitCode {
+    speed_mark("process entry");
     #[cfg(windows)]
     windows::attach_parent_console();
     run_app(false)
 }
 
 pub fn run_console() -> ExitCode {
+    speed_mark("console process entry");
     run_app(true)
 }
 
 fn run_app(console_launcher: bool) -> ExitCode {
     speed_mark("app entry");
-    let platform = current_platform();
-    #[cfg(windows)]
-    let streams = windows::standard_streams();
-    #[cfg(not(windows))]
-    let streams = if std::io::stderr().is_terminal() {
-        startup::StandardStreams::Terminal
-    } else {
-        startup::StandardStreams::Redirected
+    let presentation = |platform| {
+        #[cfg(windows)]
+        let streams = windows::standard_streams();
+        #[cfg(not(windows))]
+        let streams = if std::io::stderr().is_terminal() {
+            startup::StandardStreams::Terminal
+        } else {
+            startup::StandardStreams::Redirected
+        };
+        startup::error_presentation(std::env::args_os().skip(1), console_launcher, streams, &ProcessEnv, platform)
     };
-    let presentation =
-        startup::error_presentation(std::env::args_os().skip(1), console_launcher, streams, &ProcessEnv, platform);
     let dialog = |message: &str| {
         #[cfg(windows)]
         windows::show_error(message);
         #[cfg(not(windows))]
         let _ = message;
     };
-    if let Err(code) =
-        startup::recover(presentation, kwil_update::recover_on_startup, |message| eprintln!("{message}"), dialog)
-    {
+    if let Err(code) = startup::recover(
+        || presentation(current_platform()),
+        kwil_update::recover_on_startup,
+        |message| eprintln!("{message}"),
+        dialog,
+    ) {
         return code;
     }
     let args = match parse_args() {
@@ -271,15 +276,6 @@ fn run_app(console_launcher: bool) -> ExitCode {
             kwil_update::spawn_background(VERSION, notify);
         })
     };
-    let in_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-
-    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, platform);
-    if let Frontend::Error(e) = frontend {
-        eprintln!("kwil: {e}");
-        return ExitCode::from(2);
-    }
-    #[allow(unused_mut)]
-    let mut use_gui = frontend == Frontend::Gui;
     // Hidden IPC checks require an explicit test namespace; default hidden runs
     // never join or claim the owner's live instance.
     let join_primary = match join_primary_instance(
@@ -310,7 +306,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             Ok(true) => {
                 speed_mark("IPC acknowledged");
                 #[cfg(windows)]
-                if use_gui && !console_launcher {
+                if !console_launcher && windows::gui_child() {
                     // The existing UI accepted the request. Complete the console
                     // launch handshake without constructing a second window.
                     windows::first_frame();
@@ -324,6 +320,19 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         }
     }
+    // An accepted handoff needs no desktop, terminal or renderer. Select a
+    // frontend only when this process must actually start one.
+    speed_mark("frontend selection");
+    let platform = current_platform();
+    let presentation = presentation(platform);
+    let in_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, platform);
+    if let Frontend::Error(e) = frontend {
+        eprintln!("kwil: {e}");
+        return ExitCode::from(2);
+    }
+    #[allow(unused_mut)]
+    let mut use_gui = frontend == Frontend::Gui;
     #[cfg(windows)]
     if console_launcher && use_gui {
         match windows::launch_gui() {

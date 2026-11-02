@@ -1,4 +1,4 @@
-//! Error presentation is decided before recovery, without executing CLI actions.
+//! Recovery precedes CLI actions and probes error presentation only on failure.
 use crate::frontend::{EnvLookup, Platform};
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -56,13 +56,13 @@ impl ErrorPresentation {
 }
 
 pub(crate) fn recover<E: std::fmt::Display>(
-    presentation: ErrorPresentation,
+    presentation: impl FnOnce() -> ErrorPresentation,
     recovery: impl FnOnce() -> Result<(), E>,
     stderr: impl FnOnce(&str),
     dialog: impl FnOnce(&str),
 ) -> Result<(), ExitCode> {
     recovery().map_err(|e| {
-        presentation.report(&format!("kwil: {e}"), stderr, dialog);
+        presentation().report(&format!("kwil: {e}"), stderr, dialog);
         ExitCode::FAILURE
     })
 }
@@ -176,7 +176,7 @@ mod tests {
         let mut dialogs = Vec::new();
         let presentation = classify(&["--version"], true, StandardStreams::Redirected, &[], DESKTOP);
         let result = recover(
-            presentation,
+            || presentation,
             || {
                 attempted.set(true);
                 Err("update lock unavailable; retry after the update finishes")
@@ -198,7 +198,7 @@ mod tests {
         let mut stderr = String::new();
         let mut dialogs = Vec::new();
         let result = recover(
-            classify(&[], false, StandardStreams::Absent, &[], DESKTOP),
+            || classify(&[], false, StandardStreams::Absent, &[], DESKTOP),
             || Err("cannot restore interrupted update; backups retained"),
             |message| stderr.push_str(message),
             |message| dialogs.push(message.to_owned()),
@@ -213,7 +213,7 @@ mod tests {
         for presentation in [ErrorPresentation::StderrOnly, ErrorPresentation::Dialog] {
             assert_eq!(
                 recover(
-                    presentation,
+                    || presentation,
                     || Ok::<_, String>(()),
                     |_| panic!("unexpected stderr"),
                     |_| panic!("unexpected dialog")
@@ -221,5 +221,18 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    #[test]
+    fn successful_recovery_skips_desktop_and_standard_stream_probes() {
+        assert_eq!(
+            recover(
+                || panic!("successful recovery must not probe frontend/error presentation"),
+                || Ok::<_, String>(()),
+                |_| panic!("unexpected stderr"),
+                |_| panic!("unexpected dialog"),
+            ),
+            Ok(())
+        );
     }
 }
