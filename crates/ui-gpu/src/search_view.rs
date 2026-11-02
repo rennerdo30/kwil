@@ -24,6 +24,7 @@ pub(super) enum Target {
     Close,
     ReplaceNext,
     ReplaceAll,
+    FolderDetails,
     Row(usize),
     PagePrevious,
     PageNext,
@@ -536,6 +537,14 @@ fn draw_files(
         view.hits.push(rect, target);
         x += w + s.gap / 2;
     }
+    if panel.folder_preview() {
+        let text = if panel.folder_match_preview() { "Files" } else { "Matches" };
+        let rect = Rect { x, y, w: desktop::button_width(font, text, &s), h: s.text };
+        option_chip(pixels, stride, font, rect, text, false, view.hover == Some(Target::FolderDetails), &c, &s);
+        if !panel.is_pending() {
+            view.hits.push(rect, Target::FolderDetails);
+        }
+    }
     y += s.text + s.gap;
     let status = Rect { x: inner.x, y, w: inner.w, h: s.text };
     desktop::label_right(pixels, stride, font, status, panel.status(), c.muted);
@@ -621,7 +630,7 @@ fn draw_files(
         font,
         help,
         if panel.folder_preview() {
-            "Enter Include/Exclude · Preview · Apply · Esc Cancel"
+            "Enter toggle · Alt+Enter matches/files · Apply · Esc"
         } else {
             "↑↓ Select · Enter Open · PgUp/PgDn · Esc Cancel"
         },
@@ -707,6 +716,7 @@ pub(super) fn click(view: &View, panel: &SearchPanel, current: Option<Rect>, poi
         Some(Target::Previous) => Click::Input(SearchInput::Previous),
         Some(Target::Next) => Click::Input(SearchInput::Next),
         Some(Target::Close) => Click::Input(SearchInput::Cancel),
+        Some(Target::FolderDetails) => Click::Input(SearchInput::FolderDetails),
         Some(Target::Row(row)) if view.painted_revision == view.rows_revision => {
             Click::Input(SearchInput::SelectRow(row))
         }

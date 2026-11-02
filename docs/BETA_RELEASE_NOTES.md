@@ -30,6 +30,12 @@ without independent signature verification. beta.2 copies update to
 this release by themselves; frozen beta.1 copies must be replaced manually. Stable download installers do not
 select betas.
 
+## Unreleased
+
+- **Replace in files:** use Matches or Alt+Enter on a selected preview file to
+  inspect and exclude individual matches. Alt+Enter returns to the file list.
+  Apply and cancellation report file counts, exclusions and failures.
+
 ## Changes since beta.7
 
 - **Settings take effect:** ten settings that were saved but not yet used now
@@ -199,8 +205,9 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
   Real low-RAM machines and multi-GB files have not been measured.
 - Complete metadata pre-growth admission is unfinished. Large or demanding
   editing workloads have not received bounded-memory acceptance.
-- Complete regex/long-line search and folder
-  replacement remain incomplete.
+- Complete regex/long-line search remains incomplete. Folder replacement skips
+  binary files and files with lines above the folder search memory limit, and
+  reports skipped files and failures in its result.
 - The TUI supports text-only Markdown preview and log follow, text/regex,
   level/time/unknown filters, highlight rules, marks and result navigation.
   Log row copy uses OSC 52 and requires terminal clipboard support.

@@ -92,6 +92,8 @@ pub(crate) enum Step {
     FolderCheck,
     FolderPreview,
     FolderPreviewCheck,
+    FolderMatches,
+    FolderMatchesCheck,
     FolderSelect,
     FolderOpened,
     PresenterCpu,
@@ -631,6 +633,9 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::FolderPreview),
             (700, Step::FolderPreviewCheck),
             (100, Step::UsabilityCapture("folder-replace-preview.bmp")),
+            (100, Step::FolderMatches),
+            (700, Step::FolderMatchesCheck),
+            (100, Step::UsabilityCapture("folder-replace-matches.bmp")),
             (100, Step::End),
         ];
         let hex_editor = [
@@ -1120,6 +1125,15 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.search_panel.results()[0].label.ends_with("1 match"));
             assert!(app.search_panel.status().starts_with("Preview: 1 file, 1 match."));
             println!("kwil-folder-replace preview=PASS files=1 matches=1 native-hidden=true");
+        }
+        Step::FolderMatches => {
+            app.search_input(kwil_view_model::search_panel::SearchInput::FolderDetails);
+        }
+        Step::FolderMatchesCheck => {
+            assert!(app.search_panel.folder_match_preview());
+            assert!(!app.search_panel.is_pending());
+            assert!(app.search_panel.results()[0].label.starts_with("[x] #1"));
+            println!("kwil-folder-replace matches=PASS native-hidden=true");
         }
         Step::FolderSelect => {
             app.search_input(kwil_view_model::search_panel::SearchInput::SelectRow(0));
