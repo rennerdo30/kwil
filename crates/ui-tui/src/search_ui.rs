@@ -1226,6 +1226,146 @@ mod tests {
     }
 
     #[test]
+    fn palette_native_interaction_acceptance() {
+        use kwil_view_model::palette_session::{PaletteInput, PaletteSession};
+        let mut h = Harness::new("");
+        let tree = h.root.join("palette-workspace");
+        std::fs::create_dir(&tree).unwrap();
+        let file = tree.join("palette-target.txt");
+        let expected = b"first line\nsecond line\nthird line\nfourth line\n";
+        std::fs::write(&file, expected).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut palette = PaletteSession::new(
+            tree,
+            std::sync::Arc::new(move || {
+                let _ = tx.send(());
+            }),
+        )
+        .unwrap();
+        let fresh = |palette: &mut PaletteSession| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                palette.worker_ready();
+                if palette.model().results_are_fresh() && palette.model().rows().len() == 1 {
+                    break;
+                }
+                rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("palette worker wake");
+            }
+        };
+        let press = |h: &mut Harness, palette: &mut PaletteSession, code| {
+            let intent = palette_ui::key(
+                &mut h.view,
+                palette,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut h.keys,
+                Duration::ZERO,
+                h.settings.keymap,
+            );
+            assert!(matches!(intent, KeyResult::Changed(true)));
+        };
+        let text = |h: &mut Harness, palette: &mut PaletteSession, value: &str| {
+            for c in value.chars() {
+                press(h, palette, KeyCode::Char(c));
+            }
+        };
+        let capture = |h: &mut Harness, palette: &PaletteSession, name: &str| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    tabs::draw(frame, &h.view, h.settings.tabs.layout);
+                    palette_ui::draw(frame, palette.model(), &h.keys);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut screen = String::new();
+            for row in buffer.content.chunks(100) {
+                for cell in row {
+                    screen.push_str(cell.symbol());
+                }
+                screen.push('\n');
+            }
+            if let Some(dir) = std::env::var_os("KWIL_TUI_CAPTURE_DIR") {
+                let dir = PathBuf::from(dir);
+                std::fs::write(dir.join(format!("{name}.txt")), &screen).unwrap();
+                let cells: String = buffer
+                    .content
+                    .iter()
+                    .map(|cell| format!("{:?}|{:?}|{}\n", cell.fg, cell.bg, cell.symbol()))
+                    .collect();
+                std::fs::write(dir.join(format!("{name}.cells")), cells).unwrap();
+            }
+            screen
+        };
+        palette_ui::open(&mut h.view, Some(&mut palette), &mut h.keys, "");
+        text(&mut h, &mut palette, "palette-target");
+        fresh(&mut palette);
+        assert_eq!(
+            palette.model().rows()[0].action,
+            kwil_core_commands::palette::PaletteAction::OpenFile(file.clone())
+        );
+        assert!(capture(&mut h, &palette, "tui-files").contains("palette-target.txt"));
+        press(&mut h, &mut palette, KeyCode::Enter);
+        h.until_stage("palette file opened", |h| {
+            h.view.editor().is_some_and(|e| e.document().path() == Some(file.as_path()))
+                && !h.view.document_busy(h.view.active_id())
+        });
+        assert!(!palette.model().is_open());
+        capture(&mut h, &palette, "tui-opened");
+
+        palette_ui::open(&mut h.view, Some(&mut palette), &mut h.keys, "");
+        text(&mut h, &mut palette, ":3");
+        assert!(capture(&mut h, &palette, "tui-line").contains(":3"));
+        press(&mut h, &mut palette, KeyCode::Enter);
+        assert_eq!(h.selection(), 23..23);
+        capture(&mut h, &palette, "tui-goto");
+
+        palette_ui::open(&mut h.view, Some(&mut palette), &mut h.keys, ">");
+        text(&mut h, &mut palette, "New File");
+        fresh(&mut palette);
+        assert!(capture(&mut h, &palette, "tui-commands").contains("New File"));
+        let count = h.view.session().tabs().len();
+        press(&mut h, &mut palette, KeyCode::Enter);
+        assert_eq!(h.view.session().tabs().len(), count + 1);
+        assert!(h.view.editor().unwrap().document().path().is_none());
+        capture(&mut h, &palette, "tui-new");
+
+        palette_ui::open(&mut h.view, Some(&mut palette), &mut h.keys, "");
+        text(&mut h, &mut palette, "#palette-target");
+        fresh(&mut palette);
+        capture(&mut h, &palette, "tui-tabs");
+        press(&mut h, &mut palette, KeyCode::Enter);
+        assert_eq!(h.view.editor().unwrap().document().path(), Some(file.as_path()));
+        assert_eq!(h.selection(), 23..23);
+        capture(&mut h, &palette, "tui-switched");
+
+        palette_ui::open(&mut h.view, Some(&mut palette), &mut h.keys, "");
+        // Crossterm Event::Paste dispatches this exact bounded query input;
+        // bracketed paste does not consult the host clipboard.
+        let intent = palette_ui::input(
+            &mut h.view,
+            &mut palette,
+            &mut h.keys,
+            PaletteInput::Text("palette-target"),
+            Duration::ZERO,
+            h.settings.keymap,
+        );
+        assert!(matches!(intent, KeyResult::Changed(true)));
+        assert_eq!(palette.model().query(), "palette-target");
+        fresh(&mut palette);
+        capture(&mut h, &palette, "tui-paste");
+        let before = (h.view.active_id(), h.view.session().tabs().len(), h.selection(), h.bytes());
+        press(&mut h, &mut palette, KeyCode::Esc);
+        assert!(!palette.model().is_open());
+        assert_eq!((h.view.active_id(), h.view.session().tabs().len(), h.selection(), h.bytes()), before);
+        capture(&mut h, &palette, "tui-escape");
+        assert_eq!(std::fs::read(&file).unwrap(), expected);
+        for handle in palette.stop() {
+            handle.join().unwrap();
+        }
+        h.finish();
+    }
+
+    #[test]
     fn folder_replace_preview_exclusion_and_atomic_closed_apply() {
         let mut h = Harness::new("retain editor");
         let tree = h.root.join("replace");

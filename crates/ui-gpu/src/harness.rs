@@ -128,6 +128,7 @@ pub(crate) enum Step {
     SettingsClose,
     PaletteOpen,
     PaletteClose,
+    PaletteProbe(u8),
     WelcomeProbe,
     WelcomeDismiss,
     FileTypesSetup,
@@ -641,10 +642,25 @@ pub(crate) fn start(proxy: super::HostProxy) {
             ]);
         }
         categories.extend([(100, Step::SettingsClose), (100, Step::End)]);
+        let palette = [
+            (1800, Step::DismissSetup),
+            (500, Step::PaletteProbe(0)),
+            (500, Step::PaletteProbe(1)),
+            (700, Step::PaletteProbe(2)),
+            (500, Step::PaletteProbe(3)),
+            (500, Step::PaletteProbe(4)),
+            (500, Step::PaletteProbe(5)),
+            (500, Step::PaletteProbe(6)),
+            (500, Step::PaletteProbe(7)),
+            (500, Step::PaletteProbe(8)),
+            (100, Step::End),
+        ];
         let steps = if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
             renderer.as_slice()
         } else if std::env::var_os("KWIL_SETTINGS_CATEGORIES_CAPTURE").is_some() {
             categories.as_slice()
+        } else if std::env::var_os("KWIL_PALETTE_PROBE").is_some() {
+            palette.as_slice()
         } else if probe == "crash" {
             &session_seed[..session_seed.len() - 1]
         } else if probe == "seed" || probe == "transient" {
@@ -2161,6 +2177,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             app.dispatch_palette("view.commandPalette");
         }
         Step::PaletteClose => app.palette_input(kwil_view_model::palette_session::PaletteInput::Cancel),
+        Step::PaletteProbe(phase) => palette_probe(app, el, dir.as_deref(), phase),
         Step::ZoomIn => {
             app.dispatch_zoom("view.zoomIn");
         }
@@ -2219,6 +2236,156 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
     }
 }
+// Scoped to the GUI thread and installed only around the probe's Ctrl+V.
+// Production builds do not compile this substitute or its dispatch branch.
+std::thread_local! {
+    static PALETTE_CLIPBOARD: std::cell::RefCell<Option<ProbeClipboard>> = const { std::cell::RefCell::new(None) };
+}
+
+struct ProbeClipboard(Option<kwil_view_model::ClipboardData>);
+impl kwil_view_model::Clipboard for ProbeClipboard {
+    fn set(&mut self, data: kwil_view_model::ClipboardData) -> std::io::Result<()> {
+        self.0 = Some(data);
+        Ok(())
+    }
+    fn get(&mut self) -> std::io::Result<Option<kwil_view_model::ClipboardData>> {
+        Ok(self.0.take())
+    }
+}
+
+pub(super) fn palette_clipboard_text(limit: usize) -> Option<std::io::Result<Option<String>>> {
+    use kwil_view_model::Clipboard;
+    PALETTE_CLIPBOARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let clipboard = slot.as_mut()?;
+        Some((|| {
+            let Some(data) = clipboard.get()? else { return Ok(None) };
+            let mut bytes = Vec::new();
+            data.write_to(&mut bytes)?;
+            assert!(bytes.len() <= limit);
+            String::from_utf8(bytes).map(Some).map_err(std::io::Error::other)
+        })())
+    })
+}
+
+fn palette_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>, phase: u8) {
+    use super::{HostKey, Key, NamedKey};
+    let press = |app: &mut App, key, text| {
+        app.key_after_settings(Some(el), &HostKey { logical_key: key, text, repeat: false });
+    };
+    let text = |app: &mut App, value: &str| {
+        press(app, Key::Character(value.into()), Some(value));
+    };
+    let shoot = |app: &mut App, name| {
+        assert!(app.render());
+        capture(app, dir, name);
+    };
+    let root = PathBuf::from(std::env::var_os("KWIL_WORKSPACE_ROOT").expect("isolated palette workspace"));
+    let file = root.join("palette-target.txt");
+    let expected = b"first line\nsecond line\nthird line\nfourth line\n";
+    let fresh = |app: &App| {
+        let model = app.palette.as_ref().expect("palette worker").model();
+        assert!(model.results_are_fresh(), "palette query must publish before acceptance");
+        assert_eq!(model.rows().len(), 1);
+    };
+    match phase {
+        0 => {
+            assert!(app.view.recovery_ready());
+            assert!(app.dispatch_palette("view.fileFinder"));
+            text(app, "palette-target");
+        }
+        1 => {
+            fresh(app);
+            assert_eq!(
+                app.palette.as_ref().unwrap().model().rows()[0].action,
+                kwil_core_commands::palette::PaletteAction::OpenFile(file.clone())
+            );
+            shoot(app, "palette-files.bmp");
+            press(app, Key::Named(NamedKey::Enter), None);
+        }
+        2 => {
+            assert!(!app.palette_open());
+            let editor = app.view.editor().expect("opened file editor");
+            assert_eq!(editor.document().path(), Some(file.as_path()));
+            assert!(!app.view.document_busy(app.view.active_id()));
+            shoot(app, "palette-opened.bmp");
+            app.dispatch_palette("view.fileFinder");
+            text(app, ":3");
+            shoot(app, "palette-line.bmp");
+            press(app, Key::Named(NamedKey::Enter), None);
+        }
+        3 => {
+            assert!(!app.palette_open());
+            assert_eq!(app.view.editor().unwrap().primary_cursor().head, 23);
+            shoot(app, "palette-goto.bmp");
+            app.dispatch_palette("view.commandPalette");
+            text(app, "New File");
+        }
+        4 => {
+            fresh(app);
+            shoot(app, "palette-commands.bmp");
+            press(app, Key::Named(NamedKey::Enter), None);
+        }
+        5 => {
+            assert!(!app.palette_open());
+            assert!(app.view.editor().unwrap().document().path().is_none());
+            shoot(app, "palette-new.bmp");
+            app.dispatch_palette("view.fileFinder");
+            text(app, "#palette-target");
+        }
+        6 => {
+            fresh(app);
+            shoot(app, "palette-tabs.bmp");
+            press(app, Key::Named(NamedKey::Enter), None);
+            assert_eq!(app.view.editor().unwrap().document().path(), Some(file.as_path()));
+            assert_eq!(app.view.editor().unwrap().primary_cursor().head, 23);
+            shoot(app, "palette-switched.bmp");
+            app.dispatch_palette("view.fileFinder");
+            use kwil_view_model::Clipboard;
+            let mut clipboard = ProbeClipboard(None);
+            clipboard.set(kwil_view_model::ClipboardData::text(b"palette-target").unwrap()).unwrap();
+            PALETTE_CLIPBOARD.with(|slot| *slot.borrow_mut() = Some(clipboard));
+            app.mods = winit::keyboard::ModifiersState::CONTROL;
+            press(app, Key::Character("v".into()), None);
+            app.mods = winit::keyboard::ModifiersState::empty();
+            PALETTE_CLIPBOARD.with(|slot| {
+                assert!(slot.borrow_mut().take().unwrap().0.is_none(), "Ctrl+V must read the private clipboard")
+            });
+            assert_eq!(app.palette.as_ref().unwrap().model().query(), "palette-target");
+        }
+        7 => {
+            fresh(app);
+            shoot(app, "palette-paste.bmp");
+            let before = (
+                app.view.active_id(),
+                app.view.session().tabs().len(),
+                app.view.editor().unwrap().document().revision(),
+                app.view.editor().unwrap().cursors().to_vec(),
+            );
+            press(app, Key::Named(NamedKey::Escape), None);
+            assert!(!app.palette_open());
+            assert_eq!(
+                (
+                    app.view.active_id(),
+                    app.view.session().tabs().len(),
+                    app.view.editor().unwrap().document().revision(),
+                    app.view.editor().unwrap().cursors().to_vec()
+                ),
+                before
+            );
+            shoot(app, "palette-escape.bmp");
+        }
+        8 => {
+            assert_eq!(std::fs::read(&file).unwrap(), expected);
+            assert_eq!(app.view.editor().unwrap().document().revision(), 0);
+            if let Some(dir) = dir {
+                std::fs::write(dir.join("palette-result.txt"), "PASS: native file open, >New File, :3, #tab switch, private clipboard Ctrl+V, Esc preserves active tab/count/revision/cursors; fixture bytes unchanged\n").unwrap();
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
 fn fake_journal(root: &Path, name: &str) -> PathBuf {
     let path = root.join(name);
     let builder = std::fs::DirBuilder::new();
