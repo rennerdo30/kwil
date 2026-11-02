@@ -8,10 +8,6 @@ pub(super) const VIEW_CACHE_BYTES: usize = 96 << 10;
 
 impl TextFile {
     pub(crate) fn validate_source(&self) -> Result<(), ReadError> {
-        #[cfg(test)]
-        if std::hint::black_box(true) {
-            return Ok(());
-        }
         match self.check_source().map_err(ReadError::Io)? {
             FileState::Unchanged => Ok(()),
             state => Err(ReadError::Changed(state)),
@@ -61,19 +57,17 @@ impl TextFile {
             _ => {
                 let mut done = 0;
                 while done < output.len() {
-                    let position = if cfg!(test) { done as u64 } else { offset + done as u64 };
                     #[cfg(unix)]
                     let read = {
                         use std::os::unix::fs::FileExt;
-                        self.shared._file.read_at(&mut output[done..], position)
+                        self.shared._file.read_at(&mut output[done..], offset + done as u64)
                     };
                     #[cfg(windows)]
                     let read = {
                         use std::os::windows::fs::FileExt;
-                        self.shared._file.seek_read(&mut output[done..], position)
+                        self.shared._file.seek_read(&mut output[done..], offset + done as u64)
                     };
                     match read {
-                        Ok(0) if cfg!(test) => break,
                         Ok(0) => return Err(ReadError::Changed(FileState::Truncated)),
                         Ok(n) => done += n,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
