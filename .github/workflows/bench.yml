@@ -26,7 +26,8 @@ env:
 jobs:
   compare:
     # Performance numbers start informational; correctness/measurement errors fail.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    # Runs up to ~20 minutes per OS, so only on request (dispatch or a `bench`-labelled PR), not on every push to main.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
     strategy:
       fail-fast: false
       matrix:
