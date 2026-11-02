@@ -36,7 +36,13 @@ impl Mapping {
     }
 
     pub fn points(self, area: Rect) -> Option<Points> {
-        self.clip(area).map(|_| self.bounds)
+        let area = self.clip(area)?;
+        Some(Points {
+            x: self.bounds.x + area.x as f64 * self.bounds.w / self.size.0 as f64,
+            y: self.bounds.y + area.y as f64 * self.bounds.h / self.size.1 as f64,
+            w: area.w as f64 * self.bounds.w / self.size.0 as f64,
+            h: area.h as f64 * self.bounds.h / self.size.1 as f64,
+        })
     }
 
     pub fn pixels(self, area: Points) -> Option<Rect> {
