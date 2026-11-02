@@ -4914,16 +4914,7 @@ mod tests {
         while !done(workspace) {
             let wait = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!wait.is_zero(), "workspace condition timed out: {}", workspace.status_text());
-            let result = receiver.recv_timeout(wait).unwrap_or_else(|error| {
-                panic!(
-                    "worker result before deadline: {error:?}; exit={} close={} saves={} recovery_ready={}; {}",
-                    workspace.wants_exit(),
-                    workspace.close_pending(),
-                    workspace.file_saves_pending(),
-                    workspace.recovery_ready(),
-                    workspace.status_text()
-                )
-            });
+            let result = receiver.recv_timeout(wait).expect("worker result before deadline");
             workspace.test_document_result(result);
         }
     }
@@ -4949,29 +4940,16 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let mut id = None;
         for round in 0..3 {
-            eprintln!("UTF-16 round {round}: prepare recovery");
             let (tx, rx) = mpsc::channel();
             let mut workspace = Workspace::new(View::new(None)).unwrap();
             workspace.set_session_restore(true);
             workspace
                 .start_document_worker_at(Some(root.0.clone()), move |result| {
-                    let info = crate::workspace_document::commit::result_info(&result);
-                    let durable = matches!(result, DocumentResult::JournalDurable { .. });
-                    match &result {
-                        DocumentResult::JournalQueued { sequence, result, .. }
-                        | DocumentResult::JournalDurable { sequence, result, .. } => {
-                            eprintln!(
-                                "UTF-16 round {round}: {info:?} durable={durable} sequence={sequence} {result:?}"
-                            );
-                        }
-                        _ => eprintln!("UTF-16 round {round}: {info:?}"),
-                    }
                     let _ = tx.send(result);
                 })
                 .unwrap();
             drive(&mut workspace, &rx, Workspace::recovery_ready);
             let document = if round == 0 {
-                eprintln!("UTF-16 round {round}: open document");
                 let opened = workspace.open_path(path.clone()).unwrap();
                 drive(&mut workspace, &rx, |workspace| {
                     workspace.view(opened).is_some_and(|view| view.editor().is_some())
@@ -4996,7 +4974,6 @@ mod tests {
                     )
                     .unwrap();
                 workspace.request_window_close(false).unwrap();
-                eprintln!("UTF-16 round {round}: wait for durable hot exit");
                 drive(&mut workspace, &rx, Workspace::wants_exit);
             } else {
                 let editor = workspace.view(document).unwrap().editor().unwrap();
@@ -5006,7 +4983,6 @@ mod tests {
                 assert_eq!(logical, b"A\xffxy");
                 let output = root.0.join("saved-as.txt");
                 workspace.save_document(document, Some(output.clone())).unwrap();
-                eprintln!("UTF-16 round {round}: wait for Save As");
                 drive(&mut workspace, &rx, |workspace| {
                     !workspace.view(document).unwrap().editor().unwrap().document().is_dirty()
                 });
