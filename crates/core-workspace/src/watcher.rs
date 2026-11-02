@@ -39,7 +39,7 @@ enum Message {
 pub struct FileWatcher {
     // A child rearm must never stop the parent stream. FSEvents restarts the
     // entire RecommendedWatcher on watch/unwatch and discards queued events.
-    _parents: RecommendedWatcher,
+    _parents: Option<RecommendedWatcher>,
     watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
     tx: SyncSender<Message>,
     worker: Option<JoinHandle<()>>,
@@ -106,7 +106,8 @@ impl FileWatcher {
         for parent in parents {
             parent_watcher.watch(&parent, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
         }
-        let mut watcher = make_watcher()?;
+        let (parent_watcher, mut watcher) =
+            if directories { (Some(parent_watcher), make_watcher()?) } else { (None, parent_watcher) };
         if directories {
             for path in &paths {
                 watcher.watch(path, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
@@ -497,6 +498,27 @@ mod tests {
         assert_eq!(delivery_kind(&root, FileEventKind::Modified, false), FileEventKind::Modified);
         std::fs::create_dir(&root).unwrap();
         assert_eq!(delivery_kind(&root, FileEventKind::Modified, true), FileEventKind::Modified);
+    }
+
+    #[test]
+    fn watcher_directory_parent_outlives_child_stream() {
+        let dir = TempDir::new();
+        let root = dir.0.join("themes");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watcher = FileWatcher::directory(&root, Duration::from_millis(10), move |event| {
+            let _ = tx.send(event);
+        })
+        .unwrap();
+        // Model the interval in which child reconfiguration has stopped its
+        // native stream. Parent delivery must not depend on that stream.
+        let child = watcher.watcher.as_ref().unwrap();
+        *child.lock().unwrap() = notify::recommended_watcher(|_| {}).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let event = rx.recv_timeout(Duration::from_secs(5)).expect("independent parent removal wake").unwrap();
+        assert_eq!(event, FileEvent { path: root, kind: FileEventKind::Removed });
+        drop(watcher);
     }
 
     #[test]
