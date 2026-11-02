@@ -1,10 +1,22 @@
 //! Startup marks are opt-in and include Windows loader time.
 pub fn mark(label: &str) {
     if std::env::var_os("KWIL_TRACE_STARTUP").is_some() {
+        let line = format!("kwil-startup {label} {:.3} ms", age_ms());
         #[cfg(not(feature = "frame-harness"))]
-        eprintln!("kwil-startup {label} {:.3} ms", age_ms());
+        eprintln!("{line}");
         #[cfg(feature = "frame-harness")]
         event(label);
+        // The GUI deliberately releases standard handles after its first frame.
+        // Keep opt-in renderer-probe marks, including the later checked file content.
+        #[cfg(feature = "frame-harness")]
+        if std::env::var_os("KWIL_RENDERER_PROBE").is_some()
+            && let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR")
+        {
+            use std::io::Write;
+            let path = std::path::PathBuf::from(dir).join("startup.txt");
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).expect("startup probe log");
+            writeln!(file, "{line}").expect("startup probe mark");
+        }
     }
 }
 

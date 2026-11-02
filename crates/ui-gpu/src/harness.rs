@@ -105,6 +105,8 @@ pub(crate) enum Step {
     AboutClose,
     MarkdownText,
     Idle,
+    RendererType,
+    RendererTyped,
     Scroll,
     Repaint,
     Status,
@@ -177,7 +179,9 @@ struct Counts {
 #[derive(Default)]
 pub(crate) struct Metrics {
     phase: usize,
-    per: [Counts; 5],
+    per: [Counts; 6],
+    content_presented: bool,
+    scroll_copy_pixels: Option<u64>,
     resize_settled: Option<u64>,
     // UI-owned probe state belongs to this App, never a process-global gate
     // shared by concurrent headless hosts (or another window's delivery).
@@ -185,24 +189,59 @@ pub(crate) struct Metrics {
     held_text_completion: Option<kwil_view_model::document_worker::result_transport::DocumentDeliveryId>,
 }
 impl Metrics {
-    pub fn present(&mut self, full: bool, damage: u64, copy: u64) {
+    pub fn present(&mut self, full: bool, damage: u64, copy: u64, content_ready: bool) {
+        if content_ready && !self.content_presented {
+            self.content_presented = true;
+            super::trace::mark("first content presented");
+        }
         let c = &mut self.per[self.phase];
         c.presents += 1;
         c.full += u64::from(full);
         c.damage += damage;
         c.copy += copy;
     }
-    fn print(&self) {
-        for (i, name) in ["settling", "idle", "scroll", "repaint", "status"].iter().enumerate() {
+    fn report(&self) -> String {
+        let mut report = String::new();
+        for (i, name) in ["settling", "idle", "scroll", "repaint", "status", "typing"].iter().enumerate() {
             let c = self.per[i];
-            println!(
-                "kwil-frame phase={name} presents={} full={} damage_px={} copy_px={}",
+            report.push_str(&format!(
+                "kwil-frame phase={name} presents={} full={} damage_px={} copy_px={}\n",
                 c.presents, c.full, c.damage, c.copy
-            );
+            ));
+        }
+        report
+    }
+    fn assert_idle(&self) {
+        assert_eq!(self.per[1].presents, 0, "idle must not present");
+    }
+    fn assert_partial(&self, phase: usize, copied: bool, viewport: usize) {
+        let c = self.per[phase];
+        if phase == 2 || phase == 5 {
+            // Editing/scrolling also deliver asynchronous worker results.
+            // Every resulting present must remain partial; it is not idle.
+            assert!(c.presents > 0, "renderer action must present its result");
+        } else {
+            assert_eq!(c.presents, 1, "one present per renderer action");
+        }
+        assert_eq!(c.full, 0, "renderer action must not request a full repaint");
+        assert!(c.damage > 0 && c.damage < viewport as u64, "damage must be smaller than the viewport");
+        assert_eq!(c.copy > 0, copied, "scroll must copy retained pixels");
+        if copied {
+            assert_eq!(Some(c.copy), self.scroll_copy_pixels, "one copy of the retained scroll region");
+            assert!(c.damage < c.copy, "short scroll must not repaint the retained body");
         }
     }
 }
 pub(crate) fn start(proxy: super::HostProxy) {
+    // Release probes use panic=abort, so catch_unwind below cannot preserve
+    // their diagnostics. Standard handles are closed after the first frame.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR") {
+            let _ = std::fs::write(PathBuf::from(dir).join("harness-failure.txt"), info.to_string());
+        }
+        previous(info);
+    }));
     std::thread::spawn(move || {
         let usual = [
             (1800, Step::DismissSetup),
@@ -213,6 +252,17 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (150, Step::RemoteOn),
             (100, Step::RemoteOff),
             (100, Step::End),
+        ];
+        let renderer = [
+            (1800, Step::DismissSetup),
+            (200, Step::Idle),
+            (250, Step::RendererType),
+            (200, Step::RendererTyped),
+            (300, Step::Idle),
+            (250, Step::Scroll),
+            (200, Step::Repaint),
+            (150, Step::Status),
+            (150, Step::End),
         ];
         let usability = [
             (1800, Step::DismissSetup),
@@ -559,7 +609,9 @@ pub(crate) fn start(proxy: super::HostProxy) {
         let session_restore = [(1800, Step::DismissSetup), (300, Step::SessionCheck), (100, Step::SessionExit)];
         let ipc = [(1800, Step::DismissSetup), (5000, Step::SessionCheck), (100, Step::SessionExit)];
         let probe = std::env::var("KWIL_SESSION_PROBE").unwrap_or_default();
-        let steps = if probe == "crash" {
+        let steps = if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
+            renderer.as_slice()
+        } else if probe == "crash" {
             &session_seed[..session_seed.len() - 1]
         } else if probe == "seed" || probe == "transient" {
             session_seed.as_slice()
@@ -632,14 +684,23 @@ pub(crate) fn start(proxy: super::HostProxy) {
     });
 }
 pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
+    if std::env::var_os("KWIL_RENDERER_PROBE").is_some()
+        && let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR")
+    {
+        let dir = PathBuf::from(dir);
+        let _ = std::fs::write(dir.join("harness-step.txt"), format!("{step:?}"));
+        let _ = std::fs::write(dir.join("renderer-counts.txt"), app.metrics.report());
+    }
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step_inner(app, el, step))) {
         if let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR") {
+            let dir = PathBuf::from(dir);
+            let _ = std::fs::write(dir.join("renderer-counts.txt"), app.metrics.report());
             let text = payload
                 .downcast_ref::<String>()
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied())
                 .unwrap_or("non-string panic");
-            let _ = std::fs::write(PathBuf::from(dir).join("harness-failure.txt"), format!("{step:?}: {text}"));
+            let _ = std::fs::write(dir.join("harness-failure.txt"), format!("{step:?}: {text}"));
         }
         std::panic::resume_unwind(payload);
     }
@@ -1824,9 +1885,15 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert_eq!(app.markdown_mode(), super::markdown_ui::Mode::Text);
         }
         Step::Idle => {
+            if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
+                assert!(
+                    app.view.editor().is_some_and(|editor| !editor.document().is_dirty()),
+                    "renderer fixture must be clean before idle/scroll measurement"
+                );
+            }
             #[cfg(feature = "gpu")]
             if std::env::var_os("KWIL_REQUIRE_GPU").is_some() {
-                assert!(app.gpu.is_some(), "hardware GPU required by this probe");
+                assert!(app.gpu.is_some(), "native GPU presenter required by this probe");
             }
             // Prime the retained GPU image without an onscreen present, so the
             // following scroll/readback exercises GPU copies, not a fresh upload.
@@ -1855,11 +1922,19 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             capture(app, dir.as_deref(), "first.bmp");
         }
         Step::Scroll => {
+            if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
+                app.metrics.assert_idle();
+                let (source, _) = app.tab_frame().geometry.scroll_copy(3).expect("short scroll geometry");
+                app.metrics.scroll_copy_pixels = Some((source.width * source.height) as u64);
+            }
             app.metrics.phase = 2;
             let d = app.view.scroll(3);
             app.apply(d);
         }
         Step::Repaint => {
+            if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
+                app.metrics.assert_partial(2, true, app.size.0 * app.size.1);
+            }
             capture(app, dir.as_deref(), "scroll.bmp");
             #[cfg(feature = "gpu")]
             if let (Some(gpu), Some(gfx)) = (&app.gpu, &app.gfx) {
@@ -1892,11 +1967,28 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             if let Some(dir) = &dir {
                 let a = std::fs::read(dir.join("scroll.bmp"));
                 let b = std::fs::read(dir.join("repaint.bmp"));
-                println!("kwil-frame scroll_copy_matches_repaint={}", a.is_ok() && a.ok() == b.ok());
+                let equal = a.is_ok() && a.ok() == b.ok();
+                println!("kwil-frame scroll_copy_matches_repaint={equal}");
+                if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
+                    assert!(equal, "scroll copy capture must equal a forced repaint");
+                }
             }
             app.metrics.phase = 4;
             let d = app.view.set_notice("status damage probe".into());
             app.apply(d);
+        }
+        Step::RendererType => {
+            app.metrics.assert_idle();
+            app.metrics.phase = 5;
+            app.edit(super::input::Action::Text("x".into()));
+        }
+        Step::RendererTyped => {
+            assert!(app.view.line(0).unwrap().starts_with(b"xline AA "), "typing must update file content");
+            app.metrics.assert_partial(5, false, app.size.0 * app.size.1);
+            // Restore the disposable fixture before measuring scroll and exit.
+            // Undo paints belong to settling, not to either measured action.
+            app.metrics.phase = 0;
+            app.edit(super::input::Action::Command("edit.undo"));
         }
         Step::RemoteOn | Step::RemoteOff => {
             #[cfg(windows)]
@@ -2030,8 +2122,10 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 }
             }
             capture(app, dir.as_deref(), "status.bmp");
-            app.metrics.print();
+            let report = app.metrics.report();
+            print!("{report}");
             if let Some(dir) = &dir {
+                std::fs::write(dir.join("renderer-counts.txt"), &report).unwrap();
                 let counts = app.metrics.per[app.metrics.phase];
                 std::fs::write(
                     dir.join("frame-counts.txt"),
@@ -2041,6 +2135,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                     ),
                 )
                 .unwrap();
+            }
+            if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
+                app.metrics.assert_partial(4, false, app.size.0 * app.size.1);
             }
             println!(
                 "kwil-frame final_remote={} cursor_blink_allowed={}",
