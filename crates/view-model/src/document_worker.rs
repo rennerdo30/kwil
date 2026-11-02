@@ -5006,7 +5006,7 @@ mod tests {
                         panic!(
                             "UTF-16 round={round} phase={phase} results={results:?} status={} prompt={:?}: {error:?}",
                             workspace.status_text(),
-                            workspace.file_prompt()
+                            workspace.file_prompt().is_some()
                         )
                     });
                 let summary = match &result {
