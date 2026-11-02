@@ -216,7 +216,7 @@ fn partitions<H: Haystack + ?Sized>(
                 return Err(invalid("invalid haystack chunks"));
             }
             expected += bytes.len() as u64;
-            if let Some(n) = memchr::memchr(b'\n', bytes) {
+            if let Some(n) = memchr::memchr(b'\n', &bytes) {
                 boundary = Some(at + n as u64 + 1);
                 break;
             }

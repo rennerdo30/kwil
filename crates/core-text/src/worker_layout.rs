@@ -184,7 +184,7 @@ impl TreeLookup {
         Step::Ready(())
     }
 }
-fn storage_len(storage: &Storage) -> u64 {
+pub(super) fn storage_len(storage: &Storage) -> u64 {
     match storage {
         Storage::Original(file) => file.len(),
         Storage::Decoded(source) => source.origin.logical_bytes().len() as u64,
@@ -200,12 +200,16 @@ fn index(storage: &Storage) -> Option<&LineIndex> {
         _ => None,
     }
 }
-fn worker_bytes(storage: &Storage) -> Result<&[u8], InputError> {
-    match storage {
-        Storage::Original(file) => file.worker_bytes().map_err(read_error),
-        _ => storage.bytes().map_err(read_error),
+fn worker_bytes(storage: &Storage, range: std::ops::Range<u64>) -> Result<std::borrow::Cow<'_, [u8]>, InputError> {
+    if let Storage::Original(file) = storage {
+        let mut bytes = vec![0; (range.end - range.start) as usize];
+        file.read_into(range.start, &mut bytes).map_err(read_error)?;
+        Ok(std::borrow::Cow::Owned(bytes))
+    } else {
+        storage.read(range).map_err(read_error)
     }
 }
+
 fn source_operations(storage: &Storage) -> u64 {
     if matches!(storage, Storage::Original(_)) { 8 } else { 1 }
 }
@@ -366,15 +370,16 @@ impl StorageLookup {
                     // before access; no borrowed mapped slice survives Pending.
                     let lookahead = u64::from(self.at + n < storage_len(storage));
                     ready!(self.credit.poll(n + lookahead, source_operations(storage) + 1, work, cancel));
-                    let bytes = match worker_bytes(storage) {
+                    let base = self.at;
+                    let bytes = match worker_bytes(storage, base..base + n + lookahead) {
                         Ok(bytes) => bytes,
                         Err(error) => return Step::Failed(error),
                     };
                     let stop = self.at + n;
                     while self.at < stop {
-                        let byte = bytes[self.at as usize];
+                        let byte = bytes[(self.at - base) as usize];
                         self.at += 1;
-                        if byte == b'\n' || (byte == b'\r' && bytes.get(self.at as usize) != Some(&b'\n')) {
+                        if byte == b'\n' || (byte == b'\r' && bytes.get((self.at - base) as usize) != Some(&b'\n')) {
                             self.count += 1;
                         }
                         if let StorageTarget::Start(line) = self.target
@@ -450,11 +455,12 @@ impl ByteQuery {
         ready!(self.walk.poll(snapshot, work, cancel));
         let Kind::Leaf(piece) = &self.walk.node.as_ref().unwrap().kind else { unreachable!() };
         ready!(self.credit.poll(1, source_operations(&piece.storage) + 1, work, cancel));
-        let bytes = match worker_bytes(&piece.storage) {
+        let at = piece.start + self.at - self.walk.base;
+        let bytes = match worker_bytes(&piece.storage, at..at + 1) {
             Ok(bytes) => bytes,
             Err(error) => return Step::Failed(error),
         };
-        Step::Ready(Some(bytes[(piece.start + self.at - self.walk.base) as usize]))
+        Step::Ready(Some(bytes[0]))
     }
 }
 

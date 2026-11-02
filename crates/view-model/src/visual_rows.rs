@@ -793,7 +793,7 @@ impl WrapSource for SnapshotSource {
         let mut copied = 0;
         for chunk in self.snapshot.chunks(at..end)? {
             let chunk = chunk.map_err(io::Error::other)?;
-            output[copied..copied + chunk.len()].copy_from_slice(chunk);
+            output[copied..copied + chunk.len()].copy_from_slice(&chunk);
             copied += chunk.len();
         }
         Ok(copied)

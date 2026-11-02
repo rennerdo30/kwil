@@ -1133,7 +1133,7 @@ mod tests {
         let encoded = gzip(b"text");
         let source = fixture.source("gzip", &encoded);
         let raw = prepare_file(&source, CompressionMode::Raw, &fixture.0, &cancel()).unwrap();
-        assert_eq!(raw.text_file().unwrap().bytes().unwrap(), encoded);
+        assert_eq!(raw.text_file().unwrap().read_range(0..raw.text_file().unwrap().len()).unwrap(), encoded);
         assert_eq!(raw.format(), CompressionFormat::Raw);
         assert!(raw.try_finish().is_ok());
         let gzip = prepare_file(&source, CompressionMode::Gzip, &fixture.0, &cancel()).unwrap();
@@ -1149,7 +1149,7 @@ mod tests {
             Err(CompressionError::InvalidGzip(_))
         ));
         let raw = prepare_file(&source, CompressionMode::Raw, &fixture.0, &cancel()).unwrap();
-        assert_eq!(raw.text_file().unwrap().bytes().unwrap(), b"PK\x03\x04stuff");
+        assert_eq!(raw.text_file().unwrap().read_range(0..raw.text_file().unwrap().len()).unwrap(), b"PK\x03\x04stuff");
         assert!(raw.try_finish().is_ok());
         assert_eq!(fixture.backing_count(), 0);
     }

@@ -1,4 +1,4 @@
-//! A synchronous read view, equivalent to retaining a checked bytes() slice
+//! A synchronous read view, for immutable resident copies
 //! during one command. No cache survives the outer call or crosses threads.
 //! Explicit live checks and pin transitions invalidate the cached admission.
 use super::*;
@@ -21,9 +21,8 @@ thread_local! { static BATCH: RefCell<Batch> = RefCell::new(Batch::default()); }
 /// later explicit check failure or save pin generation change refuses further
 /// reads, including nested calls. A fresh command always checks again.
 ///
-/// As with a borrowed bytes() slice, this cannot protect against an external
-/// process truncating while the command reads; it does not widen TextFile's
-/// documented mmap TOCTOU contract. Never use across an event-loop wakeup.
+/// Positioned reads bypass this cache and check the live source around each
+/// copy. Never use a batch across an event-loop wakeup.
 pub fn with_checked_read_batch<R>(command: impl FnOnce() -> R) -> R {
     struct Guard;
     impl Drop for Guard {

@@ -3380,7 +3380,12 @@ fn recover_document(path: PathBuf, tab: &Tab) -> io::Result<(Document, Recovered
                     )
                 })?;
                 if encoded.detection().encoding != kwil_core_text::encoding::Encoding::UTF8
-                    || file.bytes().map_err(io::Error::other)?.contains(&0)
+                    || (0..file.len()).step_by(kwil_core_text::READ_CHUNK).try_fold(false, |found, start| {
+                        let bytes = file
+                            .read_range(start..(start + kwil_core_text::READ_CHUNK as u64).min(file.len()))
+                            .map_err(io::Error::other)?;
+                        Ok::<_, io::Error>(found || bytes.contains(&0))
+                    })?
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -3471,7 +3476,7 @@ impl io::Read for SnapshotReader {
         let mut copied = 0;
         for chunk in self.snapshot.chunks(self.offset..end)? {
             let chunk = chunk.map_err(io::Error::other)?;
-            output[copied..copied + chunk.len()].copy_from_slice(chunk);
+            output[copied..copied + chunk.len()].copy_from_slice(&chunk);
             copied += chunk.len();
         }
         self.offset += copied as u64;

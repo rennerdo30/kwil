@@ -53,12 +53,32 @@ impl LineIndex {
     }
 
     pub fn extend_with_memory_limit(&mut self, bytes: &[u8], from_len: u64, limit: usize) -> io::Result<()> {
+        self.extend_reader(bytes.len() as u64, from_len, limit, |range| {
+            Ok(std::borrow::Cow::Borrowed(&bytes[range.start as usize..range.end as usize]))
+        })
+    }
+
+    pub(crate) fn extend_reader<'a>(
+        &mut self,
+        len: u64,
+        from_len: u64,
+        limit: usize,
+        read: impl Fn(std::ops::Range<u64>) -> io::Result<std::borrow::Cow<'a, [u8]>>,
+    ) -> io::Result<()> {
+        let len = usize::try_from(len).map_err(io::Error::other)?;
         assert_eq!(from_len, self.len, "extension must start at the indexed length");
-        assert!(from_len <= bytes.len() as u64, "cannot extend a truncated file");
+        assert!(from_len <= len as u64, "cannot extend a truncated file");
         // Count only the append before reserving, so a refusal leaves all old
         // metrics intact. Exact reservation avoids hidden geometric growth.
-        let joins_crlf = crate::newlines::split_crlf(bytes, from_len as usize);
-        let added = ends(bytes, from_len as usize..bytes.len()).count() as u64;
+        let edge_start = from_len.saturating_sub(1);
+        let edge = read(edge_start..(from_len + 1).min(len as u64))?;
+        let joins_crlf = crate::newlines::split_crlf(&edge, (from_len - edge_start) as usize);
+        let mut added = 0;
+        for start in (from_len as usize..len).step_by(RANK_BYTES) {
+            let end = (start + RANK_BYTES).min(len);
+            let bytes = read(start as u64..(end + 1).min(len) as u64)?;
+            added += ends(&bytes, 0..end - start).count() as u64;
+        }
         let old_breaks = self.line_count - 1 - u64::from(joins_crlf);
         let removes_line = joins_crlf && self.checkpoints.last().is_some_and(|&(_, at)| at == from_len);
         let lines = self.checkpoints.len() - usize::from(removes_line)
@@ -66,7 +86,7 @@ impl LineIndex {
         let removes_rank = joins_crlf && self.rank_checkpoints.last().is_some_and(|&(_, at)| at == from_len);
         let rank_count = self.rank_checkpoints.len() - usize::from(removes_rank);
         let last_rank = self.rank_checkpoints[rank_count - 1].1 as usize;
-        let ranks = rank_count + bytes.len().saturating_sub(last_rank + 1) / RANK_BYTES;
+        let ranks = rank_count + len.saturating_sub(last_rank + 1) / RANK_BYTES;
         let old_lines = self.checkpoints.capacity();
         let old_ranks = self.rank_checkpoints.capacity();
         let new_lines = lines.max(old_lines);
@@ -88,7 +108,7 @@ impl LineIndex {
             .try_reserve_exact(ranks.saturating_sub(self.rank_checkpoints.len()))
             .map_err(io::Error::other)?;
         let mut start = from_len as usize;
-        if start < bytes.len() && crate::newlines::split_crlf(bytes, start) {
+        if start < len && joins_crlf {
             self.line_count -= 1;
             // Only an EOF checkpoint can move when CR grows into CRLF.
             if self.checkpoints.last().is_some_and(|&(_, at)| at == from_len) {
@@ -98,24 +118,25 @@ impl LineIndex {
                 self.rank_checkpoints.pop();
             }
         }
-        while start < bytes.len() {
+        while start < len {
             let last_rank = self.rank_checkpoints.last().unwrap().1;
             if start as u64 - last_rank == RANK_BYTES as u64 {
                 self.rank_checkpoints.push((self.line_count - 1, start as u64));
             }
             let next_rank = self.rank_checkpoints.last().unwrap().1 + RANK_BYTES as u64;
-            let end = bytes.len().min(next_rank as usize);
-            for pos in ends(bytes, start..end) {
+            let end = len.min(next_rank as usize);
+            let bytes = read(start as u64..(end + 1).min(len) as u64)?;
+            for pos in ends(&bytes, 0..end - start) {
                 // The old final (possibly partial or empty) line already counts.
                 self.line_count += 1;
                 let line = self.line_count - 1;
                 if line.is_multiple_of(DEFAULT_EVERY) {
-                    self.checkpoints.push((line, pos as u64));
+                    self.checkpoints.push((line, (start + pos) as u64));
                 }
             }
             start = end;
         }
-        self.len = bytes.len() as u64;
+        self.len = len as u64;
         Ok(())
     }
 
@@ -234,8 +255,23 @@ impl LineIndex {
         progress: &AtomicU64,
         limit: usize,
     ) -> io::Result<Self> {
+        Self::build_reader(bytes.len() as u64, every, chunk, threads, progress, limit, |range| {
+            Ok(std::borrow::Cow::Borrowed(&bytes[range.start as usize..range.end as usize]))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_reader<'a>(
+        len: u64,
+        every: u64,
+        chunk: usize,
+        threads: usize,
+        progress: &AtomicU64,
+        limit: usize,
+        read: impl Fn(std::ops::Range<u64>) -> io::Result<std::borrow::Cow<'a, [u8]>> + Sync,
+    ) -> io::Result<Self> {
         let every = every.max(1);
-        let chunks = bytes.len().div_ceil(chunk).max(1);
+        let chunks = usize::try_from(len.div_ceil(chunk as u64).max(1)).map_err(io::Error::other)?;
         let next = AtomicUsize::new(0);
         let memory = IndexMemory::new(limit);
         let mut results = IndexVec::new(&memory);
@@ -253,22 +289,23 @@ impl LineIndex {
                             if i >= chunks {
                                 break;
                             }
-                            let start = i * chunk;
-                            let end = (start + chunk).min(bytes.len());
+                            let start = i as u64 * chunk as u64;
+                            let end = (start + chunk as u64).min(len);
                             let mut newlines = 0u64;
                             let mut local = IndexVec::new(&memory);
                             let mut ranks = IndexVec::new(&memory);
                             for block_start in (start..end).step_by(RANK_BYTES) {
-                                ranks.push((newlines, block_start as u64))?;
-                                let block_end = (block_start + RANK_BYTES).min(end);
-                                for pos in ends(bytes, block_start..block_end) {
+                                ranks.push((newlines, block_start))?;
+                                let block_end = (block_start + RANK_BYTES as u64).min(end);
+                                let bytes = read(block_start..(block_end + 1).min(len))?;
+                                for pos in ends(&bytes, 0..(block_end - block_start) as usize) {
                                     newlines += 1;
                                     if newlines.is_multiple_of(every) {
-                                        local.push((newlines, pos as u64))?;
+                                        local.push((newlines, block_start + pos as u64))?;
                                     }
                                 }
                             }
-                            progress.fetch_add((end - start) as u64, Ordering::Relaxed);
+                            progress.fetch_add(end - start, Ordering::Relaxed);
                             out.push((i, ChunkResult { newlines, local, ranks }))?;
                         }
                         Ok(out)
@@ -302,7 +339,7 @@ impl LineIndex {
             checkpoints: checkpoints.into_vec(),
             rank_checkpoints: rank_checkpoints.into_vec(),
             line_count: lines_before + 1,
-            len: bytes.len() as u64,
+            len,
         })
     }
 
@@ -335,6 +372,47 @@ impl LineIndex {
         };
         scanned((offset - at) as usize);
         Some(line + ends(bytes, at as usize..offset as usize).count() as u64)
+    }
+
+    pub(crate) fn rank_reader(
+        &self,
+        offset: u64,
+        read: impl FnOnce(std::ops::Range<u64>) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Option<u64>> {
+        if offset > self.len {
+            return Ok(None);
+        }
+        let i = self.checkpoints.partition_point(|&(_, at)| at <= offset) - 1;
+        let j = self.rank_checkpoints.partition_point(|&(_, at)| at <= offset) - 1;
+        let (line, at) = if self.checkpoints[i].1 > self.rank_checkpoints[j].1 {
+            self.checkpoints[i]
+        } else {
+            self.rank_checkpoints[j]
+        };
+        let bytes = read(at..(offset + 1).min(self.len))?;
+        Ok(Some(line + ends(&bytes, 0..(offset - at) as usize).count() as u64))
+    }
+
+    pub(crate) fn start_reader(
+        &self,
+        line: u64,
+        read: impl FnOnce(std::ops::Range<u64>) -> io::Result<Vec<u8>>,
+    ) -> io::Result<Option<u64>> {
+        if line >= self.line_count {
+            return Ok(None);
+        }
+        let i = self.checkpoints.partition_point(|&(l, _)| l <= line) - 1;
+        let (mut cl, mut off) = self.checkpoints[i];
+        if cl == line {
+            return Ok(Some(off));
+        }
+        let j = self.rank_checkpoints.partition_point(|&(count, _)| count < line) - 1;
+        if self.rank_checkpoints[j].1 > off {
+            (cl, off) = self.rank_checkpoints[j];
+        }
+        let end = self.rank_checkpoints.get(j + 1).map_or(self.len, |&(_, at)| at);
+        let bytes = read(off..(end + 1).min(self.len))?;
+        Ok(ends(&bytes, 0..(end - off) as usize).nth((line - cl - 1) as usize).map(|p| off + p as u64))
     }
 
     /// Byte offset where `line` starts, or `None` past the end.

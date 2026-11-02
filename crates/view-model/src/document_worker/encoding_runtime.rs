@@ -331,9 +331,18 @@ fn matches_raw(
     }
     impl Write for Compare<'_> {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let raw = self.file.bytes().map_err(io::Error::other)?;
             let end = self.at.checked_add(bytes.len()).ok_or_else(|| io::Error::other("raw comparison overflow"))?;
-            self.equal &= raw.get(self.at..end) == Some(bytes);
+            self.equal &= end as u64 <= self.file.len();
+            if self.equal {
+                for (index, expected) in bytes.chunks(kwil_core_text::READ_CHUNK).enumerate() {
+                    let start = self.at + index * kwil_core_text::READ_CHUNK;
+                    let raw = self
+                        .file
+                        .read_range(start as u64..(start + expected.len()) as u64)
+                        .map_err(io::Error::other)?;
+                    self.equal &= raw.as_ref() == expected;
+                }
+            }
             self.at = end;
             Ok(bytes.len())
         }
@@ -384,8 +393,8 @@ fn matches_physical(snapshot: &kwil_core_text::Snapshot, file: &TextFile, cancel
             return Err(io::ErrorKind::Interrupted.into());
         }
         let chunk = chunk.map_err(io::Error::other)?;
-        let bytes = file.bytes().map_err(io::Error::other)?;
-        if bytes.get(offset..offset + chunk.len()) != Some(chunk) {
+        let bytes = file.read_range(offset as u64..(offset + chunk.len()) as u64).map_err(io::Error::other)?;
+        if bytes.as_ref() != chunk.as_ref() {
             return Ok(false);
         }
         offset += chunk.len();

@@ -323,7 +323,9 @@ impl WorkerSourceCursor {
             if !admit_source_check(&piece.storage, &mut self.validation_credit, cancel, admit)? {
                 return Ok(WorkerSourceStep::Pending);
             }
-            worker_bytes(&piece.storage).map_err(read_error)?;
+            if let Storage::Original(file) = piece.storage.as_ref() {
+                file.validate_source().map_err(read_error)?;
+            }
             self.validation_next = self.validation.base + node.metrics.bytes;
             self.validation = Walk::new();
             self.validation_located = false;
@@ -512,7 +514,12 @@ impl WorkerSourceCursor {
         if !admit_source_check(&piece.storage, &mut item.source_credit, cancel, admit)? {
             return Ok(WorkerSourceStep::Pending);
         }
-        let bytes = worker_bytes(&piece.storage).map_err(read_error)?;
+        if let Storage::Original(file) = piece.storage.as_ref() {
+            file.read_into(item.logical.start, &mut logical[..n]).map_err(read_error)?;
+        } else {
+            let bytes = piece.storage.bytes().map_err(read_error)?;
+            logical[..n].copy_from_slice(&bytes[item.logical.start as usize..item.logical.end as usize]);
+        }
         let raw_bytes = match piece.storage.as_ref() {
             Storage::Opaque { raw, .. } => raw.bytes().map_err(read_error)?,
             Storage::Decoded(source) => source.origin.raw_bytes(),
@@ -521,7 +528,6 @@ impl WorkerSourceCursor {
         if cancel.load(Ordering::Relaxed) {
             return Err(WorkerSourceError::Cancelled);
         }
-        logical[..n].copy_from_slice(&bytes[item.logical.start as usize..item.logical.end as usize]);
         raw[..r].copy_from_slice(&raw_bytes[item.raw.start as usize..item.raw.end as usize]);
         let result = WorkerSourceChunk {
             logical_len: n,
@@ -549,12 +555,7 @@ fn read_error(error: crate::ReadError) -> WorkerSourceError {
         other => WorkerSourceError::Io(io::Error::other(other)),
     }
 }
-fn worker_bytes(storage: &Storage) -> Result<&[u8], crate::ReadError> {
-    match storage {
-        Storage::Original(file) => file.worker_bytes(),
-        _ => storage.bytes(),
-    }
-}
+
 impl Item {
     fn new(
         logical: Range<u64>,

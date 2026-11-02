@@ -189,7 +189,7 @@ fn utf8_display_borrows_and_retains_invalid_bytes() {
     for segment in decoded.segments {
         match segment {
             DisplaySegment::Text(t) => original.extend_from_slice(t.as_bytes()),
-            DisplaySegment::Invalid(b) => original.extend_from_slice(b),
+            DisplaySegment::Invalid(b) => original.extend_from_slice(&b),
         }
     }
     assert_eq!(original, bytes[3..]);

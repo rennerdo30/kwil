@@ -20,12 +20,12 @@ pub fn decode_preview(
     cancelled(cancel)?;
     Interpretation::new(interpretation.encoding, interpretation.bom_len as usize)?;
     check_source(source)?;
-    let bytes = source.bytes()?;
+    let bytes = source.read_range(0..source.len().min((CHECKPOINT_RAW_BYTES + 8) as u64))?;
     let start = interpretation.bom_len as usize;
     if start > bytes.len() || (start != 0 && !bytes.starts_with(interpretation.encoding.bom_bytes())) {
         return Err(BackingError::InvalidDescriptor);
     }
-    let end = block_end(bytes, start, interpretation.encoding)?;
+    let end = block_end(&bytes, start, interpretation.encoding)?;
     let raw = &bytes[start..end];
     let mut decoder = interpretation.encoding.decoder();
     let mut scratch = [0; SCRATCH];
@@ -49,7 +49,7 @@ pub fn decode_preview(
         }
     }
     check_source(source)?;
-    Ok(DecodedPreview { text, source: start as u64..end as u64, complete: end == bytes.len() })
+    Ok(DecodedPreview { text, source: start as u64..end as u64, complete: end as u64 == source.len() })
 }
 
 #[cfg(test)]

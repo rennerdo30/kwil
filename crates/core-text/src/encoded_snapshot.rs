@@ -88,7 +88,7 @@ fn raw(
     }
     for chunk in bytes.chunks(64 << 10) {
         poll(cancelled)?;
-        output.writer.write_all(chunk)?;
+        output.writer.write_all(&chunk)?;
     }
     Ok(())
 }
@@ -234,7 +234,13 @@ fn stream(
                 input.finish()?;
                 preserved(encoding, bytes, raw_bytes, raw_offsets, &mut output, cancelled)?;
             }
-            SourceChunk::Original { bytes, .. } | SourceChunk::Added(bytes) => {
+            SourceChunk::Original { bytes, .. } => {
+                for chunk in bytes.chunks(16 << 10) {
+                    poll(cancelled)?;
+                    input.feed(chunk, |s| output.feed(s))?;
+                }
+            }
+            SourceChunk::Added(bytes) => {
                 for chunk in bytes.chunks(16 << 10) {
                     poll(cancelled)?;
                     input.feed(chunk, |s| output.feed(s))?;
