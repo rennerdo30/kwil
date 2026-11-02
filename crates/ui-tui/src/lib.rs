@@ -175,7 +175,7 @@ fn run_workspace_with_terminal_init(
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TUI closed"))
         });
         terminal = Some(initialize(&mut terminal_touched)?);
-        let terminal_colors = crossterm::style::available_color_count();
+        let terminal_colors = terminal_palette::color_count();
         crossterm::execute!(
             std::io::stdout(),
             crossterm::event::EnableMouseCapture,

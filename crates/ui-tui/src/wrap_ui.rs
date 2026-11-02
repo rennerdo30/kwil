@@ -990,6 +990,33 @@ mod tests {
         fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
         fixture.view.execute("edit.redo", &Default::default(), 1).unwrap();
         assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+
+        // Both asynchronous failures return through the real terminal document
+        // host, stay visible in the status line and leave the one-edit undo intact.
+        fixture.view.editor_mut().unwrap().set_cursors(vec![Cursor::caret(0)], 0).unwrap();
+        crate::format_document(&mut fixture.view, None, true);
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+        assert!(fixture.view.notice().contains("Select the lines"), "{}", fixture.view.notice());
+        assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        assert!(capture(&fixture.view, "selection-error").contains("Format:"));
+
+        fixture.view.editor_mut().unwrap().settings.formatters.insert(
+            "json".into(),
+            kwil_core_commands::settings::Formatter {
+                executable: fixture.root.join("missing-formatter").to_string_lossy().into_owned(),
+                args: Vec::new(),
+                range_args: Vec::new(),
+                timeout_ms: 1000,
+            },
+        );
+        crate::format_document(&mut fixture.view, None, false);
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+        assert!(fixture.view.notice().contains("formatters.json.executable"), "{}", fixture.view.notice());
+        assert!(capture(&fixture.view, "tool-error").contains("Format:"));
+        assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        fixture.view.execute("edit.undo", &Default::default(), 1).unwrap();
+        assert_eq!(bytes(&fixture.view), ORIGINAL.as_bytes(), "errors must not add an undo step");
         fixture.finish();
     }
 
