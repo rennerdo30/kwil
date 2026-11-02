@@ -914,6 +914,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editor_ascii_tiles_match_the_hinted_chrome_rasterizer() {
+        let (data, index, family) = CANDIDATES
+            .iter()
+            .find_map(|(path, index, family)| Some((std::fs::read(path).ok()?, *index, *family)))
+            .expect("a system monospace face");
+        for px in [14.0, 17.5, 21.0, 28.0] {
+            let mut reference =
+                UiFont::single_face(UiFace::from_data(data.clone(), index as usize).unwrap(), px).unwrap();
+            let mut editor = Font::from_bytes(data.clone(), index, px, family).unwrap();
+            for c in b' '..=b'~' {
+                let glyph = &reference.glyphs[&(c as char)];
+                let mut expected = vec![0x182230; editor.cw * editor.ch];
+                for gy in 0..glyph.height {
+                    for gx in 0..glyph.width {
+                        let x = glyph.left + gx as i32;
+                        let y = editor.baseline - glyph.top + gy as i32;
+                        if x >= 0 && y >= 0 && (x as usize) < editor.cw && (y as usize) < editor.ch {
+                            expected[y as usize * editor.cw + x as usize] =
+                                blend(0x182230, 0xddeeff, glyph.alpha[gy * glyph.width + gx]);
+                        }
+                    }
+                }
+                assert_eq!(editor.tile(c, 0xddeeff, 0x182230), expected, "ASCII {c} at {px} px");
+                // The reference remains usable after its ASCII cache is primed.
+                assert!(reference.width("Kwil") > 0);
+            }
+        }
+    }
+
+    #[test]
     #[cfg(windows)]
     fn startup_defers_symbol_file_and_fallback_keeps_the_same_emoji_pixels() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
