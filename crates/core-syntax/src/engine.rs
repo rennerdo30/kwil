@@ -150,6 +150,13 @@ impl Engine {
         self.parser.reset();
     }
 
+    pub fn set_parse_limit(&mut self, bytes: usize) {
+        if self.config.parse_limit != bytes {
+            self.reset_document();
+            self.config.parse_limit = bytes;
+        }
+    }
+
     /// A caller-admitted window with an explicit context allowance. Unlike the
     /// document parser, this path never reads outside `queried`, including for
     /// predicates or edit coordinates. Grammar queries parse a local fragment

@@ -19,6 +19,7 @@ const CANDIDATES: &[(&str, u32, &str)] = &[
 ];
 
 pub struct Font {
+    pub ligatures: bool,
     pub cw: usize,
     pub ch: usize,
     family: String,
@@ -80,6 +81,7 @@ impl Font {
         let ch = (lm.ascent - lm.descent + lm.line_gap).ceil() as usize + 2;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Some(Font {
+            ligatures: true,
             cw,
             ch,
             family: family.into(),
@@ -98,10 +100,26 @@ impl Font {
         })
     }
 
+    pub fn apply_preferences(&mut self, settings: &kwil_core_commands::settings::FontSettings) {
+        let height = (self.px * settings.line_height).ceil().max(1.0) as usize;
+        self.baseline += (height as i32 - self.ch as i32) / 2;
+        self.ch = height;
+        self.ligatures = settings.ligatures;
+        self.tiles.clear();
+    }
+
+    pub fn shapes_ligatures(&self, text: &[u8]) -> bool {
+        self.ligatures
+            && text
+                .windows(2)
+                .any(|pair| matches!(pair, b"->" | b"=>" | b"==" | b"!=" | b"<=" | b">=" | b"::" | b"&&" | b"||"))
+    }
+
     pub fn enable_unicode(&mut self, _family: String, ready: impl Fn(Tile, u64) + Send + 'static) {
         // The retained font can differ from a failed configured-family request.
         // Always shape combining clusters with the actual surviving primary face.
         let family = self.family.clone();
+        let ligatures = self.ligatures;
         if self.sender.is_some() {
             return;
         }
@@ -116,7 +134,11 @@ impl Font {
                 if canceled.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let raster = raster.get_or_insert_with(|| Rasterizer::new(&family, px, cw, ch, baseline));
+                let raster = raster.get_or_insert_with(|| {
+                    let mut raster = Rasterizer::new(&family, px, cw, ch, baseline);
+                    raster.ligatures = ligatures;
+                    raster
+                });
                 ready(raster.rasterize(key), generation);
             }
         });
@@ -1008,6 +1030,7 @@ mod tests {
         let font = Font {
             cw: 1,
             ch: 10,
+            ligatures: true,
             family: "monospace".into(),
             glyphs: vec![],
             baseline: 8,
@@ -1023,6 +1046,23 @@ mod tests {
             canceled: Default::default(),
         };
         (font, key)
+    }
+    #[test]
+    fn kw46_runtime_font_line_height_changes_cell_and_baseline() {
+        let (mut font, _) = waiting_font(vec![]);
+        let settings = kwil_core_commands::settings::FontSettings { line_height: 3.0, ..Default::default() };
+        font.apply_preferences(&settings);
+        assert_eq!(font.ch, 24);
+        assert_eq!(font.baseline, 15);
+    }
+    #[test]
+    fn kw46_runtime_font_ligatures_select_the_shape_path() {
+        let (mut font, _) = waiting_font(vec![]);
+        font.apply_preferences(&kwil_core_commands::settings::FontSettings { ligatures: false, ..Default::default() });
+        assert!(!font.shapes_ligatures(b"a != b => c"));
+        font.apply_preferences(&Default::default());
+        assert!(font.shapes_ligatures(b"a != b => c"));
+        assert!(!font.shapes_ligatures(b"ordinary ASCII"));
     }
     #[test]
     fn glyph_arrival_between_queued_scroll_and_paint_damages_moved_row() {

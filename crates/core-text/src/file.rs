@@ -230,21 +230,27 @@ impl TextFile {
 
     /// Opens `path` without scanning it. kind() samples lazily and caches.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
-        Self::open_with_mapper(path, |f| {
+        Self::open_with_threshold(path, MAP_THRESHOLD)
+    }
+
+    /// A worker-selected resident limit. Zero maps every nonempty file.
+    pub fn open_with_threshold(path: &Path, threshold: u64) -> Result<Self, OpenError> {
+        Self::open_with_policy(path, false, threshold, |f| {
             // SAFETY: callers obey the mapped-view contract documented above.
             // This check does not synchronize with concurrent external writers.
             unsafe { memmap2::Mmap::map(f) }
         })
     }
 
+    #[cfg(test)]
     fn open_with_mapper(path: &Path, map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>) -> Result<Self, OpenError> {
-        Self::open_with_policy(path, false, map)
+        Self::open_with_policy(path, false, MAP_THRESHOLD, map)
     }
 
     /// Saved originals remain file-backed even below the normal mapping
     /// threshold, so undo never retains another full resident copy per save.
     pub fn open_saved_version(path: &Path) -> Result<Self, OpenError> {
-        Self::open_with_policy(path, true, |file| {
+        Self::open_with_policy(path, true, MAP_THRESHOLD, |file| {
             // SAFETY: saved versions obey TextFile's checked mapped-view contract.
             unsafe { memmap2::Mmap::map(file) }
         })
@@ -253,6 +259,7 @@ impl TextFile {
     fn open_with_policy(
         path: &Path,
         map_small: bool,
+        threshold: u64,
         map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>,
     ) -> Result<Self, OpenError> {
         let path = std::path::absolute(path)?;
@@ -267,7 +274,7 @@ impl TextFile {
         let mut f = options.open(&path)?;
         let stamp = Stamp::read(&f)?;
         let len = stamp.len;
-        let bytes = if len == 0 || !map_small && len < MAP_THRESHOLD {
+        let bytes = if len == 0 || !map_small && len < threshold {
             let mut v = Vec::new();
             v.try_reserve_exact(len as usize).map_err(io::Error::other)?;
             // Bound the read even if the file grows after metadata was read.

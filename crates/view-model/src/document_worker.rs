@@ -596,6 +596,7 @@ impl std::error::Error for PendingBackingRetirement {
 }
 
 struct Storage {
+    preferences: WorkerSettings,
     root: PathBuf,
     _ownership: std::fs::File,
     service: JournalService,
@@ -649,7 +650,7 @@ struct JournalState {
     barrier_durable_sequence: Option<u64>,
 }
 impl JournalState {
-    fn new(handle: JournalSession, revision: u64, sequence: u64, policy: RecoveryPolicy) -> Self {
+    fn new(handle: JournalSession, revision: u64, sequence: u64, policy: RecoveryPolicy, interval: Duration) -> Self {
         Self {
             policy,
             handle,
@@ -661,7 +662,7 @@ impl JournalState {
             flush: None,
             needs_flush: true,
             failed: false,
-            flush_due: std::time::Instant::now() + Duration::from_secs(2),
+            flush_due: std::time::Instant::now() + interval,
             generation: 0,
             promotion: None,
             barrier_durable_sequence: None,
@@ -670,10 +671,34 @@ impl JournalState {
 }
 
 pub struct DocumentWorker {
+    preferences: std::sync::Arc<std::sync::Mutex<WorkerSettings>>,
     tx: result_transport::RequestSender,
     journal_capacity: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     journal_controls: std::sync::Arc<JournalControlCredits>,
     save_destinations: std::sync::Arc<std::sync::Mutex<Vec<(DocumentId, PathBuf)>>>,
+}
+
+#[derive(Clone, Copy)]
+struct WorkerSettings {
+    threshold: u64,
+    journal_interval: Duration,
+    undo_memory: usize,
+    persist_undo: bool,
+}
+impl From<&kwil_core_commands::Settings> for WorkerSettings {
+    fn from(settings: &kwil_core_commands::Settings) -> Self {
+        Self {
+            threshold: settings.files.small_file_threshold_bytes,
+            journal_interval: Duration::from_secs(settings.files.journal_interval_seconds.into()),
+            undo_memory: settings.undo.memory_limit_bytes as usize,
+            persist_undo: settings.undo.persist,
+        }
+    }
+}
+impl Default for WorkerSettings {
+    fn default() -> Self {
+        Self::from(&kwil_core_commands::Settings::default())
+    }
 }
 
 // Deferred receipts already retain one of the 16 observer credits. Seed and
@@ -871,6 +896,9 @@ fn journal_can_run(
 }
 
 impl DocumentWorker {
+    pub fn configure(&self, settings: &kwil_core_commands::Settings) {
+        *self.preferences.lock().unwrap_or_else(|e| e.into_inner()) = WorkerSettings::from(settings);
+    }
     pub(crate) fn set_save_destinations(&self, destinations: Vec<(DocumentId, PathBuf)>) {
         debug_assert!(destinations.len() <= session::MAX_TABS * 2);
         *self.save_destinations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = destinations;
@@ -988,6 +1016,8 @@ impl DocumentWorker {
             return Err(io::Error::other("deferred document metadata capacity"));
         }
         let worker_transport = transport.clone();
+        let preferences = std::sync::Arc::new(std::sync::Mutex::new(WorkerSettings::default()));
+        let worker_preferences = preferences.clone();
         let worker = std::thread::Builder::new().name("kwil-documents".into()).spawn(move || {
             let _exit = result_transport::WorkerExit(worker_transport);
             if let Some(shared) = &_exit.0 {
@@ -1069,6 +1099,7 @@ impl DocumentWorker {
                     }
                 };
                 if let Some(request) = request {
+                    let preferences = *worker_preferences.lock().unwrap_or_else(|e| e.into_inner());
                     if let DocumentRequest::SourceBarrier(marker) = &request {
                         if source_barrier.is_none() {
                             source_barrier = Some(SourceBarrierTracker::new(*marker, storage.as_mut()));
@@ -1146,7 +1177,10 @@ impl DocumentWorker {
                         }
                         DocumentRequest::OpenChecked { ticket, path, file } => {
                             let detected = if storage.is_some() {
-                                binary.detect(ticket, path, file)
+                                {
+                                    binary.threshold = preferences.threshold;
+                                    binary.detect(ticket, path, file)
+                                }
                             } else {
                                 Err(io::Error::other("Workspace storage is not prepared"))
                             };
@@ -1282,7 +1316,10 @@ impl DocumentWorker {
                                         .as_mut()
                                         .ok_or_else(|| io::Error::other("Workspace storage is not prepared"))?;
                                     reserve_transport(storage, document)?;
-                                    let file = kwil_core_workspace::open_for_editing(&path)?;
+                                    let file = kwil_core_workspace::open_for_editing_with_threshold(
+                                        &path,
+                                        preferences.threshold,
+                                    )?;
                                     storage.encoding.open(path.clone(), file.clone(), None, &cancel, |mut preview| {
                                         // Normal preview decoding can expand malformed bytes
                                         // into escapes. Bound the text-exit cache as well as
@@ -1397,7 +1434,10 @@ impl DocumentWorker {
                                             .path()
                                             .ok_or_else(|| io::Error::other("Open a file from disk first"))?
                                             .to_path_buf();
-                                        let file = kwil_core_workspace::open_for_editing(&path)?;
+                                        let file = kwil_core_workspace::open_for_editing_with_threshold(
+                                            &path,
+                                            preferences.threshold,
+                                        )?;
                                         let prepared =
                                             state.encoding.open(path, file, encoding, &cancel, |_| Ok(()))?;
                                         finish_journal(state, document, journal)?;
@@ -1419,7 +1459,10 @@ impl DocumentWorker {
                                             .document()
                                             .path()
                                             .ok_or_else(|| io::Error::other("Open a file from disk first"))?;
-                                        let seen = kwil_core_workspace::open_for_editing(path)?;
+                                        let seen = kwil_core_workspace::open_for_editing_with_threshold(
+                                            path,
+                                            preferences.threshold,
+                                        )?;
                                         finish_journal(state, document, journal)?;
                                         reseed = true;
                                         editor.reset_file_policy_observer();
@@ -1466,7 +1509,8 @@ impl DocumentWorker {
                             complete(DocumentResult::Replaced { key, operation, editor, result });
                         }
                         DocumentRequest::Prepare { root } => {
-                            let prepared = prepare(root).map(|(prepared, state)| {
+                            let prepared = prepare_with_settings(root, preferences).map(|(prepared, state)| {
+                                *worker_preferences.lock().unwrap_or_else(|e| e.into_inner()) = state.preferences;
                                 storage = Some(state);
                                 prepared
                             });
@@ -1502,8 +1546,13 @@ impl DocumentWorker {
                                 let now = std::time::Instant::now();
                                 // A pending marker drains accepted checkpoint work;
                                 // younger requests must not restart its debounce.
-                                session_due =
-                                    Some(if source_barrier.is_some() { now } else { now + Duration::from_secs(2) });
+                                session_due = Some(if source_barrier.is_some() {
+                                    now
+                                } else {
+                                    now + storage
+                                        .as_ref()
+                                        .map_or(preferences.journal_interval, |s| s.preferences.journal_interval)
+                                });
                             }
                         }
                         DocumentRequest::Recover { tab } => {
@@ -1512,19 +1561,30 @@ impl DocumentWorker {
                                     storage.as_mut().ok_or_else(|| io::Error::other("Recovery unavailable"))?;
                                 let path = storage.root.join(format!("{}.kwj", tab.id.0));
                                 if path.try_exists()? {
-                                    let (document, recovered, _, origins) =
-                                        recover_prepared(&storage.root, &mut storage.encoding, path, &tab)?;
+                                    let (document, recovered, _, origins) = recover_configured(
+                                        &storage.root,
+                                        &mut storage.encoding,
+                                        path,
+                                        &tab,
+                                        storage.preferences,
+                                    )?;
                                     let handle = resume(&storage.service, recovered)?;
                                     let revision = document.revision();
-                                    let mut journal =
-                                        JournalState::new(handle, revision, 0, document_policy(&document));
+                                    let mut journal = JournalState::new(
+                                        handle,
+                                        revision,
+                                        0,
+                                        document_policy(&document),
+                                        storage.preferences.journal_interval,
+                                    );
                                     journal.origins = origins;
                                     storage.journals.insert(tab.id, journal);
                                     Ok(document)
                                 } else if let Some(path) = &tab.path {
-                                    kwil_core_workspace::open_for_editing(path).and_then(|file| {
-                                        storage.encoding.open(path.clone(), file, None, &cancel, |_| Ok(()))
-                                    })
+                                    kwil_core_workspace::open_for_editing_with_threshold(path, preferences.threshold)
+                                        .and_then(|file| {
+                                            storage.encoding.open(path.clone(), file, None, &cancel, |_| Ok(()))
+                                        })
                                 } else if tab.revision == tab.saved_revision && tab.recovery_path.is_none() {
                                     Ok(Document::new())
                                 } else {
@@ -1538,7 +1598,7 @@ impl DocumentWorker {
                             });
                         }
                         DocumentRequest::Open { document, revision, path } => {
-                            match kwil_core_workspace::open_for_editing(&path) {
+                            match kwil_core_workspace::open_for_editing_with_threshold(&path, preferences.threshold) {
                                 Ok(file) => {
                                     let result = match storage.as_mut() {
                                         Some(storage) => storage.encoding.open(
@@ -1929,7 +1989,7 @@ impl DocumentWorker {
         if let Some(transport) = transport {
             transport.install_worker(worker);
         }
-        Ok(Self { tx, journal_capacity, journal_controls, save_destinations })
+        Ok(Self { preferences, tx, journal_capacity, journal_controls, save_destinations })
     }
 
     /// Full admission returns ownership. Callers must retain/retry or explicitly
@@ -1994,6 +2054,7 @@ impl DocumentWorker {
         let (tx, rx) = mpsc::sync_channel(capacity);
         (
             Self {
+                preferences: Default::default(),
                 tx: result_transport::RequestSender::new(tx, None),
                 journal_capacity: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(16)),
                 journal_controls: std::sync::Arc::new(JournalControlCredits::new()),
@@ -2036,7 +2097,21 @@ fn validate_save_destination(
     Ok(())
 }
 
+#[cfg(test)]
 fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
+    prepare_with_settings(root, WorkerSettings::default())
+}
+
+fn prepare_with_settings(
+    root: Option<PathBuf>,
+    mut preferences: WorkerSettings,
+) -> io::Result<(PreparedWorkspace, Storage)> {
+    if root.is_none() {
+        let exe = std::env::current_exe()?;
+        let path = kwil_core_commands::Settings::path(&exe).map_err(io::Error::other)?;
+        preferences =
+            WorkerSettings::from(&kwil_core_commands::Settings::load(&path).map(|r| r.settings).unwrap_or_default());
+    }
     let root = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
     #[cfg(unix)]
     {
@@ -2045,7 +2120,7 @@ fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(&root)?;
-    prepare_root(root)
+    prepare_root_configured(root, preferences)
 }
 
 fn resolve_root(root: Option<PathBuf>, override_root: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
@@ -2063,7 +2138,12 @@ fn resolve_root(root: Option<PathBuf>, override_root: Option<std::ffi::OsString>
     })
 }
 
+#[cfg(test)]
 fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
+    prepare_root_configured(root, WorkerSettings::default())
+}
+
+fn prepare_root_configured(root: PathBuf, preferences: WorkerSettings) -> io::Result<(PreparedWorkspace, Storage)> {
     let ownership = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2084,7 +2164,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
     )?;
     let cancel = AtomicBool::new(false);
     let mut session = session::load_session(&root.join("session.kws"))?;
-    let service = JournalService::spawn(Duration::from_secs(2))?;
+    let service = JournalService::spawn(preferences.journal_interval)?;
     let mut documents = Vec::new();
     let mut orphans = HashMap::new();
     let mut journals = HashMap::new();
@@ -2129,7 +2209,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
             first_visible_line: 0,
             first_byte_column: 0,
         };
-        let recovered = recover_prepared(&root, &mut encoding, path.clone(), &metadata).and_then(
+        let recovered = recover_configured(&root, &mut encoding, path.clone(), &metadata, preferences).and_then(
             |(mut document, recovered, base, origins)| {
                 mark_recovered_unsaved(&mut document)?;
                 Ok((document, recovered, base, origins))
@@ -2169,19 +2249,20 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
         let result = if paths.contains_key(&tab.id) {
             let recovered = match orphans.remove(&tab.id) {
                 Some(recovered) => recovered,
-                None => recover_prepared(&root, &mut encoding, paths[&tab.id].clone(), tab)
+                None => recover_configured(&root, &mut encoding, paths[&tab.id].clone(), tab, preferences)
                     .map(|(d, r, _, origins)| (d, r, origins)),
             };
             recovered.and_then(|(document, recovered, origins)| {
                 let handle = resume(&service, recovered)?;
                 let revision = document.revision();
-                let mut journal = JournalState::new(handle, revision, 0, document_policy(&document));
+                let mut journal =
+                    JournalState::new(handle, revision, 0, document_policy(&document), preferences.journal_interval);
                 journal.origins = origins;
                 journals.insert(tab.id, journal);
                 Ok(document)
             })
         } else if let Some(path) = &tab.path {
-            kwil_core_workspace::open_for_editing(path)
+            kwil_core_workspace::open_for_editing_with_threshold(path, preferences.threshold)
                 .and_then(|file| encoding.open(path.clone(), file, None, &cancel, |_| Ok(())))
         } else if tab.revision != tab.saved_revision || tab.recovery_path.is_some() {
             Err(io::Error::other("Unsaved document has no complete recovery journal"))
@@ -2202,6 +2283,7 @@ fn prepare_root(root: PathBuf) -> io::Result<(PreparedWorkspace, Storage)> {
     Ok((
         PreparedWorkspace { session, documents },
         Storage {
+            preferences,
             root,
             _ownership: ownership,
             service,
@@ -2382,7 +2464,7 @@ fn seed_journal(
                 first_byte_column: 0,
             });
         let (replayed, recovered, _, restored_origins) =
-            recover_prepared(&storage.root, &mut storage.encoding, journal_path, &metadata)?;
+            recover_configured(&storage.root, &mut storage.encoding, journal_path, &metadata, storage.preferences)?;
         if document_policy(&replayed).raw_bytes != policy.raw_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2430,7 +2512,7 @@ fn seed_journal(
             }
         }
     };
-    let mut state = JournalState::new(handle, revision, sequence, policy);
+    let mut state = JournalState::new(handle, revision, sequence, policy, storage.preferences.journal_interval);
     state.origins = origins;
     state.seed_origins = seed_origins;
     state.generation = generation;
@@ -3001,7 +3083,7 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
                         storage.transports.remove(&document);
                         storage.finished_journals.remove(&document);
                         journal.needs_flush = false;
-                        journal.flush_due = std::time::Instant::now() + Duration::from_secs(2);
+                        journal.flush_due = std::time::Instant::now() + storage.preferences.journal_interval;
                         complete(DocumentResult::JournalDurable {
                             document,
                             revision: journal.revision,
@@ -3068,7 +3150,7 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
                 Ok(receiver) => {
                     journal.flush = Some((journal.sequence, receiver));
                     journal.needs_flush = false;
-                    journal.flush_due = std::time::Instant::now() + Duration::from_secs(2);
+                    journal.flush_due = std::time::Instant::now() + storage.preferences.journal_interval;
                 }
                 Err(TrySendError::Full(_)) => {}
                 Err(_) => {
@@ -3085,6 +3167,7 @@ fn poll_journals(storage: &mut Storage, complete: &impl Fn(DocumentResult)) {
     }
 }
 
+#[cfg(test)]
 fn recover_prepared(
     root: &std::path::Path,
     encoding: &mut encoding_runtime::EncodingRuntime,
@@ -3094,12 +3177,41 @@ fn recover_prepared(
     recover_prepared_with_add_limit(root, encoding, path, tab, 8 * 1024 * 1024)
 }
 
+#[cfg(test)]
 fn recover_prepared_with_add_limit(
     root: &std::path::Path,
     encoding: &mut encoding_runtime::EncodingRuntime,
     path: PathBuf,
     tab: &Tab,
     add_memory_bytes: usize,
+) -> io::Result<(Document, RecoveredJournal, JournalBase, Option<provenance::OriginRegistry>)> {
+    recover_with_preferences(
+        root,
+        encoding,
+        path,
+        tab,
+        add_memory_bytes,
+        WorkerSettings { persist_undo: true, ..Default::default() },
+    )
+}
+
+fn recover_configured(
+    root: &std::path::Path,
+    encoding: &mut encoding_runtime::EncodingRuntime,
+    path: PathBuf,
+    tab: &Tab,
+    preferences: WorkerSettings,
+) -> io::Result<(Document, RecoveredJournal, JournalBase, Option<provenance::OriginRegistry>)> {
+    recover_with_preferences(root, encoding, path, tab, 8 * 1024 * 1024, preferences)
+}
+
+fn recover_with_preferences(
+    root: &std::path::Path,
+    encoding: &mut encoding_runtime::EncodingRuntime,
+    path: PathBuf,
+    tab: &Tab,
+    add_memory_bytes: usize,
+    preferences: WorkerSettings,
 ) -> io::Result<(Document, RecoveredJournal, JournalBase, Option<provenance::OriginRegistry>)> {
     use provenance::{
         decode::DecodeLimits,
@@ -3119,10 +3231,7 @@ fn recover_prepared_with_add_limit(
             replay: ReplayLimits {
                 core: kwil_core_text::RecoveryLimits {
                     add_memory_bytes,
-                    undo_memory_bytes: usize::try_from(
-                        kwil_core_commands::settings::Settings::default().undo.memory_limit_bytes,
-                    )
-                    .unwrap_or(usize::MAX),
+                    undo_memory_bytes: preferences.undo_memory,
                     max_origins,
                     max_records: 1 << 20,
                     max_pieces: 1 << 20,
@@ -3144,7 +3253,9 @@ fn recover_prepared_with_add_limit(
             max_replacements: 1 << 20,
         },
     )?;
-    recovery.retain_undo_history();
+    if preferences.persist_undo {
+        recovery.retain_undo_history();
+    }
     match encoding.recover(recovery, path.clone(), tab, max_origins, 8 * 1024 * 1024, &AtomicBool::new(false)) {
         Ok((document, journal, base, origins)) => Ok((document, journal, base, Some(origins))),
         // The authenticated consumer identifies the old raw base explicitly.
@@ -4433,6 +4544,40 @@ mod tests {
         drop(document);
         drop(storage);
     }
+    #[test]
+    fn kw46_runtime_small_file_threshold_reaches_the_open_worker() {
+        use crate::{View, Workspace};
+        let scratch = Scratch::new();
+        let path = scratch.0.join("tiny.txt");
+        std::fs::write(&path, b"tiny\n").unwrap();
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let mut settings = kwil_core_commands::Settings::default();
+        settings.files.small_file_threshold_bytes = 0;
+        workspace.set_editor_settings(&settings);
+        let (tx, rx) = mpsc::channel();
+        workspace
+            .start_document_worker_at(Some(scratch.0.clone()), move |r| {
+                let _ = tx.send(r);
+            })
+            .unwrap();
+        drive(&mut workspace, &rx, Workspace::recovery_ready);
+        let id = workspace.open_path(path).unwrap();
+        drive(&mut workspace, &rx, |w| w.view(id).is_some_and(|v| v.editor().is_some()));
+        assert!(!workspace.view(id).unwrap().file.as_ref().unwrap().is_resident());
+        workspace.file_command("file.quit").unwrap();
+        drive(&mut workspace, &rx, Workspace::wants_exit);
+        drop(workspace);
+        wait_stopped(&rx);
+    }
+    #[test]
+    fn kw46_runtime_journal_interval_reaches_workspace_storage() {
+        let scratch = Scratch::new();
+        let mut settings = kwil_core_commands::Settings::default();
+        settings.files.journal_interval_seconds = 17;
+        let (_, storage) = prepare_root_configured(scratch.0.clone(), WorkerSettings::from(&settings)).unwrap();
+        assert_eq!(storage.preferences.journal_interval, Duration::from_secs(17));
+        stop_storage(storage);
+    }
 
     #[test]
     fn recovered_raw_and_encoded_spills_remain_worker_owned_after_frontend_drop() {
@@ -4716,6 +4861,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(16);
         let capacity = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
         let worker = DocumentWorker {
+            preferences: Default::default(),
             tx: result_transport::RequestSender::new(tx, None),
             journal_capacity: capacity.clone(),
             journal_controls: std::sync::Arc::new(JournalControlCredits::new()),
@@ -4871,8 +5017,9 @@ mod tests {
     }
 
     #[test]
-    fn hot_exit_recovered_journal_edits_can_be_undone_and_redone() {
+    fn kw46_runtime_undo_persist_recovers_journal_edits_for_undo_and_redo() {
         hot_exit_roundtrip(true);
+        hot_exit_roundtrip(false);
     }
 
     fn hot_exit_roundtrip(check_history: bool) {
@@ -4882,11 +5029,13 @@ mod tests {
         let settings_path = scratch.0.join("settings.toml");
         write_settings_atomic(&settings_path, None, "[tabs]\nlayout='vertical'\n[files]\nrestore_session=true\n")
             .unwrap();
-        let settings = Settings::load(&settings_path).unwrap().settings;
+        let mut settings = Settings::load(&settings_path).unwrap().settings;
+        settings.undo.persist = check_history;
         let named = scratch.0.join("named.txt");
         std::fs::write(&named, b"one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
         let (sender, receiver) = mpsc::channel();
         let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.set_editor_settings(&settings);
         workspace.set_rows(2);
         workspace
             .execute(
@@ -4911,6 +5060,7 @@ mod tests {
         drive(&mut workspace, &receiver, |workspace| {
             workspace.view(second).is_some_and(|view| view.editor().is_some())
         });
+        workspace.set_editor_settings(&settings);
         workspace.set_rows(2);
         workspace
             .execute("navigation.goToLine", &CommandArgs { line: Some(3), column: Some(2), ..Default::default() }, 1)
@@ -4930,6 +5080,7 @@ mod tests {
             workspace.execute("edit.undo", &CommandArgs::default(), 1).unwrap();
         }
         workspace.activate(first);
+        workspace.set_editor_settings(&settings);
         workspace.set_rows(2);
         workspace
             .execute("navigation.goToLine", &CommandArgs { line: Some(4), column: Some(2), ..Default::default() }, 1)
@@ -4964,7 +5115,9 @@ mod tests {
 
         let (sender, receiver) = mpsc::channel();
         let mut restarted = Workspace::new(View::new(None)).unwrap();
-        let reloaded_settings = Settings::load(&settings_path).unwrap().settings;
+        let mut reloaded_settings = Settings::load(&settings_path).unwrap().settings;
+        reloaded_settings.undo.persist = check_history;
+        restarted.set_editor_settings(&reloaded_settings);
         assert_eq!(reloaded_settings.tabs.layout, TabLayout::Vertical);
         restarted.set_session_restore(reloaded_settings.files.restore_session);
         restarted
@@ -4989,6 +5142,12 @@ mod tests {
             document.snapshot().write_to(&mut bytes).unwrap();
             assert_eq!(bytes, expected_bytes[&tab.id]);
             assert!(document.is_dirty());
+        }
+        if !check_history {
+            assert!(
+                !restarted.editor_mut().unwrap().document.buffer.undo(),
+                "disabled persisted undo must not restore an earlier edit"
+            );
         }
         let geometry = restarted.tab_geometry(
             TabMetrics { width: 800, height: 400, cell_width: 8, cell_height: 16, scrollbar: 14 },

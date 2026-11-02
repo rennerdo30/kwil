@@ -230,6 +230,7 @@ struct Retry {
 }
 
 pub(super) struct Host {
+    log_settings: kwil_core_commands::settings::LogSettings,
     follow_watch: Option<kwil_view_model::log_follow::FollowWatch>,
     follow_document: Option<kwil_view_model::SessionDocumentId>,
     following: bool,
@@ -289,6 +290,7 @@ impl Default for Host {
     fn default() -> Self {
         let filter = Filter::default();
         Self {
+            log_settings: Default::default(),
             follow_watch: None,
             follow_document: None,
             following: false,
@@ -346,6 +348,17 @@ fn all_levels() -> u8 {
     Level::ALL.iter().fold(0, |mask, level| mask | level.bit())
 }
 impl Host {
+    pub fn configure(&mut self, settings: &kwil_core_commands::settings::LogSettings) {
+        if self.log_settings != *settings {
+            self.log_settings = settings.clone();
+            if let Some(session) = &self.session {
+                session.configure(settings);
+            }
+            self.expected = None;
+            self.loaded = None;
+            self.serial = self.serial.wrapping_add(1);
+        }
+    }
     pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send)> {
         self.session.as_ref().and_then(|session| session.panic_payload())
     }
@@ -1073,7 +1086,10 @@ impl App {
             match LogSession::start_with_index_limit(limit, move || {
                 let _ = proxy.send_event(UserEvent::LogReady);
             }) {
-                Ok(session) => self.logs.session = Some(session),
+                Ok(session) => {
+                    session.configure(&self.logs.log_settings);
+                    self.logs.session = Some(session);
+                }
                 Err(error) => {
                     self.logs.want = false;
                     self.logs.error = Some(format!("Log worker unavailable: {error}"));
@@ -1778,6 +1794,10 @@ pub(super) fn draw_body(
         );
         draw_text(pixels, stride, font, 0, y, number.as_bytes(), gutter_columns, gutter_fg(), gutter_bg());
         draw_text(pixels, stride, font, gutter, y, &row.bytes, columns, fg(), row_bg);
+        if let Some(color) = row.color {
+            draw_text(pixels, stride, font, gutter, y, &row.bytes, columns, color, row_bg);
+            continue;
+        }
         if row.bytes.iter().take(columns).all(|byte| (32..127).contains(byte)) {
             for span in &row.spans {
                 let start = (span.range.start as u64)
@@ -1975,6 +1995,7 @@ mod tests {
 
     fn row(bytes: &[u8]) -> ViewportRow {
         ViewportRow {
+            color: None,
             line: 41,
             line_start: 300,
             line_end: 300 + bytes.len() as u64,
@@ -2034,6 +2055,7 @@ mod tests {
         host.row_bytes = 1024;
         let rows = (0..300)
             .map(|index| ViewportRow {
+                color: None,
                 line: 1000 + index,
                 line_start: index * 5,
                 line_end: index * 5 + 4,

@@ -586,6 +586,7 @@ struct App {
     settings: Settings,
     zoom: zoom::Zoom,
     policy: RenderPolicy,
+    smooth_scroll: remote::SmoothScroll,
     on_event: Box<dyn FnMut(GuiEvent)>,
     #[cfg(feature = "gpu")]
     gpu: Option<gpu::Gpu>,
@@ -785,6 +786,7 @@ pub fn run_workspace_with_external_open(
                 settings: Settings::default(),
                 zoom: zoom::Zoom::default(),
                 policy: RenderPolicy::new(Default::default(), remote::detect()),
+                smooth_scroll: Default::default(),
                 on_event,
                 #[cfg(feature = "gpu")]
                 gpu: None,
@@ -3181,7 +3183,9 @@ fn draw_text(
 ) {
     let (cw, ch) = (font.cw, font.ch);
     // Pure ASCII avoids grapheme allocation and shaping entirely.
-    if text.iter().take(max_cols).all(|b| (32..127).contains(b)) {
+    if !font.shapes_ligatures(&text[..text.len().min(max_cols)])
+        && text.iter().take(max_cols).all(|b| (32..127).contains(b))
+    {
         for (i, &b) in text.iter().take(max_cols).enumerate() {
             if b != b' ' {
                 copy_tile(buf, stride, x + i * cw, y, cw, ch, font.tile(b, fg, bg));
@@ -3193,7 +3197,7 @@ fn draw_text(
     // Digits and neutral spaces belong to the same directional paragraph as
     // surrounding RTL text. Splitting them through the ASCII path loses UAX9
     // ordering. Keep all-ASCII and LTR-only mixed text on their existing paths.
-    if cells.iter().any(|c| shaping::needs_bidi(&c.text)) {
+    if font.shapes_ligatures(&text[..text.len().min(max_cols)]) || cells.iter().any(|c| shaping::needs_bidi(&c.text)) {
         let mut paragraph = String::new();
         for c in &cells {
             if c.text == "\t" {
@@ -3344,13 +3348,31 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let allowed = self.policy.smooth_scrolling_allowed()
+            && !self.settings_open()
+            && !self.palette_open()
+            && !self.logs.is_open()
+            && !self.view.hex_active();
+        let step = self.smooth_scroll.take(
+            (self.view.active_id().0, self.view.input_epoch()),
+            allowed,
+            std::time::Instant::now(),
+        );
+        if step != 0 {
+            self.wrap_sync_live();
+            if !self.wrap_wheel(step, 0) {
+                let damage = self.view.scroll(step);
+                self.apply(damage);
+            }
+        }
         self.sync_desktop_window(el);
         self.accessibility_sync();
         self.sync_close_dialog();
         self.resume_external_open();
         // No timer survives a consumed resize. This is a dirty-geometry wake,
         // never a recurring animation/idle frame source.
-        el.set_control_flow(self.resize_ready_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+        let next = self.resize_ready_at.into_iter().chain(self.smooth_scroll.next).min();
+        el.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gfx.is_some() {
@@ -3741,13 +3763,16 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::SettingsReady(settings, language_mappings) => {
                 self.settings_loaded = true;
                 self.apply_language_mappings(language_mappings);
-                let font_changed =
-                    settings.font.family != self.settings.font.family || settings.font.size != self.settings.font.size;
+                let font_changed = settings.font != self.settings.font;
                 let tabs_changed = settings.editor.tab_size != self.settings.editor.tab_size;
                 let layout_changed = settings.tabs.layout != self.settings.tabs.layout;
                 let keymap_changed =
                     settings.keymap != self.settings.keymap || settings.bindings != self.settings.bindings;
                 self.settings = *settings;
+                self.logs.configure(&self.settings.log);
+                if let Some(host) = self.highlighting.as_mut() {
+                    host.configure(&self.settings.syntax);
+                }
                 self.themes.settings_ready(&self.settings.theme);
                 self.theme_hits.clear();
                 if !self.themes.is_started()
@@ -3802,6 +3827,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.reload_font();
                     return;
                 }
+                font.apply_preferences(&self.settings.font);
                 font.tab_size = self.settings.editor.tab_size as usize;
                 let proxy = self.proxy.clone();
                 font.enable_unicode(self.settings.font.family.clone(), move |tile, generation| {
@@ -4522,6 +4548,14 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.wrap_sync_live();
+                if horizontal == 0 && !self.mods.shift_key() && self.policy.smooth_scrolling_allowed() {
+                    self.smooth_scroll.push(
+                        (self.view.active_id().0, self.view.input_epoch()),
+                        vertical,
+                        std::time::Instant::now(),
+                    );
+                    return;
+                }
                 if self.wrap_wheel(vertical, horizontal) {
                     return;
                 }

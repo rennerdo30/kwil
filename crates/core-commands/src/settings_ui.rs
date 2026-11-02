@@ -181,20 +181,25 @@ pub const SCHEMA: &[SettingSpec] = &[
     spec!("font.family", "Font family", Appearance, "Nonempty font family name.", SettingKind::Text, |s| {
         SettingValue::Text(s.font.family.clone())
     }),
-    spec!("font.size", "Font size", Appearance, "Positive finite font size.", SettingKind::Float, |s| {
+    spec!("font.size", "Font size", Appearance, "Font size from 6 to 96 points.", SettingKind::Float, |s| {
         SettingValue::Float(s.font.size.into())
     }),
     spec!(
         "font.line_height",
         "Line height",
         Appearance,
-        "Positive finite line height multiplier.",
+        "GUI line height from 1 to 3 times the font size. Applies live.",
         SettingKind::Float,
         |s| SettingValue::Float(s.font.line_height.into())
     ),
-    spec!("font.ligatures", "Ligatures", Appearance, "Enable font ligatures.", SettingKind::Bool, |s| {
-        SettingValue::Bool(s.font.ligatures)
-    }),
+    spec!(
+        "font.ligatures",
+        "Ligatures",
+        Appearance,
+        "Enable GUI font ligatures. Terminal typography belongs to the terminal.",
+        SettingKind::Bool,
+        |s| { SettingValue::Bool(s.font.ligatures) }
+    ),
     spec!(
         "theme.name",
         "Theme",
@@ -223,7 +228,7 @@ pub const SCHEMA: &[SettingSpec] = &[
         "files.small_file_threshold_bytes",
         "Small file threshold",
         Files,
-        "Files below this byte count use resident storage.",
+        "Resident limit from 0 to 67108864 bytes. Applies on next open.",
         SettingKind::Integer,
         |s| SettingValue::Integer(s.files.small_file_threshold_bytes.min(i64::MAX as u64) as i64)
     ),
@@ -242,7 +247,7 @@ pub const SCHEMA: &[SettingSpec] = &[
         "files.journal_interval_seconds",
         "Journal interval",
         Files,
-        "Positive seconds between recovery journal writes.",
+        "Recovery interval from 1 to 300 seconds. Applies to the next workspace.",
         SettingKind::Integer,
         |s| SettingValue::Integer(s.files.journal_interval_seconds.into())
     ),
@@ -349,13 +354,18 @@ pub const SCHEMA: &[SettingSpec] = &[
         "undo.memory_limit_bytes",
         "Undo memory",
         Advanced,
-        "Positive byte limit for undo memory.",
+        "Undo memory from 1 to 536870912 bytes. Applies live.",
         SettingKind::Integer,
         |s| SettingValue::Integer(s.undo.memory_limit_bytes.min(i64::MAX as u64) as i64)
     ),
-    spec!("undo.persist", "Persist undo", Advanced, "Keep undo history between sessions.", SettingKind::Bool, |s| {
-        SettingValue::Bool(s.undo.persist)
-    }),
+    spec!(
+        "undo.persist",
+        "Persist undo",
+        Advanced,
+        "Restore undo history on the next workspace open. Recovery of document text is always enabled.",
+        SettingKind::Bool,
+        |s| { SettingValue::Bool(s.undo.persist) }
+    ),
     spec!(
         "compare.ignore_whitespace",
         "Ignore whitespace",
@@ -384,7 +394,7 @@ pub const SCHEMA: &[SettingSpec] = &[
         "syntax.full_parse_limit_bytes",
         "Full parse limit",
         Advanced,
-        "Above this byte count use viewport highlighting.",
+        "Full parse limit from 0 to 20971520 bytes. Above it use viewport highlighting. Applies live.",
         SettingKind::Integer,
         |s| SettingValue::Integer(s.syntax.full_parse_limit_bytes.min(i64::MAX as u64) as i64)
     ),
@@ -403,7 +413,7 @@ pub const SCHEMA: &[SettingSpec] = &[
         "log.highlight_rules",
         "Log highlights",
         Advanced,
-        "Named patterns for log highlighting. Edit one entry at a time.",
+        "Regex patterns to #RRGGBB colours. Up to 64 rules of 1024 bytes each. Applies live to visible log rows.",
         SettingKind::StringMap,
         |s| SettingValue::StringMap(s.log.highlight_rules.clone())
     ),
