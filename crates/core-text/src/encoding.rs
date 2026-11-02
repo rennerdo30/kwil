@@ -682,25 +682,36 @@ impl EncodedFile {
         let end = (range.end as usize).max(start);
         let base = self.alignment_base(start)?;
         let window_end = (end as u64 + 8).min(self.file.len());
-        let mut bytes = vec![0; (window_end - base as u64) as usize];
-        self.file.read_into(base as u64, &mut bytes)?;
+        let bytes = if window_end - base as u64 <= crate::READ_CHUNK as u64 {
+            self.file.read_range(base as u64..window_end)?
+        } else {
+            let mut bytes = vec![0; (window_end - base as u64) as usize];
+            self.file.read_into(base as u64, &mut bytes)?;
+            Cow::Owned(bytes)
+        };
         let aligned =
             self.aligned(&bytes, start - base..end - base, if base == 0 { self.detection.bom_len } else { 0 })?;
         if aligned.len() > MAX_VIEWPORT_BYTES {
             return Err(EncodingError::ViewportTooLarge);
         }
         let source = (base + aligned.start) as u64..(base + aligned.end) as u64;
-        let raw = &bytes[aligned];
+        let raw = &bytes[aligned.clone()];
         let mut segments = Vec::new();
         let had_errors;
         if self.detection.encoding == Encoding::UTF8 {
             had_errors = simdutf8::basic::from_utf8(raw).is_err();
-            utf8_segments(raw, |segment| {
-                segments.push(match segment {
-                    DisplaySegment::Text(text) => DisplaySegment::Text(Cow::Owned(text.into_owned())),
-                    DisplaySegment::Invalid(bytes) => DisplaySegment::Invalid(Cow::Owned(bytes.into_owned())),
-                })
-            });
+            match &bytes {
+                Cow::Borrowed(source) => {
+                    let source = *source;
+                    utf8_segments(&source[aligned], |segment| segments.push(segment));
+                }
+                Cow::Owned(_) => utf8_segments(raw, |segment| {
+                    segments.push(match segment {
+                        DisplaySegment::Text(text) => DisplaySegment::Text(Cow::Owned(text.into_owned())),
+                        DisplaySegment::Invalid(bytes) => DisplaySegment::Invalid(Cow::Owned(bytes.into_owned())),
+                    })
+                }),
+            }
         } else if self.detection.encoding.utf32() {
             let mut text = String::new();
             let mut at = 0;

@@ -33,7 +33,7 @@ impl LineSource for Fragmented<'_> {
             if chunk.len() > MAX_LINE_BYTES - scratch.len() {
                 return Err(DiffError::TooLarge);
             }
-            scratch.extend_from_slice(&chunk);
+            scratch.extend_from_slice(chunk);
         }
         Ok(Line::Scratch)
     }
