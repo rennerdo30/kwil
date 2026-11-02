@@ -46,6 +46,15 @@ the original process are reported separately. Raw logs and timestamps are
 retained even on failure. Targets/hard limits remain 25/60 ms empty, 40/100 ms
 file and 20/50 ms second launch; none of these numbers block CI yet.
 
+Windows records Popen and native `CreateProcess` entry/return timestamps plus
+the child's OS creation time in each case's `spawn` object. This separates
+parent-side preparation and process creation from loader/CRT work before the
+first Rust `process entry` mark. `app entry` follows console attachment;
+recovery/argument and IPC marks follow it. Individual DLL initializers share
+the loader/CRT interval. This probe launches `kwil.exe` directly: it does not
+include a `kwil.com` to `kwil.exe` handoff. The console entry also attempts
+authenticated forwarding before it considers starting a GUI child.
+
 An informational palette case generates a 100k-file tree in the hosted runner's
 temporary directory, discovers it through the shipped catalogue, and measures
 one `file-0000` query through the shared palette worker until fresh results are

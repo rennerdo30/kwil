@@ -143,18 +143,20 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
 }
 
 pub fn run() -> ExitCode {
+    speed_mark("process entry");
     #[cfg(windows)]
     windows::attach_parent_console();
     run_app(false)
 }
 
 pub fn run_console() -> ExitCode {
+    speed_mark("console process entry");
     run_app(true)
 }
 
 fn run_app(console_launcher: bool) -> ExitCode {
     speed_mark("app entry");
-    let presentation = || {
+    let presentation = |platform| {
         #[cfg(windows)]
         let streams = windows::standard_streams();
         #[cfg(not(windows))]
@@ -163,13 +165,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
         } else {
             startup::StandardStreams::Redirected
         };
-        startup::error_presentation(
-            std::env::args_os().skip(1),
-            console_launcher,
-            streams,
-            &ProcessEnv,
-            current_platform(),
-        )
+        startup::error_presentation(std::env::args_os().skip(1), console_launcher, streams, &ProcessEnv, platform)
     };
     let dialog = |message: &str| {
         #[cfg(windows)]
@@ -177,9 +173,12 @@ fn run_app(console_launcher: bool) -> ExitCode {
         #[cfg(not(windows))]
         let _ = message;
     };
-    if let Err(code) =
-        startup::recover(presentation, kwil_update::recover_on_startup, |message| eprintln!("{message}"), dialog)
-    {
+    if let Err(code) = startup::recover(
+        || presentation(current_platform()),
+        kwil_update::recover_on_startup,
+        |message| eprintln!("{message}"),
+        dialog,
+    ) {
         return code;
     }
     let args = match parse_args() {
@@ -310,8 +309,11 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
     // An accepted handoff needs no desktop, terminal or renderer. Select a
     // frontend only when this process must actually start one.
+    speed_mark("frontend selection");
+    let platform = current_platform();
+    let presentation = presentation(platform);
     let in_terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, current_platform());
+    let frontend = choose_frontend(&ProcessEnv, Flags { gui: args.gui, tui: args.tui }, platform);
     if let Frontend::Error(e) = frontend {
         eprintln!("kwil: {e}");
         return ExitCode::from(2);
@@ -328,7 +330,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
             Err(e) => {
                 let message = format!("{e}; no interactive terminal is attached");
-                presentation().report(&format!("kwil: {message}"), |message| eprintln!("{message}"), dialog);
+                presentation.report(&format!("kwil: {message}"), |message| eprintln!("{message}"), dialog);
                 return ExitCode::FAILURE;
             }
         }
@@ -376,7 +378,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             // Fatal process exit retains the original input or partial
             // workspace. This is not successful source retirement.
             let retained = std::mem::ManuallyDrop::new(refusal);
-            presentation().report(&format!("kwil: {}", retained.error), |message| eprintln!("{message}"), dialog);
+            presentation.report(&format!("kwil: {}", retained.error), |message| eprintln!("{message}"), dialog);
             return ExitCode::FAILURE;
         }
     };
@@ -410,7 +412,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
             ControlFlow::Break(refusal) => {
                 let retained = std::mem::ManuallyDrop::new(refusal);
-                presentation().report(
+                presentation.report(
                     &format!("kwil: GUI startup retained: {:?}", retained.reason),
                     |message| eprintln!("{message}"),
                     dialog,
@@ -424,7 +426,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
                         ControlFlow::Continue(original) => original,
                         ControlFlow::Break(failure) => {
                             let retained = std::mem::ManuallyDrop::new(failure);
-                            presentation().report(
+                            presentation.report(
                                 &format!("kwil: {}", **retained),
                                 |message| eprintln!("{message}"),
                                 dialog,
@@ -434,7 +436,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
                     }
                 } else {
                     let retained = std::mem::ManuallyDrop::new(failure);
-                    presentation().report(&format!("kwil: {}", **retained), |message| eprintln!("{message}"), dialog);
+                    presentation.report(&format!("kwil: {}", **retained), |message| eprintln!("{message}"), dialog);
                     return ExitCode::FAILURE;
                 }
             }
@@ -442,7 +444,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
                 // Unexpected legacy startup refusals may also retain sources.
                 // Never reopen a file or fall back after losing its owner.
                 let retained = std::mem::ManuallyDrop::new(error);
-                presentation().report(&format!("kwil: {}", *retained), |message| eprintln!("{message}"), dialog);
+                presentation.report(&format!("kwil: {}", *retained), |message| eprintln!("{message}"), dialog);
                 return ExitCode::FAILURE;
             }
         }

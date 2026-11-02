@@ -1,4 +1,4 @@
-//! Error presentation is decided only if recovery fails, without executing CLI actions.
+//! Recovery precedes CLI actions and probes error presentation only on failure.
 use crate::frontend::{EnvLookup, Platform};
 use std::ffi::OsString;
 use std::process::ExitCode;
