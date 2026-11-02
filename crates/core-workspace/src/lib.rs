@@ -10,6 +10,7 @@ mod watcher;
 pub mod instance;
 pub mod journal;
 pub mod session;
+pub mod window_session;
 
 pub use save::{
     CompressedCheckpointOwners, CompressedSaveRetirement, CompressedSavedSnapshot, EncodedSavedSnapshot, SaveRequest,
