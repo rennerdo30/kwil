@@ -11,6 +11,7 @@ use std::{
     hash::Hasher,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone)]
@@ -29,7 +30,11 @@ pub struct Plan {
     pub matches: u64,
     page_index: u64,
     page_offset: u64,
-    pub detail: Option<(u64, u64)>,
+    selection: Arc<Selection>,
+}
+#[derive(Clone, Debug, Default)]
+struct Selection {
+    detail: Option<(u64, u64)>,
     excluded_matches: BTreeSet<(u64, u64)>,
 }
 impl Plan {
@@ -40,26 +45,30 @@ impl Plan {
         self.manifest.is_empty()
     }
     pub fn row_count(&self) -> u64 {
-        self.detail.map_or(self.len(), |(_, count)| count)
+        self.detail().map_or(self.len(), |(_, count)| count)
+    }
+    pub fn detail(&self) -> Option<(u64, u64)> {
+        self.selection.detail
     }
     pub fn match_excluded(&self, file: u64, ordinal: u64) -> bool {
-        self.excluded_matches.contains(&(file, ordinal))
+        self.selection.excluded_matches.contains(&(file, ordinal))
     }
     pub fn excluded_in_file(&self, file: u64) -> usize {
-        self.excluded_matches.range((file, 0)..=(file, u64::MAX)).count()
+        self.selection.excluded_matches.range((file, 0)..=(file, u64::MAX)).count()
     }
     pub fn include_matches(&mut self, file: u64) {
-        self.excluded_matches.retain(|&(index, _)| index != file);
+        Arc::make_mut(&mut self.selection).excluded_matches.retain(|&(index, _)| index != file);
     }
     pub fn excluded_match_count(&self) -> usize {
-        self.excluded_matches.len()
+        self.selection.excluded_matches.len()
     }
     pub fn toggle_match(&mut self, file: u64, ordinal: u64) -> Result<(), &'static str> {
-        if !self.excluded_matches.remove(&(file, ordinal)) {
-            if self.excluded_matches.len() >= INPUT_BYTES / 16 {
+        let selection = Arc::make_mut(&mut self.selection);
+        if !selection.excluded_matches.remove(&(file, ordinal)) {
+            if selection.excluded_matches.len() >= INPUT_BYTES / 16 {
                 return Err("Too many match exclusions; narrow the folder globs");
             }
-            self.excluded_matches.insert((file, ordinal));
+            selection.excluded_matches.insert((file, ordinal));
         }
         Ok(())
     }
@@ -127,7 +136,7 @@ pub(super) fn validate(task: &Task) -> Result<(), &'static str> {
     {
         return Err("folder match preview exceeds cap");
     }
-    if plan.template.len() > INPUT_BYTES || plan.excluded_matches.len() > INPUT_BYTES / 16 {
+    if plan.template.len() > INPUT_BYTES || plan.excluded_match_count() > INPUT_BYTES / 16 {
         return Err("folder template exceeds cap");
     }
     Ok(())
@@ -304,7 +313,7 @@ fn selected_recipe(
     spools: &mut SpoolOwner,
 ) -> io::Result<ReplaceRecipe> {
     let all = recipe(snapshot, &plan.search, &plan.template, key, cancel, spools)?;
-    if plan.excluded_matches.range((index, 0)..=(index, u64::MAX)).next().is_none() {
+    if plan.excluded_in_file(index) == 0 {
         return Ok(all);
     }
     if plan.excluded_in_file(index) as u64 == all.edits.len() {
@@ -399,12 +408,12 @@ fn match_page(
         return Err(io::Error::other("File changed during match preview; preview again"));
     }
     let mut plan = plan.clone();
-    plan.detail = Some((index, hit.line_number));
+    Arc::make_mut(&mut plan.selection).detail = Some((index, hit.line_number));
     Ok((plan, rows))
 }
 fn page(plan: &Plan, page: Page, cancel: &Cancellation) -> io::Result<(Plan, Vec<FileEvent>)> {
     let mut plan = plan.clone();
-    plan.detail = None;
+    Arc::make_mut(&mut plan.selection).detail = None;
     let mut index = plan.page_index;
     let mut cursor = plan.page_offset;
     while index < page.first {
@@ -520,8 +529,7 @@ pub(super) fn run(
                     matches,
                     page_index: 0,
                     page_offset: 0,
-                    detail: None,
-                    excluded_matches: BTreeSet::new(),
+                    selection: Arc::new(Selection::default()),
                 };
                 let (plan, rows) = page(&plan, Page { first: 0, len: FILE_PAGE }, cancel)?;
                 emit(SearchUpdate::Folder(Update::Preview { plan, first: 0, rows }));

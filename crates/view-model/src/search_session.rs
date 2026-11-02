@@ -310,7 +310,7 @@ impl SearchSession {
                     self.state.count = plan.matches;
                     for row in &mut self.state.files {
                         if let FileEvent::Hit(hit) = row {
-                            if plan.detail.is_none() {
+                            if plan.detail().is_none() {
                                 hit.line = counted(hit.line_number, "match", "matches").into_bytes();
                             }
                             hit.match_ranges = std::iter::once(0..0).collect();

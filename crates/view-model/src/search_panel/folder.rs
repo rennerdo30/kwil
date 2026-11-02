@@ -53,7 +53,7 @@ impl SearchPanel {
         self.mode == SearchMode::Files && self.folder.plan.is_some()
     }
     pub fn folder_match_preview(&self) -> bool {
-        self.folder.plan.as_ref().is_some_and(|plan| plan.detail.is_some())
+        self.folder.plan.as_ref().is_some_and(|plan| plan.detail().is_some())
     }
     pub fn folder_replacement_action(&self, action: &SearchAction) -> bool {
         self.folder.applying
@@ -157,7 +157,7 @@ impl SearchPanel {
                 };
                 let ordinal = self.file_first + row as u64;
                 let plan = self.folder.plan.as_mut().unwrap();
-                if let Some((file, count)) = plan.detail {
+                if let Some((file, count)) = plan.detail() {
                     if let Err(error) = plan.toggle_match(file, ordinal) {
                         return Some(Err(error.into()));
                     }
@@ -188,7 +188,7 @@ impl SearchPanel {
                 }
                 let plan = self.folder.plan.clone().unwrap();
                 self.selected = self.selected.min(session.state().files.len().saturating_sub(1));
-                if plan.detail.is_some() {
+                if plan.detail().is_some() {
                     self.selected = self.folder.files_selected;
                     self.folder_submit(
                         session,
@@ -227,7 +227,7 @@ impl SearchPanel {
                     Ok(())
                 } else {
                     let page = Page { first, len: 32 };
-                    let task = if let Some((index, _)) = plan.detail {
+                    let task = if let Some((index, _)) = plan.detail() {
                         folder_replace::Task::Matches { plan, index, page, open: view.folder_open_documents() }
                     } else {
                         folder_replace::Task::Page { plan, page }
@@ -250,7 +250,7 @@ impl SearchPanel {
                     label: format!(
                         "[{}] #{} {}",
                         if self.folder.plan.as_ref().unwrap().match_excluded(
-                            self.folder.plan.as_ref().unwrap().detail.unwrap().0,
+                            self.folder.plan.as_ref().unwrap().detail().unwrap().0,
                             self.file_first + i as u64
                         ) {
                             ' '
@@ -357,7 +357,7 @@ impl SearchPanel {
         let mut out = SearchOutcome::panel();
         let result = match update {
             folder_replace::Update::Preview { plan, .. } => {
-                let detail = plan.detail;
+                let detail = plan.detail();
                 self.folder.previewing = false;
                 self.folder.plan = Some(plan);
                 self.accept_state(session.state(), view);

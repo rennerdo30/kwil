@@ -1441,7 +1441,7 @@ mod tests {
         std::fs::write(&path, b"externally changed").unwrap();
         h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         h.settle();
-        assert_eq!(std::fs::read(path).unwrap(), b"externally changed");
+        assert_eq!(std::fs::read(&path).unwrap(), b"externally changed");
         assert!(h.host.panel.status().contains("1 skipped"));
         assert!(h.host.panel.status().contains("changed.txt"));
         std::fs::write(&path, b"needle needle").unwrap();
