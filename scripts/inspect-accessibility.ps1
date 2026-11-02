@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Executable, [string]$OutputDirectory, [string]$Revision, [switch]$WordWrap)
+param([Parameter(Mandatory=$true)][string]$Executable, [string]$OutputDirectory, [string]$Revision, [switch]$WordWrap, [switch]$WholeDocument)
 $ErrorActionPreference = 'Stop'
 if (!$Revision) { $Revision = git rev-parse HEAD }
 Write-Output "Commit $Revision; executable $Executable"
@@ -70,10 +70,12 @@ $wrapSetting = $WordWrap.IsPresent.ToString().ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $env:APPDATA 'kwil/settings.toml'), "[update]`ncheck = false`n[editor]`nword_wrap = $wrapSetting`n")
 $fixture = Join-Path $OutputDirectory 'viewport.txt'
 $japanese = -join @([char]0x65e5, [char]0x672c, [char]0x8a9e)
-[IO.File]::WriteAllText($fixture, "Accessible first line`n$japanese second line`n" + ("outside viewport`n" * 100))
+$documentText = "Accessible first line`n$japanese second line"
+if (!$WholeDocument) { $documentText += "`n" + (-join (1..100 | ForEach-Object { "outside viewport $_`n" })) }
+[IO.File]::WriteAllText($fixture, $documentText)
 $errorLog = Join-Path $OutputDirectory 'stderr.log'
-$process = Start-Process -FilePath $Executable -ArgumentList @('--hidden','--gui','--renderer=cpu', $fixture) -WindowStyle Hidden -RedirectStandardError $errorLog -PassThru
-Write-Output "Started Kwil PID $($process.Id); timeout 30 seconds"
+$process = Start-Process -FilePath $Executable -ArgumentList @('--hidden','--new-window','--gui','--renderer=cpu', ('"' + $fixture + '"')) -WindowStyle Hidden -RedirectStandardError $errorLog -PassThru
+Write-Output "Started Kwil PID $($process.Id); startup timeout 30 seconds"
 try {
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $window = $null
@@ -112,11 +114,26 @@ try {
     }
     # Prepared wrapping and cold fonts can replace the initial viewport page.
     # Reacquire the text provider after the owned modal has finished closing.
-    Start-Sleep -Milliseconds 500
-    $pattern = [Windows.Automation.TextPattern]$editor.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
-    $text = $pattern.DocumentRange.GetText(-1)
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    $text = ''
+    do {
+        try {
+            $pattern = [Windows.Automation.TextPattern]$editor.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
+            $text = $pattern.DocumentRange.GetText(-1)
+        } catch [InvalidOperationException] { }
+        $ready = $text.Contains('Accessible first line') -and $text.Contains("$japanese second line")
+        if ($WholeDocument) { $ready = $ready -and $text -ceq $documentText }
+        if ($ready) { break }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline -and !$process.HasExited)
+    [IO.File]::WriteAllText((Join-Path $OutputDirectory 'uia-text.txt'), $text)
     if (!$text.Contains('Accessible first line') -or !$text.Contains("$japanese second line")) { throw 'Visible Unicode text missing' }
-    if ($text.Length -ge [IO.File]::ReadAllText($fixture).Length) { throw 'Whole document exposed instead of viewport' }
+    if ($WholeDocument) {
+        if ($text -cne $documentText) { throw "Document text mismatch: expected $($documentText.Length) chars, actual $($text.Length)" }
+    } else {
+        if ($text.Length -ge $documentText.Length) { throw 'Whole document exposed instead of viewport' }
+        if (!$documentText.StartsWith($text, [StringComparison]::Ordinal)) { throw 'Viewport text is not the exact document prefix' }
+    }
     $selection = $pattern.GetSelection()
     if ($selection.Length -ne 1) { throw 'Caret/selection is missing' }
     [KwilEvents]::Watch($editor, $process.Id)
@@ -139,10 +156,48 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline -and !$process.HasExited)
     if ($selectedText -ne 'Acce') { throw "UIA selection action mismatch: requested '$($range.GetText(-1))', actual '$selectedText', events $([KwilEvents]::Selections)" }
     if ([KwilEvents]::Selections -eq 0) { throw 'UIA did not raise TextSelectionChanged' }
+    # A native key must change the exposed caret, rather than just succeeding
+    # through UIA's SetTextSelection action. Collapse at offset 4, then press Left.
+    $range.MoveEndpointByRange([Windows.Automation.Text.TextPatternRangeEndpoint]::Start, $range,
+        [Windows.Automation.Text.TextPatternRangeEndpoint]::End)
+    $range.Select()
+    function Assert-Caret($offset) {
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $current = [Windows.Automation.TextPattern]$editor.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
+            $ranges = $current.GetSelection()
+            if ($ranges.Length -eq 1) {
+                $prefix = $current.DocumentRange.Clone()
+                $prefix.MoveEndpointByRange([Windows.Automation.Text.TextPatternRangeEndpoint]::End, $ranges[0],
+                    [Windows.Automation.Text.TextPatternRangeEndpoint]::Start)
+                if ($ranges[0].GetText(-1) -ceq '' -and $prefix.GetText(-1) -ceq $text.Substring(0, $offset)) { return }
+            }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline -and !$process.HasExited)
+        throw "Caret did not reach document offset $offset"
+    }
+    Assert-Caret 4
+    $eventsBeforeKey = [KwilEvents]::Selections
+    [KwilInspect]::PostMessage($hwnd, 0x100, [IntPtr]0x25, [IntPtr]0x014b0001) | Out-Null
+    [KwilInspect]::PostMessage($hwnd, 0x101, [IntPtr]0x25, [IntPtr]0xc14b0001L) | Out-Null
+    Assert-Caret 3
+    if ([KwilEvents]::Selections -le $eventsBeforeKey) { throw 'Key movement did not raise TextSelectionChanged' }
+    if ($pattern.DocumentRange.GetText(-1) -cne $text) { throw 'Arrow key changed document text' }
     $nodes = $window.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition)
     $names = @($nodes | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName): $($_.Current.Name)" })
     @("Commit $Revision") + $names | Set-Content (Join-Path $OutputDirectory 'uia-tree.txt') -Encoding UTF8
     if (!($names -match 'MenuBar') -or !($names -match 'TabItem') -or !($names -match 'StatusBar')) { throw 'GUI chrome missing' }
+    function Assert-Control($root, $name, $role) {
+        $condition = [Windows.Automation.AndCondition]::new(
+            [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, $name),
+            [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, $role))
+        $control = $root.FindFirst([Windows.Automation.TreeScope]::Descendants, $condition)
+        if (!$control) { throw "Missing named control: $name ($($role.ProgrammaticName))" }
+        return $control
+    }
+    $tabs = Assert-Control $window 'Documents' ([Windows.Automation.ControlType]::Tab)
+    $null = Assert-Control $tabs 'viewport.txt' ([Windows.Automation.ControlType]::TabItem)
+    $null = Assert-Control $window 'Editor' ([Windows.Automation.ControlType]::Edit)
     $cloaked = 0
     [KwilInspect]::DwmGetWindowAttribute($hwnd, 14, [ref]$cloaked, 4) | Out-Null
     if (!$cloaked) { throw 'Inspection window must remain DWM-cloaked' }
@@ -172,6 +227,13 @@ try {
     $palette = $window.FindFirst([Windows.Automation.TreeScope]::Descendants,
         [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::List))
     if (!$palette) { throw 'Command palette did not expose a list' }
+    $palette = Assert-Control $window 'Command palette' ([Windows.Automation.ControlType]::List)
+    $null = Assert-Control $palette 'Command palette' ([Windows.Automation.ControlType]::Edit)
+    $options = $palette.FindAll([Windows.Automation.TreeScope]::Children,
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::ListItem))
+    if ($options.Count -eq 0) { throw 'Palette command controls missing' }
+    foreach ($option in $options) { if ([String]::IsNullOrWhiteSpace($option.Current.Name)) { throw 'Unnamed palette command' } }
+    $options | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName): $($_.Current.Name)" } | Set-Content (Join-Path $OutputDirectory 'uia-palette.txt')
     [KwilInspect]::PostMessage($hwnd, 0x100, [IntPtr]27, [IntPtr]::Zero) | Out-Null
     [KwilInspect]::PostMessage($hwnd, 0x101, [IntPtr]27, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Milliseconds 200
@@ -198,10 +260,17 @@ try {
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     if (!$list) { throw 'Settings dialog did not expose a labeled list' }
+    $list = Assert-Control $settings 'Settings' ([Windows.Automation.ControlType]::List)
+    $null = Assert-Control $list 'Settings' ([Windows.Automation.ControlType]::Edit)
+    $options = $list.FindAll([Windows.Automation.TreeScope]::Children,
+        [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::ListItem))
+    if ($options.Count -eq 0) { throw 'Settings controls missing' }
+    foreach ($option in $options) { if ([String]::IsNullOrWhiteSpace($option.Current.Name)) { throw 'Unnamed settings control' } }
+    $options | ForEach-Object { "$($_.Current.ControlType.ProgrammaticName): $($_.Current.Name)" } | Set-Content (Join-Path $OutputDirectory 'uia-settings.txt')
     [KwilInspect]::DwmGetWindowAttribute($settingsHwnd, 14, [ref]$cloaked, 4) | Out-Null
     if (!$cloaked) { throw 'Settings window must remain DWM-cloaked' }
     if ([KwilEvents]::Focuses -eq 0) { throw 'UIA did not raise focus notifications' }
-    Write-Output "PASS: hidden UIA tree, Unicode viewport text ($($text.Length) chars), selection action and events ($([KwilEvents]::Selections)), focus notifications ($([KwilEvents]::Focuses)), menu, tabs, status"
+    Write-Output "PASS: hidden UIA tree, exact Unicode text ($($text.Length) chars; whole=$WholeDocument; wrap=$WordWrap), selection action, Left key caret 4 -> 3, selection events ($([KwilEvents]::Selections)), focus notifications ($([KwilEvents]::Focuses)), named roles for tabs/palette/settings"
 } finally {
     [Windows.Automation.Automation]::RemoveAllEventHandlers()
     if (!$process.HasExited) { Stop-Process -Id $process.Id }

@@ -99,6 +99,29 @@ jobs:
           [ -f "$exe.exe" ] && exe="$exe.exe"
           "$exe" --version
           "$exe" --help > /dev/null
+      - name: Qualify Windows UI Automation on the hidden real binary
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        # Windows PowerShell supplies the desktop .NET UIAutomation assemblies.
+        shell: powershell
+        run: |
+          $exe = (Resolve-Path target/debug/kwil.exe).Path
+          foreach ($mode in 'document', 'wrapped', 'viewport') {
+            $flags = @()
+            if ($mode -ne 'viewport') { $flags += '-WholeDocument' }
+            if ($mode -eq 'wrapped') { $flags += '-WordWrap' }
+            # Fresh clients also prove lazy provider activation for each case.
+            & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/inspect-accessibility.ps1 -Executable $exe -OutputDirectory "$env:RUNNER_TEMP/uia-$mode" @flags
+            if ($LASTEXITCODE -ne 0) { throw "UIA qualification failed: $mode" }
+          }
+      - name: Upload Windows UIA trees, logs and hidden capture
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-uia-qualification
+          path: ${{ runner.temp }}/uia-*
+          if-no-files-found: warn
+          retention-days: 14
       - name: Compiler cache statistics
         if: always() && steps.sccache.outcome == 'success'
         run: sccache --show-stats

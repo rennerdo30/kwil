@@ -50,6 +50,17 @@ mod tests {
     }
 
     #[test]
+    fn complete_visible_document_has_no_synthetic_final_newline() {
+        for text in ["Accessible first line\n日本語 second line", "日本語\n", ""] {
+            let app = start(text);
+            let snapshot = app.accessibility_snapshot(false);
+            let exposed: String = snapshot.text.keys().map(|id| snapshot.nodes[id].value().unwrap()).collect();
+            assert_eq!(exposed, text, "TextPattern must preserve the document's final newline state");
+            document_ui::fixtures::settle_app(app);
+        }
+    }
+
+    #[test]
     fn caret_change_updates_editor_without_resending_text_and_idle_is_empty() {
         let mut app = start("日本語 first\nsecond");
         let before = app.accessibility_snapshot(false);
