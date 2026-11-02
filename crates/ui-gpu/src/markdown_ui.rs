@@ -2005,6 +2005,70 @@ mod tests {
             assert_eq!(pixels[30 * 540 + x], border, "column edge {x}");
         }
     }
+    // Replaced by the paged worker entry once the fail-first run is recorded.
+    fn large_page(snapshot: &kwil_core_text::Snapshot, _line: u64) -> (Model, usize) {
+        (parse(snapshot, &AtomicBool::new(false)).unwrap(), snapshot.len() as usize)
+    }
+    fn large_snapshot() -> kwil_core_text::Buffer {
+        let mut buffer = kwil_core_text::Buffer::default();
+        buffer.insert(0, "# Section\n\nA paragraph with **bold** text.\n\n".repeat(24_000).as_bytes()).unwrap();
+        buffer
+    }
+    #[test]
+    fn large_preview_renders_deep_source_block() {
+        let buffer = large_snapshot();
+        let (model, _) = large_page(&buffer.snapshot(), 48_000);
+        let block = model.blocks.iter().find(|b| b.source_lines.start >= 48_000).unwrap();
+        assert!(matches!(block.kind, BlockKind::Heading(1)));
+        let mut host = Host { model: Some(model), ..Default::default() };
+        let mut pixels = vec![0; 540 * 250];
+        let ui = chrome::Metrics::new(1.0);
+        let mut font = font::UiFont::load(ui.text_px()).unwrap();
+        let theme = kwil_core_commands::theme::Theme::builtin(kwil_core_commands::theme::Scheme::Dark);
+        draw(
+            &mut host,
+            Mode::Split,
+            true,
+            48_000,
+            &mut pixels,
+            (540, 250),
+            Rect { x: 0, y: 0, w: 540, h: 250 },
+            &mut font,
+            &ui,
+            &theme,
+        );
+        let bg = theme_ui::rgb(&theme, kwil_core_commands::theme::UiRole::PanelBackground);
+        assert!(pixels.iter().enumerate().any(|(i, &p)| i % 540 > 285 && p != bg));
+    }
+    #[test]
+    fn large_preview_keeps_fence_boundary_at_deep_scroll() {
+        let mut buffer = large_snapshot();
+        let start = buffer.len();
+        buffer
+            .insert(start, b"````rust\nlet a = 1;\n\n# Still code\n```\n\nlet b = 2;\n````\n\n# After fence\n")
+            .unwrap();
+        let (model, _) = large_page(&buffer.snapshot(), 96_004);
+        let code = model
+            .blocks
+            .iter()
+            .find_map(|b| match &b.kind {
+                BlockKind::CodeBlock { raw, .. } => Some(raw),
+                _ => None,
+            })
+            .unwrap();
+        assert!(code.contains("# Still code\n```\n\nlet b = 2;"));
+        assert_eq!(model.blocks.iter().filter(|b| matches!(b.kind, BlockKind::Heading(_))).count(), 1);
+    }
+    #[test]
+    fn large_preview_bounds_parse_work_per_scroll() {
+        let buffer = large_snapshot();
+        for line in [0, 48_000, 95_980] {
+            let (model, parsed) = large_page(&buffer.snapshot(), line);
+            assert!(!model.blocks.is_empty());
+            assert!(parsed <= kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES);
+            assert!(model.blocks.len() <= 512);
+        }
+    }
     #[test]
     fn whole_source_and_invalid_input_are_explicit() {
         let stop = AtomicBool::new(false);
