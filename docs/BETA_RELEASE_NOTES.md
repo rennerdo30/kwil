@@ -195,8 +195,8 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
 
 ## Known limitations
 
-- Mapping refusal does not yet have a positioned-read fallback; real low-RAM
-  machines and multi-GB files have not been measured.
+- Large originals use bounded positioned reads without requiring memory mapping.
+  Real low-RAM machines and multi-GB files have not been measured.
 - Complete metadata pre-growth admission is unfinished. Large or demanding
   editing workloads have not received bounded-memory acceptance.
 - Complete regex/long-line search and folder
