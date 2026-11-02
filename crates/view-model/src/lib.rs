@@ -452,8 +452,8 @@ impl View {
                 let (offsets, lines) = lines
                     .into_iter()
                     .map(|l| {
-                        let start = grid::boundary(l, self.first_byte_column.min(l.len() as u64) as usize);
-                        let end = grid::boundary(l, start.saturating_add(self.line_byte_limit).min(l.len()));
+                        let start = grid::boundary(&l, self.first_byte_column.min(l.len() as u64) as usize);
+                        let end = grid::boundary(&l, start.saturating_add(self.line_byte_limit).min(l.len()));
                         (start as u64, l[start..end].to_vec())
                     })
                     .unzip();

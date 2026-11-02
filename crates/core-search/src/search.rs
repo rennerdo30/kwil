@@ -21,19 +21,33 @@ pub trait Haystack {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>>;
+    fn chunks(
+        &self,
+        range: Range<u64>,
+    ) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>>;
 }
 
 impl Haystack for kwil_core_text::TextFile {
     fn len(&self) -> u64 {
         self.len()
     }
-    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
-        // TextFile owns the mapping and its external-change safety contract.
-        let bytes = self.bytes().map_err(io::Error::other)?;
-        let bytes =
-            bytes.get(range.start as usize..range.end as usize).ok_or_else(|| invalid("invalid haystack range"))?;
-        Ok(bytes.chunks(BLOCK).enumerate().map(move |(i, b)| Ok((range.start + (i * BLOCK) as u64, b))))
+    fn chunks(
+        &self,
+        range: Range<u64>,
+    ) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>> {
+        if range.start > range.end || range.end > self.len() {
+            return Err(invalid("invalid haystack range"));
+        }
+        let mut at = range.start;
+        Ok(std::iter::from_fn(move || {
+            if at == range.end {
+                return None;
+            }
+            let end = (at + BLOCK as u64).min(range.end);
+            let start = at;
+            at = end;
+            Some(self.read_range(start..end).map(|bytes| (start, bytes)).map_err(io::Error::other))
+        }))
     }
 }
 
@@ -41,7 +55,10 @@ impl Haystack for kwil_core_text::Snapshot {
     fn len(&self) -> u64 {
         self.len()
     }
-    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+    fn chunks(
+        &self,
+        range: Range<u64>,
+    ) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>> {
         let mut at = range.start;
         Ok(self.chunks(range)?.map(move |chunk| {
             let bytes = chunk.map_err(io::Error::other)?;
@@ -56,10 +73,16 @@ impl Haystack for [u8] {
     fn len(&self) -> u64 {
         self.len() as u64
     }
-    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+    fn chunks(
+        &self,
+        range: Range<u64>,
+    ) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>> {
         let bytes =
             self.get(range.start as usize..range.end as usize).ok_or_else(|| invalid("invalid haystack range"))?;
-        Ok(bytes.chunks(BLOCK).enumerate().map(move |(i, b)| Ok((range.start + (i * BLOCK) as u64, b))))
+        Ok(bytes
+            .chunks(BLOCK)
+            .enumerate()
+            .map(move |(i, b)| Ok((range.start + (i * BLOCK) as u64, std::borrow::Cow::Borrowed(b)))))
     }
 }
 
@@ -435,7 +458,7 @@ pub(crate) fn copy_range<H: Haystack + ?Sized>(source: &H, range: Range<u64>, ou
         if at != expected || b.len() as u64 > range.end - expected {
             return Err(invalid("invalid haystack chunks"));
         }
-        out.extend_from_slice(b);
+        out.extend_from_slice(&b);
         expected += b.len() as u64;
     }
     if expected != range.end {
@@ -473,7 +496,7 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
                 }
             }
             if !cancel.load(Ordering::Relaxed) {
-                visit(bytes, lo, range.end, true)?;
+                visit(&bytes, lo, range.end, true)?;
             }
             return Ok(());
         }
@@ -484,7 +507,8 @@ pub(crate) fn windows<H: Haystack + ?Sized>(
     let pad = max_len + 4;
     let mut finished_direct = false;
     for chunk in source.chunks(lo..hi)? {
-        let (at, mut chunk) = chunk?;
+        let (at, owner) = chunk?;
+        let mut chunk = owner.as_ref();
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }

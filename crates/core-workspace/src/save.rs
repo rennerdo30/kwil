@@ -323,7 +323,7 @@ fn sync_parent_with<Directory>(
 
 fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io::Write) -> io::Result<()> {
     for chunk in snapshot.chunks(range)? {
-        writer.write_all(chunk.map_err(io::Error::other)?)?;
+        writer.write_all(&chunk.map_err(io::Error::other)?)?;
     }
     Ok(())
 }
@@ -745,7 +745,7 @@ mod tests {
         .unwrap();
         assert!(error.to_string().contains("simulated replacement failure"));
         assert_eq!(fs::read(&path).unwrap(), b"original");
-        assert_eq!(original.bytes().unwrap(), b"original");
+        assert_eq!(original.read_range(0..original.len()).unwrap().as_ref(), b"original");
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
     }
 
@@ -795,7 +795,11 @@ mod tests {
         };
         assert!(message.contains(operation) && message.contains(cause), "{message}");
         assert_eq!(fs::read(&path).unwrap(), b"new original", "postcommit failure cannot roll back/remove saved bytes");
-        assert_eq!(original.bytes().unwrap(), b"original", "old worker/undo original remains pinned");
+        assert_eq!(
+            original.read_range(0..original.len()).unwrap().as_ref(),
+            b"original",
+            "old worker/undo original remains pinned"
+        );
         drop((b, original));
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1, "retire old pins and temp without unlinking destination");
         assert_eq!(fs::read(&path).unwrap(), b"new original");
@@ -840,7 +844,7 @@ mod tests {
             |file| {
                 assert!(!open_fails, "failed reopen cannot reach indexing");
                 assert_eq!(file.path(), path);
-                assert_eq!(file.bytes().unwrap(), b"new original");
+                assert_eq!(file.read_range(0..file.len()).unwrap().as_ref(), b"new original");
                 Err(io::Error::new(io::ErrorKind::InvalidData, "injected saved-checkpoint index failure"))
             },
         )
@@ -856,7 +860,7 @@ mod tests {
         assert!(message.contains("file committed at "), "{message}");
         assert!(message.contains(&path.display().to_string()), "{message}");
         assert!(message.contains(operation) && message.contains(cause), "{message}");
-        assert_eq!(original.bytes().unwrap(), b"original");
+        assert_eq!(original.read_range(0..original.len()).unwrap().as_ref(), b"original");
         drop((b, original));
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
         assert_eq!(fs::read(&path).unwrap(), b"new original", "checkpoint failure must never roll back saved bytes");
@@ -979,7 +983,7 @@ mod tests {
         assert_eq!(saved.file.len(), written as u64);
         assert!(b.undo());
         let snapshot = b.snapshot();
-        assert_eq!(snapshot.chunks(0..16).unwrap().next().unwrap().unwrap(), &[0; 16]);
+        assert_eq!(snapshot.chunks(0..16).unwrap().next().unwrap().unwrap().as_ref(), &[0; 16]);
         drop(snapshot);
         drop((saved, b));
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);

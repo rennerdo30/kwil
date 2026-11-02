@@ -1420,7 +1420,7 @@ impl ProjectionIndex {
                 if cancelled() {
                     return Ok(None);
                 }
-                self.bytes(chunk.map_err(io::Error::other)?)?;
+                self.bytes(&chunk.map_err(io::Error::other)?)?;
             }
             if cancelled() {
                 return Ok(None);
@@ -1475,7 +1475,7 @@ impl ProjectionIndex {
                 if cancelled() {
                     return Ok(None);
                 }
-                bytes.extend_from_slice(chunk.map_err(io::Error::other)?);
+                bytes.extend_from_slice(&chunk.map_err(io::Error::other)?);
             }
             let left = crate::grid::boundary(&bytes, (desired - from) as usize);
             let right = crate::grid::boundary(&bytes, (left + viewport.row_bytes).min(bytes.len()));
@@ -1706,7 +1706,7 @@ fn scan(
                 return None;
             }
             match chunk {
-                Ok(bytes) => scan.bytes(bytes, &request.filter, request.page_start),
+                Ok(bytes) => scan.bytes(&bytes, &request.filter, request.page_start),
                 Err(error) => return Some(Err(error.to_string())),
             }
         }

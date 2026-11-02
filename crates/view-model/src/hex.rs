@@ -150,16 +150,16 @@ impl HexView {
         let range = self.range(snapshot.len());
         let mut bytes = Vec::with_capacity((range.end - range.start) as usize);
         for chunk in snapshot.chunks(range.clone())? {
-            bytes.extend_from_slice(chunk.map_err(io::Error::other)?);
+            bytes.extend_from_slice(&chunk.map_err(io::Error::other)?);
         }
         Ok(self.layout(range, &bytes))
     }
     /// Worker-only first-screen path. Never pass a decoded document's original
     /// alongside its logical byte length: these are different representations.
     pub fn file_rows(&self, file: &TextFile) -> io::Result<Vec<HexRow>> {
-        let bytes = file.bytes().map_err(io::Error::other)?;
-        let range = self.range(bytes.len() as u64);
-        Ok(self.layout(range.clone(), &bytes[range.start as usize..range.end as usize]))
+        let range = self.range(file.len());
+        let bytes = file.read_range(range.clone()).map_err(io::Error::other)?;
+        Ok(self.layout(range, &bytes))
     }
     /// Worker-only legacy synchronous entry point. Frontends use Session's
     /// request protocol so edit/spill/journal reads cannot run during input.

@@ -1413,7 +1413,7 @@ fn copy_seed_bytes(snapshot: &Snapshot, range: Range<u64>, into: &mut [u8], canc
     for chunk in snapshot.chunks(range)? {
         seed_cancel(cancel)?;
         let chunk = chunk.map_err(io::Error::other)?;
-        into[offset..offset + chunk.len()].copy_from_slice(chunk);
+        into[offset..offset + chunk.len()].copy_from_slice(&chunk);
         offset += chunk.len();
     }
     Ok(())
@@ -1459,8 +1459,8 @@ fn visit_seed_sources(
             })?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "seed source range ended early"))?;
         let len = match &chunk {
+            SourceChunk::Original { bytes, .. } => bytes.len(),
             SourceChunk::Added(bytes)
-            | SourceChunk::Original { bytes, .. }
             | SourceChunk::Decoded { bytes, .. }
             | SourceChunk::Preserved { bytes, .. }
             | SourceChunk::Opaque { bytes, .. } => bytes.len(),
@@ -1471,7 +1471,7 @@ fn visit_seed_sources(
         budget.charge(len + SOURCE_OVERHEAD)?;
         remaining -= len;
         let text = match chunk {
-            SourceChunk::Added(bytes) | SourceChunk::Preserved { bytes, .. } => bytes,
+            SourceChunk::Added(bytes) | SourceChunk::Preserved { bytes, .. } => std::borrow::Cow::Borrowed(bytes),
             SourceChunk::Original { bytes, .. } if request.allow_raw_utf8 => bytes,
             SourceChunk::Original { .. } => {
                 return Err(seed_error("seed raw origin has no verified UTF-8 interpretation"));
@@ -1481,12 +1481,12 @@ fn visit_seed_sources(
                 origin
                     .raw_range_admitted(range, cancel, |bytes| budget.charge(bytes))
                     .map_err(kwil_core_text::decoded_backing::BackingError::into_io_error)?;
-                bytes
+                std::borrow::Cow::Borrowed(bytes)
             }
         };
         if let Some(output) = &mut output {
             budget.charge(text.len())?;
-            output.extend_from_slice(text);
+            output.extend_from_slice(&text);
         }
     }
     Ok(())

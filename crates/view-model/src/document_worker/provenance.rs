@@ -318,7 +318,15 @@ impl OriginRegistry {
                     physical_len = add(physical_len, REFERENCE_LEN)?;
                     len
                 }
-                SourceChunk::Original { bytes, .. } | SourceChunk::Added(bytes) => {
+                SourceChunk::Original { bytes, .. } => {
+                    if seed.is_some() {
+                        return Err(invalid("seed must reference only its decoded origin"));
+                    }
+                    let len = count(bytes.len())?;
+                    physical_len = add(physical_len, add(LOGICAL_HEADER_LEN, len)?)?;
+                    len
+                }
+                SourceChunk::Added(bytes) => {
                     if seed.is_some() {
                         return Err(invalid("seed must reference only its decoded origin"));
                     }
@@ -894,7 +902,15 @@ impl CapsuleReader {
                     self.pending.extend_from_slice(&range.end.to_le_bytes());
                     self.cursor = add(self.cursor, len)?;
                 }
-                SourceChunk::Original { bytes, .. } | SourceChunk::Added(bytes) => {
+                SourceChunk::Original { bytes, .. } => {
+                    let len = count(bytes.len())?;
+                    self.pending.push(3);
+                    self.pending.extend_from_slice(&len.to_le_bytes());
+                    let end = add(self.cursor, len)?;
+                    self.payload = Payload::Logical { cursor: self.cursor, end };
+                    self.cursor = end;
+                }
+                SourceChunk::Added(bytes) => {
                     let len = count(bytes.len())?;
                     self.pending.push(3);
                     self.pending.extend_from_slice(&len.to_le_bytes());

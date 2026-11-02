@@ -142,7 +142,7 @@ impl NativeFileLease {
         };
         let file = source.clone_capture_file().map_err(map)?;
         let stamp = Stamp::read(&file)?;
-        source.bytes().map_err(map)?;
+        source.validate_source().map_err(map)?;
         Ok(Self { file: ManuallyDrop::new(Some(file)), identity, stamp: Some(stamp), at: 0, validation_credit: 0 })
     }
 

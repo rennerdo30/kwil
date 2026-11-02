@@ -41,7 +41,7 @@ pub fn run(snapshot: &Snapshot, query: &Query, mut cancelled: impl FnMut() -> bo
             let mut out = String::with_capacity((range.end - range.start) as usize * 3);
             for chunk in snapshot.chunks(range.clone())? {
                 check(&mut cancelled)?;
-                for byte in chunk.map_err(io::Error::other)? {
+                for byte in chunk.map_err(io::Error::other)?.iter() {
                     if !out.is_empty() {
                         out.push(' ');
                     }
@@ -73,7 +73,7 @@ pub fn run(snapshot: &Snapshot, query: &Query, mut cancelled: impl FnMut() -> bo
                     check(&mut cancelled)?;
                     let end = at.saturating_add(64 * 1024).min(range.end);
                     for chunk in snapshot.chunks(at..end)? {
-                        for &byte in chunk.map_err(io::Error::other)? {
+                        for &byte in chunk.map_err(io::Error::other)?.iter() {
                             while matched > 0 && byte != bytes[matched] {
                                 matched = prefixes[matched - 1];
                             }

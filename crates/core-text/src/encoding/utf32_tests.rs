@@ -196,9 +196,9 @@ fn utf32_original_byte_index_and_viewport_ignore_newline_bytes_inside_units() {
         assert!(!view.had_errors);
         let view = source.decode_range(16..20).unwrap();
         assert!(view.had_errors);
-        assert_eq!(view.segments, vec![DisplaySegment::Invalid(&bytes[16..20])]);
+        assert_eq!(view.segments, vec![DisplaySegment::Invalid(std::borrow::Cow::Borrowed(&bytes[16..20]))]);
         let view = source.decode_range(44..45).unwrap();
-        assert_eq!(view.segments, vec![DisplaySegment::Invalid(&bytes[44..45])]);
+        assert_eq!(view.segments, vec![DisplaySegment::Invalid(std::borrow::Cow::Borrowed(&bytes[44..45]))]);
     }
 }
 
