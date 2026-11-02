@@ -1303,6 +1303,10 @@ impl<'a, W: Write> TextOutput<'a, W> {
         Ok(())
     }
     fn iso_begin(&mut self, state: iso2022::State) -> Result<(), EncodingError> {
+        if self.pending_cr {
+            self.encode(self.plan.line_ending.unwrap().text())?;
+            self.pending_cr = false;
+        }
         let current = match self.iso_raw_state {
             Some(current) => current,
             None => {
