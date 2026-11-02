@@ -3,6 +3,8 @@
 Settings registers checked types without removing existing types. Unregister selected
 restores only those types; Remove all restores everything still owned by the receipt.
 The current-file palette action adds that extension to the existing set.
+After restart, Windows status includes custom extensions found in the retained
+receipt, then verifies their complete native bindings before reporting them registered.
 
 Every update is a new immutable version-2 intent naming the preceding active receipt.
 Surviving values retain their original `before` bytes and registry type. The native
