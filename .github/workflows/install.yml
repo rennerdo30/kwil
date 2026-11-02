@@ -27,7 +27,8 @@ jobs:
       CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
     steps:
       - uses: actions/checkout@v7
-      - run: rustup target add ${{ matrix.target }} --no-self-update
+      # target add does not self-update; --no-self-update is not a target option.
+      - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked -j 4 -p kwil --features windows-console --target ${{ matrix.target }}
       - name: Inspect GUI and console runtime imports
         shell: bash
