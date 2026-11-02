@@ -783,36 +783,6 @@ mod platform {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn ipc_reads_queued_ack_after_peer_disconnects() {
-            let (mut client, mut peer) = UnixStream::pair().unwrap();
-            client.set_nonblocking(true).unwrap();
-            peer.write_all(&[1]).unwrap();
-            drop(peer);
-            let mut ack = [0];
-            read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_secs(2)).unwrap();
-            assert_eq!(ack, [1]);
-            assert_eq!(
-                read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_secs(2)).unwrap_err().kind(),
-                io::ErrorKind::UnexpectedEof
-            );
-        }
-
-        #[test]
-        fn ipc_read_waits_only_until_its_absolute_deadline() {
-            let (mut client, _peer) = UnixStream::pair().unwrap();
-            client.set_nonblocking(true).unwrap();
-            let mut ack = [0];
-            assert_eq!(
-                read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_millis(10)).unwrap_err().kind(),
-                io::ErrorKind::TimedOut
-            );
-        }
-    }
     // A blocking UnixStream::connect can hang on a full accept backlog. Create
     // nonblocking and wait only to the caller's deadline. Frame I/O stays nonblocking.
     fn connect(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
@@ -884,5 +854,35 @@ mod platform {
             }
         }
         Ok(stream)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ipc_reads_queued_ack_after_peer_disconnects() {
+            let (mut client, mut peer) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            peer.write_all(&[1]).unwrap();
+            drop(peer);
+            let mut ack = [0];
+            read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(ack, [1]);
+            assert_eq!(
+                read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_secs(2)).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+
+        #[test]
+        fn ipc_read_waits_only_until_its_absolute_deadline() {
+            let (mut client, _peer) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            let mut ack = [0];
+            assert_eq!(
+                read_deadline(&mut client, &mut ack, Instant::now() + Duration::from_millis(10)).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
     }
 }
