@@ -282,6 +282,17 @@ impl Gpu {
     pub fn init_with_wake(wake: impl Fn(Result<(), String>) + Send + 'static) -> Result<Self, String> {
         unsafe {
             let mut device = None;
+            #[cfg(feature = "frame-harness")]
+            let adapter: Option<windows::core::IUnknown> = if std::env::var_os("KWIL_FRAME_WARP").is_some() {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
+                Some(factory.EnumWarpAdapter().map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+            #[cfg(feature = "frame-harness")]
+            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| e.to_string())?;
+            #[cfg(not(feature = "frame-harness"))]
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| e.to_string())?;
             let device: ID3D12Device = device.ok_or("DX12 returned no device")?;
             let queue: ID3D12CommandQueue = device
@@ -410,6 +421,16 @@ impl Gpu {
         if let Err(error) = result {
             *self.readiness.lock().unwrap_or_else(|e| e.into_inner()) = Readiness::Failed(error);
         }
+    }
+    /// Check credit before the host consumes damage or copies scroll pixels.
+    /// request() only subscribes to the existing completion wake; it does not
+    /// consume a ready credit. Initialization/resize and failures still enter
+    /// present(), which owns those transitions and CPU fallback.
+    pub fn frame_ready(&self, size: (usize, usize)) -> bool {
+        if self.backend.as_ref().is_none_or(|backend| backend.size != size) {
+            return true;
+        }
+        self.readiness.lock().unwrap_or_else(|e| e.into_inner()).request().unwrap_or(true)
     }
     fn arm(&self, notify: bool) -> Result<(), String> {
         let b = self.backend.as_ref().ok_or("DX12 backend unavailable")?;

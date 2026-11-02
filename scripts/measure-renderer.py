@@ -13,7 +13,7 @@ import subprocess
 import uuid
 
 
-def measure(executable, output, renderer, commit):
+def measure(executable, output, renderer, commit, warp=False):
     output.mkdir(parents=True, exist_ok=False)
     profile = output / "profile" / "kwil"
     profile.mkdir(parents=True)
@@ -43,6 +43,9 @@ def measure(executable, output, renderer, commit):
     )
     if renderer == "gpu":
         env["KWIL_REQUIRE_GPU"] = "1"
+    if warp:
+        env["KWIL_FRAME_WARP"] = "1"
+        env["KWIL_REQUIRE_GPU"] = "1"
     with (output / "stdout.txt").open("wb") as stdout, (output / "stderr.txt").open("wb") as stderr:
         for stream in (stdout, stderr):
             stream.write(f"commit {commit}\n".encode())
@@ -64,7 +67,9 @@ def measure(executable, output, renderer, commit):
             print(f"Closed owned PID {process.pid}", flush=True)
     failure = output / "harness-failure.txt"
     if failure.exists():
-        raise RuntimeError(failure.read_text(encoding="utf-8"))
+        step = output / "harness-step.txt"
+        phase = step.read_text(encoding="utf-8") if step.exists() else "harness"
+        raise RuntimeError(f"{phase}: {failure.read_text(encoding='utf-8')}")
     if code != 0:
         raise RuntimeError(f"renderer probe exited {code}; see {output}")
     native = (output / "native-window.txt").read_text(encoding="utf-8")
@@ -85,6 +90,7 @@ def measure(executable, output, renderer, commit):
     result = dict(
         commit=commit,
         renderer=renderer,
+        warp=warp,
         backend=backend.read_text(encoding="utf-8") if backend.exists() else "CPU window-DC capture",
         first_frame_ms=frame,
         first_content_ms=content,
@@ -103,12 +109,15 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--renderer", choices=["cpu", "auto", "gpu"], default="cpu")
     parser.add_argument("--commit", required=True)
+    parser.add_argument("--warp", action="store_true", help="exercise native DX12 with its software adapter")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("this probe verifies DWM-cloaked Windows presentation only")
+    if args.warp and args.renderer == "cpu":
+        parser.error("--warp requires the auto or gpu presenter")
     output = args.output.resolve() / f"{args.renderer}-{os.getpid()}-{uuid.uuid4().hex}"
     print(f"commit {args.commit}\nEvidence: {output}", flush=True)
-    print(json.dumps(measure(args.executable.resolve(strict=True), output, args.renderer, args.commit), indent=2))
+    print(json.dumps(measure(args.executable.resolve(strict=True), output, args.renderer, args.commit, args.warp), indent=2))
 
 
 if __name__ == "__main__":

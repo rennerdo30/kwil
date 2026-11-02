@@ -233,6 +233,15 @@ impl Metrics {
     }
 }
 pub(crate) fn start(proxy: super::HostProxy) {
+    // Release probes use panic=abort, so catch_unwind below cannot preserve
+    // their diagnostics. Standard handles are closed after the first frame.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR") {
+            let _ = std::fs::write(PathBuf::from(dir).join("harness-failure.txt"), info.to_string());
+        }
+        previous(info);
+    }));
     std::thread::spawn(move || {
         let usual = [
             (1800, Step::DismissSetup),
@@ -675,6 +684,13 @@ pub(crate) fn start(proxy: super::HostProxy) {
     });
 }
 pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
+    if std::env::var_os("KWIL_RENDERER_PROBE").is_some()
+        && let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR")
+    {
+        let dir = PathBuf::from(dir);
+        let _ = std::fs::write(dir.join("harness-step.txt"), format!("{step:?}"));
+        let _ = std::fs::write(dir.join("renderer-counts.txt"), app.metrics.report());
+    }
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step_inner(app, el, step))) {
         if let Some(dir) = std::env::var_os("KWIL_CAPTURE_DIR") {
             let dir = PathBuf::from(dir);
@@ -1877,7 +1893,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             }
             #[cfg(feature = "gpu")]
             if std::env::var_os("KWIL_REQUIRE_GPU").is_some() {
-                assert!(app.gpu.is_some(), "hardware GPU required by this probe");
+                assert!(app.gpu.is_some(), "native GPU presenter required by this probe");
             }
             // Prime the retained GPU image without an onscreen present, so the
             // following scroll/readback exercises GPU copies, not a fresh upload.

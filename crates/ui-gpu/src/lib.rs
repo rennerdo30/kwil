@@ -951,6 +951,17 @@ pub fn run_workspace_with_external_open(
 }
 
 impl App {
+    #[cfg(all(windows, feature = "gpu"))]
+    fn paint_pending(&self) -> bool {
+        self.pending != Damage::default()
+            || self.document.live.update.is_some()
+            || self.language_picker.dirty
+            || self.chrome_dirty
+            || self.palette_dirty
+            || self.menu_dirty
+            || self.overlay_paint_pending()
+    }
+
     fn try_finish_startup(&mut self, el: &ActiveEventLoop) {
         use document_ui::FontProduct;
         if self.startup_fonts.finished || self.gfx.is_none() {
@@ -2130,6 +2141,17 @@ impl App {
             && !self.palette_dirty
             && !self.menu_dirty
             && !self.overlay_paint_pending()
+        {
+            return true;
+        }
+        // Ordinary frame-credit waits must preserve the host's damage and
+        // retained pixels. Painting first would consume them, forcing a full
+        // repair when present() defers on a slower (for example WARP) device.
+        #[cfg(all(windows, feature = "gpu"))]
+        if self.gpu_active()
+            && self.gfx.as_ref().and_then(|gfx| gfx.gpu_canvas.as_ref()).is_some_and(|canvas| canvas.visible())
+            && let Some(gpu) = &self.gpu
+            && !gpu.frame_ready(self.size)
         {
             return true;
         }
@@ -3817,18 +3839,30 @@ impl ApplicationHandler<UserEvent> for App {
             #[cfg(feature = "gpu")]
             UserEvent::GpuAvailable(result) => {
                 #[cfg(windows)]
-                if let Some(gpu) = &mut self.gpu {
-                    gpu.available(result);
+                {
+                    let failed = result.is_err();
+                    if let Some(gpu) = &mut self.gpu {
+                        gpu.available(result);
+                    }
+                    if failed {
+                        self.apply(Damage { full: true, ..Default::default() });
+                    } else if self.paint_pending() {
+                        // Credit makes retained damage drawable; it is not damage
+                        // itself and must never manufacture a full or idle frame.
+                        self.request_frame();
+                    }
                 }
                 #[cfg(not(windows))]
-                if let Err(error) = result {
-                    eprintln!("kwil GPU worker failed; using CPU: {error}");
-                    self.gpu = None;
-                    self.pending.full = true;
-                }
-                // Successful asynchronous completion alone never produces an idle frame.
-                if cfg!(windows) || self.pending != Damage::default() {
-                    self.apply(Damage { full: true, ..Default::default() });
+                {
+                    if let Err(error) = result {
+                        eprintln!("kwil GPU worker failed; using CPU: {error}");
+                        self.gpu = None;
+                        self.pending.full = true;
+                    }
+                    // Successful asynchronous completion alone never produces an idle frame.
+                    if self.pending != Damage::default() {
+                        self.apply(Damage { full: true, ..Default::default() });
+                    }
                 }
                 return;
             }

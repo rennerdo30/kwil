@@ -44,7 +44,7 @@ jobs:
           $commit = git rev-parse HEAD
           .renderer-venv/Scripts/python.exe scripts/measure-renderer.py --executable target/release/kwil.exe --output target/renderer-results --commit $commit --renderer cpu
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .renderer-venv/Scripts/python.exe scripts/measure-renderer.py --executable target/release/kwil.exe --output target/renderer-results --commit $commit --renderer auto
+          .renderer-venv/Scripts/python.exe scripts/measure-renderer.py --executable target/release/kwil.exe --output target/renderer-results --commit $commit --renderer auto --warp
           exit $LASTEXITCODE
       - name: Summarize first content and damage measurements
         if: always()
@@ -54,7 +54,7 @@ jobs:
           Get-ChildItem target/renderer-results -Filter result.json -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
             $r = Get-Content $_.FullName -Raw | ConvertFrom-Json
             "- $($r.renderer): first frame $($r.first_frame_ms) ms; first file content $($r.first_content_ms) ms; 40 ms target met: $($r.within_content_target)." >> $env:GITHUB_STEP_SUMMARY
-            "  Backend: $($r.backend). Hosted timing is informational; no owner-PC or remote-wire acceptance." >> $env:GITHUB_STEP_SUMMARY
+            "  Backend: $($r.backend); WARP: $($r.warp). Hosted timing is informational; no owner-PC or remote-wire acceptance." >> $env:GITHUB_STEP_SUMMARY
             $r.counts.PSObject.Properties | ForEach-Object {
               "  $($_.Name): $($_.Value | ConvertTo-Json -Compress)" >> $env:GITHUB_STEP_SUMMARY
             }
