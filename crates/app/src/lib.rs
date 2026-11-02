@@ -680,7 +680,10 @@ mod isolation_tests {
         std::fs::write(&path, [0, 1, 0xfe, 0xff, 0x41]).unwrap();
         let mut view = initial_view(&path).expect("binary startup reaches the checked document worker");
         assert_eq!(view.file().unwrap().kind().unwrap(), kwil_core_text::FileKind::Binary);
-        assert_eq!(view.file().unwrap().read_range(0..view.file().unwrap().len()).unwrap(), [0, 1, 0xfe, 0xff, 0x41]);
+        assert_eq!(
+            view.file().unwrap().read_range(0..view.file().unwrap().len()).unwrap().as_ref(),
+            [0, 1, 0xfe, 0xff, 0x41]
+        );
         view.set_rows(2);
         assert!(view.editor().is_none());
         assert!(

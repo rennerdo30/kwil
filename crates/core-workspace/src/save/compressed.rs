@@ -380,7 +380,10 @@ mod tests {
             drop(result.saved);
             assert!(result.owners.try_retire().is_ok());
             let owner = prepare_file(&f.path(), CompressionMode::Auto, &f.root, &AtomicBool::new(false)).unwrap();
-            assert_eq!(owner.text_file().unwrap().bytes().unwrap(), b"\xff\xfee\0d\0i\0t\0e\0d\0 \0\xe9\0\r\0\n\0");
+            assert_eq!(
+                owner.text_file().unwrap().read_range(0..owner.text_file().unwrap().len()).unwrap().as_ref(),
+                b"\xff\xfee\0d\0i\0t\0e\0d\0 \0\xe9\0\r\0\n\0"
+            );
             assert!(owner.try_finish().is_ok());
             f.only_destination();
         }
@@ -702,7 +705,7 @@ mod tests {
         };
         assert!(pending.body.is_some());
         assert!(pending.decoded.is_some());
-        assert_eq!(body_pin.bytes().unwrap(), b"both owners pinned");
+        assert_eq!(body_pin.read_range(0..body_pin.len()).unwrap().as_ref(), b"both owners pinned");
         assert_eq!(logical(&logical_pin), b"both owners pinned");
         drop(body_pin);
         drop(logical_pin);

@@ -1706,7 +1706,7 @@ fn scan(
                 return None;
             }
             match chunk {
-                Ok(bytes) => scan.bytes(bytes, &request.filter, request.page_start),
+                Ok(bytes) => scan.bytes(&bytes, &request.filter, request.page_start),
                 Err(error) => return Some(Err(error.to_string())),
             }
         }
