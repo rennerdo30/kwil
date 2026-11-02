@@ -27,7 +27,8 @@ changes and its known limitations.
 ## Next candidate: 0.1.0-beta.8
 
 Settings take effect, incremental file-type registration, faster command
-palette, renderer fix, compare wording, homepage.
+palette, compare of any size, formatting fixes, faster macOS start, renderer
+fix, homepage.
 
 ## In beta.3
 
