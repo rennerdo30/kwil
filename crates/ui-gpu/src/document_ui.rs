@@ -613,6 +613,7 @@ impl App {
         };
         let replacement = update.replacement;
         let damage = update.damage();
+        let paint_owned = damage.full || damage.scroll != 0 || !damage.rows.is_empty();
         let scalar = Damage { full: damage.full, status: damage.status, scroll: damage.scroll, rows: Vec::new() };
         let rows = self.text_rows();
         queue_damage(&mut self.pending, scalar, rows, self.font.as_mut());
@@ -647,7 +648,14 @@ impl App {
             host.invalidate_painted(&self.view, self.document.live.update.as_ref().unwrap().damage());
         }
         self.apply(Damage::default());
-        self.request_frame();
+        if paint_owned {
+            self.request_frame();
+        } else {
+            // Scalar receipts own no borrowed rows. Status damage is already
+            // copied into pending; an occluded window must not hold later
+            // journal acknowledgements hostage to its next native paint.
+            self.document_frame_painted();
+        }
     }
 
     /// Applying Workspace's receipt precedes the original producer's residual
@@ -676,7 +684,7 @@ impl App {
         }
     }
 
-    /// Called after the charged update's row publication, never from idle.
+    /// Release after row publication, or immediately for a scalar-only update.
     pub(super) fn document_frame_painted(&mut self) {
         self.document.live.update = None;
         self.document.live.row_shift = 0;
@@ -1161,6 +1169,90 @@ mod tests {
             UserEvent::SearchReady => app.search_ready(),
             _ => panic!("unexpected tiny worker fixture wake"),
         }
+    }
+
+    #[test]
+    fn restored_journal_durability_does_not_wait_for_a_frame() {
+        restored_journal_durability(false);
+    }
+
+    #[test]
+    fn restored_journal_durability_after_one_edit_survives_another_restart() {
+        restored_journal_durability(true);
+    }
+
+    fn restored_journal_durability(edit: bool) {
+        use std::sync::mpsc::Receiver;
+        let root = crate::test_support::directory("kwil-gui-restored-durability").unwrap();
+        let captured = crate::test_support::directory("kwil-gui-durable-journal").unwrap();
+        let start = |root: &std::path::Path, text: &str| {
+            let (mut app, rx) = crate::search_ui::host_dispatch_tests::host(text);
+            app.view.set_session_restore(true);
+            app.start_document_at(Some(root.to_owned()));
+            (app, rx)
+        };
+        let until = |app: &mut App, rx: &Receiver<UserEvent>, done: fn(&App) -> bool, allow_scalar_frame: bool| {
+            // Three-second production interval plus bounded scheduling slack.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(app) {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(UserEvent::DocumentReady) => {
+                        app.document_ready();
+                        if let Some(update) = &app.document.live.update {
+                            let damage = update.damage();
+                            assert!(
+                                allow_scalar_frame || damage.full || damage.scroll != 0 || !damage.rows.is_empty(),
+                                "a scalar completion must not retain the GUI publication slot until a frame: {:?}",
+                                damage
+                            );
+                            fixtures::publish(app);
+                        }
+                    }
+                    Ok(_) => panic!("unexpected restored-journal wake"),
+                    Err(error) => panic!("restored journal stalled: {error}; {}", app.view.status_text()),
+                }
+            }
+        };
+        let bytes = |app: &App| {
+            let mut bytes = Vec::new();
+            app.view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+            bytes
+        };
+        let (mut seed, rx) = start(&root, "unsaved🌿");
+        until(&mut seed, &rx, |app| app.view.recovery_ready(), true);
+        seed.view.request_window_close(false).unwrap();
+        until(&mut seed, &rx, |app| app.view.wants_exit(), true);
+        fixtures::settle_app(seed);
+
+        let (mut restored, rx) = start(&root, "");
+        until(&mut restored, &rx, |app| app.view.recovery_ready(), false);
+        assert_eq!(bytes(&restored), "unsaved🌿".as_bytes());
+        assert!(restored.view.editor().unwrap().document().is_dirty());
+        let expected = if edit {
+            let end = restored.view.editor().unwrap().document().snapshot().len();
+            restored.view.editor_mut().unwrap().set_cursors(vec![kwil_view_model::Cursor::caret(end)], 0).unwrap();
+            restored
+                .view
+                .execute("edit.insert", &CommandArgs { text: Some("!".into()), ..Default::default() }, 1)
+                .unwrap();
+            "unsaved🌿!".as_bytes()
+        } else {
+            "unsaved🌿".as_bytes()
+        };
+        until(&mut restored, &rx, |app| app.view.recovery_notice().is_none(), false);
+        assert_eq!(bytes(&restored), expected);
+        assert!(restored.view.editor().unwrap().document().is_dirty());
+        // Snapshot the actual journal BEFORE teardown can rescue missing bytes.
+        let id = restored.view.active_id().0;
+        std::fs::copy(root.join(format!("{id}.kwj")), captured.join(format!("{id}.kwj"))).unwrap();
+        std::fs::copy(root.join("session.kws"), captured.join("session.kws")).unwrap();
+        fixtures::settle_app(restored);
+        let (mut again, rx) = start(&captured, "");
+        until(&mut again, &rx, |app| app.view.recovery_ready(), false);
+        assert_eq!(bytes(&again), expected, "second restart reads the already-durable journal");
+        fixtures::settle_app(again);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(captured).unwrap();
     }
     #[test]
     fn genuinely_unstarted_recovery_returns_original_workspace_and_budget_after_real_search_join() {

@@ -3600,6 +3600,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::DocumentReady => {
                 self.document_ready();
+                // A cloaked/occluded native window may defer redraw requests.
+                // Service this real completion's retained damage now; render
+                // returns without presenting when there is nothing to paint.
+                if !self.render() && self.force_exit() {
+                    el.exit();
+                    return;
+                }
                 if self.may_exit() {
                     el.exit();
                 }
