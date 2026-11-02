@@ -11,6 +11,7 @@ pub(super) enum Kind {
 }
 
 pub(super) struct Dialog {
+    pub accessibility: accessibility::Host,
     pub gfx: Gfx,
     pub kind: Kind,
     pub size: (usize, usize),
@@ -117,6 +118,7 @@ impl App {
         }
         let result = (|| {
             let window = Rc::new(el.create_window(attrs).map_err(|e| e.to_string())?);
+            let accessibility = accessibility::Host::new(el, &window, &self.proxy);
             window_placement::fit_window(&window, placement);
             if !self.opts.hidden {
                 window.set_visible(true);
@@ -138,6 +140,7 @@ impl App {
                 cloak_and_show(hwnd);
             }
             Ok::<_, String>(Dialog {
+                accessibility,
                 gfx: Gfx {
                     #[cfg(all(windows, feature = "gpu"))]
                     gpu_canvas: None,

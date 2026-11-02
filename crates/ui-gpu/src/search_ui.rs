@@ -929,6 +929,8 @@ pub(crate) mod host_dispatch_tests {
         let frontend_epoch = view.input_epoch();
         (
             App {
+                accessibility: None,
+                accessibility_dirty: true,
                 themes: Default::default(),
                 theme_hits: Vec::new(),
                 startup_fonts: StartupFonts { editor_ready: true, chrome_ready: true, finished: true },
