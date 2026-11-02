@@ -1,0 +1,8 @@
+{
+  "name": "Kwil",
+  "short_name": "Kwil",
+  "icons": [{ "src": "assets/kwil-icon.svg", "sizes": "any", "type": "image/svg+xml" }],
+  "theme_color": "#0a101c",
+  "background_color": "#0b111d",
+  "display": "browser"
+}

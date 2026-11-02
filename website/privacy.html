@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy · Kwil</title>
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'">
+  <link rel="canonical" href="https://kwil.renner.dev/privacy.html">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="assets/kwil-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="night">
+    <header class="top">
+      <a class="brand" href="./" aria-label="Kwil home">
+        <img src="assets/kwil-icon.svg" width="30" height="30" alt="">
+        <span>Kwil</span>
+      </a>
+      <nav aria-label="Site">
+        <a href="./#download">Download</a>
+        <a class="nav-gh" href="https://github.com/rennerdo30/kwil">GitHub</a>
+      </nav>
+    </header>
+  </div>
+
+  <main class="doc">
+    <h1>Privacy</h1>
+
+    <h2>This website</h2>
+    <p>This site sets no cookies, uses no analytics and loads nothing from other sites except one request: your browser asks the public GitHub API for the list of Kwil releases, so the download links point at the newest version. GitHub receives that request like any other visit to GitHub. The site itself is hosted on GitHub Pages, which keeps its own server logs; see the <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub privacy statement</a>.</p>
+
+    <h2>The Kwil app</h2>
+    <p>Kwil has no account and no telemetry. The only network request it makes is the update check against GitHub's release list, plus the download of an update when one is installed. You can turn the check off with <code>check = false</code> in the <code>[update]</code> section of the settings file. Markdown previews show local images only and never fetch from the internet.</p>
+
+    <h2>Questions</h2>
+    <p>Open an issue on <a href="https://github.com/rennerdo30/kwil/issues">GitHub</a>.</p>
+  </main>
+
+  <footer class="foot">
+    <p><img src="assets/kwil-icon.svg" width="20" height="20" alt=""> Kwil, a project by <a href="https://github.com/rennerdo30">rennerdo30</a>.</p>
+    <p><a href="./">Home</a> <a href="https://github.com/rennerdo30/kwil">GitHub</a></p>
+  </footer>
+</body>
+</html>
