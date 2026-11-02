@@ -2797,6 +2797,7 @@ const FORMAT_DOCUMENT: &str = "[\n  {\n    \"keep\": [\n      3,\n      2\n    ]
 const FORMAT_SELECTION: &str = "[\n{  \"keep\": [3,2] },\n{\n  \"target\": [\n    1,\n    2\n  ]\n}]\n";
 
 fn format_bytes(app: &App) -> Vec<u8> {
+    assert!(app.document.live.failure.is_none(), "formatting must not poison the document lane");
     assert!(!app.view.file_saves_pending(), "format probe requires idle document actions");
     assert!(!app.document.live.transport.as_ref().unwrap().status().occupied, "format probe requires retired results");
     let mut bytes = Vec::new();
