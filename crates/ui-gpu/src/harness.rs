@@ -2222,6 +2222,10 @@ fn palette_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>, phase:
     match phase {
         0 => {
             assert!(app.view.recovery_ready());
+            // The complete CPU frontend presents into the real window DC even
+            // while DWM-cloaked, so these are native window captures.
+            app.user_event(el, UserEvent::SessionChanged(true));
+            assert!(app.policy.remote());
             assert!(app.dispatch_palette("view.fileFinder"));
             text(app, "palette-target");
         }
