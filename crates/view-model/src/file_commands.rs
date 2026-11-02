@@ -3,7 +3,7 @@ use super::*;
 use crate::document_worker::FileAction;
 use kwil_core_text::encoding::Encoding;
 
-// Canonical stateless encoding_rs names plus the engine's UTF-32 codecs.
+// Canonical encoding_rs names plus the engine's UTF-32 codecs.
 const ENCODINGS: &[&str] = &[
     "UTF-8",
     "UTF-16LE",
@@ -12,6 +12,7 @@ const ENCODINGS: &[&str] = &[
     "UTF-32BE",
     "Big5",
     "EUC-JP",
+    "ISO-2022-JP",
     "EUC-KR",
     "GBK",
     "gb18030",
@@ -457,7 +458,7 @@ mod tests {
         for label in ENCODINGS {
             Encoding::for_label(label).unwrap();
         }
-        assert!(!ENCODINGS.iter().any(|label| label.eq_ignore_ascii_case("ISO-2022-JP")));
+        assert!(ENCODINGS.iter().any(|label| label.eq_ignore_ascii_case("ISO-2022-JP")));
         assert_eq!(FilePromptKind::LineEnding.choices(), &["LF", "CRLF", "CR"]);
     }
 }
