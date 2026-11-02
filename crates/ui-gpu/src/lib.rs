@@ -1674,6 +1674,9 @@ impl App {
             self.apply(damage);
             return;
         }
+        if self.view.hex_session().is_some_and(|s| s.prompt_open()) && !self.hex_body_blocked() && self.hex_key(ev) {
+            return;
+        }
         if !self.composing
             && let Some(chord) = input::chord(&ev.logical_key, self.mods)
         {

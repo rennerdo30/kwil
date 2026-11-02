@@ -292,6 +292,12 @@ impl Workspace {
         {
             return Err(busy());
         }
+        // A fresh bounded hex open can return without a recovery sink: ordinary
+        // checkpoints skip it while its editor is on a page/reopen loan. Install
+        // only this ready target, before taking the edit loan and queuing bytes.
+        if editing && !self.files.observed.contains_key(&id) {
+            self.install_journal_observers_for(Some(id));
+        }
         if editing && (!self.files.observed.contains_key(&id) || self.files.journal_failed.contains_key(&id)) {
             return Err(io::Error::other("Hex edits require an admitted recovery observer"));
         }

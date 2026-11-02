@@ -316,6 +316,7 @@ fn run_workspace_with_terminal_init(
                             // this borrow. Never clone rows into retained UI data.
                             highlighting.invalidate_painted(view, update.damage());
                         }
+                        hex_ui::copy_ready(view);
                         update.is_some() || document.wrap_failed()
                     }
                     Msg::ContentReady => true,

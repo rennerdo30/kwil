@@ -12,6 +12,7 @@ mod document;
 mod editor;
 pub mod grid;
 pub mod hex;
+pub mod hex_actions;
 pub mod hex_session;
 pub mod highlight_session;
 pub mod highlighting;

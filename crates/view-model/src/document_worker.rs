@@ -1318,7 +1318,7 @@ impl DocumentWorker {
                             complete(DocumentResult::HexPage { document, editor, request, result });
                         }
                         DocumentRequest::HexEdit { document, mut editor, request } => {
-                            let completion = hex.edit(document, &mut editor, &request);
+                            let completion = hex.edit(document, &mut editor, &request, &cancel);
                             complete(DocumentResult::HexEdited { document, editor, completion });
                         }
                         DocumentRequest::ReleaseHex { document, epoch } => hex.release(document, epoch),

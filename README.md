@@ -27,7 +27,8 @@ important files.
   shared text/save engine. Per-file pickers reopen clean files or select the next
   save encoding, and convert LF / CRLF / CR line endings.
 - **Hex editing:** inspect physical bytes and edit in hex, with an explicit
-  text/hex choice for binary input.
+  text/hex choice for binary input. See [hex controls](docs/HEX.md) for ASCII
+  editing, byte offsets, byte search and copy-as-hex.
 - **Syntax highlighting:** bundled language support and a generic fallback for
   other text, with background highlighting work.
 - **Markdown preview in the GUI:** text, preview and split modes, including
