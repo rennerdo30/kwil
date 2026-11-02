@@ -40,7 +40,7 @@ jobs:
       - name: Install isolated-display tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends tigervnc-standalone-server xdotool fonts-dejavu-core
+          sudo apt-get install -y --no-install-recommends tigervnc-standalone-server xdotool fonts-dejavu-core libxkbcommon-x11-0 libxcb-shape0 libxcb-xfixes0
       - uses: Swatinem/rust-cache@v2
         with:
           add-rust-environment-hash-key: false

@@ -16,6 +16,8 @@ an application's session environment. Settings retain `render.remote = "auto"`.
 The existing `frame-harness` diagnostic must report `session_detected=true
 remote=true blink=false` after focusing the owned window. No forced remote
 override or synthetic in-process input is used. The built-in frame script is off.
+The development-profile binary is measured. Debug onboarding is dismissed using
+two RFB Escape keys before sampling (advance About, then skip registration).
 
 After initial pixels settle, the client measures idle, one typed character,
 one wheel notch, opening a file through the running instance, and post-action
