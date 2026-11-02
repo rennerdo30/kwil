@@ -77,10 +77,6 @@ fn error_text(error: &ActionError) -> String {
             let list: Vec<&str> = missing.iter().take(8).map(Extension::as_str).collect();
             format!("No verified content type for: {}{}", list.join(", "), if missing.len() > 8 { ", …" } else { "" })
         }
-        ActionErrorKind::ExtendNotAdopted { .. } => {
-            "Kwil is already registered. Adding types to an existing registration is not available in this build."
-                .into()
-        }
         ActionErrorKind::StaleReview => "The selection changed after the review; review again.".into(),
         ActionErrorKind::StaleCurrentFile => "The current file changed; review again.".into(),
         ActionErrorKind::InvalidNativePath => "Kwil's own path cannot be registered.".into(),
@@ -744,7 +740,6 @@ mod tests {
             ActionErrorKind::Busy,
             ActionErrorKind::EmptySelection,
             ActionErrorKind::UnadoptedCapacity { selected: 240, limit: 128 },
-            ActionErrorKind::ExtendNotAdopted { journal_id: 3 },
             ActionErrorKind::StaleReview,
             ActionErrorKind::Exhausted,
         ] {
