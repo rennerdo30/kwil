@@ -244,7 +244,10 @@ fn registration_explicit_accept_repeat_and_unregister_use_actual_durable_worker(
     h.event(); // repeat preview reports retained status too
     assert_eq!(h.fake.lock().unwrap().writes, writes);
     h.session().selection_mut().add_custom("custom").unwrap();
-    assert_eq!(h.session().preview().unwrap_err().kind, ActionErrorKind::ExtendNotAdopted { journal_id });
+    h.session().preview().unwrap();
+    h.event();
+    assert!(matches!(h.session().registration_status(), RegistrationStatus::Ready { .. }));
+    assert_eq!(h.fake.lock().unwrap().writes, writes, "additional-type preview stays read-only");
     h.session().unregister(journal_id).unwrap();
     h.event();
     assert!(h.fake.lock().unwrap().values.is_empty());
@@ -402,7 +405,11 @@ fn registration_restart_retains_unknown_membership_receipt_and_additional_type_g
     assert!(matches!(h.session().registration_status(), RegistrationStatus::RetainedRecovery { journal_id: 1, .. }));
     assert!(h.session().extension_status().is_empty(), "no invented durable selection metadata");
     h.session().selection_mut().add_custom("extra").unwrap();
-    assert_eq!(h.session().preview().unwrap_err().kind, ActionErrorKind::ExtendNotAdopted { journal_id: 1 });
+    let writes = h.fake.lock().unwrap().writes;
+    h.session().preview().unwrap();
+    h.event();
+    assert!(matches!(h.session().registration_status(), RegistrationStatus::Ready { .. }));
+    assert_eq!(h.fake.lock().unwrap().writes, writes);
     h.session().unregister(1).unwrap();
     h.event();
     assert!(h.fake.lock().unwrap().values.is_empty());
@@ -727,6 +734,34 @@ fn registration_apply_adds_and_removes_single_types_of_an_existing_registration(
     assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }), "no 'unregister first' detour");
     assert_eq!(h.open_with(), ["md", "txt"]);
     assert_eq!(names(h.session().registered()), ["md", "txt"]);
+}
+
+#[test]
+fn kw46_update_controller_preserves_survivors_for_register_and_unregister_selected() {
+    let _admission_case = registration_admission_case();
+    let mut h = Harness::new();
+    h.session().selection_mut().add_custom("txt").unwrap();
+    h.session().apply().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    let original = fs::read(h.journal.join("00000000000000000001.intent")).unwrap();
+    let writes = h.fake.lock().unwrap().writes;
+    *h.session().selection_mut() = Selection::default();
+    h.session().selection_mut().add_custom("log").unwrap();
+    h.session().register_checked().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    assert_eq!(h.open_with(), ["log", "txt"]);
+    assert_eq!(h.fake.lock().unwrap().writes - writes, 3);
+    assert_eq!(fs::read(h.journal.join("00000000000000000001.intent")).unwrap(), original);
+    let writes = h.fake.lock().unwrap().writes;
+    *h.session().selection_mut() = Selection::default();
+    h.session().selection_mut().add_custom("log").unwrap();
+    h.session().unregister_checked().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Applied { .. }));
+    assert_eq!(h.open_with(), ["txt"]);
+    assert_eq!(h.fake.lock().unwrap().writes - writes, 3);
+    h.session().remove_all().unwrap();
+    assert!(matches!(h.settle(), RegistrationStatus::Unregistered { .. }));
+    assert!(h.fake.lock().unwrap().values.is_empty());
 }
 #[test]
 fn registration_status_resets_checkboxes_to_what_is_registered() {
