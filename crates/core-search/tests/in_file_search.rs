@@ -122,3 +122,83 @@ fn finite_regex_over_one_mib_is_rejected_with_actionable_limit() {
     let error = Pattern::regex(r"(?-u:.){1048577}", Options::default(), 32).unwrap_err();
     assert!(error.to_string().contains("1 MiB"), "{error}");
 }
+
+#[test]
+fn unbounded_digits_find_every_number_in_a_multi_mib_file() {
+    let fixture = Fixture::new(0, 0, b"");
+    let block = b"id=12345\n".repeat(4096);
+    let mut file = OpenOptions::new().append(true).open(&fixture.0).unwrap();
+    for _ in 0..96 {
+        file.write_all(&block).unwrap();
+    }
+    drop(file);
+    let source = kwil_core_text::TextFile::open(&fixture.0).unwrap();
+    assert!(source.len() > 3 * MIB);
+    let pattern = Pattern::regex(r"\d+", Options::default(), 64 << 10).unwrap();
+    let mut count = 0;
+    let summary = search_default(
+        &source,
+        &pattern,
+        0..source.len(),
+        SearchMode::Hits,
+        &cancel(),
+        |hit| {
+            assert_eq!(hit, Match { offset: count * 9 + 3, len: 5 });
+            count += 1;
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(count, 96 * 4096);
+    assert_eq!(summary.count, count);
+    assert_eq!(summary.scanned, source.len());
+}
+
+#[test]
+fn unbounded_line_cap_keeps_hits_before_and_after_an_oversized_line() {
+    let bytes = b"123\nthis line is too long for the cap\n456\n";
+    let pattern = Pattern::regex(r"\d+", Options::default(), 8).unwrap();
+    let mut hits = Vec::new();
+    let summary = search_default(
+        bytes.as_slice(),
+        &pattern,
+        0..bytes.len() as u64,
+        SearchMode::Hits,
+        &cancel(),
+        |hit| hits.push(hit),
+        |_| {},
+    )
+    .unwrap();
+    let offset = bytes.windows(3).position(|b| b == b"456").unwrap() as u64;
+    assert_eq!(hits, [Match { offset: 0, len: 3 }, Match { offset, len: 3 }]);
+    assert_eq!(summary.count, 2);
+    assert_eq!(summary.scanned, bytes.len() as u64);
+}
+
+#[test]
+fn unbounded_line_search_preserves_crlf_anchors_and_empty_match_semantics() {
+    let bytes = b"foo 12 bar\r\nfoo 3 bar\rfoo 4 bar\n";
+    for expression in [r"^foo.*bar$", r"(?-m:^foo.*bar$)", r"foo.*?bar", r"\Afoo.*bar", r"foo.*bar\z", r"a*"] {
+        let pattern = Pattern::regex(expression, Options::default(), 64).unwrap();
+        let expected: Vec<_> = regex::bytes::RegexBuilder::new(expression)
+            .multi_line(true)
+            .crlf(true)
+            .build()
+            .unwrap()
+            .find_iter(bytes)
+            .map(|m| Match { offset: m.start() as u64, len: m.len() as u64 })
+            .collect();
+        let mut hits = Vec::new();
+        kwil_core_search::search(
+            bytes.as_slice(),
+            &pattern,
+            0..bytes.len() as u64,
+            SearchMode::Hits,
+            &cancel(),
+            |hit| hits.push(hit),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(hits, expected, "{expression}");
+    }
+}
