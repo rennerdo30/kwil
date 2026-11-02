@@ -217,8 +217,9 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
   Extending their decoded backings remains follow-up work.
 - Accessibility, remote rendering, platform integration, crash/recovery and
   performance budgets have not completed their full qualification.
-- Markdown preview pages large documents on workers; indivisible blocks above 64 KiB use a labelled source view. ISO-2022-JP is
-  explicitly unsupported.
+- Markdown preview pages large documents on workers; indivisible blocks above 64 KiB use a labelled source view.
+- ISO-2022-JP read/save uses sparse decoder-state checkpoints. Malformed input
+  remains lossless raw bytes; other stateful encodings remain unsupported.
 
 Report the platform, exact beta version, steps to reproduce and expected versus
 actual behavior at https://github.com/rennerdo30/kwil/issues. Attach only files
