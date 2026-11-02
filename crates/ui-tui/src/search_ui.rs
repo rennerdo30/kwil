@@ -1378,6 +1378,88 @@ mod tests {
     }
 
     #[test]
+    fn folder_replace_match_exclusion_closed_preserves_encoding_and_endings() {
+        let mut h = Harness::new("");
+        let tree = h.root.join("match-closed");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("utf16.txt");
+        let encoded =
+            |text: &str| [vec![0xff, 0xfe], text.encode_utf16().flat_map(u16::to_le_bytes).collect()].concat();
+        std::fs::write(&path, encoded("needle\r\nneedle\n")).unwrap();
+        h.files(tree, "needle");
+        h.field(SearchField::Replacement, "changed");
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        h.press(KeyCode::Enter, KeyModifiers::ALT);
+        h.settle();
+        assert_eq!(h.host.panel.results().len(), 2, "preview each match in the selected file");
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(1));
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.settle();
+        assert_eq!(std::fs::read(path).unwrap(), encoded("changed\r\nneedle\n"));
+        assert!(h.host.panel.status().contains("1 match excluded"));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_replace_match_exclusion_changed_file_is_skipped() {
+        let mut h = Harness::new("");
+        let tree = h.root.join("match-changed");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("changed.txt");
+        std::fs::write(&path, b"needle needle").unwrap();
+        h.files(tree, "needle");
+        h.field(SearchField::Replacement, "changed");
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        h.press(KeyCode::Enter, KeyModifiers::ALT);
+        h.settle();
+        assert_eq!(h.host.panel.results().len(), 2);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(1));
+        std::fs::write(&path, b"externally changed").unwrap();
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.settle();
+        assert_eq!(std::fs::read(path).unwrap(), b"externally changed");
+        assert!(h.host.panel.status().contains("1 skipped"));
+        assert!(h.host.panel.status().contains("changed.txt"));
+        h.finish();
+    }
+
+    #[test]
+    fn folder_replace_match_exclusion_open_is_dirty_and_undoable() {
+        let mut h = Harness::new("");
+        let tree = h.root.join("match-open");
+        std::fs::create_dir(&tree).unwrap();
+        let path = tree.join("open.txt");
+        std::fs::write(&path, b"needle needle").unwrap();
+        h.view
+            .open_files(kwil_core_workspace::instance::OpenFiles {
+                files: vec![kwil_core_workspace::instance::OpenFile { path: path.clone(), line: None, column: None }],
+            })
+            .unwrap();
+        h.until(|h| h.view.editor().is_some_and(|e| e.document().path() == Some(path.as_path())));
+        h.files(tree, "needle");
+        h.field(SearchField::Replacement, "changed");
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL);
+        h.settle();
+        h.press(KeyCode::Enter, KeyModifiers::ALT);
+        h.settle();
+        assert_eq!(h.host.panel.results().len(), 2);
+        h.host.input(&mut h.view, &mut h.keys, SearchInput::SelectRow(1));
+        h.press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        h.settle();
+        h.receipts();
+        assert_eq!(h.bytes(), b"changed needle");
+        assert!(h.view.editor().unwrap().document().is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"needle needle");
+        h.view.execute("edit.undo", &CommandArgs::default(), 1).unwrap();
+        h.view.sync_all();
+        h.receipts();
+        assert_eq!(h.bytes(), b"needle needle");
+        h.finish();
+    }
+
+    #[test]
     fn folder_replace_preview_exclusion_and_atomic_closed_apply() {
         let mut h = Harness::new("retain editor");
         let tree = h.root.join("replace");
