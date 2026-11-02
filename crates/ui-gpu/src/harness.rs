@@ -2797,7 +2797,7 @@ fn resize_interaction(app: &App, active: bool) {
 
 const FORMAT_ORIGINAL: &str = "[\n{  \"keep\": [3,2] },\n{  \"target\": [1,2] }\n]\n";
 const FORMAT_DOCUMENT: &str = "[\n  {\n    \"keep\": [\n      3,\n      2\n    ]\n  },\n  {\n    \"target\": [\n      1,\n      2\n    ]\n  }\n]\n";
-const FORMAT_SELECTION: &str = "[\n{  \"keep\": [3,2] },\n{\n  \"target\": [\n    1,\n    2\n  ]\n}]\n";
+const FORMAT_SELECTION: &str = "[\n{  \"keep\": [3,2] },\n{\n  \"target\": [\n    1,\n    2\n  ]\n}\n]\n";
 
 fn format_bytes(app: &App) -> Vec<u8> {
     assert!(app.document.live.failure.is_none(), "formatting must not poison the document lane");

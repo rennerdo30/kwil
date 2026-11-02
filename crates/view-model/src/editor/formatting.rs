@@ -185,9 +185,20 @@ impl Editor {
             };
             (replacement, result.bytes)
         };
-        if replacement.is_empty() && output.is_empty() || input.get(replacement.clone()) == Some(output.as_slice()) {
+        let (replacement, output) = if selection {
+            // Formatters may trim indentation or omit the final line break.
+            // Leave the selection's exact boundary bytes in the document and
+            // replace only its content, including for external range results.
+            let original = &input[replacement.clone()];
+            let leading = original.len() - original.trim_ascii_start().len();
+            let start = replacement.start + leading;
+            (start..start + original.trim_ascii().len(), output.trim_ascii())
+        } else {
+            (replacement, output.as_slice())
+        };
+        if replacement.is_empty() && output.is_empty() || input.get(replacement.clone()) == Some(output) {
             return Ok(Damage::default());
         }
-        self.replace_byte_range(replacement.start as u64..replacement.end as u64, &output)
+        self.replace_byte_range(replacement.start as u64..replacement.end as u64, output)
     }
 }
