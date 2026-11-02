@@ -153,6 +153,7 @@ pub fn run_console() -> ExitCode {
 }
 
 fn run_app(console_launcher: bool) -> ExitCode {
+    speed_mark("app entry");
     let platform = current_platform();
     #[cfg(windows)]
     let streams = windows::standard_streams();
@@ -182,6 +183,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    speed_mark("recovery and arguments ready");
     if args.update {
         return match kwil_update::disabled_reason(VERSION) {
             Some(why) => {
@@ -290,8 +292,10 @@ fn run_app(console_launcher: bool) -> ExitCode {
         }
     };
     if let Some(endpoint) = &endpoint {
+        speed_mark("IPC connect");
         match instance::try_forward(endpoint, &requests) {
             Ok(true) => {
+                speed_mark("IPC acknowledged");
                 #[cfg(windows)]
                 if use_gui && !console_launcher {
                     // The existing UI accepted the request. Complete the console
@@ -339,6 +343,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
         },
         None => None,
     };
+    speed_mark("instance claimed");
     let remaining = remaining_initial_files(&requests);
     let external_ready = || {
         if let Some(owner) = &instance_owner {
@@ -368,6 +373,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    speed_mark("initial workspace ready");
     if args.new_window {
         workspace.use_transient_session();
     }
@@ -461,6 +467,11 @@ fn run_app(console_launcher: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn speed_mark(_label: &str) {
+    #[cfg(feature = "startup-bench")]
+    kwil_ui_gpu::trace_startup(_label);
 }
 
 fn initial_view(path: &std::path::Path) -> Result<View, String> {

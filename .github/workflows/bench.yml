@@ -19,6 +19,60 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  startup:
+    # Measurements only: neither timing misses nor an unavailable desktop gate a PR.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          key: startup-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libvulkan-dev libegl1-mesa-dev xvfb
+      - name: Build the release app with opt-in startup trace
+        run: cargo build --release --locked -j 4 -p kwil --features startup-bench
+      - name: First frame, file content and second-launch display (informational)
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          exe=target/release/kwil
+          [ ! -f "$exe.exe" ] || exe="$exe.exe"
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a python scripts/bench-startup.py "$exe" results/startup-${{ matrix.os }}
+          else
+            python scripts/bench-startup.py "$exe" results/startup-${{ matrix.os }}
+          fi
+      - name: macOS palette over 100k files (informational)
+        if: always() && runner.os == 'macOS'
+        timeout-minutes: 5
+        env:
+          CARGO_TARGET_DIR: target-palette
+          KWIL_PALETTE_PROFILE: 1
+        shell: bash
+        run: |
+          mkdir -p results
+          cargo build --manifest-path crates/bench-palette/Cargo.toml --release --locked -j 4
+          git rev-parse HEAD > results/palette-profile-macos-15.log
+          target-palette/release/kwil-palette-bench "$RUNNER_TEMP/kwil-palette-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" > results/palette-macos-15.json 2>> results/palette-profile-macos-15.log
+          python -c 'import json,os; r=json.load(open("results/palette-macos-15.json")); print(r); open(os.environ["GITHUB_STEP_SUMMARY"],"a").write("\nPalette (informational): " + str(r) + "\n")'
+      - name: Retain startup traces and measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: responsiveness-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: results
+          if-no-files-found: warn
+
   budgets:
     # Optional performance check: never add this job to required branch checks.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
@@ -126,11 +180,13 @@ jobs:
         timeout-minutes: 5
         env:
           CARGO_TARGET_DIR: target-palette
+          KWIL_PALETTE_PROFILE: 1
         shell: bash
         run: |
           mkdir -p results
           cargo build --manifest-path crates/bench-palette/Cargo.toml --release --locked -j 4
-          target-palette/release/kwil-palette-bench "$RUNNER_TEMP/kwil-palette-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" > results/palette-${{ matrix.os }}.json
+          git rev-parse HEAD > results/palette-profile-${{ matrix.os }}.log
+          target-palette/release/kwil-palette-bench "$RUNNER_TEMP/kwil-palette-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" > results/palette-${{ matrix.os }}.json 2>> results/palette-profile-${{ matrix.os }}.log
       - name: Summarize benchmarks
         if: always()
         shell: pwsh
@@ -148,6 +204,7 @@ jobs:
             $comparison = if ($palette.within_target) { 'within' } else { 'MISSES' }
             "`nPalette: **$($palette.query_results_ms) ms** query-to-fresh-results over $($palette.files) files; $comparison the 16 ms target (informational, non-blocking)." >> $env:GITHUB_STEP_SUMMARY
             "Query: $($palette.query); matches: $($palette.matches); displayed rows: $($palette.rows). One sample, discovery excluded; no GUI/TUI presentation timing." >> $env:GITHUB_STEP_SUMMARY
+            Get-Content 'results/palette-profile-${{ matrix.os }}.log' >> $env:GITHUB_STEP_SUMMARY
           } else {
             "`nPalette measurement unavailable (step: ${{ steps.palette.outcome }}); no timing acceptance claimed." >> $env:GITHUB_STEP_SUMMARY
           }
