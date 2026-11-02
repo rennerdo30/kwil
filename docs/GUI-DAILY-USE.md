@@ -193,3 +193,42 @@ must be evaluated on the revised head.
 
 Additional focused validation: two pending-present retry tests pass; strict
 workspace/all-target Clippy with the harness passes. No full local suite ran.
+
+## KW-48 / KW-55 current-main recheck (2026-11-02)
+
+The requested editor and welcome behavior is already on `4509ee8`. The recheck
+repairs only the existing development probes: use an admitted `kwil-test-` IPC
+namespace within its 48-byte limit, allow asynchronous DPI font completion before
+the menu-input step, and add a short welcome dismissal path. Production UI and
+welcome copy/persistence are unchanged.
+
+`daily-use.ps1 -Probe welcome` now captures the actual owned welcome window,
+clicks its painted **Not now** button through the App window-input route, asserts
+completion and window closure, then captures the editor. The new assertion
+rejects a compiling restoration of the historical FileTypes-only dismissal bug.
+The existing normal-worker test verifies remembered completion on its next start;
+debug mode still shows setup without reading or writing that marker.
+
+The daily probe also captures 133% text zoom and its reset to 100%. At the native
+150% monitor scale, chrome stays at 45/53/39 px for menu/tabs/status, with a 24 px
+scrollbar track and 48 px minimum thumb. The existing focused welcome, chrome,
+scrollbar, zoom and fractional-wheel selection passes all 31 tests.
+
+Inspected hidden window-DC captures show both scrollbar endpoints, typed text and
+caret, selection, saved text, zoom/reset, and benefits above technology on the
+welcome page. Native controls/styles, enabled Close, both icon handles and cloak
+pass the existing native assertions. Visible taskbar/caption pixels, physical
+button clicks/snap behavior, native macOS/Linux and a normal release executable
+are not verified by these cloaked runs.
+
+Evidence lives outside Git:
+
+- Welcome before/after: `E:/AgentData/scratch/kwil/gui-daily-welcome-40404-6e84b5f31f354115a629523eda23887c/`.
+- Editing/scrollbars/zoom: `E:/AgentData/scratch/kwil/gui-daily-daily-46628-c8c7dbb674044a89a660fd9f838304ec/`.
+- DPI/menu input: `E:/AgentData/reports/kwil-welcome-ui-4509ee8/usability-9b4f1d4333014a1fbea9c1860ced367e/`.
+
+The broader `KWIL_WELCOME_PROBE=1` still stops at its file-type custom-row
+assertion (`WelcomeKeyboard: painted custom row`); that separate failure is
+retained on KW-55. The short dismissal probe does not claim registration or
+custom-extension coverage. Full suites, hosted CI and owner acceptance remain
+separate from these focused local checks.

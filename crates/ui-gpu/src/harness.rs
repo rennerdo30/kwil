@@ -114,6 +114,7 @@ pub(crate) enum Step {
     MenuClose,
     ZoomIn,
     InputOwnership,
+    InputOwnershipMenu,
     UsabilityCapture(&'static str),
     /// Desktop overlays (settings, palette) captured in the hidden window.
     SettingsOpen,
@@ -124,6 +125,7 @@ pub(crate) enum Step {
     PaletteOpen,
     PaletteClose,
     WelcomeProbe,
+    WelcomeDismiss,
     FileTypesSetup,
     FileTypesRegister,
     FileTypesCheck(bool),
@@ -216,6 +218,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (1800, Step::DismissSetup),
             (200, Step::Idle),
             (100, Step::InputOwnership),
+            // Let the asynchronous DPI font reload settle before menu input.
+            (300, Step::InputOwnershipMenu),
             (100, Step::MenuOpen),
             (150, Step::UsabilityCapture("menu.bmp")),
             (100, Step::MenuClose),
@@ -253,6 +257,13 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (200, Step::UsabilityCapture("welcome-complete.bmp")),
             (100, Step::End),
         ];
+        let welcome_dismiss = [
+            (2000, Step::WelcomeProbe),
+            (100, Step::UsabilityCapture("welcome.bmp")),
+            (100, Step::WelcomeDismiss),
+            (200, Step::UsabilityCapture("welcome-complete.bmp")),
+            (100, Step::End),
+        ];
         let file_types = [
             (1800, Step::DismissSetup),
             (100, Step::FileTypesSetup),
@@ -283,6 +294,13 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (200, Step::DailyUndone),
             (200, Step::DailyRedone),
             (700, Step::DailySaved),
+            (100, Step::ZoomIn),
+            (100, Step::ZoomIn),
+            (100, Step::ZoomIn),
+            (400, Step::UsabilityCapture("daily-zoom.bmp")),
+            (100, Step::Command("view.zoomOut")),
+            (100, Step::Command("view.zoomReset")),
+            (400, Step::UsabilityCapture("daily-zoom-reset.bmp")),
             (200, Step::End),
         ];
         let handback = [
@@ -589,6 +607,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             resize.as_slice()
         } else if std::env::var_os("KWIL_FILETYPES_PROBE").is_some() {
             file_types.as_slice()
+        } else if std::env::var("KWIL_WELCOME_PROBE").as_deref() == Ok("dismiss") {
+            welcome_dismiss.as_slice()
         } else if std::env::var_os("KWIL_WELCOME_PROBE").is_some() {
             welcome.as_slice()
         } else if std::env::var_os("KWIL_UI_USABILITY_CAPTURE").is_some() {
@@ -1296,6 +1316,38 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.view.editor().unwrap().document().revision() > revision);
         }
         Step::WelcomeProbe => welcome_probe(app, el),
+        Step::WelcomeDismiss => {
+            use winit::event::WindowEvent;
+            assert_eq!(app.welcome.stage(), super::welcome::Stage::About);
+            let dialog = app.desktop_window.as_ref().expect("actual welcome window");
+            let id = dialog.gfx.window.id();
+            let (button, _) = app
+                .welcome_view
+                .hits
+                .iter()
+                .find(|(_, action)| *action == super::welcome_ui::Action::Skip)
+                .copied()
+                .expect("painted Not now button");
+            app.window_event(
+                el,
+                id,
+                WindowEvent::CursorMoved {
+                    device_id: winit::event::DeviceId::dummy(),
+                    position: winit::dpi::PhysicalPosition::new((button.x + 1) as f64, (button.y + 1) as f64),
+                },
+            );
+            app.window_event(
+                el,
+                id,
+                WindowEvent::MouseInput {
+                    device_id: winit::event::DeviceId::dummy(),
+                    state: winit::event::ElementState::Pressed,
+                    button: winit::event::MouseButton::Left,
+                },
+            );
+            assert_eq!(app.welcome.stage(), super::welcome::Stage::Complete, "Not now completes setup");
+            assert!(app.desktop_window.is_none(), "dismissal closes the owned welcome window");
+        }
         Step::FileTypesSetup => filetypes::setup(app),
         Step::FileTypesRegister => filetypes::register(app),
         Step::FileTypesUnregister => filetypes::unregister(app),
@@ -1863,6 +1915,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             let available = app.menu_available();
             app.menu_set(super::menu::State::open(0, &|id| super::menu::enabled(&available, id)), true);
         }
+        Step::InputOwnershipMenu => input_ownership_menu(app, el, dir.as_deref()),
         Step::InputOwnership => {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input_ownership(app, el, dir.as_deref())));
@@ -2079,9 +2132,9 @@ fn welcome_probe(app: &mut App, el: &ActiveEventLoop) {
     );
 }
 
-fn input_ownership(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
+fn input_ownership(app: &mut App, el: &ActiveEventLoop, _dir: Option<&Path>) {
     use winit::application::ApplicationHandler;
-    use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
+    use winit::event::WindowEvent;
     let window = app.gfx.as_ref().unwrap().window.id();
     let arm = |app: &mut App| {
         let body = app.body_area();
@@ -2110,7 +2163,11 @@ fn input_ownership(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
     app.window_event(el, window, WindowEvent::Resized(winit::dpi::PhysicalSize::new(size.0 as u32 + 1, size.1 as u32)));
     assert!(app.drag.is_none(), "resize must release the old coordinate anchor");
     app.window_event(el, window, WindowEvent::Resized(winit::dpi::PhysicalSize::new(size.0 as u32, size.1 as u32)));
+}
 
+fn input_ownership_menu(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>) {
+    use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
+    let window = app.gfx.as_ref().unwrap().window.id();
     let before = app.view.editor().map(|editor| (editor.document().revision(), editor.cursors().to_vec()));
     // Find is now enabled: the menu must retain click ownership through cancelled preedit.
     assert!(super::menu::enabled(&app.menu_available(), "search.find"));

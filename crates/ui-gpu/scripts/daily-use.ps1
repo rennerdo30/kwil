@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$Executable,
-    [ValidateSet('resize','daily','handback')][string]$Probe='resize',
+    [ValidateSet('resize','daily','handback','welcome')][string]$Probe='resize',
     [ValidateSet('cpu','auto')][string]$Renderer='cpu',
     [switch]$RequireCoalescing
 )
@@ -21,12 +21,14 @@ Copy-Item -LiteralPath "$dir/example.txt" -Destination "$dir/original.txt"
 $env:APPDATA="$dir/profile"
 $env:LOCALAPPDATA="$dir/local"
 $env:KWIL_WORKSPACE_ROOT="$dir/workspace"
-$env:KWIL_INSTANCE_NAMESPACE="gui-daily-$PID-$([guid]::NewGuid().ToString('N'))"
+# Hidden IPC requires this prefix and caps the complete namespace at 48 bytes.
+$env:KWIL_INSTANCE_NAMESPACE="kwil-test-$([guid]::NewGuid().ToString('N'))"
 $env:KWIL_NO_UPDATE='1'
 $env:KWIL_FRAME_SCRIPT='1'
 $env:KWIL_CAPTURE_DIR=$dir
 if($Probe -eq 'resize') { $env:KWIL_RESIZE_PROBE='1' }
 elseif($Probe -eq 'handback') { $env:KWIL_HANDBACK_PROBE='1' }
+elseif($Probe -eq 'welcome') { $env:KWIL_WELCOME_PROBE='dismiss' }
 else { $env:KWIL_DAILY_USE_PROBE='1' }
 if($RequireCoalescing) { $env:KWIL_RESIZE_REQUIRE_COALESCING='1' }
 $exe=(Resolve-Path -LiteralPath $Executable).Path
