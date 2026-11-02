@@ -383,9 +383,9 @@ fn files_oversize_lines_report_error_and_range_caps() {
 }
 
 #[test]
-fn invalid_ranges_chunks_and_match_bounds_are_errors() {
+fn derived_match_lengths_and_invalid_ranges_or_chunks() {
     let p = Pattern::regex("x{4}", Options::default(), 2).unwrap();
-    assert!(search(&b"xxxx"[..], &p, 0..4, SearchMode::Count, &token(), |_| {}, |_| {}).is_err());
+    assert_eq!(search(&b"xxxx"[..], &p, 0..4, SearchMode::Count, &token(), |_| {}, |_| {}).unwrap().count, 1);
     let p = literal(b"x");
     assert!(search(&b"x"[..], &p, 0..2, SearchMode::Count, &token(), |_| {}, |_| {}).is_err());
     struct Broken;

@@ -215,17 +215,31 @@ not a passing measurement for this commit. No second timing was taken under
 the one-run budget. Parent owns any decision about further measurement and
 performance acceptance, plus final-head hosted CI and independent review.
 
-## Regex match-bound limitation
+## In-file regex completeness policy
 
-The in-buffer regex engine requires every possible match to fit the declared
-`max_match_bytes`. A match longer than this bound may be **missed silently across
-window borders**: for example, `x{200}` with a bound of 2 can return no match
-without an error. Only overlong matches that the windows actually expose can
-produce a bound error. Callers must not assume every violation errors, even
-when a small-input probe does error. This limitation also applies to line filters
-using the bounded window engine. Prefer the line-oriented `find_in_files` mode
-where completeness matters: it searches complete lines and reports an error if
-a line exceeds its configured heap cap. It does not support multiline matches.
+Finite expressions derive their maximum match length in bytes from
+`regex-syntax` HIR, including Unicode case folding and alternations. Windows
+retain that much overlap plus assertion context; caller-supplied bounds never
+truncate finite matches. A computed maximum above 1 MiB is rejected before
+matching, with a limit error. Window storage is at most one 1 MiB work block
+plus the computed overlap and eight context bytes, independent of file/line size.
+
+Unbounded expressions have no finite safe overlap. They are searched only when
+the entire source fits `max_match_bytes` (1..=1 MiB; UI default 64 KiB). Larger
+sources return an actionable error before reading/matching or emitting hits,
+including patterns that would find nothing. This conservative **input cap**
+preserves greedy, lazy, alternation, anchor and selection semantics. It does not
+claim that a short match makes an unbounded expression safe on a large input.
+For larger documents use finite repetitions, e.g. `.{0,4096}` instead of `.*`.
+Selections still use the complete source size because outside-selection context
+can affect the chosen match. Line filters apply this input cap to each line.
+Folder search and replacement are unchanged.
+
+Before this change, `x{256}` with a declared bound of 16 could silently miss a
+chunk-boundary match, including in a 51 MiB line and at the tail of a file
+larger than 65 MiB. All six new regressions failed on `af0bb5e` before the fix.
+The focused `tests/in_file_search.rs` fixtures generate sparse
+files under ignored `fixtures/`, with unique PID/counter names and bounded writes.
 
 ## Focused checks
 

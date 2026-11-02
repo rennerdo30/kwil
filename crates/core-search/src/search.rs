@@ -104,6 +104,7 @@ enum Engine {
 pub struct Pattern {
     engine: Engine,
     max_len: usize,
+    source_limit: Option<usize>,
     captures: bool,
     pub(crate) newline_safe: bool,
 }
@@ -124,6 +125,14 @@ impl Pattern {
             // assertions let regex retry in one scan, emitting non-overlapping
             // accepted hits. Ordinary exact literals keep the memmem fast path.
             let expression = if options.whole_word { whole_word_expression(&escaped)? } else { escaped };
+            let hir = regex_syntax::ParserBuilder::new()
+                .utf8(false)
+                .unicode(unicode)
+                .case_insensitive(options.case_insensitive)
+                .build()
+                .parse(&expression)
+                .map_err(invalid)?;
+            let max_len = supported_match_len(hir.properties().maximum_len().unwrap_or(0))?;
             let re = RegexBuilder::new(&expression)
                 .unicode(unicode)
                 .case_insensitive(options.case_insensitive)
@@ -131,11 +140,8 @@ impl Pattern {
                 .map_err(invalid)?;
             Ok(Self {
                 engine: Engine::Regex(re),
-                max_len: if options.case_insensitive {
-                    needle.len().saturating_mul(4).min(MAX_PATTERN)
-                } else {
-                    needle.len()
-                },
+                max_len,
+                source_limit: None,
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
             })
@@ -143,21 +149,22 @@ impl Pattern {
             Ok(Self {
                 engine: Engine::Literal(needle.to_vec()),
                 max_len: needle.len(),
+                source_limit: None,
                 captures: false,
                 newline_safe: !needle.contains(&b'\n'),
             })
         }
     }
 
-    /// Regex search uses overlap, never a whole-file or whole-line buffer.
+    /// Finite regexes derive their overlap from the maximum possible match
+    /// length in bytes, including Unicode case folding. Maxima above 1 MiB
+    /// return a limit error; the caller's bound never truncates finite matches.
     ///
-    /// Contract: every possible match must fit `max_match_bytes` (1..=1 MiB).
-    /// 64 KiB is a useful UI default. Unbounded expressions such as `.*` are
-    /// supported only when the caller can guarantee this bound for its input.
-    /// Longer matches are outside this API's contract. Detected overlong matches
-    /// return an error, but matches longer than the bound may be missed silently
-    /// across window borders. Callers must not assume every violation errors.
-    /// Use line-oriented find-in-files when complete bounded lines are needed.
+    /// For unbounded expressions such as `.*`, `max_match_bytes` (1..=1 MiB)
+    /// caps the entire source size, including for selection searches. Larger
+    /// sources return an actionable error before any matching or hit emission.
+    /// Use finite repetitions on larger inputs. This conservative input cap
+    /// preserves regex semantics without silently missing overlong matches.
     /// Anchors, captures, Unicode and zero-width matches retain regex semantics
     /// within this contract. The range restricts matches, not anchor context.
     pub fn regex(expression: &str, options: Options, max_match_bytes: usize) -> io::Result<Self> {
@@ -171,7 +178,16 @@ impl Pattern {
             .build()
             .parse(expression)
             .map_err(invalid)?;
-        let newline_safe = !consumes_newline(&hir);
+        let maximum = if hir.properties().minimum_len().is_none() {
+            Some(0) // The expression matches nothing, rather than an unbounded string.
+        } else {
+            hir.properties().maximum_len()
+        };
+        let source_limit = maximum.is_none().then_some(max_match_bytes);
+        let max_len = supported_match_len(maximum.unwrap_or(max_match_bytes))?;
+        // An unbounded expression must see its complete, admitted input in one
+        // search, never separate line shards with different greedy semantics.
+        let newline_safe = source_limit.is_none() && !consumes_newline(&hir);
         let constrained = if options.whole_word { whole_word_expression(expression)? } else { expression.to_owned() };
         let re = RegexBuilder::new(&constrained)
             .crlf(true)
@@ -180,7 +196,7 @@ impl Pattern {
             .dfa_size_limit(2 << 20)
             .build()
             .map_err(invalid)?;
-        Ok(Self { engine: Engine::Regex(re), max_len: max_match_bytes, captures: true, newline_safe })
+        Ok(Self { engine: Engine::Regex(re), max_len, source_limit, captures: true, newline_safe })
     }
 
     pub(crate) fn visit(
@@ -286,6 +302,13 @@ pub(crate) fn expand_captures(caps: &regex::bytes::Captures<'_>, replacement: &[
     Ok(out)
 }
 
+fn supported_match_len(len: usize) -> io::Result<usize> {
+    if len > MAX_PATTERN {
+        return Err(invalid("regex maximum match length exceeds 1 MiB; use a smaller bounded repetition"));
+    }
+    Ok(len.max(1))
+}
+
 fn whole_word_expression(expression: &str) -> io::Result<String> {
     // AST serialization removes comments while retaining capture syntax and
     // inline flags. HIR serialization would drop groups under {0} and renumber
@@ -347,6 +370,13 @@ pub fn search<H: Haystack + ?Sized>(
     mut on_hit: impl FnMut(Match),
     mut progress: impl FnMut(Progress),
 ) -> io::Result<SearchSummary> {
+    if let Some(limit) = pattern.source_limit
+        && source.len() > limit as u64
+    {
+        return Err(invalid(format!(
+            "unbounded regex requires a source of at most {limit} bytes; use a bounded repetition such as .{{0,4096}} for larger files"
+        )));
+    }
     let mut result = SearchSummary { workers: 1, ..SearchSummary::default() };
     let mut next = range.start;
     let mut last_end = None;

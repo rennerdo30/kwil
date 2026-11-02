@@ -6,11 +6,10 @@
 //! decode files; find-in-files decodes BOM-marked UTF-16 LE/BE in bounded lines
 //! and translates hits back to original-file byte offsets.
 //!
-//! Regex windowing requires every match to fit the caller's max-match bound.
-//! A longer match may be missed silently across window borders; only detected
-//! overlong matches return errors. Callers must not assume every bound violation
-//! errors. Prefer the line-oriented [`find_in_files`] mode when completeness
-//! matters: it searches complete lines and reports lines exceeding its heap cap.
+//! Finite regexes derive their window overlap from their maximum match length
+//! (up to 1 MiB), independent of file or line size. Unbounded regexes require
+//! the complete source to fit the caller's input cap (UI default 64 KiB), or
+//! return an actionable limit error before emitting hits. See [`Pattern::regex`].
 
 mod files;
 mod filter;

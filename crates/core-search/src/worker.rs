@@ -45,7 +45,8 @@ pub struct Query {
     pub expression: String,
     pub literal: bool,
     pub options: Options,
-    /// Engine completeness contract: every match must fit this declared bound.
+    /// Input cap for unbounded regexes (UI default 64 KiB). Finite expressions
+    /// derive their maximum match length, up to the engine's 1 MiB limit.
     pub max_match_bytes: usize,
 }
 impl Query {
