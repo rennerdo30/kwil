@@ -660,14 +660,7 @@ fn run_workspace_with_terminal_init(
                                 unreachable!("body intent resolved")
                             }
                             KeyResult::Format(selection) => {
-                                let language = highlighting
-                                    .as_ref()
-                                    .map(|host| host.language_status(view).label())
-                                    .filter(|language| *language != "Automatic")
-                                    .map(str::to_owned);
-                                if let Err(error) = view.format_command(selection, language) {
-                                    view.set_notice(format!("Format: {error}"));
-                                }
+                                format_document(view, highlighting.as_ref(), selection);
                                 true
                             }
                             KeyResult::Search(_) => unreachable!("search intent resolved above"),
@@ -2757,6 +2750,20 @@ fn draw(f: &mut ratatui::Frame, view: &View) {
 #[cfg(test)]
 fn draw_area(f: &mut ratatui::Frame, view: &View, area: Rect, status: bool) {
     draw_area_highlighted(f, view, area, status, &[]);
+}
+
+fn format_document(
+    view: &mut Workspace,
+    highlighting: Option<&kwil_view_model::highlight_session::HighlightSession>,
+    selection: bool,
+) {
+    let language = highlighting
+        .map(|host| host.language_status(view).label())
+        .filter(|language| *language != "Automatic")
+        .map(str::to_owned);
+    if let Err(error) = view.format_command(selection, language) {
+        view.set_notice(format!("Format: {error}"));
+    }
 }
 
 fn draw_area_highlighted(

@@ -35,6 +35,10 @@ pub(super) fn hold_preview_completion(
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Step {
     Command(&'static str),
+    FormatBefore(bool),
+    FormatAfter(bool),
+    FormatUndo,
+    FormatSaved,
     TabContextProbe,
     FileCommand(&'static str),
     FilePromptChoice(&'static str),
@@ -563,9 +567,18 @@ pub(crate) fn start(proxy: super::HostProxy) {
             [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
         let format = [
             (1800, Step::DismissSetup),
+            (300, Step::FormatBefore(false)),
             (300, Step::Command("edit.formatDocument")),
-            (2500, Step::UsabilityCapture("formatted.bmp")),
-            (100, Step::Command("file.save")),
+            (2500, Step::FormatAfter(false)),
+            (100, Step::Command("edit.undo")),
+            (500, Step::FormatBefore(true)),
+            (100, Step::Command("edit.formatSelection")),
+            (2500, Step::FormatAfter(true)),
+            (100, Step::Command("edit.undo")),
+            (500, Step::FormatUndo),
+            (100, Step::Command("edit.redo")),
+            (500, Step::Command("file.save")),
+            (1000, Step::FormatSaved),
             (2000, Step::End),
         ];
         let tab_menu = [
@@ -2073,6 +2086,58 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             app.settings_epoch = app.settings_epoch.wrapping_add(1);
             app.palette_redraw();
         }
+        Step::FormatBefore(selection) => {
+            assert!(app.opts.hidden);
+            assert!(app.desktop_window.is_none(), "setup must be dismissed before formatting");
+            assert!(app.view.recovery_ready());
+            assert_eq!(format_bytes(app), FORMAT_ORIGINAL.as_bytes());
+            app.view.editor_mut().unwrap().settings.editor.tab_size = 2;
+            if selection {
+                let start = FORMAT_ORIGINAL.find("{  \"target\"").unwrap() as u64;
+                let end = FORMAT_ORIGINAL.rfind(']').unwrap() as u64;
+                let damage = app
+                    .view
+                    .editor_mut()
+                    .unwrap()
+                    .set_cursors(vec![kwil_view_model::Cursor { anchor: start, head: end, desired_column: None }], 0)
+                    .unwrap();
+                let damage = app.view.refresh_after_cursor(damage);
+                app.apply(damage);
+            }
+            app.apply(Damage { full: true, ..Default::default() });
+            assert!(app.render());
+            #[cfg(windows)]
+            native_probe(app.gfx.as_ref().unwrap().hwnd, dir.as_deref());
+            capture(
+                app,
+                dir.as_deref(),
+                if selection { "format-selection-before.bmp" } else { "format-document-before.bmp" },
+            );
+        }
+        Step::FormatAfter(selection) => {
+            assert_eq!(format_bytes(app), if selection { FORMAT_SELECTION } else { FORMAT_DOCUMENT }.as_bytes());
+            assert_eq!(app.view.notice(), "Formatting complete");
+            assert!(app.render());
+            let name = if selection { "format-selection-after" } else { "format-document-after" };
+            capture(app, dir.as_deref(), &format!("{name}.bmp"));
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join(format!("{name}.json")), format_bytes(app)).unwrap();
+            }
+        }
+        Step::FormatUndo => {
+            assert_eq!(format_bytes(app), FORMAT_ORIGINAL.as_bytes(), "one Undo restores every byte");
+            let cursor = app.view.editor().unwrap().primary_cursor();
+            assert_eq!(cursor.anchor, FORMAT_ORIGINAL.find("{  \"target\"").unwrap() as u64);
+            assert_eq!(cursor.head, FORMAT_ORIGINAL.rfind(']').unwrap() as u64);
+        }
+        Step::FormatSaved => {
+            assert_eq!(format_bytes(app), FORMAT_SELECTION.as_bytes());
+            let path = app.view.editor().unwrap().document().path().unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), FORMAT_SELECTION.as_bytes());
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join("format-result.txt"), "PASS: built-in JSON document and selection; exact output, unchanged unselected bytes, one-step undo, redo and native save\n").unwrap();
+            }
+        }
         Step::Command(command) => {
             app.palette_action(kwil_core_commands::palette::PaletteAction::Command(command));
         }
@@ -2484,6 +2549,18 @@ fn resize_interaction(app: &App, active: bool) {
     let _ = (app, active);
 }
 
+const FORMAT_ORIGINAL: &str = "[\n{  \"keep\": [3,2] },\n{  \"target\": [1,2] }\n]\n";
+const FORMAT_DOCUMENT: &str = "[\n  {\n    \"keep\": [\n      3,\n      2\n    ]\n  },\n  {\n    \"target\": [\n      1,\n      2\n    ]\n  }\n]\n";
+const FORMAT_SELECTION: &str = "[\n{  \"keep\": [3,2] },\n{\n  \"target\": [\n    1,\n    2\n  ]\n}]\n";
+
+fn format_bytes(app: &App) -> Vec<u8> {
+    assert!(!app.view.file_saves_pending(), "format probe requires idle document actions");
+    assert!(!app.document.live.transport.as_ref().unwrap().status().occupied, "format probe requires retired results");
+    let mut bytes = Vec::new();
+    app.view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
+    bytes
+}
+
 fn capture(app: &App, dir: Option<&Path>, name: &str) {
     if let (Some(dir), Some(gfx)) = (dir, app.desktop_window.as_ref().map(|d| &d.gfx).or(app.gfx.as_ref())) {
         #[cfg(all(windows, feature = "gpu"))]
@@ -2504,20 +2581,20 @@ fn capture(app: &App, dir: Option<&Path>, name: &str) {
             .unwrap();
             return;
         }
+        // The CPU compositor retains exactly the pixels copied into softbuffer.
+        // DWM-cloaked windows do not need a window-DC/PrintWindow capture.
+        let size = app.desktop_window.as_ref().map_or(app.size, |dialog| dialog.size);
+        write_pixels(&dir.join(name), size, &gfx.pixels).expect("CPU compositor capture write");
+        std::fs::write(
+            dir.join(format!("{name}.backend.txt")),
+            "CPU retained compositor pixels (not a DWM/window-DC capture)",
+        )
+        .unwrap();
         #[cfg(windows)]
+        if std::env::var_os("KWIL_CAPTURE_WINDOW_FRAME").is_some()
+            && let Err(error) = capture_dc(gfx.hwnd, &dir.join(format!("frame-{name}")), true)
         {
-            if let Err(error) = capture_dc(gfx.hwnd, &dir.join(name), false) {
-                eprintln!("capture failed: {error}");
-            }
-            if std::env::var_os("KWIL_CAPTURE_WINDOW_FRAME").is_some()
-                && let Err(error) = capture_dc(gfx.hwnd, &dir.join(format!("frame-{name}")), true)
-            {
-                eprintln!("window frame capture failed: {error}");
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (dir, gfx, name);
+            eprintln!("window frame capture failed: {error}");
         }
     }
 }
@@ -2616,7 +2693,6 @@ fn capture_dc(hwnd: isize, path: &Path, frame: bool) -> std::io::Result<()> {
     }
 }
 
-#[cfg(all(windows, feature = "gpu"))]
 fn write_pixels(path: &Path, size: (usize, usize), pixels: &[u32]) -> std::io::Result<()> {
     let (w, h) = size;
     let len = w * h * 4;
