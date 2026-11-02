@@ -18,7 +18,7 @@ pub mod worker_edit;
 
 pub use buffer::{Buffer, Lines, PreparedSavedInstall, Snapshot, SnapshotImporter};
 pub use file::with_checked_read_batch;
-pub use file::{FileKind, FileState, IndexProgress, OpenError, ReadError, TextFile};
+pub use file::{FileKind, FileState, IndexProgress, OpenError, READ_CHUNK, ReadError, TextFile};
 pub use file::{OriginalSavePin, cleanup_stale_save_backups};
 pub use index_memory::INDEX_MEMORY_BYTES;
 pub use line_index::LineIndex;

@@ -61,11 +61,11 @@ impl Haystack for Chunks<'_> {
     fn len(&self) -> u64 {
         self.bytes.len() as u64
     }
-    fn chunks(&self, r: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+    fn chunks(&self, r: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>> {
         Ok(self.bytes[r.start as usize..r.end as usize]
             .chunks(self.size)
             .enumerate()
-            .map(move |(i, b)| Ok((r.start + (i * self.size) as u64, b))))
+            .map(move |(i, b)| Ok((r.start + (i * self.size) as u64, std::borrow::Cow::Borrowed(b)))))
     }
 }
 fn collect<H: Haystack + ?Sized>(h: &H, p: &Pattern, r: Range<u64>) -> Vec<Match> {
@@ -393,8 +393,11 @@ fn invalid_ranges_chunks_and_match_bounds_are_errors() {
         fn len(&self) -> u64 {
             10
         }
-        fn chunks(&self, _: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
-            Ok(std::iter::once(Ok((1, b"x".as_slice()))))
+        fn chunks(
+            &self,
+            _: Range<u64>,
+        ) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>> {
+            Ok(std::iter::once(Ok((1, std::borrow::Cow::Borrowed(b"x".as_slice())))))
         }
     }
     assert!(search(&Broken, &p, 0..10, SearchMode::Count, &token(), |_| {}, |_| {}).is_err());
@@ -659,7 +662,10 @@ fn haystack_read_errors_reach_search_filter_and_replace() {
         fn len(&self) -> u64 {
             2048
         }
-        fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+        fn chunks(
+            &self,
+            range: Range<u64>,
+        ) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>> {
             if self.initial {
                 return Err(io::Error::other("initial read failed"));
             }

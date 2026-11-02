@@ -16,7 +16,7 @@ fn scalar_bytes(s: &Snapshot, range: Range<u64>) -> io::Result<([u8; 4], usize)>
     let mut written = 0;
     for chunk in s.chunks(range)? {
         let chunk = chunk.map_err(io::Error::other)?;
-        bytes[written..written + chunk.len()].copy_from_slice(chunk);
+        bytes[written..written + chunk.len()].copy_from_slice(&chunk);
         written += chunk.len();
     }
     debug_assert_eq!(written, length);
@@ -29,7 +29,7 @@ pub(crate) fn read(s: &Snapshot, range: Range<u64>, limit: u64) -> io::Result<Ve
     }
     let mut result = Vec::with_capacity((range.end - range.start) as usize);
     for chunk in s.chunks(range)? {
-        result.extend_from_slice(chunk.map_err(io::Error::other)?);
+        result.extend_from_slice(&chunk.map_err(io::Error::other)?);
     }
     Ok(result)
 }

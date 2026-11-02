@@ -60,7 +60,7 @@ impl DocumentLineEnding {
     pub(crate) fn detect(snapshot: &Snapshot) -> io::Result<Self> {
         let mut previous = 0;
         for chunk in snapshot.chunks(0..snapshot.len().min(64 << 10))? {
-            for &byte in chunk.map_err(io::Error::other)? {
+            for &byte in chunk.map_err(io::Error::other)?.iter() {
                 if byte == b'\n' {
                     return Ok(if previous == b'\r' { Self::CrLf } else { Self::Lf });
                 }
@@ -72,7 +72,7 @@ impl DocumentLineEnding {
         if let Some(end) = snapshot.line_start(1).map_err(io::Error::other)? {
             let mut last = [0, 0];
             for chunk in snapshot.chunks(end.saturating_sub(2)..end)? {
-                for &byte in chunk.map_err(io::Error::other)? {
+                for &byte in chunk.map_err(io::Error::other)?.iter() {
                     last = [last[1], byte];
                 }
             }

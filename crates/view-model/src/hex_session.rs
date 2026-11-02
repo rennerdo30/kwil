@@ -807,7 +807,7 @@ pub fn read_page(snapshot: &Snapshot, request: PageRequest, mut cancelled: impl 
         if cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "hex page cancelled"));
         }
-        bytes.extend_from_slice(chunk.map_err(io::Error::other)?);
+        bytes.extend_from_slice(&chunk.map_err(io::Error::other)?);
     }
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "hex page cancelled"));
@@ -894,8 +894,8 @@ pub fn read_file_page(file: &TextFile, request: PageRequest, mut cancelled: impl
         return Err(io::Error::new(io::ErrorKind::Interrupted, "hex page cancelled"));
     }
     let range = view.range(file.len());
-    let bytes = file.bytes().map_err(io::Error::other)?;
-    let page = Page { request, rows: view.layout(range.clone(), &bytes[range.start as usize..range.end as usize]) };
+    let bytes = file.read_range(range.clone()).map_err(io::Error::other)?;
+    let page = Page { request, rows: view.layout(range.clone(), &bytes) };
     if cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "hex page cancelled"));
     }

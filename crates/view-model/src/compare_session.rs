@@ -137,7 +137,7 @@ impl LineSource for Input {
         }
         scratch.clear();
         for chunk in self.0.chunks(start..end).map_err(|e| diff::DiffError::Read(e.kind()))? {
-            scratch.extend_from_slice(chunk.map_err(read)?);
+            scratch.extend_from_slice(&chunk.map_err(read)?);
         }
         Ok(diff::Line::Scratch)
     }
@@ -328,7 +328,7 @@ impl State {
                         for chunk in
                             input.0.chunks(start..end.min(start + ROW_BYTES as u64)).map_err(|e| e.to_string())?
                         {
-                            text[side].extend_from_slice(chunk.map_err(|e| e.to_string())?);
+                            text[side].extend_from_slice(&chunk.map_err(|e| e.to_string())?);
                         }
                         while text[side].last().is_some_and(|b| matches!(b, b'\r' | b'\n')) {
                             text[side].pop();

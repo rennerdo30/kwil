@@ -934,7 +934,10 @@ mod tests {
             let owner = prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancel()).unwrap();
             assert_eq!(owner.format(), format);
             assert_eq!(owner.text_file().unwrap().resident_original_bytes(), 0);
-            assert_eq!(owner.text_file().unwrap().bytes().unwrap(), text);
+            assert_eq!(
+                owner.text_file().unwrap().read_range(0..owner.text_file().unwrap().len()).unwrap().as_ref(),
+                text
+            );
             assert!(owner.try_finish().is_ok());
             for cut in [1, payload.len() / 2] {
                 fs::write(&path, &payload[..payload.len() - cut]).unwrap();
@@ -950,7 +953,10 @@ mod tests {
             assert_eq!(fixture.backing_count(), 0);
             fs::write(&path, payload.repeat(2)).unwrap();
             let owner = prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancel()).unwrap();
-            assert_eq!(owner.text_file().unwrap().bytes().unwrap(), text.repeat(2));
+            assert_eq!(
+                owner.text_file().unwrap().read_range(0..owner.text_file().unwrap().len()).unwrap().as_ref(),
+                text.repeat(2)
+            );
             assert!(owner.try_finish().is_ok());
             for damaged in [
                 [payload.as_slice(), &payload[..payload.len() / 2]].concat(),
@@ -1113,7 +1119,10 @@ mod tests {
         let prepared = prepare_file(&source, CompressionMode::Auto, &fixture.0, &cancel()).unwrap();
         assert_eq!(prepared.format(), CompressionFormat::Gzip);
         assert_eq!(prepared.source_path(), source);
-        assert_eq!(prepared.text_file().unwrap().bytes().unwrap(), bytes);
+        assert_eq!(
+            prepared.text_file().unwrap().read_range(0..prepared.text_file().unwrap().len()).unwrap().as_ref(),
+            bytes
+        );
         assert_eq!(prepared.text_file().unwrap().resident_original_bytes(), 0);
         assert!(prepared.backing_path().unwrap().exists());
         assert!(prepared.try_finish().is_ok());
@@ -1123,7 +1132,10 @@ mod tests {
         let prepared = prepare_file(&source, CompressionMode::Auto, &fixture.0, &cancel()).unwrap();
         assert_eq!(prepared.format(), CompressionFormat::Raw);
         assert!(prepared.backing_path().is_none());
-        assert_eq!(prepared.text_file().unwrap().bytes().unwrap(), b"uncompressed");
+        assert_eq!(
+            prepared.text_file().unwrap().read_range(0..prepared.text_file().unwrap().len()).unwrap().as_ref(),
+            b"uncompressed"
+        );
         assert!(prepared.try_finish().is_ok());
     }
 
@@ -1133,11 +1145,11 @@ mod tests {
         let encoded = gzip(b"text");
         let source = fixture.source("gzip", &encoded);
         let raw = prepare_file(&source, CompressionMode::Raw, &fixture.0, &cancel()).unwrap();
-        assert_eq!(raw.text_file().unwrap().bytes().unwrap(), encoded);
+        assert_eq!(raw.text_file().unwrap().read_range(0..raw.text_file().unwrap().len()).unwrap().as_ref(), encoded);
         assert_eq!(raw.format(), CompressionFormat::Raw);
         assert!(raw.try_finish().is_ok());
         let gzip = prepare_file(&source, CompressionMode::Gzip, &fixture.0, &cancel()).unwrap();
-        assert_eq!(gzip.text_file().unwrap().bytes().unwrap(), b"text");
+        assert_eq!(gzip.text_file().unwrap().read_range(0..gzip.text_file().unwrap().len()).unwrap().as_ref(), b"text");
         assert!(gzip.try_finish().is_ok());
 
         let source = fixture.source("unsupported", b"PK\x03\x04stuff");
@@ -1149,7 +1161,10 @@ mod tests {
             Err(CompressionError::InvalidGzip(_))
         ));
         let raw = prepare_file(&source, CompressionMode::Raw, &fixture.0, &cancel()).unwrap();
-        assert_eq!(raw.text_file().unwrap().bytes().unwrap(), b"PK\x03\x04stuff");
+        assert_eq!(
+            raw.text_file().unwrap().read_range(0..raw.text_file().unwrap().len()).unwrap().as_ref(),
+            b"PK\x03\x04stuff"
+        );
         assert!(raw.try_finish().is_ok());
         assert_eq!(fixture.backing_count(), 0);
     }
@@ -1160,7 +1175,10 @@ mod tests {
         let encoded = [gzip(b"first\r\n"), gzip(b""), gzip(b"\xffsecond\0")].concat();
         let source = fixture.source("members", &encoded);
         let prepared = prepare_file(&source, CompressionMode::Auto, &fixture.0, &cancel()).unwrap();
-        assert_eq!(prepared.text_file().unwrap().bytes().unwrap(), b"first\r\n\xffsecond\0");
+        assert_eq!(
+            prepared.text_file().unwrap().read_range(0..prepared.text_file().unwrap().len()).unwrap().as_ref(),
+            b"first\r\n\xffsecond\0"
+        );
         assert!(prepared.try_finish().is_ok());
     }
 
@@ -1541,7 +1559,10 @@ mod payload_tests {
         let identity = f.0.join("original.gz");
         let owner = prepare_gzip_payload(&identity, &mut &payload[..], &f.0, &AtomicBool::new(false)).unwrap();
         assert_eq!(owner.source_path(), identity);
-        assert_eq!(owner.text_file().unwrap().bytes().unwrap(), b"first\xfflast");
+        assert_eq!(
+            owner.text_file().unwrap().read_range(0..owner.text_file().unwrap().len()).unwrap().as_ref(),
+            b"first\xfflast"
+        );
         assert_eq!(owner.text_file().unwrap().resident_original_bytes(), 0);
         assert!(owner.try_finish().is_ok());
         assert!(!identity.exists(), "decompression must never create or overwrite the original");

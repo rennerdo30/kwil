@@ -194,7 +194,7 @@ impl LineFilter {
                     break 'chunks;
                 }
             }
-            for n in memchr::memchr2_iter(b'\r', b'\n', bytes) {
+            for n in memchr::memchr2_iter(b'\r', b'\n', &bytes) {
                 let end = at + n as u64;
                 if let Some(previous) = cr.take() {
                     let paired = end == previous + 1 && bytes[n] == b'\n';
@@ -241,7 +241,10 @@ impl<H: Haystack + ?Sized> Haystack for LineSource<'_, H> {
     fn len(&self) -> u64 {
         self.range.end - self.range.start
     }
-    fn chunks(&self, range: Range<u64>) -> io::Result<impl Iterator<Item = io::Result<(u64, &[u8])>>> {
+    fn chunks(
+        &self,
+        range: Range<u64>,
+    ) -> io::Result<impl Iterator<Item = io::Result<(u64, std::borrow::Cow<'_, [u8]>)>>> {
         Ok(self
             .source
             .chunks(self.range.start + range.start..self.range.start + range.end)?

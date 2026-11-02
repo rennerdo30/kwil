@@ -121,7 +121,7 @@ impl Snapshot {
         Ok(Some((line, offset - self.line_start(line)?.unwrap())))
     }
 
-    /// Borrowed slices clipped to `range`; invalid/reversed ranges are errors.
+    /// Bounded borrowed or owned ranges clipped to `range`; invalid/reversed ranges are errors.
     /// Empty ranges yield no chunks. No file-sized output allocation occurs.
     /// Each iterator item reports original-file read errors and then stops.
     pub fn chunks(&self, range: Range<u64>) -> io::Result<Chunks<'_>> {
@@ -129,7 +129,7 @@ impl Snapshot {
         Ok(Chunks::new(&self.root, range))
     }
 
-    /// Encoding-save traversal retaining original byte ranges. Does not decode or copy.
+    /// Bounded encoding-save traversal retaining original byte ranges.
     pub fn source_chunks(&self, range: Range<u64>) -> io::Result<crate::piece_tree::SourceChunks<'_>> {
         self.check_range(&range)?;
         Ok(crate::piece_tree::SourceChunks::new(&self.root, range))
@@ -145,7 +145,7 @@ impl Snapshot {
     /// Stream this version to a writer. Atomic replacement is the save layer's job.
     pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
         for chunk in Chunks::new(&self.root, 0..self.len()) {
-            writer.write_all(chunk.map_err(io::Error::other)?)?;
+            writer.write_all(&chunk.map_err(io::Error::other)?)?;
         }
         Ok(())
     }
@@ -1828,11 +1828,13 @@ mod tests {
         buffer.insert(0, b"one\rtwo\r").unwrap();
         buffer.insert(buffer.len(), b"\n\nlast\r\n").unwrap();
         buffer.insert(2, b"\xff").unwrap();
-        let lines: Vec<Vec<u8>> =
-            buffer.lines(0, 10).map(|line| line.unwrap().flat_map(Result::unwrap).copied().collect()).collect();
+        let lines: Vec<Vec<u8>> = buffer
+            .lines(0, 10)
+            .map(|line| line.unwrap().flat_map(|chunk| chunk.unwrap().into_owned()).collect())
+            .collect();
         // Line views split lone CR too; raw chunk ranges below keep its byte.
         assert_eq!(lines, [b"on\xffe".to_vec(), b"two".to_vec(), vec![], b"last".to_vec(), vec![]]);
-        let middle: Vec<_> = buffer.chunks(3..12).unwrap().flat_map(Result::unwrap).copied().collect();
+        let middle: Vec<_> = buffer.chunks(3..12).unwrap().flat_map(|chunk| chunk.unwrap().into_owned()).collect();
         assert_eq!(middle, b"e\rtwo\r\n\nl");
         assert_eq!(buffer.chunks(2..2).unwrap().count(), 0);
         assert_eq!(buffer.chunks(1..1).unwrap().count(), 0);
@@ -1945,7 +1947,7 @@ mod tests {
         let index_ms = start.elapsed().as_secs_f64() * 1000.0;
         let len = file.len();
         let middle = len / 2;
-        let original_jump = file.index().unwrap().line_start(file.bytes().unwrap(), 15_000_000).unwrap();
+        let original_jump = file.line_start(15_000_000).unwrap().unwrap();
         let start = Instant::now();
         let mut buffer = Buffer::from_file(file).unwrap();
         let attach_ms = start.elapsed().as_secs_f64() * 1000.0;
