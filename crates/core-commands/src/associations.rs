@@ -20,6 +20,7 @@ use std::{
     },
 };
 
+mod updates;
 pub mod windows_paths;
 pub mod worker;
 
@@ -124,6 +125,9 @@ impl<'a> IntoIterator for &'a SharedChanges {
     }
 }
 impl SharedChanges {
+    fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|storage| storage.items.is_empty())
+    }
     fn admitted(items: Vec<Change>, admission: Admission) -> Self {
         if items.is_empty() {
             Self::default()
