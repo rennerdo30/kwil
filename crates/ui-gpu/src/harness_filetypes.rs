@@ -81,7 +81,7 @@ pub(super) fn unregister(app: &mut App) {
 pub(super) fn extend(app: &mut App, add: bool) {
     let page = app.file_types.as_mut().unwrap();
     *page.service.selection_mut() = Selection::default();
-    page.service.selection_mut().add_custom("md").unwrap();
+    page.service.selection_mut().add_custom("ownerlog46").unwrap();
     page.click(if add { 1 } else { 3 });
     app.apply(Damage { full: true, ..Default::default() });
 }
@@ -89,8 +89,10 @@ pub(super) fn extend(app: &mut App, add: bool) {
 pub(super) fn check_extended(app: &mut App, added: bool) {
     check(app, true);
     let service = &app.file_types.as_ref().unwrap().service;
-    assert_eq!(service.registered().unwrap().contains(&Extension::parse("md").unwrap()), added);
-    println!("kw46 file-types additional md={added}; original plain-text types preserved; fake registry only");
+    assert_eq!(service.registered().unwrap().contains(&Extension::parse("ownerlog46").unwrap()), added);
+    println!(
+        "kw46 file-types additional custom ownerlog46={added}; original plain-text types preserved; fake registry only"
+    );
 }
 
 pub(super) fn check(app: &mut App, registered: bool) {

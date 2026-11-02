@@ -497,6 +497,22 @@ impl<A: AssociationAdapter> Engine<A> {
                 if !executable.is_absolute() || !bounded_path(&executable) || extensions.len() > super::MAX_TYPES * 4 {
                     return Err(failure("Windows inspection exceeds bounds"));
                 }
+                let mut extensions: std::collections::BTreeSet<_> = extensions.into_iter().collect();
+                if let Some(active) = &self.journal.active {
+                    for change in active.receipt.pending().iter().chain(active.removed.iter()) {
+                        if let super::Location::WindowsValue { subkey, name } = &change.location
+                            && let Some(extension) =
+                                subkey.strip_prefix('.').and_then(|s| s.strip_suffix("\\OpenWithProgids"))
+                            && name.eq_ignore_ascii_case(&format!("Kwil.{extension}"))
+                            && crate::file_types::registration_allowed(extension)
+                        {
+                            extensions.insert(extension.to_owned());
+                        }
+                    }
+                }
+                if extensions.len() > super::MAX_TYPES * 4 {
+                    return Err(failure("combined Windows inspection exceeds bounds"));
+                }
                 // Reuse the exact registration contract without creating a plan
                 // token or changing the retained receipt. Never write native data.
                 let mut registered = Vec::new();
@@ -1511,6 +1527,25 @@ mod tests {
         assert!(second > first);
         assert_eq!(fake.0.lock().unwrap().writes, writes);
         assert_eq!(status(&mut service).recovery.unwrap().receipt.pending().len(), 3);
+    }
+    #[test]
+    fn kw46_update_restart_status_discovers_owned_custom_types_outside_catalog() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let fake = Fake::default();
+        let mut service = engine(&scratch, &fake);
+        update_apply(&mut service, &["ownerlog46"]);
+        drop(service);
+        let mut service = engine(&scratch, &fake);
+        let writes = fake.0.lock().unwrap().writes;
+        let Response::WindowsStatus { registered, .. } = service
+            .execute(Request::WindowsStatus { executable: request().executable, extensions: vec!["txt".into()] })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(registered, ["ownerlog46"], "durable custom types must survive a controller restart");
+        assert_eq!(fake.0.lock().unwrap().writes, writes, "status is read-only");
     }
     #[test]
     fn kw46_update_shared_linux_files_keep_intermediate_undo_signatures_and_subset_mimes() {
