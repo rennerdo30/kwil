@@ -1535,10 +1535,12 @@ impl DocumentWorker {
                             complete(DocumentResult::Prepared(prepared));
                         }
                         DocumentRequest::PrepareWindow { root, window, restore } => {
-                            let prepared = prepare_window(root, window, restore).map(|(prepared, state)| {
-                                storage = Some(state);
-                                prepared
-                            });
+                            let prepared =
+                                prepare_window(root, window, restore, preferences).map(|(prepared, state)| {
+                                    *worker_preferences.lock().unwrap_or_else(|e| e.into_inner()) = state.preferences;
+                                    storage = Some(state);
+                                    prepared
+                                });
                             complete(DocumentResult::Prepared(prepared));
                         }
                         DocumentRequest::Persist(session) | DocumentRequest::PersistTransient(session) => {
@@ -2129,14 +2131,9 @@ fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
 
 fn prepare_with_settings(
     root: Option<PathBuf>,
-    mut preferences: WorkerSettings,
+    preferences: WorkerSettings,
 ) -> io::Result<(PreparedWorkspace, Storage)> {
-    if root.is_none() {
-        let exe = std::env::current_exe()?;
-        let path = kwil_core_commands::Settings::path(&exe).map_err(io::Error::other)?;
-        preferences =
-            WorkerSettings::from(&kwil_core_commands::Settings::load(&path).map(|r| r.settings).unwrap_or_default());
-    }
+    let preferences = prepare_preferences(&root, preferences)?;
     let root = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
     #[cfg(unix)]
     {
@@ -2146,6 +2143,16 @@ fn prepare_with_settings(
     #[cfg(not(unix))]
     std::fs::create_dir_all(&root)?;
     prepare_root_configured(root, preferences)
+}
+
+fn prepare_preferences(root: &Option<PathBuf>, mut preferences: WorkerSettings) -> io::Result<WorkerSettings> {
+    if root.is_none() {
+        let exe = std::env::current_exe()?;
+        let path = kwil_core_commands::Settings::path(&exe).map_err(io::Error::other)?;
+        preferences =
+            WorkerSettings::from(&kwil_core_commands::Settings::load(&path).map(|r| r.settings).unwrap_or_default());
+    }
+    Ok(preferences)
 }
 
 fn resolve_root(root: Option<PathBuf>, override_root: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
@@ -2176,21 +2183,23 @@ fn prepare_root_configured(root: PathBuf, preferences: WorkerSettings) -> io::Re
         .truncate(false)
         .open(root.join("workspace.lock"))?;
     ownership.try_lock().map_err(io::Error::other)?;
-    prepare_owned_root(root, ownership)
+    prepare_owned_root(root, ownership, preferences)
 }
 
 fn prepare_window(
     root: Option<PathBuf>,
     window: kwil_core_workspace::window_session::WindowSession,
     restore: Option<WindowRestore>,
+    preferences: WorkerSettings,
 ) -> io::Result<(PreparedWorkspace, Storage)> {
     use kwil_core_workspace::window_session::{WindowSession, claim_window, restorable_windows};
+    let preferences = prepare_preferences(&root, preferences)?;
     let base = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
     let claim = claim_window(&base, &window)?;
     let windows =
         if window == WindowSession::Primary && restore.is_some() { restorable_windows(&claim)? } else { Vec::new() };
     let (root, ownership) = claim.into_parts();
-    let prepared = prepare_owned_root(root, ownership)?;
+    let prepared = prepare_owned_root(root, ownership, preferences)?;
     if let Some(restore) = restore
         && !windows.is_empty()
         && let Err(error) = restore(&base, windows)
@@ -2200,7 +2209,11 @@ fn prepare_window(
     Ok(prepared)
 }
 
-fn prepare_owned_root(root: PathBuf, ownership: std::fs::File) -> io::Result<(PreparedWorkspace, Storage)> {
+fn prepare_owned_root(
+    root: PathBuf,
+    ownership: std::fs::File,
+    preferences: WorkerSettings,
+) -> io::Result<(PreparedWorkspace, Storage)> {
     // Reserve owner/path bookkeeping before opening any decoded document.
     // This is a metadata admission ceiling, not a resident allocation or a
     // file-size limit. Registry slots retain owners until snapshots retire.
