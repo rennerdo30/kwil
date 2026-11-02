@@ -1,0 +1,59 @@
+name: KW-69 temporary macOS proof
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+env:
+  CARGO_TARGET_DIR: target
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+jobs:
+  macos-proof:
+    if: github.head_ref == 't3/fix-macos-test-timeouts'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          save-if: false
+      - name: Prove queued ACK fails with the original product
+        shell: bash
+        run: |
+          cp crates/core-workspace/src/instance.rs /tmp/kw69-instance-fixed.rs
+          python3 - <<'PY'
+          import pathlib, subprocess
+          p = pathlib.Path('crates/core-workspace/src/instance.rs')
+          fixed = p.read_text()
+          tests = fixed[fixed.index('    #[cfg(test)]\n    mod tests {', fixed.index('    fn wait_ready(')):fixed.index('    // A blocking UnixStream::connect')]
+          old = subprocess.check_output(['git', 'show', 'HEAD:crates/core-workspace/src/instance.rs'], text=True)
+          start = old.index('            remaining(deadline)?;', old.index('    fn read_deadline('))
+          end = old.index('            if n == 0 {', start)
+          old = old[:start] + '''            s.set_read_timeout(Some(remaining(deadline)?))?;
+                      let n = s.read(&mut b[p..])?;
+          ''' + old[end:]
+          p.write_text(old)
+          PY
+          set +e
+          cargo test --locked -p kwil-core-workspace --lib ipc_reads_queued_ack_after_peer_disconnects -- --exact instance::platform::tests::ipc_reads_queued_ack_after_peer_disconnects --nocapture > /tmp/kw69-ipc-red.log 2>&1
+          result=$?
+          set -e
+          cat /tmp/kw69-ipc-red.log
+          cp /tmp/kw69-instance-fixed.rs crates/core-workspace/src/instance.rs
+          test "$result" != 0
+          grep 'Invalid argument' /tmp/kw69-ipc-red.log
+      - name: Repeat the three reported failures 30 times
+        shell: bash
+        run: |
+          for n in $(seq 1 30); do
+            echo "KW-69 repeat $n/30 commit $GITHUB_SHA"
+            cargo test --locked -p kwil-view-model --lib production_utf16_opaque_journal_survives_two_restarts_and_save_as -- --nocapture
+            cargo test --locked -p kwil-core-workspace --lib watcher_directory_native_rearms_after_parent_observes_recreation -- --nocapture
+            cargo test --locked -p kwil-core-workspace --test workspace_backend kw20_ipc_receiver_delivery_duplicate_owner_and_own_endpoint_cleanup -- --nocapture
+          done
+          cargo test --locked -p kwil-core-workspace --lib ipc_ -- --nocapture
