@@ -3,10 +3,30 @@ use kwil_core_commands::settings::TabLayout;
 use kwil_view_model::{TabArea, TabGeometry, TabMetrics};
 
 pub(super) fn geometry(workspace: &Workspace, width: u16, height: u16, layout: TabLayout) -> TabGeometry {
-    workspace.tab_geometry(
+    let mut geometry = workspace.tab_geometry(
         TabMetrics { width: width as usize, height: height as usize, cell_width: 1, cell_height: 1, scrollbar: 0 },
         layout,
-    )
+    );
+    if layout == TabLayout::Horizontal {
+        // Retain the shared page capacity and body, but use terminal cell
+        // widths to keep each marker beside its label and gaps outside hits.
+        let mut x = geometry.previous.width;
+        for slot in &mut geometry.slots {
+            let gap = 2.min(slot.area.width.saturating_sub(4));
+            let available = slot.area.width - gap;
+            let close_width = slot.close.width.min(available);
+            let separator = usize::from(available > close_width);
+            let title_width = Line::from(workspace.tab_title(slot.document))
+                .width()
+                .min(available.saturating_sub(close_width + separator));
+            slot.area.x = x;
+            slot.area.width = title_width + separator + close_width;
+            slot.close.x = x + title_width + separator;
+            slot.close.width = close_width;
+            x += slot.area.width + gap;
+        }
+    }
+    geometry
 }
 
 fn rect(area: TabArea, origin: Rect) -> Rect {
@@ -57,7 +77,10 @@ pub(super) fn draw_prepared(
         };
         let style = Style::default().fg(foreground).bg(bg);
         frame.render_widget(Paragraph::new("").style(style), rect(slot.area, area));
-        let title = TabArea { width: slot.close.x - slot.area.x, ..slot.area };
+        let title = TabArea {
+            width: (slot.close.x - slot.area.x).saturating_sub(usize::from(layout == TabLayout::Horizontal)),
+            ..slot.area
+        };
         frame.render_widget(Paragraph::new(workspace.tab_title(slot.document)).style(style), rect(title, area));
         frame.render_widget(Paragraph::new("[x]").style(style), rect(slot.close, area));
     }
@@ -123,6 +146,88 @@ pub(super) fn mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tab_workspace(named: bool) -> Workspace {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        let first = workspace.active_id();
+        workspace.execute("edit.insert", &CommandArgs { text: Some("body".into()), ..Default::default() }, 1).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "kwil-tab-spacing-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if named {
+            workspace.open_path(directory.join("palette-target.txt")).unwrap();
+        } else {
+            workspace.open(View::new(None)).unwrap();
+        }
+        workspace.open(View::new(None)).unwrap();
+        workspace.activate(first);
+        workspace
+    }
+
+    #[test]
+    fn tab_bar_text_keeps_markers_with_labels_and_preserves_active_dirty_and_truncation() {
+        let workspace = tab_workspace(true);
+        for (width, expected) in [
+            (80, "  * Untitled 1 [x]  palette-target.txt [x]  Untitled 3 [x]"),
+            (44, "  * Untitled 1 [x]  palette-target [x]    >"),
+        ] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).unwrap();
+            terminal.draw(|frame| draw(frame, &workspace, TabLayout::Horizontal)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+            assert_eq!(row, format!("{expected:<width$}", width = width as usize));
+            assert_ne!(buffer[(2, 0)].bg, buffer[(20, 0)].bg, "active tab keeps its background");
+        }
+        assert_mouse_closes_the_document_beside_each_rendered_marker();
+    }
+
+    fn assert_mouse_closes_the_document_beside_each_rendered_marker() {
+        for width in [80, 44] {
+            let initial = tab_workspace(false);
+            for column in [18, 19] {
+                assert_eq!(geometry(&initial, width, 8, TabLayout::Horizontal).hit(column, 0), None);
+            }
+            let documents: Vec<_> =
+                geometry(&initial, width, 8, TabLayout::Horizontal).slots.iter().map(|slot| slot.document).collect();
+            for document in documents {
+                let mut workspace = tab_workspace(false);
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).unwrap();
+                terminal.draw(|frame| draw(frame, &workspace, TabLayout::Horizontal)).unwrap();
+                let row: String = (0..width).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+                let slot_index = geometry(&workspace, width, 8, TabLayout::Horizontal)
+                    .slots
+                    .iter()
+                    .position(|slot| slot.document == document)
+                    .unwrap();
+                let column = row.match_indices("[x]").nth(slot_index).unwrap().0;
+                let click = crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: column as u16 + 1,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                };
+                let remaining: Vec<_> = geometry(&workspace, width, 8, TabLayout::Horizontal)
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.document != document)
+                    .map(|slot| slot.document)
+                    .collect();
+                assert!(mouse(&mut workspace, &click, width, 8, TabLayout::Horizontal));
+                if workspace.tab_dirty(document) {
+                    assert!(workspace.close_pending());
+                    assert!(workspace.view(document).is_some());
+                } else {
+                    assert!(workspace.view(document).is_none(), "clicked marker closes its document");
+                }
+                for other in remaining {
+                    assert!(workspace.view(other).is_some(), "neighbouring tabs stay open");
+                }
+            }
+        }
+    }
 
     #[test]
     fn rendered_tabs_and_mouse_actions_preserve_body_text_and_dirty_close_guards() {

@@ -1191,7 +1191,16 @@ fn wrap_atomic_intake_stale_ready_with_two_reserved_slots_wakes_and_worker_conti
     // retirement must use that one slot BEFORE attempting two-slot valid intake.
     drop(first);
     wakes.next(&mut seen);
+    // Hold the worker after its empty retirement scan. Enqueue the stale owner
+    // before it reacquires the condition-variable mutex: that notification must
+    // not be lost between the scan and the idle wait.
+    let (idle, at_idle) = mpsc::sync_channel(1);
+    let idle_gate = Arc::new(Gate { entered: idle, release: Mutex::new(false), changed: Condvar::new() });
+    let held = idle_gate.clone();
+    session.before_idle_for_test(move || held.wait().unwrap());
+    at_idle.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(session.take_registered_update_with_retirement(None, Some(current)).unwrap().is_none());
+    idle_gate.open();
     entered_drop.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(
         matches!(session.reserve_retirement(), Err(WrapError::Busy)),
