@@ -510,3 +510,153 @@ fn review_conversion_decodes_logically_adjacent_original_pieces() {
         }
     }
 }
+
+#[test]
+fn iso2022_round_trip_and_edited_shifted_text() {
+    let dir = TempDir::new();
+    let raw = b"\x1b$BF|K\\8l\x1b(B\r\n";
+    let source = EncodedFile::new(dir.open("iso-roundtrip", raw)).unwrap();
+    assert_eq!(source.detection().encoding.name(), "ISO-2022-JP");
+    source.build_index().unwrap();
+    assert_eq!(text(&source.decode_range(0..raw.len() as u64).unwrap()), "日本語\r\n");
+    let mut buffer = Buffer::from_file(source.file.clone()).unwrap();
+    let mut saved = Vec::new();
+    source.write_to(&buffer.snapshot(), source.save_plan(), &mut saved).unwrap();
+    assert_eq!(saved, raw);
+    buffer.insert(5, "本X".as_bytes()).unwrap();
+    saved.clear();
+    source.write_to(&buffer.snapshot(), source.save_plan(), &mut saved).unwrap();
+    let (decoded, errors) = encoding_rs::ISO_2022_JP.decode_without_bom_handling(&saved);
+    assert!(!errors);
+    assert_eq!(decoded, "日本X本語\r\n");
+}
+
+#[test]
+fn iso2022_random_access_sparse_checkpoints_keep_shifted_charset() {
+    let dir = TempDir::new();
+    let mut raw = Vec::new();
+    let mut positions = Vec::new();
+    for i in 0..18000 {
+        positions.push(raw.len() as u64);
+        raw.extend_from_slice(if i % 2 == 0 { b"\x1b$BF|K\\8l\x1b(B\r\n" } else { b"\x1b(J\\~\x1b(B abc\n" });
+    }
+    let source = EncodedFile::new(dir.open("iso-random", &raw)).unwrap();
+    let index = source.build_index().unwrap();
+    assert!(index.checkpoint_count() <= raw.len() / STRIDE + 2);
+    assert!(index.allocated_bytes() < 4096);
+    for i in [17000, 7, 12345, 8192, 17998, 9001] {
+        let decoded = source.decode_lines(i as u64, 1).unwrap().unwrap();
+        assert_eq!(decoded.source.start, positions[i]);
+        assert_eq!(text(&decoded), if i % 2 == 0 { "日本語\r\n" } else { "¥‾ abc\n" });
+    }
+    let raw = [b"\x1b$B".as_slice(), &b"F|".repeat(80000), b"\x1b(B"].concat();
+    let source = EncodedFile::new(dir.open("iso-long-shift", &raw)).unwrap();
+    source.build_index().unwrap();
+    assert_eq!(text(&source.decode_range(140003..140005).unwrap()), "日");
+}
+
+#[test]
+fn iso2022_malformed_input_is_lossless_and_conversion_refuses() {
+    let dir = TempDir::new();
+    let encoding = Encoding::for_label("iso-2022-jp").unwrap();
+    for (i, raw) in
+        [b"\x1b$BF|\xff\x1b(B".as_slice(), b"\x1b$BF", b"\x1b$BF|\x1b", b"\x1b$BF|\x1b(X"].into_iter().enumerate()
+    {
+        let source = EncodedFile::new_with_encoding(dir.open(&format!("iso-malformed-{i}"), raw), encoding).unwrap();
+        source.build_index().unwrap();
+        let display = source.decode_range(0..raw.len() as u64).unwrap();
+        assert!(display.had_errors);
+        assert!(display.segments.iter().any(|s| matches!(s, DisplaySegment::Invalid(_))));
+        let buffer = Buffer::from_file(source.file.clone()).unwrap();
+        let mut saved = Vec::new();
+        source.write_to(&buffer.snapshot(), source.save_plan(), &mut saved).unwrap();
+        assert_eq!(saved, raw);
+        saved.clear();
+        assert!(
+            source
+                .write_to(&buffer.snapshot(), source.save_plan().convert_to(Encoding::UTF8, false), &mut saved)
+                .is_err()
+        );
+        assert!(saved.is_empty());
+    }
+}
+
+#[test]
+fn iso2022_decoded_backing_roundtrip_edit_and_malformed() {
+    use crate::decoded_backing::{DecodedBacking, Interpretation};
+    use std::sync::atomic::AtomicBool;
+    let dir = TempDir::new();
+    let encoding = Encoding::for_label("iso-2022-jp").unwrap();
+    for (i, raw) in [b"\x1b$BF|K\\8l\x1b(B".as_slice(), b"\x1b$BF|\xff\x1b(B"].into_iter().enumerate() {
+        let file = dir.open(&format!("iso-backing-{i}"), raw);
+        let owner =
+            DecodedBacking::prepare(&file, Interpretation::new(encoding, 0).unwrap(), &dir.0, &AtomicBool::new(false))
+                .unwrap();
+        let mut buffer = Buffer::from_decoded(owner.snapshot());
+        let plan = SavePlan { encoding, bom: false, line_ending: None };
+        let mut saved = Vec::new();
+        write_snapshot(&buffer.snapshot(), plan, &mut saved).unwrap();
+        assert_eq!(saved, raw);
+        if i == 0 {
+            assert_eq!(owner.snapshot().logical_bytes(), "日本語".as_bytes());
+            buffer.insert(3, b"X").unwrap();
+            saved.clear();
+            write_snapshot(&buffer.snapshot(), plan, &mut saved).unwrap();
+            let (text, errors) = encoding_rs::ISO_2022_JP.decode_without_bom_handling(&saved);
+            assert!(!errors);
+            assert_eq!(text, "日X本語");
+        } else {
+            assert!(owner.snapshot().logical_bytes().contains(&0xff));
+            assert!(
+                write_snapshot(&buffer.snapshot(), plan.convert_to(Encoding::UTF8, false), &mut Vec::new()).is_err()
+            );
+        }
+        drop(buffer);
+        assert!(owner.try_retire().is_ok());
+    }
+}
+
+#[test]
+fn iso2022_save_conversion_finishes_escape_and_rejects_unmappable() {
+    let encoding = Encoding::for_label("iso-2022-jp").unwrap();
+    let mut buffer = Buffer::empty();
+    buffer.insert(0, "日".as_bytes()).unwrap();
+    let plan = SavePlan { encoding, bom: false, line_ending: None };
+    let mut saved = Vec::new();
+    write_snapshot(&buffer.snapshot(), plan, &mut saved).unwrap();
+    assert_eq!(saved, b"\x1b$BF|\x1b(B");
+    buffer.insert(buffer.len(), "😀".as_bytes()).unwrap();
+    saved.clear();
+    assert!(matches!(write_snapshot(&buffer.snapshot(), plan, &mut saved), Err(EncodingError::Unmappable { .. })));
+    assert!(saved.is_empty());
+}
+
+#[test]
+fn iso2022_backing_sparse_replay_and_first_preview() {
+    use crate::decoded_backing::{Boundary, DecodedBacking, Interpretation, decode_preview};
+    use std::sync::atomic::AtomicBool;
+    let dir = TempDir::new();
+    let encoding = Encoding::for_label("iso-2022-jp").unwrap();
+    let raw = [b"\x1b$B".as_slice(), &b"F|".repeat(80000), b"\x1b(B"].concat();
+    let file = dir.open("iso-backing-seek", &raw);
+    let cancel = AtomicBool::new(false);
+    let interpretation = Interpretation::new(encoding, 0).unwrap();
+    let preview = decode_preview(&file, interpretation, &cancel).unwrap();
+    assert!(!preview.complete);
+    assert!(std::str::from_utf8(&preview.text).unwrap().chars().all(|c| c == '日'));
+    let owner = DecodedBacking::prepare(&file, interpretation, &dir.0, &cancel).unwrap();
+    let origin = owner.snapshot();
+    assert!(origin.checkpoint_count() <= 5);
+    for at in [70000, 4, 65536, 79999, 40000] {
+        let logical = at * 3;
+        let raw = at * 2 + 3;
+        assert_eq!(origin.resolve_logical(logical).unwrap(), Boundary::Exact { logical, raw });
+        let atom = origin.atom_at(logical).unwrap().unwrap();
+        assert_eq!(atom.content, crate::decoded_backing::AtomContent::Text("日"));
+        let mut position = crate::decoded_backing::ResumeBoundary::new(&origin, logical);
+        let boundary = position.poll(&origin, &cancel, &mut |_| Ok(true)).unwrap().unwrap();
+        assert_eq!(boundary, Boundary::Exact { logical, raw });
+    }
+    drop(origin);
+    assert!(owner.try_retire().is_ok());
+}

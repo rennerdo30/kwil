@@ -207,8 +207,9 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
   lines over 1 MiB.
 - Accessibility, remote rendering, platform integration, crash/recovery and
   performance budgets have not completed their full qualification.
-- Markdown preview is limited to 256 KiB of logical source. ISO-2022-JP is
-  explicitly unsupported.
+- Markdown preview is limited to 256 KiB of logical source.
+- ISO-2022-JP read/save uses sparse decoder-state checkpoints. Malformed input
+  remains lossless raw bytes; other stateful encodings remain unsupported.
 
 Report the platform, exact beta version, steps to reproduce and expected versus
 actual behavior at https://github.com/rennerdo30/kwil/issues. Attach only files
