@@ -48,7 +48,7 @@ jobs:
           cargo fmt --manifest-path crates/bench/compare/Cargo.toml --check
           cargo clippy --manifest-path crates/bench/compare/Cargo.toml --all-targets --locked -j 4 -- -D warnings
           cargo test -p kwil-core-text --locked -j 4 compare_input::tests
-          cargo test -p kwil-core-diff --locked -j 4 stream_tests
+          cargo test -p kwil-core-diff --locked -j 4 --lib stream::tests
           cargo build --manifest-path crates/bench/compare/Cargo.toml --release --locked -j 4
       - name: Python environment
         run: python -m venv .compare-venv
