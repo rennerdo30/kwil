@@ -601,6 +601,13 @@ pub(crate) fn start(proxy: super::HostProxy) {
             if proxy.send_event(UserEvent::Harness(step)).is_err() {
                 break;
             }
+            // Reuse the showcase script without running unrelated editor probes.
+            if std::env::var("KWIL_MARKDOWN_PROBE").as_deref() == Ok("preview-only")
+                && matches!(step, Step::UsabilityCapture("markdown-text.bmp"))
+            {
+                let _ = proxy.send_event(UserEvent::Harness(Step::End));
+                break;
+            }
         }
     });
 }
