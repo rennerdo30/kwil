@@ -110,6 +110,8 @@ jobs:
           done
       - name: Check the separate palette benchmark workspace
         if: always()
+        # Informational like the measurement below; never blocks the core gate.
+        continue-on-error: true
         env:
           CARGO_TARGET_DIR: target-palette
         shell: bash
