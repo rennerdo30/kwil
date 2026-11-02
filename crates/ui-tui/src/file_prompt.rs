@@ -107,11 +107,13 @@ pub(super) fn draw_prompt(frame: &mut ratatui::Frame, workspace: &Workspace) {
     let bounds = frame.area();
     let width = bounds.width.min(72);
     let choices = prompt.kind.choices();
-    let target = (prompt.kind == kwil_view_model::FilePromptKind::SaveAs && !prompt.text.is_empty()).then(|| {
-        match workspace.resolve_typed_save_path(std::path::Path::new(&prompt.text)) {
-            Ok(path) => format!("Target: {}", path.display()),
-            Err(error) => format!("Target: {error}"),
-        }
+    let target = (matches!(
+        prompt.kind,
+        kwil_view_model::FilePromptKind::SaveAs | kwil_view_model::FilePromptKind::SaveUncompressedAs
+    ) && !prompt.text.is_empty())
+    .then(|| match workspace.resolve_typed_save_path(std::path::Path::new(&prompt.text)) {
+        Ok(path) => format!("Target: {}", path.display()),
+        Err(error) => format!("Target: {error}"),
     });
     let target_rows = target
         .as_ref()

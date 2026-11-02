@@ -11,6 +11,8 @@ gpu = ["dep:wgpu"]
 frame-harness = []
 
 [dependencies]
+accesskit = "0.25.2"
+accesskit_winit = "0.34.2"
 kwil-core-runtime = { path = "../core-runtime" }
 kwil-core-markdown = { path = "../core-markdown" }
 kwil-core-syntax = { path = "../core-syntax" }

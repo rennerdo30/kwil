@@ -18,6 +18,10 @@ use std::{
     path::PathBuf,
 };
 
+pub(super) fn counted(count: u64, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchStatus {
     Idle,
@@ -306,7 +310,7 @@ impl SearchSession {
                     self.state.count = plan.matches;
                     for row in &mut self.state.files {
                         if let FileEvent::Hit(hit) = row {
-                            hit.line = format!("{} matches", hit.line_number).into_bytes();
+                            hit.line = counted(hit.line_number, "match", "matches").into_bytes();
                             hit.match_ranges = std::iter::once(0..0).collect();
                         }
                     }

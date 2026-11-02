@@ -14,6 +14,8 @@
 //! Dependency: flate2 =1.1.10, default-features=false, rust_backend. Its fetched
 //! Cargo.toml and LICENSE-{MIT,APACHE} were checked; only API/source docs were
 //! consulted. Gzip headers, CRC/ISIZE and all members are validated by flate2.
+//! Additional codecs and fixed memory ceilings are documented in
+//! docs/COMPRESSED-TEXT.md. All codec work is single-threaded on the caller's worker.
 
 use flate2::{Compression, bufread::MultiGzDecoder, write::GzEncoder};
 use kwil_core_text::{Snapshot, TextFile};
@@ -35,12 +37,39 @@ pub enum CompressionMode {
     Auto,
     Raw,
     Gzip,
+    Zstd,
+    Bzip2,
+    Xz,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompressionFormat {
     Raw,
     Gzip,
+    Zstd,
+    Bzip2,
+    Xz,
+}
+
+impl CompressionFormat {
+    pub fn badge(self) -> Option<&'static str> {
+        match self {
+            Self::Raw => None,
+            Self::Gzip => Some("gzip"),
+            Self::Zstd => Some("zstd"),
+            Self::Bzip2 => Some("bzip2"),
+            Self::Xz => Some("xz"),
+        }
+    }
+    pub fn mode(self) -> CompressionMode {
+        match self {
+            Self::Raw => CompressionMode::Raw,
+            Self::Gzip => CompressionMode::Gzip,
+            Self::Zstd => CompressionMode::Zstd,
+            Self::Bzip2 => CompressionMode::Bzip2,
+            Self::Xz => CompressionMode::Xz,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,7 +107,23 @@ impl std::fmt::Display for UnsupportedFormat {
 pub enum DetectedFormat {
     Raw,
     Gzip,
+    Zstd,
+    Bzip2,
+    Xz,
     Unsupported(UnsupportedFormat),
+}
+
+impl DetectedFormat {
+    pub fn supported(self) -> Option<CompressionFormat> {
+        match self {
+            Self::Raw => Some(CompressionFormat::Raw),
+            Self::Gzip => Some(CompressionFormat::Gzip),
+            Self::Zstd => Some(CompressionFormat::Zstd),
+            Self::Bzip2 => Some(CompressionFormat::Bzip2),
+            Self::Xz => Some(CompressionFormat::Xz),
+            Self::Unsupported(_) => None,
+        }
+    }
 }
 
 /// Signature-only sniff. Eight bytes suffice; filenames are deliberately absent.
@@ -93,11 +138,11 @@ pub fn detect_magic(prefix: &[u8]) -> DetectedFormat {
     {
         Zip
     } else if prefix.starts_with(b"BZh") && matches!(prefix.get(3), Some(b'1'..=b'9')) {
-        Bzip2
+        return DetectedFormat::Bzip2;
     } else if prefix.starts_with(b"\xfd7zXZ\0") {
-        Xz
+        return DetectedFormat::Xz;
     } else if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        Zstandard
+        return DetectedFormat::Zstd;
     } else if prefix.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
         Lz4
     } else if matches!(prefix.first(), Some(0x50..=0x5f)) && prefix.get(1..4) == Some(&[0x2a, 0x4d, 0x18]) {
@@ -125,6 +170,7 @@ pub enum CompressionError {
     Cancelled,
     Unsupported(UnsupportedFormat),
     InvalidGzip(io::Error),
+    InvalidStream(CompressionFormat, io::Error),
     Io(io::Error),
     /// Failed preparation could not remove its own partial file/directory.
     Cleanup {
@@ -142,6 +188,9 @@ impl std::fmt::Display for CompressionError {
                 write!(f, "unsupported compressed format: {format}; choose Raw to inspect bytes")
             }
             Self::InvalidGzip(error) => write!(f, "corrupt or invalid gzip stream: {error}"),
+            Self::InvalidStream(format, error) => {
+                write!(f, "corrupt or invalid {} stream: {error}", format.badge().unwrap_or("raw"))
+            }
             Self::Io(error) => write!(f, "compressed-file I/O failed: {error}"),
             Self::Cleanup { path, cause, error } => {
                 write!(f, "{cause}; partial backing retained at {}: {error}", path.display())
@@ -153,7 +202,7 @@ impl std::fmt::Display for CompressionError {
 impl std::error::Error for CompressionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) | Self::InvalidGzip(error) => Some(error),
+            Self::Io(error) | Self::InvalidGzip(error) | Self::InvalidStream(_, error) => Some(error),
             Self::Cleanup { cause, .. } => Some(cause.as_ref()),
             _ => None,
         }
@@ -191,7 +240,7 @@ impl PreparedFile {
     }
 
     pub fn notice(&self) -> Option<CompressionNotice> {
-        (self.mode != CompressionMode::Auto || self.format == CompressionFormat::Gzip)
+        (self.mode != CompressionMode::Auto || self.format != CompressionFormat::Raw)
             .then_some(CompressionNotice { mode: self.mode, format: self.format })
     }
 
@@ -483,7 +532,8 @@ pub fn prepare_file(
             len += count;
         }
     }
-    let format = match (mode, detect_magic(&prefix[..len])) {
+    let detected = detect_magic(&prefix[..len]);
+    let format = match (mode, detected) {
         (CompressionMode::Raw, _) | (CompressionMode::Auto, DetectedFormat::Raw) => CompressionFormat::Raw,
         (CompressionMode::Auto, DetectedFormat::Unsupported(format)) => {
             return Err(CompressionError::Unsupported(format));
@@ -494,7 +544,11 @@ pub fn prepare_file(
                 "gzip signature missing",
             )));
         }
-        _ => CompressionFormat::Gzip,
+        (CompressionMode::Auto, detected) => detected.supported().unwrap(),
+        (CompressionMode::Gzip, _) => CompressionFormat::Gzip,
+        (CompressionMode::Zstd, _) => CompressionFormat::Zstd,
+        (CompressionMode::Bzip2, _) => CompressionFormat::Bzip2,
+        (CompressionMode::Xz, _) => CompressionFormat::Xz,
     };
     if format == CompressionFormat::Raw {
         check_cancel(cancel)?;
@@ -503,7 +557,7 @@ pub fn prepare_file(
         return Ok(PreparedFile { source, format, mode, file: Some(file), backing: None, cleanup_error: None });
     }
     input.seek(SeekFrom::Start(0))?;
-    let mut prepared = prepare_gzip(&source, &mut input, scratch_parent, cancel)?;
+    let mut prepared = prepare_compressed(&source, &mut input, format, scratch_parent, cancel)?;
     prepared.mode = mode;
     // Catch ordinary concurrent edits before publishing decoded bytes. The
     // parent still owns original-path identity/watch/journal/save conflict checks.
@@ -530,16 +584,17 @@ pub fn prepare_file(
     Ok(prepared)
 }
 
-fn prepare_gzip(
+fn prepare_compressed(
     source: &Path,
     input: &mut impl Read,
+    format: CompressionFormat,
     scratch_parent: &Path,
     cancel: &AtomicBool,
 ) -> Result<PreparedFile, CompressionError> {
     check_cancel(cancel)?;
     let mut scratch = WorkerScratch::create(scratch_parent)?;
     let result = (|| {
-        decode_gzip(input, scratch.file.as_mut().unwrap(), cancel)?;
+        decode_stream(input, scratch.file.as_mut().unwrap(), format, cancel)?;
         scratch.file.take();
         check_cancel(cancel)?;
         let file = TextFile::open_saved_version(&scratch.backing.as_ref().unwrap().path).map_err(io::Error::from)?;
@@ -549,13 +604,57 @@ fn prepare_gzip(
     match result {
         Ok(file) => Ok(PreparedFile {
             source: source.to_path_buf(),
-            format: CompressionFormat::Gzip,
-            mode: CompressionMode::Gzip,
+            format,
+            mode: format.mode(),
             file: Some(file),
             backing: scratch.backing.take(),
             cleanup_error: None,
         }),
         Err(error) => Err(scratch.abort(error)),
+    }
+}
+
+// Dictionaries have a fixed ceiling independent of the logical file length.
+// XzReader validates indexes incrementally; the sans-I/O XzStream retains them.
+const DECODER_MEMORY_KIB: u32 = 64 * 1024;
+fn decode_stream(
+    input: &mut impl Read,
+    writer: &mut impl Write,
+    format: CompressionFormat,
+    cancel: &AtomicBool,
+) -> Result<(), CompressionError> {
+    if format == CompressionFormat::Gzip {
+        return decode_gzip(input, writer, cancel);
+    }
+    check_cancel(cancel)?;
+    let buffered = BufReader::with_capacity(STREAM_CHUNK, Cancellable { inner: input, cancel });
+    let guarded = Cancellable { inner: buffered, cancel };
+    let mut decoder: Box<dyn Read + '_> = match format {
+        CompressionFormat::Zstd => {
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(guarded)?;
+            decoder.window_log_max(26)?;
+            Box::new(decoder)
+        }
+        CompressionFormat::Bzip2 => Box::new(bzip2::bufread::MultiBzDecoder::new(guarded)),
+        CompressionFormat::Xz => Box::new(lzma_rust2::XzReader::new_mem_limit(guarded, true, DECODER_MEMORY_KIB)),
+        _ => return Err(io::Error::other("compressed decoder requires a container").into()),
+    };
+    let mut bytes = [0; STREAM_CHUNK];
+    loop {
+        check_cancel(cancel)?;
+        let count = match decoder.read(&mut bytes) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                check_cancel(cancel)?;
+                return Err(CompressionError::InvalidStream(format, error));
+            }
+        };
+        check_cancel(cancel)?;
+        if count == 0 {
+            return Ok(());
+        }
+        writer.write_all(&bytes[..count])?;
     }
 }
 
@@ -743,7 +842,56 @@ pub fn prepare_gzip_payload(
     cancel: &AtomicBool,
 ) -> Result<PreparedFile, CompressionError> {
     let identity = std::path::absolute(identity)?;
-    prepare_gzip(&identity, input, scratch_parent, cancel)
+    prepare_compressed(&identity, input, CompressionFormat::Gzip, scratch_parent, cancel)
+}
+
+pub fn prepare_payload(
+    identity: &Path,
+    input: &mut impl Read,
+    format: CompressionFormat,
+    scratch_parent: &Path,
+    cancel: &AtomicBool,
+) -> Result<PreparedFile, CompressionError> {
+    prepare_compressed(&std::path::absolute(identity)?, input, format, scratch_parent, cancel)
+}
+
+/// Same bounded, cancellation-guarded payload seam for every supported codec.
+/// XZ uses one block, so its encoder's index does not grow with the file.
+pub fn recompress_format_payload(
+    format: CompressionFormat,
+    writer: &mut impl Write,
+    cancel: &AtomicBool,
+    feed: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> Result<(), CompressionError> {
+    if format == CompressionFormat::Gzip {
+        return recompress_payload(writer, cancel, feed);
+    }
+    check_cancel(cancel)?;
+    let aborted = std::cell::Cell::new(false);
+    let output = Output { writer, cancel, aborted: &aborted };
+    let result = match format {
+        CompressionFormat::Zstd => {
+            let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
+            encoder.include_checksum(true)?;
+            feed(&mut encoder).and_then(|()| encoder.finish().map(|_| ()))
+        }
+        CompressionFormat::Bzip2 => {
+            let mut encoder = bzip2::write::BzEncoder::new(output, bzip2::Compression::default());
+            let result = feed(&mut encoder).and_then(|()| encoder.try_finish());
+            aborted.set(true);
+            drop(encoder);
+            result
+        }
+        CompressionFormat::Xz => {
+            let mut encoder = lzma_rust2::XzWriter::new(output, lzma_rust2::XzOptions::with_preset(1))?;
+            feed(&mut encoder).and_then(|()| encoder.finish().map(|_| ()))
+        }
+        CompressionFormat::Raw => feed(&mut { output }),
+        CompressionFormat::Gzip => unreachable!(),
+    };
+    aborted.set(true);
+    check_cancel(cancel)?;
+    result.map_err(CompressionError::Io)
 }
 
 /// Streams encoded output through the guarded gzip encoder. Finishes CRC/trailer
@@ -764,6 +912,115 @@ mod tests {
     use super::*;
     use kwil_core_text::Buffer;
     use std::{cell::Cell, io::Cursor};
+
+    #[test]
+    fn requested_text_container_signatures_are_supported() {
+        for signature in [&b"BZh9"[..], &b"\xfd7zXZ\0"[..], &b"\x28\xb5\x2f\xfd"[..]] {
+            assert!(!matches!(detect_magic(signature), DetectedFormat::Unsupported(_)), "{signature:?}");
+        }
+    }
+
+    #[test]
+    fn all_containers_stream_to_private_maps_validate_trailers_and_cancel() {
+        for format in
+            [CompressionFormat::Gzip, CompressionFormat::Zstd, CompressionFormat::Bzip2, CompressionFormat::Xz]
+        {
+            let fixture = Fixture::new();
+            let text = b"\xef\xbb\xbfhello\r\n\xffworld\n";
+            let mut payload = Vec::new();
+            recompress_format_payload(format, &mut payload, &cancel(), |writer| writer.write_all(text)).unwrap();
+            assert_eq!(detect_magic(&payload).supported(), Some(format));
+            let path = fixture.source("no-extension", &payload);
+            let owner = prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancel()).unwrap();
+            assert_eq!(owner.format(), format);
+            assert_eq!(owner.text_file().unwrap().resident_original_bytes(), 0);
+            assert_eq!(owner.text_file().unwrap().bytes().unwrap(), text);
+            assert!(owner.try_finish().is_ok());
+            for cut in [1, payload.len() / 2] {
+                fs::write(&path, &payload[..payload.len() - cut]).unwrap();
+                let error = prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancel()).err().unwrap();
+                assert!(error.to_string().contains("stream"), "{format:?}: {error}");
+                assert_eq!(fixture.backing_count(), 0);
+            }
+            let mut corrupt = payload.clone();
+            let at = corrupt.len() - 1;
+            corrupt[at] ^= 0x80;
+            fs::write(&path, &corrupt).unwrap();
+            assert!(prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancel()).is_err(), "{format:?}");
+            assert_eq!(fixture.backing_count(), 0);
+            fs::write(&path, payload.repeat(2)).unwrap();
+            let owner = prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancel()).unwrap();
+            assert_eq!(owner.text_file().unwrap().bytes().unwrap(), text.repeat(2));
+            assert!(owner.try_finish().is_ok());
+            for damaged in [
+                [payload.as_slice(), &payload[..payload.len() / 2]].concat(),
+                [payload.as_slice(), b"garbage"].concat(),
+            ] {
+                fs::write(&path, damaged).unwrap();
+                assert!(
+                    prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancel()).is_err(),
+                    "{format:?}: damaged later member/tail"
+                );
+                assert_eq!(fixture.backing_count(), 0);
+            }
+            let cancelled = AtomicBool::new(true);
+            assert!(matches!(
+                prepare_file(&path, CompressionMode::Auto, &fixture.0, &cancelled),
+                Err(CompressionError::Cancelled)
+            ));
+            assert_eq!(fixture.backing_count(), 0);
+        }
+    }
+
+    #[test]
+    fn every_codec_checks_cancellation_between_bounded_chunks_and_preserves_feed_errors() {
+        struct CancelOnWrite<'a>(&'a AtomicBool, usize);
+        impl Write for CancelOnWrite<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(bytes.len() <= STREAM_CHUNK);
+                self.1 += bytes.len();
+                self.0.store(true, Ordering::Relaxed);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct BoundedReader<'a>(&'a [u8]);
+        impl Read for BoundedReader<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                assert!(bytes.len() <= STREAM_CHUNK);
+                self.0.read(bytes)
+            }
+        }
+        for format in
+            [CompressionFormat::Gzip, CompressionFormat::Zstd, CompressionFormat::Bzip2, CompressionFormat::Xz]
+        {
+            let mut payload = Vec::new();
+            recompress_format_payload(format, &mut payload, &cancel(), |writer| {
+                writer.write_all(&[b'x'; STREAM_CHUNK * 2])
+            })
+            .unwrap();
+            let stop = AtomicBool::new(false);
+            let mut writer = CancelOnWrite(&stop, 0);
+            assert!(
+                matches!(
+                    decode_stream(&mut BoundedReader(&payload), &mut writer, format, &stop),
+                    Err(CompressionError::Cancelled)
+                ),
+                "{format:?}"
+            );
+            assert!(writer.1 > 0);
+            let error = recompress_format_payload(format, &mut Vec::new(), &cancel(), |writer| {
+                writer.write_all(b"partial input")?;
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "source fixture failed"))
+            })
+            .unwrap_err()
+            .into_io_error();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("source fixture failed"));
+        }
+    }
 
     struct Fixture(PathBuf);
 
@@ -832,9 +1089,6 @@ mod tests {
             (&b"PK\x03\x04"[..], Zip),
             (&b"PK\x05\x06"[..], Zip),
             (&b"PK\x07\x08"[..], Zip),
-            (&b"BZh9"[..], Bzip2),
-            (&b"\xfd7zXZ\0"[..], Xz),
-            (&b"\x28\xb5\x2f\xfd"[..], Zstandard),
             (&b"\x04\x22\x4d\x18"[..], Lz4),
             (&b"\x50\x2a\x4d\x18"[..], SkippableFrame),
             (&b"7z\xbc\xaf\x27\x1c"[..], SevenZip),
@@ -886,16 +1140,16 @@ mod tests {
         assert_eq!(gzip.text_file().unwrap().bytes().unwrap(), b"text");
         assert!(gzip.try_finish().is_ok());
 
-        let source = fixture.source("unsupported", b"\xfd7zXZ\0stuff");
+        let source = fixture.source("unsupported", b"PK\x03\x04stuff");
         let error = prepare_file(&source, CompressionMode::Auto, &fixture.0, &cancel()).err().unwrap();
-        assert!(matches!(error, CompressionError::Unsupported(UnsupportedFormat::Xz)));
-        assert!(error.to_string().contains("unsupported compressed format: XZ"));
+        assert!(matches!(error, CompressionError::Unsupported(UnsupportedFormat::Zip)));
+        assert!(error.to_string().contains("unsupported compressed format: ZIP"));
         assert!(matches!(
             prepare_file(&source, CompressionMode::Gzip, &fixture.0, &cancel()),
             Err(CompressionError::InvalidGzip(_))
         ));
         let raw = prepare_file(&source, CompressionMode::Raw, &fixture.0, &cancel()).unwrap();
-        assert_eq!(raw.text_file().unwrap().bytes().unwrap(), b"\xfd7zXZ\0stuff");
+        assert_eq!(raw.text_file().unwrap().bytes().unwrap(), b"PK\x03\x04stuff");
         assert!(raw.try_finish().is_ok());
         assert_eq!(fixture.backing_count(), 0);
     }
@@ -974,7 +1228,7 @@ mod tests {
             parent: &fixture.0,
         };
         assert!(matches!(
-            prepare_gzip(Path::new("synthetic"), &mut reader, &fixture.0, &cancel),
+            prepare_compressed(Path::new("synthetic"), &mut reader, CompressionFormat::Gzip, &fixture.0, &cancel),
             Err(CompressionError::Cancelled)
         ));
         assert!(partial_seen.get(), "cancellation must exercise cleanup after output was written");
