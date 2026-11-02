@@ -908,7 +908,7 @@ mod tests {
     fn format_json(selection: bool) {
         const ORIGINAL: &str = "[\n{  \"keep\": [3,2] },\n{  \"target\": [1,2] }\n]\n";
         const DOCUMENT: &str = "[\n  {\n    \"keep\": [\n      3,\n      2\n    ]\n  },\n  {\n    \"target\": [\n      1,\n      2\n    ]\n  }\n]\n";
-        const SELECTION: &str = "[\n{  \"keep\": [3,2] },\n{\n  \"target\": [\n    1,\n    2\n  ]\n}]\n";
+        const SELECTION: &str = "[\n{  \"keep\": [3,2] },\n{\n  \"target\": [\n    1,\n    2\n  ]\n}\n]\n";
         let mut fixture = BoundedFrontend::new();
         let path = fixture.root.join("messy.json");
         std::fs::write(&path, ORIGINAL).unwrap();
