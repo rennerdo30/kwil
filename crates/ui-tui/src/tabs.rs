@@ -95,21 +95,19 @@ pub(super) fn draw_prepared(
             );
         }
     }
-    let status = if let Some(status) = prepared_status {
-        status.to_owned()
-    } else if workspace.hex_active() {
-        hex_ui::workspace_status(workspace)
-    } else {
-        workspace.status_text()
-    };
-    let status = Paragraph::new(status).style(
-        Style::default()
-            .fg(theme_ui::color(kwil_core_commands::theme::UiRole::StatusForeground, Color::Rgb(0x8f, 0xe3, 0xff)))
-            .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18))),
-    );
-    frame.render_widget(
-        status,
+    draw_status(
+        frame,
         Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
+        workspace.notice(),
+        || {
+            if let Some(status) = prepared_status {
+                status.to_owned()
+            } else if workspace.hex_active() {
+                hex_ui::workspace_status(workspace)
+            } else {
+                workspace.status_text()
+            }
+        },
     );
 }
 

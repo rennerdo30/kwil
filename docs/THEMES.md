@@ -22,6 +22,15 @@ the syntax engine's broad token classes to their corresponding theme scopes;
 more specific imported scopes are retained but need richer syntax-engine spans.
 Source parsing and imports run after first frame, on the theme worker.
 
+The TUI preserves RGB colours on truecolor terminals. Otherwise, it maps the
+completed terminal buffer (including syntax, chrome and overlays) to the nearest
+fixed xterm 256-colour cube or grey-ramp entry before ratatui compares frames.
+It avoids the terminal's configurable first 16 palette entries. `COLORTERM`
+or `TERM` advertising `truecolor`/`24bit` enables RGB; an explicit `TERM` with
+`256color` selects the fallback even on Windows. Other terminals use crossterm's
+capability detection, with 256 colours as the fallback. A theme switch still
+uses the shared host and the ordinary changed-cell output, without idle redraws.
+
 `theme::Theme::builtin(Scheme)` constructs static data without source parsing.
 The corresponding native files are `crates/core-commands/src/themes/{dark,light}.toml`;
 focused tests require them to equal those constructors. Theme changes affect

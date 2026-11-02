@@ -20,6 +20,7 @@ mod palette_ui;
 mod search_ui;
 mod settings_ui;
 mod tabs;
+mod terminal_palette;
 #[cfg(test)]
 mod test_support;
 mod theme_ui;
@@ -174,6 +175,7 @@ fn run_workspace_with_terminal_init(
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TUI closed"))
         });
         terminal = Some(initialize(&mut terminal_touched)?);
+        let terminal_colors = terminal_palette::color_count();
         crossterm::execute!(
             std::io::stdout(),
             crossterm::event::EnableMouseCapture,
@@ -1126,6 +1128,7 @@ fn run_workspace_with_terminal_init(
                         binary_offer.draw(f, view);
                     }
                     theme_ui::draw(f, &themes);
+                    terminal_palette::apply(f.buffer_mut(), terminal_colors);
                 })?;
                 if let Some(host) = wrap {
                     host.painted();
@@ -2825,14 +2828,11 @@ fn draw_area_highlighted(
         );
     }
     if status {
-        let status = Paragraph::new(view.status_text()).style(
-            Style::default()
-                .fg(theme_ui::color(kwil_core_commands::theme::UiRole::StatusForeground, Color::Rgb(0x8f, 0xe3, 0xff)))
-                .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18))),
-        );
-        f.render_widget(
-            status,
+        draw_status(
+            f,
             Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 },
+            view.notice(),
+            || view.status_text(),
         );
     }
     if let Some(editor) = view.editor()
@@ -2857,6 +2857,17 @@ fn draw_area_highlighted(
             }
         }
     }
+}
+
+/// A transient error/action notice owns the status line. Path and position
+/// metadata must not push it beyond the terminal's visible columns. Keeping
+/// the fallback lazy also preserves prepared-body source-read boundaries.
+fn draw_status(f: &mut ratatui::Frame, area: Rect, notice: &str, details: impl FnOnce() -> String) {
+    let text = if notice.is_empty() { details() } else { notice.to_owned() };
+    let style = Style::default()
+        .fg(theme_ui::color(kwil_core_commands::theme::UiRole::StatusForeground, Color::Rgb(0x8f, 0xe3, 0xff)))
+        .bg(theme_ui::color(kwil_core_commands::theme::UiRole::PanelBackground, Color::Rgb(0x08, 0x0d, 0x18)));
+    f.render_widget(Paragraph::new(text).style(style), area);
 }
 
 fn keep_visible(view: &mut View, horizontal: &mut u64, columns: usize, tab: usize) {

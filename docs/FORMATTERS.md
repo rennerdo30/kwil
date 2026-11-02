@@ -4,6 +4,11 @@ Format Document and Format Selection are available in the GUI and TUI palette.
 Formatting runs on the document worker and is a single undo step. The document
 is temporarily busy while formatting; switching tabs is allowed.
 
+In the TUI, open the command palette (`Ctrl+Shift+P`) and choose Format Document
+or Format Selection. Completion and `Format:` errors appear in the status line.
+An empty selection or missing external tool leaves both the document bytes and
+undo history unchanged.
+
 JSON, XML/HTML, YAML, TOML, CSS and SQL use the existing conservative built-in
 formatters. Other tokenized types use safe tidy where supported. Rust defaults
 to `rustfmt`, Python to `black`, and JavaScript, TypeScript, TSX and Markdown to

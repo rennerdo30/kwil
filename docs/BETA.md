@@ -45,7 +45,9 @@ not run (no ARM64 NSIS runner check).
 
 - Any-size comparison integration and final word-refinement qualification.
 - Complete any-size opening/indexing and regex/long-line paths, and folder replacement.
-- Formatter, log-watcher, custom theme and TUI integration.
+- Log-watcher integration and native terminal/remote acceptance. TUI custom themes,
+  theme switching and Format Document/Selection are integrated; terminals without
+  truecolor use the 256-colour palette.
 - Further save/recovery qualification and complete metadata pre-growth admission.
 - Accessibility, remaining platform behavior, native/remote performance and enforcing budget gates.
 - Code signing, macOS notarization and update signatures (keys from the owner, KW-4, KW-5).

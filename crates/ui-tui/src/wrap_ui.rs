@@ -956,9 +956,21 @@ mod tests {
             view.editor().unwrap().document().snapshot().write_to(&mut bytes).unwrap();
             bytes
         };
-        let capture = |view: &kwil_view_model::Workspace, stage: &str| {
+        let capture = |view: &kwil_view_model::Workspace, stage: &str, prepared: bool| {
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            terminal.draw(|frame| crate::draw_area_highlighted(frame, view, frame.area(), true, &[])).unwrap();
+            let status = prepared.then(|| view.status_text());
+            terminal
+                .draw(|frame| {
+                    crate::tabs::draw_prepared(
+                        frame,
+                        view,
+                        kwil_core_commands::settings::TabLayout::Horizontal,
+                        &[],
+                        prepared,
+                        status.as_deref(),
+                    );
+                })
+                .unwrap();
             let buffer = terminal.backend().buffer();
             let mut text = String::new();
             for y in 0..24 {
@@ -971,11 +983,12 @@ mod tests {
                 let root = std::path::PathBuf::from(root);
                 assert!(root.is_absolute());
                 let mode = if selection { "selection" } else { "document" };
-                std::fs::write(root.join(format!("tui-{mode}-{stage}.txt")), &text).unwrap();
+                let suffix = if prepared { "-prepared" } else { "" };
+                std::fs::write(root.join(format!("tui-{mode}-{stage}{suffix}.txt")), &text).unwrap();
             }
             text
         };
-        let before = capture(&fixture.view, "before");
+        let before = capture(&fixture.view, "before", false);
         assert!(before.contains("{  \"keep\": [3,2] }"));
         let command = if selection { "edit.formatSelection" } else { "edit.formatDocument" };
         fixture.keys = kwil_core_commands::keymap::KeymapEngine::new(
@@ -998,7 +1011,7 @@ mod tests {
         let expected = if selection { SELECTION } else { DOCUMENT };
         assert_eq!(bytes(&fixture.view), expected.as_bytes());
         assert_eq!(fixture.view.notice(), "Formatting complete");
-        let after = capture(&fixture.view, "after");
+        let after = capture(&fixture.view, "after", false);
         assert_ne!(before, after);
         assert!(after.contains("\"target\": ["));
         if selection {
@@ -1011,6 +1024,41 @@ mod tests {
         fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
         fixture.view.execute("edit.redo", &Default::default(), 1).unwrap();
         assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+
+        // Both asynchronous failures return through the real terminal document
+        // host, stay visible in the status line and leave the one-edit undo intact.
+        fixture.view.editor_mut().unwrap().set_cursors(vec![Cursor::caret(0)], 0).unwrap();
+        crate::format_document(&mut fixture.view, None, true);
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+        assert!(fixture.view.notice().contains("Select the lines"), "{}", fixture.view.notice());
+        assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        for prepared in [false, true] {
+            let captured = capture(&fixture.view, "selection-error", prepared);
+            let status = captured.lines().last().unwrap();
+            assert!(status.starts_with("Format: Select the lines"), "visible status: {status:?}");
+        }
+
+        fixture.view.editor_mut().unwrap().settings.formatters.insert(
+            "json".into(),
+            kwil_core_commands::settings::Formatter {
+                executable: fixture.root.join("missing-formatter").to_string_lossy().into_owned(),
+                args: Vec::new(),
+                range_args: Vec::new(),
+                timeout_ms: 1000,
+            },
+        );
+        crate::format_document(&mut fixture.view, None, false);
+        fixture.until(|f| !f.view.file_saves_pending() && !f.document.transport.as_ref().unwrap().status().occupied);
+        assert!(fixture.view.notice().contains("formatters.json.executable"), "{}", fixture.view.notice());
+        for prepared in [false, true] {
+            let captured = capture(&fixture.view, "tool-error", prepared);
+            let status = captured.lines().last().unwrap();
+            assert!(status.starts_with("Format: Check formatters.json.executable"), "visible status: {status:?}");
+        }
+        assert_eq!(bytes(&fixture.view), expected.as_bytes());
+        fixture.view.execute("edit.undo", &Default::default(), 1).unwrap();
+        assert_eq!(bytes(&fixture.view), ORIGINAL.as_bytes(), "errors must not add an undo step");
         fixture.finish();
     }
 
