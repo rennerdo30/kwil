@@ -49,7 +49,8 @@ define_class!(
         #[unsafe(method(isOpaque))]
         fn opaque(&self) -> bool { true }
 
-        #[unsafe(method(hitTest:))]
+        // Retained object returns require objc2's ownership-aware ABI adapter.
+        #[unsafe(method_id(hitTest:))]
         fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
 
         #[unsafe(method(drawRect:))]
