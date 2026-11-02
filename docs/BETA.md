@@ -6,6 +6,9 @@ changes and its known limitations.
 
 ## Published
 
+- **0.1.0-beta.7**, published 2026-11-02 from main `4509ee8`: hot exit and
+  session restore, single instance, compressed files, hex editor, screen reader
+  support, TUI Markdown and log commands; beta.6 updated itself to it.
 - **0.1.0-beta.6**, published 2026-11-02 from main `7ca9199`: replace in files,
   native Save As, compare folding, language mode, keymap presets, CR-only line
   endings, file types page, large-file memory limits; beta.5 updated itself to it.
@@ -21,10 +24,10 @@ changes and its known limitations.
   files match the published checksums.
 - **0.1.0-beta.1** was never published; its tag stays as history.
 
-## Next candidate: 0.1.0-beta.7
+## Next candidate: 0.1.0-beta.8
 
-Hot exit and session restore, single instance, compressed files, hex
-editor, screen reader support, TUI Markdown and log commands, UI polish.
+Settings take effect, incremental file-type registration, faster command
+palette, renderer fix, compare wording, homepage.
 
 ## In beta.3
 

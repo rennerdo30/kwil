@@ -1,9 +1,9 @@
-# Kwil 0.1.0-beta.7
+# Kwil 0.1.0-beta.8
 
 Draft notes for the next candidate. Artifacts and packaged native gates are not yet qualified.
 
 An early beta for evaluation and feedback. This is not an RC or a claim that the
-full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.7/docs/SPEC.md)
+full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.8/docs/SPEC.md)
 is complete. Test with copies of important files.
 
 ## Downloads and installation
@@ -30,7 +30,25 @@ without independent signature verification. beta.2 copies update to
 this release by themselves; frozen beta.1 copies must be replaced manually. Stable download installers do not
 select betas.
 
-## Changes since beta.6
+## Changes since beta.7
+
+- **Settings take effect:** ten settings that were saved but not yet used now
+  change Kwil's behaviour, and so does smooth scrolling. Values are checked
+  against their allowed ranges. Settings that only apply to newly opened files
+  say so on the Settings page.
+- **File types:** after the first registration you can register more file
+  types or remove only some of them. Kwil keeps its record of what it
+  registered up to date, so Unregister still removes everything Kwil added.
+- **Faster command palette:** finding a file in a folder of 100,000 files now
+  takes 5 to 13 ms per query on the CI runners (was up to 21 ms on Windows).
+- **Rendering:** a pending redraw is no longer lost while the GPU waits for a
+  free frame (seen with the software WARP renderer).
+- Compare says "1 change" and "1 unchanged line" in GUI and TUI.
+- Homepage: https://kwil.renner.dev
+- CI: startup time to first file content and drawing regressions are measured
+  on every change to main; several flaky tests were fixed.
+
+## Changes in beta.7
 
 - **Hot exit and session restore:** quit with unsaved changes or untitled tabs
   and they come back on the next start, with undo where the recovery journal
@@ -160,7 +178,7 @@ implemented" any more (a contract test for GUI and TUI enforces it).
 
 This list identifies areas to evaluate, not blanket platform or performance
 acceptance. Exact candidate checks and remaining release gates are recorded in
-[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.7/docs/BETA.md).
+[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.8/docs/BETA.md).
 
 ## Known limitations
 
