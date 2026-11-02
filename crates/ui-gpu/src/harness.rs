@@ -247,6 +247,7 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (200, Step::Idle),
             (250, Step::RendererType),
             (200, Step::RendererTyped),
+            (300, Step::Idle),
             (250, Step::Scroll),
             (200, Step::Repaint),
             (150, Step::Status),
@@ -1809,6 +1810,12 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert_eq!(app.markdown_mode(), super::markdown_ui::Mode::Text);
         }
         Step::Idle => {
+            if std::env::var_os("KWIL_RENDERER_PROBE").is_some() {
+                assert!(
+                    app.view.editor().is_some_and(|editor| !editor.document().is_dirty()),
+                    "renderer fixture must be clean before idle/scroll measurement"
+                );
+            }
             #[cfg(feature = "gpu")]
             if std::env::var_os("KWIL_REQUIRE_GPU").is_some() {
                 assert!(app.gpu.is_some(), "hardware GPU required by this probe");
@@ -1903,7 +1910,10 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::RendererTyped => {
             assert!(app.view.line(0).unwrap().starts_with(b"xline AA "), "typing must update file content");
             app.metrics.assert_partial(5, false, app.size.0 * app.size.1);
-            app.metrics.phase = 1;
+            // Restore the disposable fixture before measuring scroll and exit.
+            // Undo paints belong to settling, not to either measured action.
+            app.metrics.phase = 0;
+            app.edit(super::input::Action::Command("edit.undo"));
         }
         Step::RemoteOn | Step::RemoteOff => {
             #[cfg(windows)]
