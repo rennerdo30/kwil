@@ -9,6 +9,8 @@ use winit::event_loop::ActiveEventLoop;
 
 #[path = "harness_filetypes.rs"]
 mod filetypes;
+#[path = "harness_recovery.rs"]
+mod recovery;
 
 pub(super) fn hold_preview_completion(
     metrics: &mut Metrics,
@@ -176,6 +178,7 @@ pub(crate) enum Step {
     SessionEdit,
     SessionCheck,
     SessionExit,
+    RecoveryTick,
     End,
 }
 #[derive(Default, Clone, Copy)]
@@ -196,6 +199,7 @@ pub(crate) struct Metrics {
     // shared by concurrent headless hosts (or another window's delivery).
     hold_text_completion: bool,
     held_text_completion: Option<kwil_view_model::document_worker::result_transport::DocumentDeliveryId>,
+    recovery_phase: u8,
 }
 impl Metrics {
     pub fn present(&mut self, full: bool, damage: u64, copy: u64, content_ready: bool) {
@@ -255,6 +259,17 @@ pub(crate) fn start(proxy: super::HostProxy) {
         previous(info);
     }));
     std::thread::spawn(move || {
+        if std::env::var("KWIL_SESSION_PROBE").is_ok_and(|probe| probe.starts_with("kill-")) {
+            // Bounded readiness checks only in the opt-in test script. The
+            // external runner kills this process after the durable receipt.
+            for _ in 0..450 {
+                std::thread::sleep(Duration::from_millis(100));
+                if proxy.send_event(UserEvent::Harness(Step::RecoveryTick)).is_err() {
+                    break;
+                }
+            }
+            return;
+        }
         let usual = [
             (1800, Step::DismissSetup),
             (200, Step::Idle),
@@ -799,6 +814,7 @@ fn session_scratch(app: &App) -> String {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = session_capture_directory();
     match step {
+        Step::RecoveryTick => recovery::tick(app, dir.as_deref()),
         Step::SessionStart => {
             assert!(app.view.recovery_ready(), "{}", app.view.status_text());
             app.view.set_session_restore(true);
