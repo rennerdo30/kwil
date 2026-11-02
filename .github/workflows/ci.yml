@@ -77,23 +77,6 @@ jobs:
           key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Temporary KW-69 forced-split proof (30 repeats)
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('crates/core-search/src/worker.rs')
-          source = path.read_text()
-          before = 'if rows.len() == FILE_PAGE || !rows.is_empty() && flush_at.elapsed() >= Duration::from_millis(100) {'
-          after = 'if rows.len() == 1 || !rows.is_empty() && flush_at.elapsed() >= Duration::from_millis(100) {'
-          assert source.count(before) == 1 or source.count(after) == 1
-          path.write_text(source.replace(before, after))
-          PY
-          for iteration in $(seq 1 30); do
-            echo "KW-69 forced-split iteration $iteration/30"
-            cargo test -p kwil-ui-gpu --locked --lib search_ui::host_dispatch_tests::actual_host_folder_enter_and_click_open_native_lines_and_keep_query_pages -- --exact
-          done
-          git restore -- crates/core-search/src/worker.rs
       - run: cargo test --workspace --locked
       - name: Prove Linux association safe-open mutations
         if: runner.os == 'Linux'
