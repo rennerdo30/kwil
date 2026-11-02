@@ -85,6 +85,9 @@ pub mod text;
 mod trace;
 pub use kwil_core_commands::settings::RenderBackend;
 pub use remote::RenderPolicy;
+#[cfg(feature = "frame-harness")]
+#[doc(hidden)]
+pub use trace::mark as trace_startup;
 
 use kwil_core_commands::settings::Settings;
 
@@ -2301,6 +2304,12 @@ impl App {
         let mut copied = 0u64;
         let body_changed =
             p.full || p.scroll != 0 || !p.rows.is_empty() || document_rows().next().is_some() || projection_body_dirty;
+        #[cfg(feature = "frame-harness")]
+        let content_mark = trace::content_mark(
+            self.view.line(0),
+            body_changed,
+            binary_blocks_paint || projection_owns_body || hex_active || wrap_active || palette_open || menu_list,
+        );
         if p.full {
             font.invalidate_rows();
             pixels.fill(bg());
@@ -2743,6 +2752,8 @@ impl App {
                 gpu.present(gfx.window.clone(), pixels, (w, h), &damage, p.scroll, ch, tabs::rect(geometry.text));
             match presented {
                 gpu::Presented::Yes => {
+                    #[cfg(feature = "frame-harness")]
+                    trace::presented(content_mark);
                     // Retrying an older pending DX12 frame returns Deferred;
                     // only a current full, final-size success reveals the child.
                     #[cfg(windows)]
@@ -2816,6 +2827,8 @@ impl App {
             target.copy_from_slice(pixels);
             match target.present_with_damage(&rects) {
                 Ok(()) => {
+                    #[cfg(feature = "frame-harness")]
+                    trace::presented(content_mark);
                     #[cfg(feature = "frame-harness")]
                     self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
                 }

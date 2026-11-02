@@ -668,11 +668,15 @@ fn match_files(
     matcher: &SkimMatcherV2,
     cancelled: impl Fn() -> bool,
 ) -> Option<PaletteResults> {
+    #[cfg(feature = "palette-profile")]
+    let started = std::time::Instant::now();
     if cancelled() {
         return None;
     }
     let mut rows = Vec::new();
     let mut total = 0;
+    #[cfg(feature = "palette-profile")]
+    let mut scored = 0usize;
     if query.query.is_empty() {
         rows.extend(paths.iter().take(limit).map(|path| (0, path.clone())));
         total = paths.len();
@@ -681,11 +685,23 @@ fn match_files(
             if cancelled() {
                 return None;
             }
+            #[cfg(feature = "palette-profile")]
+            {
+                scored += 1;
+            }
             if let Some(score) = matcher.fuzzy_match(&path.label, &query.query) {
                 total += 1;
                 keep_best(&mut rows, score, path.clone(), limit);
             }
         }
+    }
+    #[cfg(feature = "palette-profile")]
+    if !query.query.is_empty() && std::env::var_os("KWIL_PALETTE_PROFILE").is_some() {
+        eprintln!(
+            "kwil-palette-profile candidates={} scored={scored} matching_ms={:.3}",
+            paths.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
     Some(PaletteResults {
         generation: query.generation,

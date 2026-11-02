@@ -56,8 +56,13 @@ impl Font {
     }
     pub fn startup(size: std::sync::mpsc::Receiver<f32>) -> Option<Font> {
         let prepared = Self::prepare_default()?;
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("editor font parsed");
         let px = size.recv().ok()?;
-        Self::from_face(prepared.face, px, &prepared.family)
+        let font = Self::from_face(prepared.face, px, &prepared.family);
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("editor font rasterized");
+        font
     }
     pub fn load_named(px: f32, family: &str) -> Option<Font> {
         if family == "monospace" {
@@ -341,10 +346,14 @@ impl UiFont {
         let face = UiFace::chain()?;
         let mono = UiFace::read(editor_candidates());
         let symbols = UiFace::symbols();
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("chrome fonts parsed");
         let px = px.recv().ok()?;
         let mut font = Self::from_face(face, px)?;
         font.monospace = mono.and_then(|face| Self::single_face(face, px)).map(Box::new);
         font.install_symbols(symbols);
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("chrome fonts rasterized");
         Some(font)
     }
     /// Worker-only (reads files).
