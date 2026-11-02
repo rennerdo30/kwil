@@ -27,6 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Release notes name the tagged version
+        # Only prereleases use docs/BETA_RELEASE_NOTES.md; stable tags use generated notes.
+        if: contains(github.ref_name, '-')
         run: |
           expected="# Kwil ${GITHUB_REF_NAME#v}"
           heading=$(head -n 1 docs/BETA_RELEASE_NOTES.md | tr -d '\r')

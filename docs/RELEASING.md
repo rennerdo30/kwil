@@ -28,7 +28,7 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 4. The owner reviews the draft and publishes it.
 5. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once.
 
-Before any release build, `docs/BETA_RELEASE_NOTES.md` must start with
+Before any prerelease build, `docs/BETA_RELEASE_NOTES.md` must start with
 `# Kwil X.Y.Z`, using the exact tagged version without its leading `v`
 (including any prerelease suffix). A stale or missing heading stops the workflow
 before notices or builds run. The exact tagged commit must first pass the `CI`
