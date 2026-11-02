@@ -22,8 +22,12 @@ prepared wrap page. Each run carries UTF-8 character lengths and a bounded map
 to source positions. Only the primary caret/selection is exposed; endpoints
 outside the viewport are clipped to the exposed boundary. The accessible text
 is a viewport, not a virtual copy of the full document. Moving the viewport
-replaces those runs. While a prepared page is pending, one empty run keeps the
-native text provider present so reflow cannot suppress selection events.
+replaces those runs. While a prepared page is pending for the same document,
+input epoch and revision, the last published bounded runs and source mappings
+remain available. Replacing them with an empty placeholder would invalidate
+live UIA ranges even though the document text has not changed. Without a prior
+matching viewport, one empty run keeps the native text provider present during
+initial layout. Changed documents never reuse the retained text.
 The TUI is unchanged.
 
 ## Windows inspection
@@ -76,7 +80,7 @@ has a newline, using existing line-count/page metadata without reading more
 document data. The focused regression also covers an empty document and one
 that ends with a newline.
 
-This qualifies the Windows UIA provider contract exercised above on the CPU
+Coverage is limited to the Windows UIA provider contract above on the CPU
 renderer. It does not complete screen-reader listening, normal foreground
 keyboard/IME navigation, all settings subpanels, GPU rendering, or the native
 macOS/Linux checks below. The beta accessibility limitation remains for those

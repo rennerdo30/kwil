@@ -271,6 +271,10 @@ try {
     if (!$cloaked) { throw 'Settings window must remain DWM-cloaked' }
     if ([KwilEvents]::Focuses -eq 0) { throw 'UIA did not raise focus notifications' }
     Write-Output "PASS: hidden UIA tree, exact Unicode text ($($text.Length) chars; whole=$WholeDocument; wrap=$WordWrap), selection action, Left key caret 4 -> 3, selection events ($([KwilEvents]::Selections)), focus notifications ($([KwilEvents]::Focuses)), named roles for tabs/palette/settings"
+} catch {
+    [IO.File]::WriteAllText((Join-Path $OutputDirectory 'uia-error.txt'),
+        "$($_.Exception.ToString())`n$($_.InvocationInfo.PositionMessage)`n$($_.ScriptStackTrace)")
+    throw
 } finally {
     [Windows.Automation.Automation]::RemoveAllEventHandlers()
     if (!$process.HasExited) { Stop-Process -Id $process.Id }
