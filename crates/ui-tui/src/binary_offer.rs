@@ -435,6 +435,9 @@ mod tests {
         assert!(Host::captures(&f.view, &Event::Paste("body must stay fenced".into()), false));
         assert!(Host::blocked(&f.view) && f.view.editor().is_none());
         assert_eq!(f.document.transport.as_ref().unwrap().result_info(), Some(completion));
+        for handle in palette.stop() {
+            handle.join().unwrap();
+        }
         drop(palette);
         f.document.transport.as_ref().unwrap().wake_ready();
         f.settled(id);
