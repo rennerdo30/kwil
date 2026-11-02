@@ -19,7 +19,7 @@ pub fn measure(path: &Path) -> std::io::Result<serde_json::Value> {
     assert!(count > JUMP);
     let start = Instant::now();
     let jump = file.lines(JUMP, SCREEN).map_err(std::io::Error::other)?.expect("index ready and fixture has 15M lines");
-    assert!(String::from_utf8_lossy(jump[0]).contains("line=15000000"));
+    assert!(String::from_utf8_lossy(&jump[0]).contains("line=15000000"));
     let jump_ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok(
         serde_json::json!({"open_first_ms": open_ms, "index_gb_s": file.len() as f64 / index_ms / 1e6, "index_ms":index_ms, "jump_ms":jump_ms, "private_mb":crate::private_bytes()? as f64 / 1048576.0, "lines":count}),
