@@ -31,16 +31,27 @@ The TUI is unchanged.
 Build with `cargo build -p kwil -j 4 --locked`, then run from Windows PowerShell:
 
 ```powershell
-powershell -NoProfile -File scripts/inspect-accessibility.ps1 -Executable <absolute-path-to-kwil.exe>
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/inspect-accessibility.ps1 -Executable <absolute-path-to-kwil.exe>
 ```
 
-Add `-WordWrap` to inspect the prepared wrapped-text path too.
+Add `-WordWrap` to inspect the prepared wrapped-text path too. Add
+`-WholeDocument` to use a small two-line Unicode file without a final newline
+and compare TextPattern's complete text exactly with the file. Without it,
+the larger fixture verifies that the exposed viewport is an exact prefix and
+does not contain the full document.
 
 The inspection uses isolated workspace/settings storage, launches only
 `--hidden --gui --renderer=cpu` with updates disabled, records its owned PID,
 and closes that process in `finally`. It checks UI Automation's TextPattern,
 Unicode viewport text, bounded text length, selection actions and selection
 events, menu actions, palette/prompt lists and the owned settings window.
+It collapses a selection at document offset 4, posts a Left key to the owned
+HWND, and asserts that UIA reports a collapsed caret at offset 3, emits a new
+selection event, and leaves the text unchanged. It checks the exact names and
+UIA roles of the Documents tab list, file tab, editor, command palette and its
+query, and settings list and its query. Palette commands and settings rows must
+be named ListItems. Settings are exposed as navigable list rows with their
+title, value and description, rather than individual native checkbox widgets.
 Both HWNDs must remain DWM-cloaked. A synthetic WM_SETFOCUS notification to the
 owned hidden HWND exercises UIA focus events without calling SetFocus or
 changing the owner's foreground window. This is not a real NVDA listening
@@ -48,6 +59,28 @@ test. A PrintWindow capture and the discovered UIA tree go outside the repo
 under `E:/AgentData/reports/`.
 Debug builds always open Welcome; the script closes that owned hidden modal
 before inspecting editor actions.
+
+## Automated Windows qualification
+
+The hosted `windows-latest` test job runs `inspect-accessibility.ps1` against
+the real debug `kwil.exe` after the smoke build. Three fresh hidden processes
+check the complete short document with wrapping off and on, then a larger
+bounded viewport. Each case uses a separate Windows PowerShell UIA client.
+The step has a three-minute timeout and uploads available trees, logs and
+PrintWindow captures as the `windows-uia-qualification` artifact, including on
+failure.
+
+The exact-text regression caught an extra newline at EOF in both the logical
+and prepared text providers. Exposed text now preserves whether the final line
+has a newline, using existing line-count/page metadata without reading more
+document data. The focused regression also covers an empty document and one
+that ends with a newline.
+
+This qualifies the Windows UIA provider contract exercised above on the CPU
+renderer. It does not complete screen-reader listening, normal foreground
+keyboard/IME navigation, all settings subpanels, GPU rendering, or the native
+macOS/Linux checks below. The beta accessibility limitation remains for those
+unverified cases.
 
 ## Remaining native verification
 

@@ -384,7 +384,9 @@ impl App {
                         }
                     }
                     positions.push(line.source_coverage.end);
-                    if line.hard_line_end {
+                    // A hard line end also describes EOF. Only actual line
+                    // separators belong in TextPattern's document text.
+                    if line.hard_line_end && !(page.at_end && row + 1 == page.rows().len()) {
                         text.push('\n');
                         positions.push(line.source_coverage.end);
                     }
@@ -402,8 +404,10 @@ impl App {
                         }
                     }
                     positions.push(end);
-                    text.push('\n');
-                    positions.push(end);
+                    if self.view.line_count().is_none_or(|count| self.view.line_number(row) < count) {
+                        text.push('\n');
+                        positions.push(end);
+                    }
                 }
                 let bounds = accesskit::Rect::new(
                     body.x as f64,
