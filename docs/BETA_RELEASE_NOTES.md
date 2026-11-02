@@ -43,10 +43,23 @@ select betas.
   takes 5 to 13 ms per query on the CI runners (was up to 21 ms on Windows).
 - **Rendering:** a pending redraw is no longer lost while the GPU waits for a
   free frame (seen with the software WARP renderer).
-- Compare says "1 change" and "1 unchanged line" in GUI and TUI.
+- **Compare any size:** comparing large files (or a large file against its
+  saved version) works beyond the old limit; alignment, folding of unchanged
+  regions and word highlights are worked out on disk within bounded memory.
+  Compare says "1 change" and "1 unchanged line" in GUI and TUI.
+- **Format Document / Format Selection:** formatting works right after a
+  search, and Format Selection keeps the whitespace and line break the
+  selection ended with, so the lines around it stay as they were.
+- **Hot exit fix:** after Kwil restores unsaved tabs, new edits are saved to
+  the recovery journal again and "Recovery pending" clears within seconds;
+  before, an idle restored window could keep them unconfirmed.
+- **Faster start on macOS:** fonts are prepared while the window is created;
+  time to file content on the CI runner fell from about 207 to 138 ms (warm
+  file) and from 188 to 153 ms (1 GiB file).
 - Homepage: https://kwil.renner.dev
 - CI: startup time to first file content and drawing regressions are measured
-  on every change to main; several flaky tests were fixed.
+  on every change to main; the command palette is checked end to end in GUI
+  and TUI; several flaky tests were fixed.
 
 ## Changes in beta.7
 
