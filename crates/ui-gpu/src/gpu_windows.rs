@@ -140,6 +140,8 @@ struct Backend {
     latency: Option<Arc<Event>>,
     pending: Option<PendingPresent>,
     presented: u64,
+    #[cfg(feature = "frame-harness")]
+    last_present: (bool, u64, u64),
     // A failed queue Signal cannot retire accepted work using an older fence.
     unsignalled: bool,
 }
@@ -369,6 +371,8 @@ impl Gpu {
                     latency: None,
                     pending: None,
                     presented: 0,
+                    #[cfg(feature = "frame-harness")]
+                    last_present: (false, 0, 0),
                     unsignalled: false,
                 })),
                 wait: tx,
@@ -840,6 +844,14 @@ impl Backend {
             return Ok(false);
         }
         self.presented = self.presented.saturating_add(1);
+        #[cfg(feature = "frame-harness")]
+        {
+            let full = pending.plan.dirty.is_empty()
+                || pending.plan.dirty.contains(&Rect { x: 0, y: 0, w: self.size.0, h: self.size.1 });
+            let damage = pending.plan.dirty.iter().map(|r| (r.w * r.h) as u64).sum();
+            let copy = pending.plan.scroll.as_ref().map_or(0, |s| (s.source.w * s.source.h) as u64);
+            self.last_present = (full, damage, copy);
+        }
         self.pending = None;
         Ok(true)
     }
@@ -847,6 +859,10 @@ impl Backend {
 
 #[cfg(feature = "frame-harness")]
 impl Gpu {
+    /// Metadata of the most recent successful native Present1, not host damage.
+    pub fn last_present(&self) -> (bool, u64, u64) {
+        self.backend.as_ref().map_or((false, 0, 0), |b| b.last_present)
+    }
     pub fn presents(&self) -> u64 {
         self.backend.as_ref().map_or(0, |b| b.presented)
     }

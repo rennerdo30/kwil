@@ -2750,7 +2750,19 @@ impl App {
                         canvas.show();
                     }
                     #[cfg(feature = "frame-harness")]
-                    self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
+                    {
+                        #[cfg(windows)]
+                        let (full, damage_px, copy_px) = gpu.last_present();
+                        #[cfg(not(windows))]
+                        let (full, damage_px, copy_px) =
+                            (p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
+                        self.metrics.present(
+                            full,
+                            damage_px,
+                            copy_px,
+                            self.view.editor().is_some() && self.view.line(0).is_some_and(|line| !line.is_empty()),
+                        );
+                    }
                     drop(document_update);
                     self.document_frame_painted();
                     if self.wrap_frame_painted() {
@@ -2817,7 +2829,12 @@ impl App {
             match target.present_with_damage(&rects) {
                 Ok(()) => {
                     #[cfg(feature = "frame-harness")]
-                    self.metrics.present(p.full, damage.iter().map(|area| (area.w * area.h) as u64).sum(), copied);
+                    self.metrics.present(
+                        p.full,
+                        damage.iter().map(|area| (area.w * area.h) as u64).sum(),
+                        copied,
+                        self.view.editor().is_some() && self.view.line(0).is_some_and(|line| !line.is_empty()),
+                    );
                 }
                 Err(error) => {
                     self.error = Some(GuiError::Unavailable(error.to_string()));
