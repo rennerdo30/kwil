@@ -47,6 +47,15 @@ pub struct Row {
     pub words: [Vec<Range<usize>>; 2],
     pub hidden: usize,
 }
+impl Row {
+    pub fn collapsed_label(&self) -> String {
+        format!(
+            "… {} unchanged {} (click or Enter to expand)",
+            self.hidden,
+            if self.hidden == 1 { "line" } else { "lines" }
+        )
+    }
+}
 enum Request {
     Start(Snapshot, PathBuf, CompareSettings),
     Action(Action),

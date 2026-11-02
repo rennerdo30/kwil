@@ -53,10 +53,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame, view: &Workspace, layout: kwil_co
     for (index, row) in page.rows.iter().take(area.height.saturating_sub(1) as usize).enumerate() {
         let y = area.y + index as u16 + 1;
         if row.hidden > 0 {
-            frame.render_widget(
-                Paragraph::new(format!("… {} unchanged lines (click or Enter to expand)", row.hidden)).style(base),
-                Rect::new(area.x, y, area.width, 1),
-            );
+            frame.render_widget(Paragraph::new(row.collapsed_label()).style(base), Rect::new(area.x, y, area.width, 1));
             continue;
         }
         for side in 0..2 {
@@ -92,6 +89,33 @@ pub(super) fn draw(frame: &mut ratatui::Frame, view: &Workspace, layout: kwil_co
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compare_collapsed_label_pluralizes_line_count() {
+        use kwil_view_model::compare_session::{Page, Row};
+        let mut view = Workspace::new(View::new(None)).unwrap();
+        for (hidden, expected) in [(1, "1 unchanged line ("), (2, "2 unchanged lines (")] {
+            view.compare.page = Some(Page {
+                rows: vec![Row {
+                    left: None,
+                    right: None,
+                    kind: Kind::Equal,
+                    text: Default::default(),
+                    words: Default::default(),
+                    hidden,
+                }],
+                top: 0,
+                total: 1,
+                changes: 0,
+                ignore_whitespace: false,
+                collapsed: true,
+                right_title: "saved.txt".into(),
+            });
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            terminal.draw(|frame| draw(frame, &view, Settings::default().tabs.layout)).unwrap();
+            let painted: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            assert!(painted.contains(expected), "{painted}");
+        }
+    }
     #[test]
     fn compare_tui_command_paints_both_sides_and_rejects_edits() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
