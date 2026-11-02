@@ -15,8 +15,8 @@ impl Host {
         view.binary_offer_pending(view.active_id())
     }
 
-    pub(super) fn captures(view: &Workspace, event: &Event, settings_open: bool) -> bool {
-        if !Self::blocked(view) || settings_open {
+    pub(super) fn captures(view: &Workspace, event: &Event, chrome_open: bool) -> bool {
+        if !Self::blocked(view) || chrome_open {
             return false;
         }
         match event {
@@ -34,6 +34,24 @@ impl Host {
             Event::Key(_) | Event::Paste(_) | Event::Mouse(_) => true,
             _ => false,
         }
+    }
+
+    /// A vetted preview still fences document input, but palette chrome does
+    /// not need the pending Editor. An unresolved binary choice remains modal.
+    pub(super) fn palette_query(view: &Workspace, keys: &mut KeymapEngine, event: &Event) -> Option<&'static str> {
+        if !view.binary_preview_ready(view.active_id())
+            || view.binary_offer().is_some()
+            || view.file_prompt().is_some()
+            || view.close_pending()
+        {
+            return None;
+        }
+        let Event::Key(key) = event else { return None };
+        if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        let VimResult::Command(call) = keys.feed_with_selection(chord(*key)?) else { return None };
+        palette_ui::command_query(call.id)
     }
 
     pub(super) fn sync(&mut self, view: &mut Workspace, keys: &mut KeymapEngine) -> bool {
@@ -399,6 +417,31 @@ mod tests {
     }
 
     #[test]
+    fn pending_preview_palette_opens_without_accepting_held_document_completion() {
+        let mut f = Fixture::new();
+        let id = f.open("palette-before-completion", b"vetted palette preview\n");
+        let completion = f.hold_checked_opened(id);
+        f.modal.sync(&mut f.view, &mut f.keys);
+        assert!(Host::blocked(&f.view) && f.view.binary_preview_ready(id));
+        assert!(f.view.editor().is_none());
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        let query = Host::palette_query(&f.view, &mut f.keys, &event).expect("pending preview admits palette chrome");
+        assert_eq!(query, "");
+        let mut palette =
+            kwil_view_model::palette_session::PaletteSession::new(f.root.clone(), std::sync::Arc::new(|| {})).unwrap();
+        palette_ui::open(&mut f.view, Some(&mut palette), &mut f.keys, query);
+        assert!(palette.model().is_open(), "palette opens while Editor completion is still held");
+        assert!(!Host::captures(&f.view, &event, palette.model().is_open()));
+        assert!(Host::captures(&f.view, &Event::Paste("body must stay fenced".into()), false));
+        assert!(Host::blocked(&f.view) && f.view.editor().is_none());
+        assert_eq!(f.document.transport.as_ref().unwrap().result_info(), Some(completion));
+        drop(palette);
+        f.document.transport.as_ref().unwrap().wake_ready();
+        f.settled(id);
+        f.finish();
+    }
+
+    #[test]
     fn binary_offer_terminal_vetted_preview_paints_before_held_completion_without_releasing_input() {
         use kwil_view_model::workspace_document::ResultKind;
         const TEXT: &[u8] = b"vetted first screen\n";
@@ -480,6 +523,15 @@ mod tests {
         f.input(Event::Paste("must not edit".into()));
         f.offered();
         let rendered = f.paint();
+        assert_eq!(
+            Host::palette_query(
+                &f.view,
+                &mut f.keys,
+                &Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            ),
+            None,
+            "an unresolved binary choice remains modal"
+        );
         for label in [
             "Binary file (15 bytes)",
             "> [H] Hex (default)",

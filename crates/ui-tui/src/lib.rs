@@ -527,11 +527,18 @@ fn run_workspace_with_terminal_init(
                         if binary_offer::Host::captures(
                             view,
                             &event,
-                            settings_panel.as_ref().is_some_and(|panel| panel.is_open()),
+                            settings_panel.as_ref().is_some_and(|panel| panel.is_open())
+                                || palette.as_ref().is_some_and(|host| host.model().is_open()),
                         ) =>
                     {
-                        let size = terminal.size()?;
-                        binary_offer.input(view, &mut keys, &event, Rect::new(0, 0, size.width, size.height))
+                        binary_offer.sync(view, &mut keys);
+                        if let Some(query) = binary_offer::Host::palette_query(view, &mut keys, &event) {
+                            palette_ui::open(view, palette.as_mut(), &mut keys, query);
+                            true
+                        } else {
+                            let size = terminal.size()?;
+                            binary_offer.input(view, &mut keys, &event, Rect::new(0, 0, size.width, size.height))
+                        }
                     }
                     Msg::Input(Event::Resize(_, _)) => {
                         view.cancel_hex_input();
@@ -1120,7 +1127,9 @@ fn run_workspace_with_terminal_init(
                     if let Some(panel) = &settings_panel {
                         settings_ui::draw(f, panel);
                     }
-                    if !settings_panel.as_ref().is_some_and(|panel| panel.is_open()) {
+                    if !settings_panel.as_ref().is_some_and(|panel| panel.is_open())
+                        && !palette.as_ref().is_some_and(|host| host.model().is_open())
+                    {
                         binary_offer.draw(f, view);
                     }
                     theme_ui::draw(f, &themes);

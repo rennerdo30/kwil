@@ -208,6 +208,11 @@ class Tui:
         self.wait(lambda s: "Open by path" in s.text(), "file-prompt")
         self.send(str(path))
         self.wait(lambda s: str(path) in s.text(), "file-path")
+        # This field comes from Editor::document().line_ending, unlike raw
+        # preview text or workspace tab chrome. Compare needs that Editor's
+        # snapshot; the palette above must work before it is installed.
+        self.wait(lambda s: re.search(r"\|\s+LF(?:\s|$)", s.text().splitlines()[-1]) is not None,
+                  "document-ready")
         start = time.monotonic()
         self.send(b"\r")
         return start

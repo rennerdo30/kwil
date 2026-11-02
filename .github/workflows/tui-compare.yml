@@ -43,7 +43,7 @@ jobs:
           shared-key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}-test
           add-rust-environment-hash-key: false
           save-if: false
-      - name: Prove the PTY test rejects broken navigation and stale compare text
+      - name: Prove pending palette, navigation and stale text regressions can fail
         run: python3 scripts/check-tui-compare-mutation.py
       - name: Build the restored production TUI
         run: cargo build -j 4 --locked -p kwil --bin kwil
