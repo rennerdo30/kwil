@@ -28,8 +28,10 @@ the retained image; buffer age does not force text layout or glyph rasterization
   are capped at 256 bytes and layout at 4096 columns. Pathological longer combining
   sequences are clipped for display only. Original bytes remain untouched.
 
-ASCII uses fontdue tiles. Non-ASCII runs are itemized by script and fallback face and
-shaped/rasterized with swash on a deferred worker. Before their lazy font is ready,
+ASCII uses cached, hinted Swash tiles, rasterized only for the printable ASCII set
+with the same scaler as chrome. Startup reads font metadata without constructing
+outlines for every mapped character. Non-ASCII runs are itemized by script and
+fallback face and shaped/rasterized with Swash on a deferred worker. Before their lazy font is ready,
 the first CPU frame uses a visible placeholder of the correct grid width. Font discovery
 never runs on the first-frame path. Combining clusters prefer the same primary font as
 ASCII, and fallback can render colour emoji. Positive and negative fallback results
