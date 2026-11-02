@@ -450,12 +450,14 @@ fn review_explicit_override_recovers_ambiguous_utf32_detection() {
     assert_eq!(saved, bytes);
     assert_eq!(source.reinterpret(Encoding::UTF16_LE).unwrap().detection().encoding, Encoding::UTF16_LE);
 
-    // Another unsupported automatic detection is recoverable from the retained
-    // TextFile too. The user's choice is explicit; automatic ISO refusal stays.
+    // ISO is now detected and decoded, while an explicit UTF-8 override still
+    // reinterprets the retained raw TextFile without changing its bytes.
     let (iso, _, errors) = encoding_rs::ISO_2022_JP.encode("日本語のメールです。");
     assert!(!errors);
     let file = dir.open("override-iso", &iso);
-    assert!(EncodedFile::new(file.clone()).is_err());
+    let automatic = EncodedFile::new(file.clone()).unwrap();
+    assert_eq!(automatic.detection().encoding, Encoding::ISO2022_JP);
+    assert_eq!(text(&automatic.decode_range(0..iso.len() as u64).unwrap()), "日本語のメールです。");
     let explicit = EncodedFile::new_with_encoding(file, Encoding::UTF8).unwrap();
     assert_eq!(explicit.detection().encoding, Encoding::UTF8);
 }
