@@ -637,7 +637,10 @@ impl Workspace {
                 if panic_after_field {
                     panic!("controlled panic after first source field");
                 }
-                if action.is_none() {
+                // Only search owns an acknowledgement in the frontend search
+                // host. Formatting restores the same editor through this lane
+                // but must not manufacture a search loan receipt.
+                if action.is_none() && !formatting {
                     commit.replacement =
                         Some(ExactReplacementReceipt { key: *key, operation: *operation, succeeded: result.is_ok() });
                 }
