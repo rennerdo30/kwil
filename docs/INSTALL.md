@@ -32,13 +32,23 @@ the setup asks if it is still running.
 Uninstall through Settings > Apps > Installed apps. The uninstaller first
 removes Kwil's "Open with" entries (`kwil --unregister-file-types`, the same
 as "Remove all" on the file-types page), then the installed files, shortcut and
-entry. Settings and recovery data in `%APPDATA%\kwil` stay. Silent use:
+entry. Settings and recovery data in `%APPDATA%\kwil` stay, including
+`settings.toml` and `workspace/session.kws`. Unknown files you put in the
+installation folder also stay. Silent use:
 `setup.exe /S`, `uninstall.exe /S`; `/D=<folder>` (last argument) picks
 another folder.
 
 The installer script is `installer/kwil.nsi`; `scripts/package-windows.ps1`
-builds the setup and zip, and CI installs, runs and uninstalls the x64 setup
-(`scripts/test-nsis-installer.ps1`) for every release.
+builds the setup and zip using the shared renner.dev template (provenance and
+Kwil compatibility hooks in `installer/shared/README.md`). Installer-check CI
+installs the checksum-verified published beta.7 setup, writes settings and a
+session, upgrades to the candidate, checks the version, then uninstalls. It
+compares settings/session/recovery bytes after upgrade and uninstall and checks
+that program files, the shortcut and Installed apps entry are removed. It also
+retains a native welcome-page capture. Release CI runs the current-setup
+install/uninstall smoke with the same data-preservation checks. These checks
+run only on disposable GitHub-hosted Windows runners; they never run a setup
+on the developer's PC. ARM64 lifecycle execution remains unverified.
 
 ## Portable (zip, tar.gz)
 

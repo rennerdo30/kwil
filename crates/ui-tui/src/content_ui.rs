@@ -2,7 +2,7 @@
 use super::*;
 use kwil_core_markdown::{BlockKind, Model};
 use kwil_core_runtime::{NativeExitObservation, NativeExitState};
-use kwil_view_model::log_session::{Filter, Level, LogSession, TextQuery, Viewport, ViewportPage};
+use kwil_view_model::log_session::{Filter, Level, LogSession, Viewport, ViewportPage};
 use std::{sync::Arc, time::Instant};
 
 type Source = (u64, u64, u64);
@@ -97,6 +97,14 @@ pub(super) struct Host {
     to: String,
     field: Option<usize>,
     level: usize,
+    level_chosen: bool,
+    keep_unknown: Option<bool>,
+    applied_fields: (String, String, String),
+    field_cursor: usize,
+    field_all: bool,
+    selected: usize,
+    body: Rect,
+    visible: usize,
     page: Option<ViewportPage>,
     submitted: Option<(Source, Filter, Viewport)>,
     generation: u64,
@@ -162,15 +170,19 @@ impl Host {
             "log.resume" | "log.toggleFollow" => self.resume(view),
             "view.logFilters" => {
                 self.open = !self.open;
-                self.field = self.open.then_some(0);
+                if self.open {
+                    self.begin_field(0);
+                } else {
+                    self.field = None;
+                }
             }
             "log.filter" => {
                 self.open = true;
-                self.field = Some(0);
+                self.begin_field(0);
             }
             "log.goToTime" => {
                 self.open = true;
-                self.field = Some(1);
+                self.begin_field(1);
             }
             "log.toggleRegex" => {
                 self.open = true;
@@ -179,7 +191,8 @@ impl Host {
             }
             "log.toggleLevel" => {
                 self.open = true;
-                self.filter.levels ^= Level::ALL[self.level].bit();
+                let level = if self.level_chosen { Level::ALL[self.level] } else { Level::Error };
+                self.filter.levels ^= level.bit();
                 self.invalidate();
             }
             "log.clearFilter" => {
@@ -188,6 +201,9 @@ impl Host {
                 self.from.clear();
                 self.to.clear();
                 self.regex = false;
+                self.keep_unknown = None;
+                self.level_chosen = false;
+                self.applied_fields = Default::default();
                 self.field = None;
                 self.open = true;
                 self.invalidate();
@@ -229,34 +245,21 @@ impl Host {
         self.submitted = None;
         self.page = None;
         self.top = 0;
+        self.selected = 0;
     }
     fn apply(&mut self) {
-        let result = (|| {
-            let parse = |text: &str| {
-                if text.is_empty() {
-                    Ok(None)
-                } else {
-                    kwil_core_syntax::logs::parse_timestamp(text)
-                        .map(Some)
-                        .ok_or("Use an ISO timestamp, e.g. 2026-11-02T10:00:00Z")
-                }
-            };
-            let from = parse(&self.from)?;
-            let to = parse(&self.to)?;
-            if from.zip(to).is_some_and(|(a, b)| a > b) {
-                return Err("Time range end precedes start");
-            }
-            Ok(Filter {
-                text: TextQuery::new(&self.query, self.regex)?,
-                from,
-                to,
-                keep_unknown: from.is_none() && to.is_none(),
-                ..self.filter
-            })
-        })();
+        let result = kwil_view_model::log_view::filter_from_fields(
+            self.filter,
+            &self.query,
+            self.regex,
+            &self.from,
+            &self.to,
+            self.keep_unknown,
+        );
         match result {
             Ok(filter) => {
                 self.filter = filter;
+                self.applied_fields = (self.query.clone(), self.from.clone(), self.to.clone());
                 self.error.clear();
                 self.invalidate();
                 self.field = None;
@@ -271,22 +274,29 @@ impl Host {
         if let Some(field) = self.field {
             match key.code {
                 KeyCode::Esc => {
+                    (self.query, self.from, self.to) = self.applied_fields.clone();
                     self.field = None;
                     self.error.clear();
                 }
                 KeyCode::Enter => self.apply(),
-                KeyCode::Tab => self.field = Some((field + 1) % 3),
-                KeyCode::BackTab => self.field = Some((field + 2) % 3),
-                KeyCode::Backspace => {
-                    self.edit(field).pop();
+                KeyCode::Tab => self.begin_field((field + 1) % 3),
+                KeyCode::BackTab => self.begin_field((field + 2) % 3),
+                KeyCode::Left => self.edit_input(kwil_view_model::log_view::FieldInput::Left),
+                KeyCode::Right => self.edit_input(kwil_view_model::log_view::FieldInput::Right),
+                KeyCode::Home => self.edit_input(kwil_view_model::log_view::FieldInput::Home),
+                KeyCode::End => self.edit_input(kwil_view_model::log_view::FieldInput::End),
+                KeyCode::Delete => self.edit_input(kwil_view_model::log_view::FieldInput::Delete),
+                KeyCode::Backspace => self.edit_input(kwil_view_model::log_view::FieldInput::Backspace),
+                KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.edit_input(kwil_view_model::log_view::FieldInput::SelectAll)
+                }
+                _ if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) => {
+                    return false;
                 }
                 KeyCode::Char(c)
                     if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && !c.is_control() =>
                 {
-                    let text = self.edit(field);
-                    if text.len() + c.len_utf8() <= 256 {
-                        text.push(c);
-                    }
+                    self.paste(&c.to_string());
                 }
                 _ => {}
             }
@@ -303,6 +313,12 @@ impl Host {
             _ => 0,
         };
         match key.code {
+            KeyCode::Char('c' | 'C') if self.open && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.copy_selected(view, &mut std::io::stdout().lock());
+            }
+            _ if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) => {
+                return false;
+            }
             KeyCode::Esc => {
                 self.mode = Mode::Text;
                 self.open = false;
@@ -310,13 +326,15 @@ impl Host {
             }
             KeyCode::Home => {
                 self.top = 0;
+                self.selected = 0;
                 self.markdown_top = 0;
                 self.following = false;
             }
             KeyCode::End => {
                 self.markdown_top = usize::MAX;
                 if let Some(page) = &self.page {
-                    self.top = page.total.saturating_sub(view.rows().max(1) as u64);
+                    self.top = page.total.saturating_sub(self.visible.max(1) as u64);
+                    self.selected = 0;
                 }
             }
             KeyCode::Left if self.open => {
@@ -325,42 +343,116 @@ impl Host {
             KeyCode::Right if self.open => {
                 self.horizontal = self.horizontal.saturating_add(8);
             }
-            KeyCode::Enter if self.open => {
-                if let Some(row) = self.page.as_ref().and_then(|p| p.rows.first()) {
-                    let line = row.line + 1;
-                    self.open = false;
-                    self.following = false;
-                    if let Err(e) = view.execute(
-                        "navigation.goToLine",
-                        &CommandArgs { line: Some(line), column: Some(1), ..Default::default() },
-                        1,
-                    ) {
-                        view.set_notice(e.to_string());
-                    }
-                }
+            KeyCode::Enter if self.open => self.activate(view),
+            KeyCode::Char('f') if self.open => self.begin_field(0),
+            KeyCode::Char('t') if self.open => self.begin_field(1),
+            KeyCode::Char('u') if self.open => {
+                self.filter.keep_unknown = !self.filter.keep_unknown;
+                self.keep_unknown = Some(self.filter.keep_unknown);
+                self.invalidate();
             }
-            KeyCode::Char('f') if self.open => self.field = Some(0),
-            KeyCode::Char('t') if self.open => self.field = Some(1),
+            KeyCode::Char('a') if self.open => {
+                self.filter.levels = Filter::default().levels;
+                self.invalidate();
+            }
+            KeyCode::Char('c') if self.open => self.command(view, "log.clearFilter"),
             KeyCode::Char('r') if self.open => {
                 self.regex = !self.regex;
                 self.apply();
             }
             KeyCode::Char(c @ '1'..='6') if self.open => {
                 self.level = c as usize - '1' as usize;
+                self.level_chosen = true;
                 self.filter.levels ^= Level::ALL[self.level].bit();
                 self.invalidate();
             }
             _ if delta != 0 => {
                 self.following = false;
-                self.top = self.top.saturating_add_signed(delta);
-                if let Some(page) = &self.page {
-                    self.top = self.top.min(page.total.saturating_sub(1));
+                if self.open
+                    && matches!(key.code, KeyCode::Up | KeyCode::Down)
+                    && self.page_current(view)
+                    && let Some(page) = &self.page
+                    && ((delta < 0 && self.selected > 0)
+                        || (delta > 0 && self.selected + 1 < page.rows.len().min(self.visible.max(1))))
+                {
+                    self.selected = self.selected.saturating_add_signed(delta as isize);
+                } else {
+                    if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+                        self.selected = 0;
+                    }
+                    self.top = self.top.saturating_add_signed(delta);
+                    if let Some(page) = &self.page {
+                        self.top = self.top.min(page.total.saturating_sub(self.visible.max(1) as u64));
+                    }
                 }
                 self.markdown_top = self.markdown_top.saturating_add_signed(delta as isize);
             }
             _ => return false,
         }
         true
+    }
+    fn begin_field(&mut self, field: usize) {
+        self.field = Some(field);
+        self.field_cursor = self.edit(field).len();
+        self.field_all = false;
+    }
+    fn draft(&self) -> bool {
+        self.query != self.applied_fields.0 || self.from != self.applied_fields.1 || self.to != self.applied_fields.2
+    }
+    fn edit_input(&mut self, input: kwil_view_model::log_view::FieldInput<'_>) {
+        let Some(field) = self.field else { return };
+        let mut cursor = self.field_cursor;
+        let mut all = self.field_all;
+        if let Err(error) = kwil_view_model::log_view::edit_field(self.edit(field), &mut cursor, &mut all, input) {
+            self.error = error.into();
+        } else {
+            self.error.clear();
+        }
+        self.field_cursor = cursor;
+        self.field_all = all;
+    }
+    fn page_current(&self, view: &Workspace) -> bool {
+        !self.draft()
+            && self.open
+            && self.submitted.is_some_and(|(key, filter, viewport)| {
+                Some(key) == source(view)
+                    && filter == self.filter
+                    && self.page.as_ref().is_some_and(|page| {
+                        page.viewport == viewport && viewport.top == self.top && viewport.horizontal == self.horizontal
+                    })
+            })
+    }
+    fn activate(&mut self, view: &mut Workspace) {
+        let Some(line) = self.mark_line(view) else {
+            return;
+        };
+        match view.execute(
+            "navigation.goToLine",
+            &CommandArgs { line: Some(line), column: Some(1), ..Default::default() },
+            1,
+        ) {
+            Ok(_) => self.close_logs(),
+            Err(error) => {
+                view.set_notice(format!("Cannot jump to line: {error}"));
+            }
+        };
+    }
+    fn copy_selected(&self, view: &mut Workspace, output: &mut impl std::io::Write) {
+        let result = if self.page_current(view) {
+            self.page
+                .as_ref()
+                .and_then(|page| page.rows.get(self.selected))
+                .ok_or("Wait for filtered log lines before copying")
+                .and_then(kwil_view_model::log_view::copy_text)
+        } else {
+            Err("Wait for filtered log lines before copying")
+        };
+        let notice = match result {
+            Ok(text) => hex_ui::write_clipboard(output, text)
+                .map_or_else(|error| error.to_string(), |_| "Log row sent to terminal clipboard (OSC 52)".into()),
+            Err(error) => error.into(),
+        };
+        view.set_notice(notice);
     }
     fn edit(&mut self, field: usize) -> &mut String {
         match field {
@@ -376,20 +468,30 @@ impl Host {
             && (self.open || self.mode == Mode::Preview)
     }
     pub fn paste(&mut self, text: &str) {
-        if let Some(field) = self.field {
-            let value = self.edit(field);
-            if !text.chars().any(char::is_control) && value.len() + text.len() <= 256 {
-                value.push_str(text);
-            }
-        }
+        self.edit_input(kwil_view_model::log_view::FieldInput::Text(text));
     }
     pub fn mouse(&mut self, view: &mut Workspace, event: &event::MouseEvent) -> bool {
+        if self.open
+            && !self.editing()
+            && self.body.contains((event.column, event.row).into())
+            && event.kind == MouseEventKind::Down(event::MouseButton::Left)
+        {
+            self.selected = event.row.saturating_sub(self.body.y) as usize;
+            self.activate(view);
+            return true;
+        }
         let code = match event.kind {
             MouseEventKind::ScrollUp => KeyCode::Up,
             MouseEventKind::ScrollDown => KeyCode::Down,
             _ => return true,
         };
-        if self.mode == Mode::Split {
+        if self.open {
+            self.following = false;
+            self.top = if code == KeyCode::Up { self.top.saturating_sub(1) } else { self.top.saturating_add(1) };
+            if let Some(page) = &self.page {
+                self.top = self.top.min(page.total.saturating_sub(self.visible.max(1) as u64));
+            }
+        } else if self.mode == Mode::Split {
             self.markdown_top = if code == KeyCode::Up {
                 self.markdown_top.saturating_sub(1)
             } else {
@@ -404,13 +506,10 @@ impl Host {
         self.field.is_some()
     }
     pub fn mark_line(&self, view: &Workspace) -> Option<u64> {
-        if !self.submitted.is_some_and(|(key, _, _)| Some(key) == source(view)) {
+        if !self.page_current(view) {
             return None;
         }
-        if !self.open {
-            return None;
-        }
-        self.page.as_ref()?.rows.first().map(|row| row.line + 1)
+        self.page.as_ref()?.rows.get(self.selected).map(|row| row.line + 1)
     }
     pub fn close(&mut self) {
         self.mode = Mode::Text;
@@ -431,9 +530,11 @@ impl Host {
     pub fn close_logs(&mut self) {
         self.open = false;
         self.field = None;
+        (self.query, self.from, self.to) = self.applied_fields.clone();
         self.following = false;
     }
     pub fn sync(&mut self, view: &mut Workspace, rows: usize) {
+        self.visible = rows.clamp(1, kwil_view_model::log_session::VIEWPORT_ROWS);
         if view.hex_active() || view.compare.open {
             self.mode = Mode::Text;
             self.close_logs();
@@ -514,6 +615,7 @@ impl Host {
                 Err(e) => self.error = e.to_string(),
             }
         }
+        let draft = self.draft();
         let Some(session) = &mut self.logs else {
             return;
         };
@@ -528,6 +630,7 @@ impl Host {
                         if self.following && page.exact {
                             self.top = page.total.saturating_sub(rows.max(1) as u64);
                         }
+                        self.selected = self.selected.min(page.rows.len().saturating_sub(1));
                         self.page = Some(page);
                         self.error.clear();
                     }
@@ -545,8 +648,12 @@ impl Host {
             }
             self.retry = Some((key, snapshot));
         }
-        if !self.open {
+        if !self.open || draft {
             session.cancel_viewport();
+            // A cancelled request may never publish a page. Restoring the last
+            // applied fields must issue a fresh request even for the same key.
+            self.submitted = None;
+            self.page = None;
             return;
         }
         let Some(key) = current else {
@@ -607,6 +714,7 @@ impl Host {
             return;
         }
         frame.render_widget(Paragraph::new("").style(theme_ui::base()), area);
+        self.body = Rect { y: area.y.saturating_add(1), height: area.height.saturating_sub(1), ..area };
         let levels = Level::ALL
             .iter()
             .enumerate()
@@ -616,29 +724,42 @@ impl Host {
             .collect::<Vec<_>>()
             .join(" ");
         let label = if let Some(field) = self.field {
-            format!("{}: {} | Tab: next Enter: apply Esc: cancel", ["Filter", "From", "To"][field], self.edit(field))
+            let caption = ["Filter", "From", "To"][field];
+            let cursor = self.field_cursor;
+            let hint = if area.width >= 60 { " | Tab:next Enter:apply Esc:cancel" } else { "" };
+            let window = kwil_view_model::palette_session::text_window(
+                self.edit(field),
+                cursor,
+                area.width.saturating_sub((caption.len() + hint.len() + 2) as u16) as usize,
+            );
+            if area.width > caption.len() as u16 + 2 && area.height > 0 {
+                frame.set_cursor_position((area.x + caption.len() as u16 + 2 + window.cursor as u16, area.y));
+            }
+            format!("{caption}: {}{hint}", window.text)
         } else {
             format!(
-                "{}{} rows | {} | f:filter t:time r:regex={} | {} | Esc:text",
+                "{} | {}{} rows | {} | r:regex={} u:unknown={} | f:filter t:time a:all c:clear Enter:source Ctrl+C:copy Esc:text",
+                if self.following { "Following" } else { "Paused" },
                 self.page.as_ref().map_or(0, |page| page.total),
                 if self.page.as_ref().is_some_and(|page| page.exact) { "" } else { "+" },
                 levels,
                 self.regex,
-                if self.following { "Following" } else { "Paused" }
+                self.filter.keep_unknown
             )
         };
         frame.render_widget(Paragraph::new(label).style(theme_ui::base()), Rect { height: 1, ..area });
         let body = Rect { y: area.y.saturating_add(1), height: area.height.saturating_sub(1), ..area };
         if !self.error.is_empty() {
             frame.render_widget(Paragraph::new(self.error.clone()), body);
-        } else if self.submitted.is_some_and(|(key, filter, _)| Some(key) == source(view) && filter == self.filter)
+        } else if self.page_current(view)
             && let Some(page) = &self.page
         {
             let lines = page
                 .rows
                 .iter()
                 .take(body.height as usize)
-                .map(|row| {
+                .enumerate()
+                .map(|(index, row)| {
                     let mut spans = vec![Span::raw(format!(
                         "{:>7}{} ",
                         row.line + 1,
@@ -661,7 +782,21 @@ impl Host {
                             }),
                         ));
                     }
-                    Line::from(spans)
+                    if index == self.selected {
+                        let background = theme_ui::color(kwil_core_commands::theme::UiRole::Selection, Color::DarkGray);
+                        for span in &mut spans {
+                            span.style = span.style.bg(background);
+                        }
+                    }
+                    let line = Line::from(spans);
+                    if index == self.selected {
+                        line.style(
+                            Style::default()
+                                .bg(theme_ui::color(kwil_core_commands::theme::UiRole::Selection, Color::DarkGray)),
+                        )
+                    } else {
+                        line
+                    }
                 })
                 .collect::<Vec<_>>();
             frame.render_widget(Paragraph::new(lines).style(theme_ui::base()), body);
@@ -832,6 +967,10 @@ pub(super) fn chrome_key(
 ) -> KeyResult {
     if let Some(chord) = chord(key) {
         match keys.feed_with_selection(chord) {
+            VimResult::Command(call) if call.id.starts_with("edit.") || call.id.starts_with("motion.") => {
+                view.set_notice("Content view is read-only; open the original row to edit".into());
+                return KeyResult::Changed(true);
+            }
             VimResult::Command(call) => return invoke(view, call, false, at, preset),
             VimResult::Error(error) => {
                 view.set_notice(error);
@@ -940,8 +1079,7 @@ mod tests {
         assert_eq!(host.page.as_ref().unwrap().rows.iter().map(|r| r.line).collect::<Vec<_>>(), [0, 2]);
         host.query = "beta|alpha".into();
         host.command(&mut view, "log.toggleRegex");
-        host.level = Level::ALL.iter().position(|l| *l == Level::Info).unwrap();
-        host.command(&mut view, "log.toggleLevel");
+        host.key(&mut view, KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
         host.command(&mut view, "log.goToTime");
         host.from = "2026-11-02T10:30:00Z".into();
         host.to = "2026-11-02T11:30:00Z".into();
@@ -954,6 +1092,131 @@ mod tests {
         assert_eq!(view.status_position().unwrap().0, 1);
         host.command(&mut view, "log.clearFilter");
         assert_eq!(host.filter, Filter::default());
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_level_command_defaults_to_error_and_unknown_is_independent() {
+        let (_file, mut view) = Fixture::view("log", "ERROR failed\nplain row\n");
+        let (mut host, _) = host();
+        host.command(&mut view, "log.toggleLevel");
+        assert_eq!(host.filter.levels & Level::Error.bit(), 0);
+        assert_ne!(host.filter.levels & Level::Trace.bit(), 0);
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)));
+        assert!(!host.filter.keep_unknown);
+        host.command(&mut view, "log.goToTime");
+        host.from = "2026-11-02T10:00:00Z".into();
+        host.apply();
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)));
+        assert!(host.filter.keep_unknown);
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert_eq!(host.filter.levels, Filter::default().levels);
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
+        assert_eq!(host.filter, Filter::default());
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_selected_result_is_marked_and_enter_opens_that_source_row() {
+        let (_file, mut view) = Fixture::view("log", "INFO first\nERROR second\nWARN third\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.clearFilter");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        host.key(&mut view, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(host.mark_line(&view), Some(2));
+        assert!(host.page.is_some(), "moving within the page must not submit another viewport");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|f| host.draw(f, &view, f.area())).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 2)].bg,
+            theme_ui::color(kwil_core_commands::theme::UiRole::Selection, Color::DarkGray)
+        );
+        let mut copied = Vec::new();
+        host.copy_selected(&mut view, &mut copied);
+        assert_eq!(copied, b"\x1b]52;c;RVJST1Igc2Vjb25k\x07");
+        host.key(&mut view, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!host.open);
+        assert_eq!(view.status_position().unwrap().0, 1);
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_mouse_opens_clicked_result_and_copy_is_owned_by_projection() {
+        let (_file, mut view) = Fixture::view("log", "INFO first\nERROR second\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.clearFilter");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|f| host.draw(f, &view, f.area())).unwrap();
+        host.mouse(
+            &mut view,
+            &event::MouseEvent {
+                kind: MouseEventKind::Down(event::MouseButton::Left),
+                column: 15,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(!host.open);
+        assert_eq!(view.status_position().unwrap().0, 1);
+        host.command(&mut view, "log.clearFilter");
+        // No completed current page: copying must be consumed, never fall through to hidden editor selection.
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(view.notice().contains("Wait"));
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_draft_hides_results_and_escape_restores_applied_query() {
+        let (_file, mut view) = Fixture::view("log", "ERROR original\nINFO other\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.filter");
+        host.paste("original");
+        host.apply();
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        host.key(&mut view, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        host.paste(" draft");
+        host.sync(&mut view, 12);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|f| host.draw(f, &view, f.area())).unwrap();
+        let screen = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(!screen.contains("ERROR original"), "unapplied fields must not expose actionable old rows");
+        assert_eq!(host.mark_line(&view), None);
+        host.key(&mut view, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(host.query, "original");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        assert_eq!(host.mark_line(&view), Some(1));
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_fields_support_caret_replacement_and_unicode_deletion() {
+        let (_file, mut view) = Fixture::view("log", "INFO original\n");
+        let (mut host, _) = host();
+        host.command(&mut view, "log.filter");
+        host.paste("ae\u{301}z");
+        for code in [KeyCode::Left, KeyCode::Backspace] {
+            host.key(&mut view, KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert_eq!(host.query, "az", "delete one grapheme at the caret, not the final scalar");
+        host.key(&mut view, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        host.paste("replacement");
+        assert_eq!(host.query, "replacement");
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_copy_rejects_partial_invalid_and_nul_rows_without_falling_through() {
+        let (_file, mut view) = Fixture::view("log", "ERROR original\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.clearFilter");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        for (bytes, prefix, expected) in
+            [(b"tail".as_slice(), 1, "byte window"), (b"\xff", 0, "UTF-8"), (b"a\0b", 0, "NUL")]
+        {
+            let row = &mut host.page.as_mut().unwrap().rows[0];
+            row.bytes = bytes.to_vec();
+            row.offset = prefix;
+            row.line_start = 0;
+            row.line_end = prefix + bytes.len() as u64;
+            assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+            assert!(view.notice().contains(expected), "{}", view.notice());
+        }
+        assert!(!view.editor().unwrap().document().is_dirty());
         stop(&mut host);
     }
     #[test]

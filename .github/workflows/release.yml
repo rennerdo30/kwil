@@ -25,6 +25,17 @@ jobs:
   candidate-ci:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+      - name: Release notes name the tagged version
+        # Only prereleases use docs/BETA_RELEASE_NOTES.md; stable tags use generated notes.
+        if: contains(github.ref_name, '-')
+        run: |
+          expected="# Kwil ${GITHUB_REF_NAME#v}"
+          heading=$(head -n 1 docs/BETA_RELEASE_NOTES.md | tr -d '\r')
+          if [ "$heading" != "$expected" ]; then
+            echo "docs/BETA_RELEASE_NOTES.md must start with '$expected' before release artifacts are built." >&2
+            exit 1
+          fi
       - name: Require successful CI for the exact tagged commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -187,6 +198,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -198,6 +211,10 @@ jobs:
         run: |
           rm -f rust.txt
           sha256sum kwil-* THIRD-PARTY-NOTICES.txt > SHA256SUMS && cat SHA256SUMS
+      - name: Attest every release asset
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: dist/*
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}

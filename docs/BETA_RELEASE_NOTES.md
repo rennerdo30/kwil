@@ -201,8 +201,9 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
   editing workloads have not received bounded-memory acceptance.
 - Complete regex/long-line search and folder
   replacement remain incomplete.
-- Some GUI/TUI feature parity remains incomplete: Markdown preview and parts of
-  the log view are window-only.
+- The TUI supports text-only Markdown preview and log follow, text/regex,
+  level/time/unknown filters, highlight rules, marks and result navigation.
+  Log row copy uses OSC 52 and requires terminal clipboard support.
 - Log follow extends plain UTF-8/ASCII indexes after the initial follow refresh,
   using file identity and first/last 64 KiB prefix samples. Compressed,
   BOM-prefixed and legacy-encoded logs still reopen and re-index on changes.
