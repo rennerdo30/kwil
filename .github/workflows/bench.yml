@@ -6,6 +6,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      compare_only:
+        description: Run only the isolated large-file compare measurement
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,9 +24,57 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  compare:
+    # Performance numbers start informational; correctness/measurement errors fail.
+    # Runs up to ~20 minutes per OS, so only on request (dispatch or a `bench`-labelled PR), not on every push to main.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'bench'))
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target-compare
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/bench/compare -> ../../../target-compare
+          key: bench-compare
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check the isolated compare measurement
+        shell: bash
+        run: |
+          cargo fmt --manifest-path crates/bench/compare/Cargo.toml --check
+          cargo clippy --manifest-path crates/bench/compare/Cargo.toml --all-targets --locked -j 4 -- -D warnings
+          cargo test -p kwil-core-text --locked -j 4 compare_input::tests
+          cargo test -p kwil-core-diff --locked -j 4 --lib stream::tests
+          cargo build --manifest-path crates/bench/compare/Cargo.toml --release --locked -j 4
+      - name: Python environment
+        run: python -m venv .compare-venv
+      - name: Small fixture smoke
+        shell: bash
+        run: |
+          py=.compare-venv/bin/python
+          [ ! -f .compare-venv/Scripts/python.exe ] || py=.compare-venv/Scripts/python.exe
+          "$py" crates/bench/compare/run.py --binary target-compare/release/kwil-compare-bench --sizes-mib 1 --timeout 30 --require-complete --output results/compare-smoke
+      - name: Compare scattered differences in 1 GiB and 2 GiB files
+        shell: bash
+        run: |
+          py=.compare-venv/bin/python
+          [ ! -f .compare-venv/Scripts/python.exe ] || py=.compare-venv/Scripts/python.exe
+          "$py" crates/bench/compare/run.py --binary target-compare/release/kwil-compare-bench --output results/compare
+      - name: Retain compare results and progress even on failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compare-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          path: results/
+          if-no-files-found: error
   startup:
     # Measurements only: neither timing misses nor an unavailable desktop gate a PR.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    if: inputs.compare_only != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench'))
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -76,7 +129,7 @@ jobs:
   renderer:
     # The requested KW-11 measurement uses the existing finite frame harness.
     # Startup is informational on hosted hardware; drawing invariants assert.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    if: inputs.compare_only != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench'))
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
@@ -122,7 +175,7 @@ jobs:
 
   budgets:
     # Optional performance check: never add this job to required branch checks.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    if: inputs.compare_only != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench'))
     strategy:
       fail-fast: false
       matrix:
