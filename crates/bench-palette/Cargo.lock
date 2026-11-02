@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-commands"
-version = "0.1.0-beta.6"
+version = "0.1.0-beta.7"
 dependencies = [
  "fuzzy-matcher",
  "kwil-core-workspace",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-text"
-version = "0.1.0-beta.6"
+version = "0.1.0-beta.7"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-workspace"
-version = "0.1.0-beta.6"
+version = "0.1.0-beta.7"
 dependencies = [
  "bzip2",
  "flate2",

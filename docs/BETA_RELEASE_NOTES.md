@@ -1,9 +1,9 @@
-# Kwil 0.1.0-beta.6
+# Kwil 0.1.0-beta.7
 
 Draft notes for the next candidate. Artifacts and packaged native gates are not yet qualified.
 
 An early beta for evaluation and feedback. This is not an RC or a claim that the
-full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.6/docs/SPEC.md)
+full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.7/docs/SPEC.md)
 is complete. Test with copies of important files.
 
 ## Downloads and installation
@@ -30,7 +30,35 @@ without independent signature verification. beta.2 copies update to
 this release by themselves; frozen beta.1 copies must be replaced manually. Stable download installers do not
 select betas.
 
-## Changes since beta.5
+## Changes since beta.6
+
+- **Hot exit and session restore:** quit with unsaved changes or untitled tabs
+  and they come back on the next start, with undo where the recovery journal
+  reaches; open tabs and their order are restored.
+- **Single instance:** opening a file while Kwil runs adds a tab to the running
+  window. `--new-window` opens a separate window without a saved session; it
+  asks Save / Don't Save / Cancel before discarding unsaved changes.
+- **Compressed files:** gzip, zstd, bzip2 and xz files (detected by content)
+  open as text, decompressed to disk rather than into memory, and save back in
+  the same compression. "Save uncompressed as…" exports a plain copy; the status
+  bar shows the format.
+- **Hex editor:** edit bytes in the hex or text column, go to offset, find a
+  byte sequence, copy as hex, undo/redo and save, in GUI and TUI. Editing a
+  freshly opened file in hex mode works.
+- **Screen readers:** the GUI exposes menus, tabs, palette, prompts, settings,
+  status bar and the visible editor text with caret and selection (AccessKit).
+- **TUI:** Markdown Text/Preview/Split and the log-file commands (follow,
+  filters, levels, marks, time range, highlight rules) now work in the terminal.
+- **UI polish:** button labels no longer clip g/y/p; "1 file"/"1 match"
+  singulars; long folder paths are shortened with "…"; the compare view's
+  collapsed row aligns with the text.
+- YAML formatting keeps the existing formatter (`pretty_yaml` changed values in
+  tests; see docs/FORMATTERS.md).
+- CI: lint runs in parallel jobs; build time and size are tracked on main and
+  weekly; the benchmark workflow works again and times the palette over
+  100,000 files (informational).
+
+## Changes in beta.6
 
 - **Replace in files:** enter a replacement in Find in Files, preview the
   affected files with match counts, untick files, then apply. Open files change
@@ -132,7 +160,7 @@ implemented" any more (a contract test for GUI and TUI enforces it).
 
 This list identifies areas to evaluate, not blanket platform or performance
 acceptance. Exact candidate checks and remaining release gates are recorded in
-[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.6/docs/BETA.md).
+[BETA.md](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.7/docs/BETA.md).
 
 ## Known limitations
 
