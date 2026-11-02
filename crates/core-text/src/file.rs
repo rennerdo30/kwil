@@ -742,6 +742,29 @@ mod tests {
     }
 
     #[test]
+    fn kw41_append_counts_only_new_index_work() {
+        let dir = TempDir::new();
+        let path = dir.file(&b"INFO row\n".repeat(8192));
+        let file = TextFile::open_saved_version(&path).unwrap();
+        file.build_index(1).unwrap();
+        let added = b"ERROR appended\n";
+        File::options().append(true).open(&path).unwrap().write_all(added).unwrap();
+        let grown = file.reopen_grown().unwrap();
+        assert_eq!(grown.progress().scanned, 2 * added.len() as u64 + 2);
+        assert_eq!(grown.index().unwrap().line_count(), 8194);
+    }
+
+    #[test]
+    fn kw41_truncate_regrow_rejects_old_prefix() {
+        let dir = TempDir::new();
+        let path = dir.file(b"one\ntwo\n");
+        let file = TextFile::open_saved_version(&path).unwrap();
+        file.build_index(1).unwrap();
+        std::fs::write(&path, b"a longer replacement without breaks").unwrap();
+        assert!(file.reopen_grown().is_err(), "growth must verify the old indexed bytes");
+    }
+
+    #[test]
     fn reopen_grown_carries_index() {
         let dir = TempDir::new();
         let path = dir.file(b"first\npartial");

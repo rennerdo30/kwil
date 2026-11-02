@@ -1728,6 +1728,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kw41_regex_matches_inside_two_mib_line() {
+        let mut bytes = vec![b'x'; (2 << 20) + 31];
+        bytes.extend_from_slice(b"needle42 tail\n");
+        let source = snapshot(&bytes);
+        let filter = Filter { text: TextQuery::new("needle[0-9]+", true).unwrap(), ..Filter::default() };
+        let request = request(source, filter, 0);
+        let mut index = ProjectionIndex::new(&request, 1 << 20).unwrap();
+        let page = index.query(viewport(0, 0), &|| false, |_| {}).unwrap().unwrap();
+        assert!(page.exact);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].line, 0);
+        assert_eq!(page.rows[0].line_end, bytes.len() as u64 - 1);
+    }
+
+    #[test]
     fn text_projection_filters_original_lines_and_rejects_bad_regex() {
         let source = snapshot(b"INFO a.b\rERROR axb\r\nWARN a.b\n");
         for (text, regex, expected) in [

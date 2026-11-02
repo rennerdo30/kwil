@@ -3623,6 +3623,88 @@ mod tests {
     use crate::CommandArgs;
 
     #[test]
+    fn kw41_follow_append_indexes_only_appended_bytes() {
+        kw41_follow_change("append");
+    }
+
+    #[test]
+    fn kw41_follow_truncation_rebuilds_index() {
+        kw41_follow_change("truncate");
+    }
+
+    #[test]
+    fn kw41_follow_rotation_rebuilds_index_even_with_same_prefix() {
+        kw41_follow_change("rotate");
+    }
+
+    fn kw41_follow_change(change: &str) {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        };
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(format!(
+            "kw41-follow-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("app.log");
+        let initial = b"INFO row\n".repeat(8192);
+        std::fs::write(&path, &initial).unwrap();
+        let file = kwil_core_text::TextFile::open_saved_version(&path).unwrap();
+        file.build_index(1).unwrap();
+        let mut workspace = Workspace::new(View::new(Some((path.clone(), file)))).unwrap();
+        let expected =
+            if change == "truncate" { b"WARN cut\n".to_vec() } else { [initial.as_slice(), b"ERROR new\n"].concat() };
+        if change == "rotate" {
+            std::fs::rename(&path, root.join("rotated.log")).unwrap();
+        }
+        std::fs::write(&path, &expected).unwrap();
+        workspace.reload_log().unwrap();
+        let request = workspace.files.queue.pop_back().unwrap();
+        let DocumentRequest::OpenChecked { file, .. } = &request else { panic!("checked follow reopen") };
+        assert!(file.is_some(), "follow must carry the old indexed generation to the worker");
+        let (tx, rx) = mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = tx.send(result);
+        })
+        .unwrap();
+        worker.try_submit(DocumentRequest::Prepare { root: Some(root.clone()) }).unwrap();
+        loop {
+            if let DocumentResult::Prepared(result) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                drop(result.unwrap());
+                break;
+            }
+        }
+        worker.try_submit(request).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let document = loop {
+            let result = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            if let DocumentResult::CheckedOpened { result, .. } = result {
+                break result.unwrap().unwrap();
+            }
+        };
+        let mut actual = Vec::new();
+        document.snapshot().write_to(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        let original = document.original.as_ref().unwrap();
+        let expected_work = if change == "append" { 22 } else { expected.len() as u64 };
+        assert_eq!(original.progress().scanned, expected_work, "index work after {change}");
+        assert_eq!(document.snapshot().line_count(), if change == "truncate" { 2 } else { 8194 });
+        drop(document);
+        drop(worker);
+        loop {
+            if let DocumentResult::Stopped(result) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                result.unwrap();
+                break;
+            }
+        }
+        drop(workspace);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn log_reload_reopens_current_path_and_preserves_dirty_edits() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
