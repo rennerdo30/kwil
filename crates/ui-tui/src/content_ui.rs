@@ -957,6 +957,112 @@ mod tests {
         stop(&mut host);
     }
     #[test]
+    fn log_parity_level_command_defaults_to_error_and_unknown_is_independent() {
+        let (_file, mut view) = Fixture::view("log", "ERROR failed\nplain row\n");
+        let (mut host, _) = host();
+        host.command(&mut view, "log.toggleLevel");
+        assert_eq!(host.filter.levels & Level::Error.bit(), 0);
+        assert_ne!(host.filter.levels & Level::Trace.bit(), 0);
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)));
+        assert!(!host.filter.keep_unknown);
+        host.command(&mut view, "log.goToTime");
+        host.from = "2026-11-02T10:00:00Z".into();
+        host.apply();
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)));
+        assert!(host.filter.keep_unknown);
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert_eq!(host.filter.levels, Filter::default().levels);
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
+        assert_eq!(host.filter, Filter::default());
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_selected_result_is_marked_and_enter_opens_that_source_row() {
+        let (_file, mut view) = Fixture::view("log", "INFO first\nERROR second\nWARN third\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.clearFilter");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        host.key(&mut view, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(host.mark_line(&view), Some(2));
+        assert!(host.page.is_some(), "moving within the page must not submit another viewport");
+        host.key(&mut view, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!host.open);
+        assert_eq!(view.status_position().unwrap().0, 1);
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_mouse_opens_clicked_result_and_copy_is_owned_by_projection() {
+        let (_file, mut view) = Fixture::view("log", "INFO first\nERROR second\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.clearFilter");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|f| host.draw(f, &view, f.area())).unwrap();
+        host.mouse(&mut view, &event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left), column: 15, row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!host.open);
+        assert_eq!(view.status_position().unwrap().0, 1);
+        host.command(&mut view, "log.clearFilter");
+        // No completed current page: copying must be consumed, never fall through to hidden editor selection.
+        assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(view.notice().contains("Wait"));
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_draft_hides_results_and_escape_restores_applied_query() {
+        let (_file, mut view) = Fixture::view("log", "ERROR original\nINFO other\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.filter");
+        host.paste("original");
+        host.apply();
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        host.key(&mut view, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        host.paste(" draft");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|f| host.draw(f, &view, f.area())).unwrap();
+        let screen = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(!screen.contains("ERROR original"), "unapplied fields must not expose actionable old rows");
+        assert_eq!(host.mark_line(&view), None);
+        host.key(&mut view, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(host.query, "original");
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_fields_support_caret_replacement_and_unicode_deletion() {
+        let (_file, mut view) = Fixture::view("log", "INFO original\n");
+        let (mut host, _) = host();
+        host.command(&mut view, "log.filter");
+        host.paste("ae\u{301}z");
+        for code in [KeyCode::Left, KeyCode::Backspace] {
+            host.key(&mut view, KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert_eq!(host.query, "az", "delete one grapheme at the caret, not the final scalar");
+        host.key(&mut view, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        host.paste("replacement");
+        assert_eq!(host.query, "replacement");
+        stop(&mut host);
+    }
+    #[test]
+    fn log_parity_copy_rejects_partial_invalid_and_nul_rows_without_falling_through() {
+        let (_file, mut view) = Fixture::view("log", "ERROR original\n");
+        let (mut host, rx) = host();
+        host.command(&mut view, "log.clearFilter");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        for (bytes, prefix, expected) in [(b"tail".as_slice(), 1, "byte window"), (b"\xff", 0, "UTF-8"), (b"a\0b", 0, "NUL")] {
+            let row = &mut host.page.as_mut().unwrap().rows[0];
+            row.bytes = bytes.to_vec();
+            row.offset = prefix;
+            row.line_start = 0;
+            row.line_end = prefix + bytes.len() as u64;
+            assert!(host.key(&mut view, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+            assert!(view.notice().contains(expected), "{}", view.notice());
+        }
+        assert!(!view.editor().unwrap().document().is_dirty());
+        stop(&mut host);
+    }
+    #[test]
     fn invalid_ranges_preserve_the_filter_and_log_input_is_bounded() {
         let (_file, mut view) = Fixture::view("log", "INFO original\n");
         let (mut host, _) = host();
