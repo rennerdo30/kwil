@@ -427,7 +427,11 @@ mod tests {
     use std::{
         collections::VecDeque,
         path::PathBuf,
-        sync::mpsc,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         time::{Duration, Instant},
     };
 
@@ -439,18 +443,35 @@ mod tests {
         document: crate::DocumentLane,
         root: PathBuf,
         trail: VecDeque<String>,
+        worker_gate: Arc<AtomicBool>,
+        wake_held: Arc<AtomicBool>,
+        worker_release: mpsc::SyncSender<()>,
     }
     impl Host {
         fn new() -> Self {
             let root = crate::test_support::directory("kwil-tui-hex-host").unwrap();
             let (tx, receiver) = mpsc::channel();
+            let worker_gate = Arc::new(AtomicBool::new(false));
+            let wake_held = Arc::new(AtomicBool::new(false));
+            let producer_gate = worker_gate.clone();
+            let producer_held = wake_held.clone();
+            let (worker_release, gate_rx) = mpsc::sync_channel(1);
+            let gate_rx = Mutex::new(gate_rx);
             let budget = crate::AllocationBudget::default();
             let mut document = crate::DocumentLane::new(&budget).unwrap();
             let mut workspace = Workspace::new(kwil_view_model::View::new(None)).unwrap();
             workspace.set_rows(3);
             document
                 .started(workspace.start_bounded_document_worker_at(Some(root.join("recovery")), &budget, move || {
-                    tx.send(Msg::DocumentReady).map_err(|_| std::io::Error::other("hex fixture wake closed"))
+                    let held = producer_gate.load(Ordering::Acquire);
+                    if held {
+                        producer_held.store(true, Ordering::Release);
+                    }
+                    tx.send(Msg::DocumentReady).map_err(|_| std::io::Error::other("hex fixture wake closed"))?;
+                    if held {
+                        gate_rx.lock().unwrap().recv_timeout(Duration::from_secs(10)).map_err(std::io::Error::other)?;
+                    }
+                    Ok(())
                 }))
                 .unwrap();
             let bindings = [
@@ -475,6 +496,9 @@ mod tests {
                 document,
                 root,
                 trail: VecDeque::new(),
+                worker_gate,
+                wake_held,
+                worker_release,
             };
             host.until("initial recovery ready", |h| h.workspace.recovery_ready());
             host
@@ -528,6 +552,9 @@ mod tests {
             self.record(format!("stage {stage}: {}", self.state()));
             let deadline = Instant::now() + Duration::from_secs(10);
             while !ready(self) {
+                if self.wake_held.swap(false, Ordering::AcqRel) {
+                    self.worker_release.try_send(()).unwrap();
+                }
                 let message = self.receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .unwrap_or_else(|error| panic!("bounded real hex document worker wake at stage '{stage}': {error:?}\nstate: {}\ntrail:\n{}",
                         self.state(), self.trail.iter().cloned().collect::<Vec<_>>().join("\n")));
@@ -616,6 +643,9 @@ mod tests {
             terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
         }
         fn finish(self) {
+            if self.wake_held.swap(false, Ordering::AcqRel) {
+                self.worker_release.try_send(()).unwrap();
+            }
             let root = self.root.clone();
             let deadline = Instant::now() + Duration::from_secs(35);
             std::thread::spawn(move || {
@@ -660,13 +690,19 @@ mod tests {
         for c in "42 00".chars() {
             host.press(KeyCode::Char(c), KeyModifiers::NONE);
         }
+        // CI negative control: hold the producer after its real completion wake.
+        // Restore the old busy-only wait to expose Copy before slot retirement.
+        host.worker_gate.store(true, Ordering::Release);
         host.press(KeyCode::Enter, KeyModifiers::NONE);
         // Returning the editor does not retire the bounded result slot. A
         // following query can still be refused until its capacity wake arrives.
-        host.idle("byte find and result retirement");
+        host.until("byte find before result retirement (negative control)", |h| {
+            !h.workspace.document_busy(h.workspace.active_id())
+        });
         assert_eq!(host.workspace.hex_session().unwrap().view().selection(), 4..6);
         host.named("edit.copy");
         host.idle("hex copy and result retirement");
+        eprintln!("negative-control copy state: {}; trail: {:?}", host.state(), host.trail);
         assert_eq!(host.workspace.hex_session_mut().unwrap().take_copy().unwrap(), "42 00");
         assert_eq!(base64(b"42 00"), "NDIgMDA=");
         host.named("file.save");
