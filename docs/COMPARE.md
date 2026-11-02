@@ -45,3 +45,25 @@ path and preserves the core reservation rather than releasing its capacity.
 The all-size host integration does not establish multi-GB performance, the
 100k-line timing gate, remote-desktop damage budgets or other-platform native
 acceptance. Those remain separate hosted/owner checks.
+
+## Live terminal regression
+
+The `TUI compare` workflow launches the actual `kwil --tui --hidden` binary in
+private Unix pseudo-terminals on hosted Linux and macOS. It first proves that
+the navigation assertion rejects a deliberately broken Shift+F7 handler, then
+restores and builds production code. No terminal window or global input is used.
+
+`python3 scripts/test-tui-compare.py target/debug/kwil` checks two files, an edited
+buffer against its saved version, `1 change` / `1 unchanged line` labels, and
+F7/Shift+F7 movement of the logical compare position (the first numbered row in
+the viewport). The underlying editing cursor is not the read-only compare anchor.
+It checks that both source files stay byte-exact and the TUI exits normally.
+
+A 100,000-line fixture (about 5 MiB per file) must display its first complete
+side-by-side view within one second of submitting the compare path. Subsequent
+next/previous navigation must each complete within one second. CI optimizes the
+application crates in the development profile; it does not time compilation or
+app startup. Text screen captures and the original ANSI output are uploaded even
+on failure. Settings, recovery and temporary storage are private to each case.
+This does not establish Windows ConPTY behavior or the separate multi-GB memory
+and diff benchmarks.
