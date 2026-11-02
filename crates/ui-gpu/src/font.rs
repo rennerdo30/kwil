@@ -1,6 +1,6 @@
 //! Monospace ASCII fast path: glyphs are rasterized once, then cached as
 //! ready-to-copy cell tiles per (byte, fg, bg). Non-ASCII shaping and font
-//! fallback are M1 work (KW-11).
+//! fallback stay on the deferred worker (KW-11).
 
 use crate::shaping::{Rasterizer, Tile, TileKey};
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub struct Font {
     pub cw: usize,
     pub ch: usize,
     family: String,
-    glyphs: Vec<(fontdue::Metrics, Vec<u8>)>,
+    glyphs: Vec<UiGlyph>,
     baseline: i32,
     tiles: HashMap<(u8, u32, u32), Vec<u32>>,
     pub px: f32,
@@ -40,7 +40,7 @@ pub struct Font {
 /// Parsed on the font worker while the event loop creates its window. Only
 /// rasterization waits for that window's actual monitor scale.
 struct PreparedFont {
-    face: fontdue::Font,
+    face: UiFace,
     family: String,
 }
 
@@ -52,8 +52,7 @@ impl Font {
     fn prepare_default() -> Option<PreparedFont> {
         let (data, index, family) =
             CANDIDATES.iter().find_map(|(p, i, family)| Some((std::fs::read(p).ok()?, *i, *family)))?;
-        let settings = fontdue::FontSettings { collection_index: index, ..Default::default() };
-        Some(PreparedFont { face: fontdue::Font::from_bytes(data, settings).ok()?, family: family.into() })
+        Some(PreparedFont { face: UiFace::from_data(data, index as usize)?, family: family.into() })
     }
     pub fn startup(size: std::sync::mpsc::Receiver<f32>) -> Option<Font> {
         let prepared = Self::prepare_default()?;
@@ -77,15 +76,20 @@ impl Font {
         db.with_face_data(id, |data, index| Self::from_bytes(data.to_vec(), index, px, family))?
     }
     fn from_bytes(data: Vec<u8>, index: u32, px: f32, family: &str) -> Option<Font> {
-        let settings = fontdue::FontSettings { collection_index: index, ..Default::default() };
-        let font = fontdue::Font::from_bytes(data, settings).ok()?;
-        Self::from_face(font, px, family)
+        Self::from_face(UiFace::from_data(data, index as usize)?, px, family)
     }
-    fn from_face(font: fontdue::Font, px: f32, family: &str) -> Option<Font> {
-        let lm = font.horizontal_line_metrics(px)?;
-        let glyphs: Vec<_> = (32u8..127).map(|c| font.rasterize(c as char, px)).collect();
-        let cw = glyphs[(b'M' - 32) as usize].0.advance_width.round().max(1.0) as usize;
-        let ch = (lm.ascent - lm.descent + lm.line_gap).ceil() as usize + 2;
+    fn from_face(face: UiFace, px: f32, family: &str) -> Option<Font> {
+        // Reuse chrome's on-demand scaler instead of constructing outlines for
+        // every mapped glyph before the first frame. Unicode stays worker-only.
+        let lm = face.font().metrics(&[]).scale(px);
+        if lm.glyph_count == 0 {
+            return None;
+        }
+        let mut ascii = UiFont::at_pixels(face, px)?;
+        let glyphs: Vec<_> = (b' '..=b'~').map(|c| ascii.glyphs.remove(&(c as char)).unwrap()).collect();
+        let cw = glyphs[(b'M' - b' ') as usize].advance.round().max(1.0) as usize;
+        // Swash reports descent as a positive distance below the baseline.
+        let ch = (lm.ascent + lm.descent + lm.leading).ceil() as usize + 2;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Some(Font {
             ligatures: true,
@@ -210,13 +214,15 @@ impl Font {
         let glyphs = &self.glyphs;
         self.tiles.entry((c, fg, bg)).or_insert_with(|| {
             let mut t = vec![bg; cw * ch];
-            let (m, bmp) = &glyphs[(c - 32) as usize];
-            let top = baseline - m.height as i32 - m.ymin;
-            for gy in 0..m.height {
-                for gx in 0..m.width {
-                    let (x, y) = (m.xmin + gx as i32, top + gy as i32);
+            let glyph = &glyphs[(c - 32) as usize];
+            let top = baseline - glyph.top;
+            for gy in 0..glyph.height {
+                for gx in 0..glyph.width {
+                    let (x, y) = (glyph.left + gx as i32, top + gy as i32);
                     if x >= 0 && y >= 0 && (x as usize) < cw && (y as usize) < ch {
-                        t[y as usize * cw + x as usize] = blend(bg, fg, bmp[gy * m.width + gx]);
+                        let pixel = gy * glyph.width + gx;
+                        let alpha = glyph.alpha[if glyph.color { pixel * 4 + 3 } else { pixel }];
+                        t[y as usize * cw + x as usize] = blend(bg, fg, alpha);
                     }
                 }
             }
@@ -401,8 +407,13 @@ impl UiFont {
         Some(font)
     }
     fn single_face(face: UiFace, px: f32) -> Option<UiFont> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let px = if px.is_finite() { px.clamp(4.0, 160.0) } else { 14.0 };
+        Self::at_pixels(face, px)
+    }
+    // Editor zoom already supplies bounded physical pixels (up to 256),
+    // independently of chrome's smaller size limit.
+    fn at_pixels(face: UiFace, px: f32) -> Option<UiFont> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let metrics = face.font().metrics(&[]).scale(px);
         let mut font = UiFont {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -919,10 +930,18 @@ mod tests {
             .iter()
             .find_map(|(path, index, family)| Some((std::fs::read(path).ok()?, *index, *family)))
             .expect("a system monospace face");
-        for px in [14.0, 17.5, 21.0, 28.0] {
-            let mut reference =
-                UiFont::single_face(UiFace::from_data(data.clone(), index as usize).unwrap(), px).unwrap();
+        let previous = fontdue::Font::from_bytes(
+            data.clone(),
+            fontdue::FontSettings { collection_index: index, ..Default::default() },
+        )
+        .unwrap();
+        for px in [14.0, 17.5, 21.0, 28.0, 192.0, 256.0] {
+            let reference = UiFont::at_pixels(UiFace::from_data(data.clone(), index as usize).unwrap(), px).unwrap();
             let mut editor = Font::from_bytes(data.clone(), index, px, family).unwrap();
+            let lines = previous.horizontal_line_metrics(px).unwrap();
+            assert_eq!(editor.cw, previous.metrics('M', px).advance_width.round().max(1.0) as usize);
+            assert_eq!(editor.ch, (lines.ascent - lines.descent + lines.line_gap).ceil() as usize + 2);
+            assert_eq!(editor.baseline, lines.ascent.ceil() as i32 + 1);
             for c in b' '..=b'~' {
                 let glyph = &reference.glyphs[&(c as char)];
                 let mut expected = vec![0x182230; editor.cw * editor.ch];
@@ -937,8 +956,6 @@ mod tests {
                     }
                 }
                 assert_eq!(editor.tile(c, 0xddeeff, 0x182230), expected, "ASCII {c} at {px} px");
-                // The reference remains usable after its ASCII cache is primed.
-                assert!(reference.width("Kwil") > 0);
             }
         }
     }
