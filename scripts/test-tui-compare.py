@@ -32,6 +32,7 @@ class Screen:
         self.x = self.y = 0
         self.pending = ""
         self.saved = (0, 0)
+        self.completed = None
 
     def feed(self, text):
         self.pending += text
@@ -72,6 +73,10 @@ class Screen:
                 self.x = min(self.width - 1, self.x + 1)
 
     def csi(self, params, command):
+        if params == "?25" and command in "hl":
+            # Ratatui updates cursor visibility after writing a frame's cell
+            # diff. Keep assertions/captures off partial PTY read fragments.
+            self.completed = [row.copy() for row in self.rows]
         if params.startswith(("?", ">", "=")) or command in "mnhlqtu":
             return  # styles, terminal modes and device queries do not paint
         values = [int(part or 0) for part in params.split(";")]
@@ -103,10 +108,13 @@ class Screen:
             raise AssertionError(f"unsupported painting sequence: CSI {params}{command}")
 
     def text(self):
-        return "\n".join("".join(row).rstrip() for row in self.rows)
+        return "\n".join("".join(row).rstrip() for row in self.visible_rows())
+
+    def visible_rows(self):
+        return self.completed if self.completed is not None else self.rows
 
     def first_compare_line(self):
-        for row in self.rows:
+        for row in self.visible_rows():
             match = re.match(r"^\s{0,4}(\d+) ", "".join(row))
             if match:
                 return int(match[1])
@@ -233,7 +241,16 @@ def compare_ready(screen, count, left, right):
     text = screen.text()
     return (re.search(rf"\b{count} changes?\b", text) is not None
             and any(left in "".join(row[:screen.width // 2])
-                    and right in "".join(row[screen.width // 2:]) for row in screen.rows))
+                    and right in "".join(row[screen.width // 2:]) for row in screen.visible_rows()))
+
+
+def assert_compare_row(screen, line, left, right):
+    expected = (f"{line:>5} {left}", f"{line:>5} {right}")
+    for row in screen.visible_rows():
+        halves = tuple("".join(part).rstrip() for part in (row[:screen.width // 2], row[screen.width // 2:]))
+        if halves == expected:
+            return
+    raise AssertionError(f"compare row {line} must have exact text in both panes: {expected}\n{screen.text()}")
 
 
 def run_case(exe, output, name, large=False):
@@ -260,7 +277,10 @@ def run_case(exe, output, name, large=False):
         tui = Tui(exe, root, left, output, name)
         finished = False
         try:
-            tui.wait(lambda s: lines[0] in s.text(), "editor-ready")
+            # The raw first-content preview precedes recovery/workspace
+            # admission. Wait for real workspace chrome before sending input;
+            # timing starts later, when the compare path is submitted.
+            tui.wait(lambda s: lines[0] in s.text() and "[1/1]" in s.text(), "editor-ready")
             started = tui.compare_files(right)
             count = 1 if name == "singular-saved" else 2
             tui.wait(lambda s: compare_ready(s, count, lines[0], other[0]), "first-view", timeout=1 if large else 10)
@@ -272,6 +292,7 @@ def run_case(exe, output, name, large=False):
             if name == "singular-saved":
                 assert "1 changes" not in tui.screen.text(), tui.screen.text()
                 tui.wait(lambda s: "1 unchanged line (" in s.text(), "one-unchanged-line")
+                assert_compare_row(tui.screen, 2, "same one", "same one")
                 tui.command("Close Comparison")
                 tui.wait(lambda s: "Buffer |" not in s.text() and "original first" in s.text(), "editor-return")
                 tui.send("buffer ")
@@ -280,6 +301,7 @@ def run_case(exe, output, name, large=False):
                 tui.wait(lambda s: compare_ready(s, 1, "buffer original first", "original first"), "saved-view")
                 assert "1 changes" not in tui.screen.text(), tui.screen.text()
                 tui.wait(lambda s: "1 unchanged line (" in s.text(), "saved-unchanged-line")
+                assert_compare_row(tui.screen, 2, "same one", "same one")
             else:
                 assert tui.screen.first_compare_line() == 1, tui.screen.text()
                 # Logical compare cursor/anchor is the first numbered row of

@@ -46,6 +46,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame, view: &Workspace, layout: kwil_co
     let body = tabs::geometry(view, size.width, size.height, layout).body;
     let area = Rect::new(body.x as u16, body.y as u16, body.width as u16, body.height as u16);
     let base = Style::default().fg(Color::Rgb(214, 228, 240)).bg(Color::Rgb(16, 29, 49));
+    frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Paragraph::new("").style(base), area);
     frame.render_widget(Paragraph::new(view.compare.header()).style(base), Rect { height: 1.min(area.height), ..area });
     let Some(page) = &view.compare.page else { return };
