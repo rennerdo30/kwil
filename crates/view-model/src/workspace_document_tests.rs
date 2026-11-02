@@ -374,7 +374,7 @@ fn settle_shutdown_contract(
     now: Instant,
 ) -> Result<DocumentShutdownStatus, DocumentShutdownReason> {
     let deadline = bundle.deadline().map_or(requested_deadline, |old| old.min(requested_deadline));
-    let result = bundle.settle_until_with(
+    bundle.settle_until_with(
         requested_deadline,
         || now,
         |actual| {
@@ -385,28 +385,7 @@ fn settle_shutdown_contract(
             assert!(remaining <= LIMIT);
             Instant::now() + remaining
         },
-    );
-    if result.is_err() {
-        let workspace = bundle.workspace.as_ref().unwrap();
-        eprintln!(
-            "shutdown contract: result={result:?} phase={:?} status={:?} barrier={:?} receipt={} flush={} preparing={} queue={} persist={}/{}/{} seeded={:?} observed={:?} durable={:?} targets={:?}",
-            bundle.phase,
-            bundle.status(),
-            bundle.barrier,
-            bundle.barrier_receipt.is_some(),
-            bundle.flush_requested,
-            workspace.files.preparing,
-            workspace.files.queue.len(),
-            workspace.files.persist_pending,
-            workspace.files.persist_inflight,
-            workspace.files.metadata_durable,
-            workspace.files.seeded,
-            workspace.files.observed,
-            workspace.files.durable,
-            bundle.durability_targets,
-        );
-    }
-    result
+    )
 }
 
 fn finish_shutdown_contract_fixture(ticket: WorkspaceDocumentSettlementTicket, workspace: &mut Workspace) {
