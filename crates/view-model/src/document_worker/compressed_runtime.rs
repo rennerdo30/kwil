@@ -104,6 +104,49 @@ fn compressed_worker_sample_exact_save_reopen_and_clean_session_restore() {
 }
 
 #[test]
+fn compressed_worker_all_formats_edit_save_reopen_and_recovery_policy() {
+    use kwil_core_workspace::compressed::{CompressionFormat, recompress_format_payload};
+    for format in [CompressionFormat::Gzip, CompressionFormat::Zstd, CompressionFormat::Bzip2, CompressionFormat::Xz] {
+        let root = super::tests::Scratch::new();
+        let path = root.0.join("magic-only.txt");
+        let mut bytes = Vec::new();
+        recompress_format_payload(format, &mut bytes, &AtomicBool::new(false), |writer| {
+            std::io::Write::write_all(writer, b"hello\n")
+        })
+        .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let (worker, rx) = start(&root.0);
+        let document = opened(&worker, &rx, &path).unwrap();
+        assert_eq!(document.compression, format);
+        assert_eq!(logical(&document), b"hello\n");
+        let mut editor = crate::Editor::new(*document);
+        editor
+            .execute("edit.insert", &crate::CommandArgs { text: Some("edit ".into()), ..Default::default() }, 1)
+            .unwrap();
+        let policy = encoding_runtime::document_policy(editor.document());
+        assert_eq!(provenance::journal::RecoveryPolicy::from_codec(&policy.to_codec().unwrap()).unwrap(), policy);
+        let request = editor.save_request(None).unwrap();
+        worker
+            .try_submit(DocumentRequest::Save { document: DocumentId(1), request, plan: editor.document().save_plan() })
+            .unwrap();
+        loop {
+            if let DocumentResult::Saved { result, .. } = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                editor.finish_save_for_test(result).unwrap();
+                break;
+            }
+        }
+        assert_eq!(editor.document().compression, format);
+        drop(editor);
+        let document = opened(&worker, &rx, &path).unwrap();
+        assert_eq!(document.compression, format);
+        assert_eq!(logical(&document), b"edit hello\n");
+        drop(document);
+        drop(worker);
+        super::tests::wait_stopped(&rx);
+    }
+}
+
+#[test]
 fn compressed_worker_rejects_crc_truncation_and_unsupported_without_raw_fallback() {
     let root = super::tests::Scratch::new();
     let (worker, rx) = start(&root.0);

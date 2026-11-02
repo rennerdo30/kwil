@@ -35,6 +35,7 @@ pub(super) fn chrome_command(id: &str) -> bool {
             | "file.openHex"
             | "file.save"
             | "file.saveAs"
+            | "file.saveUncompressedAs"
             | "file.saveAll"
             | "file.close"
             | "file.closeAll"

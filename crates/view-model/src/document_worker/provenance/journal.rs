@@ -35,6 +35,7 @@ use std::{
 const POLICY_MAGIC: &[u8; 4] = b"KWJR";
 const POLICY_VERSION: u8 = 2;
 const RAW_POLICY_VERSION: u8 = 3;
+const CONTAINER_POLICY_VERSION: u8 = 4;
 const MAX_ENCODING_NAME: usize = 40;
 
 /// Explicit document output policy, independent of every embedded origin.
@@ -70,9 +71,18 @@ impl RecoveryPolicy {
             | match self.compression {
                 kwil_core_workspace::compressed::CompressionFormat::Raw => 0,
                 kwil_core_workspace::compressed::CompressionFormat::Gzip => 2,
+                kwil_core_workspace::compressed::CompressionFormat::Zstd => 8,
+                kwil_core_workspace::compressed::CompressionFormat::Bzip2 => 10,
+                kwil_core_workspace::compressed::CompressionFormat::Xz => 12,
             };
         tag.extend_from_slice(&[
-            if self.raw_bytes { RAW_POLICY_VERSION } else { POLICY_VERSION },
+            if self.raw_bytes {
+                RAW_POLICY_VERSION
+            } else if flags & 8 != 0 {
+                CONTAINER_POLICY_VERSION
+            } else {
+                POLICY_VERSION
+            },
             flags,
             ending,
             label.len() as u8,
@@ -84,14 +94,16 @@ impl RecoveryPolicy {
         if tag.len() < 9
             || tag.len() > 8 + MAX_ENCODING_NAME
             || &tag[..4] != POLICY_MAGIC
-            || !matches!(tag[4], 1 | POLICY_VERSION | RAW_POLICY_VERSION)
+            || !matches!(tag[4], 1 | POLICY_VERSION | RAW_POLICY_VERSION | CONTAINER_POLICY_VERSION)
             || tag[5]
                 > match tag[4] {
                     1 => 1,
                     POLICY_VERSION => 3,
-                    _ => 7,
+                    RAW_POLICY_VERSION => 7,
+                    _ => 13,
                 }
             || (tag[4] == RAW_POLICY_VERSION && tag[5] != 4)
+            || (tag[4] == CONTAINER_POLICY_VERSION && !matches!(tag[5] & !1, 8 | 10 | 12))
             || tag[7] as usize != tag.len() - 8
         {
             return Err(invalid("unsupported encoded recovery codec/version"));
@@ -112,7 +124,14 @@ impl RecoveryPolicy {
             encoding,
             bom: tag[5] & 1 != 0,
             preferred_ending,
-            compression: if tag[4] >= POLICY_VERSION && tag[5] & 2 != 0 {
+            compression: if tag[4] == CONTAINER_POLICY_VERSION {
+                match tag[5] & !1 {
+                    8 => kwil_core_workspace::compressed::CompressionFormat::Zstd,
+                    10 => kwil_core_workspace::compressed::CompressionFormat::Bzip2,
+                    12 => kwil_core_workspace::compressed::CompressionFormat::Xz,
+                    _ => return Err(invalid("recovery compression policy")),
+                }
+            } else if tag[4] >= POLICY_VERSION && tag[5] & 2 != 0 {
                 kwil_core_workspace::compressed::CompressionFormat::Gzip
             } else {
                 kwil_core_workspace::compressed::CompressionFormat::Raw

@@ -20,6 +20,7 @@ commands! {
         "file.new" => "New File", "file.open" => "Open File",
         "file.openFolder" => "Open Folder", "file.save" => "Save",
         "file.saveAs" => "Save As", "file.saveAll" => "Save All",
+        "file.saveUncompressedAs" => "Save uncompressed as…",
         "file.close" => "Close File", "file.closeAll" => "Close All Files",
         "file.reopenClosed" => "Reopen Closed Tab", "file.recent" => "Open Recent File",
         "file.reload" => "Reload from Disk", "file.keepChanges" => "Keep Local Changes",

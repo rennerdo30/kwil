@@ -130,7 +130,8 @@ pub(super) fn draw(
     } else {
         prompt.kind.choices().iter().map(Path::new).collect()
     };
-    let native_dialog = native_dialog && matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::SaveAs);
+    let native_dialog = native_dialog
+        && matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs);
     draw_card(prompt.kind, prompt.generation, &recent, text, pixels, size, font, theme, m, native_dialog, view)
 }
 
@@ -274,7 +275,7 @@ fn draw_card(
         // Enter opens the typed row; the button says so once there is one.
         FilePromptKind::Recent => chosen.map(|_| "Open"),
         FilePromptKind::Open => Some("Open"),
-        FilePromptKind::SaveAs => Some("Save"),
+        FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs => Some("Save"),
         FilePromptKind::Folder => Some("Open Folder"),
         _ => chosen.map(|_| "Apply"),
     };
