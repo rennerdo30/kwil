@@ -132,6 +132,7 @@ mod tests {
                 && !status.retry_pending
                 && !status.retry_acknowledgement_required
                 && !a.view.document_busy(a.view.active_id())
+                && !a.view.file_saves_pending()
                 && a.view.recovery_notice().is_none()
         });
     }
@@ -203,7 +204,9 @@ mod tests {
         );
         assert!(session.reject_edit(&request)); // Keep the native clipboard isolated in this unit fixture.
         app.edit(input::Action::Command("file.save"));
-        until(&mut app, &rx, "exact save", |a| !a.view.file_saves_pending());
+        // Saved installs the clean revision before its original worker result
+        // retires. Wait for capacity too, so the next Undo can be admitted.
+        idle(&mut app, &rx, "exact save");
         assert_eq!(std::fs::read(path).unwrap(), data(&app));
         assert_eq!(&data(&app)[1..], &original[1..]);
         assert!(app.dispatch_hex("edit.undo"));
