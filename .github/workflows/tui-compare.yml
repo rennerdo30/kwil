@@ -1,0 +1,57 @@
+name: TUI compare
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tui-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: PTY compare (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      # Measure optimized application code without the release profile's LTO.
+      CARGO_PROFILE_DEV_OPT_LEVEL: 2
+      CARGO_NET_RETRY: 10
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - run: git rev-parse HEAD
+      - run: rustup show active-toolchain
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}-test
+          add-rust-environment-hash-key: false
+          save-if: false
+      - name: Prove the PTY test rejects broken previous-change navigation
+        run: python3 scripts/check-tui-compare-mutation.py
+      - name: Build the restored production TUI
+        run: cargo build -j 4 --locked -p kwil --bin kwil
+      - name: Compare files and saved buffer, navigate, and enforce first view below one second
+        timeout-minutes: 4
+        run: python3 scripts/test-tui-compare.py target/debug/kwil
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: tui-compare-${{ matrix.os }}
+          path: target/tui-compare/
+          if-no-files-found: warn
+          retention-days: 14
