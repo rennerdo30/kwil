@@ -11,6 +11,7 @@ enum Operation {
     Seed(u64, u64),
     Receipt(u64, u64),
     Finish(u64),
+    Flush,
 }
 
 fn operation(request: &DocumentRequest) -> Option<Operation> {
@@ -20,6 +21,7 @@ fn operation(request: &DocumentRequest) -> Option<Operation> {
         }
         DocumentRequest::Journal { generation, receipt, .. } => Some(Operation::Receipt(*generation, receipt.sequence)),
         DocumentRequest::FinishJournal { generation, .. } => Some(Operation::Finish(*generation)),
+        DocumentRequest::FlushJournals => Some(Operation::Flush),
         _ => None,
     }
 }
@@ -44,10 +46,11 @@ impl Control {
         deferred: &VecDeque<DocumentRequest>,
         _storage: Option<&Storage>,
     ) {
-        if journal_document(request) != Some(self.document) {
+        if journal_document(request) != Some(self.document) && !matches!(request, DocumentRequest::FlushJournals) {
             return;
         }
-        let Some(op @ (Operation::Seed(3, _) | Operation::Receipt(3, 4))) = operation(request) else {
+        let Some(op @ (Operation::Seed(3, _) | Operation::Receipt(3, 4) | Operation::Flush)) = operation(request)
+        else {
             return;
         };
         let mut pending = [None; 8];
@@ -60,7 +63,7 @@ impl Control {
     }
 
     pub(super) fn applying(&mut self, request: &DocumentRequest) {
-        if journal_document(request) == Some(self.document)
+        if (journal_document(request) == Some(self.document) || matches!(request, DocumentRequest::FlushJournals))
             && let Some(operation) = operation(request)
         {
             self.events.try_send(Event::Applying(operation)).expect("bounded schedule observations");
@@ -247,6 +250,58 @@ fn next_result(receiver: &mpsc::Receiver<DocumentResult>, deadline: Instant) -> 
         _ => {}
     }
     result
+}
+
+#[test]
+fn journal_scheduler_flush_waits_for_earlier_receipt_held_by_seed_completion() {
+    let fixture = super::tests::Scratch::new();
+    let (events_tx, events) = mpsc::sync_channel(16);
+    let (results_tx, results) = mpsc::sync_channel(32);
+    let control = Control { document: DocumentId(7), held: false, events: events_tx };
+    let worker = DocumentWorker::spawn_inner(move |result| results_tx.send(result).unwrap(), Some(control)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(worker.try_submit(DocumentRequest::Prepare { root: Some(fixture.0.clone()) }).is_ok());
+    loop {
+        if let DocumentResult::Prepared(result) = next_result(&results, deadline) {
+            drop(result.unwrap());
+            break;
+        }
+    }
+    let mut editor = Editor::new(Document::new());
+    let policy = document_policy(editor.document());
+    editor.set_edit_observer(Some(worker.observer(DocumentId(7), None, 1, 2, policy))).unwrap();
+    assert!(worker.try_submit(seed(DocumentId(7), 2, 1, &editor)).is_ok());
+    assert!(matches!(events.recv_timeout(remaining(deadline)).unwrap(), Event::Applying(Operation::Seed(2, 1))));
+    let Event::Held { actual, release } = events.recv_timeout(remaining(deadline)).unwrap() else {
+        panic!("hold the real seed completion before its first receipt");
+    };
+    editor.insert_text("B", Duration::ZERO).unwrap();
+    assert!(worker.try_submit(DocumentRequest::FlushJournals).is_ok());
+    let Event::Arrived { operation: Operation::Flush, pending } = events.recv_timeout(remaining(deadline)).unwrap()
+    else {
+        panic!("observe the flush while seed readiness is held");
+    };
+    assert_eq!(pending[0], Some(Operation::Receipt(2, 1)));
+    release.send(actual.recv_timeout(remaining(deadline)).unwrap()).unwrap();
+    let applied = [
+        match events.recv_timeout(remaining(deadline)).unwrap() {
+            Event::Applying(op) => op,
+            other => panic!("unexpected schedule event: {other:?}"),
+        },
+        match events.recv_timeout(remaining(deadline)).unwrap() {
+            Event::Applying(op) => op,
+            other => panic!("unexpected schedule event: {other:?}"),
+        },
+    ];
+    drop(editor);
+    drop(worker);
+    loop {
+        if let DocumentResult::Stopped(result) = next_result(&results, deadline) {
+            result.unwrap();
+            break;
+        }
+    }
+    assert_eq!(applied, [Operation::Receipt(2, 1), Operation::Flush], "flush must cover all earlier admitted receipts");
 }
 
 fn edit(

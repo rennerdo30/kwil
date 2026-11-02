@@ -295,6 +295,8 @@ struct Shared {
     native_teardown: Mutex<Option<Arc<tests::CompletionGate>>>,
     #[cfg(test)]
     work_quantum: Mutex<ReadWork>,
+    #[cfg(test)]
+    before_idle: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 struct AcceptedRelative {
     id: u64,
@@ -445,6 +447,8 @@ impl WrapSession {
             native_teardown: Mutex::new(None),
             #[cfg(test)]
             work_quantum: Mutex::new(ReadWork::new(SOURCE_WINDOW as u64, SOURCE_WINDOW as u64)),
+            #[cfg(test)]
+            before_idle: Mutex::new(None),
         });
         let worker_shared = shared.clone();
         let worker_budget = budget.clone();
@@ -624,6 +628,12 @@ impl WrapSession {
     }
     /// Stale ready owners retire on the fixed worker. Saturation retains the
     /// ready slot intact, instead of dropping its last source on the UI.
+    #[cfg(test)]
+    pub(crate) fn before_idle_for_test(&self, action: impl FnOnce() + Send + 'static) {
+        let _state = self.shared.state.lock().unwrap();
+        *self.shared.before_idle.lock().unwrap() = Some(Box::new(action));
+        self.shared.changed.notify_one();
+    }
     pub fn take_update(&mut self, current: NavigationFence) -> Option<LayoutUpdate> {
         self.consume_update(Some(current))
     }
@@ -895,6 +905,15 @@ fn worker_loop(shared: &Arc<Shared>, budget: AllocationBudget) -> WrapResult<()>
             continue;
         }
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        {
+            let action = shared.before_idle.lock().unwrap().take();
+            if let Some(action) = action {
+                drop(state);
+                action();
+                state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            }
+        }
         if shared.stop.load(Ordering::Acquire) {
             if state.retirement_reserved.iter().any(|reserved| *reserved) {
                 drop(shared.changed.wait(state).unwrap_or_else(|e| e.into_inner()));
