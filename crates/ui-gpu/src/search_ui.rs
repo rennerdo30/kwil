@@ -929,6 +929,7 @@ pub(crate) mod host_dispatch_tests {
         let frontend_epoch = view.input_epoch();
         (
             App {
+                smooth_scroll: Default::default(),
                 accessibility: None,
                 accessibility_dirty: true,
                 themes: Default::default(),

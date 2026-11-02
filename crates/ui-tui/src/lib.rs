@@ -445,11 +445,13 @@ fn run_workspace_with_terminal_init(
                             false
                         };
                         if accepted && let Some(host) = highlighting {
+                            host.configure(&settings.syntax);
                             host.apply_mappings(mappings);
                             if !view.hex_active() {
                                 prepare_highlighting_for_draw(host, view);
                             }
                         }
+                        content.configure(&settings.log);
                         view.set_session_restore(settings.files.restore_session);
                         themes.settings_ready(&settings.theme);
                         if !themes.is_started()

@@ -20,6 +20,7 @@ pub use compressed::{
 pub use encoded::{EncodedSavedSnapshot, save_encoded_snapshot};
 
 pub struct SaveRequest {
+    pub backup: bool,
     /// Output container policy is explicit, including dirty recovered Save As.
     pub compression: crate::compressed::CompressionFormat,
     pub snapshot: Snapshot,
@@ -51,6 +52,11 @@ pub struct SavedSnapshot {
 pub fn open_for_editing(path: &Path) -> io::Result<TextFile> {
     kwil_core_text::cleanup_stale_save_backups(path)?;
     TextFile::open(path).map_err(Into::into)
+}
+
+pub fn open_for_editing_with_threshold(path: &Path, threshold: u64) -> io::Result<TextFile> {
+    kwil_core_text::cleanup_stale_save_backups(path)?;
+    TextFile::open_with_threshold(path, threshold).map_err(Into::into)
 }
 
 struct Temporary {
@@ -197,6 +203,28 @@ fn commit_with_operations(
     temp.file.as_ref().unwrap().sync_all().map_err(|e| save_error(&path, e))?;
     temp.file.take();
     prepare(&temp.path).map_err(|e| save_error(&path, e))?;
+    if request.backup
+        && let Some(metadata) = &metadata
+    {
+        // A unique immutable sibling never overwrites an unrelated .bak file.
+        let mut backup = Temporary::new(parent)?;
+        #[cfg(windows)]
+        let backup_security = preserve_metadata(&path, &backup.path, metadata, &mut warnings)?;
+        #[cfg(not(windows))]
+        preserve_metadata(&path, &backup.path, metadata, &mut warnings)?;
+        let mut source = File::open(&path)?;
+        io::copy(&mut source, backup.file.as_mut().unwrap())?;
+        backup.file.as_ref().unwrap().sync_all()?;
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".kwil-backup-{}", backup.path.file_name().unwrap().to_string_lossy()));
+        let retained = PathBuf::from(name);
+        fs::hard_link(&backup.path, &retained)?;
+        #[cfg(windows)]
+        if let Some(security) = backup_security {
+            security.restore_and_verify_dacl(&retained, &mut warnings);
+        }
+        self::sync_parent(&retained, parent)?;
+    }
     // Do not pin an unrelated source when Save As targets a different path.
     let original = request.original.filter(|f| f.path() == path);
     let original = if original.is_none() && metadata.is_some() {
@@ -557,6 +585,13 @@ mod tests {
     static ALLOCATOR: CountingAllocator = CountingAllocator;
     struct Fixture(PathBuf);
     impl Fixture {
+        fn backups(&self) -> Vec<PathBuf> {
+            fs::read_dir(&self.0)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("text.txt.kwil-backup-"))
+                .collect()
+        }
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
@@ -581,6 +616,7 @@ mod tests {
         }
         fn request(&self, original: TextFile, buffer: &Buffer) -> SaveRequest {
             SaveRequest {
+                backup: false,
                 compression: crate::compressed::CompressionFormat::Raw,
                 path: self.path(),
                 snapshot: buffer.snapshot(),
@@ -594,6 +630,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn kw46_runtime_backup_retains_previous_bytes_only_when_requested() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path(), b"old").unwrap();
+        let original = TextFile::open(&fixture.path()).unwrap();
+        let mut buffer = Buffer::empty();
+        buffer.insert(0, b"new").unwrap();
+        let mut request = fixture.request(original, &buffer);
+        request.backup = true;
+        drop(save_snapshot(request).unwrap());
+        assert_eq!(fixture.backups().len(), 1);
+        assert_eq!(fs::read(&fixture.backups()[0]).unwrap(), b"old");
+        let original = TextFile::open(&fixture.path()).unwrap();
+        buffer.insert(3, b"!").unwrap();
+        drop(save_snapshot(fixture.request(original, &buffer)).unwrap());
+        assert_eq!(fixture.backups().len(), 1);
+        assert_eq!(fs::read(fixture.path()).unwrap(), b"new!");
     }
 
     #[test]

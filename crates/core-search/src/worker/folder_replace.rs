@@ -500,6 +500,7 @@ pub fn apply_closed_at(
         cancelled(cancel)?;
         let saved = kwil_core_workspace::save_encoded_snapshot(
             kwil_core_workspace::SaveRequest {
+                backup: false,
                 compression: kwil_core_workspace::compressed::CompressionFormat::Raw,
                 snapshot: buffer.snapshot(),
                 path: hit.path.clone(),

@@ -118,6 +118,8 @@ pub(crate) enum Step {
     UsabilityCapture(&'static str),
     /// Desktop overlays (settings, palette) captured in the hidden window.
     SettingsOpen,
+    SettingsCategory(usize),
+    SettingsChange(usize),
     SettingsKeymap,
     SettingsFileTypes,
     SettingsCapture,
@@ -559,7 +561,31 @@ pub(crate) fn start(proxy: super::HostProxy) {
         let session_restore = [(1800, Step::DismissSetup), (300, Step::SessionCheck), (100, Step::SessionExit)];
         let ipc = [(1800, Step::DismissSetup), (5000, Step::SessionCheck), (100, Step::SessionExit)];
         let probe = std::env::var("KWIL_SESSION_PROBE").unwrap_or_default();
-        let steps = if probe == "crash" {
+        let mut categories = vec![(1800, Step::DismissSetup), (200, Step::SettingsOpen)];
+        for (i, (before, after)) in [
+            ("before-editor.bmp", "after-editor.bmp"),
+            ("before-appearance.bmp", "after-appearance.bmp"),
+            ("before-keymap.bmp", "after-keymap.bmp"),
+            ("before-files.bmp", "after-files.bmp"),
+            ("before-search.bmp", "after-search.bmp"),
+            ("before-updates.bmp", "after-updates.bmp"),
+            ("before-remote.bmp", "after-remote.bmp"),
+            ("before-advanced.bmp", "after-advanced.bmp"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            categories.extend([
+                (100, Step::SettingsCategory(i)),
+                (250, Step::UsabilityCapture(before)),
+                (100, Step::SettingsChange(i)),
+                (600, Step::UsabilityCapture(after)),
+            ]);
+        }
+        categories.extend([(100, Step::SettingsClose), (100, Step::End)]);
+        let steps = if std::env::var_os("KWIL_SETTINGS_CATEGORIES_CAPTURE").is_some() {
+            categories.as_slice()
+        } else if probe == "crash" {
             &session_seed[..session_seed.len() - 1]
         } else if probe == "seed" || probe == "transient" {
             session_seed.as_slice()
@@ -1941,6 +1967,39 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::MenuClose => app.menu_set(super::menu::State::Closed, false),
         Step::SettingsOpen => {
             app.dispatch_settings("view.settings");
+        }
+        Step::SettingsCategory(index) => {
+            let host = app.settings_panel.as_mut().expect("settings host ready");
+            host.set_category(Some(kwil_core_commands::settings_ui::CATEGORIES[index]));
+            let ids = [
+                "editor.word_wrap",
+                "font.line_height",
+                "keymap.preset",
+                "files.backup",
+                "search.case_sensitive",
+                "update.check",
+                "render.remote",
+                "undo.memory_limit_bytes",
+            ];
+            host.select(host.rows().iter().position(|row| row.spec.id == ids[index]).unwrap());
+            app.settings_epoch = app.settings_epoch.wrapping_add(1);
+            app.palette_redraw();
+        }
+        Step::SettingsChange(index) => {
+            use kwil_core_commands::settings_ui::SettingValue;
+            let host = app.settings_panel.as_mut().unwrap();
+            let id = host.selected_row().unwrap().spec.id;
+            let value = match index {
+                0 | 3 | 4 => SettingValue::Bool(true),
+                1 => SettingValue::Float(2.0),
+                2 => SettingValue::Text("notepad++".into()),
+                5 => SettingValue::Bool(false),
+                6 => SettingValue::Text("on".into()),
+                _ => SettingValue::Integer(2 * 1024 * 1024),
+            };
+            host.edit_document(|doc| doc.edit(id, value)).expect("validated autosave");
+            app.settings_epoch = app.settings_epoch.wrapping_add(1);
+            app.palette_redraw();
         }
         Step::SettingsFileTypes => {
             assert!(app.settings_hosted_available());
