@@ -128,6 +128,7 @@ pub(crate) struct Tile {
 }
 
 pub(crate) struct Rasterizer {
+    pub ligatures: bool,
     db: fontdb::Database,
     fallback: FallbackCache,
     faces: HashMap<fontdb::ID, Face>,
@@ -149,6 +150,7 @@ impl Rasterizer {
             ..Default::default()
         });
         Self {
+            ligatures: true,
             db,
             primary,
             fallback: FallbackCache::default(),
@@ -240,7 +242,15 @@ impl Rasterizer {
                 continue;
             };
             let font = self.faces[&id].font();
-            let mut shaper = self.shape.builder(font).script(script).direction(direction).size(self.px).build();
+            let enabled = u16::from(self.ligatures);
+            let mut shaper = self
+                .shape
+                .builder(font)
+                .script(script)
+                .direction(direction)
+                .size(self.px)
+                .features([("liga", enabled), ("calt", enabled), ("dlig", enabled)])
+                .build();
             // Mirror punctuation in RTL while keeping original source offsets.
             let mut parser = Parser::new(
                 script,

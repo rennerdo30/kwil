@@ -94,6 +94,7 @@ fn actual_highlight_worker_panic_payload_remains_sticky() {
     .unwrap();
     worker
         .submit(HighlightRequest {
+            parse_limit: 20 * 1024 * 1024,
             key: HighlightKey { document_id: DocumentId(1), revision: 1, viewport_generation: 1 },
             source: Arc::new(vec![b'x']),
             path: Arc::new(PathBuf::from("unknown")),

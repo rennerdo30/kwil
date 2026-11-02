@@ -87,6 +87,7 @@ pub(super) struct Host {
     rendered: Vec<Line<'static>>,
     rendered_width: usize,
     error: String,
+    log_settings: kwil_core_commands::settings::LogSettings,
     logs: Option<LogSession>,
     open: bool,
     filter: Filter,
@@ -108,6 +109,15 @@ pub(super) struct Host {
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl Host {
+    pub fn configure(&mut self, settings: &kwil_core_commands::settings::LogSettings) {
+        if self.log_settings != *settings {
+            self.log_settings = settings.clone();
+            if let Some(session) = &self.logs {
+                session.configure(settings);
+            }
+            self.submitted = None;
+        }
+    }
     pub fn start(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.wake = Some(wake);
     }
@@ -497,7 +507,10 @@ impl Host {
             let wake = self.wake.clone().unwrap();
             // Same disk admission as GUI log projection and SearchWorker.
             match LogSession::start_with_index_limit(1 << 30, move || wake()) {
-                Ok(session) => self.logs = Some(session),
+                Ok(session) => {
+                    session.configure(&self.log_settings);
+                    self.logs = Some(session);
+                }
                 Err(e) => self.error = e.to_string(),
             }
         }
@@ -643,7 +656,9 @@ impl Host {
                         );
                         spans.push(Span::styled(
                             if cell.text == "\t" { " ".repeat(cell.width) } else { cell.text },
-                            style,
+                            row.color.map_or(style, |rgb| {
+                                theme_ui::base().fg(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+                            }),
                         ));
                     }
                     Line::from(spans)

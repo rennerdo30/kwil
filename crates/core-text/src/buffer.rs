@@ -833,6 +833,9 @@ impl Buffer {
     pub fn undo_memory_bytes(&self) -> usize {
         self.history.bytes()
     }
+    pub fn undo_memory_limit(&self) -> usize {
+        self.history.limit()
+    }
 
     /// Resident added bytes across this buffer, history and worker snapshots.
     pub fn add_memory_bytes(&self) -> usize {

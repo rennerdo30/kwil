@@ -672,6 +672,7 @@ impl Editor {
         self.end_burst();
         self.saving = true;
         Ok(SaveRequest {
+            backup: self.settings.files.backup,
             compression: self.document.compression,
             snapshot: self.document.snapshot(),
             path,

@@ -49,6 +49,98 @@ const CHUNK_BYTES: u64 = 64 * 1024;
 const PROGRESS_BYTES: u64 = 4 * CHUNK_BYTES;
 const RETIRED: usize = 4;
 
+struct LogAppearance {
+    detect_levels: bool,
+    rules: Vec<(kwil_core_search::Pattern, u32)>,
+}
+impl LogAppearance {
+    fn new(settings: &kwil_core_commands::settings::LogSettings) -> Self {
+        Self {
+            detect_levels: settings.detect_levels,
+            rules: settings
+                .highlight_rules
+                .iter()
+                .filter_map(|(pattern, color)| {
+                    Some((
+                        kwil_core_search::Pattern::regex(pattern, Default::default(), ROW_BYTES).ok()?,
+                        u32::from_str_radix(color.strip_prefix('#')?, 16).ok()?,
+                    ))
+                })
+                .collect(),
+        }
+    }
+    fn apply(&self, page: &mut ViewportPage) {
+        for row in &mut page.rows {
+            if !self.detect_levels {
+                // The log lexer identifies the severity token in its bounded prefix.
+                row.spans.retain(|span| {
+                    let start = span.range.start.saturating_sub(row.offset as usize);
+                    let end = span.range.end.saturating_sub(row.offset as usize);
+                    row.bytes.get(start..end).is_none_or(|bytes| Level::parse(bytes).is_none())
+                });
+            }
+            for (pattern, color) in &self.rules {
+                let cancel = Arc::new(AtomicBool::new(false));
+                if kwil_core_search::search(
+                    row.bytes.as_slice(),
+                    pattern,
+                    0..row.bytes.len() as u64,
+                    kwil_core_search::SearchMode::Count,
+                    &cancel,
+                    |_| {},
+                    |_| {},
+                )
+                .is_ok_and(|result| result.count > 0)
+                {
+                    row.color = Some(*color);
+                    row.spans.clear();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_preferences_tests {
+    use super::*;
+    fn page() -> ViewportPage {
+        ViewportPage {
+            viewport: Viewport { top: 0, rows: 1, horizontal: 0, row_bytes: 128 },
+            rows: vec![ViewportRow {
+                color: None,
+                line: 0,
+                line_start: 0,
+                line_end: 12,
+                offset: 0,
+                bytes: b"ERROR failed".to_vec(),
+                spans: vec![kwil_core_syntax::Span { range: 0..5, class: kwil_core_syntax::Class::Error }],
+            }],
+            total: 1,
+            exact: true,
+            max_line_bytes: 12,
+        }
+    }
+    #[test]
+    fn kw46_runtime_log_detect_levels_disables_automatic_severity_colour() {
+        let mut page = page();
+        LogAppearance::new(&kwil_core_commands::settings::LogSettings { detect_levels: false, ..Default::default() })
+            .apply(&mut page);
+        assert!(page.rows[0].spans.is_empty());
+    }
+    #[test]
+    fn kw46_runtime_log_highlight_rules_use_configured_pattern_and_colour() {
+        let mut page = page();
+        let settings = kwil_core_commands::settings::LogSettings {
+            highlight_rules: std::collections::BTreeMap::from([("fail(ed)?".into(), "#123456".into())]),
+            ..Default::default()
+        };
+        LogAppearance::new(&settings).apply(&mut page);
+        assert_eq!(page.rows[0].color, Some(0x123456));
+        assert!(page.rows[0].spans.is_empty());
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Filter {
     pub levels: u8,
@@ -183,6 +275,7 @@ impl Viewport {
 }
 #[derive(Clone, Debug)]
 pub struct ViewportRow {
+    pub color: Option<u32>,
     pub line: u64,
     pub line_start: u64,
     /// End excludes LF and a preceding CR, including at EOF.
@@ -268,6 +361,7 @@ struct Mailbox {
 }
 
 struct Shared {
+    preferences: Mutex<Arc<kwil_core_commands::settings::LogSettings>>,
     mailbox: Mutex<Mailbox>,
     latest: AtomicU64,
     closed: AtomicBool,
@@ -330,7 +424,16 @@ impl Shared {
         }
     }
 
-    fn publish_viewport(&self, request: &Request, result: Result<ViewportPage, String>, wake: &dyn Fn()) {
+    fn publish_viewport(
+        &self,
+        request: &Request,
+        mut result: Result<ViewportPage, String>,
+        appearance: &LogAppearance,
+        wake: &dyn Fn(),
+    ) {
+        if let Ok(page) = &mut result {
+            appearance.apply(page);
+        }
         let mut mailbox = self.mailbox.lock().unwrap_or_else(|error| error.into_inner());
         if self.cancelled(request.key.generation) {
             return;
@@ -424,6 +527,12 @@ impl LogShutdown {
 }
 
 impl LogSession {
+    pub fn configure(&self, settings: &kwil_core_commands::settings::LogSettings) {
+        let mut current = self.shared.preferences.lock().unwrap_or_else(|e| e.into_inner());
+        if current.as_ref() != settings {
+            *current = Arc::new(settings.clone());
+        }
+    }
     /// Declared facade/shared headers, aligned Arc allocation, retirement and
     /// completion guards and one typed return. The existing sync-channel's
     /// opaque std allocation, projection/index and source accounting remain
@@ -498,6 +607,7 @@ impl LogSession {
         Self::checked_retained_metadata_bytes().ok_or(io::Error::from(io::ErrorKind::OutOfMemory))?;
         let (signal, ready) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared {
+            preferences: Mutex::new(Arc::new(Default::default())),
             mailbox: Mutex::new(Mailbox::default()),
             latest: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -891,6 +1001,8 @@ impl Drop for WorkerRetirement {
 
 fn worker_loop(shared: &Shared, ready: mpsc::Receiver<()>, wake: &dyn Fn(), index_limit: u64) {
     let mut index: Option<ProjectionIndex> = None;
+    let mut settings = Arc::new(kwil_core_commands::settings::LogSettings::default());
+    let mut appearance = LogAppearance::new(&settings);
     while ready.recv().is_ok() {
         loop {
             if shared.closed.load(Ordering::Acquire) {
@@ -916,6 +1028,11 @@ fn worker_loop(shared: &Shared, ready: mpsc::Receiver<()>, wake: &dyn Fn(), inde
             }
             let generation = request.key.generation;
             if let Some(viewport) = request.viewport {
+                let next = shared.preferences.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if !Arc::ptr_eq(&settings, &next) {
+                    appearance = LogAppearance::new(&next);
+                    settings = next;
+                }
                 // A pending same-source viewport resumes a cancelled partial
                 // pass. Different source/filter retires before new admission.
                 if index.as_ref().is_some_and(|old| !old.matches(&request)) {
@@ -928,15 +1045,15 @@ fn worker_loop(shared: &Shared, ready: mpsc::Receiver<()>, wake: &dyn Fn(), inde
                     index.as_mut().unwrap().query(
                         viewport,
                         &|| shared.cancelled(generation) || shared.retire_index.load(Ordering::Acquire),
-                        |page| shared.publish_viewport(&request, Ok(page), wake),
+                        |page| shared.publish_viewport(&request, Ok(page), &appearance, wake),
                     )
                 })();
                 match result {
-                    Ok(Some(page)) => shared.publish_viewport(&request, Ok(page), wake),
+                    Ok(Some(page)) => shared.publish_viewport(&request, Ok(page), &appearance, wake),
                     Ok(None) => {}
                     Err(error) => {
                         retire_index(&mut index, shared);
-                        shared.publish_viewport(&request, Err(error.to_string()), wake);
+                        shared.publish_viewport(&request, Err(error.to_string()), &appearance, wake);
                     }
                 }
                 continue;
@@ -1397,7 +1514,15 @@ impl ProjectionIndex {
                     class: span.class,
                 })
                 .collect();
-            page.rows.push(ViewportRow { line, line_start: start, line_end: end, offset, bytes: raw, spans });
+            page.rows.push(ViewportRow {
+                color: None,
+                line,
+                line_start: start,
+                line_end: end,
+                offset,
+                bytes: raw,
+                spans,
+            });
         }
         if cancelled() { Ok(None) } else { Ok(Some(page)) }
     }

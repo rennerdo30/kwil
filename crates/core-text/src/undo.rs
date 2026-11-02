@@ -202,6 +202,9 @@ impl History {
         self.undo.shrink_to_fit();
         self.redo.shrink_to_fit();
     }
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 
     pub fn charge_latest_model(&mut self, cost: usize) {
         if let Some(entry) = self.undo.back_mut() {

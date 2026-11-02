@@ -242,6 +242,41 @@ impl Settings {
                 return Err(error(&format!("formatters.{kind}.timeout_ms"), "must be positive"));
             }
         }
+        for (path, valid, range) in [
+            ("font.size", (6.0..=96.0).contains(&self.font.size), "6 to 96"),
+            ("font.line_height", (1.0..=3.0).contains(&self.font.line_height), "1 to 3"),
+            (
+                "files.small_file_threshold_bytes",
+                self.files.small_file_threshold_bytes <= 64 * 1024 * 1024,
+                "0 to 67108864",
+            ),
+            ("files.journal_interval_seconds", (1..=300).contains(&self.files.journal_interval_seconds), "1 to 300"),
+            (
+                "undo.memory_limit_bytes",
+                (1..=512 * 1024 * 1024).contains(&self.undo.memory_limit_bytes),
+                "1 to 536870912",
+            ),
+            ("syntax.full_parse_limit_bytes", self.syntax.full_parse_limit_bytes <= 20 * 1024 * 1024, "0 to 20971520"),
+        ] {
+            if !valid {
+                return Err(error(path, &format!("must be in range {range}")));
+            }
+        }
+        if self.log.highlight_rules.len() > 64 {
+            return Err(error("log.highlight_rules", "at most 64 rules"));
+        }
+        for (pattern, color) in &self.log.highlight_rules {
+            if pattern.len() > 1024
+                || pattern.is_empty()
+                || color.len() != 7
+                || !color.starts_with('#')
+                || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(error("log.highlight_rules", "use a nonempty regex (at most 1024 bytes) and #RRGGBB"));
+            }
+            kwil_core_search::Pattern::regex(pattern, Default::default(), 64 * 1024)
+                .map_err(|e| error("log.highlight_rules", &e.to_string()))?;
+        }
         for (i, binding) in self.bindings.iter().enumerate() {
             if !binding.command.is_empty() && crate::command(&binding.command).is_none() {
                 return Err(error(&format!("bindings[{i}].command"), &format!("unknown command: {}", binding.command)));

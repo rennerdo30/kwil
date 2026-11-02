@@ -646,7 +646,7 @@ impl Workspace {
                 let installed = self.views.get_mut(&id).unwrap();
                 let editor = installed.editor.as_mut().unwrap();
                 if let Some(settings) = &self.editor_settings {
-                    editor.settings = settings.clone();
+                    editor.apply_settings(settings);
                 }
                 let sequence = editor.next_edit_sequence().saturating_sub(1);
                 if editor.document().revision() != key.revision {
@@ -915,7 +915,7 @@ impl Workspace {
         let view = self.views.get_mut(&id).unwrap();
         let editor = view.editor.as_mut().unwrap();
         if let Some(settings) = &self.editor_settings {
-            editor.settings = settings.clone();
+            editor.apply_settings(settings);
         }
         let raw = editor.document().representation() == crate::hex_session::Representation::RawBytes;
         if kind == ResultKind::Recovered

@@ -308,6 +308,7 @@ mod tests {
         }
         fn request(&self, buffer: &Buffer, trim: bool) -> SaveRequest {
             SaveRequest {
+                backup: false,
                 compression: crate::compressed::CompressionFormat::Gzip,
                 snapshot: buffer.snapshot(),
                 path: self.path(),

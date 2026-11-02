@@ -36,7 +36,7 @@ impl Level {
             Self::Fatal => "FATAL",
         }
     }
-    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
         Self::ALL.iter().copied().find(|level| bytes.eq_ignore_ascii_case(level.label().as_bytes())).or_else(|| {
             if bytes.eq_ignore_ascii_case(b"warning") {
                 Some(Self::Warn)
