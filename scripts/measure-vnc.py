@@ -237,7 +237,7 @@ def measure(binary, output, commit):
         app = stack.enter_context(owned([str(binary), "--gui", str(fixture)], env, output, "kwil", commit,
                                        cwd=profile))
         log = output / "kwil.log"
-        wait_for(lambda: "file content presented" in log.read_text(), "initial file pixels")
+        wait_for(lambda: "first frame presented" in log.read_text(), "initial window frame")
         windows = run(["xdotool", "search", "--onlyvisible", "--pid", str(app.pid), "--name", "Kwil"],
                       env, capture_output=True, text=True).stdout.splitlines()
         if not windows:
@@ -248,6 +248,13 @@ def measure(binary, output, commit):
                  "automatic remote policy diagnostic")
         client.socket.sendall(struct.pack("!BBHH", 5, 0, 500, 400))
         client.collect("app_setup", 3)
+        # Debug builds intentionally show onboarding even with a seen marker.
+        # Escape advances About, then explicitly skips file registration. Both
+        # inputs travel over RFB and their traffic belongs only to setup.
+        for _ in range(2):
+            client.press(0xFF1B)
+            client.collect("dismiss_welcome", 0.5)
+        wait_for(lambda: "file content presented" in log.read_text(), "initial file pixels")
         client.capture(output / "initial.png")
         records = [client.collect("idle", 3)]
         client.press(ord("x"))
