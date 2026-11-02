@@ -22,12 +22,18 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
    - macOS and Linux: a tar.gz per target;
    - the bare binaries for the updater (`kwil-<target>` on Unix; `kwil-<target>.exe` and `kwil-<target>.com` on Windows).
 
-   It then creates a **draft** GitHub Release with all of them, `THIRD-PARTY-NOTICES.txt` and `SHA256SUMS`.
+   It generates GitHub build provenance attestations for every staged release asset,
+   including `THIRD-PARTY-NOTICES.txt` and `SHA256SUMS`, then creates a **draft**
+   GitHub Release with those files. Attestation failure prevents draft creation.
 4. The owner reviews the draft and publishes it.
 5. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once.
 
-The exact tagged commit must first pass the `CI` workflow. Release builds refuse
-to start without that successful run. A prerelease version such as
+Before any release build, `docs/BETA_RELEASE_NOTES.md` must start with
+`# Kwil X.Y.Z`, using the exact tagged version without its leading `v`
+(including any prerelease suffix). A stale or missing heading stops the workflow
+before notices or builds run. The exact tagged commit must first pass the `CI`
+workflow. Release builds refuse to start without that successful run. A prerelease
+version such as
 `0.1.0-beta.1` uses the matching tag `v0.1.0-beta.1`; the workflow creates a
 **draft prerelease**, sets `latest=false` and uses `docs/BETA_RELEASE_NOTES.md`.
 Review the notes for the specific prerelease before tagging. Only the owner
@@ -36,6 +42,28 @@ publishes the resulting draft.
 Prereleases do not enter the stable updater or the download scripts. Builds after beta.1 can opt into prerelease
 updates and can advance from beta to stable; see [update settings](UPDATES.md).
 Frozen beta.1 copies still require manual replacement. See [beta gates and limitations](BETA.md).
+
+## Verify a downloaded asset
+
+For releases built with this workflow change, use an authenticated
+[GitHub CLI](https://cli.github.com/manual/gh_attestation_verify) with
+`gh attestation verify` support. Download the asset from the intended release,
+keep its original bytes, and run (replace `X.Y.Z` with that release's version):
+
+```sh
+gh attestation verify ./kwil-x86_64-pc-windows-msvc.exe --repo rennerdo30/kwil --signer-workflow rennerdo30/kwil/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
+```
+
+Replace the path with any other release asset, including an installer, archive,
+the Windows `.com`, `THIRD-PARTY-NOTICES.txt` or `SHA256SUMS`. Verify an archive
+before extracting it. A successful exit verifies that the downloaded bytes match
+an attestation from this repository's release workflow for the selected tag.
+Stop if verification fails; older releases may have no attestation.
+
+Attestations are stored by GitHub and need no owner signing key. They establish
+GitHub workflow provenance; Windows Authenticode, Apple notarization and the
+updater's independent signature verification remain separate work. The built-in
+updater currently checks `SHA256SUMS`, without running this manual command.
 
 ## Asset contract (do not change without updating `crates/update`)
 
