@@ -50,6 +50,7 @@ fn startup_stage(_label: &'static str) {
         let _ = writeln!(file, "kwil-speed\t{}\t{ns}\t{_label}", std::process::id());
     }
 }
+pub type WindowRestore = Box<dyn FnOnce(&std::path::Path, Vec<String>) -> io::Result<()> + Send>;
 use kwil_core_text::{Buffer, TextFile};
 use kwil_core_workspace::{SaveRequest, SavedSnapshot, session::DocumentId};
 use kwil_core_workspace::{
@@ -375,6 +376,11 @@ pub enum DocumentRequest {
     },
     Prepare {
         root: Option<PathBuf>,
+    },
+    PrepareWindow {
+        root: Option<PathBuf>,
+        window: kwil_core_workspace::window_session::WindowSession,
+        restore: Option<WindowRestore>,
     },
     Persist(Session),
     /// Checkpoint separate-window bookkeeping without writing session metadata.
@@ -1528,6 +1534,14 @@ impl DocumentWorker {
                             });
                             complete(DocumentResult::Prepared(prepared));
                         }
+                        DocumentRequest::PrepareWindow { root, window, restore } => {
+                            let prepared = prepare_window(root, window, restore).map(|(prepared, state)| {
+                                *worker_preferences.lock().unwrap_or_else(|e| e.into_inner()) = state.preferences;
+                                storage = Some(state);
+                                prepared
+                            });
+                            complete(DocumentResult::Prepared(prepared));
+                        }
                         DocumentRequest::Persist(session) | DocumentRequest::PersistTransient(session) => {
                             if let Some(storage) = &mut storage {
                                 storage.order.retain(|id, _| {
@@ -2116,14 +2130,9 @@ fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
 
 fn prepare_with_settings(
     root: Option<PathBuf>,
-    mut preferences: WorkerSettings,
+    preferences: WorkerSettings,
 ) -> io::Result<(PreparedWorkspace, Storage)> {
-    if root.is_none() {
-        let exe = std::env::current_exe()?;
-        let path = kwil_core_commands::Settings::path(&exe).map_err(io::Error::other)?;
-        preferences =
-            WorkerSettings::from(&kwil_core_commands::Settings::load(&path).map(|r| r.settings).unwrap_or_default());
-    }
+    let preferences = prepare_preferences(&root, preferences)?;
     let root = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
     #[cfg(unix)]
     {
@@ -2133,6 +2142,16 @@ fn prepare_with_settings(
     #[cfg(not(unix))]
     std::fs::create_dir_all(&root)?;
     prepare_root_configured(root, preferences)
+}
+
+fn prepare_preferences(root: &Option<PathBuf>, preferences: WorkerSettings) -> io::Result<WorkerSettings> {
+    if root.is_none() { profile_preferences() } else { Ok(preferences) }
+}
+
+fn profile_preferences() -> io::Result<WorkerSettings> {
+    let exe = std::env::current_exe()?;
+    let path = kwil_core_commands::Settings::path(&exe).map_err(io::Error::other)?;
+    Ok(WorkerSettings::from(&kwil_core_commands::Settings::load(&path).map(|r| r.settings).unwrap_or_default()))
 }
 
 fn resolve_root(root: Option<PathBuf>, override_root: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
@@ -2163,6 +2182,38 @@ fn prepare_root_configured(root: PathBuf, preferences: WorkerSettings) -> io::Re
         .truncate(false)
         .open(root.join("workspace.lock"))?;
     ownership.try_lock().map_err(io::Error::other)?;
+    prepare_owned_root(root, ownership, preferences)
+}
+
+fn prepare_window(
+    root: Option<PathBuf>,
+    window: kwil_core_workspace::window_session::WindowSession,
+    restore: Option<WindowRestore>,
+) -> io::Result<(PreparedWorkspace, Storage)> {
+    use kwil_core_workspace::window_session::{WindowSession, claim_window, restorable_windows};
+    // A persistent application window always follows its profile settings.
+    // An isolated recovery root changes storage, not journal/undo preferences.
+    let preferences = profile_preferences()?;
+    let base = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
+    let claim = claim_window(&base, &window)?;
+    let windows =
+        if window == WindowSession::Primary && restore.is_some() { restorable_windows(&claim)? } else { Vec::new() };
+    let (root, ownership) = claim.into_parts();
+    let prepared = prepare_owned_root(root, ownership, preferences)?;
+    if let Some(restore) = restore
+        && !windows.is_empty()
+        && let Err(error) = restore(&base, windows)
+    {
+        eprintln!("kwil: some saved windows could not be reopened: {error}; recovery retained");
+    }
+    Ok(prepared)
+}
+
+fn prepare_owned_root(
+    root: PathBuf,
+    ownership: std::fs::File,
+    preferences: WorkerSettings,
+) -> io::Result<(PreparedWorkspace, Storage)> {
     // Reserve owner/path bookkeeping before opening any decoded document.
     // This is a metadata admission ceiling, not a resident allocation or a
     // file-size limit. Registry slots retain owners until snapshots retire.
