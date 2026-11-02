@@ -94,7 +94,7 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          cargo build --locked -p kwil
+          cargo build --locked -p kwil --features kwil-ui-gpu/frame-harness
           exe=target/debug/kwil
           [ -f "$exe.exe" ] && exe="$exe.exe"
           "$exe" --version
