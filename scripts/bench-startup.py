@@ -93,7 +93,7 @@ def measure(binary, output):
     active = []
     failure = None
     try:
-        for name, files in [("empty-first", ()), ("file-first", (fixture,)),
+        for name, files in [("empty-first", ()), ("file-first", (fixture,)), ("empty-warm", ()),
                             ("file-warm", (fixture,)), ("file-large", (large,))]:
             profile = root / name
             profile.mkdir(mode=0o700)

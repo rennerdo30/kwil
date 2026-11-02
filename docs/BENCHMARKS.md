@@ -33,12 +33,14 @@ It launches hidden native CPU windows with isolated profiles, records every
 PID, and bounds every wait/exit. Linux uses Xvfb. These measure successful
 native presentation, not compositor scanout or visible-desktop acceptance.
 
-One sample each covers an empty process, a 74 KiB text file, a repeated launch,
+One sample each covers first/repeated empty processes, a 76 KiB text file, a repeated launch,
 and a 1 GiB text file. "First" means a fresh process/profile; the runner's disk
 cache is uncontrolled, so this is not a cache-flushed cold-boot measurement.
 The first chrome frame and the first successfully presented fixture-content
 row are separate marks. A missing, covered or undrawn row cannot satisfy the
-content measurement. The second process opens a different sentinel file only
+content measurement. A vetted read-only preview counts while the final open
+still owns editing/input; timing follows the renderer's paint fence. The
+second process opens a different sentinel file only
 after the original UI route reports ready. IPC acknowledgment and display by
 the original process are reported separately. Raw logs and timestamps are
 retained even on failure. Targets/hard limits remain 25/60 ms empty, 40/100 ms

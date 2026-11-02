@@ -441,7 +441,10 @@ impl UiFont {
     }
 
     /// The existing worker reads optional text/symbol coverage after a glyph miss.
-    pub(super) fn read_fallback() -> UiFallback {
+    pub(super) fn needs_symbols(&self) -> bool {
+        self.symbols.is_none()
+    }
+    pub(super) fn read_fallback(include_symbols: bool) -> UiFallback {
         fn read(candidates: &[(&str, usize)]) -> Option<(Vec<u8>, usize)> {
             candidates.iter().find_map(|(path, index)| {
                 let data = std::fs::read(path).ok()?;
@@ -449,7 +452,10 @@ impl UiFont {
                 Some((data, *index))
             })
         }
-        UiFallback { text: read(UI_FALLBACK_CANDIDATES), symbols: read(UI_SYMBOL_CANDIDATES) }
+        UiFallback {
+            text: read(UI_FALLBACK_CANDIDATES),
+            symbols: if include_symbols { read(UI_SYMBOL_CANDIDATES) } else { None },
+        }
     }
     /// True once per font when a glyph was missing and no fallback was tried.
     pub fn take_fallback_request(&mut self) -> bool {
@@ -462,7 +468,9 @@ impl UiFont {
         wanted
     }
     pub(super) fn install_fallback(&mut self, faces: UiFallback) {
-        self.install_symbols(faces.symbols.and_then(|(data, index)| UiFace::from_data(data, index)));
+        if let Some(face) = faces.symbols.and_then(|(data, index)| UiFace::from_data(data, index)) {
+            self.install_symbols(Some(face));
+        }
         self.install_shared_fallback(faces.text.and_then(|(data, index)| UiFace::from_data(data, index)));
     }
     fn install_shared_fallback(&mut self, face: Option<UiFace>) {
@@ -483,7 +491,9 @@ impl UiFont {
         }
     }
     pub(super) fn copy_fallback_from(&mut self, other: &Self) {
-        self.install_symbols(other.symbols.clone());
+        if other.symbols.is_some() {
+            self.install_symbols(other.symbols.clone());
+        }
         self.install_shared_fallback(other.fallback.clone());
     }
     pub(super) fn fallback_finished(&self) -> bool {
@@ -884,11 +894,11 @@ mod tests {
         tx.send(14.0).unwrap();
         let mut startup = UiFont::startup(rx).unwrap();
         assert!(startup.symbols.is_none(), "startup must not read the optional emoji font");
-        let faces = UiFont::read_fallback();
+        let faces = UiFont::read_fallback(startup.needs_symbols());
         assert!(faces.symbols.is_some(), "Windows ships the symbol face used by this regression");
         startup.install_fallback(faces);
         let mut reference = UiFont::load(14.0).unwrap();
-        reference.install_fallback(UiFont::read_fallback());
+        reference.install_fallback(UiFont::read_fallback(reference.needs_symbols()));
         for font in [&mut startup, &mut reference] {
             font.prepare(['🚀'].into_iter());
         }
@@ -899,6 +909,9 @@ mod tests {
             (b.advance, b.width, b.height, b.color, &b.alpha)
         );
         assert!(!a.alpha.is_empty(), "the deferred face must render the actual glyph");
+        assert!(!startup.needs_symbols());
+        startup.install_fallback(UiFallback { text: None, symbols: None });
+        assert!(!startup.needs_symbols(), "a later missing optional face must not evict installed coverage");
     }
 
     #[test]

@@ -954,6 +954,28 @@ pub fn run_workspace_with_external_open(
 }
 
 impl App {
+    #[cfg(feature = "frame-harness")]
+    fn content_trace_paint_allowed(&self) -> bool {
+        // A checked preview is paint authority while binary/open ownership is
+        // still pending. Follow the renderer's paint fence, never its input fence.
+        !(self.binary_blocks_paint()
+            || self.document_input_blocked()
+            || self.view.hex_active()
+            || self.view.compare.open
+            || self.wrap_owns_text()
+            || self.view.wrap_input_blocked()
+            || self.welcome.visible()
+            || self.language_open()
+            || self.palette_open()
+            || self.settings_open()
+            || self.search_panel.is_open()
+            || self.logs.is_open()
+            || self.save_path.is_some()
+            || self.menu.dropdown.is_some()
+            || self.menu_area.is_some()
+            || self.context.is_open())
+    }
+
     fn try_finish_startup(&mut self, el: &ActiveEventLoop) {
         use document_ui::FontProduct;
         if self.startup_fonts.finished || self.gfx.is_none() {
@@ -2250,6 +2272,8 @@ impl App {
         let wrapped_hits = self
             .search_panel
             .visible_hits(self.view.active_id(), wrap_context.map_or(0, |context| context.key.source.revision));
+        #[cfg(feature = "frame-harness")]
+        let trace_paint_allowed = self.content_trace_paint_allowed();
         let mut wrapped_paint = self.wrap.paint(wrap_identity.map(|(key, _)| key));
         let hex_source = self.view.hex_source();
         let hex_read_only = hex_active && self.view.document_busy(self.view.active_id());
@@ -2308,7 +2332,7 @@ impl App {
         let content_mark = trace::content_mark(
             self.view.line(0),
             p.full || p.rows.contains(&0) || document_rows().any(|row| row == 0),
-            binary_blocks_paint || projection_owns_body || hex_active || wrap_active || palette_open || menu_list,
+            !trace_paint_allowed || projection_owns_body,
         );
         if p.full {
             font.invalidate_rows();
@@ -2642,7 +2666,7 @@ impl App {
             && ui_font.take_fallback_request()
             && let Some(id) = self.ui_fallback.request(ui_font.id())
         {
-            spawn_ui_fallback(&self.proxy, id);
+            spawn_ui_fallback(&self.proxy, id, ui_font.needs_symbols());
         }
         if let (Some(prompt), Some(ui_font)) = (self.goto.as_ref(), self.ui_font.as_mut()) {
             self.palette_area = palette_view::draw(
@@ -2850,10 +2874,10 @@ impl App {
 }
 
 /// Reads the wide-coverage chrome face off the UI thread for face `id`.
-fn spawn_ui_fallback(proxy: &HostProxy, id: u64) {
+fn spawn_ui_fallback(proxy: &HostProxy, id: u64, include_symbols: bool) {
     let proxy = proxy.clone();
     std::thread::spawn(move || {
-        let _ = proxy.send_event(UserEvent::UiFallbackReady(id, font::UiFont::read_fallback()));
+        let _ = proxy.send_event(UserEvent::UiFallbackReady(id, font::UiFont::read_fallback(include_symbols)));
     });
 }
 
@@ -3773,7 +3797,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // glyphs meanwhile gets exactly one retry, still one read at a time.
                 let (bind, retry) = self.ui_fallback.finished(id, self.ui_font.as_ref().map(font::UiFont::id));
                 if let Some(retry) = retry {
-                    spawn_ui_fallback(&self.proxy, retry);
+                    spawn_ui_fallback(
+                        &self.proxy,
+                        retry,
+                        self.ui_font.as_ref().is_some_and(font::UiFont::needs_symbols),
+                    );
                 }
                 let Some(font) = self.ui_font.as_mut().filter(|_| bind) else {
                     return;
