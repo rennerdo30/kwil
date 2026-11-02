@@ -82,6 +82,42 @@ fn bytes(editor: &Editor) -> Vec<u8> {
     output
 }
 
+fn json_selection_boundaries(ending: &str, end_at_line_start: bool) {
+    let prefix = format!("[{ending}{{\"keep\": [3,2]}},{ending}");
+    let selected = format!(" \t{{  \"target\": [1,2] }}\t {ending}");
+    let suffix = format!("]{ending}");
+    let input = format!("{prefix}{selected}{suffix}");
+    let mut editor = editor(&input);
+    editor.settings.editor.tab_size = 2;
+    let end = prefix.len() + if end_at_line_start { selected.len() } else { selected.find('}').unwrap() + 1 };
+    assert_eq!(editor.position_at(end as u64).unwrap().1 == 0, end_at_line_start);
+    let cursors = vec![Cursor { anchor: prefix.len() as u64, head: end as u64, desired_column: None }];
+    editor.set_cursors(cursors.clone(), 0).unwrap();
+    editor.apply_formatting(true, Some("json".into())).unwrap();
+    let object = "{\n  \"target\": [\n    1,\n    2\n  ]\n}".replace('\n', ending);
+    let expected = format!("{prefix} \t{object}\t {ending}{suffix}");
+    assert_eq!(bytes(&editor), expected.as_bytes(), "preserve the selected line's exact boundary whitespace");
+    editor.execute("edit.undo", &CommandArgs::default(), 1).unwrap();
+    assert_eq!(bytes(&editor), input.as_bytes());
+    assert_eq!(editor.cursors(), cursors);
+    editor.execute("edit.redo", &CommandArgs::default(), 1).unwrap();
+    assert_eq!(bytes(&editor), expected.as_bytes());
+}
+
+#[test]
+fn formatting_selection_boundary_ending_at_line_start_preserves_lf_and_crlf() {
+    for ending in ["\n", "\r\n"] {
+        json_selection_boundaries(ending, true);
+    }
+}
+
+#[test]
+fn formatting_selection_boundary_ending_mid_line_preserves_whitespace_and_line_ending() {
+    for ending in ["\n", "\r\n"] {
+        json_selection_boundaries(ending, false);
+    }
+}
+
 #[test]
 fn formatting_external_is_one_undoable_edit() {
     let fake = Fake::new();
