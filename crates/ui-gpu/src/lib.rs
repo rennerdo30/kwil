@@ -637,6 +637,9 @@ pub fn run_workspace_with_external_open(
         std::ops::ControlFlow::Break(refusal) => return std::ops::ControlFlow::Break(refusal),
         std::ops::ControlFlow::Continue(prepared) => prepared,
     };
+
+    #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+    trace::mark("event loop built");
     let proxy = match HostProxy::admit(event_loop.create_proxy(), &budget) {
         Ok(proxy) => proxy,
         Err(error) => {
@@ -3343,6 +3346,8 @@ impl ApplicationHandler<UserEvent> for App {
         el.set_control_flow(self.resize_ready_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window resume entered");
         if self.gfx.is_some() {
             return;
         }
@@ -3365,6 +3370,9 @@ impl ApplicationHandler<UserEvent> for App {
                 attrs = attrs.with_active(false).with_skip_taskbar(true);
             }
         }
+
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window creation entered");
         let window = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -3373,18 +3381,30 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window created");
         if let Some(monitor) = window.current_monitor().or_else(|| el.primary_monitor()) {
             let placement =
                 window_placement::Placement::centered(window_placement::work(&monitor), None, (1280.0, 840.0));
             window_placement::fit_window(&window, placement);
             self.window_normal = Some(placement);
         }
+
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("window placed");
         self.accessibility = Some(accessibility::Host::new(el, &window, &self.proxy));
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("accessibility attached");
         if !self.opts.hidden {
             window.set_visible(true);
         }
         window.set_ime_allowed(true);
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("IME enabled");
         let surface = Context::new(window.clone()).and_then(|c| Surface::new(&c, window.clone()));
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("CPU surface created");
         let surface = match surface {
             Ok(s) => s,
             Err(e) => {
@@ -3410,6 +3430,9 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(ui_font_size) = self.ui_font_size.take() {
             let _ = ui_font_size.try_send(self.ui.text_px());
         }
+
+        #[cfg(all(target_os = "macos", feature = "frame-harness"))]
+        trace::mark("font scale sent");
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
         self.gfx = Some(Gfx {
