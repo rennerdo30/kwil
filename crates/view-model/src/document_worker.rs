@@ -365,6 +365,8 @@ pub enum DocumentRequest {
         root: Option<PathBuf>,
     },
     Persist(Session),
+    /// Checkpoint separate-window bookkeeping without writing session metadata.
+    PersistTransient(Session),
     SessionTimer,
     Recover {
         tab: Tab,
@@ -1107,6 +1109,7 @@ impl DocumentWorker {
                     if let Some(control) = &mut schedule_control {
                         control.applying(&request);
                     }
+                    let transient_checkpoint = matches!(&request, DocumentRequest::PersistTransient(_));
                     match request {
                         DocumentRequest::ResumeSaveCompletion { key } => {
                             complete(DocumentResult::ResumeSaveCompletion { key });
@@ -1469,7 +1472,7 @@ impl DocumentWorker {
                             });
                             complete(DocumentResult::Prepared(prepared));
                         }
-                        DocumentRequest::Persist(session) => {
+                        DocumentRequest::Persist(session) | DocumentRequest::PersistTransient(session) => {
                             if let Some(storage) = &mut storage {
                                 storage.order.retain(|id, _| {
                                     session.tabs().iter().chain(session.closed()).any(|tab| tab.id == *id)
@@ -1478,7 +1481,20 @@ impl DocumentWorker {
                             let result = storage
                                 .as_mut()
                                 .ok_or_else(|| io::Error::other("Session recovery is unavailable"))
-                                .and_then(|s| persist_session(s, &session));
+                                .and_then(|s| {
+                                    if transient_checkpoint {
+                                        s.durable_session = session.clone();
+                                        s.finished_journals.retain(|id, _| {
+                                            session.tabs().iter().chain(session.closed()).any(|tab| tab.id == *id)
+                                        });
+                                        s.transports.retain(|id, _| {
+                                            session.tabs().iter().chain(session.closed()).any(|tab| tab.id == *id)
+                                        });
+                                        Ok(())
+                                    } else {
+                                        persist_session(s, &session)
+                                    }
+                                });
                             complete(DocumentResult::Persisted(result));
                         }
                         DocumentRequest::SessionTimer => {
@@ -2022,6 +2038,12 @@ fn validate_save_destination(
 
 fn prepare(root: Option<PathBuf>) -> io::Result<(PreparedWorkspace, Storage)> {
     let root = resolve_root(root, std::env::var_os("KWIL_WORKSPACE_ROOT"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&root)?;
     prepare_root(root)
 }
@@ -3091,7 +3113,7 @@ fn recover_prepared_with_add_limit(
         .len()
         .checked_add(64)
         .ok_or_else(|| io::Error::other("Recovery private path overflow"))?;
-    let recovery = JournalRecovery::new(
+    let mut recovery = JournalRecovery::new(
         root.to_owned(),
         JournalReplayLimits {
             replay: ReplayLimits {
@@ -3122,6 +3144,7 @@ fn recover_prepared_with_add_limit(
             max_replacements: 1 << 20,
         },
     )?;
+    recovery.retain_undo_history();
     match encoding.recover(recovery, path.clone(), tab, max_origins, 8 * 1024 * 1024, &AtomicBool::new(false)) {
         Ok((document, journal, base, origins)) => Ok((document, journal, base, Some(origins))),
         // The authenticated consumer identifies the old raw base explicitly.
@@ -4814,7 +4837,45 @@ mod tests {
     }
 
     #[test]
+    fn transient_worker_checkpoint_never_writes_restorable_session_metadata() {
+        let scratch = Scratch::new();
+        let (tx, rx) = mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = tx.send(result);
+        })
+        .unwrap();
+        worker.try_submit(DocumentRequest::Prepare { root: Some(scratch.0.clone()) }).unwrap();
+        loop {
+            if let DocumentResult::Prepared(result) = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                drop(result.unwrap());
+                break;
+            }
+        }
+        let mut session = Session::default();
+        session.open(None).unwrap();
+        worker.try_submit(DocumentRequest::PersistTransient(session)).unwrap();
+        loop {
+            if let DocumentResult::Persisted(result) = rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                result.unwrap();
+                break;
+            }
+        }
+        assert!(!scratch.0.join("session.kws").exists());
+        drop(worker);
+        wait_stopped(&rx);
+    }
+
+    #[test]
     fn normal_hot_exit_restores_order_active_paths_caret_viewport_layout_and_unsaved_bytes() {
+        hot_exit_roundtrip(false);
+    }
+
+    #[test]
+    fn hot_exit_recovered_journal_edits_can_be_undone_and_redone() {
+        hot_exit_roundtrip(true);
+    }
+
+    fn hot_exit_roundtrip(check_history: bool) {
         use crate::{CommandArgs, TabMetrics, View, Workspace};
         use kwil_core_commands::settings::{Settings, TabLayout, write_settings_atomic};
         let scratch = Scratch::new();
@@ -4857,6 +4918,17 @@ mod tests {
         workspace.execute("edit.insert", &CommandArgs { text: Some("X".into()), ..Default::default() }, 1).unwrap();
         workspace.execute("edit.undo", &CommandArgs::default(), 1).unwrap();
         workspace.execute("edit.redo", &CommandArgs::default(), 1).unwrap();
+        if check_history {
+            for text in ["Y", "Z"] {
+                let cursor = workspace.editor().unwrap().primary_cursor().clone();
+                workspace.editor_mut().unwrap().set_cursors(vec![cursor], 0).unwrap();
+                workspace
+                    .execute("edit.insert", &CommandArgs { text: Some(text.into()), ..Default::default() }, 1)
+                    .unwrap();
+            }
+            workspace.execute("edit.undo", &CommandArgs::default(), 1).unwrap();
+            workspace.execute("edit.undo", &CommandArgs::default(), 1).unwrap();
+        }
         workspace.activate(first);
         workspace.set_rows(2);
         workspace
@@ -4924,6 +4996,36 @@ mod tests {
         );
         assert!(geometry.body.x > 0);
         assert_eq!(geometry.body.y, 0);
+        if check_history {
+            restarted.activate(second);
+            let end = restarted.editor().unwrap().document().snapshot().len();
+            restarted.editor_mut().unwrap().set_cursors(vec![crate::Cursor::caret(end)], 0).unwrap();
+            restarted.execute("edit.insert", &CommandArgs { text: Some("!".into()), ..Default::default() }, 1).unwrap();
+            assert!(restarted.editor().unwrap().document().revision() > 3, "new edits must not reuse historical IDs");
+            let mut live = Vec::new();
+            restarted.editor().unwrap().document().snapshot().write_to(&mut live).unwrap();
+            restarted.execute("edit.undo", &CommandArgs::default(), 3).unwrap();
+            restarted.execute("edit.undo", &CommandArgs::default(), 3).unwrap();
+            let mut undone = Vec::new();
+            restarted.editor().unwrap().document().snapshot().write_to(&mut undone).unwrap();
+            assert_eq!(
+                undone, b"one\ntwo\nthree\nfour\nfive\nsix\n",
+                "journal transitions must survive restart as undo"
+            );
+            restarted.execute("edit.undo", &CommandArgs::default(), 3).unwrap();
+            let mut oldest = Vec::new();
+            restarted.editor().unwrap().document().snapshot().write_to(&mut oldest).unwrap();
+            assert_eq!(oldest, undone, "recovery must not turn the original undo/redo into extra inverse edits");
+            assert!(restarted.editor().unwrap().document().is_dirty(), "unverified recovery is never implicitly saved");
+            restarted.execute("edit.redo", &CommandArgs::default(), 4).unwrap();
+            let mut redone = Vec::new();
+            restarted.editor().unwrap().document().snapshot().write_to(&mut redone).unwrap();
+            assert_eq!(redone, expected_bytes[&second]);
+            restarted.execute("edit.redo", &CommandArgs::default(), 4).unwrap();
+            let mut live_redone = Vec::new();
+            restarted.editor().unwrap().document().snapshot().write_to(&mut live_redone).unwrap();
+            assert_eq!(live_redone, live, "live redo must remain ordered behind the recovered redo");
+        }
         drop(restarted);
         wait_stopped(&receiver);
     }

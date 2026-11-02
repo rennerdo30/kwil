@@ -110,7 +110,16 @@ impl RecoveryAssembler {
         let root = self.buffer.snapshot().root;
         let origin_start = self.origins.len();
         let usage = self.usage;
-        RecoveryRevision { assembler: self, root, fragment: None, origin_start, usage, failed: false, committed: false }
+        RecoveryRevision {
+            assembler: self,
+            root,
+            fragment: None,
+            origin_start,
+            usage,
+            failed: false,
+            committed: false,
+            history: None,
+        }
     }
 
     /// Consume the registry on the worker and return a normal editable Buffer.
@@ -136,8 +145,47 @@ pub struct RecoveryRevision<'a> {
     usage: RecoveryUsage,
     failed: bool,
     committed: bool,
+    history: Option<(crate::undo::History, Snapshot)>,
 }
 impl RecoveryRevision<'_> {
+    /// Opt-in journal checkpoints, still private until the outer commit.
+    /// The ordinary undo cap evicts oldest transitions. Spilled snapshots are
+    /// excluded: their last-drop retirement must remain on the owning worker.
+    pub fn checkpoint_undo(
+        &mut self,
+        revisions: Option<(u64, u64)>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<()> {
+        let result = (|| {
+            self.ready()?;
+            poll(&mut cancelled)?;
+            if self.fragment.is_some() {
+                return Err(invalid("history checkpoint requires a complete fragment"));
+            }
+            let charge =
+                sum(&[tree_work(&self.root)?, self.assembler.origins.len().checked_mul(1024).ok_or_else(overflow)?])?;
+            let usage = self.reserve(0, 0, charge)?;
+            let next = Buffer::recovery_snapshot(self.root.clone());
+            poll(&mut cancelled)?;
+            let (mut history, previous) = self
+                .history
+                .take()
+                .unwrap_or_else(|| (crate::undo::History::new(self.assembler.limits.undo_memory_bytes), next.clone()));
+            if let Some((from, to)) = revisions
+                && previous.storage_resources().spilled_blocks == 0
+                && next.storage_resources().spilled_blocks == 0
+            {
+                history.record_recovered(previous, next.clone(), from, to);
+            } else {
+                history = crate::undo::History::new(self.assembler.limits.undo_memory_bytes);
+            }
+            self.history = Some((history, next));
+            self.usage = usage;
+            Ok(())
+        })();
+        self.checked(result)
+    }
+
     /// Cumulative admitted work staged by this revision, before publication.
     pub fn usage(&self) -> RecoveryUsage {
         self.usage
@@ -433,6 +481,9 @@ impl RecoveryRevision<'_> {
             let snapshot = Buffer::recovery_snapshot(self.root.take());
             poll(&mut cancelled)?;
             self.assembler.buffer.recovery_install(snapshot);
+            if let Some((history, _)) = self.history.take() {
+                self.assembler.buffer.history = history;
+            }
             self.assembler.usage = usage;
             self.committed = true;
             Ok(())
@@ -563,6 +614,45 @@ mod tests {
         snapshot.write_to(&mut out).unwrap();
         out
     }
+    #[test]
+    fn recovery_undo_checkpoints_obey_cap_spill_retirement_and_atomic_publication() {
+        for (cap, resident, expected) in [(1 << 20, 4096, true), (0, 4096, false), (1 << 20, 0, false)] {
+            let mut policy = limits();
+            policy.undo_memory_bytes = cap;
+            policy.add_memory_bytes = resident;
+            let mut assembler = RecoveryAssembler::new(policy).unwrap();
+            let mut revision = assembler.begin_revision();
+            revision.begin_fragment().unwrap();
+            revision.append_bytes(b"base", || false).unwrap();
+            revision.replace(0..0, || false).unwrap();
+            revision.checkpoint_undo(None, || false).unwrap();
+            revision.begin_fragment().unwrap();
+            revision.append_bytes(b"after", || false).unwrap();
+            revision.replace(4..4, || false).unwrap();
+            revision.checkpoint_undo(Some((0, 1)), || false).unwrap();
+            revision.commit(|| false).unwrap();
+            let mut buffer = assembler.finish(|| false).unwrap();
+            assert_eq!(buffer.undo(), expected);
+            if expected {
+                assert_eq!(bytes(&buffer.snapshot()), b"base");
+                assert!(buffer.redo());
+                assert_eq!(bytes(&buffer.snapshot()), b"baseafter");
+            }
+            assert!(buffer.undo_memory_bytes() <= cap);
+        }
+        let mut assembler = RecoveryAssembler::new(limits()).unwrap();
+        let mut revision = assembler.begin_revision();
+        revision.checkpoint_undo(None, || false).unwrap();
+        revision.begin_fragment().unwrap();
+        revision.append_bytes(b"uncommitted", || false).unwrap();
+        revision.replace(0..0, || false).unwrap();
+        revision.checkpoint_undo(Some((0, 1)), || false).unwrap();
+        assert!(revision.commit(|| true).is_err());
+        let mut buffer = assembler.finish(|| false).unwrap();
+        assert!(buffer.is_empty());
+        assert!(!buffer.undo());
+    }
+
     #[test]
     fn recovery_origin_preflight_allocates_nothing_and_refuses_before_registration() {
         let mut assembler = RecoveryAssembler::new(limits()).unwrap();

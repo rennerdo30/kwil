@@ -2006,8 +2006,7 @@ impl App {
             return;
         }
 
-        let result =
-            if discard { self.view.request_window_close(true) } else { self.view.request_window_close_with_prompt() };
+        let result = self.view.request_window_close(discard);
         if let Err(error) = result {
             self.view.set_notice(error.to_string());
         }

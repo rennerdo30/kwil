@@ -419,6 +419,7 @@ impl DocumentContinuationPermit {
                 | DocumentRequest::ExportUncompressed { .. }
                 | DocumentRequest::SaveRaw { .. }
                 | DocumentRequest::Persist(_)
+                | DocumentRequest::PersistTransient(_)
                 | DocumentRequest::SeedJournal { .. }
                 | DocumentRequest::FinishJournal { .. }
                 | DocumentRequest::FlushJournals

@@ -1125,12 +1125,34 @@ impl Editor {
         let old = self.cursor_rows()?;
         self.end_burst();
         self.trim_history();
+        let recovered_revision = self.document.buffer.recovered_history_revision(redo);
+        let before_snapshot = recovered_revision.map(|revision| (self.document.snapshot(), revision));
         let changed = if redo { self.document.buffer.redo() } else { self.document.buffer.undo() };
         if !changed {
             return Ok(Damage::default());
         }
         let mut edited = self.top..self.top + self.rows as u64;
-        if redo {
+        if let Some((before, revision)) = before_snapshot {
+            // Journal frames retain byte transitions, not historical selections
+            // or typing groups. Use the persisted identity and a complete replacement
+            // receipt so undo/redo itself remains crash-recoverable.
+            let after = self.document.snapshot();
+            let recipe =
+                Recipe::Explicit(Arc::new(vec![receipts::Shape { range: 0..before.len(), inserted: after.len() }]));
+            if self.document.path.is_none() && revision == self.document.saved_revision {
+                self.document.mark_unsaved();
+            }
+            self.document.revision = revision;
+            self.note_external_cursor_change();
+            for cursor in &mut self.cursors {
+                cursor.anchor = cursor.anchor.min(after.len());
+                cursor.head = cursor.head.min(after.len());
+                cursor.desired_column = None;
+            }
+            self.box_column = None;
+            self.normalize();
+            self.publish(Transition { before, after, recipe }, before_revision, self.document.revision, EditKind::Edit);
+        } else if redo {
             if let Some(entry) = self.redo.pop_back() {
                 if !entry.structural {
                     edited = entry.edited.clone();
