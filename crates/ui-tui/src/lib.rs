@@ -2761,7 +2761,7 @@ fn format_document(
         .map(|host| host.language_status(view).label())
         .filter(|language| *language != "Automatic")
         .map(str::to_owned);
-    if let Err(error) = view.format_command(selection, language) {
+    if let Err(error) = view.format_command(!selection, language) {
         view.set_notice(format!("Format: {error}"));
     }
 }
