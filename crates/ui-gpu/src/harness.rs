@@ -2273,9 +2273,12 @@ fn palette_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>, phase:
     let press = |app: &mut App, key, text| {
         app.key_after_settings(Some(el), &HostKey { logical_key: key, text, repeat: false });
     };
-    let text = |app: &mut App, value: &str| {
-        press(app, Key::Character(value.into()), Some(value));
-    };
+    fn text(app: &mut App, el: &ActiveEventLoop, value: &str) {
+        app.key_after_settings(
+            Some(el),
+            &HostKey { logical_key: Key::Character(value.into()), text: Some(value), repeat: false },
+        );
+    }
     let shoot = |app: &mut App, name| {
         assert!(app.render());
         capture(app, dir, name);
@@ -2296,7 +2299,7 @@ fn palette_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>, phase:
             app.user_event(el, UserEvent::SessionChanged(true));
             assert!(app.policy.remote());
             assert!(app.dispatch_palette("view.fileFinder"));
-            text(app, "palette-target");
+            text(app, el, "palette-target");
         }
         1 => {
             fresh(app);
@@ -2314,7 +2317,7 @@ fn palette_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>, phase:
             assert!(!app.view.document_busy(app.view.active_id()));
             shoot(app, "palette-opened.bmp");
             app.dispatch_palette("view.fileFinder");
-            text(app, ":3");
+            text(app, el, ":3");
             shoot(app, "palette-line.bmp");
             press(app, Key::Named(NamedKey::Enter), None);
         }
@@ -2323,7 +2326,7 @@ fn palette_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>, phase:
             assert_eq!(app.view.editor().unwrap().primary_cursor().head, 23);
             shoot(app, "palette-goto.bmp");
             app.dispatch_palette("view.commandPalette");
-            text(app, "New File");
+            text(app, el, "New File");
         }
         4 => {
             fresh(app);
@@ -2335,7 +2338,7 @@ fn palette_probe(app: &mut App, el: &ActiveEventLoop, dir: Option<&Path>, phase:
             assert!(app.view.editor().unwrap().document().path().is_none());
             shoot(app, "palette-new.bmp");
             app.dispatch_palette("view.fileFinder");
-            text(app, "#palette-target");
+            text(app, el, "#palette-target");
         }
         6 => {
             fresh(app);
