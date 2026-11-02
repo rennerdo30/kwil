@@ -215,6 +215,15 @@ pub struct IndexProgress {
 }
 
 impl TextFile {
+    /// Worker capture borrows the exact open generation, never a second path
+    /// lookup that could select a replacement file. No line index is built.
+    pub(crate) fn clone_capture_file(&self) -> Result<File, ReadError> {
+        self.bytes()?;
+        let file = self.shared._file.try_clone().map_err(ReadError::Io)?;
+        self.bytes()?;
+        Ok(file)
+    }
+
     /// Worker-only retirement seam. Close the shared mapping/handle only if no
     /// snapshot, buffer or reader retains it. Failure returns this owner intact
     /// so its private backing must remain available until a later worker event.

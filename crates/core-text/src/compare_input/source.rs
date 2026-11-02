@@ -133,6 +133,19 @@ pub struct NativeFileLease {
     validation_credit: u8,
 }
 impl NativeFileLease {
+    /// Clone the exact detected native generation without constructing a text
+    /// index. Seed the validation stamp before capture can start.
+    pub fn from_text_file(source: &crate::TextFile, identity: InputIdentity) -> Result<Self, InputError> {
+        let map = |e| match e {
+            crate::ReadError::Io(e) => InputError::Io(e),
+            crate::ReadError::Changed(_) => InputError::SourceChanged,
+        };
+        let file = source.clone_capture_file().map_err(map)?;
+        let stamp = Stamp::read(&file)?;
+        source.bytes().map_err(map)?;
+        Ok(Self { file: ManuallyDrop::new(Some(file)), identity, stamp: Some(stamp), at: 0, validation_credit: 0 })
+    }
+
     pub fn new(file: File, identity: InputIdentity) -> Self {
         Self { file: ManuallyDrop::new(Some(file)), identity, stamp: None, at: 0, validation_credit: 0 }
     }
@@ -478,6 +491,7 @@ pub struct DecodedNativeLease<A: Admission> {
     credit: AccessCredit,
     decoder_bytes: usize,
     decoder_ops: usize,
+    utf8_run: Option<usize>,
 }
 #[must_use]
 pub struct RejectedNative<A: Admission> {
@@ -527,6 +541,7 @@ impl<A: Admission> DecodedNativeLease<A> {
             credit: AccessCredit::default(),
             decoder_bytes: 0,
             decoder_ops: 0,
+            utf8_run: None,
         })
     }
     /// Worker only; return the complete native invocation handle and budget.
@@ -536,6 +551,39 @@ impl<A: Admission> DecodedNativeLease<A> {
         let mut aggregate = self.aggregate.take().unwrap();
         aggregate.release(Usage { resident: self.charged, ..Usage::default() });
         (native, aggregate)
+    }
+
+    // Canonical UTF-8 needs no original-byte alias. Publish validated plain
+    // runs, preserving malformed atoms and partial scalars for the shared
+    // decoder below. This avoids one spool write/index record per character.
+    // Validation and copying have separate resumable credits; neither Pending
+    // lane writes the caller's window.
+    fn utf8_run(&mut self, out: &mut [u8], work: &mut ReadWork, cancel: &AtomicBool) -> Step<Option<usize>> {
+        if self.utf8_run.is_none() {
+            let available = self.filled - self.next;
+            match self.credit.admit(available + 4, work, cancel) {
+                Ok(true) => {}
+                Ok(false) => return paused(cancel),
+                Err(e) => return Step::Failed(e.into()),
+            }
+            let bytes = &self.window.as_ref().unwrap()[self.next..self.filled];
+            let valid = std::str::from_utf8(bytes).map_or_else(|e| e.valid_up_to(), str::len);
+            let mut n = valid.min(out.len());
+            while n > 0 && n < valid && bytes[n] & 0xc0 == 0x80 { n -= 1; }
+            if n == 0 { return Step::Ready(None); }
+            self.utf8_run = Some(n);
+        }
+        let n = self.utf8_run.unwrap();
+        if out.len() < n { return Step::Failed(InputError::SourceContract); }
+        match self.credit.admit(n, work, cancel) {
+            Ok(true) => {}
+            Ok(false) => return paused(cancel),
+            Err(e) => return Step::Failed(e.into()),
+        }
+        out[..n].copy_from_slice(&self.window.as_ref().unwrap()[self.next..self.next+n]);
+        self.next += n;
+        self.utf8_run = None;
+        Step::Ready(Some(n))
     }
 
     fn fill_carry(&mut self, work: &mut ReadWork, cancel: &AtomicBool) -> Step<()> {
@@ -607,6 +655,17 @@ impl<A: Admission> SourceLease for DecodedNativeLease<A> {
                 Step::Pending => return Step::Pending,
                 Step::Cancelled => return Step::Cancelled,
                 Step::Failed(error) => return Step::Failed(error),
+            }
+            if self.atom.is_none() && self.carry_len == 0 && self.bom_checked
+                && self.interpretation.encoding == Encoding::UTF8 && self.next < self.filled
+            {
+                match self.utf8_run(logical, work, cancel) {
+                    Step::Ready(Some(n)) => return Step::Ready(Some(Captured { logical: n, original: 0, kind: CaptureKind::Text, encoding: 0 })),
+                    Step::Ready(None) => {},
+                    Step::Pending => return Step::Pending,
+                    Step::Cancelled => return Step::Cancelled,
+                    Step::Failed(e) => return Step::Failed(e),
+                }
             }
             if self.atom.is_none() {
                 match self.fill_carry(work, cancel) {
