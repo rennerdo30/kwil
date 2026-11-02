@@ -16,22 +16,19 @@ mod source;
 pub use source::READ_CHUNK;
 
 /// Files below this size are read into memory; larger ones are mapped
-/// (spec §5, "mmap safety").
+/// (spec Â§5, "mmap safety").
 pub const MAP_THRESHOLD: u64 = 64 << 20;
 
 /// Opening never falls back to a file-sized allocation above MAP_THRESHOLD.
 #[derive(Debug)]
 pub enum OpenError {
     Io(io::Error),
-    /// Mapping was refused. A bounded positioned-read source is a follow-up.
-    CannotMap(io::Error),
 }
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{e}"),
-            Self::CannotMap(e) => write!(f, "cannot map large file (positioned-read fallback not yet available): {e}"),
         }
     }
 }
@@ -39,7 +36,7 @@ impl std::fmt::Display for OpenError {
 impl std::error::Error for OpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(match self {
-            Self::Io(e) | Self::CannotMap(e) => e,
+            Self::Io(e) => e,
         })
     }
 }
@@ -54,7 +51,6 @@ impl From<OpenError> for io::Error {
     fn from(e: OpenError) -> Self {
         match e {
             OpenError::Io(e) => e,
-            e @ OpenError::CannotMap(_) => io::Error::other(e),
         }
     }
 }
@@ -150,14 +146,15 @@ fn identity(file: &File, _: &Metadata) -> io::Result<(u64, u64)> {
 
 enum Bytes {
     Owned(Vec<u8>),
-    Mapped(memmap2::Mmap),
+    Positioned,
 }
 
+#[cfg(test)]
 impl Bytes {
     fn as_slice(&self) -> &[u8] {
         match self {
             Bytes::Owned(v) => v,
-            Bytes::Mapped(m) => m,
+            Bytes::Positioned => panic!("positioned sources require a bounded range"),
         }
     }
 }
@@ -198,13 +195,8 @@ impl OriginalRef {
 /// An open file. The first screen is readable at once; the line index
 /// fills in on a background thread.
 ///
-/// Mapped views are not immutable snapshots of external writers. Frontends
-/// must call check() on watcher events. Read entry points also check on the
-/// thread doing the read, including indexing workers. On any change stop
-/// reading the old view and reopen; growth alone may use reopen_grown().
-/// Checking cannot close the TOCTOU race with an uncooperative writer
-/// truncating during a read. A future
-/// positioned-read source is needed for that stronger guarantee on Unix.
+/// External originals use positioned reads. Each bounded read checks the live
+/// identity, size and modification stamp before and after copying bytes.
 #[derive(Clone)]
 pub struct TextFile {
     shared: Arc<Shared>,
@@ -235,35 +227,17 @@ impl TextFile {
         Self::open_with_threshold(path, MAP_THRESHOLD)
     }
 
-    /// A worker-selected resident limit. Zero maps every nonempty file.
+    /// A worker-selected resident limit. Zero uses positioned reads for every nonempty file.
     pub fn open_with_threshold(path: &Path, threshold: u64) -> Result<Self, OpenError> {
-        Self::open_with_policy(path, false, threshold, |f| {
-            // SAFETY: callers obey the mapped-view contract documented above.
-            // This check does not synchronize with concurrent external writers.
-            unsafe { memmap2::Mmap::map(f) }
-        })
+        Self::open_with_policy(path, false, threshold)
     }
 
-    #[cfg(test)]
-    fn open_with_mapper(path: &Path, map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>) -> Result<Self, OpenError> {
-        Self::open_with_policy(path, false, MAP_THRESHOLD, map)
-    }
-
-    /// Saved originals remain file-backed even below the normal mapping
-    /// threshold, so undo never retains another full resident copy per save.
+    /// Saved versions remain file-backed, even below the resident threshold.
     pub fn open_saved_version(path: &Path) -> Result<Self, OpenError> {
-        Self::open_with_policy(path, true, MAP_THRESHOLD, |file| {
-            // SAFETY: saved versions obey TextFile's checked mapped-view contract.
-            unsafe { memmap2::Mmap::map(file) }
-        })
+        Self::open_with_policy(path, true, MAP_THRESHOLD)
     }
 
-    fn open_with_policy(
-        path: &Path,
-        map_small: bool,
-        threshold: u64,
-        map: impl FnOnce(&File) -> io::Result<memmap2::Mmap>,
-    ) -> Result<Self, OpenError> {
+    fn open_with_policy(path: &Path, file_backed: bool, threshold: u64) -> Result<Self, OpenError> {
         let path = std::path::absolute(path)?;
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
@@ -276,16 +250,16 @@ impl TextFile {
         let mut f = options.open(&path)?;
         let stamp = Stamp::read(&f)?;
         let len = stamp.len;
-        let bytes = if len == 0 || !map_small && len < threshold {
+        let bytes = if len == 0 || !file_backed && len < threshold {
             let mut v = Vec::new();
             v.try_reserve_exact(len as usize).map_err(io::Error::other)?;
             // Bound the read even if the file grows after metadata was read.
             (&mut f).take(len).read_to_end(&mut v)?;
             Bytes::Owned(v)
         } else {
-            Bytes::Mapped(map(&f).map_err(OpenError::CannotMap)?)
+            Bytes::Positioned
         };
-        if Stamp::read(&f)? != stamp || bytes.as_slice().len() as u64 != len {
+        if Stamp::read(&f)? != stamp || matches!(&bytes, Bytes::Owned(v) if v.len() as u64 != len) {
             return Err(io::Error::other("file changed while opening; retry").into());
         }
         Ok(TextFile {
@@ -351,7 +325,7 @@ impl TextFile {
         &self.shared.path
     }
 
-    /// The bytes were copied at open (below MAP_THRESHOLD), not mapped.
+    /// The bytes were copied at open (below MAP_THRESHOLD).
     pub fn is_resident(&self) -> bool {
         matches!(self.shared.bytes, Bytes::Owned(_))
     }
@@ -371,7 +345,7 @@ impl TextFile {
     pub fn resident_original_bytes(&self) -> usize {
         match &self.shared.bytes {
             Bytes::Owned(bytes) => bytes.len(),
-            Bytes::Mapped(_) => 0,
+            Bytes::Positioned => 0,
         }
     }
 
@@ -397,7 +371,9 @@ impl TextFile {
         }
         if let Some(index) = self.index() {
             let mut index = index.clone();
-            index.extend(next.bytes().map_err(io::Error::other)?, self.len())?;
+            index.extend_reader(next.len(), self.len(), crate::INDEX_MEMORY_BYTES, |r| {
+                next.read_range(r).map_err(io::Error::other)
+            })?;
             let _ = next.shared.index.set(index);
             next.shared.scanned.store(next.len(), Ordering::Relaxed);
         }
@@ -407,32 +383,23 @@ impl TextFile {
     /// Bounded binary heuristic, sampled once on first use (at most 128 KiB).
     /// Validates even when the classification is already cached.
     pub fn kind(&self) -> Result<FileKind, ReadError> {
-        let bytes = self.bytes()?;
-        Ok(*self.shared.kind.get_or_init(|| detect_kind(bytes)))
+        self.validate_source()?;
+        if let Some(kind) = self.shared.kind.get() {
+            return Ok(*kind);
+        }
+        let mut bytes = self.read_range(0..self.len().min(64 << 10))?.into_owned();
+        let last = self.len().saturating_sub(64 << 10).max(bytes.len() as u64);
+        bytes.extend_from_slice(&self.read_range(last..self.len())?);
+        let kind = detect_kind(&bytes);
+        let _ = self.shared.kind.set(kind);
+        Ok(kind)
     }
 
-    /// Checks metadata and identity before exposing a region. Do not retain
-    /// this slice across a wake-up; the check cannot prevent a concurrent
-    /// external truncation while the slice is being read.
-    pub fn bytes(&self) -> Result<&[u8], ReadError> {
-        if let Some(result) = read_batch::admitted(self) {
-            result?;
-            return Ok(self.shared.bytes.as_slice());
-        }
-        match self.check_source().map_err(ReadError::Io)? {
-            FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
-            state => Err(ReadError::Changed(state)),
-        }
-    }
-
-    /// Worker capture only, after its caller has admitted the fixed source
-    /// check and temporary handle. Bypass the UI command's read-batch cache:
-    /// it can grow a HashMap and must never retain admission across worker
-    /// quota pauses. The live source check and mapped-read caveat are unchanged.
-    pub(crate) fn worker_bytes(&self) -> Result<&[u8], ReadError> {
-        match self.observe_check(self.check_source_live()).map_err(ReadError::Io)? {
-            FileState::Unchanged => Ok(self.shared.bytes.as_slice()),
-            state => Err(ReadError::Changed(state)),
+    #[cfg(test)]
+    fn bytes(&self) -> Result<&[u8], ReadError> {
+        match self.read_range(0..self.len())? {
+            std::borrow::Cow::Borrowed(bytes) => Ok(bytes),
+            _ => panic!("test helper requires resident bytes"),
         }
     }
 
@@ -477,7 +444,7 @@ impl TextFile {
     /// Worker admission override, useful on constrained hosts. A failed build
     /// retains no partial index and can be retried with a different limit.
     pub fn build_index_with_memory_limit(&self, threads: usize, limit: usize) -> Result<&LineIndex, ReadError> {
-        let bytes = self.bytes()?;
+        self.validate_source()?;
         let s = &self.shared;
         if let Some(index) = s.index.get() {
             return Ok(index);
@@ -485,8 +452,12 @@ impl TextFile {
         let _build = s.index_build.lock().map_err(|_| ReadError::Io(io::Error::other("line index lock poisoned")))?;
         if s.index.get().is_none() {
             s.scanned.store(0, Ordering::Relaxed);
-            let index = LineIndex::build_with_memory_limit(bytes, DEFAULT_EVERY, threads, &s.scanned, limit)
-                .map_err(ReadError::Io)?;
+            let result =
+                LineIndex::build_reader(self.len(), DEFAULT_EVERY, 16 << 20, threads, &s.scanned, limit, |r| {
+                    self.read_range(r).map_err(io::Error::other)
+                });
+            self.validate_source()?;
+            let index = result.map_err(ReadError::Io)?;
             let _ = s.index.set(index);
         }
         Ok(s.index.get().unwrap())
@@ -502,17 +473,38 @@ impl TextFile {
 
     /// Up to `count` lines from the start, without the index. Used to paint
     /// the first screen before any full pass.
-    pub fn first_lines(&self, count: usize) -> Result<Vec<&[u8]>, ReadError> {
-        Ok(lines_from(self.bytes()?, 0, count))
+    pub fn first_lines(&self, count: usize) -> Result<Vec<Vec<u8>>, ReadError> {
+        self.lines_at(0, count)
     }
 
-    /// Up to `count` lines starting at `line`. `None` until the index is
-    /// ready (callers keep showing what they have).
-    pub fn lines(&self, line: u64, count: usize) -> Result<Option<Vec<&[u8]>>, ReadError> {
-        let bytes = self.bytes()?;
-        let Some(index) = self.index() else { return Ok(None) };
-        let Some(start) = index.line_start(bytes, line) else { return Ok(None) };
-        Ok(Some(lines_from(bytes, start as usize, count)))
+    pub fn line_start(&self, line: u64) -> Result<Option<u64>, ReadError> {
+        self.validate_source()?;
+        self.index()
+            .expect("indexed original")
+            .start_reader(line, |r| self.read_range(r).map(|b| b.into_owned()).map_err(io::Error::other))
+            .map_err(ReadError::Io)
+    }
+
+    pub fn line_of_offset(&self, at: u64) -> Result<Option<u64>, ReadError> {
+        self.validate_source()?;
+        self.index()
+            .expect("indexed original")
+            .rank_reader(at, |r| self.read_range(r).map(|b| b.into_owned()).map_err(io::Error::other))
+            .map_err(ReadError::Io)
+    }
+
+    pub fn lines(&self, line: u64, count: usize) -> Result<Option<Vec<Vec<u8>>>, ReadError> {
+        self.validate_source()?;
+        if self.index().is_none() {
+            return Ok(None);
+        }
+        let Some(start) = self.line_start(line)? else { return Ok(None) };
+        self.lines_at(start, count).map(Some)
+    }
+
+    fn lines_at(&self, start: u64, count: usize) -> Result<Vec<Vec<u8>>, ReadError> {
+        let bytes = self.read_range(start..self.len().min(start.saturating_add(READ_CHUNK as u64)))?;
+        Ok(lines_from(&bytes, 0, count).into_iter().map(<[u8]>::to_vec).collect())
     }
 }
 
@@ -699,28 +691,24 @@ mod tests {
     }
 
     #[test]
-    fn mapping_refusal_never_reads_large_file() {
+    fn large_original_uses_positioned_reads() {
         // Sparse fixture above 1 MB stays in ignored fixtures/ per repo rules.
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         std::fs::create_dir_all(&root).unwrap();
         let dir = TempDir(root.join(format!("kw9-map-{}", std::process::id())));
         std::fs::create_dir(&dir.0).unwrap();
         let path = dir.file(b"small");
-        let small = TextFile::open_with_mapper(&path, |_| panic!("small file must not map")).unwrap();
+        let small = TextFile::open(&path).unwrap();
         assert!(matches!(small.shared.bytes, Bytes::Owned(_)));
         File::options().write(true).open(&path).unwrap().set_len(MAP_THRESHOLD).unwrap();
-        let error = TextFile::open_with_mapper(&path, |_| {
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "mapping refused"))
-        });
-        assert!(matches!(error, Err(OpenError::CannotMap(_))));
         let mapped = TextFile::open(&path).unwrap();
-        assert!(matches!(mapped.shared.bytes, Bytes::Mapped(_)));
+        assert!(matches!(mapped.shared.bytes, Bytes::Positioned));
         assert_eq!(mapped.check().unwrap(), FileState::Unchanged);
         mapped.build_index(2).unwrap();
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"\nappended").unwrap();
         assert_eq!(mapped.check().unwrap(), FileState::Grown { new_len: MAP_THRESHOLD + 9 });
         let grown = mapped.reopen_grown().unwrap();
-        assert!(matches!(grown.shared.bytes, Bytes::Mapped(_)));
+        assert!(matches!(grown.shared.bytes, Bytes::Positioned));
         assert_eq!(grown.index().unwrap().line_count(), 2);
         assert_eq!(grown.lines(1, 1).unwrap().unwrap(), vec![b"appended".as_slice()]);
     }
@@ -731,7 +719,7 @@ mod tests {
         for bytes in [
             b"".as_slice(),
             b"hello\tworld\r\n",
-            "日本語 🦀".as_bytes(),
+            "æ—¥æœ¬èªž ðŸ¦€".as_bytes(),
             b"\xff\xfeh\0i\0",
             b"\xfe\xff\0h\0i",
             b"\xef\xbb\xbfUTF-8",
@@ -833,13 +821,13 @@ mod tests {
 
     #[test]
     fn kind_detects_bomless_utf16_le() {
-        let bytes: Vec<_> = "Hello world!\r\nCafé\t日本語".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let bytes: Vec<_> = "Hello world!\r\nCafÃ©\tæ—¥æœ¬èªž".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(detect_kind(&bytes), FileKind::Text);
     }
 
     #[test]
     fn kind_detects_bomless_utf16_be() {
-        let text = "Hello world!\r\nCafé\t日本語".repeat(4096);
+        let text = "Hello world!\r\nCafÃ©\tæ—¥æœ¬èªž".repeat(4096);
         let bytes: Vec<_> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
         assert_eq!(detect_kind(&bytes), FileKind::Text);
     }

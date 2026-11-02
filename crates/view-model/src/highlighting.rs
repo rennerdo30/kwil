@@ -145,7 +145,7 @@ impl TextSource for SnapshotTextSource {
         let end = self.len().min(offset.saturating_add(max_len.min(SOURCE_CHUNK_BYTES)));
         let first = self.snapshot.chunks(offset as u64..end as u64)?.next();
         match first {
-            Some(bytes) => Ok(Cow::Borrowed(bytes.map_err(io::Error::other)?)),
+            Some(bytes) => bytes.map_err(io::Error::other),
             None => Ok(Cow::Borrowed(b"")),
         }
     }

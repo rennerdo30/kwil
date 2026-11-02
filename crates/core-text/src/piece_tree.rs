@@ -507,7 +507,7 @@ impl Drop for Storage {
 impl Storage {
     fn bytes(&self) -> Result<&[u8], ReadError> {
         Ok(match self {
-            Self::Original(file) => file.bytes()?,
+            Self::Original(_) => return Err(ReadError::Io(io::Error::other("original requires a bounded range"))),
             Self::Decoded(source) => source.origin.logical_bytes(),
             Self::Memory { bytes, .. } => bytes,
             Self::Disk(block) => block.map.as_ref().expect("mapped add block"),
@@ -515,11 +515,30 @@ impl Storage {
         })
     }
 
+    fn read(&self, range: Range<u64>) -> Result<std::borrow::Cow<'_, [u8]>, ReadError> {
+        match self {
+            Self::Original(file) => file.read_range(range),
+            _ => Ok(std::borrow::Cow::Borrowed(&self.bytes()?[range.start as usize..range.end as usize])),
+        }
+    }
+    fn edge_range(&self, range: Range<u64>) -> Result<(bool, bool), ReadError> {
+        if range.is_empty() {
+            return Ok((false, false));
+        }
+        Ok((self.read(range.start..range.start + 1)?[0] == b'\n', self.read(range.end - 1..range.end)?[0] == b'\r'))
+    }
+    fn split_crlf(&self, at: u64) -> Result<bool, ReadError> {
+        if at == 0 {
+            return Ok(false);
+        }
+        let len = worker_layout::storage_len(self);
+        let bytes = self.read(at - 1..(at + 1).min(len))?;
+        Ok(split_crlf(&bytes, 1))
+    }
+
     fn rank(&self, offset: u64) -> Result<u64, ReadError> {
         Ok(match self {
-            Self::Original(file) => {
-                file.index().expect("indexed original").line_of_offset(file.bytes()?, offset).unwrap()
-            }
+            Self::Original(file) => file.line_of_offset(offset)?.unwrap(),
             Self::Decoded(source) => source.index.line_of_offset(source.origin.logical_bytes(), offset).unwrap(),
             // Added pieces never scan more than ADD_BLOCK bytes.
             _ => ends(self.bytes()?, 0..offset as usize).count() as u64,
@@ -528,7 +547,7 @@ impl Storage {
 
     fn line_start(&self, line: u64) -> Result<u64, ReadError> {
         Ok(match self {
-            Self::Original(file) => file.index().unwrap().line_start(file.bytes()?, line).unwrap(),
+            Self::Original(file) => file.line_start(line)?.unwrap(),
             Self::Decoded(source) => source.index.line_start(source.origin.logical_bytes(), line).unwrap(),
             _ if line == 0 => 0,
             _ => ends(self.bytes()?, 0..self.bytes()?.len()).nth((line - 1) as usize).unwrap() as u64,
@@ -604,25 +623,24 @@ impl Piece {
         if !self.edges.1 {
             return Ok(0);
         }
-        Ok(u64::from(split_crlf(self.storage.bytes()?, self.end as usize)))
+        Ok(u64::from(self.storage.split_crlf(self.end)?))
     }
     fn split(&self, at: u64) -> Result<(Self, Self), ReadError> {
         let middle = self.start + at;
         let line = self.storage.rank(middle)?;
-        let bytes = self.storage.bytes()?;
-        let correction = u64::from(split_crlf(bytes, middle as usize));
+        let correction = u64::from(self.storage.split_crlf(middle)?);
         Ok((
             Self {
                 end: middle,
                 breaks: line - self.first_line + correction,
-                edges: edges(&bytes[self.start as usize..middle as usize]),
+                edges: self.storage.edge_range(self.start..middle)?,
                 ..self.clone()
             },
             Self {
                 start: middle,
                 first_line: line,
                 breaks: self.first_line + self.breaks - line,
-                edges: edges(&bytes[middle as usize..self.end as usize]),
+                edges: self.storage.edge_range(middle..self.end)?,
                 ..self.clone()
             },
         ))
@@ -796,7 +814,7 @@ pub(crate) fn original(file: TextFile, owner: Arc<()>) -> Result<Tree, ReadError
         return Ok(None);
     }
     let len = file.len();
-    let edges = edges(file.bytes()?);
+    let edges = (file.read_range(0..1)?[0] == b'\n', file.read_range(len - 1..len)?[0] == b'\r');
     Ok(Some(leaf(Piece {
         storage: Arc::new(Storage::Original(file)),
         owner: Some(owner),
@@ -1480,8 +1498,13 @@ fn import_observed(tree: Tree, budget: &Arc<AddBudget>, owner: &Arc<()>, visit: 
                 Storage::Opaque { .. } => unreachable!(),
             };
             if foreign {
-                let bytes = piece.storage.bytes().map_err(io::Error::other)?;
-                added(&bytes[piece.start as usize..piece.end as usize], budget)
+                let mut result = None;
+                for start in (piece.start..piece.end).step_by(ADD_BLOCK) {
+                    let end = (start + ADD_BLOCK as u64).min(piece.end);
+                    let bytes = piece.storage.read(start..end).map_err(io::Error::other)?;
+                    result = join(result, added(&bytes, budget)?);
+                }
+                Ok(result)
             } else {
                 Ok(Some(node))
             }
@@ -2107,18 +2130,25 @@ impl WorkerAllocation {
                         return Err(crate::worker_edit::invalid("foreign source owner"));
                     }
                     storage_check(&piece.storage)?;
-                    let data = piece.storage.bytes().map_err(io::Error::other)?;
-                    if piece.start > piece.end || piece.end > data.len() as u64 {
+                    if piece.start > piece.end || piece.end > worker_layout::storage_len(&piece.storage) {
                         return Err(crate::worker_edit::invalid("candidate piece range"));
                     }
                     if let Storage::Decoded(source) = piece.storage.as_ref() {
                         crate::decoded_piece::validate_range(&source.origin, piece.start..piece.end)?;
                     } else if let Storage::Opaque { offsets, .. } = piece.storage.as_ref() {
                         let offsets = offsets.bytes().map_err(io::Error::other)?;
-                        validate_detached_endpoint(data, offsets, piece.start as usize)?;
-                        validate_detached_endpoint(data, offsets, piece.end as usize)?;
+                        validate_detached_endpoint(
+                            piece.storage.bytes().map_err(io::Error::other)?,
+                            offsets,
+                            piece.start as usize,
+                        )?;
+                        validate_detached_endpoint(
+                            piece.storage.bytes().map_err(io::Error::other)?,
+                            offsets,
+                            piece.end as usize,
+                        )?;
                     }
-                    for _ in data[piece.start as usize..piece.end as usize].chunks(ADD_BLOCK) {
+                    for _ in (piece.start..piece.end).step_by(ADD_BLOCK) {
                         crate::worker_edit::poll(cancelled)?;
                     }
                     let breaks = piece
@@ -2129,7 +2159,7 @@ impl WorkerAllocation {
                         .ok_or_else(crate::worker_edit::overflow)?
                         + piece.end_correction().map_err(io::Error::other)?;
                     if breaks != piece.breaks
-                        || piece.edges != edges(&data[piece.start as usize..piece.end as usize])
+                        || piece.edges != piece.storage.edge_range(piece.start..piece.end).map_err(io::Error::other)?
                         || node.metrics.edges != piece.edges
                     {
                         return Err(crate::worker_edit::invalid("candidate line metrics"));
@@ -2459,8 +2489,16 @@ pub(crate) fn worker_import(
                 }
                 _ => {
                     // COPY foreign spills too, even Free/all-spilled leaves.
-                    let bytes = piece.storage.bytes().map_err(io::Error::other)?;
-                    worker_added(&bytes[piece.start as usize..piece.end as usize], budget, allocation, cancelled)
+                    let mut result = None;
+                    for start in (piece.start..piece.end).step_by(ADD_BLOCK) {
+                        crate::worker_edit::poll(cancelled)?;
+                        let bytes = piece
+                            .storage
+                            .read(start..(start + ADD_BLOCK as u64).min(piece.end))
+                            .map_err(io::Error::other)?;
+                        result = join(result, worker_added(&bytes, budget, allocation, cancelled)?);
+                    }
+                    Ok(result)
                 }
             }
         }
@@ -2582,8 +2620,9 @@ pub struct Chunks<'a> {
 pub enum SourceChunk<'a> {
     Original {
         file: &'a TextFile,
+        piece_range: Range<u64>,
         range: Range<u64>,
-        bytes: &'a [u8],
+        bytes: std::borrow::Cow<'a, [u8]>,
     },
     /// Logical UTF-8 coordinates in this immutable decoded generation. Its
     /// typed opaque atoms retain their original bytes, independently of BOMs.
@@ -2771,6 +2810,27 @@ impl<'a> SourceChunks<'a> {
                 Kind::Leaf(piece) => {
                     let start = piece.start + self.chunks.range.start.saturating_sub(offset);
                     let end = piece.start + (self.chunks.range.end - offset).min(node.metrics.bytes);
+                    let end = if matches!(piece.storage.as_ref(), Storage::Original(_)) {
+                        end.min(start + crate::READ_CHUNK as u64)
+                    } else {
+                        end
+                    };
+                    if end < piece.start + (self.chunks.range.end - offset).min(node.metrics.bytes) {
+                        self.chunks.stack.push((node, offset));
+                        self.chunks.range.start = offset + end - piece.start;
+                    }
+                    if let Storage::Original(file) = piece.storage.as_ref() {
+                        let result = file.read_range(start..end).map(|bytes| SourceChunk::Original {
+                            file,
+                            piece_range: piece.start..piece.end,
+                            range: start..end,
+                            bytes,
+                        });
+                        if result.is_err() {
+                            self.chunks.stack.clear();
+                        }
+                        return Ok(Some(result));
+                    }
                     let result = if let Storage::Opaque { encoding, raw, offsets, .. } = &*piece.storage {
                         let payloads =
                             piece.storage.bytes().and_then(|bytes| Ok((bytes, raw.bytes()?, offsets.bytes()?)));
@@ -2794,7 +2854,7 @@ impl<'a> SourceChunks<'a> {
                         piece.storage.bytes().map(|bytes| {
                             let bytes = &bytes[start as usize..end as usize];
                             match piece.storage.as_ref() {
-                                Storage::Original(file) => SourceChunk::Original { file, range: start..end, bytes },
+                                Storage::Original(_) => unreachable!(),
                                 Storage::Decoded(source) => {
                                     SourceChunk::Decoded { origin: &source.origin, range: start..end, bytes }
                                 }
@@ -2837,7 +2897,7 @@ impl<'a> Chunks<'a> {
 }
 
 impl<'a> Iterator for Chunks<'a> {
-    type Item = Result<&'a [u8], ReadError>;
+    type Item = Result<std::borrow::Cow<'a, [u8]>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some((node, offset)) = self.stack.pop() {
@@ -2851,14 +2911,16 @@ impl<'a> Iterator for Chunks<'a> {
                 }
                 Kind::Leaf(piece) => {
                     let start = self.range.start.saturating_sub(offset);
-                    let end = (self.range.end - offset).min(node.metrics.bytes);
-                    let bytes = piece.storage.bytes();
+                    let end = (self.range.end - offset).min(node.metrics.bytes).min(start + crate::READ_CHUNK as u64);
+                    if end < (self.range.end - offset).min(node.metrics.bytes) {
+                        self.stack.push((node, offset));
+                        self.range.start = offset + end;
+                    }
+                    let bytes = piece.storage.read(piece.start + start..piece.start + end);
                     if bytes.is_err() {
                         self.stack.clear();
                     }
-                    return Some(
-                        bytes.map(|bytes| &bytes[(piece.start + start) as usize..(piece.start + end) as usize]),
-                    );
+                    return Some(bytes);
                 }
             }
         }

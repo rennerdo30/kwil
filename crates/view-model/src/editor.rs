@@ -324,7 +324,7 @@ impl ClipboardData {
                 writer.write_all(b"\n")?;
             }
             for chunk in self.snapshot.chunks(range.clone())? {
-                writer.write_all(chunk.map_err(io::Error::other)?)?;
+                writer.write_all(&chunk.map_err(io::Error::other)?)?;
             }
         }
         Ok(())

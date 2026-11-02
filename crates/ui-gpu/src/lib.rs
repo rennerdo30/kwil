@@ -2962,7 +2962,7 @@ fn horizontal_extent(view: &View, columns: usize, tab_size: usize) -> (u64, u64)
             let tail = (|| -> std::io::Result<Vec<u8>> {
                 let mut tail = Vec::with_capacity((range.end - context) as usize);
                 for chunk in snapshot.chunks(context..range.end)? {
-                    tail.extend_from_slice(chunk.map_err(std::io::Error::other)?);
+                    tail.extend_from_slice(&chunk.map_err(std::io::Error::other)?);
                 }
                 Ok(tail)
             })();

@@ -323,7 +323,7 @@ fn sync_parent_with<Directory>(
 
 fn write_range(snapshot: &Snapshot, range: Range<u64>, writer: &mut impl std::io::Write) -> io::Result<()> {
     for chunk in snapshot.chunks(range)? {
-        writer.write_all(chunk.map_err(io::Error::other)?)?;
+        writer.write_all(&chunk.map_err(io::Error::other)?)?;
     }
     Ok(())
 }
@@ -840,7 +840,7 @@ mod tests {
             |file| {
                 assert!(!open_fails, "failed reopen cannot reach indexing");
                 assert_eq!(file.path(), path);
-                assert_eq!(file.bytes().unwrap(), b"new original");
+                assert_eq!(file.read_range(0..file.len()).unwrap(), b"new original");
                 Err(io::Error::new(io::ErrorKind::InvalidData, "injected saved-checkpoint index failure"))
             },
         )

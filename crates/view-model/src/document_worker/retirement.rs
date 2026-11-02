@@ -482,7 +482,7 @@ fn require_unchanged(file: &TextFile) -> io::Result<()> {
 
 pub(super) fn source_format(file: &TextFile) -> io::Result<DetectedFormat> {
     require_unchanged(file)?;
-    let bytes = file.bytes().map_err(io::Error::other)?;
+    let bytes = file.read_range(0..file.len().min(8)).map_err(io::Error::other)?;
     Ok(detect_magic(&bytes[..bytes.len().min(8)]))
 }
 

@@ -276,7 +276,20 @@ pub struct Detection {
 /// is the authoritative user override. Incomplete UTF-8 at artificial sample
 /// edges is excluded from validation, not mistaken for a legacy encoding.
 pub fn detect(file: &TextFile) -> Result<Detection, EncodingError> {
-    detect_bytes(file.bytes()?, None)
+    detect_file(file, None)
+}
+
+fn detect_file(file: &TextFile, chosen: Option<Encoding>) -> Result<Detection, EncodingError> {
+    if file.len() <= (2 * SAMPLE) as u64 {
+        return detect_bytes(&file.read_range(0..file.len())?, chosen);
+    }
+    let mut bytes = file.read_range(0..SAMPLE as u64)?.into_owned();
+    // Keep the last sample's code-unit parity and artificial edge semantics.
+    for _ in 0..file.len() % 4 {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&file.read_range(file.len() - SAMPLE as u64..file.len())?);
+    detect_bytes(&bytes, chosen)
 }
 
 fn samples(bytes: &[u8]) -> [Range<usize>; 2] {
@@ -424,7 +437,7 @@ fn for_breaks(bytes: &[u8], start: usize, end: usize, encoding: Encoding, mut em
 #[derive(Debug, PartialEq, Eq)]
 pub enum DisplaySegment<'a> {
     Text(Cow<'a, str>),
-    Invalid(&'a [u8]),
+    Invalid(Cow<'a, [u8]>),
 }
 
 pub fn utf8_segments<'a>(mut bytes: &'a [u8], mut emit: impl FnMut(DisplaySegment<'a>)) {
@@ -440,7 +453,7 @@ pub fn utf8_segments<'a>(mut bytes: &'a [u8], mut emit: impl FnMut(DisplaySegmen
                     emit(DisplaySegment::Text(Cow::Borrowed(std::str::from_utf8(&bytes[..valid]).unwrap())));
                 }
                 let invalid = error.error_len().unwrap_or(bytes.len() - valid);
-                emit(DisplaySegment::Invalid(&bytes[valid..valid + invalid]));
+                emit(DisplaySegment::Invalid(Cow::Borrowed(&bytes[valid..valid + invalid])));
                 bytes = &bytes[valid + invalid..];
             }
         }
@@ -505,7 +518,7 @@ impl EncodedFile {
     /// Explicit interpretation, including recovery when automatic detection
     /// refuses an ambiguous BOM or an unsupported detected encoding.
     pub fn new_with_encoding(file: TextFile, encoding: Encoding) -> Result<Self, EncodingError> {
-        let detection = detect_bytes(file.bytes()?, Some(encoding))?;
+        let detection = detect_file(&file, Some(encoding))?;
         Ok(Self::with_detection(file, detection))
     }
     fn with_detection(file: TextFile, detection: Detection) -> Self {
@@ -524,7 +537,7 @@ impl EncodedFile {
     /// Reinterpret original bytes, without editing them. Indexes are tied to
     /// the interpretation; previous clones keep their own interpretation.
     pub fn reinterpret(&self, encoding: Encoding) -> Result<Self, EncodingError> {
-        Ok(Self::with_detection(self.file.clone(), detect_bytes(self.file.bytes()?, Some(encoding))?))
+        Ok(Self::with_detection(self.file.clone(), detect_file(&self.file, Some(encoding))?))
     }
     pub fn index(&self) -> Option<&DecodeIndex> {
         self.index.ready.get()
@@ -547,7 +560,7 @@ impl EncodedFile {
     }
 
     pub fn build_index_with_memory_limit(&self, limit: usize) -> Result<&DecodeIndex, EncodingError> {
-        let bytes = self.file.bytes()?;
+        self.file.validate_source()?;
         if let Some(index) = self.index() {
             return Ok(index);
         }
@@ -566,13 +579,15 @@ impl EncodedFile {
         })?;
         let mut line_count = 1;
         let mut line_start = self.detection.bom_len as u64;
-        let mut at = self.detection.bom_len;
-        while at < bytes.len() {
-            // Recheck once per region before touching mapping pages.
-            let bytes = self.file.bytes()?;
+        let mut offset = self.detection.bom_len as u64;
+        while offset < self.file.len() {
+            let width = encoding.fixed_width();
+            let base = offset.saturating_sub(width as u64);
+            let bytes = self.file.read_range(base..(offset + STRIDE as u64 + 8).min(self.file.len()))?;
+            let at = (offset - base) as usize;
             let mut end = (at + STRIDE).min(bytes.len());
             if encoding.utf16() {
-                end = utf16_boundary(bytes, end, encoding);
+                end = utf16_boundary(&bytes, end, encoding);
             } else if encoding.utf32() {
                 // Complete units are restartable even when malformed. Only the
                 // real EOF may end with a 1..3 byte opaque tail.
@@ -590,9 +605,9 @@ impl EncodedFile {
             }
             // Keep CRLF together in both the line and byte checkpoints.
             let width = encoding.fixed_width();
-            let cr = end >= width && end.is_multiple_of(width) && encoding.unit(bytes, end - width) == Some(13);
+            let cr = end >= width && end.is_multiple_of(width) && encoding.unit(&bytes, end - width) == Some(13);
             if cr && end + width <= bytes.len() {
-                let lf = encoding.unit(bytes, end) == Some(10);
+                let lf = encoding.unit(&bytes, end) == Some(10);
                 if lf {
                     if width == 1 {
                         discard(&mut decoder, &bytes[end..end + width]);
@@ -600,23 +615,24 @@ impl EncodedFile {
                     end += width;
                 }
             }
-            for_breaks(bytes, at, end, encoding, |offset, _| {
+            for_breaks(&bytes, at, end, encoding, |offset, _| {
                 line_count += 1;
-                line_start = offset as u64;
+                line_start = base + offset as u64;
             });
-            at = end;
-            if at < bytes.len() {
-                checkpoints.push(Checkpoint { offset: at as u64, line: line_count - 1, line_start })?;
+            offset = base + end as u64;
+            if offset < self.file.len() {
+                checkpoints.push(Checkpoint { offset, line: line_count - 1, line_start })?;
             }
-            self.index.scanned.store(at as u64, Ordering::Relaxed);
+            self.index.scanned.store(offset, Ordering::Relaxed);
         }
+        self.file.validate_source()?;
         self.index.scanned.store(self.file.len(), Ordering::Relaxed);
         let _ = self.index.ready.set(DecodeIndex { checkpoints: checkpoints.into_vec(), line_count });
         Ok(self.index().unwrap())
     }
 
     pub fn line_start(&self, line: u64) -> Result<Option<u64>, EncodingError> {
-        let bytes = self.file.bytes()?;
+        self.file.validate_source()?;
         let index = self.index().ok_or(EncodingError::IndexNotReady)?;
         if line >= index.line_count {
             return Ok(None);
@@ -632,13 +648,14 @@ impl EncodedFile {
         // preceding line is gigabytes long;
         // no strings or per-line allocations even for a giant line.
         let mut start = checkpoint.offset as usize;
-        while start < bytes.len() && found.is_none() {
-            let bytes = self.file.bytes()?;
-            let end = (start + STRIDE).min(bytes.len());
-            for_breaks(bytes, start, end, self.detection.encoding, |at, _| {
+        while (start as u64) < self.file.len() && found.is_none() {
+            let base = start.saturating_sub(self.detection.encoding.fixed_width());
+            let bytes = self.file.read_range(base as u64..(start as u64 + STRIDE as u64 + 4).min(self.file.len()))?;
+            let end = (start + STRIDE).min(self.file.len() as usize);
+            for_breaks(&bytes, start - base, end - base, self.detection.encoding, |at, _| {
                 current += 1;
                 if current == line {
-                    found = Some(at as u64);
+                    found = Some((base + at) as u64);
                 }
             });
             start = end;
@@ -659,24 +676,33 @@ impl EncodedFile {
     }
 
     pub fn decode_range(&self, range: Range<u64>) -> Result<DecodedRange<'_>, EncodingError> {
-        let bytes = self.file.bytes()?;
         self.check_range(&range)?;
         if range.len_u64() > MAX_VIEWPORT_BYTES as u64 {
             return Err(EncodingError::ViewportTooLarge);
         }
         let start = (range.start as usize).max(self.detection.bom_len);
         let end = (range.end as usize).max(start);
-        let aligned = self.aligned(bytes, start..end)?;
+        let base = self.alignment_base(start)?;
+        let window_end = (end as u64 + 8).min(self.file.len());
+        let mut bytes = vec![0; (window_end - base as u64) as usize];
+        self.file.read_into(base as u64, &mut bytes)?;
+        let aligned =
+            self.aligned(&bytes, start - base..end - base, if base == 0 { self.detection.bom_len } else { 0 })?;
         if aligned.len() > MAX_VIEWPORT_BYTES {
             return Err(EncodingError::ViewportTooLarge);
         }
-        let source = aligned.start as u64..aligned.end as u64;
+        let source = (base + aligned.start) as u64..(base + aligned.end) as u64;
         let raw = &bytes[aligned];
         let mut segments = Vec::new();
         let had_errors;
         if self.detection.encoding == Encoding::UTF8 {
             had_errors = simdutf8::basic::from_utf8(raw).is_err();
-            utf8_segments(raw, |segment| segments.push(segment));
+            utf8_segments(raw, |segment| {
+                segments.push(match segment {
+                    DisplaySegment::Text(text) => DisplaySegment::Text(Cow::Owned(text.into_owned())),
+                    DisplaySegment::Invalid(bytes) => DisplaySegment::Invalid(Cow::Owned(bytes.into_owned())),
+                })
+            });
         } else if self.detection.encoding.utf32() {
             let mut text = String::new();
             let mut at = 0;
@@ -694,7 +720,8 @@ impl EncodedFile {
                             segments.push(DisplaySegment::Text(Cow::Owned(std::mem::take(&mut text))));
                         }
                         let finish = at - after as usize;
-                        segments.push(DisplaySegment::Invalid(&raw[finish - length as usize..finish]));
+                        segments
+                            .push(DisplaySegment::Invalid(Cow::Owned(raw[finish - length as usize..finish].to_vec())));
                         errors = true;
                     }
                     DecoderResult::InputEmpty => break,
@@ -710,7 +737,7 @@ impl EncodedFile {
             let (text, errors) = codec.decode_without_bom_handling(raw);
             had_errors = errors;
             if !text.is_empty() {
-                segments.push(DisplaySegment::Text(text));
+                segments.push(DisplaySegment::Text(Cow::Owned(text.into_owned())));
             }
         }
         Ok(DecodedRange { source, segments, had_errors })
@@ -720,7 +747,22 @@ impl EncodedFile {
         if range.start > range.end || range.end > self.file.len() { Err(EncodingError::InvalidRange) } else { Ok(()) }
     }
 
-    fn aligned(&self, bytes: &[u8], range: Range<usize>) -> Result<Range<usize>, EncodingError> {
+    fn alignment_base(&self, start: usize) -> Result<usize, EncodingError> {
+        let before = start.saturating_sub(8);
+        if self.detection.encoding.fixed_width() > 1 {
+            return Ok(before - before % self.detection.encoding.fixed_width());
+        }
+        if self.detection.encoding.is_single_byte() {
+            return Ok(start);
+        }
+        if start <= STRIDE + self.detection.bom_len {
+            Ok(0)
+        } else {
+            Ok(self.index().ok_or(EncodingError::IndexNotReady)?.before(before as u64))
+        }
+    }
+
+    fn aligned(&self, bytes: &[u8], range: Range<usize>, bom_len: usize) -> Result<Range<usize>, EncodingError> {
         if range.is_empty() {
             return Ok(range);
         }
@@ -743,11 +785,7 @@ impl EncodedFile {
         if encoding.is_single_byte() {
             return Ok(range);
         }
-        let base = if range.start <= STRIDE + self.detection.bom_len {
-            self.detection.bom_len
-        } else {
-            self.index().ok_or(EncodingError::IndexNotReady)?.before(range.start.saturating_sub(8) as u64)
-        };
+        let base = bom_len;
         let mut decoder = encoding.decoder();
         let prefix_end = base.max(range.start.saturating_sub(8));
         discard(&mut decoder, &bytes[base..prefix_end]);
@@ -878,20 +916,24 @@ impl EncodedFile {
         target: LineEnding,
         emit: impl FnMut(LineEndingEdit) -> Result<(), EncodingError>,
     ) -> Result<(), EncodingError> {
-        let original = self.file.bytes()?;
+        self.file.validate_source()?;
         let mut planner = EndingPlanner { target, pending_cr: None, emit };
         let mut offset = 0;
         for chunk in snapshot.source_chunks(0..snapshot.len())? {
             let (bytes, encoding) = match chunk? {
-                SourceChunk::Original { file, range, bytes } => {
-                    if !std::ptr::eq(file.bytes()?.as_ptr(), original.as_ptr()) || file.len() != self.file.len() {
+                SourceChunk::Original { file, range, bytes, piece_range } => {
+                    if !file.same_source(&self.file) {
                         return Err(EncodingError::WrongSource);
                     }
-                    self.require_boundary(original, range.start)?;
-                    self.require_boundary(original, range.end)?;
+                    if range.start == piece_range.start {
+                        self.require_boundary(range.start)?;
+                    }
+                    if range.end == piece_range.end {
+                        self.require_boundary(range.end)?;
+                    }
                     (bytes, self.detection.encoding)
                 }
-                SourceChunk::Added(bytes) => (bytes, Encoding::UTF8),
+                SourceChunk::Added(bytes) => (Cow::Borrowed(bytes), Encoding::UTF8),
                 SourceChunk::Decoded { .. } | SourceChunk::Opaque { .. } | SourceChunk::Preserved { .. } => {
                     return Err(EncodingError::WrongSource);
                 }
@@ -899,13 +941,13 @@ impl EncodedFile {
             let width = encoding.fixed_width();
             if width != 1 {
                 for at in (0..bytes.len().saturating_sub(width - 1)).step_by(width) {
-                    let unit = encoding.unit(bytes, at).unwrap();
+                    let unit = encoding.unit(&bytes, at).unwrap();
                     if unit == 10 || unit == 13 {
                         planner.newline(offset + at as u64..offset + at as u64 + width as u64, unit)?;
                     }
                 }
             } else {
-                for at in memchr::memchr2_iter(b'\r', b'\n', bytes) {
+                for at in memchr::memchr2_iter(b'\r', b'\n', &bytes) {
                     planner.newline(offset + at as u64..offset + at as u64 + 1, bytes[at] as u32)?;
                 }
             }
@@ -939,7 +981,7 @@ impl EncodedFile {
         if plan.bom && plan.encoding.bom_bytes().is_empty() {
             return Err(EncodingError::UnsupportedEncoding(format!("BOM for {}", plan.encoding.name())));
         }
-        let original = self.file.bytes()?;
+        self.file.validate_source()?;
         let preserve = plan.encoding == self.detection.encoding && plan.line_ending.is_none();
         if plan.bom {
             writer.write_all(plan.encoding.bom_bytes())?;
@@ -949,10 +991,10 @@ impl EncodedFile {
         let mut source_decoder = None;
         for chunk in snapshot.source_chunks(0..snapshot.len())? {
             match chunk? {
-                SourceChunk::Original { file, range, bytes } => {
+                SourceChunk::Original { file, range, bytes, piece_range } => {
                     // Original references are immutable handles; pointer
                     // equality identifies this source without comparing data.
-                    if !std::ptr::eq(file.bytes()?.as_ptr(), original.as_ptr()) || file.len() != self.file.len() {
+                    if !file.same_source(&self.file) {
                         return Err(EncodingError::WrongSource);
                     }
                     let start = range.start.max(self.detection.bom_len as u64);
@@ -961,8 +1003,12 @@ impl EncodedFile {
                     }
                     added.finish()?;
                     if plan.encoding == self.detection.encoding && self.detection.encoding != Encoding::UTF8 {
-                        self.require_boundary(original, start)?;
-                        self.require_boundary(original, range.end)?;
+                        if range.start == piece_range.start {
+                            self.require_boundary(start)?;
+                        }
+                        if range.end == piece_range.end {
+                            self.require_boundary(range.end)?;
+                        }
                     }
                     let bytes = &bytes[(start - range.start) as usize..];
                     if preserve {
@@ -991,12 +1037,16 @@ impl EncodedFile {
         output.finish()
     }
 
-    fn require_boundary(&self, bytes: &[u8], at: u64) -> Result<(), EncodingError> {
+    fn require_boundary(&self, at: u64) -> Result<(), EncodingError> {
         if at == self.detection.bom_len as u64 || at == self.file.len() {
             return Ok(());
         }
-        let aligned = self.aligned(bytes, at as usize..at as usize + 1)?;
-        if aligned.start != at as usize {
+        let base = self.alignment_base(at as usize)?;
+        let mut bytes = vec![0; ((at + 9).min(self.file.len()) - base as u64) as usize];
+        self.file.read_into(base as u64, &mut bytes)?;
+        let local = at as usize - base;
+        let aligned = self.aligned(&bytes, local..local + 1, if base == 0 { self.detection.bom_len } else { 0 })?;
+        if aligned.start != local {
             return Err(EncodingError::SplitCharacter(at));
         }
         Ok(())
@@ -1148,10 +1198,10 @@ impl<'a, W: Write> TextOutput<'a, W> {
         };
         if width != 1 {
             for at in (0..bytes.len().saturating_sub(width - 1)).step_by(width) {
-                visit(at, encoding.unit(bytes, at).unwrap())?;
+                visit(at, encoding.unit(&bytes, at).unwrap())?;
             }
         } else {
-            for at in memchr::memchr2_iter(b'\r', b'\n', bytes) {
+            for at in memchr::memchr2_iter(b'\r', b'\n', &bytes) {
                 visit(at, bytes[at] as u32)?;
             }
         }

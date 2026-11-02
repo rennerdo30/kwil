@@ -388,7 +388,7 @@ fn compressed_worker_encoding_is_detected_after_decompression_and_roundtrips_opa
                 &TextFile::open(&path).unwrap(),
                 CompressionFormat::Gzip,
                 &AtomicBool::new(false),
-                |body| Ok(body.bytes().map_err(io::Error::other)? == raw)
+                |body| Ok(body.read_range(0..body.len()).map_err(io::Error::other)? == raw)
             )
             .unwrap()
     );

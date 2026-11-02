@@ -27,7 +27,7 @@ impl SnapshotInsert {
     }
     pub fn write_to(&self, writer: &mut impl io::Write) -> io::Result<()> {
         for chunk in self.snapshot.chunks(self.range.clone())? {
-            writer.write_all(chunk.map_err(io::Error::other)?)?;
+            writer.write_all(&chunk.map_err(io::Error::other)?)?;
         }
         Ok(())
     }

@@ -84,7 +84,10 @@ fn prepared_body_resize_scroll_and_refresh_never_read_unavailable_original() {
     // set_viewport, even though those operations do not necessarily read bytes.
     view.editor_mut().unwrap().set_viewport(5, 1);
     fixture.hide();
-    assert!(view.file().unwrap().bytes().is_err(), "negative control: source reads really fail");
+    assert!(
+        view.file().unwrap().read_range(0..view.file().unwrap().len()).is_err(),
+        "negative control: source reads really fail"
+    );
     view.set_notice("untouched".into());
     view.set_rows(99); // Legacy clamping would move top 2 to zero.
     assert_eq!(view.top(), 2);
