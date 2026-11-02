@@ -354,10 +354,10 @@ impl TextFile {
 
     pub(crate) fn history_backing_ref(&self) -> OriginalRef {
         // The one initially opened resident original is baseline. Saved
-        // versions are mapped; their sparse index/handles/path are charged
+        // versions use positioned reads; their sparse index/handles/path are charged
         // once per snapshot, not once per piece of that same original.
+        // The reusable read window is shared read state, not retained history.
         let cost = std::mem::size_of::<Shared>()
-            + source::VIEW_CACHE_BYTES
             + self.shared.path.as_os_str().len() * 4
             + self.index().map_or(0, LineIndex::memory_bytes);
         OriginalRef { file: Arc::downgrade(&self.shared), cost }
