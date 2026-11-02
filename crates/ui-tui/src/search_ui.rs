@@ -1261,7 +1261,13 @@ mod tests {
                 Duration::ZERO,
                 h.settings.keymap,
             );
-            assert!(matches!(intent, KeyResult::Changed(true)));
+            match intent {
+                KeyResult::File(command) => {
+                    h.view.file_command(command).unwrap();
+                }
+                KeyResult::Changed(true) => {}
+                _ => panic!("unexpected palette intent"),
+            }
         };
         let text = |h: &mut Harness, palette: &mut PaletteSession, value: &str| {
             for c in value.chars() {
