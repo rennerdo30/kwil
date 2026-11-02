@@ -1759,7 +1759,7 @@ fn run_files(
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                if rows.len() == 1 || !rows.is_empty() && flush_at.elapsed() >= Duration::from_millis(100) {
+                if rows.len() == FILE_PAGE || !rows.is_empty() && flush_at.elapsed() >= Duration::from_millis(100) {
                     let len = rows.len();
                     if !emit(SearchUpdate::Files {
                         first,

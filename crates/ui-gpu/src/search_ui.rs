@@ -1225,6 +1225,11 @@ pub(crate) mod host_dispatch_tests {
         app.dispatch_search("search.findInFiles");
         folder_query(&mut app, "needle");
         finish(&mut app, &rx);
+        // A timed flush can leave the last streamed page showing only the
+        // second hit. Revisit page zero before asserting global hit positions.
+        named(&mut app, NamedKey::PageUp, false);
+        finish(&mut app, &rx);
+        assert_eq!(app.search.as_ref().unwrap().state().file_first, 0);
         assert_eq!(app.search_panel.selected(), 0);
         paint_folder(&mut app);
         let key = app.search.as_ref().unwrap().key();
