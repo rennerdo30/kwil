@@ -679,7 +679,7 @@ fn replacement_button(
     } else {
         chrome::round_rect(pixels, stride, rect, sizes.radius, colors.border);
         chrome::round_rect(pixels, stride, inset(rect, sizes.hairline), sizes.radius, colors.control);
-        let clip = inset(rect, sizes.inner.min(rect.w / 4));
+        let clip = desktop::button_clip(rect, sizes.inner);
         let fitted = font.fit(text, clip.w);
         let width = font.measure(&fitted, clip.w);
         let baseline = font.baseline(rect.y, rect.h);

@@ -2,7 +2,7 @@
 resolver = "3"
 members = ["crates/*"]
 # Spikes are separate workspaces so their heavy dependencies never enter the main build.
-exclude = ["spike", "crates/bench"]
+exclude = ["spike", "crates/bench", "crates/bench-palette"]
 
 [workspace.package]
 version = "0.1.0-beta.6"

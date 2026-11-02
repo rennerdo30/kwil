@@ -11,13 +11,14 @@ struct Entry {
     after: Snapshot,
     cost: usize,
     model_cost: usize,
+    recovered_revisions: Option<(u64, u64)>,
 }
 
 impl Entry {
     fn new(before: Snapshot, after: Snapshot) -> Self {
         let cost =
             before.retained_bytes().saturating_add(after.retained_bytes()).saturating_add(std::mem::size_of::<Self>());
-        Self { before, after, cost, model_cost: 0 }
+        Self { before, after, cost, model_cost: 0, recovered_revisions: None }
     }
 }
 
@@ -120,7 +121,7 @@ impl History {
             .and_then(|n| n.checked_add(model_cost))
             .ok_or_else(crate::worker_edit::overflow)?;
         self.bytes.checked_add(cost).ok_or_else(crate::worker_edit::overflow)?;
-        Ok(PreparedHistory { entry: Entry { before, after, cost, model_cost } })
+        Ok(PreparedHistory { entry: Entry { before, after, cost, model_cost, recovered_revisions: None } })
     }
     pub(crate) fn install_prepared(&mut self, prepared: PreparedHistory) {
         for entry in self.redo.drain(..) {
@@ -159,6 +160,33 @@ impl History {
         let snapshot = entry.before.clone();
         self.redo.push_back(entry);
         Some(snapshot)
+    }
+
+    pub fn recovered_revision(&self, redo: bool) -> Option<u64> {
+        if redo {
+            self.redo.back()?.recovered_revisions.map(|(_, after)| after)
+        } else {
+            self.undo.back()?.recovered_revisions.map(|(before, _)| before)
+        }
+    }
+
+    pub fn record_recovered(&mut self, before: Snapshot, after: Snapshot, from: u64, to: u64) {
+        if self.undo.back().and_then(|entry| entry.recovered_revisions) == Some((to, from)) {
+            let _ = self.undo();
+        } else if self.redo.back().and_then(|entry| entry.recovered_revisions) == Some((from, to)) {
+            let _ = self.redo();
+        } else if to < from {
+            // An undo spanning a typing group cannot be reconstructed from
+            // its individual journal frames. Keep the text, drop this prefix.
+            self.undo.clear();
+            self.redo.clear();
+            self.bytes = 0;
+        } else {
+            self.record(before, after, false);
+            if let Some(entry) = self.undo.back_mut() {
+                entry.recovered_revisions = Some((from, to));
+            }
+        }
     }
 
     pub fn redo(&mut self) -> Option<Snapshot> {

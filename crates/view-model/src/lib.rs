@@ -572,7 +572,12 @@ impl View {
         };
         let notice = if self.notice.is_empty() { String::new() } else { format!("  |  {}", self.notice) };
         let ending = self.editor.as_ref().map_or("", |e| e.document().line_ending.label());
-        format!("{name}{lines}  |  {ending}{notice}")
+        let compression = self
+            .editor
+            .as_ref()
+            .and_then(|e| e.document().compression.badge())
+            .map_or(String::new(), |badge| format!("{badge}  |  "));
+        format!("{compression}{name}{lines}  |  {ending}{notice}")
     }
 }
 

@@ -717,6 +717,12 @@ impl Buffer {
         self.history.depth()
     }
 
+    /// Persisted identity for a recovered transition whose model metadata was
+    /// not journaled. Ordinary live editor history has its own identity owner.
+    pub fn recovered_history_revision(&self, redo: bool) -> Option<u64> {
+        self.history.recovered_revision(redo)
+    }
+
     /// Charge frontend-independent cursor/recipe metadata against the same
     /// cap as roots. Replaces the latest charge, then evicts oldest entries.
     pub fn charge_latest_model_history(&mut self, bytes: usize) {

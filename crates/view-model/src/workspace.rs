@@ -130,6 +130,7 @@ impl TabGeometry {
 pub enum FilePromptKind {
     Open,
     SaveAs,
+    SaveUncompressedAs,
     Recent,
     Folder,
     Encoding,
@@ -284,6 +285,7 @@ struct FileFlow {
     journal_failed: HashMap<DocumentId, String>,
     metadata_durable: bool,
     restore_session: Option<bool>,
+    transient_root: Option<PathBuf>,
     hot_exit: bool,
     manual_guard: bool,
     history_wait: Option<DocumentId>,
@@ -1282,7 +1284,7 @@ impl Workspace {
             .worker
             .as_ref()
             .unwrap()
-            .try_submit(DocumentRequest::Prepare { root })
+            .try_submit(DocumentRequest::Prepare { root: self.files.transient_root.clone().or(root) })
             .map_err(|_| io::Error::other("Recovery admission failed"))?;
         self.files.preparing = true;
         Ok(())
@@ -1348,7 +1350,9 @@ impl Workspace {
                     {
                         self.files.reopen = None;
                     }
-                    if let DocumentRequest::Save { document, .. } | DocumentRequest::SaveRaw { document, .. } = *request
+                    if let DocumentRequest::Save { document, .. }
+                    | DocumentRequest::SaveRaw { document, .. }
+                    | DocumentRequest::ExportUncompressed { document, .. } = *request
                     {
                         self.files.saves.remove(&document);
                         if let Some(editor) = self.views.get_mut(&document).and_then(View::editor_mut) {
@@ -1399,12 +1403,30 @@ impl Workspace {
                 tab.recovery_path = None;
             }
         }
-        self.files.queue.push_back(DocumentRequest::Persist(snapshot));
+        self.files.queue.push_back(if self.files.transient_root.is_some() {
+            DocumentRequest::PersistTransient(snapshot)
+        } else {
+            DocumentRequest::Persist(snapshot)
+        });
         self.pump_files();
     }
 
+    /// Separate windows own temporary worker storage and never join the primary
+    /// recovery store. Settings reload cannot enable hot exit in these windows.
+    pub fn use_transient_session(&mut self) {
+        assert!(!self.files.document_started, "session policy must precede worker startup");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        self.files.transient_root = Some(std::env::temp_dir().join(format!(
+            "kwil-window-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        self.files.restore_session = Some(false);
+    }
+
     pub fn set_session_restore(&mut self, enabled: bool) {
-        self.files.restore_session = Some(enabled);
+        self.files.restore_session = Some(enabled && self.files.transient_root.is_none());
     }
 
     fn install_journal_observers(&mut self) {
@@ -1492,6 +1514,11 @@ impl Workspace {
     pub fn close_pending(&self) -> bool {
         self.files.quit || !self.files.close.is_empty()
     }
+    /// A durable hot exit is cancellable, but must not offer to discard work
+    /// while its journal flush is in progress.
+    pub fn close_confirmation_pending(&self) -> bool {
+        self.close_pending() && !self.files.hot_exit
+    }
     pub fn cancel_close_intent(&mut self) {
         self.files.close.clear();
         self.files.quit = false;
@@ -1517,6 +1544,7 @@ impl Workspace {
                 let label = match p.kind {
                     FilePromptKind::Open => "Open",
                     FilePromptKind::SaveAs => "Save as",
+                    FilePromptKind::SaveUncompressedAs => "Save uncompressed as",
                     FilePromptKind::Recent => "Recent (number)",
                     _ => p.kind.title(),
                 };
@@ -1531,7 +1559,10 @@ impl Workspace {
             return Ok(());
         }
         let prompt = self.files.prompt.take().unwrap();
-        if !matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::Recent | FilePromptKind::SaveAs) {
+        if !matches!(
+            prompt.kind,
+            FilePromptKind::Open | FilePromptKind::Recent | FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs
+        ) {
             return self.submit_command_prompt(prompt);
         }
         match prompt.kind {
@@ -1563,7 +1594,7 @@ impl Workspace {
                     }
                 }
             }
-            FilePromptKind::SaveAs => {
+            FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs => {
                 if self
                     .views
                     .get(&prompt.document)
@@ -1574,7 +1605,12 @@ impl Workspace {
                     return Err(io::Error::other("Document changed while naming it; save again"));
                 }
                 let path = self.resolve_typed_save_path(std::path::Path::new(&prompt.text))?;
-                self.save_document(prompt.document, Some(path.clone()))?;
+                self.save_document_output(
+                    prompt.document,
+                    Some(path.clone()),
+                    false,
+                    prompt.kind == FilePromptKind::SaveUncompressedAs,
+                )?;
                 self.remember_file_folder(&path);
             }
             _ => unreachable!(),
@@ -1724,6 +1760,16 @@ impl Workspace {
     }
 
     fn save_document_with(&mut self, id: DocumentId, path: Option<PathBuf>, overwrite: bool) -> io::Result<()> {
+        self.save_document_output(id, path, overwrite, false)
+    }
+
+    fn save_document_output(
+        &mut self,
+        id: DocumentId,
+        path: Option<PathBuf>,
+        overwrite: bool,
+        uncompressed: bool,
+    ) -> io::Result<()> {
         if self.document_busy(id) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1774,7 +1820,13 @@ impl Workspace {
         }
         let plan = editor.document().save_plan();
         let raw = editor.document().representation() == crate::hex_session::Representation::RawBytes;
-        let request = match if raw { editor.raw_save_request(path) } else { editor.save_request(path) } {
+        if uncompressed && raw {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Switch to text view before saving an uncompressed copy",
+            ));
+        }
+        let mut request = match if raw { editor.raw_save_request(path) } else { editor.save_request(path) } {
             // The kept private copy supplies every byte; the changed file on
             // disk is replaced like a Save As target.
             Ok(mut request) if overwrite => {
@@ -1787,6 +1839,23 @@ impl Workspace {
                 return Err(error);
             }
         };
+        if uncompressed {
+            request.compression = kwil_core_workspace::compressed::CompressionFormat::Raw;
+            // The explicit Save As target is independent of the compressed original.
+            // Reject aliases so this command cannot silently replace that original.
+            if request
+                .original
+                .as_ref()
+                .is_some_and(|original| kwil_core_workspace::paths_may_alias(original.path(), &request.path))
+            {
+                editor.fail_save_completion();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Choose a different path for Save uncompressed as",
+                ));
+            }
+            request.original = None;
+        }
         self.files.saves.insert(
             id,
             SaveFlight {
@@ -1799,7 +1868,9 @@ impl Workspace {
             },
         );
         self.refresh_save_destinations();
-        self.files.queue.push_back(if raw {
+        self.files.queue.push_back(if uncompressed {
+            DocumentRequest::ExportUncompressed { document: id, request, plan }
+        } else if raw {
             DocumentRequest::SaveRaw { document: id, request }
         } else {
             DocumentRequest::Save { document: id, request, plan }
@@ -1833,13 +1904,14 @@ impl Workspace {
                 self.cancel_file_prompt();
                 self.open(View::new(None))?;
             }
-            "file.open" | "file.recent" | "file.saveAs" => {
+            "file.open" | "file.recent" | "file.saveAs" | "file.saveUncompressedAs" => {
                 self.hex.prompt = false;
                 let id = self.active_id();
                 let revision = self.editor().map_or(0, |e| e.document().revision());
                 let kind = match command {
                     "file.open" => FilePromptKind::Open,
                     "file.recent" => FilePromptKind::Recent,
+                    "file.saveUncompressedAs" => FilePromptKind::SaveUncompressedAs,
                     _ => FilePromptKind::SaveAs,
                 };
                 self.files.next_prompt = self.files.next_prompt.wrapping_add(1);
@@ -2484,6 +2556,23 @@ impl Workspace {
                     damage.full = self.active_id() == document;
                 }
                 self.hex_indexed(document);
+            }
+            DocumentResult::ExportedUncompressed { document, revision, result } => {
+                if self.files.saves.get(&document).is_some_and(|save| save.revision == revision) {
+                    self.files.saves.remove(&document);
+                    if let Some(view) = self.views.get_mut(&document) {
+                        if let Some(editor) = view.editor_mut() {
+                            editor.fail_save_completion();
+                        }
+                        view.set_notice(match result {
+                            Ok(()) => "Saved uncompressed copy; original document retained".into(),
+                            Err(error) => format!("Uncompressed copy failed: {error}"),
+                        });
+                    }
+                    self.cancel_close_intent();
+                    self.refresh_save_destinations();
+                    damage.status = true;
+                }
             }
             DocumentResult::Saved { document, revision, result } => {
                 if result.as_ref().is_ok_and(|saved| saved.revision != revision) {
@@ -3584,6 +3673,39 @@ mod tests {
     }
 
     #[test]
+    fn transient_window_never_hot_exits_or_persists_and_guards_dirty_close() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.use_transient_session();
+        let root = workspace.files.transient_root.clone().unwrap();
+        assert!(root.is_absolute());
+        let mut other = Workspace::new(View::new(None)).unwrap();
+        other.use_transient_session();
+        assert_ne!(other.files.transient_root.as_ref(), Some(&root));
+        workspace.set_session_restore(true); // a late settings reload
+        workspace.files.storage_ready = true;
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("unsaved".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.checkpoint_session();
+        workspace.persist_snapshot();
+        assert!(matches!(workspace.files.queue.back(), Some(DocumentRequest::PersistTransient(_))));
+        workspace.files.queue.clear();
+        workspace.test_document_result(DocumentResult::Persisted(Ok(())));
+        workspace.request_window_close(false).unwrap();
+        assert!(workspace.close_pending());
+        assert!(!workspace.files.hot_exit);
+        assert!(workspace.close_confirmation_pending());
+        assert!(!workspace.wants_exit());
+        workspace.cancel_close_intent();
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        workspace.request_window_close(false).unwrap();
+        workspace.discard_pending_close().unwrap();
+        workspace.test_document_result(DocumentResult::Persisted(Ok(())));
+        assert!(workspace.wants_exit(), "only explicit discard permits quitting unsaved work");
+        assert!(!root.exists(), "policy construction performs no filesystem work");
+    }
+
+    #[test]
     fn confirmed_window_close_keeps_dirty_work_pending_even_with_session_restore() {
         let make = || {
             let mut workspace = Workspace::new(View::new(None)).unwrap();
@@ -3611,6 +3733,7 @@ mod tests {
         let mut terminal = make();
         terminal.request_window_close(false).unwrap();
         assert!(terminal.files.hot_exit, "the terminal's existing recovery policy is preserved");
+        assert!(!terminal.close_confirmation_pending(), "a primary hot exit must not open a dirty-close dialog");
     }
 
     #[test]
@@ -4832,6 +4955,48 @@ mod tests {
     }
 
     #[test]
+    fn save_uncompressed_as_routes_prompt_and_retains_compressed_document() {
+        use kwil_core_workspace::compressed::CompressionFormat;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "kwil-uncompressed-save-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("plain.txt");
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        edit(&mut workspace, "edited text\n");
+        workspace.editor_mut().unwrap().document.compression = CompressionFormat::Xz;
+        assert!(workspace.status_text().contains("xz"));
+        workspace.file_command("file.saveUncompressedAs").unwrap();
+        assert_eq!(workspace.file_prompt().unwrap().kind, FilePromptKind::SaveUncompressedAs);
+        assert!(workspace.native_file_prompt().is_some());
+        workspace.file_prompt_mut().unwrap().text = target.to_string_lossy().into();
+        workspace.submit_file_prompt().unwrap();
+        let Some(DocumentRequest::ExportUncompressed { document, request, .. }) = workspace.files.queue.pop_front()
+        else {
+            panic!("expected uncompressed export");
+        };
+        assert_eq!(request.compression, CompressionFormat::Raw);
+        assert!(request.original.is_none());
+        assert_eq!(workspace.editor().unwrap().document().compression, CompressionFormat::Xz);
+        workspace.test_document_result(DocumentResult::ExportedUncompressed {
+            document,
+            revision: request.revision,
+            result: kwil_core_workspace::save_snapshot(request).map(|_| ()),
+        });
+        assert_eq!(workspace.editor().unwrap().document().compression, CompressionFormat::Xz);
+        assert_eq!(std::fs::read(&target).unwrap(), b"edited text\n");
+        assert!(workspace.status_text().contains("xz"));
+        assert!(workspace.editor().unwrap().document().is_dirty());
+        assert!(workspace.editor().unwrap().document().path().is_none());
+        drop(workspace);
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn tabs_keep_their_text_undo_and_cursor_and_refuse_dirty_close() {
         let mut workspace = Workspace::new(View::new(None)).unwrap();
         let first = workspace.active_id();
@@ -5037,7 +5202,7 @@ impl Workspace {
     /// Capture only native-chooser prompt kinds. TUI's String path stays intact.
     pub fn native_file_prompt(&self) -> Option<NativeFilePrompt> {
         let prompt = self.files.prompt.as_ref()?;
-        if !matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::SaveAs) {
+        if !matches!(prompt.kind, FilePromptKind::Open | FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs) {
             return None;
         }
         Some(NativeFilePrompt {
@@ -5098,6 +5263,7 @@ impl Workspace {
             }),
             FilePromptKind::Open => self.open_path(path).map(|_| ()),
             FilePromptKind::SaveAs => self.save_document(ticket.document, Some(path)),
+            FilePromptKind::SaveUncompressedAs => self.save_document_output(ticket.document, Some(path), false, true),
             _ => {
                 unreachable!("native_file_prompt excludes recent-number prompts")
             }

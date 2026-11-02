@@ -118,6 +118,7 @@ pub(crate) enum Step {
     /// Desktop overlays (settings, palette) captured in the hidden window.
     SettingsOpen,
     SettingsKeymap,
+    SettingsFileTypes,
     SettingsCapture,
     SettingsClose,
     PaletteOpen,
@@ -158,6 +159,10 @@ pub(crate) enum Step {
     FindCheck,
     PlacementSet,
     PlacementCheck,
+    SessionStart,
+    SessionEdit,
+    SessionCheck,
+    SessionExit,
     End,
 }
 #[derive(Default, Clone, Copy)]
@@ -465,6 +470,27 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (200, Step::UsabilityCapture("file-folder.bmp")),
             (100, Step::End),
         ];
+        let polish = [
+            (1800, Step::WelcomeProbe),
+            (100, Step::WelcomeSkip),
+            (100, Step::SettingsOpen),
+            (200, Step::SettingsFileTypes),
+            (200, Step::UsabilityCapture("polish-file-types.bmp")),
+            (100, Step::SettingsClose),
+            (100, Step::SettingsOpen),
+            (200, Step::SettingsKeymap),
+            (200, Step::UsabilityCapture("polish-keymap.bmp")),
+            (100, Step::SettingsClose),
+            (100, Step::FolderOpen),
+            (700, Step::FolderCheck),
+            (100, Step::UsabilityCapture("polish-folder.bmp")),
+            (100, Step::FolderPreview),
+            (700, Step::FolderPreviewCheck),
+            (100, Step::UsabilityCapture("polish-replace.bmp")),
+            (100, Step::CompareOpen),
+            (1200, Step::CompareCheck),
+            (100, Step::End),
+        ];
         let compare =
             [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
         let format = [
@@ -504,12 +530,35 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (500, Step::UsabilityCapture("hex-editor.bmp")),
             (100, Step::End),
         ];
-        let steps = if std::env::var_os("KWIL_HEX_EDITOR_PROBE").is_some() {
+        let gzip = [(1800, Step::DismissSetup), (100, Step::GzipOpen), (1000, Step::GzipCheck), (100, Step::End)];
+        let session_seed = [
+            (1800, Step::DismissSetup),
+            (300, Step::SessionStart),
+            (700, Step::SessionEdit),
+            (300, Step::SessionCheck),
+            (100, Step::SessionExit),
+        ];
+        let session_restore = [(1800, Step::DismissSetup), (300, Step::SessionCheck), (100, Step::SessionExit)];
+        let ipc = [(1800, Step::DismissSetup), (5000, Step::SessionCheck), (100, Step::SessionExit)];
+        let probe = std::env::var("KWIL_SESSION_PROBE").unwrap_or_default();
+        let steps = if probe == "crash" {
+            &session_seed[..session_seed.len() - 1]
+        } else if probe == "seed" || probe == "transient" {
+            session_seed.as_slice()
+        } else if probe == "restore" {
+            session_restore.as_slice()
+        } else if probe == "ipc" {
+            ipc.as_slice()
+        } else if std::env::var_os("KWIL_GZIP_PROBE").is_some() {
+            gzip.as_slice()
+        } else if std::env::var_os("KWIL_HEX_EDITOR_PROBE").is_some() {
             hex_editor.as_slice()
         } else if std::env::var_os("KWIL_FOLDER_REPLACE_PROBE").is_some() {
             folder_replace.as_slice()
         } else if std::env::var_os("KWIL_TAB_MENU_PROBE").is_some() {
             tab_menu.as_slice()
+        } else if std::env::var_os("KWIL_POLISH_PROBE").is_some() {
+            polish.as_slice()
         } else if std::env::var_os("KWIL_FORMAT_PROBE").is_some() {
             format.as_slice()
         } else if std::env::var_os("KWIL_LOG_COMMANDS_PROBE").is_some() {
@@ -571,6 +620,88 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
     match step {
+        Step::SessionStart => {
+            assert!(app.view.recovery_ready(), "{}", app.view.status_text());
+            app.view.set_session_restore(true);
+            app.view.file_command("file.new").unwrap();
+            app.view
+                .execute(
+                    "edit.insert",
+                    &kwil_view_model::CommandArgs { text: Some("session scratch".into()), ..Default::default() },
+                    1,
+                )
+                .unwrap();
+            app.view.checkpoint_session();
+            app.apply(Damage { full: true, status: true, ..Default::default() });
+        }
+        Step::SessionEdit => {
+            app.view
+                .execute(
+                    "edit.insert",
+                    &kwil_view_model::CommandArgs { text: Some(" changed".into()), ..Default::default() },
+                    2,
+                )
+                .unwrap();
+            app.view.checkpoint_session();
+            app.apply(Damage { full: true, status: true, ..Default::default() });
+        }
+        Step::SessionCheck => {
+            assert!(app.view.recovery_ready());
+            assert_eq!(app.view.session().tabs().len(), 2);
+            if std::env::var("KWIL_SESSION_PROBE").as_deref() == Ok("ipc") {
+                let path = app.view.editor().unwrap().document().path().unwrap();
+                assert_eq!(path.file_name().unwrap(), "forwarded.txt");
+                println!("kwil-session forwarded_tab=true");
+            } else {
+                let mut text = Vec::new();
+                app.view.editor().unwrap().document().snapshot().write_to(&mut text).unwrap();
+                assert_eq!(text, b"session scratch changed");
+                assert!(app.view.editor().unwrap().document().is_dirty());
+                if std::env::var("KWIL_SESSION_PROBE").as_deref() == Ok("restore") {
+                    app.view.execute("edit.undo", &Default::default(), 3).unwrap();
+                    let mut text = Vec::new();
+                    app.view.editor().unwrap().document().snapshot().write_to(&mut text).unwrap();
+                    assert_eq!(text, b"session scratch");
+                    app.view.execute("edit.redo", &Default::default(), 4).unwrap();
+                }
+            }
+            app.apply(Damage { full: true, status: true, ..Default::default() });
+            assert!(app.render());
+            capture(app, dir.as_deref(), "session.bmp");
+            if let Some(dir) = &dir {
+                std::fs::write(
+                    dir.join("session-check.txt"),
+                    format!(
+                        "PASS mode={} tabs=2 active={} cursor={}\n",
+                        std::env::var("KWIL_SESSION_PROBE").unwrap(),
+                        app.view.active_id().0,
+                        app.view.editor().unwrap().primary_cursor().head
+                    ),
+                )
+                .unwrap();
+            }
+            println!("kwil-session tabs=2 active_preserved=true");
+        }
+        Step::SessionExit => {
+            app.request_close(el, false);
+            if std::env::var("KWIL_SESSION_PROBE").as_deref() == Ok("transient") {
+                assert!(!app.view.wants_exit());
+                assert!(app.view.close_pending());
+                assert!(app.view.editor().unwrap().document().is_dirty());
+                app.view.cancel_close_intent();
+                assert!(app.view.editor().unwrap().document().is_dirty());
+                println!("kwil-session transient_dirty_close_guarded=true cancel_preserves=true");
+                if let Some(dir) = &dir {
+                    std::fs::write(
+                        dir.join("session-close.txt"),
+                        "PASS dirty close guarded; Cancel retains work; explicit discard permits exit\n",
+                    )
+                    .unwrap();
+                }
+                app.request_close(el, false);
+                app.request_close(el, true);
+            }
+        }
         Step::CompareOpen => {
             assert!(app.opts.hidden);
             app.edit(super::input::Action::Text("Edited buffer: ".into()));
@@ -777,7 +908,8 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.search_panel.folder_preview());
             assert!(!app.search_panel.is_pending());
             assert_eq!(app.search_panel.count(), (1, true));
-            assert!(app.search_panel.results()[0].label.contains("1 matches"));
+            assert!(app.search_panel.results()[0].label.ends_with("1 match"));
+            assert!(app.search_panel.status().starts_with("Preview: 1 file, 1 match."));
             println!("kwil-folder-replace preview=PASS files=1 matches=1 native-hidden=true");
         }
         Step::FolderSelect => {
@@ -1260,6 +1392,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             let mut bytes = Vec::new();
             document.snapshot().write_to(&mut bytes).unwrap();
             assert_eq!(bytes, include_bytes!("../../../examples/smoke/example.log"));
+            assert!(super::chrome::status(&app.view, 100).1.iter().any(|segment| segment.text.contains("gzip")));
+            assert!(app.render());
+            capture(app, dir.as_deref(), "gzip-open.bmp");
             if let Some(dir) = &dir {
                 std::fs::write(
                     dir.join("gzip-result.txt"),
@@ -1747,7 +1882,14 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::SettingsOpen => {
             app.dispatch_settings("view.settings");
         }
+        Step::SettingsFileTypes => {
+            assert!(app.settings_hosted_available());
+            app.settings_view.hosted = true;
+            app.settings_hosted_opened();
+            app.palette_redraw();
+        }
         Step::SettingsKeymap => {
+            app.settings_view.hosted = false;
             // The same host calls a click on Keymap -> Custom bindings -> Edit makes.
             if let Some(host) = app.settings_panel.as_mut() {
                 host.set_category(Some(kwil_core_commands::settings_ui::Category::Keymap));
@@ -1769,8 +1911,11 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::SettingsClose => {
             if let Some(host) = app.settings_panel.as_mut() {
                 // Cancel the capture, leave the page, then close: no edit is applied.
-                let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
-                let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
+                for _ in 0..2 {
+                    if host.panel().is_some() {
+                        let _ = host.panel_input(kwil_view_model::settings_panels::PanelInput::Cancel);
+                    }
+                }
                 host.close();
             }
             app.settings_epoch = app.settings_epoch.wrapping_add(1);

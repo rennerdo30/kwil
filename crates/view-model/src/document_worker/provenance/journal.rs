@@ -35,6 +35,7 @@ use std::{
 const POLICY_MAGIC: &[u8; 4] = b"KWJR";
 const POLICY_VERSION: u8 = 2;
 const RAW_POLICY_VERSION: u8 = 3;
+const CONTAINER_POLICY_VERSION: u8 = 4;
 const MAX_ENCODING_NAME: usize = 40;
 
 /// Explicit document output policy, independent of every embedded origin.
@@ -70,9 +71,18 @@ impl RecoveryPolicy {
             | match self.compression {
                 kwil_core_workspace::compressed::CompressionFormat::Raw => 0,
                 kwil_core_workspace::compressed::CompressionFormat::Gzip => 2,
+                kwil_core_workspace::compressed::CompressionFormat::Zstd => 8,
+                kwil_core_workspace::compressed::CompressionFormat::Bzip2 => 10,
+                kwil_core_workspace::compressed::CompressionFormat::Xz => 12,
             };
         tag.extend_from_slice(&[
-            if self.raw_bytes { RAW_POLICY_VERSION } else { POLICY_VERSION },
+            if self.raw_bytes {
+                RAW_POLICY_VERSION
+            } else if flags & 8 != 0 {
+                CONTAINER_POLICY_VERSION
+            } else {
+                POLICY_VERSION
+            },
             flags,
             ending,
             label.len() as u8,
@@ -84,14 +94,16 @@ impl RecoveryPolicy {
         if tag.len() < 9
             || tag.len() > 8 + MAX_ENCODING_NAME
             || &tag[..4] != POLICY_MAGIC
-            || !matches!(tag[4], 1 | POLICY_VERSION | RAW_POLICY_VERSION)
+            || !matches!(tag[4], 1 | POLICY_VERSION | RAW_POLICY_VERSION | CONTAINER_POLICY_VERSION)
             || tag[5]
                 > match tag[4] {
                     1 => 1,
                     POLICY_VERSION => 3,
-                    _ => 7,
+                    RAW_POLICY_VERSION => 7,
+                    _ => 13,
                 }
             || (tag[4] == RAW_POLICY_VERSION && tag[5] != 4)
+            || (tag[4] == CONTAINER_POLICY_VERSION && !matches!(tag[5] & !1, 8 | 10 | 12))
             || tag[7] as usize != tag.len() - 8
         {
             return Err(invalid("unsupported encoded recovery codec/version"));
@@ -112,7 +124,14 @@ impl RecoveryPolicy {
             encoding,
             bom: tag[5] & 1 != 0,
             preferred_ending,
-            compression: if tag[4] >= POLICY_VERSION && tag[5] & 2 != 0 {
+            compression: if tag[4] == CONTAINER_POLICY_VERSION {
+                match tag[5] & !1 {
+                    8 => kwil_core_workspace::compressed::CompressionFormat::Zstd,
+                    10 => kwil_core_workspace::compressed::CompressionFormat::Bzip2,
+                    12 => kwil_core_workspace::compressed::CompressionFormat::Xz,
+                    _ => return Err(invalid("recovery compression policy")),
+                }
+            } else if tag[4] >= POLICY_VERSION && tag[5] & 2 != 0 {
                 kwil_core_workspace::compressed::CompressionFormat::Gzip
             } else {
                 kwil_core_workspace::compressed::CompressionFormat::Raw
@@ -155,6 +174,7 @@ pub struct JournalRecoverySummary {
     /// Original path/identity are informational; never open or attach that path.
     pub base: JournalBase,
     pub policy: RecoveryPolicy,
+    pub highest_revision: u64,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct JournalRetirementStatus {
@@ -177,6 +197,7 @@ pub struct JournalRecovery {
     parent: PathBuf,
     limits: ConsumerLimits,
     phase: Phase,
+    retain_undo: bool,
     summary: Option<JournalRecoverySummary>,
     // Construct on the worker; never accidentally transfer cleanup ownership
     // in a frontend completion. Buffer alone may cross that boundary.
@@ -218,9 +239,15 @@ impl JournalRecovery {
             parent: private_parent,
             limits: consumer,
             phase: Phase::Fresh,
+            retain_undo: false,
             summary: None,
             _worker: PhantomData,
         })
+    }
+
+    /// Restore complete journal transitions under the core undo cap.
+    pub fn retain_undo_history(&mut self) {
+        self.retain_undo = true;
     }
 
     /// One-shot, including failure and cancellation. Retry cleanup on this
@@ -288,10 +315,12 @@ impl JournalRecovery {
                 base_complete: false,
                 logical: 0,
                 revision_id: 0,
+                highest_revision: 0,
                 batch: None,
                 replacement: None,
                 batches: 0,
                 replacements: 0,
+                retain_undo: self.retain_undo,
             };
             let (journal, value) = run(&mut |event| events.event(event))?;
             Ok((events.finish(journal)?, value))
@@ -423,10 +452,12 @@ struct Consumer<'a, 'r, 'state, F> {
     base_complete: bool,
     logical: u64,
     revision_id: u64,
+    highest_revision: u64,
     batch: Option<Batch>,
     replacement: Option<Replacement>,
     batches: u64,
     replacements: u64,
+    retain_undo: bool,
 }
 impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
     fn admit_payload(&mut self, physical: u64, logical: u64) -> io::Result<()> {
@@ -464,6 +495,7 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
                 self.policy = Some(policy);
                 self.logical = logical_len;
                 self.revision_id = base.revision;
+                self.highest_revision = base.revision;
             }
             RecoveryEvent::BaseBytes(bytes) => {
                 if self.base.is_none() || self.base_complete {
@@ -478,6 +510,9 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
                 let physical = self.base.as_ref().ok_or_else(|| invalid("recovery missing base"))?.byte_len;
                 self.apply(physical, self.logical, 0..0)?;
                 self.base_complete = true;
+                if self.retain_undo {
+                    self.revision.checkpoint_undo(None)?;
+                }
             }
             RecoveryEvent::BeginBatch(header) => {
                 if !self.base_complete
@@ -543,6 +578,10 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
                     return Err(invalid("recovery incomplete batch"));
                 }
                 self.revision_id = batch.header.to_revision;
+                self.highest_revision = self.highest_revision.max(batch.header.to_revision);
+                if self.retain_undo {
+                    self.revision.checkpoint_undo(Some((batch.header.from_revision, batch.header.to_revision)))?;
+                }
             }
             RecoveryEvent::Base(_) => {
                 return Err(io::Error::new(
@@ -574,6 +613,7 @@ impl<F: FnMut(Point) -> io::Result<()>> Consumer<'_, '_, '_, F> {
             journal,
             base: self.base.ok_or_else(|| invalid("recovery missing base metadata"))?,
             policy: self.policy.ok_or_else(|| invalid("recovery missing policy"))?,
+            highest_revision: self.highest_revision,
         })
     }
 }

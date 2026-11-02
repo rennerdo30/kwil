@@ -264,10 +264,8 @@ impl App {
         if let Some(recovery) = self.view.recovery_notice() {
             segments.push(chrome::Segment { text: recovery.into(), command: None, warn: true });
         }
-        if self.view.editor().is_some_and(|editor| {
-            editor.document().compression == kwil_core_workspace::compressed::CompressionFormat::Gzip
-        }) {
-            segments.push(chrome::Segment { text: "Gzip · decoded text".into(), command: None, warn: false });
+        if let Some(badge) = self.view.editor().and_then(|editor| editor.document().compression.badge()) {
+            segments.push(chrome::Segment { text: format!("{badge} · decoded text"), command: None, warn: false });
         }
         if self.zoom.percent() != 100 {
             segments.push(chrome::Segment {

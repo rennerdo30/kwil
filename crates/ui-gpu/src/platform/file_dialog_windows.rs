@@ -353,7 +353,7 @@ fn options(kind: FilePromptKind, previous: u32) -> u32 {
         | DONT_ADD_TO_RECENT;
     match kind {
         FilePromptKind::Open => base | FILE_MUST_EXIST,
-        FilePromptKind::SaveAs => (base & !FILE_MUST_EXIST) | OVERWRITE_PROMPT,
+        FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs => (base & !FILE_MUST_EXIST) | OVERWRITE_PROMPT,
         _ => base,
     }
 }
@@ -371,7 +371,7 @@ fn choose_inner(request: &Request, pump: &Pump) -> Result<Outcome, String> {
     }
     let (class, iid) = match request.ticket.kind() {
         FilePromptKind::Open => (&CLSID_OPEN, &IID_OPEN),
-        FilePromptKind::SaveAs => (&CLSID_SAVE, &IID_SAVE),
+        FilePromptKind::SaveAs | FilePromptKind::SaveUncompressedAs => (&CLSID_SAVE, &IID_SAVE),
         _ => return Err("this prompt is not a native chooser".into()),
     };
     let mut raw = null_mut();

@@ -52,6 +52,7 @@ impl FilePromptKind {
         match self {
             Self::Open => "Open by path",
             Self::SaveAs => "Save as path",
+            Self::SaveUncompressedAs => "Save uncompressed as path",
             Self::Recent => "Open recent",
             Self::Folder => "Open Folder",
             Self::Encoding => "Change Encoding",
