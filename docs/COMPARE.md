@@ -9,8 +9,9 @@ line-length or total-text cap on the fallback.
 The worker captures both logical bytes and original-byte provenance using
 `SnapshotLease` and `InputStore`. Right-hand files use encoding detection and
 `DecodedNativeLease` over a duplicate of that exact file handle. This avoids
-constructing a resident text index or decoded document for the right side. Capture validates the sources;
-a changed source fails explicitly instead of publishing a partial comparison.
+constructing a resident text index or decoded document for the right side.
+Capture validates the sources; a changed source fails explicitly instead of
+publishing a partial comparison.
 After capture, whitespace toggles reuse the immutable stores.
 
 Alignment runs and hunk ranks stay in the engine's disk records. A fixed-width

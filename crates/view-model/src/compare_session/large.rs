@@ -108,7 +108,8 @@ fn capture(
 ) -> Result<InputStore<Budget>, String> {
     let len = snapshot.len();
     let source = SnapshotLease::try_new(snapshot, 0..len, InputIdentity([id, 0, 0, 0]), budget.clone())
-        .map_err(|e| error(e.error))?;
+        .map_err(|e| error(e.error))?
+        .with_comparison_text_runs();
     capture_source(source, root, budget, cancel)
 }
 trait CaptureOwner: SourceLease {
@@ -330,10 +331,10 @@ impl Drop for Projection {
     fn drop(&mut self) {
         drop(self.file.take());
         let path = self.root.join("projection");
-        if let Err(e) = fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("Compare projection cleanup {}: {e}", path.display());
-            }
+        if let Err(e) = fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("Compare projection cleanup {}: {e}", path.display());
         }
         if let Err(e) = fs::remove_dir(&self.root) {
             eprintln!("Compare directory cleanup {}: {e}", self.root.display());
@@ -588,7 +589,7 @@ impl LargeState {
                 return Err(error(r.error));
             }
         };
-        let result = (|| {
+        let (terminal, result) = (|| {
             loop {
                 let step = build.step(quantum(), cancel);
                 match step.state() {
@@ -600,7 +601,11 @@ impl LargeState {
                         build = lane(step.into_build());
                         break;
                     }
-                    words::WordBuildState::Terminal => return Err(lane(step.into_terminal())),
+                    words::WordBuildState::Terminal => {
+                        let terminal = lane(step.into_terminal());
+                        let error = terminal.error.as_ref().map_or_else(|| "Comparison cancelled".into(), error);
+                        return (terminal, Err(error));
+                    }
                 }
             }
             let mut ranges = [Vec::new(), Vec::new()];
@@ -609,7 +614,7 @@ impl LargeState {
                 let mut query = words::WordPageQuery::new(backend, continuation);
                 let mut page = words::WordPage::empty(backend);
                 if let Err(e) = drive(cancel, |work| build.page(&mut query, &mut page, work, cancel)) {
-                    return Ok((build.into_parts(), Err(e)));
+                    return (build.into_parts(), Err(e));
                 }
                 for change in page.records[..page.len].iter().flatten() {
                     for (side, span, range) in [(0, left, &change.left), (1, right, &change.right)] {
@@ -625,15 +630,8 @@ impl LargeState {
                 }
                 continuation = page.continuation;
             }
-            Ok((build.into_parts(), Ok(ranges)))
+            (build.into_parts(), Ok(ranges))
         })();
-        let (terminal, result) = match result {
-            Ok(pair) => pair,
-            Err(t) => {
-                let e = t.error.as_ref().map_or_else(|| "Comparison cancelled".into(), error);
-                (t, Err(e))
-            }
-        };
         self.model = Some(terminal.comparison);
         let mut retirement = terminal.retirement;
         loop {

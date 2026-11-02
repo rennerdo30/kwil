@@ -563,19 +563,25 @@ mod tests {
     }
     #[test]
     fn compare_above_line_limit_publishes_files_and_saved_buffer() {
-        let text = "same word\n".repeat(diff::MAX_LINES / 2 + 1);
+        let text = (0..diff::MAX_LINES / 2 + 1).map(|n| format!("row {n:06} same word\n")).collect::<String>();
         let fixture = Fixture::new(text.as_bytes());
         let file = TextFile::open_saved_version(&fixture.0).unwrap();
-        file.build_index(1).unwrap();
-        let mut buffer = kwil_core_text::Buffer::from_file(file).unwrap();
+        let backing = kwil_core_text::decoded_backing::DecodedBacking::prepare(
+            &file,
+            kwil_core_text::decoded_backing::Interpretation::new(kwil_core_text::encoding::Encoding::UTF8, 0).unwrap(),
+            &std::env::temp_dir(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut buffer = kwil_core_text::Buffer::from_decoded(backing.snapshot()).unwrap();
         buffer.insert(0, b"changed ").unwrap();
-        buffer.insert(1_300_008, b"   ").unwrap();
+        buffer.insert(130_000 * 21 + 8, b"   ").unwrap();
         let mut session = Session::default();
         session.send(Request::Start(buffer.snapshot(), fixture.0.clone(), CompareSettings::default())).unwrap();
         let result = session.worker.as_ref().unwrap().rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
         let page = result.expect("above-limit saved buffer must compare").unwrap();
         assert_eq!(page.changes, 2);
-        assert_eq!(page.rows[0].text, [b"changed same word".to_vec(), b"same word".to_vec()]);
+        assert_eq!(page.rows[0].text, [b"changed row 000000 same word".to_vec(), b"row 000000 same word".to_vec()]);
         assert!(!page.rows[0].words[0].is_empty());
         assert!(page.rows.iter().any(|r| r.hidden > 100_000));
         assert!(page.rows.len() <= PAGE_ROWS);
@@ -645,7 +651,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(files.changes, 1);
-        assert_eq!(files.rows[0].text, [b"same word".to_vec(), b"other same word".to_vec()]);
+        assert_eq!(files.rows[0].text, [b"row 000000 same word".to_vec(), b"other row 000000 same word".to_vec()]);
         assert!(!files.rows[0].words[1].is_empty());
         session.busy = false;
         session.send(Request::Close).unwrap();
@@ -662,6 +668,8 @@ mod tests {
         );
         assert_eq!(std::fs::read(&fixture.0).unwrap(), text.as_bytes());
         drop(session);
+        drop(buffer);
+        assert!(backing.try_retire().is_ok());
     }
     #[test]
     fn compare_above_line_length_limit_is_exact_and_paged() {

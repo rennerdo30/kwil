@@ -831,9 +831,14 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         Step::CompareOpen => {
             assert!(app.opts.hidden);
             if let Some(path) = std::env::var_os("KWIL_COMPARE_PATH") {
-                assert!(app.dispatch_compare("compare.files"));
+                // Install the host wake callback, then inject a path before
+                // native chooser sync (choosers are forbidden in hidden runs).
+                assert!(app.dispatch_compare("compare.close"));
+                assert!(app.view.compare_command("compare.files"));
                 app.view.file_prompt_mut().expect("compare path prompt").text = path.to_string_lossy().into();
                 app.view.submit_file_prompt().expect("compare two files");
+                app.sync_file_ui();
+                app.apply(Damage { full: true, status: true, ..Default::default() });
             } else {
                 app.edit(super::input::Action::Text("Edited buffer: ".into()));
                 assert!(app.dispatch_compare("compare.saved"));

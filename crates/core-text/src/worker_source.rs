@@ -193,6 +193,8 @@ pub struct WorkerSourceCursor {
     validation_located: bool,
     validation_credit: u8,
     stopped: bool,
+    comparison_runs: bool,
+    comparison_prefix: Option<usize>,
     _worker: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -270,6 +272,8 @@ impl WorkerSourceCursor {
             validation_located: false,
             validation_credit: 0,
             stopped: false,
+            comparison_runs: false,
+            comparison_prefix: None,
             _worker: std::marker::PhantomData,
         })
     }
@@ -278,6 +282,10 @@ impl WorkerSourceCursor {
         // SAFETY: consumes the sole cursor; no custom Drop reads this field.
         // The Arc slots drop on this worker while the returned root stays live.
         unsafe { ManuallyDrop::take(&mut self.snapshot) }
+    }
+
+    pub(crate) fn comparison_text_runs(&mut self) {
+        self.comparison_runs = true;
     }
 
     /// Restartable full-source validation pass, used before capture and after
@@ -377,6 +385,26 @@ impl WorkerSourceCursor {
         let Kind::Leaf(piece) = &node.kind else { unreachable!() };
         let start = piece.start + self.next - self.walk.base;
         let limit = piece.start + (self.range.end - self.walk.base).min(node.metrics.bytes);
+        // Compare may materialize canonical UTF-8 as plain text. A malformed
+        // marker (0xff) ends this run and still takes the exact atom resolver.
+        // Save/edit cursors keep their original per-atom provenance contract.
+        if self.item.is_none()
+            && self.comparison_runs
+            && let Storage::Decoded(source) = piece.storage.as_ref()
+            && source.origin.interpretation().encoding == Encoding::UTF8
+        {
+            if self.comparison_prefix.is_none() {
+                let end = limit.min(start + logical.len().min(WINDOW) as u64);
+                if !visit((end - start) as usize + 4, cancel, admit)? {
+                    return Ok(WorkerSourceStep::Pending);
+                }
+                let bytes = &source.origin.logical_bytes()[start as usize..end as usize];
+                self.comparison_prefix = Some(std::str::from_utf8(bytes).map_or_else(|e| e.valid_up_to(), str::len));
+            }
+            if let Some(n) = self.comparison_prefix.filter(|&n| n > 0) {
+                self.item = Some(Item::new(start..start + n as u64, 0..0, WorkerSourceKind::Text, None, None));
+            }
+        }
         if self.item.is_none() {
             let item = match piece.storage.as_ref() {
                 Storage::Opaque { encoding, logical: text, offsets, .. } => {
@@ -533,6 +561,7 @@ impl WorkerSourceCursor {
         self.decoded_next = item.decoded_end;
         self.item = None;
         self.detached = None;
+        self.comparison_prefix = None;
         self.decoding = None;
         if self.next == self.walk.base + node.metrics.bytes {
             self.walk = Walk::new();

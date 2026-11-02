@@ -325,6 +325,14 @@ impl<A: Admission> SnapshotLease<A> {
         aggregate.release(Usage { resident: self.charged, handles: self.handles, ..Usage::default() });
         (snapshot, aggregate)
     }
+
+    /// Comparison-only materialization of canonical UTF-8 runs. Malformed
+    /// atoms retain their codec and original bytes; aliases in other codecs
+    /// retain the ordinary complete-atom representation.
+    pub fn with_comparison_text_runs(mut self) -> Self {
+        self.cursor.as_mut().unwrap().comparison_text_runs();
+        self
+    }
 }
 impl<A: Admission> SourceLease for SnapshotLease<A> {
     fn identity(&self) -> InputIdentity {
@@ -492,6 +500,8 @@ pub struct DecodedNativeLease<A: Admission> {
     decoder_bytes: usize,
     decoder_ops: usize,
     utf8_run: Option<usize>,
+    utf8_fallback: bool,
+    plain: ManuallyDrop<Option<Box<[u8; INPUT_WINDOW + 4]>>>,
 }
 #[must_use]
 pub struct RejectedNative<A: Admission> {
@@ -515,7 +525,7 @@ impl<A: Admission> DecodedNativeLease<A> {
         };
         // Exact fixed read window, its constructor overlap, by-value wrapper
         // overlap and shared primitive's fixed decoder/output temporaries.
-        let charge = (INPUT_WINDOW * 2)
+        let charge = (INPUT_WINDOW * 4 + 8)
             .checked_add(2 * std::mem::size_of::<Self>())
             .and_then(|n| n.checked_add(2 * std::mem::size_of::<crate::decoded_backing::ResumeAtom>()))
             .and_then(|n| n.checked_add(std::mem::size_of::<crate::decoded_backing::AtomSize>() + 16));
@@ -542,11 +552,14 @@ impl<A: Admission> DecodedNativeLease<A> {
             decoder_bytes: 0,
             decoder_ops: 0,
             utf8_run: None,
+            utf8_fallback: false,
+            plain: ManuallyDrop::new(Some(Box::new([0; INPUT_WINDOW + 4]))),
         })
     }
     /// Worker only; return the complete native invocation handle and budget.
     pub fn into_parts(mut self) -> (NativeFileLease, A) {
         drop(self.window.take());
+        drop(self.plain.take());
         let native = self.native.take().unwrap();
         let mut aggregate = self.aggregate.take().unwrap();
         aggregate.release(Usage { resident: self.charged, ..Usage::default() });
@@ -560,28 +573,41 @@ impl<A: Admission> DecodedNativeLease<A> {
     // lane writes the caller's window.
     fn utf8_run(&mut self, out: &mut [u8], work: &mut ReadWork, cancel: &AtomicBool) -> Step<Option<usize>> {
         if self.utf8_run.is_none() {
-            let available = self.filled - self.next;
-            match self.credit.admit(available + 4, work, cancel) {
+            let available = self.carry_len + self.filled - self.next;
+            match self.credit.admit(available * 2 + 4, work, cancel) {
                 Ok(true) => {}
                 Ok(false) => return paused(cancel),
                 Err(e) => return Step::Failed(e.into()),
             }
-            let bytes = &self.window.as_ref().unwrap()[self.next..self.filled];
+            let plain = self.plain.as_mut().unwrap();
+            plain[..self.carry_len].copy_from_slice(&self.carry[..self.carry_len]);
+            plain[self.carry_len..available].copy_from_slice(&self.window.as_ref().unwrap()[self.next..self.filled]);
+            let bytes = &plain[..available];
             let valid = std::str::from_utf8(bytes).map_or_else(|e| e.valid_up_to(), str::len);
             let mut n = valid.min(out.len());
-            while n > 0 && n < valid && bytes[n] & 0xc0 == 0x80 { n -= 1; }
-            if n == 0 { return Step::Ready(None); }
+            while n > 0 && n < valid && bytes[n] & 0xc0 == 0x80 {
+                n -= 1;
+            }
+            if n == 0 {
+                self.utf8_fallback = true;
+                return Step::Ready(None);
+            }
             self.utf8_run = Some(n);
         }
         let n = self.utf8_run.unwrap();
-        if out.len() < n { return Step::Failed(InputError::SourceContract); }
-        match self.credit.admit(n, work, cancel) {
+        if out.len() < n {
+            return Step::Failed(InputError::SourceContract);
+        }
+        match self.credit.admit(n + 4, work, cancel) {
             Ok(true) => {}
             Ok(false) => return paused(cancel),
             Err(e) => return Step::Failed(e.into()),
         }
-        out[..n].copy_from_slice(&self.window.as_ref().unwrap()[self.next..self.next+n]);
-        self.next += n;
+        out[..n].copy_from_slice(&self.plain.as_ref().unwrap()[..n]);
+        let carry = n.min(self.carry_len);
+        self.carry.copy_within(carry..self.carry_len, 0);
+        self.carry_len -= carry;
+        self.next += n - carry;
         self.utf8_run = None;
         Step::Ready(Some(n))
     }
@@ -656,17 +682,6 @@ impl<A: Admission> SourceLease for DecodedNativeLease<A> {
                 Step::Cancelled => return Step::Cancelled,
                 Step::Failed(error) => return Step::Failed(error),
             }
-            if self.atom.is_none() && self.carry_len == 0 && self.bom_checked
-                && self.interpretation.encoding == Encoding::UTF8 && self.next < self.filled
-            {
-                match self.utf8_run(logical, work, cancel) {
-                    Step::Ready(Some(n)) => return Step::Ready(Some(Captured { logical: n, original: 0, kind: CaptureKind::Text, encoding: 0 })),
-                    Step::Ready(None) => {},
-                    Step::Pending => return Step::Pending,
-                    Step::Cancelled => return Step::Cancelled,
-                    Step::Failed(e) => return Step::Failed(e),
-                }
-            }
             if self.atom.is_none() {
                 match self.fill_carry(work, cancel) {
                     Step::Ready(()) => {}
@@ -699,6 +714,26 @@ impl<A: Admission> SourceLease for DecodedNativeLease<A> {
                 }
                 if self.carry_len == 0 {
                     return Step::Ready(None);
+                }
+                if self.interpretation.encoding == Encoding::UTF8
+                    && !self.utf8_fallback
+                    && self.decoder_bytes == 0
+                    && self.decoder_ops == 0
+                {
+                    match self.utf8_run(logical, work, cancel) {
+                        Step::Ready(Some(n)) => {
+                            return Step::Ready(Some(Captured {
+                                logical: n,
+                                original: 0,
+                                kind: CaptureKind::Text,
+                                encoding: 0,
+                            }));
+                        }
+                        Step::Ready(None) => {}
+                        Step::Pending => return Step::Pending,
+                        Step::Cancelled => return Step::Cancelled,
+                        Step::Failed(e) => return Step::Failed(e),
+                    }
                 }
                 // Shared helper's documented worst case: <=4 raw visits,
                 // <=4 decoder calls and <=8 logical bytes. Prepay every unit;
@@ -766,6 +801,7 @@ impl<A: Admission> SourceLease for DecodedNativeLease<A> {
             self.carry.copy_within(atom.raw_len..self.carry_len, 0);
             self.carry_len -= atom.raw_len;
             self.atom = None;
+            self.utf8_fallback = false;
             return Step::Ready(Some(result));
         }
     }
