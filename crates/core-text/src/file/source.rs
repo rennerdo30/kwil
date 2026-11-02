@@ -4,6 +4,7 @@ use std::{borrow::Cow, ops::Range};
 /// Maximum allocation of an owned source range. Streaming callers reuse a
 /// caller-owned buffer; no source range borrows externally mutable file pages.
 pub const READ_CHUNK: usize = 1 << 20;
+pub(super) const VIEW_CACHE_BYTES: usize = 96 << 10;
 
 impl TextFile {
     pub(crate) fn validate_source(&self) -> Result<(), ReadError> {
@@ -11,6 +12,32 @@ impl TextFile {
             FileState::Unchanged => Ok(()),
             state => Err(ReadError::Changed(state)),
         }
+    }
+
+    pub(super) fn cached_range(&self, range: Range<u64>) -> Result<Vec<u8>, ReadError> {
+        let mut cache = self
+            .shared
+            .read_window
+            .lock()
+            .map_err(|_| ReadError::Io(io::Error::other("source window lock poisoned")))?;
+        if range.start >= cache.0 && range.end <= cache.0 + cache.1.len() as u64 {
+            self.validate_source()?;
+            return Ok(cache.1[(range.start - cache.0) as usize..(range.end - cache.0) as usize].to_vec());
+        }
+        let end = (range.end + (16 << 10)).min(self.len());
+        if end - range.start > VIEW_CACHE_BYTES as u64 {
+            return self.read_range(range).map(|b| b.into_owned());
+        }
+        cache.0 = range.start;
+        let size = (end - range.start) as usize;
+        let extra = size.saturating_sub(cache.1.len());
+        cache.1.try_reserve_exact(extra).map_err(|error| ReadError::Io(io::Error::other(error)))?;
+        cache.1.resize(size, 0);
+        if let Err(error) = self.read_into(range.start, &mut cache.1) {
+            cache.1.clear();
+            return Err(error);
+        }
+        Ok(cache.1[..(range.end - range.start) as usize].to_vec())
     }
 
     pub fn same_source(&self, other: &Self) -> bool {
@@ -113,7 +140,7 @@ mod tests {
     #[test]
     fn bounded_source_truncate_during_indexing_refuses_partial_result() {
         let fixture = Fixture::new();
-        let file = fixture.source(&vec![b'x'; 3 * (64 << 10)]);
+        let file = fixture.source(&vec![b'x'; 8 << 20]);
         let truncated = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
         let result = LineIndex::build_reader(
@@ -123,8 +150,11 @@ mod tests {
             1,
             &progress,
             crate::INDEX_MEMORY_BYTES,
-            |range| {
-                let bytes = file.read_range(range).map_err(io::Error::other)?;
+            |range, scratch| {
+                scratch.reserve((range.end - range.start) as usize)?;
+                scratch.items.resize((range.end - range.start) as usize, 0);
+                file.read_into(range.start, &mut scratch.items).map_err(io::Error::other)?;
+                let bytes = std::borrow::Cow::Owned(std::mem::take(&mut scratch.items));
                 if !truncated.swap(true, Ordering::Relaxed) {
                     // The scanner has already admitted/read its first window.
                     // Shrink while indexing, before the next window is requested.
