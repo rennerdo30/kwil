@@ -37,6 +37,11 @@ x11-dl = "2.21.0"
 wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "vulkan", "gles", "wgsl"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSView", "NSResponder", "NSGraphicsContext", "objc2-core-graphics", "objc2-quartz-core"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSGeometry"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage"] }
 wgpu = { version = "30.0.1", optional = true, default-features = false, features = ["std", "metal", "wgsl"] }
 
 [target.'cfg(windows)'.dependencies]

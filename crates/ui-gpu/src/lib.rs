@@ -34,6 +34,10 @@ mod ime;
 mod input;
 mod language_ui;
 mod log_ui;
+#[cfg(any(target_os = "macos", test))]
+mod macos_damage;
+#[cfg(target_os = "macos")]
+mod macos_presenter;
 mod markdown_diagram;
 mod markdown_images;
 mod markdown_ui;
@@ -306,6 +310,8 @@ pub enum GuiEvent {
 }
 
 struct Gfx {
+    #[cfg(target_os = "macos")]
+    macos_presenter: macos_presenter::Presenter,
     #[cfg(all(windows, feature = "gpu"))]
     gpu_canvas: Option<gpu_surface::Canvas>,
     native: Option<platform::Native>,
@@ -1283,6 +1289,9 @@ impl App {
         #[cfg(feature = "gpu")]
         {
             self.gpu.is_some()
+                // Metal/wgpu exposes no damage present API. AppKit owns macOS
+                // presentation, including when the GPU preference is selected.
+                && !cfg!(target_os = "macos")
                 && !self.policy.remote()
                 // DXGI resize can stall even after retirement. CPU owns drag
                 // frames; GPU resumes once at the final native geometry.
@@ -2884,7 +2893,40 @@ impl App {
                 }
             }
         }
-        if !rects.is_empty() {
+        #[cfg(target_os = "macos")]
+        let macos_presented = if !rects.is_empty() {
+            match gfx.macos_presenter.present(&gfx.window, pixels, (w, h), &damage) {
+                Ok(true) => {
+                    #[cfg(feature = "frame-harness")]
+                    trace::presented(content_mark);
+                    #[cfg(feature = "frame-harness")]
+                    self.metrics.present(
+                        p.full,
+                        damage.iter().map(|area| (area.w * area.h) as u64).sum(),
+                        copied,
+                        self.view.editor().is_some() && self.view.line(0).is_some_and(|line| !line.is_empty()),
+                    );
+                    true
+                }
+                result => {
+                    if let Err(error) = result {
+                        eprintln!("kwil AppKit presentation failed; using full CPU present: {error}");
+                    }
+                    // Retiring the native child exposes softbuffer's old image.
+                    // Repair it immediately, and keep full presents thereafter.
+                    rects.clear();
+                    if let Some(full) = (Rect { x: 0, y: 0, w, h }).to_softbuffer() {
+                        rects.push(full);
+                    }
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "macos"))]
+        let macos_presented = false;
+        if !rects.is_empty() && !macos_presented {
             let mut target = match gfx.surface.buffer_mut() {
                 Ok(target) => target,
                 Err(error) => {
@@ -2905,10 +2947,17 @@ impl App {
                 Ok(()) => {
                     #[cfg(feature = "frame-harness")]
                     trace::presented(content_mark);
-                    #[cfg(feature = "frame-harness")]
+                    #[cfg(all(feature = "frame-harness", not(target_os = "macos")))]
                     self.metrics.present(
                         p.full,
                         damage.iter().map(|area| (area.w * area.h) as u64).sum(),
+                        copied,
+                        self.view.editor().is_some() && self.view.line(0).is_some_and(|line| !line.is_empty()),
+                    );
+                    #[cfg(all(feature = "frame-harness", target_os = "macos"))]
+                    self.metrics.present(
+                        true,
+                        rects.iter().map(|area| u64::from(area.width.get()) * u64::from(area.height.get())).sum(),
                         copied,
                         self.view.editor().is_some() && self.view.line(0).is_some_and(|line| !line.is_empty()),
                     );
@@ -3467,6 +3516,8 @@ impl ApplicationHandler<UserEvent> for App {
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
         self.gfx = Some(Gfx {
+            #[cfg(target_os = "macos")]
+            macos_presenter: Default::default(),
             #[cfg(all(windows, feature = "gpu"))]
             gpu_canvas: None,
             native: None,
@@ -4776,6 +4827,9 @@ impl App {
         #[cfg(feature = "gpu")]
         if self.settings_loaded
             && !self.gpu_started
+            // Avoid both a full-image Metal surface and unused GPU startup.
+            // The native AppKit presenter preserves damage for all preferences.
+            && !cfg!(target_os = "macos")
             && !self.policy.remote()
             && self.opts.renderer.unwrap_or(self.settings.render.backend)
                 != kwil_core_commands::settings::RenderBackend::Cpu

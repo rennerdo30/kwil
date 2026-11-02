@@ -57,12 +57,25 @@ input integration must account for the renderer's resolved visual order for RTL.
 | Windows CPU | `copy_within` plus same-window GDI `BitBlt` | Exposed rows and status only through softbuffer/GDI |
 | X11 CPU | `copy_within` plus server `XCopyArea` on Xlib windows | Exposed rows and status; if no native copy is available, moved pixels are also damaged |
 | Wayland CPU | `copy_within`; Wayland has no window-pixel copy request | Moved pixels plus exposed rows via `damage_buffer`; surface protocol versions below 4 receive full damage |
-| macOS CPU | `copy_within`; no public softbuffer scroll-copy seam | softbuffer 0.4.8 ignores damage and replaces the CALayer image; actions are disabled |
+| macOS CPU | `copy_within`; moved pixels are also damaged | Native AppKit view invalidation per rectangle, cropped CoreGraphics images for the actual dirty regions; full softbuffer fallback on error |
 
 Wayland must damage moved pixels: advertising only the exposed strip would leave stale
-content in a compositor that applies damage incrementally. macOS partial presentation
-and compositor-level scroll copy are **open**, not claimed implemented. X11 and macOS
-native behavior has not been exercised on this Windows machine.
+content in a compositor that applies damage incrementally. macOS uses the same moved-region
+damage rule: compositor-level scroll copy remains open. The native presenter keeps a
+viewport-sized pixel cache, updates damaged rows, and uses `setNeedsDisplayInRect:` plus
+`getRectsBeingDrawn:count:` instead of replacing a full CALayer image. Physical pixel
+rectangles map to flipped view points using the actual bounds, including Retina and
+fractional dimensions. Each CoreGraphics image owns only its dirty crop until released.
+The view leaves hit testing and first-responder ownership with winit. An initialization,
+geometry, allocation or drawing error removes the child view and immediately repairs the
+whole softbuffer image; fallback is sticky for that window. No timer or idle redraw is added.
+See Apple's [view drawing guidance](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CocoaViewsGuide/Optimizing/Optimizing.html).
+
+macOS uses this native CPU presenter for every renderer preference, including remote
+mode, because wgpu/Metal's full-image swapchain would undo damage-only presentation.
+It skips unused GPU initialization on macOS. Windows and Linux backend selection is
+unchanged. X11 and real macOS presentation have not been observed on this Windows machine;
+macOS CI compilation/tests do not establish native display or compositor behavior.
 
 ## GPU status: partial completion
 
