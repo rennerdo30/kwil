@@ -615,6 +615,7 @@ impl Host {
                 Err(e) => self.error = e.to_string(),
             }
         }
+        let draft = self.draft();
         let Some(session) = &mut self.logs else {
             return;
         };
@@ -647,8 +648,12 @@ impl Host {
             }
             self.retry = Some((key, snapshot));
         }
-        if !self.open || self.draft() {
+        if !self.open || draft {
             session.cancel_viewport();
+            // A cancelled request may never publish a page. Restoring the last
+            // applied fields must issue a fresh request even for the same key.
+            self.submitted = None;
+            self.page = None;
             return;
         }
         let Some(key) = current else {
@@ -721,15 +726,16 @@ impl Host {
         let label = if let Some(field) = self.field {
             let caption = ["Filter", "From", "To"][field];
             let cursor = self.field_cursor;
+            let hint = if area.width >= 60 { " | Tab:next Enter:apply Esc:cancel" } else { "" };
             let window = kwil_view_model::palette_session::text_window(
                 self.edit(field),
                 cursor,
-                area.width.saturating_sub(caption.len() as u16 + 2) as usize,
+                area.width.saturating_sub((caption.len() + hint.len() + 2) as u16) as usize,
             );
             if area.width > caption.len() as u16 + 2 && area.height > 0 {
                 frame.set_cursor_position((area.x + caption.len() as u16 + 2 + window.cursor as u16, area.y));
             }
-            format!("{caption}: {}", window.text)
+            format!("{caption}: {}{hint}", window.text)
         } else {
             format!(
                 "{} | {}{} rows | {} | r:regex={} u:unknown={} | f:filter t:time a:all c:clear Enter:source Ctrl+C:copy Esc:text",
@@ -1166,6 +1172,7 @@ mod tests {
         wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
         host.key(&mut view, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
         host.paste(" draft");
+        host.sync(&mut view, 12);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();
         terminal.draw(|f| host.draw(f, &view, f.area())).unwrap();
         let screen = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
@@ -1173,6 +1180,8 @@ mod tests {
         assert_eq!(host.mark_line(&view), None);
         host.key(&mut view, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(host.query, "original");
+        wait(&mut host, &mut view, &rx, |h| h.page.as_ref().is_some_and(|p| p.exact));
+        assert_eq!(host.mark_line(&view), Some(1));
         stop(&mut host);
     }
     #[test]
