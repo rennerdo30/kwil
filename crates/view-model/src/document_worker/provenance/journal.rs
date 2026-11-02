@@ -1855,11 +1855,11 @@ mod tests {
             .to_codec()
             .is_err()
         );
-        for label in ["utf8", "ISO-2022-JP", "unknown"] {
+        for label in ["utf8", "unknown"] {
             let mut codec = b"KWJR\x01\x00\x00".to_vec();
             codec.push(label.len() as u8);
             codec.extend_from_slice(label.as_bytes());
-            assert!(RecoveryPolicy::from_codec(&codec).is_err(), "strict canonical/stateless policy: {label}");
+            assert!(RecoveryPolicy::from_codec(&codec).is_err(), "strict canonical policy: {label}");
         }
     }
 

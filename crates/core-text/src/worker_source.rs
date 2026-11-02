@@ -159,7 +159,7 @@ struct Item {
     kind: WorkerSourceKind,
     encoding: Option<Encoding>,
     /// Exact end of the containing decoded atom, even for a partial text item.
-    decoded_end: Option<(u64, u64)>,
+    decoded_end: Option<(u64, u64, Option<crate::encoding::iso2022::State>)>,
     credit: usize,
     source_credit: u8,
 }
@@ -186,7 +186,7 @@ pub struct WorkerSourceCursor {
     located: bool,
     detached: Option<Detached>,
     decoding: Option<Decoding>,
-    decoded_next: Option<(u64, u64)>,
+    decoded_next: Option<(u64, u64, Option<crate::encoding::iso2022::State>)>,
     item: Option<Item>,
     validation: Walk,
     validation_next: u64,
@@ -450,11 +450,9 @@ impl WorkerSourceCursor {
                 Storage::Decoded(source) => {
                     if self.decoding.is_none() {
                         self.decoding = Some(match self.decoded_next {
-                            Some((at, raw)) if at == start => Decoding::Atom {
-                                logical: at,
-                                raw,
-                                decoder: ResumeAtom::new(source.origin.interpretation().encoding),
-                            },
+                            Some((at, raw, state)) if at == start => {
+                                Decoding::Atom { logical: at, raw, decoder: ResumeAtom::at(&source.origin, raw, state) }
+                            }
                             _ => Decoding::Locate(ResumeBoundary::new(&source.origin, start)),
                         });
                     }
@@ -469,7 +467,7 @@ impl WorkerSourceCursor {
                                         self.decoding = Some(Decoding::Atom {
                                             logical: at,
                                             raw,
-                                            decoder: ResumeAtom::new(source.origin.interpretation().encoding),
+                                            decoder: ResumeAtom::at(&source.origin, raw, None),
                                         })
                                     }
                                     other => break other,
@@ -502,8 +500,20 @@ impl WorkerSourceCursor {
                     } else {
                         WorkerSourceKind::Preserved
                     };
-                    let decoded_end = Some((atom.end, original.end));
-                    let raw = if complete { original } else { 0..0 };
+                    // Detached valid text is encoded at its destination; an ISO
+                    // fragment alone does not carry the preceding charset.
+                    let kind = if source.origin.interpretation().encoding.iso2022() && kind != WorkerSourceKind::Opaque
+                    {
+                        WorkerSourceKind::Text
+                    } else {
+                        kind
+                    };
+                    let state = match &self.decoding {
+                        Some(Decoding::Atom { decoder, .. }) => decoder.iso_state(),
+                        _ => None,
+                    };
+                    let decoded_end = Some((atom.end, original.end, state));
+                    let raw = if complete && kind != WorkerSourceKind::Text { original } else { 0..0 };
                     Item::new(start..end, raw, kind, Some(source.origin.interpretation().encoding), decoded_end)
                 }
                 storage => {
@@ -591,7 +601,7 @@ impl Item {
         raw: Range<u64>,
         kind: WorkerSourceKind,
         encoding: Option<Encoding>,
-        decoded_end: Option<(u64, u64)>,
+        decoded_end: Option<(u64, u64, Option<crate::encoding::iso2022::State>)>,
     ) -> Self {
         Self { logical, raw, kind, encoding, decoded_end, credit: 0, source_credit: 0 }
     }

@@ -339,7 +339,7 @@ fn reinterpretation_changes_display_without_modifying_source() {
     let mut saved = Vec::new();
     sjis.write_to(&buffer.snapshot(), sjis.save_plan(), &mut saved).unwrap();
     assert_eq!(saved, bytes);
-    assert!(matches!(Encoding::for_label("iso-2022-jp"), Err(EncodingError::UnsupportedEncoding(_))));
+    assert_eq!(Encoding::for_label("iso-2022-jp").unwrap(), Encoding::ISO2022_JP);
 }
 
 #[test]
@@ -429,19 +429,6 @@ fn save_rejects_edits_inside_encoded_characters() {
             Err(EncodingError::SplitCharacter(1))
         ));
     }
-}
-
-#[test]
-fn iso2022_jp_is_known_limitation_never_garbled() {
-    let dir = TempDir::new();
-    let (bytes, _, errors) = encoding_rs::ISO_2022_JP.encode("日本語のメールです。\r\n文字化けを防ぎます。\r\n");
-    assert!(!errors);
-    let error =
-        EncodedFile::new(dir.open("iso2022-jp", &bytes)).err().expect("stateful file must not produce garbled UTF-8");
-    assert!(matches!(error, EncodingError::UnsupportedEncoding(_)));
-    assert_eq!(error.to_string(), "ISO-2022-JP is not supported yet (known limitation, KW-45)");
-    let error = Encoding::for_label("iso-2022-jp").unwrap_err();
-    assert_eq!(error.to_string(), "ISO-2022-JP is not supported yet (known limitation, KW-45)");
 }
 
 #[test]
@@ -536,7 +523,7 @@ fn iso2022_random_access_sparse_checkpoints_keep_shifted_charset() {
     let dir = TempDir::new();
     let mut raw = Vec::new();
     let mut positions = Vec::new();
-    for i in 0..18000 {
+    for i in 0..180000 {
         positions.push(raw.len() as u64);
         raw.extend_from_slice(if i % 2 == 0 { b"\x1b$BF|K\\8l\x1b(B\r\n" } else { b"\x1b(J\\~\x1b(B abc\n" });
     }
@@ -544,7 +531,7 @@ fn iso2022_random_access_sparse_checkpoints_keep_shifted_charset() {
     let index = source.build_index().unwrap();
     assert!(index.checkpoint_count() <= raw.len() / STRIDE + 2);
     assert!(index.allocated_bytes() < 4096);
-    for i in [17000, 7, 12345, 8192, 17998, 9001] {
+    for i in [170000, 7, 12345, 81920, 179998, 90001] {
         let decoded = source.decode_lines(i as u64, 1).unwrap().unwrap();
         assert_eq!(decoded.source.start, positions[i]);
         assert_eq!(text(&decoded), if i % 2 == 0 { "日本語\r\n" } else { "¥‾ abc\n" });
@@ -592,19 +579,50 @@ fn iso2022_decoded_backing_roundtrip_edit_and_malformed() {
         let owner =
             DecodedBacking::prepare(&file, Interpretation::new(encoding, 0).unwrap(), &dir.0, &AtomicBool::new(false))
                 .unwrap();
-        let mut buffer = Buffer::from_decoded(owner.snapshot());
+        let mut buffer = Buffer::from_decoded(owner.snapshot()).unwrap();
         let plan = SavePlan { encoding, bom: false, line_ending: None };
         let mut saved = Vec::new();
         write_snapshot(&buffer.snapshot(), plan, &mut saved).unwrap();
         assert_eq!(saved, raw);
         if i == 0 {
             assert_eq!(owner.snapshot().logical_bytes(), "日本語".as_bytes());
+            let mut cursor = crate::WorkerSourceCursor::try_new(buffer.snapshot(), 0..buffer.len(), |_| Ok(true))
+                .unwrap_or_else(|_| panic!("ISO cursor"));
+            let mut collected = Vec::new();
+            loop {
+                let mut logical = [0; 16];
+                let mut raw = [0; 16];
+                match cursor.fill(&mut logical, &mut raw, &AtomicBool::new(false), |_| Ok(true)).unwrap() {
+                    crate::WorkerSourceStep::Ready(Some(chunk)) => {
+                        assert_eq!(chunk.kind, crate::WorkerSourceKind::Text);
+                        collected.extend_from_slice(&logical[..chunk.logical_len]);
+                    }
+                    crate::WorkerSourceStep::Ready(None) => break,
+                    crate::WorkerSourceStep::Pending => panic!("unlimited source admission"),
+                }
+            }
+            assert_eq!(collected, "日本語".as_bytes());
+            drop(cursor.into_snapshot());
             buffer.insert(3, b"X").unwrap();
             saved.clear();
             write_snapshot(&buffer.snapshot(), plan, &mut saved).unwrap();
             let (text, errors) = encoding_rs::ISO_2022_JP.decode_without_bom_handling(&saved);
             assert!(!errors);
             assert_eq!(text, "日X本語");
+            buffer.insert(buffer.len(), "日".as_bytes()).unwrap();
+            saved.clear();
+            write_snapshot(&buffer.snapshot(), plan, &mut saved).unwrap();
+            let (text, errors) = encoding_rs::ISO_2022_JP.decode_without_bom_handling(&saved);
+            assert!(!errors, "appending shifted text must coalesce the original final reset");
+            assert_eq!(text, "日X本語日");
+            let mut shifted = Buffer::from_decoded(owner.snapshot()).unwrap();
+            shifted.insert(3, "日".as_bytes()).unwrap();
+            saved.clear();
+            write_snapshot(&shifted.snapshot(), plan, &mut saved).unwrap();
+            let (text, errors) = encoding_rs::ISO_2022_JP.decode_without_bom_handling(&saved);
+            assert!(!errors, "new shifted text must join the shifted original");
+            assert_eq!(text, "日日本語");
+            drop(shifted);
         } else {
             assert!(owner.snapshot().logical_bytes().contains(&0xff));
             assert!(

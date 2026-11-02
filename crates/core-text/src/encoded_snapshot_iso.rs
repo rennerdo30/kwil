@@ -19,7 +19,9 @@ pub(super) fn decoded_iso(
         output.iso_raw_state = Some(origin.iso_state_at(last).map_err(backing_error)?);
         return Ok(());
     }
-    if state == State::Raw { return Err(EncodingError::MalformedSource); }
+    if state == State::Raw {
+        return Err(EncodingError::MalformedSource);
+    }
     for atom in origin.atoms(range).map_err(backing_error)? {
         poll(cancelled)?;
         let atom = atom.map_err(backing_error)?;

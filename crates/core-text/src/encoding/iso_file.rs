@@ -12,7 +12,9 @@ impl EncodedFile {
             return Err(EncodingError::UnsupportedEncoding(format!("BOM for {}", plan.encoding.name())));
         }
         self.file.validate_source()?;
-        if plan.bom { writer.write_all(plan.encoding.bom_bytes())?; }
+        if plan.bom {
+            writer.write_all(plan.encoding.bom_bytes())?;
+        }
         let mut output = TextOutput::new(plan, writer);
         let mut added = Utf8Input::default();
         let mut decoder = None;
@@ -20,27 +22,44 @@ impl EncodedFile {
         for chunk in snapshot.source_chunks(0..snapshot.len())? {
             match chunk? {
                 SourceChunk::Original { file, range, bytes, piece_range } => {
-                    if !file.same_source(&self.file) { return Err(EncodingError::WrongSource); }
+                    if !file.same_source(&self.file) {
+                        return Err(EncodingError::WrongSource);
+                    }
                     added.finish()?;
                     if range.start == piece_range.start {
                         let (at, state) = self.iso_position(range.start)?;
                         let (end, _) = self.iso_position(piece_range.end)?;
-                        if at != range.start { return Err(EncodingError::SplitCharacter(range.start)); }
-                        if end != piece_range.end { return Err(EncodingError::SplitCharacter(piece_range.end)); }
-                        if preserve { output.iso_begin(state)?; }
-                        else {
-                            if state == State::Raw { return Err(EncodingError::MalformedSource); }
+                        if at != range.start {
+                            return Err(EncodingError::SplitCharacter(range.start));
+                        }
+                        if end != piece_range.end {
+                            return Err(EncodingError::SplitCharacter(piece_range.end));
+                        }
+                        if preserve {
+                            output.iso_begin(state)?;
+                        } else {
+                            if state == State::Raw {
+                                return Err(EncodingError::MalformedSource);
+                            }
                             decoder = Some(state.decoder());
                         }
                     }
-                    if preserve { output.writer.write_all(bytes)?; }
-                    else { transcode(decoder.as_mut().unwrap(), bytes, false, &mut output)?; }
+                    if preserve {
+                        output.write_bytes(&bytes)?;
+                    } else {
+                        transcode(decoder.as_mut().unwrap(), &bytes, false, &mut output)?;
+                    }
                     if range.end == piece_range.end {
-                        if preserve { output.iso_raw_state = Some(self.iso_position(range.end)?.1); }
-                        else { finish_source(&mut decoder, &mut output)?; }
+                        if preserve {
+                            output.iso_raw_state = Some(self.iso_position(range.end)?.1);
+                        } else {
+                            finish_source(&mut decoder, &mut output)?;
+                        }
                     }
                 }
-                SourceChunk::Added(bytes) => { added.feed(bytes, |text| output.feed(text))?; }
+                SourceChunk::Added(bytes) => {
+                    added.feed(bytes, |text| output.feed(text))?;
+                }
                 _ => return Err(EncodingError::WrongSource),
             }
         }
@@ -56,12 +75,13 @@ impl EncodedFile {
         while offset < self.file.len() {
             let bytes = self.file.read_range(offset..(offset + STRIDE as u64 + 8).min(self.file.len()))?;
             let eof = offset + bytes.len() as u64 == self.file.len();
+            let initial = state;
             let mut at = 0;
             while at < bytes.len() && at < STRIDE - 8 {
-                match iso2022::atom(&bytes[at..], state, eof) {
-                    Ok(atom) => {
-                        state = atom.state;
-                        at += atom.raw;
+                match iso2022::frame(&bytes[at..], state, eof) {
+                    Ok((count, next)) => {
+                        state = next;
+                        at += count;
                     }
                     Err(_) => {
                         raw_mode = true;
@@ -72,6 +92,25 @@ impl EncodedFile {
             }
             if at > 0 && bytes[at - 1] == b'\r' && bytes.get(at) == Some(&b'\n') {
                 at += 1;
+            }
+            if !raw_mode {
+                let mut decoder = initial.decoder();
+                let mut scratch = [0; SCRATCH];
+                let mut input = 0;
+                loop {
+                    let (result, read, _) =
+                        decoder.decode_to_utf8_without_replacement(&bytes[input..at], &mut scratch, true);
+                    input += read;
+                    match result {
+                        DecoderResult::InputEmpty => break,
+                        DecoderResult::OutputFull => {}
+                        DecoderResult::Malformed(..) => {
+                            raw_mode = true;
+                            state = State::Raw;
+                            break;
+                        }
+                    }
+                }
             }
             for_breaks(&bytes, 0, at, self.detection.encoding, |end, _| {
                 line += 1;
@@ -121,7 +160,13 @@ impl EncodedFile {
             Err(error) => return Err(error),
         };
         let end = (range.end + 8).min(self.file.len());
-        let bytes = self.file.read_range(start..end)?;
+        let bytes = if end - start <= crate::READ_CHUNK as u64 {
+            self.file.read_range(start..end)?
+        } else {
+            let mut bytes = vec![0; (end - start) as usize];
+            self.file.read_into(start, &mut bytes)?;
+            Cow::Owned(bytes)
+        };
         if state == State::Raw {
             let raw = bytes[..(range.end - start) as usize].to_vec();
             return Ok(DecodedRange {

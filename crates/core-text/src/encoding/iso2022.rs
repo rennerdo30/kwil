@@ -42,8 +42,8 @@ impl State {
             // Emit a throwaway scalar after designating the active charset.
             let dummy = if self == Self::Jis0208 { b"!!".as_slice() } else { b"!" };
             let mut scratch = [0; 16];
-            decoder.decode_to_utf8_without_replacement(self.escape(), &mut scratch, false);
-            decoder.decode_to_utf8_without_replacement(dummy, &mut scratch, false);
+            let _ = decoder.decode_to_utf8_without_replacement(self.escape(), &mut scratch, false);
+            let _ = decoder.decode_to_utf8_without_replacement(dummy, &mut scratch, false);
         }
         decoder
     }
@@ -59,44 +59,43 @@ pub(crate) struct Atom {
 /// A valid ISO atom has at most one designation before a scalar. Consecutive
 /// designations are errors in encoding_rs/WHATWG. Include a final designation
 /// with the last scalar so an untouched save retains its otherwise empty tail.
-pub(crate) fn atom(raw: &[u8], state: State, eof: bool) -> Result<Atom, EncodingError> {
+pub(crate) fn frame(raw: &[u8], state: State, eof: bool) -> Result<(usize, State), EncodingError> {
     if raw.is_empty() {
         return Err(EncodingError::InvalidRange);
     }
     if state == State::Raw {
+        return Ok((1, state));
+    }
+    let (prefix, mut next) = if raw[0] == 0x1b {
+        (3, designation(raw.get(..3).ok_or(EncodingError::MalformedSource)?).ok_or(EncodingError::MalformedSource)?)
+    } else {
+        (0, state)
+    };
+    let mut count = prefix + if next == State::Jis0208 { 2 } else { 1 };
+    if count > raw.len() {
+        return Err(EncodingError::MalformedSource);
+    }
+    if eof
+        && raw.len() - count == 3
+        && let Some(state) = designation(&raw[count..])
+    {
+        next = state;
+        count += 3;
+    }
+    Ok((count, next))
+}
+
+pub(crate) fn atom(raw: &[u8], state: State, eof: bool) -> Result<Atom, EncodingError> {
+    let (count, next) = frame(raw, state, eof)?;
+    if state == State::Raw {
         return Ok(Atom { raw: 1, text: [0xff; 8], len: 1, state });
     }
-    let mut decoder = state.decoder();
-    let mut next = state;
     let mut text = [0; 8];
-    let mut consumed = 0;
-    while consumed < raw.len().min(8) {
-        let (result, read, written) = decoder.decode_to_utf8_without_replacement(
-            &raw[consumed..consumed + 1],
-            &mut text,
-            eof && consumed + 1 == raw.len(),
-        );
-        consumed += read;
-        if matches!(result, DecoderResult::Malformed(..)) || read == 0 {
-            return Err(EncodingError::MalformedSource);
-        }
-        if consumed == 3 && raw[0] == 0x1b {
-            next = designation(&raw[..3]).ok_or(EncodingError::MalformedSource)?;
-        }
-        if written != 0 {
-            if eof && raw.len() - consumed == 3 && designation(&raw[consumed..]).is_some() {
-                let (result, read, count) =
-                    decoder.decode_to_utf8_without_replacement(&raw[consumed..], &mut [0; 16], true);
-                if result != DecoderResult::InputEmpty || count != 0 || read != 3 {
-                    return Err(EncodingError::MalformedSource);
-                }
-                next = designation(&raw[consumed..]).unwrap();
-                consumed += 3;
-            }
-            return Ok(Atom { raw: consumed, text, len: written, state: next });
-        }
+    let (result, read, written) = state.decoder().decode_to_utf8_without_replacement(&raw[..count], &mut text, true);
+    if result != DecoderResult::InputEmpty || read != count || written == 0 {
+        return Err(EncodingError::MalformedSource);
     }
-    Err(EncodingError::MalformedSource)
+    Ok(Atom { raw: count, text, len: written, state: next })
 }
 
 fn designation(bytes: &[u8]) -> Option<State> {

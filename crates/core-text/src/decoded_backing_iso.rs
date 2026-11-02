@@ -18,35 +18,62 @@ pub(super) fn build_iso(
     // the existing opaque-byte model for the whole origin, with no replacement.
     let mut decoder = State::Ascii.decoder();
     let mut scratch = [0; SCRATCH];
-    let (mut at, mut output) = (0, 0);
+    let (mut at, mut output) = (0, false);
     let mut valid = true;
     loop {
         cancelled(cancel)?;
         let (result, read, written) = decoder.decode_to_utf8_without_replacement(&raw[at..], &mut scratch, true);
         at += read;
-        output += written;
+        output |= written != 0;
         match result {
-            DecoderResult::Malformed(..) => { valid = false; break; }
+            DecoderResult::Malformed(..) => {
+                valid = false;
+                break;
+            }
             DecoderResult::InputEmpty => break,
             DecoderResult::OutputFull => {}
         }
     }
-    let mut state = if valid && (raw.is_empty() || output != 0) { State::Ascii } else { State::Raw };
-    let (mut at, mut length, mut checkpoint_at) = (0, 0, 0);
+    let mut state = if valid && (raw.is_empty() || output) { State::Ascii } else { State::Raw };
+    let (mut at, mut length) = (0, 0);
     write_checkpoint(index, at, length, state)?;
     while at < raw.len() {
-        if at >= checkpoint_at + CHECKPOINT_RAW_BYTES - 8 {
-            cancelled(cancel)?;
-            write_checkpoint(index, at, length, state)?;
-            checkpoint_at = at;
+        cancelled(cancel)?;
+        let first = at;
+        let initial = state;
+        let limit = raw.len().min(first + CHECKPOINT_RAW_BYTES - 8);
+        if state == State::Raw {
+            at = limit;
+            let opaque = [OPAQUE; SCRATCH];
+            let mut remaining = at - first;
+            while remaining != 0 {
+                let count = remaining.min(opaque.len());
+                logical.write_all(&opaque[..count])?;
+                remaining -= count;
+            }
+            length += (at - first) as u64;
+        } else {
+            while at < limit {
+                let (count, next) = iso2022::frame(&raw[at..], state, true)?;
+                at += count;
+                state = next;
+            }
+            let mut decoder = initial.decoder();
+            let mut input = first;
+            loop {
+                cancelled(cancel)?;
+                let (result, read, written) =
+                    decoder.decode_to_utf8_without_replacement(&raw[input..at], &mut scratch, true);
+                input += read;
+                logical.write_all(&scratch[..written])?;
+                length += written as u64;
+                match result {
+                    DecoderResult::InputEmpty => break,
+                    DecoderResult::OutputFull => {}
+                    DecoderResult::Malformed(..) => return Err(EncodingError::MalformedSource.into()),
+                }
+            }
         }
-        let atom = iso2022::atom(&raw[at..], state, true)?;
-        logical.write_all(&atom.text[..atom.len])?;
-        at += atom.raw;
-        length += atom.len as u64;
-        state = atom.state;
-    }
-    if at != 0 {
         write_checkpoint(index, at, length, state)?;
     }
     Ok(())
@@ -70,7 +97,9 @@ impl DecodedSnapshot {
             raw += atom.raw as u64;
             state = atom.state;
         }
-        if raw != position { return Err(BackingError::InvalidRange); }
+        if raw != position {
+            return Err(BackingError::InvalidRange);
+        }
         Ok(state)
     }
 
@@ -115,9 +144,13 @@ pub(super) struct Replay {
 impl Replay {
     pub(super) fn new(origin: &DecodedSnapshot, target: u64, state: Option<State>) -> Self {
         Self {
-            origin: origin.clone(), target, low: 0,
+            origin: origin.clone(),
+            target,
+            low: 0,
             high: if state.is_some() { 0 } else { origin.checkpoint_count() },
-            floor: 0, at: state.map(|_| target), state: state.unwrap_or_default(),
+            floor: 0,
+            at: state.map(|_| target),
+            state: state.unwrap_or_default(),
         }
     }
 
@@ -128,15 +161,23 @@ impl Replay {
     ) -> Result<Option<(AtomSize, [u8; 8])>, BackingError> {
         while self.low < self.high {
             cancelled(cancel)?;
-            if !admit(ISO_RECORD)? { return Ok(None); }
+            if !admit(ISO_RECORD)? {
+                return Ok(None);
+            }
             let mid = self.low + (self.high - self.low) / 2;
             let (raw, _) = self.origin.checkpoint(mid);
-            if raw <= self.target { self.floor = mid; self.low = mid + 1; }
-            else { self.high = mid; }
+            if raw <= self.target {
+                self.floor = mid;
+                self.low = mid + 1;
+            } else {
+                self.high = mid;
+            }
         }
         if self.at.is_none() {
             cancelled(cancel)?;
-            if !admit(ISO_RECORD)? { return Ok(None); }
+            if !admit(ISO_RECORD)? {
+                return Ok(None);
+            }
             self.at = Some(self.origin.checkpoint(self.floor).0);
             self.state = self.origin.checkpoint_state(self.floor);
         }
@@ -144,7 +185,9 @@ impl Replay {
             cancelled(cancel)?;
             let at = self.at.unwrap();
             let end = self.origin.raw_bytes().len().min(at as usize + 8);
-            if !admit(end - at as usize)? { return Ok(None); }
+            if !admit(end - at as usize)? {
+                return Ok(None);
+            }
             cancelled(cancel)?;
             let raw = &self.origin.raw_bytes()[at as usize..end];
             let atom = iso2022::atom(raw, self.state, end == self.origin.raw_bytes().len())?;
@@ -154,7 +197,9 @@ impl Replay {
             if at == self.target {
                 return Ok(Some((AtomSize { raw: atom.raw, logical: atom.len, kind }, atom.text)));
             }
-            if self.at.unwrap() > self.target { return Err(BackingError::InvalidRange); }
+            if self.at.unwrap() > self.target {
+                return Err(BackingError::InvalidRange);
+            }
         }
     }
 }

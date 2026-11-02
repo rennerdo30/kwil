@@ -7,6 +7,8 @@ use crate::decoded_backing::{AtomContent, AtomKind, Boundary, DecodedSnapshot};
 use crate::{Snapshot, SourceChunk};
 use std::io::{self, Write};
 use std::ops::Range;
+#[path = "encoded_snapshot_iso.rs"]
+mod iso;
 
 /// Preflight on a worker before creating/opening the destination. No bytes are
 /// retained. Use the same immutable snapshot and plan for the eventual write.
@@ -88,7 +90,7 @@ fn raw(
     }
     for chunk in bytes.chunks(64 << 10) {
         poll(cancelled)?;
-        output.writer.write_all(chunk)?;
+        output.write_bytes(chunk)?;
     }
     Ok(())
 }
@@ -99,6 +101,9 @@ fn decoded(
     output: &mut TextOutput<'_, impl Write>,
     cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(), EncodingError> {
+    if origin.interpretation().encoding.iso2022() && output.plan.encoding == origin.interpretation().encoding {
+        return iso::decoded_iso(origin, range, output, cancelled);
+    }
     poll(cancelled)?;
     let start = endpoint(origin, range.start)?;
     poll(cancelled)?;
@@ -227,6 +232,9 @@ fn stream(
                 input.finish()?;
                 if plan.encoding != encoding {
                     return Err(EncodingError::MalformedSource);
+                }
+                if encoding.iso2022() {
+                    output.iso_begin(super::iso2022::State::Raw)?;
                 }
                 raw(&mut output, raw_bytes, cancelled)?;
             }
