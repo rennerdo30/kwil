@@ -59,6 +59,7 @@ fn lock(root: &Path) -> io::Result<File> {
 /// Claims ownership before metadata or journals may be read, replaced or resumed.
 /// Existing primary data is used in place; no migration moves or deletes it.
 pub fn claim_window(base: &Path, window: &WindowSession) -> io::Result<WindowClaim> {
+    let window = if matches!(window, WindowSession::New) { &WindowSession::Primary } else { window };
     if !base.is_absolute() {
         return Err(io::Error::other("Recovery directory must be absolute"));
     }
