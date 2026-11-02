@@ -957,17 +957,6 @@ pub fn run_workspace_with_external_open(
 }
 
 impl App {
-    #[cfg(all(windows, feature = "gpu"))]
-    fn paint_pending(&self) -> bool {
-        self.pending != Damage::default()
-            || self.document.live.update.is_some()
-            || self.language_picker.dirty
-            || self.chrome_dirty
-            || self.palette_dirty
-            || self.menu_dirty
-            || self.overlay_paint_pending()
-    }
-
     #[cfg(feature = "frame-harness")]
     fn content_trace_paint_allowed(&self) -> bool {
         // A checked preview is paint authority while binary/open ownership is
@@ -988,6 +977,17 @@ impl App {
             || self.menu.dropdown.is_some()
             || self.menu_area.is_some()
             || self.context.is_open())
+    }
+
+    #[cfg(all(windows, feature = "gpu"))]
+    fn paint_pending(&self) -> bool {
+        self.pending != Damage::default()
+            || self.document.live.update.is_some()
+            || self.language_picker.dirty
+            || self.chrome_dirty
+            || self.palette_dirty
+            || self.menu_dirty
+            || self.overlay_paint_pending()
     }
 
     fn try_finish_startup(&mut self, el: &ActiveEventLoop) {

@@ -19,52 +19,6 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  renderer:
-    # The requested KW-11 measurement uses the existing finite frame harness.
-    # Startup is informational on hosted hardware; drawing invariants assert.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
-    runs-on: windows-2025
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          add-rust-environment-hash-key: false
-          key: bench-renderer-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build the release renderer probe
-        run: cargo build --release --locked -p kwil --features kwil-ui-gpu/frame-harness -j 4
-      - name: Python environment
-        run: python -m venv .renderer-venv
-      - name: Measure hidden CPU and automatic presentation
-        shell: pwsh
-        run: |
-          $commit = git rev-parse HEAD
-          .renderer-venv/Scripts/python.exe scripts/measure-renderer.py --executable target/release/kwil.exe --output target/renderer-results --commit $commit --renderer cpu
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .renderer-venv/Scripts/python.exe scripts/measure-renderer.py --executable target/release/kwil.exe --output target/renderer-results --commit $commit --renderer auto --warp
-          exit $LASTEXITCODE
-      - name: Summarize first content and damage measurements
-        if: always()
-        shell: pwsh
-        run: |
-          '## KW-11 hidden renderer (one sample per backend)' >> $env:GITHUB_STEP_SUMMARY
-          Get-ChildItem target/renderer-results -Filter result.json -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            $r = Get-Content $_.FullName -Raw | ConvertFrom-Json
-            "- $($r.renderer): first frame $($r.first_frame_ms) ms; first file content $($r.first_content_ms) ms; 40 ms target met: $($r.within_content_target)." >> $env:GITHUB_STEP_SUMMARY
-            "  Backend: $($r.backend); WARP: $($r.warp). Hosted timing is informational; no owner-PC or remote-wire acceptance." >> $env:GITHUB_STEP_SUMMARY
-            $r.counts.PSObject.Properties | ForEach-Object {
-              "  $($_.Name): $($_.Value | ConvertTo-Json -Compress)" >> $env:GITHUB_STEP_SUMMARY
-            }
-          }
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: renderer-windows-attempt-${{ github.run_attempt }}
-          path: target/renderer-results/
-          if-no-files-found: error
   startup:
     # Measurements only: neither timing misses nor an unavailable desktop gate a PR.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
@@ -118,6 +72,53 @@ jobs:
           name: responsiveness-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: results
           if-no-files-found: warn
+
+  renderer:
+    # The requested KW-11 measurement uses the existing finite frame harness.
+    # Startup is informational on hosted hardware; drawing invariants assert.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'bench')
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          key: bench-renderer-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the release renderer probe
+        run: cargo build --release --locked -p kwil --features kwil-ui-gpu/frame-harness -j 4
+      - name: Python environment
+        run: python -m venv .renderer-venv
+      - name: Measure hidden CPU and automatic presentation
+        shell: pwsh
+        run: |
+          $commit = git rev-parse HEAD
+          .renderer-venv/Scripts/python.exe scripts/measure-renderer.py --executable target/release/kwil.exe --output target/renderer-results --commit $commit --renderer cpu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .renderer-venv/Scripts/python.exe scripts/measure-renderer.py --executable target/release/kwil.exe --output target/renderer-results --commit $commit --renderer auto --warp
+          exit $LASTEXITCODE
+      - name: Summarize first content and damage measurements
+        if: always()
+        shell: pwsh
+        run: |
+          '## KW-11 hidden renderer (one sample per backend)' >> $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem target/renderer-results -Filter result.json -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $r = Get-Content $_.FullName -Raw | ConvertFrom-Json
+            "- $($r.renderer): first frame $($r.first_frame_ms) ms; first file content $($r.first_content_ms) ms; 40 ms target met: $($r.within_content_target)." >> $env:GITHUB_STEP_SUMMARY
+            "  Backend: $($r.backend); WARP: $($r.warp). Hosted timing is informational; no owner-PC or remote-wire acceptance." >> $env:GITHUB_STEP_SUMMARY
+            $r.counts.PSObject.Properties | ForEach-Object {
+              "  $($_.Name): $($_.Value | ConvertTo-Json -Compress)" >> $env:GITHUB_STEP_SUMMARY
+            }
+          }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: renderer-windows-attempt-${{ github.run_attempt }}
+          path: target/renderer-results/
+          if-no-files-found: error
 
   budgets:
     # Optional performance check: never add this job to required branch checks.
