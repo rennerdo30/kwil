@@ -306,11 +306,13 @@ impl SearchSession {
                 if let folder_replace::Update::Preview { plan, first, rows } = &mut update {
                     self.state.files = std::mem::take(rows);
                     self.state.file_first = *first;
-                    self.state.files_seen = plan.len();
+                    self.state.files_seen = plan.row_count();
                     self.state.count = plan.matches;
                     for row in &mut self.state.files {
                         if let FileEvent::Hit(hit) = row {
-                            hit.line = counted(hit.line_number, "match", "matches").into_bytes();
+                            if plan.detail.is_none() {
+                                hit.line = counted(hit.line_number, "match", "matches").into_bytes();
+                            }
                             hit.match_ranges = std::iter::once(0..0).collect();
                         }
                     }

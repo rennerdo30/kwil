@@ -45,6 +45,7 @@ pub enum SearchInput<'a> {
     AddCursor,
     ReplaceNext,
     ReplaceAll,
+    FolderDetails,
     ToggleRegex,
     ToggleCase,
     ToggleWord,
@@ -1078,6 +1079,10 @@ impl SearchPanel {
             return self.folder_ready(update, session, view);
         }
         if changed && session.state().status == SearchStatus::Failed {
+            if self.folder.applying {
+                self.folder_failed(session.state().error.clone().unwrap_or_else(|| "Folder worker failed".into()));
+                return SearchOutcome::panel();
+            }
             self.folder.reset();
         }
         if self.refresh_needed

@@ -164,6 +164,7 @@ fn input_for_key<'a>(
                 SearchInput::NextField
             }
         }
+        Key::Named(NamedKey::Enter) if mods.alt_key() && panel.folder_preview() => SearchInput::FolderDetails,
         Key::Named(NamedKey::Enter) if ctrl && matches!(panel.mode(), SearchMode::Replace | SearchMode::Files) => {
             if mods.shift_key() {
                 SearchInput::ReplaceAll
@@ -570,7 +571,7 @@ impl App {
         if let SearchAction::FolderClosed { key, index, offset, plan, cancel } = action {
             if let Err(error) = self.view.submit_folder_closed(key.generation, index, offset, plan, cancel) {
                 self.search_panel.folder_failed(error.to_string());
-                self.search_notice(error.to_string());
+                self.search_notice(self.search_panel.status().to_owned());
             }
             return;
         }
@@ -586,8 +587,10 @@ impl App {
         {
             if folder_action {
                 self.search_panel.folder_failed("Folder replacement target changed; preview again".into());
+                self.search_notice(self.search_panel.status().to_owned());
+            } else {
+                self.search_notice("Search navigation cancelled: its document, query or cursor changed".into());
             }
-            self.search_notice("Search navigation cancelled: its document, query or cursor changed".into());
             return;
         }
         let acknowledgement = if matches!(&action, SearchAction::Replace(_)) {
@@ -620,8 +623,10 @@ impl App {
                 Err(error) => {
                     if folder_action {
                         self.search_panel.folder_failed(error.to_string());
+                        self.search_notice(self.search_panel.status().to_owned());
+                    } else {
+                        self.search_notice(format!("Replacement was not admitted: {error}"));
                     }
-                    self.search_notice(format!("Replacement was not admitted: {error}"));
                 }
             }
             return;
@@ -1799,13 +1804,25 @@ pub(crate) mod host_dispatch_tests {
         finish(&mut app, &rx);
         assert_eq!(app.search_panel.count(), (3, true));
         assert!(app.search_panel.folder_preview());
+        let included = app.search_panel.results().iter().position(|r| r.label.contains("a.txt")).unwrap();
+        // Select the file without toggling its inclusion.
+        for _ in 0..included {
+            app.search_input(SearchInput::RowNext);
+        }
+        press(&mut app, Key::Named(NamedKey::Enter), None, ModifiersState::ALT);
+        finish(&mut app, &rx);
+        assert_eq!(app.search_panel.results().len(), 2, "actual host opens individual match preview");
+        app.search_view.paint_test_rows(&app.search_panel, Rect { x: 0, y: 0, w: 100, h: 100 });
+        app.search_input(SearchInput::SelectRow(1));
+        press(&mut app, Key::Named(NamedKey::Enter), None, ModifiersState::ALT);
+        finish(&mut app, &rx);
         let excluded = app.search_panel.results().iter().position(|r| r.label.contains("b.txt")).unwrap();
         app.search_view.paint_test_rows(&app.search_panel, Rect { x: 0, y: 0, w: 100, h: 100 });
         app.search_input(SearchInput::SelectRow(excluded));
         assert!(app.search_panel.results()[excluded].label.starts_with("[ ]"));
         app.search_input(SearchInput::ReplaceAll);
         finish(&mut app, &rx);
-        assert_eq!(std::fs::read(a).unwrap(), b"y12$\r\ny34$\n");
+        assert_eq!(std::fs::read(a).unwrap(), b"y12$\r\nx34\n");
         assert_eq!(std::fs::read(b).unwrap(), b"x56\n");
         assert_eq!(bytes(&app), b"retain editor");
         worker_stop(app, rx, root);
