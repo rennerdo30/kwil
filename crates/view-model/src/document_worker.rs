@@ -26,6 +26,8 @@ pub(crate) fn is_external_change(error: &io::Error) -> bool {
 #[cfg(test)]
 mod compressed_runtime;
 mod decoded;
+mod log_reopen;
+use log_reopen::{follow_source, plain_utf8_follow};
 mod encoding_runtime;
 mod encoding_seed;
 mod hex_runtime;
@@ -1197,7 +1199,9 @@ impl DocumentWorker {
                             let detected = if storage.is_some() {
                                 {
                                     binary.threshold = preferences.threshold;
-                                    binary.detect(ticket, path, file)
+                                    let source =
+                                        if ticket.follow { follow_source(&path, file).map(Some) } else { Ok(file) };
+                                    source.and_then(|file| binary.detect(ticket, path, file))
                                 }
                             } else {
                                 Err(io::Error::other("Workspace storage is not prepared"))
@@ -1209,6 +1213,13 @@ impl DocumentWorker {
                                 other => {
                                     let result = other.and_then(|detected| {
                                         let binary_offer::Detection::Text(pending) = detected else { unreachable!() };
+                                        // Plain UTF-8 logs use the checked positioned source
+                                        // directly. Decoded/compressed generations retain the
+                                        // existing immutable-backing path and full reopen.
+                                        if ticket.follow && plain_utf8_follow(&pending.file)? {
+                                            pending.file.build_index(1).map_err(io::Error::other)?;
+                                            return Document::from_indexed_file(pending.path, pending.file);
+                                        }
                                         let storage = storage.as_mut().expect("prepared checked open");
                                         storage.encoding.open(pending.path, pending.file, None, &cancel, |preview| {
                                             complete(DocumentResult::CheckedPreview { ticket, preview });

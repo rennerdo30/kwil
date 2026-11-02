@@ -203,8 +203,10 @@ acceptance. Exact candidate checks and remaining release gates are recorded in
   replacement remain incomplete.
 - Some GUI/TUI feature parity remains incomplete: Markdown preview and parts of
   the log view are window-only.
-- Log follow mode re-indexes the file after each change; regex log filters skip
-  lines over 1 MiB.
+- Log follow extends plain UTF-8/ASCII indexes after the initial follow refresh,
+  using file identity and first/last 64 KiB prefix samples. Compressed,
+  BOM-prefixed and legacy-encoded logs still reopen and re-index on changes.
+  Extending their decoded backings remains follow-up work.
 - Accessibility, remote rendering, platform integration, crash/recovery and
   performance budgets have not completed their full qualification.
 - Markdown preview is limited to 256 KiB of logical source. ISO-2022-JP is

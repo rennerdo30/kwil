@@ -175,7 +175,7 @@ impl TextQuery {
         query.bytes[..text.len()].copy_from_slice(text.as_bytes());
         Ok(query)
     }
-    fn patterns(self) -> io::Result<Vec<Vec<(bool, kwil_core_search::Pattern)>>> {
+    fn patterns(self) -> io::Result<Vec<Vec<(bool, TextPattern)>>> {
         use kwil_core_search::{Options, Pattern};
         if self.len == 0 {
             return Ok(Vec::new());
@@ -194,12 +194,18 @@ impl TextQuery {
                         } else {
                             Pattern::literal(term.as_bytes(), Options::default())?
                         };
-                        Ok((negated, pattern))
+                        let streaming = if self.regex { Some(kwil_core_search::StreamRegex::new(term)?) } else { None };
+                        Ok((negated, TextPattern { pattern, streaming }))
                     })
                     .collect()
             })
             .collect()
     }
+}
+
+struct TextPattern {
+    pattern: kwil_core_search::Pattern,
+    streaming: Option<kwil_core_search::StreamRegex>,
 }
 
 impl Default for Filter {
@@ -1280,7 +1286,7 @@ struct ProjectionIndex {
     last: Option<u8>,
     exact: bool,
     max_line_bytes: u64,
-    patterns: Vec<Vec<(bool, kwil_core_search::Pattern)>>,
+    patterns: Vec<Vec<(bool, TextPattern)>>,
     #[cfg(test)]
     scanned_bytes: u64,
 }
@@ -1314,7 +1320,7 @@ impl ProjectionIndex {
             && self.filter == request.filter
             && self.snapshot.len() == request.snapshot.len()
     }
-    fn end_line(&mut self) -> io::Result<()> {
+    fn end_line(&mut self, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
         let end = self.offset - u64::from(self.last == Some(b'\r'));
         let prefix = if self.offset - self.start == self.prefix.len() as u64 {
             self.prefix.strip_suffix(b"\r").unwrap_or(&self.prefix)
@@ -1323,32 +1329,32 @@ impl ProjectionIndex {
         };
         let mut matches = self.filter.matches(&logs::metadata(prefix));
         if matches && !self.patterns.is_empty() {
-            // Do not silently miss regex matches beyond the search engine's
-            // maximum match window. Literal searches have no line-size limit.
-            if self.filter.text.regex && end - self.start > 1024 * 1024 {
-                return Err(invalid(
-                    "Regex log filtering supports lines up to 1 MiB; use a literal filter for longer lines",
-                ));
-            }
             let line = self.snapshot.slice(self.start..end)?;
             matches = false;
             for group in &self.patterns {
                 let mut all = true;
                 for (negated, pattern) in group {
-                    let cancel = Arc::new(AtomicBool::new(false));
-                    let mut found = false;
-                    kwil_core_search::search(
-                        &line,
-                        pattern,
-                        0..line.len(),
-                        kwil_core_search::SearchMode::Hits,
-                        &cancel,
-                        |_| {
-                            found = true;
-                            cancel.store(true, Ordering::Relaxed);
-                        },
-                        |_| {},
-                    )?;
+                    let found = if line.len() > 1024 * 1024
+                        && let Some(streaming) = &pattern.streaming
+                    {
+                        streaming.is_match(&line, cancelled)?
+                    } else {
+                        let cancel = Arc::new(AtomicBool::new(false));
+                        let mut found = false;
+                        kwil_core_search::search(
+                            &line,
+                            &pattern.pattern,
+                            0..line.len(),
+                            kwil_core_search::SearchMode::Hits,
+                            &cancel,
+                            |_| {
+                                found = true;
+                                cancel.store(true, Ordering::Relaxed);
+                            },
+                            |_| {},
+                        )?;
+                        found
+                    };
                     if found == *negated {
                         all = false;
                         break;
@@ -1368,7 +1374,7 @@ impl ProjectionIndex {
         self.last = None;
         Ok(())
     }
-    fn bytes(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+    fn bytes(&mut self, mut bytes: &[u8], cancelled: &dyn Fn() -> bool) -> io::Result<()> {
         #[cfg(test)]
         {
             self.scanned_bytes += bytes.len() as u64;
@@ -1394,7 +1400,7 @@ impl ProjectionIndex {
                 break;
             }
             self.skip_lf = bytes[end] == b'\r';
-            self.end_line()?;
+            self.end_line(cancelled)?;
             self.offset += 1;
             self.line += 1;
             self.start = self.offset;
@@ -1420,7 +1426,7 @@ impl ProjectionIndex {
                 if cancelled() {
                     return Ok(None);
                 }
-                self.bytes(&chunk.map_err(io::Error::other)?)?;
+                self.bytes(&chunk.map_err(io::Error::other)?, cancelled)?;
             }
             if cancelled() {
                 return Ok(None);
@@ -1438,7 +1444,7 @@ impl ProjectionIndex {
             return Ok(None);
         }
         if !self.exact {
-            self.end_line()?;
+            self.end_line(cancelled)?;
             self.exact = true;
         }
         self.page(viewport, cancelled)

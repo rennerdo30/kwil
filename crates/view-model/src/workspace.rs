@@ -1719,7 +1719,7 @@ impl Workspace {
             view.path.as_ref().ok_or_else(|| io::Error::other("Save the log file before following it"))?.to_path_buf();
         // Restore the exact editor if admission refuses, before any transfer.
         let editor = self.views.get_mut(&id).unwrap().editor.take();
-        let request = match self.checked_open_request(id, 0, path) {
+        let request = match self.checked_open_request_with_follow(id, 0, path, true) {
             Ok(request) => request,
             Err(error) => {
                 self.views.get_mut(&id).unwrap().editor = editor;
@@ -1733,13 +1733,9 @@ impl Workspace {
         tab.revision = 0;
         tab.saved_revision = 0;
         self.input_epoch = self.input_epoch.wrapping_add(1);
-        // The old file must retire, never feed the new checked open.
-        if let DocumentRequest::OpenChecked { ticket, path, file } = request {
-            if let Some(file) = file {
-                self.files.queue.push_back(DocumentRequest::RetireSource { file });
-            }
-            self.files.queue.push_back(DocumentRequest::OpenChecked { ticket, path, file: None });
-        }
+        // The worker verifies identity/prefix samples before reusing any
+        // index. Rotation, truncation and non-UTF-8 sources reopen in full.
+        self.files.queue.push_back(request);
         self.wrap.path_changed();
         self.pump_files();
         Ok(())
@@ -3247,6 +3243,15 @@ impl Workspace {
         })
     }
     fn checked_open_request(&mut self, id: DocumentId, revision: u64, path: PathBuf) -> io::Result<DocumentRequest> {
+        self.checked_open_request_with_follow(id, revision, path, false)
+    }
+    fn checked_open_request_with_follow(
+        &mut self,
+        id: DocumentId,
+        revision: u64,
+        path: PathBuf,
+        follow: bool,
+    ) -> io::Result<DocumentRequest> {
         if self.binary.flights.len() + self.binary.retiring.len() >= kwil_core_workspace::session::MAX_TABS
             || self.binary.flights.contains_key(&id)
             || path.capacity() > kwil_core_workspace::session::MAX_PATH_BYTES
@@ -3264,7 +3269,7 @@ impl Workspace {
         // admitted. There is no allocation proportional to source length.
         self.binary.retiring.try_reserve(self.binary.flights.len() + 1).map_err(io::Error::other)?;
         self.binary.next_generation = generation;
-        let ticket = BinaryTicket { document: id, revision, generation };
+        let ticket = BinaryTicket { document: id, revision, generation, follow };
         self.binary.flights.insert(
             id,
             BinaryFlight {
@@ -3648,6 +3653,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        let root = std::path::absolute(root).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("app.log");
         let initial = b"INFO row\n".repeat(8192);
@@ -3723,7 +3729,7 @@ mod tests {
             assert!(workspace.editor().is_none());
             let request = workspace.files.queue.pop_back().unwrap();
             let DocumentRequest::OpenChecked { ticket, file, .. } = request else { panic!("checked reopen") };
-            assert!(file.is_none(), "must not reuse the invalidated file");
+            assert!(file.is_some(), "worker owns append verification and fallback");
             let file = kwil_core_text::TextFile::open(&path).unwrap();
             let document = crate::Document::from_file(path.clone(), file).unwrap();
             workspace

@@ -14,6 +14,8 @@ pub struct Ticket {
     pub(crate) document: DocumentId,
     pub(crate) revision: u64,
     pub(crate) generation: u64,
+    /// Native follow refresh may reuse a verified plain UTF-8 index.
+    pub(crate) follow: bool,
 }
 impl Ticket {
     pub fn document(self) -> DocumentId {

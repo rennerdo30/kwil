@@ -39,7 +39,7 @@ impl Drop for Fixture {
     }
 }
 fn ticket(document: u64, generation: u64) -> Ticket {
-    Ticket { document: DocumentId(document), revision: 0, generation }
+    Ticket { document: DocumentId(document), revision: 0, generation, follow: false }
 }
 fn start(root: &Fixture) -> (DocumentWorker, mpsc::Receiver<DocumentResult>) {
     let (tx, rx) = mpsc::channel();
