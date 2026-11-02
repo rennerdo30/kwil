@@ -683,7 +683,7 @@ fn whole_document_line_move_and_clipboard_reuse_keep_original_pieces_owned() {
     let mut e = Editor::new(Document::from_file(path.clone(), file).unwrap());
     e.move_lines(true).unwrap();
     assert_eq!(e.document().buffer().add_memory_bytes(), 0);
-    assert_eq!(e.document().snapshot().chunks(0..1).unwrap().next().unwrap().unwrap(), b"b");
+    assert_eq!(e.document().snapshot().chunks(0..1).unwrap().next().unwrap().unwrap().as_ref(), b"b");
     e.undo().unwrap();
     let mut clipboard = MemoryClipboard::default();
     e.select_all().unwrap();

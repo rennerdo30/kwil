@@ -285,9 +285,7 @@ fn detect_file(file: &TextFile, chosen: Option<Encoding>) -> Result<Detection, E
     }
     let mut bytes = file.read_range(0..SAMPLE as u64)?.into_owned();
     // Keep the last sample's code-unit parity and artificial edge semantics.
-    for _ in 0..file.len() % 4 {
-        bytes.push(0);
-    }
+    bytes.resize(bytes.len() + (file.len() % 4) as usize, 0);
     bytes.extend_from_slice(&file.read_range(file.len() - SAMPLE as u64..file.len())?);
     detect_bytes(&bytes, chosen)
 }
@@ -1198,10 +1196,10 @@ impl<'a, W: Write> TextOutput<'a, W> {
         };
         if width != 1 {
             for at in (0..bytes.len().saturating_sub(width - 1)).step_by(width) {
-                visit(at, encoding.unit(&bytes, at).unwrap())?;
+                visit(at, encoding.unit(bytes, at).unwrap())?;
             }
         } else {
-            for at in memchr::memchr2_iter(b'\r', b'\n', &bytes) {
+            for at in memchr::memchr2_iter(b'\r', b'\n', bytes) {
                 visit(at, bytes[at] as u32)?;
             }
         }

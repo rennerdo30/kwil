@@ -88,7 +88,7 @@ fn raw(
     }
     for chunk in bytes.chunks(64 << 10) {
         poll(cancelled)?;
-        output.writer.write_all(&chunk)?;
+        output.writer.write_all(chunk)?;
     }
     Ok(())
 }
