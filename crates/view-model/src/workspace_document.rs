@@ -1238,7 +1238,8 @@ impl Workspace {
             charge: AdapterCharge(Some(charge.adapter)),
             budget: budget.clone(),
         };
-        match submit(self.files.worker.as_ref().unwrap(), &mut transport.receiver, DocumentRequest::Prepare { root }) {
+        let prepare = self.prepare_session_request(root);
+        match submit(self.files.worker.as_ref().unwrap(), &mut transport.receiver, prepare) {
             Ok(()) => {
                 self.files.preparing = true;
                 Ok(transport)

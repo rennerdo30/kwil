@@ -233,6 +233,9 @@ impl Metrics {
     }
 }
 pub(crate) fn start(proxy: super::HostProxy) {
+    if let Some(dir) = session_capture_directory() {
+        std::fs::create_dir_all(dir).expect("isolated per-window capture directory");
+    }
     // Release probes use panic=abort, so catch_unwind below cannot preserve
     // their diagnostics. Standard handles are closed after the first frame.
     let previous = std::panic::take_hook();
@@ -613,9 +616,9 @@ pub(crate) fn start(proxy: super::HostProxy) {
             renderer.as_slice()
         } else if probe == "crash" {
             &session_seed[..session_seed.len() - 1]
-        } else if probe == "seed" || probe == "transient" {
+        } else if probe == "seed" || probe == "transient" || probe == "windows-seed" {
             session_seed.as_slice()
-        } else if probe == "restore" {
+        } else if probe == "restore" || probe == "windows-restore" {
             session_restore.as_slice()
         } else if probe == "ipc" {
             ipc.as_slice()
@@ -705,8 +708,26 @@ pub(crate) fn step(app: &mut App, el: &ActiveEventLoop, step: Step) {
         std::panic::resume_unwind(payload);
     }
 }
+fn session_capture_directory() -> Option<PathBuf> {
+    let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from)?;
+    Some(if std::env::var("KWIL_SESSION_PROBE").is_ok_and(|mode| mode.starts_with("windows-")) {
+        dir.join(format!("window-{}", std::process::id()))
+    } else {
+        dir
+    })
+}
+
+fn session_scratch(app: &App) -> String {
+    if std::env::var("KWIL_SESSION_PROBE").is_ok_and(|mode| mode.starts_with("windows-")) {
+        let name = app.view.session().tabs()[0].path.as_ref().unwrap().file_name().unwrap().to_str().unwrap();
+        format!("session scratch {name}")
+    } else {
+        "session scratch".into()
+    }
+}
+
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
-    let dir = std::env::var_os("KWIL_CAPTURE_DIR").map(PathBuf::from);
+    let dir = session_capture_directory();
     match step {
         Step::SessionStart => {
             assert!(app.view.recovery_ready(), "{}", app.view.status_text());
@@ -715,7 +736,7 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             app.view
                 .execute(
                     "edit.insert",
-                    &kwil_view_model::CommandArgs { text: Some("session scratch".into()), ..Default::default() },
+                    &kwil_view_model::CommandArgs { text: Some(session_scratch(app)), ..Default::default() },
                     1,
                 )
                 .unwrap();
@@ -743,13 +764,13 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             } else {
                 let mut text = Vec::new();
                 app.view.editor().unwrap().document().snapshot().write_to(&mut text).unwrap();
-                assert_eq!(text, b"session scratch changed");
+                assert_eq!(text, format!("{} changed", session_scratch(app)).as_bytes());
                 assert!(app.view.editor().unwrap().document().is_dirty());
-                if std::env::var("KWIL_SESSION_PROBE").as_deref() == Ok("restore") {
+                if matches!(std::env::var("KWIL_SESSION_PROBE").as_deref(), Ok("restore" | "windows-restore")) {
                     app.view.execute("edit.undo", &Default::default(), 3).unwrap();
                     let mut text = Vec::new();
                     app.view.editor().unwrap().document().snapshot().write_to(&mut text).unwrap();
-                    assert_eq!(text, b"session scratch");
+                    assert_eq!(text, session_scratch(app).as_bytes());
                     app.view.execute("edit.redo", &Default::default(), 4).unwrap();
                 }
             }
@@ -760,10 +781,11 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
                 std::fs::write(
                     dir.join("session-check.txt"),
                     format!(
-                        "PASS mode={} tabs=2 active={} cursor={}\n",
+                        "PASS mode={} tabs=2 active={} cursor={}\nlabel={}\n",
                         std::env::var("KWIL_SESSION_PROBE").unwrap(),
                         app.view.active_id().0,
-                        app.view.editor().unwrap().primary_cursor().head
+                        app.view.editor().unwrap().primary_cursor().head,
+                        session_scratch(app)
                     ),
                 )
                 .unwrap();

@@ -4,6 +4,7 @@ mod file_argument;
 pub mod frontend;
 mod instance;
 mod startup;
+mod window_sessions;
 #[cfg(windows)]
 mod windows;
 use frontend::{Flags, Frontend, ProcessEnv, after_gui_failure, choose_frontend, current_platform};
@@ -25,7 +26,7 @@ Usage: kwil [options] [file[:line[:column]] ...]
 Options:
   --gui        Force the window UI
   --tui        Force the terminal UI
-  --new-window Open a separate window without session restore
+  --new-window Open a separate window with its own saved session
   --renderer auto|cpu|gpu  Select the GUI rendering backend (overrides settings)
   --update     Check for an update now and install it
   --unregister-file-types  Remove Kwil from \"Open with\" (Windows; the uninstaller runs this)
@@ -43,6 +44,7 @@ struct Args {
     tui: bool,
     hidden: bool,
     new_window: bool,
+    restore_window: Option<String>,
     update: bool,
     unregister_file_types: bool,
     renderer: Option<kwil_ui_gpu::RenderBackend>,
@@ -109,6 +111,14 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
             // Agent and test runs: window composed but never shown (Windows).
             Some("--hidden") => a.hidden = true,
             Some("--new-window") => a.new_window = true,
+            Some("--restore-window") => {
+                let id =
+                    arguments.next().and_then(|id| id.into_string().ok()).ok_or("missing saved window identity")?;
+                if a.restore_window.is_some() || !kwil_core_workspace::window_session::valid_window_id(&id) {
+                    return Err("invalid saved window identity".into());
+                }
+                a.restore_window = Some(id);
+            }
             Some("--update") => a.update = true,
             Some("--unregister-file-types") => a.unregister_file_types = true,
             Some("--version" | "-V") => {
@@ -130,6 +140,9 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
     }
     if a.gui && a.tui {
         return Err("--gui and --tui exclude each other".into());
+    }
+    if a.new_window && a.restore_window.is_some() {
+        return Err("--new-window and --restore-window exclude each other".into());
     }
     if a.tui && a.renderer.is_some() {
         return Err("--renderer selects the GUI backend, not the terminal UI".into());
@@ -269,7 +282,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
     // never join or claim the owner's live instance.
     let join_primary = match join_primary_instance(
         args.hidden,
-        args.new_window,
+        args.new_window || args.restore_window.is_some(),
         std::env::var_os("KWIL_INSTANCE_NAMESPACE").as_deref(),
     ) {
         Ok(join) => join,
@@ -368,8 +381,18 @@ fn run_app(console_launcher: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if args.new_window {
-        workspace.use_transient_session();
+    if use_gui || args.new_window || args.restore_window.is_some() {
+        use kwil_core_workspace::window_session::WindowSession;
+        let window = if let Some(id) = args.restore_window {
+            WindowSession::Restore(id)
+        } else if args.new_window {
+            WindowSession::New
+        } else {
+            WindowSession::Primary
+        };
+        workspace.use_window_session(window, move |base, ids| {
+            window_sessions::restore(base, ids, args.hidden, args.renderer)
+        });
     }
     let budget = AllocationBudget::default();
     let (workspace, budget) = if use_gui {
@@ -538,6 +561,20 @@ mod isolation_tests {
         assert!(join_primary_instance(true, false, Some(std::ffi::OsStr::new("kwil-test-123"))).unwrap());
         assert!(!join_primary_instance(true, true, Some(std::ffi::OsStr::new("kwil-test-123"))).unwrap());
         assert!(join_primary_instance(false, false, None).unwrap());
+    }
+
+    #[test]
+    fn restored_windows_validate_identity_and_bypass_primary_forwarding() {
+        let args = parse_args_values(["--restore-window", "window-123-4-5"].into_iter().map(Into::into)).unwrap();
+        assert_eq!(args.restore_window.as_deref(), Some("window-123-4-5"));
+        assert!(!join_primary_instance(false, args.new_window || args.restore_window.is_some(), None).unwrap());
+        for arguments in [
+            vec!["--restore-window", "../session"],
+            vec!["--restore-window"],
+            vec!["--new-window", "--restore-window", "window-123"],
+        ] {
+            assert!(parse_args_values(arguments.into_iter().map(Into::into)).is_err());
+        }
     }
 
     #[test]

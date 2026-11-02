@@ -19,6 +19,10 @@ use workspace_hex::HexFlow;
 pub mod workspace_wrap;
 use workspace_wrap::WorkspaceWrapState;
 
+#[cfg(test)]
+#[path = "workspace_window_tests.rs"]
+mod window_session_tests;
+
 #[path = "workspace_document.rs"]
 pub mod workspace_document;
 
@@ -286,6 +290,7 @@ struct FileFlow {
     metadata_durable: bool,
     restore_session: Option<bool>,
     transient_root: Option<PathBuf>,
+    window_session: Option<(kwil_core_workspace::window_session::WindowSession, crate::document_worker::WindowRestore)>,
     hot_exit: bool,
     manual_guard: bool,
     history_wait: Option<DocumentId>,
@@ -1280,11 +1285,12 @@ impl Workspace {
         self.files.worker = Some(DocumentWorker::spawn(complete)?);
         self.files.document_started = true;
         self.refresh_save_destinations();
+        let prepare = self.prepare_session_request(self.files.transient_root.clone().or(root));
         self.files
             .worker
             .as_ref()
             .unwrap()
-            .try_submit(DocumentRequest::Prepare { root: self.files.transient_root.clone().or(root) })
+            .try_submit(prepare)
             .map_err(|_| io::Error::other("Recovery admission failed"))?;
         self.files.preparing = true;
         Ok(())
@@ -1411,8 +1417,8 @@ impl Workspace {
         self.pump_files();
     }
 
-    /// Separate windows own temporary worker storage and never join the primary
-    /// recovery store. Settings reload cannot enable hot exit in these windows.
+    /// Explicit transient storage for embedders. Application windows use
+    /// `use_window_session` so their unsaved work can survive restart.
     pub fn use_transient_session(&mut self) {
         assert!(!self.files.document_started, "session policy must precede worker startup");
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1423,6 +1429,24 @@ impl Workspace {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         )));
         self.files.restore_session = Some(false);
+    }
+
+    /// Configure before worker startup. Filesystem selection, locking and
+    /// launching restored windows run on the existing document worker.
+    pub fn use_window_session(
+        &mut self,
+        window: kwil_core_workspace::window_session::WindowSession,
+        restore: impl FnOnce(&std::path::Path, Vec<String>) -> io::Result<()> + Send + 'static,
+    ) {
+        assert!(!self.files.document_started, "session policy must precede worker startup");
+        self.files.window_session = Some((window, Box::new(restore)));
+    }
+
+    fn prepare_session_request(&mut self, root: Option<PathBuf>) -> DocumentRequest {
+        match self.files.window_session.take() {
+            Some((window, restore)) => DocumentRequest::PrepareWindow { root, window, restore: Some(restore) },
+            None => DocumentRequest::Prepare { root },
+        }
     }
 
     pub fn set_session_restore(&mut self, enabled: bool) {
@@ -3670,6 +3694,21 @@ mod tests {
         assert_eq!(workspace.active_id(), second);
         workspace.activate(first);
         assert_eq!(workspace.editor().unwrap().primary_cursor().head, "æ—¥æœ¬èªž".len() as u64);
+    }
+
+    #[test]
+    fn separate_window_hot_exit_keeps_unsaved_tabs_for_restart() {
+        let mut workspace = Workspace::new(View::new(None)).unwrap();
+        workspace.use_window_session(kwil_core_workspace::window_session::WindowSession::New, |_, _| Ok(()));
+        workspace.set_session_restore(true);
+        workspace.files.storage_ready = true;
+        workspace
+            .execute("edit.insert", &CommandArgs { text: Some("keep secondary".into()), ..Default::default() }, 1)
+            .unwrap();
+        workspace.request_window_close(false).unwrap();
+        assert!(workspace.files.hot_exit, "a separate window must retain dirty tabs on quit");
+        assert!(!workspace.close_confirmation_pending());
+        assert_eq!(workspace.session.tabs().len(), 1);
     }
 
     #[test]
