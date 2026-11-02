@@ -57,8 +57,13 @@ impl Font {
     }
     pub fn startup(size: std::sync::mpsc::Receiver<f32>) -> Option<Font> {
         let prepared = Self::prepare_default()?;
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("editor font parsed");
         let px = size.recv().ok()?;
-        Self::from_face(prepared.face, px, &prepared.family)
+        let font = Self::from_face(prepared.face, px, &prepared.family);
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("editor font rasterized");
+        font
     }
     pub fn load_named(px: f32, family: &str) -> Option<Font> {
         if family == "monospace" {
@@ -251,6 +256,12 @@ const UI_FALLBACK_CANDIDATES: &[(&str, usize)] = &[
 /// Hard bounds of the chrome glyph cache: entries and retained coverage bytes.
 const UI_GLYPH_LIMIT: usize = 4096;
 const UI_GLYPH_BYTES: usize = 4 << 20;
+const UI_SYMBOL_CANDIDATES: &[(&str, usize)] = &[
+    (r"C:\Windows\Fonts\seguiemj.ttf", 0),
+    ("/System/Library/Fonts/Apple Color Emoji.ttc", 0),
+    ("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 0),
+    ("/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf", 0),
+];
 /// Scalars one text operation may examine. Chrome strings are clipped to a
 /// few hundred pixels, so work never follows the length of a notice or name
 /// (zero-advance marks included).
@@ -268,6 +279,13 @@ struct UiFace {
     key: swash::CacheKey,
 }
 
+/// Both optional coverage faces are read by the existing glyph-miss worker.
+/// Keep symbol coverage when the primary/wide text faces have no emoji glyph.
+pub(super) struct UiFallback {
+    pub(super) text: Option<(Vec<u8>, usize)>,
+    pub(super) symbols: Option<(Vec<u8>, usize)>,
+}
+
 /// Every face the editor font can start from, as chrome fallbacks.
 fn editor_candidates() -> impl Iterator<Item = (&'static str, usize)> {
     CANDIDATES.iter().map(|(path, index, _)| (*path, *index as usize))
@@ -281,12 +299,7 @@ impl UiFace {
     /// can start from, then any installed sans or monospace face. Whenever the
     /// editor font loads, chrome text therefore has a face too.
     fn symbols() -> Option<UiFace> {
-        Self::read([
-            (r"C:\Windows\Fonts\seguiemj.ttf", 0),
-            ("/System/Library/Fonts/Apple Color Emoji.ttc", 0),
-            ("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 0),
-            ("/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf", 0),
-        ])
+        Self::read(UI_SYMBOL_CANDIDATES.iter().copied())
     }
     fn chain() -> Option<UiFace> {
         Self::chain_from(UI_CANDIDATES.iter().copied(), editor_candidates(), Self::system)
@@ -362,11 +375,13 @@ impl UiFont {
     pub fn startup(px: std::sync::mpsc::Receiver<f32>) -> Option<UiFont> {
         let face = UiFace::chain()?;
         let mono = UiFace::read(editor_candidates());
-        let symbols = UiFace::symbols();
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("chrome fonts parsed");
         let px = px.recv().ok()?;
         let mut font = Self::from_face(face, px)?;
         font.monospace = mono.and_then(|face| Self::single_face(face, px)).map(Box::new);
-        font.install_symbols(symbols);
+        #[cfg(feature = "frame-harness")]
+        crate::trace::mark("chrome fonts rasterized");
         Some(font)
     }
     /// Worker-only (reads files).
@@ -447,13 +462,22 @@ impl UiFont {
         self.id
     }
 
-    /// The worker reads one wide-coverage face after a glyph miss.
-    pub fn read_fallback() -> Option<(Vec<u8>, usize)> {
-        UI_FALLBACK_CANDIDATES.iter().find_map(|(path, index)| {
-            let data = std::fs::read(path).ok()?;
-            swash::FontRef::from_index(&data, *index)?;
-            Some((data, *index))
-        })
+    /// The existing worker reads optional text/symbol coverage after a glyph miss.
+    pub(super) fn needs_symbols(&self) -> bool {
+        self.symbols.is_none()
+    }
+    pub(super) fn read_fallback(include_symbols: bool) -> UiFallback {
+        fn read(candidates: &[(&str, usize)]) -> Option<(Vec<u8>, usize)> {
+            candidates.iter().find_map(|(path, index)| {
+                let data = std::fs::read(path).ok()?;
+                swash::FontRef::from_index(&data, *index)?;
+                Some((data, *index))
+            })
+        }
+        UiFallback {
+            text: read(UI_FALLBACK_CANDIDATES),
+            symbols: if include_symbols { read(UI_SYMBOL_CANDIDATES) } else { None },
+        }
     }
     /// True once per font when a glyph was missing and no fallback was tried.
     pub fn take_fallback_request(&mut self) -> bool {
@@ -465,8 +489,11 @@ impl UiFont {
         }
         wanted
     }
-    pub fn install_fallback(&mut self, face: Option<(Vec<u8>, usize)>) {
-        self.install_shared_fallback(face.and_then(|(data, index)| UiFace::from_data(data, index)));
+    pub(super) fn install_fallback(&mut self, faces: UiFallback) {
+        if let Some(face) = faces.symbols.and_then(|(data, index)| UiFace::from_data(data, index)) {
+            self.install_symbols(Some(face));
+        }
+        self.install_shared_fallback(faces.text.and_then(|(data, index)| UiFace::from_data(data, index)));
     }
     fn install_shared_fallback(&mut self, face: Option<UiFace>) {
         if let Some(font) = &mut self.heading {
@@ -486,6 +513,9 @@ impl UiFont {
         }
     }
     pub(super) fn copy_fallback_from(&mut self, other: &Self) {
+        if other.symbols.is_some() {
+            self.install_symbols(other.symbols.clone());
+        }
         self.install_shared_fallback(other.fallback.clone());
     }
     pub(super) fn fallback_finished(&self) -> bool {
@@ -878,6 +908,33 @@ fn move_rows(rows: &mut Vec<usize>, delta: i64, ch: usize, visible: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn startup_defers_symbol_file_and_fallback_keeps_the_same_emoji_pixels() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(14.0).unwrap();
+        let mut startup = UiFont::startup(rx).unwrap();
+        assert!(startup.symbols.is_none(), "startup must not read the optional emoji font");
+        let faces = UiFont::read_fallback(startup.needs_symbols());
+        assert!(faces.symbols.is_some(), "Windows ships the symbol face used by this regression");
+        startup.install_fallback(faces);
+        let mut reference = UiFont::load(14.0).unwrap();
+        reference.install_fallback(UiFont::read_fallback(reference.needs_symbols()));
+        for font in [&mut startup, &mut reference] {
+            font.prepare(['🚀'].into_iter());
+        }
+        let a = &startup.glyphs[&'🚀'];
+        let b = &reference.glyphs[&'🚀'];
+        assert_eq!(
+            (a.advance, a.width, a.height, a.color, &a.alpha),
+            (b.advance, b.width, b.height, b.color, &b.alpha)
+        );
+        assert!(!a.alpha.is_empty(), "the deferred face must render the actual glyph");
+        assert!(!startup.needs_symbols());
+        startup.install_fallback(UiFallback { text: None, symbols: None });
+        assert!(!startup.needs_symbols(), "a later missing optional face must not evict installed coverage");
+    }
 
     #[test]
     #[cfg(windows)]

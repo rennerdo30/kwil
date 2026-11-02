@@ -85,6 +85,9 @@ pub mod text;
 mod trace;
 pub use kwil_core_commands::settings::RenderBackend;
 pub use remote::RenderPolicy;
+#[cfg(feature = "frame-harness")]
+#[doc(hidden)]
+pub use trace::mark as trace_startup;
 
 use kwil_core_commands::settings::Settings;
 
@@ -192,7 +195,7 @@ enum UserEvent {
     FontReady(Option<Box<Font>>),
     UiFontReady(Option<Box<font::UiFont>>),
     /// Wide-coverage face read for the chrome face with this id.
-    UiFallbackReady(u64, Option<(Vec<u8>, usize)>),
+    UiFallbackReady(u64, font::UiFallback),
     SessionChanged(bool),
     DroppedFile(std::path::PathBuf),
     #[cfg(feature = "gpu")]
@@ -953,6 +956,28 @@ pub fn run_workspace_with_external_open(
 }
 
 impl App {
+    #[cfg(feature = "frame-harness")]
+    fn content_trace_paint_allowed(&self) -> bool {
+        // A checked preview is paint authority while binary/open ownership is
+        // still pending. Follow the renderer's paint fence, never its input fence.
+        !(self.binary_blocks_paint()
+            || self.document_input_blocked()
+            || self.view.hex_active()
+            || self.view.compare.open
+            || self.wrap_owns_text()
+            || self.view.wrap_input_blocked()
+            || self.welcome.visible()
+            || self.language_open()
+            || self.palette_open()
+            || self.settings_open()
+            || self.search_panel.is_open()
+            || self.logs.is_open()
+            || self.save_path.is_some()
+            || self.menu.dropdown.is_some()
+            || self.menu_area.is_some()
+            || self.context.is_open())
+    }
+
     #[cfg(all(windows, feature = "gpu"))]
     fn paint_pending(&self) -> bool {
         self.pending != Damage::default()
@@ -2271,6 +2296,8 @@ impl App {
         let wrapped_hits = self
             .search_panel
             .visible_hits(self.view.active_id(), wrap_context.map_or(0, |context| context.key.source.revision));
+        #[cfg(feature = "frame-harness")]
+        let trace_paint_allowed = self.content_trace_paint_allowed();
         let mut wrapped_paint = self.wrap.paint(wrap_identity.map(|(key, _)| key));
         let hex_source = self.view.hex_source();
         let hex_read_only = hex_active && self.view.document_busy(self.view.active_id());
@@ -2325,6 +2352,12 @@ impl App {
         let mut copied = 0u64;
         let body_changed =
             p.full || p.scroll != 0 || !p.rows.is_empty() || document_rows().next().is_some() || projection_body_dirty;
+        #[cfg(feature = "frame-harness")]
+        let content_mark = trace::content_mark(
+            self.view.line(0),
+            p.full || p.rows.contains(&0) || document_rows().any(|row| row == 0),
+            !trace_paint_allowed || projection_owns_body,
+        );
         if p.full {
             font.invalidate_rows();
             pixels.fill(bg());
@@ -2657,7 +2690,7 @@ impl App {
             && ui_font.take_fallback_request()
             && let Some(id) = self.ui_fallback.request(ui_font.id())
         {
-            spawn_ui_fallback(&self.proxy, id);
+            spawn_ui_fallback(&self.proxy, id, ui_font.needs_symbols());
         }
         if let (Some(prompt), Some(ui_font)) = (self.goto.as_ref(), self.ui_font.as_mut()) {
             self.palette_area = palette_view::draw(
@@ -2767,6 +2800,8 @@ impl App {
                 gpu.present(gfx.window.clone(), pixels, (w, h), &damage, p.scroll, ch, tabs::rect(geometry.text));
             match presented {
                 gpu::Presented::Yes => {
+                    #[cfg(feature = "frame-harness")]
+                    trace::presented(content_mark);
                     // Retrying an older pending DX12 frame returns Deferred;
                     // only a current full, final-size success reveals the child.
                     #[cfg(windows)]
@@ -2853,6 +2888,8 @@ impl App {
             match target.present_with_damage(&rects) {
                 Ok(()) => {
                     #[cfg(feature = "frame-harness")]
+                    trace::presented(content_mark);
+                    #[cfg(feature = "frame-harness")]
                     self.metrics.present(
                         p.full,
                         damage.iter().map(|area| (area.w * area.h) as u64).sum(),
@@ -2878,10 +2915,10 @@ impl App {
 }
 
 /// Reads the wide-coverage chrome face off the UI thread for face `id`.
-fn spawn_ui_fallback(proxy: &HostProxy, id: u64) {
+fn spawn_ui_fallback(proxy: &HostProxy, id: u64, include_symbols: bool) {
     let proxy = proxy.clone();
     std::thread::spawn(move || {
-        let _ = proxy.send_event(UserEvent::UiFallbackReady(id, font::UiFont::read_fallback()));
+        let _ = proxy.send_event(UserEvent::UiFallbackReady(id, font::UiFont::read_fallback(include_symbols)));
     });
 }
 
@@ -3825,7 +3862,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // glyphs meanwhile gets exactly one retry, still one read at a time.
                 let (bind, retry) = self.ui_fallback.finished(id, self.ui_font.as_ref().map(font::UiFont::id));
                 if let Some(retry) = retry {
-                    spawn_ui_fallback(&self.proxy, retry);
+                    spawn_ui_fallback(
+                        &self.proxy,
+                        retry,
+                        self.ui_font.as_ref().is_some_and(font::UiFont::needs_symbols),
+                    );
                 }
                 let Some(font) = self.ui_font.as_mut().filter(|_| bind) else {
                     return;

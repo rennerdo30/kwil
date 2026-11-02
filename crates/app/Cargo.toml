@@ -25,6 +25,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 [features]
 # Build only on Windows; release staging renames kwil-console.exe to kwil.com.
 windows-console = []
+# Hosted responsiveness measurements; absent from shipped builds.
+startup-bench = ["kwil-ui-gpu/frame-harness", "kwil-view-model/startup-bench"]
 
 [[bin]]
 name = "kwil-console"

@@ -25,14 +25,26 @@ pages from `/proc/self/smaps`. This preserves the existing per-OS baseline's
 memory definition. Divan reports API timings; the fresh-process harness supplies
 the actual gate medians and memory measurements.
 
-**GUI startup gating is explicitly deferred.** Main already owns
-`KWIL_TRACE_STARTUP` and the `ui-gpu/frame-harness` script. Its first-frame mark
-currently identifies the first chrome frame, not content-ready presentation.
-A launch-to-file-content gate must wait until that existing trace marks
-content-ready. The old `--trace-startup`, TUI trace adapter, viewer-only scroll
-contract and A/A diagnostic are superseded and are not ported into the current
-app/UI. Those files remain byte-identical to main. Existing UI harness metrics
-are not claimed as keystroke-to-pixels or refresh-rate acceptance.
+**GUI startup and second-launch numbers are informational.** The optional
+workflow builds the release app with `startup-bench` (the existing
+`ui-gpu/frame-harness` feature) on Linux, Windows and macOS. `bench-startup.py`
+records launcher timestamps and the existing `KWIL_TRACE_STARTUP` stage marks.
+It launches hidden native CPU windows with isolated profiles, records every
+PID, and bounds every wait/exit. Linux uses Xvfb. These measure successful
+native presentation, not compositor scanout or visible-desktop acceptance.
+
+One sample each covers first/repeated empty processes, a 76 KiB text file, a repeated launch,
+and a 1 GiB text file. "First" means a fresh process/profile; the runner's disk
+cache is uncontrolled, so this is not a cache-flushed cold-boot measurement.
+The first chrome frame and the first successfully presented fixture-content
+row are separate marks. A missing, covered or undrawn row cannot satisfy the
+content measurement. A vetted read-only preview counts while the final open
+still owns editing/input; timing follows the renderer's paint fence. The
+second process opens a different sentinel file only
+after the original UI route reports ready. IPC acknowledgment and display by
+the original process are reported separately. Raw logs and timestamps are
+retained even on failure. Targets/hard limits remain 25/60 ms empty, 40/100 ms
+file and 20/50 ms second launch; none of these numbers block CI yet.
 
 An informational palette case generates a 100k-file tree in the hosted runner's
 temporary directory, discovers it through the shipped catalogue, and measures
@@ -47,10 +59,15 @@ the full tree outside GitHub Actions. The original `crates/bench` workspace,
 including its sources, manifest, features and lockfile, stays unchanged; palette
 dependencies cannot affect its resolution or measured process. Local tests use
 a six-file tree only.
+The isolated palette binary enables the dev-only `palette-profile` feature:
+its raw log reports the number of labels examined/scored and matcher time.
+Production builds contain neither these counters nor clocks. macOS reports the
+same 100k-file query in the informational startup job; the existing Linux and
+Windows core-text gates retain their original processes and target directories.
 
 The other §3 budgets (search, diff, full-editor memory, typing, scrolling,
-single-instance and remote drawing) still need their own representative
-integration measurements. KW-33 remains open for those and the startup gate.
+remote drawing) still need their own representative integration measurements.
+KW-33 remains open for those and for promoting informational budgets to gates.
 
 ## Noise and regression policy
 

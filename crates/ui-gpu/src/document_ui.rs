@@ -626,6 +626,8 @@ impl App {
             self.search_replacement_finished(receipt);
         }
         self.sync_file_ui();
+        #[cfg(feature = "frame-harness")]
+        trace::content_ready(self.view.line(0));
         if let Some((document, epoch)) = self.goto_reveal {
             if document != self.view.active_id() || epoch != self.view.input_epoch() {
                 self.goto_reveal = None;

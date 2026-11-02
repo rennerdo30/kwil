@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Dev-only profiling; shipped builds contain neither counters nor clocks.
+palette-profile = []
+
 [dependencies]
 fuzzy-matcher = "=0.3.7"
 unicode-segmentation = "=1.13.3"

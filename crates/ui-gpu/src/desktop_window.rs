@@ -350,7 +350,7 @@ impl App {
                 font.copy_fallback_from(main_font);
                 dialog.gfx.window.request_redraw();
             } else if let Some(id) = self.ui_fallback.request(main_font.id()) {
-                spawn_ui_fallback(&self.proxy, id);
+                spawn_ui_fallback(&self.proxy, id, main_font.needs_symbols());
             }
         }
         let result = dialog.gfx.surface.buffer_mut().and_then(|mut target| {
