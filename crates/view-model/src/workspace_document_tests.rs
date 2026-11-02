@@ -459,6 +459,52 @@ fn finish_saved_workspace_until(workspace: Workspace, transport: WorkspaceDocume
 }
 
 #[test]
+fn workspace_document_fresh_hex_overwrite_saves_exact_bytes_and_observes_only_target() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("fresh.bin");
+    std::fs::write(&path, [0, 1, 0xfe, 0xff, b'A']).unwrap();
+    let budget = AllocationBudget::default();
+    let mut workspace = workspace();
+    workspace.set_rows(3);
+    let (mut transport, ready) = setup(&mut workspace, &budget, Some(scratch.0.join("recovery")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    {
+        let mut until = |workspace: &mut Workspace, done: &dyn Fn(&Workspace) -> bool| {
+            while !done(workspace) || transport.status().occupied || transport.status().retry_pending {
+                ready.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap();
+                let _ = transport.receive(workspace, true).unwrap();
+            }
+        };
+        until(&mut workspace, &Workspace::recovery_ready);
+        let id = workspace.open_path(path.clone()).unwrap();
+        until(&mut workspace, &|w| w.binary_offer().is_some());
+        let offer = workspace.binary_offer().unwrap();
+        workspace.resolve_binary_offer(offer.ticket, crate::document_worker::binary_offer::Choice::Hex, 3).unwrap();
+        until(&mut workspace, &|w| !w.document_busy(id) && w.editor().is_some() && !w.binary_offer_pending(id));
+
+        // A separate ready scratch view must not acquire a sink merely because
+        // the hex target needs one. Construct it without a global checkpoint.
+        let unrelated = workspace.session.open(None).unwrap();
+        workspace.views.insert(unrelated, View::new(None));
+        assert!(workspace.session.activate(id));
+        assert!(!workspace.files.observed.contains_key(&unrelated));
+        let session = workspace.hex_session().unwrap();
+        let (source, epoch) = (session.source().unwrap(), session.input_epoch());
+        workspace
+            .hex_input(source, epoch, crate::hex_session::Input::Paste("5A"))
+            .expect("a freshly opened hex document must admit its first overwrite");
+        assert!(workspace.files.observed.contains_key(&id));
+        assert!(!workspace.files.observed.contains_key(&unrelated), "hex admission must observe only its target");
+        until(&mut workspace, &|w| !w.document_busy(id));
+        workspace.save_document(id, None).unwrap();
+        until(&mut workspace, &|w| !w.file_saves_pending() && w.recovery_notice().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), [b'Z', 1, 0xfe, 0xff, b'A']);
+        assert!(workspace.recovery_notice().is_none());
+    }
+    finish_saved_workspace_until(workspace, transport, deadline);
+}
+
+#[test]
 fn workspace_document_preadmission_precedes_spawn_callback_and_preserves_root() {
     let mut workspace = workspace();
     let budget = AllocationBudget::new(0);

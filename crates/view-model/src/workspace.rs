@@ -1408,12 +1408,19 @@ impl Workspace {
     }
 
     fn install_journal_observers(&mut self) {
+        self.install_journal_observers_for(None);
+    }
+
+    fn install_journal_observers_for(&mut self, target: Option<DocumentId>) {
         if self.hex.disposing || !self.files.storage_ready {
             return;
         }
         let Some(worker) = &self.files.worker else { return };
         for (&document, view) in &mut self.views {
-            if self.files.observed.contains_key(&document) || self.hex.loans.contains_key(&document) {
+            if target.is_some_and(|target| target != document)
+                || self.files.observed.contains_key(&document)
+                || self.hex.loans.contains_key(&document)
+            {
                 continue;
             }
             let Some(editor) = view.editor_mut() else { continue };
