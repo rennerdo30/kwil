@@ -701,6 +701,27 @@ impl Runtime {
     pub fn mouse(&mut self, event: MouseEvent) -> Input {
         self.host.as_mut().map_or(Input::Pass, |host| host.mouse(event))
     }
+    pub fn scroll_rows(&mut self, delta: i64) -> Input {
+        let Some(host) = self.host.as_mut() else {
+            return Input::Refused(WrapHostInputError::Wrap(WrapError::Closed));
+        };
+        if host.input_blocked || !host.synchronized {
+            return Input::Refused(WrapHostInputError::Wrap(WrapError::Stale));
+        }
+        match host.shared.scroll(delta) {
+            Ok(_) => Input::Accepted,
+            Err(error) => Input::Refused(error),
+        }
+    }
+    pub fn reveal_source(&mut self, byte: u64) -> Input {
+        let result = self.host.as_mut().ok_or(WrapError::Closed).and_then(|host| {
+            if host.input_blocked || !host.synchronized {
+                return Err(WrapError::Stale);
+            }
+            host.request_reveal(SourcePoint { byte, affinity: CaretAffinity::Downstream })
+        });
+        result.map_or_else(|e| Input::Refused(WrapHostInputError::Wrap(e)), |_| Input::Accepted)
+    }
     pub fn status(&self, view: &kwil_view_model::Workspace) -> String {
         let mut text = view.tab_title(view.active_id());
         if let Some(host) = &self.host

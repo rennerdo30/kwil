@@ -1,6 +1,6 @@
 # Kwil Markdown showcase
 
-Use **Text**, **Preview** and **Split** in the top toolbar. This file is a visual acceptance fixture; it is small enough for the 256 KiB preview limit.
+Use **Text**, **Preview** and **Split** in the top toolbar. This small file is a visual acceptance fixture; large documents use worker-owned preview pages.
 
 ## Inline formatting
 

@@ -32,7 +32,7 @@ important files.
 - **Syntax highlighting:** bundled language support and a generic fallback for
   other text, with background highlighting work.
 - **Markdown preview in the GUI:** text, preview and split modes, including
-  supported local images. Rendered preview is limited to 256 KiB of logical source.
+  supported local images. Large Markdown previews page nearby blocks on a worker with bounded memory.
 - **Rendering designed for remote desktops:** event-driven updates, a CPU
   renderer and remote-mode controls. Cross-platform damage and remote bandwidth
   budgets still need qualification.

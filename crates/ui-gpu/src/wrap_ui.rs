@@ -503,7 +503,7 @@ impl App {
     fn wrap_body_owner(&self) -> BodyOwner {
         if self.view.hex_active() || self.binary_blocks_paint() {
             BodyOwner::Raw
-        } else if self.markdown_mode() == markdown_ui::Mode::Preview {
+        } else if self.markdown_mode() == markdown_ui::Mode::Preview && !self.large_markdown_preview() {
             BodyOwner::MarkdownPreview
         } else if self.logs.owns_body() {
             BodyOwner::LogProjection
@@ -832,7 +832,15 @@ impl App {
     /// Accept already normalized, signed visual rows from the existing wheel.
     /// Horizontal/Shift-wheel is consumed while wrap owns the text body.
     pub(super) fn wrap_wheel(&mut self, vertical: i64, horizontal: i64) -> bool {
-        if !self.wrap_owns_text() || self.markdown_pointer() {
+        if self.markdown_pointer() {
+            return false;
+        }
+        self.wrap_scroll_rows(vertical, horizontal)
+    }
+    // Markdown Split shares the editor's scroll owner even when the pointer
+    // is over its preview. Keep prepared navigation on the existing worker.
+    pub(super) fn wrap_scroll_rows(&mut self, vertical: i64, horizontal: i64) -> bool {
+        if !self.wrap_owns_text() {
             return false;
         }
         if !self.wrap_live() {

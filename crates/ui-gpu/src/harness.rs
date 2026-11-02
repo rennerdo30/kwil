@@ -429,6 +429,18 @@ pub(crate) fn start(proxy: super::HostProxy) {
         let placement =
             [(1800, Step::DismissSetup), (200, Step::PlacementSet), (350, Step::PlacementCheck), (100, Step::End)];
         let replay = [(1800, Step::DismissSetup), (250, Step::PlacementCheck), (100, Step::End)];
+        let markdown_middle = [
+            (1800, Step::DismissSetup),
+            (500, Step::MarkdownSplit),
+            (
+                4000,
+                Step::MarkdownSection(
+                    std::env::var("KWIL_MARKDOWN_MIDDLE_LINE").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
+                ),
+            ),
+            (3000, Step::UsabilityCapture("markdown-middle.bmp")),
+            (100, Step::End),
+        ];
         let markdown = [
             (1800, Step::DismissSetup),
             (200, Step::MarkdownSplit),
@@ -734,6 +746,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             binary_cold.as_slice()
         } else if std::env::var_os("KWIL_BINARY_OFFER_PROBE").is_some() {
             binary.as_slice()
+        } else if std::env::var("KWIL_MARKDOWN_PROBE").as_deref() == Ok("large") {
+            markdown_middle.as_slice()
         } else if std::env::var_os("KWIL_MARKDOWN_PROBE").is_some() {
             markdown.as_slice()
         } else if std::env::var_os("KWIL_PLACEMENT_REPLAY").is_some() {
@@ -2319,6 +2333,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             app.dispatch_zoom("view.zoomIn");
         }
         Step::UsabilityCapture(name) => {
+            if name == "markdown-middle.bmp" {
+                assert!(app.markdown.ready(), "large-file viewport worker must complete before capture");
+            }
             let metadata = format!(
                 "kwil-ui capture={name} scale={} menu={} tabs={} status={} bar={} thumb={} zoom={} editor_cell={:?}",
                 app.ui.scale,

@@ -19,9 +19,9 @@ release, performance, cross-platform or owner acceptance.
 The small `Example.md` fixture shows source highlighting, rendered headings,
 inline formatting and a local sample image. The selected **Split** control and
 the **Text** and **Preview** controls belong to the captured development build.
-Rendered Markdown preview has a 256 KiB logical-source limit in the
-[v1 specification](SPEC.md#markdown); this frame does not demonstrate large-file
-preview. The status message about disabled file-type registration comes from
+The captured build used the initial 256 KiB preview limit. Current preview
+uses worker-owned pages ([specification](SPEC.md#markdown)); this historical
+frame does not demonstrate large-file preview. The status message about disabled file-type registration comes from
 hidden test mode, rather than a successful OS registration operation.
 
 The frame is a DirectX 12 retained presentation texture readback, as stated by
