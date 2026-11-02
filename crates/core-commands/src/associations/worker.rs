@@ -970,9 +970,29 @@ fn publish_update(staging: &Path, destination: &Path) -> io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        fs::hard_link(staging, destination)
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from = CString::new(staging.as_os_str().as_bytes()).map_err(|_| invalid("journal path contains NUL"))?;
+        let to = CString::new(destination.as_os_str().as_bytes()).map_err(|_| invalid("journal path contains NUL"))?;
+        // Move in one operation: link/unlink would expose a two-link intent on
+        // interruption, which the journal correctly refuses to read on restart.
+        // Both APIs refuse an existing destination, including on a race.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staging, destination);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "atomic exclusive journal publication is unavailable"))
     }
 }
 
@@ -1377,6 +1397,21 @@ mod tests {
         let token = update_plan(engine, types);
         let Response::Applied { journal_id } = engine.execute(Request::Apply { token }).unwrap() else { panic!() };
         journal_id
+    }
+    #[test]
+    fn kw46_update_publication_moves_private_record_without_clobbering() {
+        let _guard = crate::associations::test_admission_guard();
+        let scratch = Scratch::new();
+        let staging = scratch.0.join("update.pending");
+        let destination = scratch.0.join("update.intent");
+        private_new(&staging).unwrap().write_all(b"complete successor").unwrap();
+        publish_update(&staging, &destination).unwrap();
+        assert!(!staging.exists(), "publication must leave no hard-linked staging alias");
+        assert_eq!(&*read_record(&destination, 64).unwrap(), b"complete successor");
+        private_new(&staging).unwrap().write_all(b"later attempt").unwrap();
+        assert_eq!(publish_update(&staging, &destination).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(&*read_record(&destination, 64).unwrap(), b"complete successor");
+        assert_eq!(&*read_record(&staging, 64).unwrap(), b"later attempt");
     }
     #[test]
     fn kw46_update_extends_only_new_values_and_preserves_original_receipt_after_restart() {
