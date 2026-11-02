@@ -1275,6 +1275,9 @@ mod tests {
             }
         };
         let capture = |h: &mut Harness, palette: &PaletteSession, name: &str| {
+            // Match the runtime's viewport setup on every active-tab change.
+            let geometry = tabs::geometry(&h.view, 100, 24, h.settings.tabs.layout);
+            h.view.set_rows(geometry.body.height);
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
             terminal
                 .draw(|frame| {
@@ -1316,7 +1319,8 @@ mod tests {
                 && !h.view.document_busy(h.view.active_id())
         });
         assert!(!palette.model().is_open());
-        capture(&mut h, &palette, "tui-opened");
+        let opened = capture(&mut h, &palette, "tui-opened");
+        assert!(opened.contains("first line") && opened.contains("third line"), "opened file body must be visible");
 
         palette_ui::open(&mut h.view, Some(&mut palette), &mut h.keys, "");
         text(&mut h, &mut palette, ":3");
