@@ -37,6 +37,9 @@ enum Message {
 /// The callback runs on a dedicated worker; it should only enqueue a result or
 /// wake the frontend, and must return promptly. Dropping joins that worker.
 pub struct FileWatcher {
+    // A child rearm must never stop the parent stream. FSEvents restarts the
+    // entire RecommendedWatcher on watch/unwatch and discards queued events.
+    _parents: RecommendedWatcher,
     watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
     tx: SyncSender<Message>,
     worker: Option<JoinHandle<()>>,
@@ -89,17 +92,21 @@ impl FileWatcher {
         let parents: BTreeSet<_> = paths.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
         let (tx, rx) = mpsc::sync_channel(256);
         let overflow = Arc::new(AtomicBool::new(false));
-        let events = tx.clone();
-        let overrun = overflow.clone();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            if let Err(mpsc::TrySendError::Full(_)) = events.try_send(Message::Event(event)) {
-                overrun.store(true, Ordering::Release);
-            }
-        })
-        .map_err(io::Error::other)?;
+        let make_watcher = || {
+            let events = tx.clone();
+            let overrun = overflow.clone();
+            notify::recommended_watcher(move |event| {
+                if let Err(mpsc::TrySendError::Full(_)) = events.try_send(Message::Event(event)) {
+                    overrun.store(true, Ordering::Release);
+                }
+            })
+            .map_err(io::Error::other)
+        };
+        let mut parent_watcher = make_watcher()?;
         for parent in parents {
-            watcher.watch(&parent, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
+            parent_watcher.watch(&parent, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
         }
+        let mut watcher = make_watcher()?;
         if directories {
             for path in &paths {
                 watcher.watch(path, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
@@ -158,7 +165,7 @@ impl FileWatcher {
                 }
             }
         })?;
-        Ok(Self { watcher: Some(watcher), tx, worker: Some(worker) })
+        Ok(Self { _parents: parent_watcher, watcher: Some(watcher), tx, worker: Some(worker) })
     }
 }
 
