@@ -140,6 +140,8 @@ struct Backend {
     latency: Option<Arc<Event>>,
     pending: Option<PendingPresent>,
     presented: u64,
+    #[cfg(feature = "frame-harness")]
+    last_present: (bool, u64, u64),
     // A failed queue Signal cannot retire accepted work using an older fence.
     unsignalled: bool,
 }
@@ -280,6 +282,17 @@ impl Gpu {
     pub fn init_with_wake(wake: impl Fn(Result<(), String>) + Send + 'static) -> Result<Self, String> {
         unsafe {
             let mut device = None;
+            #[cfg(feature = "frame-harness")]
+            let adapter: Option<windows::core::IUnknown> = if std::env::var_os("KWIL_FRAME_WARP").is_some() {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
+                Some(factory.EnumWarpAdapter().map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+            #[cfg(feature = "frame-harness")]
+            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| e.to_string())?;
+            #[cfg(not(feature = "frame-harness"))]
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| e.to_string())?;
             let device: ID3D12Device = device.ok_or("DX12 returned no device")?;
             let queue: ID3D12CommandQueue = device
@@ -369,6 +382,8 @@ impl Gpu {
                     latency: None,
                     pending: None,
                     presented: 0,
+                    #[cfg(feature = "frame-harness")]
+                    last_present: (false, 0, 0),
                     unsignalled: false,
                 })),
                 wait: tx,
@@ -406,6 +421,16 @@ impl Gpu {
         if let Err(error) = result {
             *self.readiness.lock().unwrap_or_else(|e| e.into_inner()) = Readiness::Failed(error);
         }
+    }
+    /// Check credit before the host consumes damage or copies scroll pixels.
+    /// request() only subscribes to the existing completion wake; it does not
+    /// consume a ready credit. Initialization/resize and failures still enter
+    /// present(), which owns those transitions and CPU fallback.
+    pub fn frame_ready(&self, size: (usize, usize)) -> bool {
+        if self.backend.as_ref().is_none_or(|backend| backend.size != size) {
+            return true;
+        }
+        self.readiness.lock().unwrap_or_else(|e| e.into_inner()).request().unwrap_or(true)
     }
     fn arm(&self, notify: bool) -> Result<(), String> {
         let b = self.backend.as_ref().ok_or("DX12 backend unavailable")?;
@@ -840,6 +865,14 @@ impl Backend {
             return Ok(false);
         }
         self.presented = self.presented.saturating_add(1);
+        #[cfg(feature = "frame-harness")]
+        {
+            let full = pending.plan.dirty.is_empty()
+                || pending.plan.dirty.contains(&Rect { x: 0, y: 0, w: self.size.0, h: self.size.1 });
+            let damage = pending.plan.dirty.iter().map(|r| (r.w * r.h) as u64).sum();
+            let copy = pending.plan.scroll.as_ref().map_or(0, |s| (s.source.w * s.source.h) as u64);
+            self.last_present = (full, damage, copy);
+        }
         self.pending = None;
         Ok(true)
     }
@@ -847,6 +880,10 @@ impl Backend {
 
 #[cfg(feature = "frame-harness")]
 impl Gpu {
+    /// Metadata of the most recent successful native Present1, not host damage.
+    pub fn last_present(&self) -> (bool, u64, u64) {
+        self.backend.as_ref().map_or((false, 0, 0), |b| b.last_present)
+    }
     pub fn presents(&self) -> u64 {
         self.backend.as_ref().map_or(0, |b| b.presented)
     }
