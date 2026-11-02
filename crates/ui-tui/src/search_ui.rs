@@ -1357,6 +1357,8 @@ mod tests {
         );
         assert!(matches!(intent, KeyResult::Changed(true)));
         assert_eq!(palette.model().query(), "palette-target");
+        assert_eq!(h.bytes(), expected, "paste must leave the document bytes unchanged");
+        assert_eq!(h.selection(), 23..23, "paste must leave the document caret unchanged");
         fresh(&mut palette);
         capture(&mut h, &palette, "tui-paste");
         let before = (h.view.active_id(), h.view.session().tabs().len(), h.selection(), h.bytes());
