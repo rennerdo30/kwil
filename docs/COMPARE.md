@@ -50,8 +50,9 @@ acceptance. Those remain separate hosted/owner checks.
 
 The `TUI compare` workflow launches the actual `kwil --tui --hidden` binary in
 private Unix pseudo-terminals on hosted Linux and macOS. It first proves that
-the navigation assertion rejects a deliberately broken Shift+F7 handler, then
-restores and builds production code. No terminal window or global input is used.
+the tests reject a deliberately broken Shift+F7 handler and the old stale-text
+painting behavior, then restores and builds production code. No terminal window
+or global input is used.
 
 `python3 scripts/test-tui-compare.py target/debug/kwil` checks two files, an edited
 buffer against its saved version, `1 change` / `1 unchanged line` labels, and
