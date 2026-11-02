@@ -7,7 +7,7 @@ use crate::{
 };
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, SyncSender},
 };
 
@@ -167,9 +167,11 @@ fn successful_retry(
 }
 
 fn run_control(receive_live: bool) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(
-        "kwil-document-retry-ack-{}-{}",
+        "kwil-document-retry-ack-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
     ));
     std::fs::create_dir(&root).unwrap();
