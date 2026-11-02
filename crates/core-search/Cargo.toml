@@ -11,6 +11,8 @@ kwil-core-text = { path = "../core-text" }
 kwil-core-workspace = { path = "../core-workspace" }
 memchr = "2.8.3"
 regex = "1.13.1"
+# Already present through regex; use its bounded Thompson states for long log lines.
+regex-automata = "0.4.18"
 regex-syntax = "0.8.11"
 ignore = "0.4.33"
 grep-searcher = "0.1.17"

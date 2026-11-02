@@ -9,6 +9,8 @@ use winit::event_loop::ActiveEventLoop;
 
 #[path = "harness_filetypes.rs"]
 mod filetypes;
+#[path = "harness_recovery.rs"]
+mod recovery;
 
 pub(super) fn hold_preview_completion(
     metrics: &mut Metrics,
@@ -90,6 +92,8 @@ pub(crate) enum Step {
     FolderCheck,
     FolderPreview,
     FolderPreviewCheck,
+    FolderMatches,
+    FolderMatchesCheck,
     FolderSelect,
     FolderOpened,
     PresenterCpu,
@@ -176,6 +180,7 @@ pub(crate) enum Step {
     SessionEdit,
     SessionCheck,
     SessionExit,
+    RecoveryTick,
     End,
 }
 #[derive(Default, Clone, Copy)]
@@ -196,6 +201,7 @@ pub(crate) struct Metrics {
     // shared by concurrent headless hosts (or another window's delivery).
     hold_text_completion: bool,
     held_text_completion: Option<kwil_view_model::document_worker::result_transport::DocumentDeliveryId>,
+    recovery_phase: u8,
 }
 impl Metrics {
     pub fn present(&mut self, full: bool, damage: u64, copy: u64, content_ready: bool) {
@@ -255,6 +261,17 @@ pub(crate) fn start(proxy: super::HostProxy) {
         previous(info);
     }));
     std::thread::spawn(move || {
+        if std::env::var("KWIL_SESSION_PROBE").is_ok_and(|probe| probe.starts_with("kill-")) {
+            // Bounded readiness checks only in the opt-in test script. The
+            // external runner kills this process after the durable receipt.
+            for _ in 0..450 {
+                std::thread::sleep(Duration::from_millis(100));
+                if proxy.send_event(UserEvent::Harness(Step::RecoveryTick)).is_err() {
+                    break;
+                }
+            }
+            return;
+        }
         let usual = [
             (1800, Step::DismissSetup),
             (200, Step::Idle),
@@ -616,6 +633,9 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::FolderPreview),
             (700, Step::FolderPreviewCheck),
             (100, Step::UsabilityCapture("folder-replace-preview.bmp")),
+            (100, Step::FolderMatches),
+            (700, Step::FolderMatchesCheck),
+            (100, Step::UsabilityCapture("folder-replace-matches.bmp")),
             (100, Step::End),
         ];
         let hex_editor = [
@@ -799,6 +819,7 @@ fn session_scratch(app: &App) -> String {
 fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
     let dir = session_capture_directory();
     match step {
+        Step::RecoveryTick => recovery::tick(app, dir.as_deref()),
         Step::SessionStart => {
             assert!(app.view.recovery_ready(), "{}", app.view.status_text());
             app.view.set_session_restore(true);
@@ -1104,6 +1125,15 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.search_panel.results()[0].label.ends_with("1 match"));
             assert!(app.search_panel.status().starts_with("Preview: 1 file, 1 match."));
             println!("kwil-folder-replace preview=PASS files=1 matches=1 native-hidden=true");
+        }
+        Step::FolderMatches => {
+            app.search_input(kwil_view_model::search_panel::SearchInput::FolderDetails);
+        }
+        Step::FolderMatchesCheck => {
+            assert!(app.search_panel.folder_match_preview());
+            assert!(!app.search_panel.is_pending());
+            assert!(app.search_panel.results()[0].label.starts_with("[x] #1"));
+            println!("kwil-folder-replace matches=PASS native-hidden=true");
         }
         Step::FolderSelect => {
             app.search_input(kwil_view_model::search_panel::SearchInput::SelectRow(0));

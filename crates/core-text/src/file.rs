@@ -12,11 +12,12 @@ mod original_save;
 pub use original_save::{OriginalSavePin, cleanup_stale_save_backups};
 mod read_batch;
 pub use read_batch::with_checked_read_batch;
+mod follow;
 mod source;
 pub use source::READ_CHUNK;
 
-/// Files below this size are read into memory; larger ones are mapped
-/// (spec Â§5, "mmap safety").
+/// Files below this size are read into memory; larger originals use bounded
+/// positioned reads, so opening never depends on mmap availability.
 pub const MAP_THRESHOLD: u64 = 64 << 20;
 
 /// Opening never falls back to a file-sized allocation above MAP_THRESHOLD.
@@ -180,6 +181,7 @@ struct Shared {
     read_window: Mutex<(u64, Vec<u8>)>,
     kind: OnceLock<FileKind>,
     index: OnceLock<LineIndex>,
+    follow_prefix: OnceLock<[u64; 2]>,
     index_build: Mutex<()>,
     scanned: AtomicU64,
     // Drops after the file handle and mapping, so Windows can delete backups.
@@ -217,6 +219,8 @@ pub struct TextFile {
 
 #[derive(Debug, Clone, Copy)]
 pub struct IndexProgress {
+    /// Index input read during this build/extension. Extension includes both
+    /// append passes and newline lookaround; prefix verification is separate.
     pub scanned: u64,
     pub total: u64,
 }
@@ -293,6 +297,7 @@ impl TextFile {
                 read_window: Mutex::new((0, Vec::new())),
                 kind: OnceLock::new(),
                 index: OnceLock::new(),
+                follow_prefix: OnceLock::new(),
                 index_build: Mutex::new(()),
                 scanned: AtomicU64::new(0),
                 save_backing: Mutex::new(None),
@@ -387,27 +392,6 @@ impl TextFile {
         OriginalRef { file: Arc::downgrade(&self.shared), cost }
     }
 
-    /// Reopens append-only growth. Existing checkpoints are cloned and only
-    /// appended bytes are scanned; if no index is ready it stays lazy. Existing
-    /// clones retain their old view. Truncation, rotation or same-size writes
-    /// require open(). The caller must know the old prefix was not rewritten;
-    /// size and mtime alone cannot establish append-only writes.
-    pub fn reopen_grown(&self) -> Result<Self, OpenError> {
-        let next = Self::open(&self.shared.path)?;
-        if !matches!(self.shared.stamp.state(&next.shared.stamp), FileState::Grown { .. }) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "file did not only grow; open it afresh").into());
-        }
-        if let Some(index) = self.index() {
-            let mut index = index.clone();
-            index.extend_reader(next.len(), self.len(), crate::INDEX_MEMORY_BYTES, |r| {
-                next.read_range(r).map_err(io::Error::other)
-            })?;
-            let _ = next.shared.index.set(index);
-            next.shared.scanned.store(next.len(), Ordering::Relaxed);
-        }
-        Ok(next)
-    }
-
     /// Bounded binary heuristic, sampled once on first use (at most 128 KiB).
     /// Validates even when the classification is already cached.
     pub fn kind(&self) -> Result<FileKind, ReadError> {
@@ -496,6 +480,9 @@ impl TextFile {
             );
             self.validate_source()?;
             let index = result.map_err(ReadError::Io)?;
+            let guard = self.follow_fingerprint(self.len())?;
+            self.validate_source()?;
+            let _ = s.follow_prefix.set(guard);
             let _ = s.index.set(index);
         }
         Ok(s.index.get().unwrap())
@@ -742,6 +729,29 @@ mod tests {
     }
 
     #[test]
+    fn kw41_append_counts_only_new_index_work() {
+        let dir = TempDir::new();
+        let path = dir.file(&b"INFO row\n".repeat(8192));
+        let file = TextFile::open_saved_version(&path).unwrap();
+        file.build_index(1).unwrap();
+        let added = b"ERROR appended\n";
+        File::options().append(true).open(&path).unwrap().write_all(added).unwrap();
+        let grown = file.reopen_grown().unwrap();
+        assert_eq!(grown.progress().scanned, 2 * added.len() as u64 + 2);
+        assert_eq!(grown.index().unwrap().line_count(), 8194);
+    }
+
+    #[test]
+    fn kw41_truncate_regrow_rejects_old_prefix() {
+        let dir = TempDir::new();
+        let path = dir.file(b"one\ntwo\n");
+        let file = TextFile::open_saved_version(&path).unwrap();
+        file.build_index(1).unwrap();
+        std::fs::write(&path, b"a longer replacement without breaks").unwrap();
+        assert!(file.reopen_grown().is_err(), "growth must verify the old indexed bytes");
+    }
+
+    #[test]
     fn reopen_grown_carries_index() {
         let dir = TempDir::new();
         let path = dir.file(b"first\npartial");
@@ -752,7 +762,7 @@ mod tests {
         assert!(grown.index().is_some(), "index must be carried forward eagerly");
         assert_eq!(grown.index().unwrap().line_count(), 3);
         assert_eq!(grown.lines(1, 5).unwrap().unwrap(), vec![b"partial end".as_slice(), b"next"]);
-        assert_eq!(grown.progress().scanned, grown.len());
+        assert_eq!(grown.progress().scanned, 2 * b" end\nnext".len() as u64 + 2);
         assert_eq!(grown.check().unwrap(), FileState::Unchanged);
         assert_eq!(file.index().unwrap().line_count(), 2);
         assert!(grown.reopen_grown().is_err());

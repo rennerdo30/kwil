@@ -26,6 +26,8 @@ pub(crate) fn is_external_change(error: &io::Error) -> bool {
 #[cfg(test)]
 mod compressed_runtime;
 mod decoded;
+mod log_reopen;
+use log_reopen::{follow_source, plain_utf8_follow};
 mod encoding_runtime;
 mod encoding_seed;
 mod hex_runtime;
@@ -1197,7 +1199,9 @@ impl DocumentWorker {
                             let detected = if storage.is_some() {
                                 {
                                     binary.threshold = preferences.threshold;
-                                    binary.detect(ticket, path, file)
+                                    let source =
+                                        if ticket.follow { follow_source(&path, file).map(Some) } else { Ok(file) };
+                                    source.and_then(|file| binary.detect(ticket, path, file))
                                 }
                             } else {
                                 Err(io::Error::other("Workspace storage is not prepared"))
@@ -1209,6 +1213,13 @@ impl DocumentWorker {
                                 other => {
                                     let result = other.and_then(|detected| {
                                         let binary_offer::Detection::Text(pending) = detected else { unreachable!() };
+                                        // Plain UTF-8 logs use the checked positioned source
+                                        // directly. Decoded/compressed generations retain the
+                                        // existing immutable-backing path and full reopen.
+                                        if ticket.follow && plain_utf8_follow(&pending.file)? {
+                                            pending.file.build_index(1).map_err(io::Error::other)?;
+                                            return Document::from_indexed_file(pending.path, pending.file);
+                                        }
                                         let storage = storage.as_mut().expect("prepared checked open");
                                         storage.encoding.open(pending.path, pending.file, None, &cancel, |preview| {
                                             complete(DocumentResult::CheckedPreview { ticket, preview });
@@ -4990,6 +5001,38 @@ mod tests {
     #[test]
     fn production_utf16_opaque_journal_survives_two_restarts_and_save_as() {
         use crate::{CommandArgs, View, Workspace};
+        fn drive_phase(
+            workspace: &mut Workspace,
+            receiver: &mpsc::Receiver<DocumentResult>,
+            round: usize,
+            phase: &str,
+            done: impl Fn(&Workspace) -> bool,
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut results = Vec::new();
+            while !done(workspace) {
+                let result = receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "UTF-16 round={round} phase={phase} results={results:?} status={} prompt={:?}: {error:?}",
+                            workspace.status_text(),
+                            workspace.file_prompt().is_some()
+                        )
+                    });
+                let summary = match &result {
+                    DocumentResult::JournalQueued { document, revision, sequence, result } => {
+                        format!("queued {document:?} rev={revision} seq={sequence}: {result:?}")
+                    }
+                    DocumentResult::JournalDurable { document, revision, sequence, result } => {
+                        format!("durable {document:?} rev={revision} seq={sequence}: {result:?}")
+                    }
+                    _ => format!("{:?}", std::mem::discriminant(&result)),
+                };
+                results.push(summary);
+                workspace.test_document_result(result);
+            }
+        }
         let root = Scratch::new();
         let path = root.0.join("malformed-utf16.txt");
         let original = b"\xff\xfeA\0\0\xd8";
@@ -5004,10 +5047,10 @@ mod tests {
                     let _ = tx.send(result);
                 })
                 .unwrap();
-            drive(&mut workspace, &rx, Workspace::recovery_ready);
+            drive_phase(&mut workspace, &rx, round, "prepare", Workspace::recovery_ready);
             let document = if round == 0 {
                 let opened = workspace.open_path(path.clone()).unwrap();
-                drive(&mut workspace, &rx, |workspace| {
+                drive_phase(&mut workspace, &rx, round, "open", |workspace| {
                     workspace.view(opened).is_some_and(|view| view.editor().is_some())
                 });
                 id = Some(opened);
@@ -5030,7 +5073,7 @@ mod tests {
                     )
                     .unwrap();
                 workspace.request_window_close(false).unwrap();
-                drive(&mut workspace, &rx, Workspace::wants_exit);
+                drive_phase(&mut workspace, &rx, round, "hot-exit", Workspace::wants_exit);
             } else {
                 let editor = workspace.view(document).unwrap().editor().unwrap();
                 assert!(editor.document().path().is_none(), "dirty recovery cannot adopt current disk baseline");
@@ -5039,7 +5082,7 @@ mod tests {
                 assert_eq!(logical, b"A\xffxy");
                 let output = root.0.join("saved-as.txt");
                 workspace.save_document(document, Some(output.clone())).unwrap();
-                drive(&mut workspace, &rx, |workspace| {
+                drive_phase(&mut workspace, &rx, round, "save", |workspace| {
                     !workspace.view(document).unwrap().editor().unwrap().document().is_dirty()
                 });
                 assert_eq!(std::fs::read(output).unwrap(), b"\xff\xfeA\0\0\xd8x\0y\0");

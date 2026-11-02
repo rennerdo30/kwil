@@ -50,3 +50,16 @@ value; other namespaces are refused in hidden mode. These checks also require an
 isolated absolute `KWIL_WORKSPACE_ROOT` and disable updates with `KWIL_NO_UPDATE=1`.
 Persistent windows still read journal/undo preferences from their settings
 profile when the recovery root is overridden; hidden checks isolate that profile too.
+
+The Windows/Linux CI process-kill check builds with
+`kwil-ui-gpu/frame-harness` and runs `scripts/test-crash-recovery.py <kwil>
+<output-directory>` (under `xvfb-run -a` on Linux). It edits named and untitled
+buffers through the existing hidden GUI script, waits for journal acknowledgements
+and persisted session metadata, then uses TerminateProcess or SIGKILL on its own
+process. Restart checks exact unsaved bytes, dirty markers, tab order, active tab
+and selections. Both unchanged and externally changed disk files retain their
+bytes; unverified named recovery shows its existing warning and requires Save As.
+Logs, owned PIDs, isolated profiles and retained compositor captures stay in the
+output directory. `--negative-control` removes only the isolated named journal
+after killing the seed and must fail the recovery assertions. These checks do not
+establish physical disk durability under power loss or macOS behavior.

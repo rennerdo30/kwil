@@ -731,6 +731,7 @@ mod cursor_cache_tests {
 
 pub mod log_follow;
 pub mod log_session;
+pub mod log_view;
 
 pub mod compare_source;
 pub mod snapshot_layout_source;

@@ -1719,7 +1719,7 @@ impl Workspace {
             view.path.as_ref().ok_or_else(|| io::Error::other("Save the log file before following it"))?.to_path_buf();
         // Restore the exact editor if admission refuses, before any transfer.
         let editor = self.views.get_mut(&id).unwrap().editor.take();
-        let request = match self.checked_open_request(id, 0, path) {
+        let request = match self.checked_open_request_with_follow(id, 0, path, true) {
             Ok(request) => request,
             Err(error) => {
                 self.views.get_mut(&id).unwrap().editor = editor;
@@ -1733,13 +1733,9 @@ impl Workspace {
         tab.revision = 0;
         tab.saved_revision = 0;
         self.input_epoch = self.input_epoch.wrapping_add(1);
-        // The old file must retire, never feed the new checked open.
-        if let DocumentRequest::OpenChecked { ticket, path, file } = request {
-            if let Some(file) = file {
-                self.files.queue.push_back(DocumentRequest::RetireSource { file });
-            }
-            self.files.queue.push_back(DocumentRequest::OpenChecked { ticket, path, file: None });
-        }
+        // The worker verifies identity/prefix samples before reusing any
+        // index. Rotation, truncation and non-UTF-8 sources reopen in full.
+        self.files.queue.push_back(request);
         self.wrap.path_changed();
         self.pump_files();
         Ok(())
@@ -3247,6 +3243,15 @@ impl Workspace {
         })
     }
     fn checked_open_request(&mut self, id: DocumentId, revision: u64, path: PathBuf) -> io::Result<DocumentRequest> {
+        self.checked_open_request_with_follow(id, revision, path, false)
+    }
+    fn checked_open_request_with_follow(
+        &mut self,
+        id: DocumentId,
+        revision: u64,
+        path: PathBuf,
+        follow: bool,
+    ) -> io::Result<DocumentRequest> {
         if self.binary.flights.len() + self.binary.retiring.len() >= kwil_core_workspace::session::MAX_TABS
             || self.binary.flights.contains_key(&id)
             || path.capacity() > kwil_core_workspace::session::MAX_PATH_BYTES
@@ -3264,7 +3269,7 @@ impl Workspace {
         // admitted. There is no allocation proportional to source length.
         self.binary.retiring.try_reserve(self.binary.flights.len() + 1).map_err(io::Error::other)?;
         self.binary.next_generation = generation;
-        let ticket = BinaryTicket { document: id, revision, generation };
+        let ticket = BinaryTicket { document: id, revision, generation, follow };
         self.binary.flights.insert(
             id,
             BinaryFlight {
@@ -3623,6 +3628,89 @@ mod tests {
     use crate::CommandArgs;
 
     #[test]
+    fn kw41_follow_append_indexes_only_appended_bytes() {
+        kw41_follow_change("append");
+    }
+
+    #[test]
+    fn kw41_follow_truncation_rebuilds_index() {
+        kw41_follow_change("truncate");
+    }
+
+    #[test]
+    fn kw41_follow_rotation_rebuilds_index_even_with_same_prefix() {
+        kw41_follow_change("rotate");
+    }
+
+    fn kw41_follow_change(change: &str) {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        };
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(format!(
+            "kw41-follow-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = std::path::absolute(root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("app.log");
+        let initial = b"INFO row\n".repeat(8192);
+        std::fs::write(&path, &initial).unwrap();
+        let file = kwil_core_text::TextFile::open_saved_version(&path).unwrap();
+        file.build_index(1).unwrap();
+        let mut workspace = Workspace::new(View::new(Some((path.clone(), file)))).unwrap();
+        let expected =
+            if change == "truncate" { b"WARN cut\n".to_vec() } else { [initial.as_slice(), b"ERROR new\n"].concat() };
+        if change == "rotate" {
+            std::fs::rename(&path, root.join("rotated.log")).unwrap();
+        }
+        std::fs::write(&path, &expected).unwrap();
+        workspace.reload_log().unwrap();
+        let request = workspace.files.queue.pop_back().unwrap();
+        let DocumentRequest::OpenChecked { file, .. } = &request else { panic!("checked follow reopen") };
+        assert!(file.is_some(), "follow must carry the old indexed generation to the worker");
+        let (tx, rx) = mpsc::channel();
+        let worker = DocumentWorker::spawn(move |result| {
+            let _ = tx.send(result);
+        })
+        .unwrap();
+        worker.try_submit(DocumentRequest::Prepare { root: Some(root.clone()) }).unwrap();
+        loop {
+            if let DocumentResult::Prepared(result) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                drop(result.unwrap());
+                break;
+            }
+        }
+        worker.try_submit(request).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let document = loop {
+            let result = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+            if let DocumentResult::CheckedOpened { result, .. } = result {
+                break result.unwrap().unwrap();
+            }
+        };
+        let mut actual = Vec::new();
+        document.snapshot().write_to(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        let original = document.original.as_ref().unwrap();
+        let expected_work = if change == "append" { 22 } else { expected.len() as u64 };
+        assert_eq!(original.progress().scanned, expected_work, "index work after {change}");
+        assert_eq!(document.snapshot().line_count(), if change == "truncate" { 2 } else { 8194 });
+        drop(document);
+        drop(worker);
+        loop {
+            if let DocumentResult::Stopped(result) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                result.unwrap();
+                break;
+            }
+        }
+        drop(workspace);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn log_reload_reopens_current_path_and_preserves_dirty_edits() {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -3641,7 +3729,7 @@ mod tests {
             assert!(workspace.editor().is_none());
             let request = workspace.files.queue.pop_back().unwrap();
             let DocumentRequest::OpenChecked { ticket, file, .. } = request else { panic!("checked reopen") };
-            assert!(file.is_none(), "must not reuse the invalidated file");
+            assert!(file.is_some(), "worker owns append verification and fallback");
             let file = kwil_core_text::TextFile::open(&path).unwrap();
             let document = crate::Document::from_file(path.clone(), file).unwrap();
             workspace

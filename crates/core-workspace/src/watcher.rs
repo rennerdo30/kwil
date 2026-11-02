@@ -37,6 +37,9 @@ enum Message {
 /// The callback runs on a dedicated worker; it should only enqueue a result or
 /// wake the frontend, and must return promptly. Dropping joins that worker.
 pub struct FileWatcher {
+    // A child rearm must never stop the parent stream. FSEvents restarts the
+    // entire RecommendedWatcher on watch/unwatch and discards queued events.
+    _parents: Option<RecommendedWatcher>,
     watcher: Option<Arc<Mutex<RecommendedWatcher>>>,
     tx: SyncSender<Message>,
     worker: Option<JoinHandle<()>>,
@@ -89,17 +92,22 @@ impl FileWatcher {
         let parents: BTreeSet<_> = paths.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
         let (tx, rx) = mpsc::sync_channel(256);
         let overflow = Arc::new(AtomicBool::new(false));
-        let events = tx.clone();
-        let overrun = overflow.clone();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            if let Err(mpsc::TrySendError::Full(_)) = events.try_send(Message::Event(event)) {
-                overrun.store(true, Ordering::Release);
-            }
-        })
-        .map_err(io::Error::other)?;
+        let make_watcher = || {
+            let events = tx.clone();
+            let overrun = overflow.clone();
+            notify::recommended_watcher(move |event| {
+                if let Err(mpsc::TrySendError::Full(_)) = events.try_send(Message::Event(event)) {
+                    overrun.store(true, Ordering::Release);
+                }
+            })
+            .map_err(io::Error::other)
+        };
+        let mut parent_watcher = make_watcher()?;
         for parent in parents {
-            watcher.watch(&parent, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
+            parent_watcher.watch(&parent, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
         }
+        let (parent_watcher, mut watcher) =
+            if directories { (Some(parent_watcher), make_watcher()?) } else { (None, parent_watcher) };
         if directories {
             for path in &paths {
                 watcher.watch(path, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
@@ -158,7 +166,7 @@ impl FileWatcher {
                 }
             }
         })?;
-        Ok(Self { watcher: Some(watcher), tx, worker: Some(worker) })
+        Ok(Self { _parents: parent_watcher, watcher: Some(watcher), tx, worker: Some(worker) })
     }
 }
 
@@ -490,6 +498,27 @@ mod tests {
         assert_eq!(delivery_kind(&root, FileEventKind::Modified, false), FileEventKind::Modified);
         std::fs::create_dir(&root).unwrap();
         assert_eq!(delivery_kind(&root, FileEventKind::Modified, true), FileEventKind::Modified);
+    }
+
+    #[test]
+    fn watcher_directory_parent_outlives_child_stream() {
+        let dir = TempDir::new();
+        let root = dir.0.join("themes");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watcher = FileWatcher::directory(&root, Duration::from_millis(10), move |event| {
+            let _ = tx.send(event);
+        })
+        .unwrap();
+        // Model the interval in which child reconfiguration has stopped its
+        // native stream. Parent delivery must not depend on that stream.
+        let child = watcher.watcher.as_ref().unwrap();
+        *child.lock().unwrap() = notify::recommended_watcher(|_| {}).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let event = rx.recv_timeout(Duration::from_secs(5)).expect("independent parent removal wake").unwrap();
+        assert_eq!(event, FileEvent { path: root, kind: FileEventKind::Removed });
+        drop(watcher);
     }
 
     #[test]

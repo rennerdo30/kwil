@@ -79,6 +79,7 @@ impl Fixture {
         self.themes.input(input, Some(&mut self.settings));
     }
     fn saved(&self) -> Settings {
+        assert!(!self.settings.is_saving(), "read settings only after the Saved receipt");
         Settings::load(self.settings.path()).unwrap().settings
     }
     fn cache(&self) -> Option<kwil_core_commands::theme_cache::CachedTheme> {
@@ -111,7 +112,12 @@ fn theme_picker_previews_cancels_and_persists_only_on_enter() {
     f.input(PaletteInput::Next);
     f.input(PaletteInput::Accept);
     assert_eq!(f.themes.active(false).scheme(), Scheme::Light, "accepted preview stays visible during save");
-    f.wait(|f| f.saved().theme.name == "light" && f.cache().is_some_and(|c| c.theme.scheme() == Scheme::Light));
+    f.wait(|f| {
+        !f.settings.is_saving()
+            && f.themes.settings.name == "light"
+            && f.cache().is_some_and(|c| c.theme.scheme() == Scheme::Light)
+    });
+    assert_eq!(f.saved().theme.name, "light");
     assert!(!f.themes.is_open());
     assert!(!f.saved().theme.follow_os);
     assert_eq!(f.saved().editor.tab_size, 7);
@@ -136,8 +142,13 @@ fn theme_import_path_enters_catalogue_and_saved_selection_survives_missing_sourc
     assert_eq!(theme.ui().get(UiRole::Background), Rgba::rgb(0x123456));
     assert_eq!(syntax_rgb(&theme, crate::highlighting::Class::Tag), 0xabcdef);
     f.input(PaletteInput::Accept);
-    f.wait(|f| f.saved().theme.name.starts_with("ocean-") && f.cache().is_some_and(|c| c.theme.name() == "Ocean"));
+    f.wait(|f| {
+        !f.settings.is_saving()
+            && f.themes.settings.name.starts_with("ocean-")
+            && f.cache().is_some_and(|c| c.theme.name() == "Ocean")
+    });
     let name = f.saved().theme.name;
+    assert!(name.starts_with("ocean-"));
     std::fs::remove_file(f.root.join("themes").join(format!("{name}.toml"))).unwrap();
     f.themes.worker.take();
     let (tx, wake) = mpsc::sync_channel(1);
