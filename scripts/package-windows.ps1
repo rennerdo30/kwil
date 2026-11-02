@@ -40,7 +40,7 @@ if (!(Test-Path $makensis) -and $InstallNsis) {
 }
 if (!(Test-Path $makensis)) { throw 'makensis.exe (NSIS 3) not found' }
 $setup = Join-Path $OutDir "$name-setup.exe"
-& $makensis -V3 "-DVERSION=$Version" "-DVI_VERSION=$numeric" "-DARCH=$arch" "-DSRC=$stage" "-DOUTFILE=$setup" (Join-Path $root 'installer\kwil.nsi')
+& $makensis -V3 -INPUTCHARSET UTF8 "-DVERSION=$Version" "-DVI_VERSION=$numeric" "-DARCH=$arch" "-DSRC=$stage" "-DOUTFILE=$setup" (Join-Path $root 'installer\kwil.nsi')
 if ($LASTEXITCODE) { throw "makensis failed ($LASTEXITCODE)" }
 Remove-Item -Recurse $stage
 Get-ChildItem $OutDir -Filter "$name*" | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
