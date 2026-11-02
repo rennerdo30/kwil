@@ -20,6 +20,7 @@ mod palette_ui;
 mod search_ui;
 mod settings_ui;
 mod tabs;
+mod terminal_palette;
 #[cfg(test)]
 mod test_support;
 mod theme_ui;
@@ -174,6 +175,7 @@ fn run_workspace_with_terminal_init(
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TUI closed"))
         });
         terminal = Some(initialize(&mut terminal_touched)?);
+        let terminal_colors = crossterm::style::available_color_count();
         crossterm::execute!(
             std::io::stdout(),
             crossterm::event::EnableMouseCapture,
@@ -1124,6 +1126,7 @@ fn run_workspace_with_terminal_init(
                         binary_offer.draw(f, view);
                     }
                     theme_ui::draw(f, &themes);
+                    terminal_palette::apply(f.buffer_mut(), terminal_colors);
                 })?;
                 if let Some(host) = wrap {
                     host.painted();
