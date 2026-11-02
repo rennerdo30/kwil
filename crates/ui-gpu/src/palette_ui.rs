@@ -471,8 +471,17 @@ impl App {
     }
 
     fn palette_paste(&mut self) {
+        #[cfg(feature = "frame-harness")]
+        if let Some(result) = super::harness::palette_clipboard_text(kwil_core_commands::palette::MAX_QUERY_BYTES) {
+            self.palette_paste_result(result);
+            return;
+        }
         let hwnd = self.gfx.as_ref().map_or(0, |gfx| gfx.hwnd);
         let result = clipboard::SystemClipboard(hwnd).get_text(kwil_core_commands::palette::MAX_QUERY_BYTES);
+        self.palette_paste_result(result);
+    }
+
+    fn palette_paste_result(&mut self, result: std::io::Result<Option<String>>) {
         match result {
             Ok(Some(text)) => self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text)),
             Ok(None) => {}
