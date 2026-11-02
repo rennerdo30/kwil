@@ -18,6 +18,41 @@ use std::{
 pub use diff::Kind;
 const PAGE_ROWS: usize = 128;
 const ROW_BYTES: usize = 4096;
+mod large;
+
+enum ActiveState {
+    Capped(Box<State>),
+    Large(Box<large::LargeState>),
+}
+impl ActiveState {
+    fn open(
+        left: Snapshot,
+        path: PathBuf,
+        cancel: &diff::CancellationToken,
+        stop: &AtomicBool,
+        settings: &CompareSettings,
+    ) -> Result<Self, String> {
+        match State::open(left.clone(), path.clone(), cancel, stop, settings) {
+            Ok(state) => Ok(Self::Capped(Box::new(state))),
+            Err(error) if error == failure(diff::DiffError::TooLarge) => {
+                large::LargeState::open(left, path, stop, settings).map(|state| Self::Large(Box::new(state)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn action(&mut self, action: Action, cancel: &diff::CancellationToken, stop: &AtomicBool) -> Result<(), String> {
+        match self {
+            Self::Capped(state) => state.action(action, cancel),
+            Self::Large(state) => state.action(action, stop),
+        }
+    }
+    fn page(&mut self, cancel: &diff::CancellationToken, stop: &AtomicBool) -> Result<Page, String> {
+        match self {
+            Self::Capped(state) => state.page(cancel),
+            Self::Large(state) => state.page(stop),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Session {
@@ -334,7 +369,7 @@ impl Session {
             let cancel = diff::CancellationToken::default();
             let cancelled = cancel.clone();
             std::thread::Builder::new().name("kwil-compare".into()).spawn(move || {
-                let mut state: Option<State> = None;
+                let mut state: Option<ActiveState> = None;
                 while let Ok(request) = requests.recv() {
                     if stopped.load(Ordering::Relaxed) {
                         break;
@@ -342,15 +377,20 @@ impl Session {
                     let result = match request {
                         Request::Start(snapshot, path, settings) => {
                             state = None;
-                            State::open(snapshot, path, &cancelled, &stopped, &settings).map(|s| state = Some(s))
+                            ActiveState::open(snapshot, path, &cancelled, &stopped, &settings).map(|s| state = Some(s))
                         }
-                        Request::Action(action) => state.as_mut().map_or(Ok(()), |s| s.action(action, &cancelled)),
+                        Request::Action(action) => {
+                            state.as_mut().map_or(Ok(()), |s| s.action(action, &cancelled, &stopped))
+                        }
                         Request::Close => {
                             state = None;
                             Ok(())
                         }
                     }
-                    .and_then(|()| state.as_ref().map(|s| s.page(&cancelled)).transpose());
+                    .and_then(|()| state.as_mut().map(|s| s.page(&cancelled, &stopped)).transpose());
+                    if result.is_err() {
+                        state = None;
+                    }
                     if results.send(result).is_err() {
                         break;
                     }
@@ -520,6 +560,146 @@ mod tests {
         let mut view = Workspace::new(View::new(None)).unwrap();
         view.execute("edit.insert", &CommandArgs { text: Some(text.into()), ..Default::default() }, 1).unwrap();
         view
+    }
+    #[test]
+    fn compare_above_line_limit_publishes_files_and_saved_buffer() {
+        let text = (0..diff::MAX_LINES / 2 + 1).map(|n| format!("row {n:06} same word\n")).collect::<String>();
+        let fixture = Fixture::new(text.as_bytes());
+        let file = TextFile::open_saved_version(&fixture.0).unwrap();
+        let backing = kwil_core_text::decoded_backing::DecodedBacking::prepare(
+            &file,
+            kwil_core_text::decoded_backing::Interpretation::new(kwil_core_text::encoding::Encoding::UTF8, 0).unwrap(),
+            &std::env::temp_dir(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let mut buffer = kwil_core_text::Buffer::from_decoded(backing.snapshot()).unwrap();
+        buffer.insert(0, b"changed ").unwrap();
+        buffer.insert(130_000 * 21 + 8, b"   ").unwrap();
+        let mut session = Session::default();
+        session.send(Request::Start(buffer.snapshot(), fixture.0.clone(), CompareSettings::default())).unwrap();
+        let result = session.worker.as_ref().unwrap().rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        let page = result.expect("above-limit saved buffer must compare").unwrap();
+        assert_eq!(page.changes, 2);
+        assert_eq!(page.rows[0].text, [b"changed row 000000 same word".to_vec(), b"row 000000 same word".to_vec()]);
+        assert!(!page.rows[0].words[0].is_empty());
+        assert!(page.rows.iter().any(|r| r.hidden > 100_000));
+        assert!(page.rows.len() <= PAGE_ROWS);
+        session.busy = false;
+        session.send(Request::Action(Action::Next)).unwrap();
+        let next = session
+            .worker
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.rows[0].left, Some(130_000));
+        session.busy = false;
+        session.send(Request::Action(Action::Previous)).unwrap();
+        let previous = session
+            .worker
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.rows[0].left, Some(0));
+        session.busy = false;
+        session.send(Request::Action(Action::Whitespace)).unwrap();
+        let ignored = session
+            .worker
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(ignored.changes, 1);
+        assert!(ignored.ignore_whitespace);
+        let hidden = ignored.rows.iter().position(|r| r.hidden > 0).unwrap();
+        session.busy = false;
+        session.send(Request::Action(Action::Expand(ignored.top + hidden))).unwrap();
+        let expanded = session
+            .worker
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(expanded.total > 100_000);
+        assert_eq!(expanded.rows.len(), PAGE_ROWS);
+        // Compare two independent files through the same shared worker.
+        let other = Fixture::new(format!("other {text}").as_bytes());
+        let original = kwil_core_text::Buffer::from_file(TextFile::open_saved_version(&fixture.0).unwrap()).unwrap();
+        session.busy = false;
+        session.send(Request::Start(original.snapshot(), other.0.clone(), CompareSettings::default())).unwrap();
+        let files = session
+            .worker
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(files.changes, 1);
+        assert_eq!(files.rows[0].text, [b"row 000000 same word".to_vec(), b"other row 000000 same word".to_vec()]);
+        assert!(!files.rows[0].words[1].is_empty());
+        session.busy = false;
+        session.send(Request::Close).unwrap();
+        assert!(
+            session
+                .worker
+                .as_ref()
+                .unwrap()
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&fixture.0).unwrap(), text.as_bytes());
+        drop(session);
+        drop(buffer);
+        assert!(backing.try_retire().is_ok());
+    }
+    #[test]
+    fn compare_above_line_length_limit_is_exact_and_paged() {
+        let fixture = Fixture::new(&vec![b'a'; diff::MAX_LINE_BYTES + 1]);
+        let file = TextFile::open_saved_version(&fixture.0).unwrap();
+        let mut buffer = kwil_core_text::Buffer::from_file(file).unwrap();
+        buffer.insert(0, b"changed ").unwrap();
+        let mut session = Session::default();
+        session.send(Request::Start(buffer.snapshot(), fixture.0.clone(), CompareSettings::default())).unwrap();
+        let result = session.worker.as_ref().unwrap().rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        let page = result.expect("a long line must compare without copying it into RAM").unwrap();
+        assert_eq!(page.changes, 1);
+        assert_eq!(page.rows[0].kind, Kind::Modify);
+        assert_eq!(page.rows[0].text[0].len(), ROW_BYTES);
+        assert_eq!(page.rows[0].text[1].len(), ROW_BYTES);
+        assert!(!page.rows[0].words[0].is_empty());
+        session.busy = false;
+        session.send(Request::Close).unwrap();
+        assert!(
+            session
+                .worker
+                .as_ref()
+                .unwrap()
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        drop(session);
     }
     #[test]
     fn compare_header_pluralizes_change_count() {

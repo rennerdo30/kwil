@@ -570,8 +570,12 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (1200, Step::CompareCheck),
             (100, Step::End),
         ];
-        let compare =
-            [(1800, Step::DismissSetup), (200, Step::CompareOpen), (1200, Step::CompareCheck), (200, Step::End)];
+        let compare = [
+            (1800, Step::DismissSetup),
+            (200, Step::CompareOpen),
+            (if std::env::var_os("KWIL_COMPARE_PATH").is_some() { 25000 } else { 1200 }, Step::CompareCheck),
+            (200, Step::End),
+        ];
         let format = [
             (1800, Step::DismissSetup),
             (300, Step::Command("edit.formatDocument")),
@@ -842,8 +846,19 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
         }
         Step::CompareOpen => {
             assert!(app.opts.hidden);
-            app.edit(super::input::Action::Text("Edited buffer: ".into()));
-            assert!(app.dispatch_compare("compare.saved"));
+            if let Some(path) = std::env::var_os("KWIL_COMPARE_PATH") {
+                // Install the host wake callback, then inject a path before
+                // native chooser sync (choosers are forbidden in hidden runs).
+                assert!(app.dispatch_compare("compare.close"));
+                assert!(app.view.compare_command("compare.files"));
+                app.view.file_prompt_mut().expect("compare path prompt").text = path.to_string_lossy().into();
+                app.view.submit_file_prompt().expect("compare two files");
+                app.sync_file_ui();
+                app.apply(Damage { full: true, status: true, ..Default::default() });
+            } else {
+                app.edit(super::input::Action::Text("Edited buffer: ".into()));
+                assert!(app.dispatch_compare("compare.saved"));
+            }
         }
         Step::CompareCheck => {
             let page = app.view.compare.page.as_ref().expect("comparison worker published a page");
@@ -858,7 +873,9 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.render());
             capture(app, dir.as_deref(), "compare.bmp");
             app.dispatch_compare("compare.close");
-            app.edit(super::input::Action::Command("edit.undo"));
+            if std::env::var_os("KWIL_COMPARE_PATH").is_none() {
+                app.edit(super::input::Action::Command("edit.undo"));
+            }
         }
         Step::HexAscii => {
             assert!(
