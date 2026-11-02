@@ -111,6 +111,8 @@ pub(super) struct Host {
     large_markdown: bool,
     model_top: Option<u64>,
     rendered_top: usize,
+    block_scroll: Option<(usize, u64, u64)>,
+    scroll_anchor: Option<u64>,
     model: Option<Model>,
     model_source: Option<Source>,
     markdown_top: usize,
@@ -343,7 +345,7 @@ impl Host {
                     return true;
                 }
                 _ if delta != 0 => {
-                    view.scroll(delta);
+                    self.scroll_preview(view, delta, None);
                     return true;
                 }
                 _ => {}
@@ -437,7 +439,7 @@ impl Host {
             _ => return true,
         };
         if self.large_markdown && self.mode != Mode::Text {
-            view.scroll(if code == KeyCode::Up { -1 } else { 1 });
+            self.scroll_preview(view, if code == KeyCode::Up { -1 } else { 1 }, None);
         } else if self.mode == Mode::Split {
             self.markdown_top = if code == KeyCode::Up {
                 self.markdown_top.saturating_sub(1)
@@ -451,6 +453,97 @@ impl Host {
     }
     pub fn editing(&self) -> bool {
         self.field.is_some()
+    }
+    pub fn prepared_key(
+        &mut self,
+        view: &mut Workspace,
+        key: KeyEvent,
+        runtime: Option<&mut wrap_ui::Runtime>,
+    ) -> bool {
+        if !self.large_markdown
+            || self.mode != Mode::Preview
+            || self.editing()
+            || view.body_policy() != kwil_view_model::ViewBodyPolicy::Prepared
+        {
+            return false;
+        }
+        let Some(runtime) = runtime else {
+            return false;
+        };
+        let result = match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                let delta = match key.code {
+                    KeyCode::Up => -1,
+                    KeyCode::Down => 1,
+                    KeyCode::PageUp => -(view.rows() as i64),
+                    _ => view.rows() as i64,
+                };
+                self.scroll_preview(view, delta, Some(runtime));
+                return true;
+            }
+            KeyCode::Home => runtime.reveal_source(0),
+            KeyCode::End => runtime.reveal_source(view.editor().map_or(0, |e| e.document().buffer().len())),
+            _ => return false,
+        };
+        if let Some(notice) = result.notice() {
+            view.set_notice(notice.into());
+        }
+        true
+    }
+    pub fn prepared_mouse(
+        &mut self,
+        view: &mut Workspace,
+        event: &event::MouseEvent,
+        runtime: Option<&mut wrap_ui::Runtime>,
+    ) -> bool {
+        if !self.large_markdown
+            || self.mode == Mode::Text
+            || view.body_policy() != kwil_view_model::ViewBodyPolicy::Prepared
+        {
+            return false;
+        }
+        let Some(runtime) = runtime else {
+            return false;
+        };
+        let delta = match event.kind {
+            MouseEventKind::ScrollUp => -3,
+            MouseEventKind::ScrollDown => 3,
+            _ => return false,
+        };
+        self.scroll_preview(view, delta, Some(runtime));
+        true
+    }
+    fn scroll_preview(&mut self, view: &mut Workspace, delta: i64, runtime: Option<&mut wrap_ui::Runtime>) {
+        let offset = self.markdown_top.saturating_add_signed(delta as isize);
+        if (delta < 0 && delta.unsigned_abs() as usize <= self.markdown_top)
+            || (delta >= 0 && self.block_scroll.is_some_and(|b| offset < b.0))
+        {
+            self.markdown_top = offset;
+        } else if delta > 0
+            && let Some((height, line, byte)) = self.block_scroll
+        {
+            self.scroll_anchor = Some(line);
+            if let Some(runtime) = runtime {
+                let result = runtime.reveal_source(byte);
+                if let Some(notice) = result.notice() {
+                    view.set_notice(notice.into());
+                    return;
+                }
+                self.markdown_top = offset.saturating_sub(height);
+            } else {
+                let old = view.top();
+                view.scroll(line.saturating_sub(old) as i64);
+                self.scroll_anchor = Some(view.top());
+                self.markdown_top = if old == view.top() { offset } else { offset.saturating_sub(height) };
+            }
+        } else {
+            if let Some(runtime) = runtime {
+                runtime.scroll_rows(-1);
+            } else {
+                view.scroll(-1);
+            }
+            self.markdown_top = 0;
+        }
     }
     pub fn mark_line(&self, view: &Workspace) -> Option<u64> {
         if !self.submitted.is_some_and(|(key, _, _)| Some(key) == source(view)) {
@@ -517,6 +610,9 @@ impl Host {
             .editor()
             .is_some_and(|e| e.document().buffer().len() > kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64);
         let markdown_top = if self.large_markdown { view.top() } else { 0 };
+        if self.large_markdown && self.model_top != Some(markdown_top) && self.scroll_anchor != Some(markdown_top) {
+            self.markdown_top = 0;
+        }
         if let Some(worker) = &self.markdown {
             while let Ok((key, top, result)) = worker.receive.try_recv() {
                 self.in_flight = false;
@@ -650,6 +746,7 @@ impl Host {
             if self.rendered_width != preview.width as usize {
                 self.rendered.clear();
                 self.rendered_top = 0;
+                self.block_scroll = None;
                 if let Some(model) = &self.model {
                     let top = self.model_top.unwrap_or(0) as usize;
                     for block in &model.blocks {
@@ -661,6 +758,13 @@ impl Host {
                         if self.large_markdown && block.source_lines.contains(&top) {
                             self.rendered_top = lines.len().saturating_mul(top - block.source_lines.start)
                                 / block.source_lines.len().max(1);
+                        }
+                        if self.large_markdown && self.block_scroll.is_none() {
+                            self.block_scroll = Some((
+                                lines.len().saturating_sub(self.rendered_top),
+                                block.source_lines.end as u64,
+                                block.source_bytes.end as u64,
+                            ));
                         }
                         self.rendered.extend(lines);
                     }
@@ -675,7 +779,11 @@ impl Host {
             } else {
                 self.rendered
                     .iter()
-                    .skip(if self.large_markdown { self.rendered_top } else { self.markdown_top })
+                    .skip(if self.large_markdown {
+                        self.rendered_top.saturating_add(self.markdown_top)
+                    } else {
+                        self.markdown_top
+                    })
                     .take(preview.height as usize)
                     .cloned()
                     .collect()
@@ -1076,7 +1184,8 @@ mod tests {
             &mut view,
             &event::MouseEvent { kind: MouseEventKind::ScrollDown, column: 80, row: 5, modifiers: KeyModifiers::NONE },
         );
-        assert_eq!(view.top(), 48_001);
+        assert_eq!(view.top(), 48_000, "scroll within a block retains its editor anchor");
+        assert_eq!(host.markdown_top, 1);
         stop(&mut host);
     }
     #[test]

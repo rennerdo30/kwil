@@ -503,7 +503,7 @@ impl App {
     fn wrap_body_owner(&self) -> BodyOwner {
         if self.view.hex_active() || self.binary_blocks_paint() {
             BodyOwner::Raw
-        } else if self.markdown_mode() == markdown_ui::Mode::Preview {
+        } else if self.markdown_mode() == markdown_ui::Mode::Preview && !self.large_markdown_preview() {
             BodyOwner::MarkdownPreview
         } else if self.logs.owns_body() {
             BodyOwner::LogProjection

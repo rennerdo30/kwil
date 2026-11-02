@@ -586,7 +586,7 @@ fn run_workspace_with_terminal_init(
                             )
                         } else if let Some(host) = palette.as_mut().filter(|host| host.model().is_open()) {
                             palette_ui::key(view, host, k, &mut keys, started.elapsed(), settings.keymap)
-                        } else if content.key(view, k) {
+                        } else if content.prepared_key(view, k, wrap.as_mut()) || content.key(view, k) {
                             KeyResult::Changed(true)
                         } else if content.captures_body(view) {
                             content_ui::chrome_key(view, k, &mut keys, started.elapsed(), settings.keymap)
@@ -909,7 +909,9 @@ fn run_workspace_with_terminal_init(
                             ))
                             && view.file_prompt().is_none() =>
                     {
-                        tabs::mouse(view, &m, size.width, size.height, settings.tabs.layout) || content.mouse(view, &m)
+                        tabs::mouse(view, &m, size.width, size.height, settings.tabs.layout)
+                            || content.prepared_mouse(view, &m, wrap.as_mut())
+                            || content.mouse(view, &m)
                     }
                     Msg::Input(Event::Mouse(m)) if view.compare.open => {
                         let size = terminal.size()?;

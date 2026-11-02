@@ -28,6 +28,15 @@ normalizes line endings and removes indentation/fences).
 
 ## Section parsing after an edit
 
+Production GUI/TUI preview uses `paged::Pager` for sources above 256 KiB. It
+streams a worker-owned snapshot into a private disk index, then reads at most
+64 KiB near a requested source-line anchor. The index and source never become
+a document-sized in-memory model. Fences, loose lists, indented code and HTML
+stay together at blank boundaries; oversized indivisible blocks use labelled
+source fragments. Reference definitions have a separate 32 KiB allowance.
+Frontends estimate block heights and refine them during layout, retaining only
+the current page. The whole-string APIs below retain their original admission.
+
 Run this on a worker over an immutable UTF-8 snapshot, never the typing path:
 
 1. Before the edit, call `block_boundaries(old_document, old_changed_lines)`.

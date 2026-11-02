@@ -177,6 +177,8 @@ pub(super) struct Host {
     scroll: usize,
     large: bool,
     heights: std::collections::HashMap<usize, usize>,
+    block_scroll: Option<(usize, u64, u64)>,
+    source_bytes: u64,
     #[cfg(feature = "frame-harness")]
     probe_target: Option<u64>,
     // Last: source/path owners must be destroyed before fixed metadata credit.
@@ -630,6 +632,9 @@ impl App {
     pub(super) fn markdown_mode(&self) -> Mode {
         self.markdown.mode(self.view.active_id())
     }
+    pub(super) fn large_markdown_preview(&self) -> bool {
+        self.markdown.large && self.markdown_mode() == Mode::Preview
+    }
     pub(super) fn dispatch_markdown(&mut self, command: &str) -> bool {
         let mode = match mode_action(command, self.markdown_mode(), self.markdown_source_eligible()) {
             ModeAction::Unhandled => return false,
@@ -672,6 +677,7 @@ impl App {
         };
         self.markdown.large =
             editor.document().buffer().len() > kwil_core_markdown::bounded::PREVIEW_SOURCE_BYTES as u64;
+        self.markdown.source_bytes = editor.document().buffer().len();
         let key = Key {
             document: self.view.active_id(),
             revision: editor.document().revision(),
@@ -780,10 +786,7 @@ impl App {
     }
     pub(super) fn markdown_scroll_key(&mut self, delta: i64) {
         if self.markdown.large {
-            if !self.wrap_scroll_rows(delta, 0) {
-                self.view.scroll(delta);
-            }
-            self.markdown.scroll = 0;
+            self.scroll_large_markdown(delta);
         } else {
             self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
         }
@@ -794,15 +797,37 @@ impl App {
             return false;
         }
         if self.markdown.large {
-            if !self.wrap_scroll_rows(delta, 0) {
-                self.view.scroll(delta);
-            }
-            self.markdown.scroll = 0;
+            self.scroll_large_markdown(delta);
         } else {
             self.markdown.scroll = self.markdown.scroll.saturating_add_signed(delta as isize).min(1_048_576);
         }
         self.apply(Damage { full: true, ..Default::default() });
         true
+    }
+    fn scroll_large_markdown(&mut self, delta: i64) {
+        let offset = self.markdown.scroll.saturating_add_signed(delta as isize);
+        if (delta < 0 && delta.unsigned_abs() as usize <= self.markdown.scroll)
+            || (delta >= 0 && self.markdown.block_scroll.is_some_and(|b| offset < b.0))
+        {
+            self.markdown.scroll = offset;
+        } else if delta > 0
+            && let Some((height, line, byte)) = self.markdown.block_scroll
+        {
+            let old = self.view.top();
+            if self.wrap_owns_text() {
+                let _ =
+                    self.wrap_fill(kwil_view_model::visual_rows::TopAnchor { source_byte: byte, ..Default::default() });
+                self.markdown.scroll = offset.saturating_sub(height);
+            } else {
+                self.view.scroll(line.saturating_sub(old) as i64);
+                self.markdown.scroll = if old == self.view.top() { offset } else { offset.saturating_sub(height) };
+            }
+        } else {
+            if !self.wrap_scroll_rows(-1, 0) {
+                self.view.scroll(-1);
+            }
+            self.markdown.scroll = 0;
+        }
     }
 }
 pub(super) fn preview_area(app: &App) -> Option<Rect> {
@@ -1270,7 +1295,7 @@ pub(super) fn draw(
         right: pane.x + pane.w.saturating_sub(pad),
         origin: pane.y + pad,
         line: 0,
-        skip: if host.large { 0 } else { host.scroll },
+        skip: host.scroll,
         height: ui.dip(25.0).max(1),
         step: 1,
         heading: false,
@@ -1295,6 +1320,7 @@ pub(super) fn draw(
         flow.skip = 0;
         flow.text(host.notice().unwrap(), &Default::default(), false);
     } else if let Some(model) = &host.model {
+        host.block_scroll = None;
         let anchor = if host.large || mode == Mode::Split { top as usize } else { 0 };
         for (index, block) in model.blocks.iter().enumerate() {
             if block.source_lines.end <= anchor {
@@ -1318,8 +1344,19 @@ pub(super) fn draw(
                     .get(&block.source_bytes.start)
                     .copied()
                     .unwrap_or_else(|| kwil_core_markdown::paged::estimated_rows(block, columns));
-                flow.skip =
+                let intra =
                     estimate.saturating_mul(anchor - block.source_lines.start) / block.source_lines.len().max(1);
+                flow.skip = host.scroll.saturating_add(intra);
+                host.block_scroll = Some((
+                    estimate.saturating_sub(intra),
+                    block.source_lines.end as u64,
+                    block.source_bytes.end as u64,
+                ));
+            } else if host.large && host.block_scroll.is_none() {
+                let estimate = host.heights.get(&block.source_bytes.start).copied().unwrap_or_else(|| {
+                    kwil_core_markdown::paged::estimated_rows(block, (flow.right - flow.left) / flow.unit.max(1))
+                });
+                host.block_scroll = Some((estimate, block.source_lines.end as u64, block.source_bytes.end as u64));
             }
             flow.heading = matches!(block.kind, BlockKind::Heading(1 | 2));
             flow.step = if flow.heading { 2 } else { 1 };
@@ -1441,9 +1478,14 @@ pub(super) fn draw(
                     host.heights.clear();
                 }
                 host.heights.insert(block.source_bytes.start, flow.line.saturating_sub(begin));
+                if begin == 0
+                    && let Some(first) = &mut host.block_scroll
+                {
+                    first.0 = flow.line;
+                }
             }
         }
-        if !host.large && !flow.done() {
+        if (!host.large || model.source_bytes.end as u64 == host.source_bytes) && !flow.done() {
             let visible = pane.h.saturating_sub(pad) / flow.height;
             let last = flow.line.saturating_sub(visible.saturating_sub(1));
             if host.scroll > last {
