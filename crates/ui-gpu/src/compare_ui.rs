@@ -129,7 +129,7 @@ pub(super) fn draw(
                 font,
                 gutter,
                 y,
-                format!("… {} unchanged lines (click or Enter to expand)", row.hidden).as_bytes(),
+                row.collapsed_label().as_bytes(),
                 width.saturating_sub(gutter) / font.cw,
                 gutter_fg(),
                 bg(),

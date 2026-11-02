@@ -47,6 +47,15 @@ pub struct Row {
     pub words: [Vec<Range<usize>>; 2],
     pub hidden: usize,
 }
+impl Row {
+    pub fn collapsed_label(&self) -> String {
+        format!(
+            "… {} unchanged {} (click or Enter to expand)",
+            self.hidden,
+            if self.hidden == 1 { "line" } else { "lines" }
+        )
+    }
+}
 enum Request {
     Start(Snapshot, PathBuf, CompareSettings),
     Action(Action),
@@ -415,9 +424,10 @@ impl Session {
         match &self.page {
             None => "Comparing…  Esc closes".into(),
             Some(p) => format!(
-                "Buffer | {} | {} changes | whitespace: {} | unchanged: {} | F7 / Shift+F7  Esc closes",
+                "Buffer | {} | {} {} | whitespace: {} | unchanged: {} | F7 / Shift+F7  Esc closes",
                 p.right_title,
                 p.changes,
+                if p.changes == 1 { "change" } else { "changes" },
                 if p.ignore_whitespace { "ignored" } else { "exact" },
                 if p.collapsed { "collapsed" } else { "shown" }
             ),
@@ -510,6 +520,27 @@ mod tests {
         let mut view = Workspace::new(View::new(None)).unwrap();
         view.execute("edit.insert", &CommandArgs { text: Some(text.into()), ..Default::default() }, 1).unwrap();
         view
+    }
+    #[test]
+    fn compare_header_pluralizes_change_count() {
+        let mut session = Session::default();
+        for (changes, expected) in [(0, "0 changes"), (1, "1 change"), (2, "2 changes")] {
+            session.page = Some(Page {
+                rows: Vec::new(),
+                top: 0,
+                total: 0,
+                changes,
+                ignore_whitespace: false,
+                collapsed: true,
+                right_title: "saved.txt".into(),
+            });
+            assert_eq!(
+                session.header(),
+                format!(
+                    "Buffer | saved.txt | {expected} | whitespace: exact | unchanged: collapsed | F7 / Shift+F7  Esc closes"
+                )
+            );
+        }
     }
     #[test]
     fn compare_defaults_collapse_with_context_and_navigation_stays_on_changes() {
