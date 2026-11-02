@@ -48,3 +48,25 @@ Signature verification is not implemented. Checksums detect mismatched bytes
 but do not authenticate the publisher independently of GitHub. Signing and a
 published-release end-to-end update remain release qualification gaps. Unit
 tests and mocked release discovery do not establish native updater acceptance.
+
+## Manually verify release provenance
+
+Releases built with the provenance-enabled release workflow attest every asset,
+including the raw updater binaries, packages, notices and `SHA256SUMS`. Before
+installing a manually downloaded asset, use an authenticated GitHub CLI:
+
+```sh
+gh attestation verify ./kwil-x86_64-pc-windows-msvc.exe --repo rennerdo30/kwil --signer-workflow rennerdo30/kwil/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
+```
+
+Substitute your downloaded filename and exact release version, including its
+beta suffix if present. Verify packages before extraction and each Windows
+entry point if downloading the pair directly. Require a successful exit before
+using the asset; older releases may not have attestations.
+
+This verifies the bytes against this repository's release workflow and tag.
+See [release verification](RELEASING.md#verify-a-downloaded-asset) and the
+[GitHub CLI verification reference](https://cli.github.com/manual/gh_attestation_verify).
+The built-in updater does not perform this attestation check. This manual check
+does not add Windows code signing, Apple notarization or independent update
+signatures.
