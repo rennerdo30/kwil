@@ -50,6 +50,9 @@ select betas.
 - **Format Document / Format Selection:** formatting works right after a
   search, and Format Selection keeps the whitespace and line break the
   selection ended with, so the lines around it stay as they were.
+- **Hot exit fix:** after Kwil restores unsaved tabs, new edits are saved to
+  the recovery journal again and "Recovery pending" clears within seconds;
+  before, an idle restored window could keep them unconfirmed.
 - **Faster start on macOS:** fonts are prepared while the window is created;
   time to file content on the CI runner fell from about 207 to 138 ms (warm
   file) and from 188 to 153 ms (1 GiB file).
