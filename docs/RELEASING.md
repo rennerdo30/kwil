@@ -25,8 +25,70 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
    It generates GitHub build provenance attestations for every staged release asset,
    including `THIRD-PARTY-NOTICES.txt` and `SHA256SUMS`, then creates a **draft**
    GitHub Release with those files. Attestation failure prevents draft creation.
-4. The owner reviews the draft and publishes it.
-5. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once.
+4. Message the Mac coordinator (`Dominics-MacBook-Pro.local/claude-Development`)
+   with the draft tag and request signing using the owner's Mac recipe. Signing
+   and notarization run **only on the owner's Mac**, never in CI. No Apple keys
+   or notary credentials belong in GitHub secrets.
+5. The Mac coordinator runs the following from a checkout containing this script
+   (authenticated `gh`, Xcode command-line tools and Python 3 are required):
+
+   ```sh
+   tag=vX.Y.Z
+   bash scripts/macos-sign.sh "$tag" "$HOME/kwil-signed/$tag"
+   gh release upload "$tag" "$HOME/kwil-signed/$tag/"* --repo rennerdo30/kwil --clobber
+   ```
+
+   The script downloads and checks all four original macOS assets against the
+   draft's `SHA256SUMS` before modifying anything. It signs without entitlements,
+   verifies the signature, submits one ditto zip per architecture and requires
+   both notarizations to be `Accepted`. It rebuilds the existing tar.gz layout
+   with the signed executable at mode 755, retaining the licence and notices.
+   It writes only the four signed assets and prints their SHA-256 hashes; it
+   never uploads. Use a fresh output directory for each attempt. Defaults are
+   `KWIL_MACOS_SIGN_IDENTITY='Developer ID Application: Dominic Renner (73L5ZHST4Q)'`
+   and `KWIL_MACOS_NOTARY_PROFILE=renner-notary`; these environment variables can
+   override the Mac's identity/profile, but CI still requires team `73L5ZHST4Q`.
+   A failed submission prints the `xcrun notarytool log` command for diagnosis.
+6. After uploading all four replacements, dispatch **Verify signed macOS release**
+   (`.github/workflows/release-macos-signed.yml`) from `main` with input `tag`:
+
+   ```sh
+   gh workflow run release-macos-signed.yml --ref main --repo rennerdo30/kwil -f tag="$tag"
+   ```
+
+   Wait for success on this tag. It checks the downloaded replacements, rebuilds
+   `SHA256SUMS` over the same asset set and in the same format as `release.yml`,
+   attests the four signed assets and new checksums, and replaces `SHA256SUMS`.
+   It refuses published releases. Keep the draft unchanged throughout signing
+   and verification; if any asset changes afterwards, run verification again.
+7. The owner reviews the draft and successful verification run, then publishes
+   it (or explicitly authorizes the coordinator to publish it).
+8. Copies without `kwil.no-update` find the new version through auto-update (`crates/update`): they check once a day after start-up, verify the SHA-256 and swap the binary for the next start. `kwil --update` checks at once.
+
+### What macOS verification proves
+
+The dispatch workflow checks **each bare executable and each tar.gz executable**:
+
+- `codesign --verify --strict` checks signature integrity. Signature metadata
+  must name team `73L5ZHST4Q`, a `Developer ID Application` authority and the
+  hardened runtime flag. `codesign -d --entitlements -` must contain no
+  entitlements, including `com.apple.security.get-task-allow`.
+- `codesign --verify --strict -R=notarized --check-notarization` checks the
+  notarization ticket online. This is [Apple DTS's assessment for other code](https://developer.apple.com/forums/thread/130560),
+  including a bare executable. `spctl -t install` assesses installer packages;
+  `syspolicy_check distribution` assesses app bundles. Neither matches our assets.
+- `lipo -archs` checks the exact target architecture. `--version` must print
+  `kwil X.Y.Z` matching the tag; Intel execution uses the macOS runner's Rosetta.
+  The archived executable must have mode 755 and match the bare asset byte for byte.
+
+These command-line checks do not replace testing a quarantined download on a
+fresh Mac. Bare binaries **cannot be stapled**: Gatekeeper needs an online
+first-launch check. Stapled `.app`/`.dmg` distribution remains follow-up KW-31.
+
+Source inspection: `release.yml` uses plain `cargo build --release`; the Cargo
+configuration and build scripts supply no macOS entitlement file, signing step
+or `get-task-allow` linker option. The signing script supplies no entitlements
+and checks the resulting signature; the dispatch checks the actual shipped bytes.
 
 Before any prerelease build, `docs/BETA_RELEASE_NOTES.md` must start with
 `# Kwil X.Y.Z`, using the exact tagged version without its leading `v`
@@ -54,15 +116,31 @@ keep its original bytes, and run (replace `X.Y.Z` with that release's version):
 gh attestation verify ./kwil-x86_64-pc-windows-msvc.exe --repo rennerdo30/kwil --signer-workflow rennerdo30/kwil/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
 ```
 
-Replace the path with any other release asset, including an installer, archive,
-the Windows `.com`, `THIRD-PARTY-NOTICES.txt` or `SHA256SUMS`. Verify an archive
+Replace the path with any unchanged release asset, including an installer, archive,
+the Windows `.com` or `THIRD-PARTY-NOTICES.txt`. Verify an archive
 before extracting it. A successful exit verifies that the downloaded bytes match
 an attestation from this repository's release workflow for the selected tag.
 Stop if verification fails; older releases may have no attestation.
 
+For signed macOS replacements and the regenerated `SHA256SUMS`, the original
+`release.yml` attestations cover the **unsigned bytes** (and old checksums).
+They do not cover the replacements. The dispatch workflow creates fresh build
+provenance attestations for the signed bytes it verified, not a rebuild or proof
+that the Mac's signing operation ran in CI. Verify these using the dispatch
+workflow and its source ref (normally `refs/heads/main`), for example:
+
+```sh
+gh attestation verify ./kwil-aarch64-apple-darwin --repo rennerdo30/kwil --signer-workflow rennerdo30/kwil/.github/workflows/release-macos-signed.yml --source-ref refs/heads/main
+```
+
+The dispatch run checks the requested tag's version; its provenance source ref
+names the workflow invocation, not the release tag. Check that run's `tag` input
+when auditing a particular release.
+
 Attestations are stored by GitHub and need no owner signing key. They establish
-GitHub workflow provenance; Windows Authenticode, Apple notarization and the
-updater's independent signature verification remain separate work. The built-in
+GitHub workflow provenance; Apple signing/notarization is the separate Mac step
+above. Windows Authenticode and the updater's independent signature verification
+remain separate work. The built-in
 updater currently checks `SHA256SUMS`, without running this manual command.
 
 ## Asset contract (do not change without updating `crates/update`)
@@ -79,7 +157,7 @@ updater currently checks `SHA256SUMS`, without running this manual command.
 
 ## Not yet in place
 
-- Code signing (Windows Authenticode, macOS notarization) and an update signature (for example minisign). Each needs keys from the owner (KW-4, KW-5).
+- Windows Authenticode and an update signature (for example minisign). Each needs keys from the owner (KW-4, KW-5).
 - Packages beyond the Windows setup and archives: winget, dmg/Homebrew and AppImage/Flatpak (KW-31).
 
 ## Windows development build
