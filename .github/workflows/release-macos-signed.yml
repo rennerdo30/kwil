@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Draft release tag whose four macOS assets have been replaced
+        description: Draft release tag whose six macOS assets have been replaced
         required: true
         type: string
 
@@ -82,6 +82,12 @@ jobs:
             [[ $(stat -f '%Lp' "$packaged") == 755 ]]
             verify "$packaged" "$arch"
             cmp "$bare" "$packaged"
+            mkdir -p "unpacked-zip/$platform"
+            ditto -x -k "dist/$name.zip" "unpacked-zip/$platform"
+            packaged=unpacked-zip/$platform/$name/kwil
+            [[ $(stat -f '%Lp' "$packaged") == 755 ]]
+            verify "$packaged" "$arch"
+            cmp "$bare" "$packaged"
           done
       - name: Regenerate the updater checksums
         working-directory: dist
@@ -97,6 +103,7 @@ jobs:
             dist/kwil-aarch64-apple-darwin
             dist/kwil-x86_64-apple-darwin
             dist/kwil-*-macos-*.tar.gz
+            dist/kwil-*-macos-*.zip
             dist/SHA256SUMS
       - name: Replace checksums only while the release is still a draft
         run: |

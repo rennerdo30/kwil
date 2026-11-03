@@ -7,8 +7,8 @@ Every GitHub Release (https://github.com/rennerdo30/kwil/releases) offers:
 | Platform | For people | Bare binaries (used by the updater) |
 | --- | --- | --- |
 | Windows x64 / ARM64 | `kwil-<version>-windows-<arch>-setup.exe`, `kwil-<version>-windows-<arch>.zip` | `kwil-<target>.exe`, `kwil-<target>.com` |
-| macOS Apple silicon / Intel | `kwil-<version>-macos-<arch>.tar.gz` | `kwil-<target>` |
-| Linux x64 / ARM64 | `kwil-<version>-linux-<arch>.tar.gz` | `kwil-<target>` |
+| macOS Apple silicon / Intel | `kwil-<version>-macos-<arch>.tar.gz`, `kwil-<version>-macos-<arch>.zip` | `kwil-<target>` |
+| Linux x64 / ARM64 | `kwil-<version>-linux-<arch>.tar.gz`, `kwil-<version>-linux-<arch>.zip` | `kwil-<target>` |
 
 Each archive and the installer contain `LICENSE.txt` and
 `THIRD-PARTY-NOTICES.txt` (the licenses of all bundled Rust crates and syntax

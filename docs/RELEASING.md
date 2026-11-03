@@ -19,7 +19,7 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 
    It generates `THIRD-PARTY-NOTICES.txt` with cargo-about (`about.toml`; an unaccepted dependency license fails the release), embeds it in the About page, and packages:
    - Windows: the NSIS setup and a zip per architecture (`scripts/package-windows.ps1`); the x64 setup is installed, run and uninstalled on the runner first;
-   - macOS and Linux: a tar.gz per target;
+   - macOS and Linux: a tar.gz and zip per target;
    - the bare binaries for the updater (`kwil-<target>` on Unix; `kwil-<target>.exe` and `kwil-<target>.com` on Windows).
 
    It generates GitHub build provenance attestations for every staged release asset,
@@ -38,18 +38,22 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
    gh release upload "$tag" "$HOME/kwil-signed/$tag/"* --repo rennerdo30/kwil --clobber
    ```
 
-   The script downloads and checks all four original macOS assets against the
+   The script downloads and checks all six original macOS assets against the
    draft's `SHA256SUMS` before modifying anything. It signs without entitlements,
    verifies the signature, submits one ditto zip per architecture and requires
-   both notarizations to be `Accepted`. It rebuilds the existing tar.gz layout
-   with the signed executable at mode 755, retaining the licence and notices.
-   It writes only the four signed assets and prints their SHA-256 hashes; it
+   both notarizations to be `Accepted`. It checks both archive layouts and that
+   their executables match the bare binary. It rebuilds tar.gz and zip with the
+   signed executable at mode 755, retaining the licence and notices. The release
+   zip uses `zip -X -r` to store Unix modes without resource forks or `__MACOSX`
+   sidecars; the binary-only ditto zip submitted to Apple stays separate.
+   It writes only the six signed assets and prints their SHA-256 hashes; it
    never uploads. Use a fresh output directory for each attempt. Defaults are
    `KWIL_MACOS_SIGN_IDENTITY='Developer ID Application: Dominic Renner (73L5ZHST4Q)'`
    and `KWIL_MACOS_NOTARY_PROFILE=renner-notary`; these environment variables can
    override the Mac's identity/profile, but CI still requires team `73L5ZHST4Q`.
    A failed submission prints the `xcrun notarytool log` command for diagnosis.
-6. After uploading all four replacements, dispatch **Verify signed macOS release**
+6. After uploading all six replacements (two bare binaries, two tar.gz files and
+   two zips), dispatch **Verify signed macOS release**
    (`.github/workflows/release-macos-signed.yml`) from `main` with input `tag`:
 
    ```sh
@@ -58,7 +62,7 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 
    Wait for success on this tag. It checks the downloaded replacements, rebuilds
    `SHA256SUMS` over the same asset set and in the same format as `release.yml`,
-   attests the four signed assets and new checksums, and replaces `SHA256SUMS`.
+   attests the six signed assets and new checksums, and replaces `SHA256SUMS`.
    It refuses published releases. Keep the draft unchanged throughout signing
    and verification; if any asset changes afterwards, run verification again.
 7. The owner reviews the draft and successful verification run, then publishes
@@ -67,7 +71,7 @@ Every publication needs the owner's yes. Agents prepare releases; only the owner
 
 ### What macOS verification proves
 
-The dispatch workflow checks **each bare executable and each tar.gz executable**:
+The dispatch workflow checks **each bare executable and each tar.gz and zip executable**:
 
 - `codesign --verify --strict` checks signature integrity. Signature metadata
   must name team `73L5ZHST4Q`, a `Developer ID Application` authority and the
@@ -146,6 +150,15 @@ updater currently checks `SHA256SUMS`, without running this manual command.
 ## Asset contract (do not change without updating `crates/update`)
 
 - Unix: one raw executable per target, named `kwil-<target triple>`.
+- macOS archives: `kwil-<version>-macos-arm64.{tar.gz,zip}` and
+  `kwil-<version>-macos-x64.{tar.gz,zip}`.
+- Linux archives: `kwil-<version>-linux-x64.{tar.gz,zip}` and
+  `kwil-<version>-linux-arm64.{tar.gz,zip}`.
+- Every Unix archive has a top folder `kwil-<version>-<platform>/` containing
+  `kwil` (mode 755, stored in the zip's Unix attributes), `LICENSE.txt` and
+  `THIRD-PARTY-NOTICES.txt`. The top folder matches the Windows zip convention.
+  The renner.dev launcher uses the zips. The `kwil-*` checksum glob and `dist/*`
+  attestation glob cover all four additional zips automatically.
 - Windows: two regular PE executables from the shared application library: `kwil-<target>.exe` (Windows subsystem) and `kwil-<target>.com` (console subsystem).
 - Install the Windows pair together as `kwil.exe` and `kwil.com` in the same folder. Explorer, shortcuts and Open with use `.exe`; shells resolve `.com` first with the standard `.COM;.EXE` PATHEXT order. Custom PATHEXT order is respected; use `kwil.com` explicitly if necessary.
 - The console entry point runs terminal work itself. For a GUI it forwards arguments unchanged to `kwil.exe`, waits for its first-frame acknowledgement, then returns. Before acknowledging readiness, the GUI detaches from the shell console and releases standard handles. Startup diagnostics use launcher-owned pipes, so redirected shell streams reach EOF when the launcher exits. Startup failure is handled while it still owns the terminal; CLI and TUI paths keep their console.

@@ -51,7 +51,7 @@ or ARM64:
 - **Windows:** run `kwil-<version>-windows-<arch>-setup.exe` (per user, no admin
   rights; Start menu entry and uninstaller), or extract the `.zip` and keep
   `kwil.exe` and `kwil.com` together.
-- **macOS / Linux:** extract `kwil-<version>-<platform>.tar.gz`.
+- **macOS / Linux:** extract `kwil-<version>-<platform>.tar.gz` or `.zip`.
 
 Packages arrive from beta.3 on; beta.2 ships bare executables (rename the
 Windows pair to `kwil.exe` and `kwil.com`). Then:
