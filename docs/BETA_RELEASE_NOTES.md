@@ -32,6 +32,7 @@ select betas.
 
 ## Unreleased
 
+- macOS and Linux zip archives
 - **macOS release process:** the next candidate can be signed and notarized on
   the owner's Mac, then verified before publication. Bare executables are not
   stapled and need an online first-launch check. This does not change beta.8's

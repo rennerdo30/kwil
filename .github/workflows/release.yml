@@ -4,7 +4,7 @@ name: Release
 # Only the owner publishes it (docs/RELEASING.md); once published, installed
 # copies pick it up through auto-update (crates/update).
 #
-# Assets: Windows setup + zip, macOS/Linux tar.gz (for people), the bare
+# Assets: Windows setup + zip, macOS/Linux tar.gz + zip (people/launcher), the bare
 # kwil-<target>[.exe|.com] binaries (for the updater; keep these names),
 # THIRD-PARTY-NOTICES.txt and SHA256SUMS over all of them.
 
@@ -155,6 +155,9 @@ jobs:
           cp LICENSE "pkg/$name/LICENSE.txt"
           cp notices/THIRD-PARTY-NOTICES.txt "pkg/$name/"
           tar -C pkg -czf "dist/$name.tar.gz" "$name"
+          (cd pkg && zip -X -r "../dist/$name.zip" "$name")
+          # Require the executable's Unix mode in the archive, not just on disk.
+          zipinfo -l "dist/$name.zip" "$name/kwil" | grep -E '^-rwxr-xr-x[[:space:]]'
       - uses: actions/upload-artifact@v7
         with:
           name: kwil-${{ matrix.target }}
