@@ -32,6 +32,10 @@ select betas.
 
 ## Unreleased
 
+- **macOS release process:** the next candidate can be signed and notarized on
+  the owner's Mac, then verified before publication. Bare executables are not
+  stapled and need an online first-launch check. This does not change beta.8's
+  already published unsigned assets.
 - **Replace in files:** use Matches or Alt+Enter on a selected preview file to
   inspect and exclude individual matches. Alt+Enter returns to the file list.
   Apply and cancellation report file counts, exclusions and failures.

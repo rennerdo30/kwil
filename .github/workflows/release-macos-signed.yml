@@ -1,0 +1,104 @@
+name: Verify signed macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag whose four macOS assets have been replaced
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-signed-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      KWIL_NO_UPDATE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download assets from the draft only
+        run: |
+          set -euo pipefail
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          [[ $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft) == true ]]
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+      - name: Verify both bare and archived executables
+        run: |
+          set -euo pipefail
+          verify() {
+            local binary=$1 expected_arch=$2 details
+            codesign --verify --strict --verbose=2 "$binary"
+            details=$(codesign -d --verbose=4 "$binary" 2>&1)
+            printf '%s\n' "$details"
+            grep -qx 'TeamIdentifier=73L5ZHST4Q' <<< "$details"
+            grep -q '^Authority=Developer ID Application:' <<< "$details"
+            grep -Eq '^CodeDirectory .*flags=.*\([^)]*runtime[^)]*\)' <<< "$details"
+            codesign -d --entitlements - "$binary" > entitlements.plist
+            python3 - <<'PY'
+          import pathlib
+          import plistlib
+          import sys
+
+          data = pathlib.Path("entitlements.plist").read_bytes()
+          if data.strip() and plistlib.loads(data):
+              sys.exit("Expected no entitlements, including get-task-allow")
+          PY
+            # Apple's assessment for non-app code; looks up the notarization online.
+            codesign --verify --strict --verbose=4 -R=notarized --check-notarization "$binary"
+            [[ $(lipo -archs "$binary") == "$expected_arch" ]]
+            [[ -x $binary ]]
+            # macos-latest is Apple silicon; Intel runs through runner-provided Rosetta.
+            [[ $(arch -"$expected_arch" "$binary" --version) == "kwil ${TAG#v}" ]]
+          }
+          for pair in aarch64-apple-darwin:arm64 x86_64-apple-darwin:x86_64; do
+            target=${pair%:*}
+            arch=${pair#*:}
+            platform=$arch
+            [[ $arch != x86_64 ]] || platform=x64
+            name=kwil-${TAG#v}-macos-$platform
+            bare=dist/kwil-$target
+            # gh downloads bare assets without their executable permission.
+            chmod 755 "$bare"
+            verify "$bare" "$arch"
+            mkdir -p "unpacked/$platform"
+            tar -xzf "dist/$name.tar.gz" -C "unpacked/$platform"
+            packaged=unpacked/$platform/$name/kwil
+            [[ $(stat -f '%Lp' "$packaged") == 755 ]]
+            verify "$packaged" "$arch"
+            cmp "$bare" "$packaged"
+          done
+      - name: Regenerate the updater checksums
+        working-directory: dist
+        run: |
+          # Same file set, glob order and two-space format as release.yml.
+          rm -f rust.txt
+          shasum -a 256 kwil-* THIRD-PARTY-NOTICES.txt > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attest the signed assets and replacement checksums
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: |
+            dist/kwil-aarch64-apple-darwin
+            dist/kwil-x86_64-apple-darwin
+            dist/kwil-*-macos-*.tar.gz
+            dist/SHA256SUMS
+      - name: Replace checksums only while the release is still a draft
+        run: |
+          [[ $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft) == true ]]
+          gh release upload "$TAG" dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
