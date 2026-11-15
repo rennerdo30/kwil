@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 kwil-core-runtime = { path = "../core-runtime" }
 globset = "0.4.20"
-tree-sitter = "=0.27.1"
+tree-sitter = "=0.27.2"
 arborium-c = { version = "=2.18.2", optional = true, default-features = false }
 arborium-cpp = { version = "=2.18.2", optional = true, default-features = false }
 arborium-c-sharp = { version = "=2.18.2", optional = true, default-features = false }
