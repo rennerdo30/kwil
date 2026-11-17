@@ -20,15 +20,21 @@ struct Scratch {
 }
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("kwil-kw90-{}-{tag}", std::process::id()));
+        // A Unix socket path is limited to about 104 bytes, and macOS temp directories are
+        // long: keep the socket's directory short.
+        #[cfg(unix)]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        let root = base.join(format!("kw90-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for dir in ["profile", "local", "workspace", "runtime"] {
+        for dir in ["profile", "local", "workspace"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         Self { root, namespace: format!("kwil-test-{}-{tag}", std::process::id()) }
     }
     fn endpoint(&self) -> InstanceEndpoint {
-        InstanceEndpoint { runtime_directory: self.root.join("runtime"), namespace: self.namespace.clone() }
+        InstanceEndpoint { runtime_directory: self.root.clone(), namespace: self.namespace.clone() }
     }
     fn file(&self) -> PathBuf {
         let path = self.root.join("COMMIT_EDITMSG");
@@ -43,7 +49,7 @@ impl Scratch {
             .env("KWIL_WORKSPACE_ROOT", self.root.join("workspace"))
             .env("APPDATA", self.root.join("profile"))
             .env("LOCALAPPDATA", self.root.join("local"))
-            .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
+            .env("XDG_RUNTIME_DIR", &self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -168,7 +174,7 @@ fn kw90_launcher_returns_with_its_own_code_when_the_editor_crashes() {
     helper
         .args(["kw90_helper_primary", "--exact", "--nocapture", "--test-threads=1"])
         .env("KW90_HELPER_NAMESPACE", &scratch.namespace)
-        .env("KW90_HELPER_RUNTIME", scratch.root.join("runtime"))
+        .env("KW90_HELPER_RUNTIME", &scratch.root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
