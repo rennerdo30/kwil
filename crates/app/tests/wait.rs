@@ -140,12 +140,30 @@ fn kw90_launcher_returns_with_success_when_the_editor_quits_normally() {
     let server = server(&scratch);
     let file = scratch.file();
     let mut launcher = scratch.launcher(&["--hidden", "--wait", file.to_str().unwrap()]);
-    server.requests.recv_timeout(LIMIT).unwrap();
+    let token = server.requests.recv_timeout(LIMIT).unwrap().wait.unwrap();
+    server.waits.shown(token); // the editor opened the file
     assert!(exit_within(&mut launcher, Duration::from_millis(500)).is_none());
     server.shutdown();
     assert!(server.waits.drain(LIMIT));
     let (status, stderr) = finished(&mut launcher);
     assert_eq!(status.code(), Some(0), "{stderr}");
+}
+
+#[test]
+fn kw93_launcher_fails_when_the_editor_quits_before_showing_the_file() {
+    // Git must not continue with a message the user never saw.
+    let scratch = Scratch::new("unseen");
+    let server = server(&scratch);
+    let file = scratch.file();
+    let mut launcher = scratch.launcher(&["--hidden", "--wait", file.to_str().unwrap()]);
+    server.requests.recv_timeout(LIMIT).unwrap();
+    // Let the server park the waiter first; a shutdown racing the park drops the
+    // connection instead, which the launcher reports as exit 3 (also not success).
+    assert!(exit_within(&mut launcher, Duration::from_millis(500)).is_none());
+    server.shutdown();
+    assert!(server.waits.drain(LIMIT));
+    let (status, stderr) = finished(&mut launcher);
+    assert_eq!(status.code(), Some(1), "{stderr}");
 }
 
 /// Runs only when the crash test starts it as its own child: a primary that accepts a
