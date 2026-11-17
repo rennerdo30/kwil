@@ -2569,7 +2569,9 @@ impl App {
                 chrome::Hover::CompareToggle(toggle) => Some(toggle),
                 _ => None,
             };
-            let force = p.full || chrome_changed || content_restored;
+            // Its own content key covers hover and page changes; only a full
+            // paint or an overlay restore wipes its pixels from outside.
+            let force = p.full || content_restored;
             let header = &mut self.compare_header;
             if let Some(area) = compare_ui::draw_header(
                 header,
