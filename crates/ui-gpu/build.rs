@@ -134,6 +134,9 @@ fn main() {
         ("Copy", "copy"),
         ("Paste", "paste"),
         ("Filter", "filter"),
+        ("Keyboard", "keyboard"),
+        ("Sliders", "sliders"),
+        ("SelectAll", "select-all"),
     ] {
         let path = dir.join(format!("{file}.svg"));
         println!("cargo:rerun-if-changed={}", path.display());

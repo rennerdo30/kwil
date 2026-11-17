@@ -224,9 +224,9 @@ pub(super) fn draw(
     let area = Rect { x: (size.0 - w) / 2, y: (size.1 - h) / 2, w, h };
     desktop::card(pixels, size.0, area, &c, &s);
     let inner = desktop::inset(area, s.pad);
-    let mut line = Rect { h: s.text, ..inner };
-    desktop::label(pixels, size.0, font, line, "This file appears to be binary", c.fg);
-    line.y += s.text;
+    let title = Rect { h: s.text + s.xs, ..inner };
+    desktop::label(pixels, size.0, font.title(), title, "This file appears to be binary", c.fg);
+    let mut line = Rect { y: title.y + title.h, h: s.text, ..inner };
     desktop::label(pixels, size.0, font, line, "Choose how to open it.", c.muted);
     line.y += s.text + s.gap;
     for (i, label) in ["Hex (H) — original bytes", "Text (T)", "Cancel (Esc)"].into_iter().enumerate() {

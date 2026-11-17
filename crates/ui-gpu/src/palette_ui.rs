@@ -3,6 +3,16 @@
 use super::*;
 use kwil_core_commands::palette::Palette;
 
+/// A palette query error in words for the status bar, not its enum name.
+pub(super) fn query_error(error: &kwil_core_commands::palette::QueryError) -> &'static str {
+    use kwil_core_commands::palette::QueryError;
+    match error {
+        QueryError::TooLong => "the text is too long",
+        QueryError::TooManyTabs => "too many tabs to list",
+        QueryError::Stopped => "stopped; open it again",
+    }
+}
+
 pub(super) fn palette_blocks_copy(open: bool, displayed: bool) -> bool {
     open || displayed
 }
@@ -94,7 +104,7 @@ impl App {
             }
         };
         if let Err(error) = result {
-            self.view.set_notice(format!("Go to Line: {error:?}"));
+            self.view.set_notice(format!("Go to Line: {}", query_error(&error)));
         }
         if !prompt.model.is_open() {
             self.goto = None;
@@ -174,7 +184,7 @@ impl App {
             let mut model = Palette::new(1);
             // Use the existing bounded parser; Line mode never submits work.
             if let Err(error) = model.open(":") {
-                let damage = self.view.set_notice(format!("Go to Line: {error:?}"));
+                let damage = self.view.set_notice(format!("Go to Line: {}", query_error(&error)));
                 self.apply(damage);
                 return true;
             }
@@ -210,8 +220,8 @@ impl App {
             .collect();
         let result =
             self.palette.as_mut().ok_or("Palette is starting; try again shortly".to_owned()).and_then(|palette| {
-                palette.set_tabs(tabs).map_err(|error| format!("Palette: {error:?}"))?;
-                palette.open(query).map_err(|error| format!("Palette: {error:?}"))
+                palette.set_tabs(tabs).map_err(|error| format!("Palette: {}", query_error(&error)))?;
+                palette.open(query).map_err(|error| format!("Palette: {}", query_error(&error)))
             });
         if let Err(error) = result {
             let damage = self.view.set_notice(error);
@@ -260,7 +270,7 @@ impl App {
             Ok(Some(action)) => self.palette_action(action),
             Ok(None) => {}
             Err(error) => {
-                let damage = self.view.set_notice(format!("Palette: {error:?}"));
+                let damage = self.view.set_notice(format!("Palette: {}", query_error(&error)));
                 self.apply(damage);
             }
         }
