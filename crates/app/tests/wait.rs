@@ -242,8 +242,9 @@ fn kw90_wait_without_a_file_or_without_an_editor_fails_with_a_clear_message() {
     assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("--wait needs at least one file"), "{stderr}");
     // No editor runs and none may be started: fail fast instead of waiting for nothing.
+    // `--gui` keeps a machine without a display (CI) from choosing the terminal UI.
     let file = scratch.file();
-    let mut no_editor = scratch.launcher(&["--hidden", "--wait", file.to_str().unwrap()]);
+    let mut no_editor = scratch.launcher(&["--hidden", "--gui", "--wait", file.to_str().unwrap()]);
     let (status, stderr) = finished(&mut no_editor);
     assert_eq!(status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("no running instance"), "{stderr}");
