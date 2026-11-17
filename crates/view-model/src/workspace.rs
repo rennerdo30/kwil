@@ -19,6 +19,14 @@ use workspace_hex::HexFlow;
 pub mod workspace_wrap;
 use workspace_wrap::WorkspaceWrapState;
 
+#[path = "workspace_wait.rs"]
+mod workspace_wait;
+use workspace_wait::WaitWatch;
+
+#[cfg(test)]
+#[path = "workspace_wait_tests.rs"]
+mod wait_tests;
+
 #[cfg(test)]
 #[path = "workspace_window_tests.rs"]
 mod window_session_tests;
@@ -322,6 +330,8 @@ pub struct Workspace {
     views: HashMap<DocumentId, View>,
     closed_views: HashMap<DocumentId, View>,
     files: FileFlow,
+    /// Launchers parked by `kwil --wait`, told when their tabs are gone.
+    waits: WaitWatch,
 }
 
 /// Constructor refusal retains the one incoming source in `input` before
@@ -395,6 +405,7 @@ impl Workspace {
             views: HashMap::new(),
             closed_views: HashMap::new(),
             files: FileFlow::default(),
+            waits: WaitWatch::default(),
         }
     }
 
@@ -407,6 +418,11 @@ impl Workspace {
             }
             Err(error) => ControlFlow::Break(WorkspaceInitRefusal { input, workspace: self, error }),
         }
+    }
+
+    /// Where `kwil --wait` launchers are told that their files are closed.
+    pub fn set_wait_sink(&mut self, sink: std::sync::Arc<kwil_core_workspace::instance::Waits>) {
+        self.waits.set_sink(sink);
     }
 
     pub fn session(&self) -> &Session {
@@ -1094,6 +1110,7 @@ impl Workspace {
             ));
         }
         self.files.metadata_durable = false;
+        self.waits.settle(&self.session);
         if self.files.history_wait == Some(id) {
             self.files.history_wait = None;
         }
@@ -1744,10 +1761,15 @@ impl Workspace {
     /// App-owned CLI/IPC parsing feeds already validated native paths here.
     pub fn open_files(&mut self, request: kwil_core_workspace::instance::OpenFiles) -> io::Result<()> {
         if request.files.len() > kwil_core_workspace::instance::MAX_OPEN_FILES {
+            if let Some(token) = request.wait {
+                self.waits.fail(token);
+            }
             return Err(io::Error::other("Too many open requests"));
         }
-        for file in request.files {
+        let mut tabs = Vec::with_capacity(request.files.len());
+        let opened = request.files.into_iter().try_for_each(|file| {
             let id = self.open_path(file.path)?;
+            tabs.push(id);
             if let Some(line) = file.line {
                 if self.hex_owns_document(id) {
                     return Err(io::Error::new(
@@ -1762,8 +1784,14 @@ impl Workspace {
                     1,
                 )?;
             }
+            Ok(())
+        });
+        match (request.wait, &opened) {
+            (Some(token), Ok(())) => self.waits.watch(token, tabs, &self.session),
+            (Some(token), Err(_)) => self.waits.fail(token),
+            (None, _) => {}
         }
-        Ok(())
+        opened
     }
 
     pub fn save_document(&mut self, id: DocumentId, path: Option<PathBuf>) -> io::Result<()> {
@@ -3416,6 +3444,7 @@ impl Workspace {
                 // proves its physical source retired on the worker. Removing
                 // its placeholder must not evict legitimate closed history.
                 assert!(self.session.cancel_open(id));
+                self.waits.settle(&self.session);
                 self.views.remove(&id);
                 self.files.failed_opens.remove(&id);
                 self.input_epoch = self.input_epoch.wrapping_add(1);

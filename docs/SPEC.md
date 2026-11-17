@@ -179,6 +179,8 @@ One binary. `kwil` starts the GUI when a desktop is available and the TUI when i
 
 Flags: `--tui` forces the terminal UI and `--gui` forces a window. The check costs well under 1 ms and runs before anything else.
 
+`--wait FILE…` (owner wish KW-90, "works from the command line better") makes Kwil usable as the editor Git and shells start (`git config core.editor "kwil --wait"`, `EDITOR`, `crontab -e`). It returns only when every file is closed: their tabs or Kwil itself. The launcher hands the files to the running instance and holds a connection open that the instance answers when the tabs are gone; with no instance running it starts one detached (the window outlives the command). Exit code 0 when closed, 1 when a file could not be opened, 3 when the instance died. It never saves: the normal close prompt decides. In the TUI the process is the editor, so it returns when you quit. `--wait` with no file is an error.
+
 ### Terminal UI
 
 `ratatui 0.30` + `crossterm 0.29`. It uses the same view model, commands, keymaps, search and diff. True colour, mouse and bracketed paste. Only changed cells are written to the terminal, never a full clear, so it also stays fast over SSH. Markdown preview is text only.
@@ -199,7 +201,7 @@ Flags: `--tui` forces the terminal UI and `--gui` forces a window. The check cos
 ## 7. Feature specification
 
 ### Files
-New, open, save, save as, save all, close, reopen closed tab, recent files, drag and drop, open from the command line (`kwil file:line:col`), single instance (a second launch passes files to the running one and exits), restore of unsaved buffers (journaled to disk every few seconds), file-changed-on-disk prompt (reload / compare / keep), and encoding and line-ending switch per file.
+New, open, save, save as, save all, close, reopen closed tab, recent files, drag and drop, open from the command line (`kwil file:line:col`), single instance (a second launch passes files to the running one and exits; `--wait` stays until they are closed), restore of unsaved buffers (journaled to disk every few seconds), file-changed-on-disk prompt (reload / compare / keep), and encoding and line-ending switch per file.
 
 ### Editing
 Undo/redo, multiple cursors (click, Ctrl+D next match), column selection, line move/duplicate/delete, indent/outdent, comment toggle, go to line, bracket match, word wrap, whitespace display, zoom and trim trailing whitespace on save (optional).

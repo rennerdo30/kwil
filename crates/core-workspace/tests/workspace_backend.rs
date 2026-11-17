@@ -287,7 +287,10 @@ fn kw20_incomplete_base_never_claims_recovery_and_revision_order_rejected() {
 #[test]
 fn kw20_ipc_size_malformed_and_native_path_roundtrip() {
     let temp = Temp::new();
-    let r = OpenFiles { files: vec![OpenFile { path: temp.path("file:123"), line: Some(42), column: Some(7) }] };
+    let r = OpenFiles {
+        files: vec![OpenFile { path: temp.path("file:123"), line: Some(42), column: Some(7) }],
+        wait: None,
+    };
     let b = r.encode().unwrap();
     assert_eq!(OpenFiles::decode(&b).unwrap(), r);
     for cut in [0, 3, 7, b.len() - 1] {
@@ -300,21 +303,24 @@ fn kw20_ipc_size_malformed_and_native_path_roundtrip() {
     bad[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(OpenFiles::decode(&bad).is_err());
     assert!(OpenFiles::decode(&vec![0; MAX_IPC_BYTES + 1]).is_err());
-    assert!(OpenFiles { files: vec![r.files[0].clone(); MAX_OPEN_FILES + 1] }.encode().is_err());
-    let invalid = OpenFiles { files: vec![OpenFile { path: PathBuf::from("relative"), line: None, column: Some(1) }] };
+    assert!(OpenFiles { files: vec![r.files[0].clone(); MAX_OPEN_FILES + 1], wait: None }.encode().is_err());
+    let invalid = OpenFiles {
+        files: vec![OpenFile { path: PathBuf::from("relative"), line: None, column: Some(1) }],
+        wait: None,
+    };
     assert!(invalid.encode().is_err());
     #[cfg(unix)]
     {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
         let path = temp.0.join(OsString::from_vec(vec![0xff, b'x']));
-        let r = OpenFiles { files: vec![OpenFile { path, line: None, column: None }] };
+        let r = OpenFiles { files: vec![OpenFile { path, line: None, column: None }], wait: None };
         assert_eq!(OpenFiles::decode(&r.encode().unwrap()).unwrap(), r);
     }
     #[cfg(windows)]
     {
         use std::{ffi::OsString, os::windows::ffi::OsStringExt};
         let path = temp.0.join(OsString::from_wide(&[0xd800, 120]));
-        let r = OpenFiles { files: vec![OpenFile { path, line: None, column: None }] };
+        let r = OpenFiles { files: vec![OpenFile { path, line: None, column: None }], wait: None };
         assert_eq!(OpenFiles::decode(&r.encode().unwrap()).unwrap(), r);
     }
 }
@@ -330,7 +336,8 @@ fn kw20_ipc_receiver_delivery_duplicate_owner_and_own_endpoint_cleanup() {
     assert!(duplicate.ready.recv_timeout(TIMEOUT).unwrap().is_err());
     assert!(duplicate.finished.recv_timeout(TIMEOUT).unwrap().is_err());
     drop(duplicate);
-    let request = OpenFiles { files: vec![OpenFile { path: temp.path("file"), line: Some(12), column: Some(3) }] };
+    let request =
+        OpenFiles { files: vec![OpenFile { path: temp.path("file"), line: Some(12), column: Some(3) }], wait: None };
     send_files(&endpoint, &request, TIMEOUT).unwrap();
     assert_eq!(first.requests.recv_timeout(TIMEOUT).unwrap(), request);
     first.shutdown();
@@ -851,4 +858,98 @@ fn kw20_unix_stale_recovery_and_replaced_endpoint_is_not_removed() {
     first.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
     assert!(socket.exists());
     drop(replacement);
+}
+
+fn wait_file(temp: &Temp) -> OpenFile {
+    OpenFile { path: temp.path("COMMIT_EDITMSG"), line: None, column: None }
+}
+fn wait_endpoint(temp: &Temp, name: &str) -> InstanceEndpoint {
+    InstanceEndpoint { runtime_directory: temp.0.clone(), namespace: format!("{name}-{}", std::process::id()) }
+}
+fn start_waiter(
+    endpoint: &InstanceEndpoint,
+    request: OpenFiles,
+) -> std::sync::mpsc::Receiver<Result<WaitOutcome, WaitError>> {
+    let endpoint = endpoint.clone();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(send_files_and_wait(&endpoint, &request, TIMEOUT));
+    });
+    finished
+}
+
+#[test]
+fn kw90_wait_frame_roundtrips_and_a_launcher_without_wait_still_sends_the_old_frame() {
+    let temp = Temp::new();
+    let plain = OpenFiles { files: vec![wait_file(&temp)], wait: None };
+    let waiting = OpenFiles { wait: Some(0x1122_3344_5566_7788), ..plain.clone() };
+    let (old, new) = (plain.encode().unwrap(), waiting.encode().unwrap());
+    // A launcher that does not wait must keep sending exactly the frame every earlier
+    // version understands, and a new primary must keep decoding such a frame.
+    assert_eq!(&old[..4], b"KWI1");
+    assert_eq!(&new[..4], b"KWI2");
+    assert_eq!(OpenFiles::decode(&old).unwrap(), plain);
+    assert_eq!(OpenFiles::decode(&new).unwrap(), waiting);
+    assert_eq!(new.len(), old.len() + 8, "the wait frame differs from the old one by the token only");
+    assert_eq!(new[12..], old[4..], "file list layout is unchanged");
+    // Token 0 means "none" and is never valid on the wire; the frame cannot be cut short.
+    assert!(OpenFiles { wait: Some(0), ..plain }.encode().is_err());
+    let mut zero = new.clone();
+    zero[4..12].copy_from_slice(&0u64.to_le_bytes());
+    assert!(OpenFiles::decode(&zero).is_err());
+    for cut in [5, 11, 12, new.len() - 1] {
+        assert!(OpenFiles::decode(&new[..cut]).is_err());
+    }
+    let mut unknown = new;
+    unknown[3] = b'9';
+    assert!(OpenFiles::decode(&unknown).is_err());
+}
+
+#[test]
+fn kw90_a_waiter_returns_only_when_the_primary_completes_it_and_others_are_not_blocked() {
+    let temp = Temp::new();
+    let endpoint = wait_endpoint(&temp, "wait-close");
+    let server = InstanceServer::spawn(endpoint.clone()).unwrap();
+    server.ready.recv_timeout(TIMEOUT).unwrap().unwrap();
+    let request = OpenFiles { files: vec![wait_file(&temp)], wait: Some(41) };
+    let waiter = start_waiter(&endpoint, request.clone());
+    assert_eq!(server.requests.recv_timeout(TIMEOUT).unwrap(), request, "the primary gets the files and the token");
+    assert!(waiter.recv_timeout(Duration::from_millis(400)).is_err(), "the tab is still open: the waiter blocks");
+    // A parked waiter must not hold the endpoint: a plain launch and a second waiter still get through.
+    let plain = OpenFiles { files: vec![wait_file(&temp)], wait: None };
+    send_files(&endpoint, &plain, TIMEOUT).unwrap();
+    assert_eq!(server.requests.recv_timeout(TIMEOUT).unwrap(), plain);
+    let second = OpenFiles { files: vec![wait_file(&temp)], wait: Some(42) };
+    let second_waiter = start_waiter(&endpoint, second.clone());
+    assert_eq!(server.requests.recv_timeout(TIMEOUT).unwrap(), second);
+    // A reused token is refused, never allowed to steal the first waiter's answer.
+    let reused = send_files_and_wait(&endpoint, &request, TIMEOUT);
+    assert!(matches!(reused, Err(WaitError::NotDelivered(_))), "{reused:?}");
+    // The tab closes: exactly its own waiter wakes.
+    server.waits.complete(41, WaitOutcome::Closed);
+    assert_eq!(waiter.recv_timeout(TIMEOUT).unwrap().unwrap(), WaitOutcome::Closed);
+    assert!(second_waiter.recv_timeout(Duration::from_millis(300)).is_err(), "the other file is still open");
+    server.waits.complete(42, WaitOutcome::OpenFailed);
+    assert_eq!(second_waiter.recv_timeout(TIMEOUT).unwrap().unwrap(), WaitOutcome::OpenFailed);
+    server.shutdown();
+    server.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+}
+
+#[test]
+fn kw90_a_waiter_returns_when_the_primary_exits() {
+    let temp = Temp::new();
+    let endpoint = wait_endpoint(&temp, "wait-exit");
+    let server = InstanceServer::spawn(endpoint.clone()).unwrap();
+    server.ready.recv_timeout(TIMEOUT).unwrap().unwrap();
+    let waiter = start_waiter(&endpoint, OpenFiles { files: vec![wait_file(&temp)], wait: Some(7) });
+    server.requests.recv_timeout(TIMEOUT).unwrap();
+    assert!(waiter.recv_timeout(Duration::from_millis(300)).is_err());
+    // Quitting normally answers every parked launcher: success, not a hang.
+    server.shutdown();
+    assert_eq!(waiter.recv_timeout(TIMEOUT).unwrap().unwrap(), WaitOutcome::Closed);
+    assert!(server.waits.drain(TIMEOUT), "the answer reached the launcher before the process may exit");
+    server.finished.recv_timeout(TIMEOUT).unwrap().unwrap();
+    // A launcher that arrives after shutdown began is not parked forever either.
+    let late = send_files_and_wait(&endpoint, &OpenFiles { wait: Some(8), ..Default::default() }, TIMEOUT);
+    assert!(matches!(late, Err(WaitError::NotDelivered(_))), "{late:?}");
 }

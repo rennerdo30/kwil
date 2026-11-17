@@ -1,17 +1,32 @@
 //! Worker-only, bounded local IPC. Paths use native Unix bytes / Windows UTF-16.
 //! No bearer secret or credential files: peer identity is checked by the OS.
 //! The app resolves relative CLI paths before forwarding. Position numbers are 1-based.
+//!
+//! Protocol: a launcher sends one frame and reads a one-byte acknowledgement. `KWI1`
+//! is the original request. `KWI2` adds a launcher-chosen wait token (`kwil --wait`):
+//! after the acknowledgement the primary keeps that connection open and later writes
+//! one outcome byte when every file of the request is closed. Closing the connection
+//! without an outcome means the primary died. A launcher that never asks to wait
+//! sends `KWI1`, so it still works against, and is still served by, any version.
 use crate::session::{Decoder, invalid, put_path, put32, put64};
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, SyncSender},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 pub const MAX_OPEN_FILES: usize = 128;
 pub const MAX_IPC_BYTES: usize = 64 * 1024;
+/// Launchers that may wait on one primary at the same time.
+pub const MAX_WAITS: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
+/// A launcher gives up waiting after a week; no editing session needs more.
+const WAIT_LIMIT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenFile {
@@ -22,13 +37,24 @@ pub struct OpenFile {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OpenFiles {
     pub files: Vec<OpenFile>,
+    /// Non-zero token chosen by a `--wait` launcher. The primary reports it back
+    /// through [`Waits::complete`] when every file of this request is closed.
+    pub wait: Option<u64>,
 }
 impl OpenFiles {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         if self.files.len() > MAX_OPEN_FILES {
             return Err(invalid("IPC file count"));
         }
-        let mut b = b"KWI1".to_vec();
+        let mut b = match self.wait {
+            None => b"KWI1".to_vec(),
+            Some(0) => return Err(invalid("IPC wait token")),
+            Some(token) => {
+                let mut b = b"KWI2".to_vec();
+                put64(&mut b, token);
+                b
+            }
+        };
         put32(&mut b, self.files.len() as u32);
         for f in &self.files {
             if !f.path.is_absolute()
@@ -52,9 +78,14 @@ impl OpenFiles {
             return Err(invalid("IPC message size"));
         }
         let mut r = Decoder::new(b);
-        if r.take(4)? != b"KWI1" {
-            return Err(invalid("IPC version"));
-        }
+        let wait = match r.take(4)? {
+            b"KWI1" => None,
+            b"KWI2" => match r.u64()? {
+                0 => return Err(invalid("IPC wait token")),
+                token => Some(token),
+            },
+            _ => return Err(invalid("IPC version")),
+        };
         let n = r.count(MAX_OPEN_FILES)?;
         let mut files = Vec::with_capacity(n);
         for _ in 0..n {
@@ -73,7 +104,115 @@ impl OpenFiles {
             files.push(OpenFile { path, line, column });
         }
         r.end()?;
-        Ok(Self { files })
+        Ok(Self { files, wait })
+    }
+}
+
+/// What a waiting launcher learns when it may return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitOutcome {
+    /// Every file of the request is closed (or the editor quit normally).
+    Closed,
+    /// A file could not be opened.
+    OpenFailed,
+}
+impl WaitOutcome {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Closed => 0,
+            Self::OpenFailed => 1,
+        }
+    }
+    fn from_byte(b: u8) -> io::Result<Self> {
+        match b {
+            0 => Ok(Self::Closed),
+            1 => Ok(Self::OpenFailed),
+            _ => Err(invalid("IPC wait outcome")),
+        }
+    }
+}
+
+/// Parked `--wait` launchers of one primary. Each owns its connection on its own
+/// thread, blocked in `recv`: no polling and no timer while a file stays open.
+pub struct Waits {
+    state: Mutex<WaitState>,
+    idle: Condvar,
+}
+#[derive(Default)]
+struct WaitState {
+    slots: HashMap<u64, SyncSender<WaitOutcome>>,
+    live: usize,
+    closed: bool,
+}
+impl Waits {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { state: Mutex::new(WaitState::default()), idle: Condvar::new() })
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, WaitState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+    /// Reserves `token` and returns the receiver its outcome arrives on. None for
+    /// token 0, a duplicate, a full table or a closed one. The server calls this for
+    /// every wait request; it is public so an embedder or a test can host a waiter.
+    pub fn admit(&self, token: u64) -> Option<Receiver<WaitOutcome>> {
+        let mut state = self.lock();
+        if token == 0 || state.closed || state.slots.len() >= MAX_WAITS || state.slots.contains_key(&token) {
+            return None;
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        state.slots.insert(token, tx);
+        Some(rx)
+    }
+    fn forget(&self, token: u64) {
+        self.lock().slots.remove(&token);
+    }
+    /// Hands the connection to a thread that writes the outcome once it is known.
+    fn park(
+        self: &Arc<Self>,
+        token: u64,
+        rx: Receiver<WaitOutcome>,
+        finish: impl FnOnce(WaitOutcome) + Send + 'static,
+    ) {
+        self.lock().live += 1;
+        let waits = self.clone();
+        let spawned = thread::Builder::new().name("kwil-wait".into()).spawn(move || {
+            // A sender dropped without a send (table cleared) means a normal exit.
+            finish(rx.recv().unwrap_or(WaitOutcome::Closed));
+            waits.lock().live -= 1;
+            waits.idle.notify_all();
+        });
+        if spawned.is_err() {
+            // The unmoved closure was dropped with the failed spawn, closing the
+            // connection: the launcher reports a lost editor rather than hanging.
+            self.forget(token);
+            self.lock().live -= 1;
+        }
+    }
+    /// Reports that the request with `token` is finished. Unknown tokens are ignored.
+    pub fn complete(&self, token: u64, outcome: WaitOutcome) {
+        if let Some(tx) = self.lock().slots.remove(&token) {
+            let _ = tx.try_send(outcome);
+        }
+    }
+    /// The primary is quitting normally: every parked launcher returns success.
+    pub fn complete_all(&self, outcome: WaitOutcome) {
+        let mut state = self.lock();
+        state.closed = true;
+        for (_, tx) in state.slots.drain() {
+            let _ = tx.try_send(outcome);
+        }
+    }
+    /// Waits until every parked launcher has been told. Exit path only; bounded.
+    pub fn drain(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock();
+        while state.live > 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return false;
+            };
+            state = self.idle.wait_timeout(state, left).unwrap_or_else(|error| error.into_inner()).0;
+        }
+        true
     }
 }
 
@@ -101,6 +240,8 @@ pub struct InstanceServer {
     pub ready: Receiver<io::Result<()>>,
     pub requests: Receiver<OpenFiles>,
     pub finished: Receiver<io::Result<()>>,
+    /// Launchers parked by `--wait`; the app completes them as their files close.
+    pub waits: Arc<Waits>,
 }
 impl InstanceServer {
     /// Spawns without opening disk/endpoints on the caller. Bind result comes via ready.
@@ -110,21 +251,25 @@ impl InstanceServer {
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let (tx, requests) = mpsc::sync_channel(16);
         let (done_tx, finished) = mpsc::sync_channel(1);
+        let waits = Waits::new();
+        let served = waits.clone();
         thread::Builder::new().name("kwil-instance".into()).spawn(move || {
-            let result = platform::serve(endpoint, signal, ready_tx, tx);
+            let result = platform::serve(endpoint, signal, ready_tx, tx, served);
             let _ = done_tx.try_send(result);
         })?;
-        Ok(Self { stop, ready, requests, finished })
+        Ok(Self { stop, ready, requests, finished, waits })
     }
     /// Wakes the blocking accept, cancels pending client I/O and releases only our endpoint.
     /// Completion is reported by finished; caller chooses a shutdown timeout off the UI.
+    /// Parked `--wait` launchers are told the editor closed normally.
     pub fn shutdown(&self) {
         self.stop.signal();
+        self.waits.complete_all(WaitOutcome::Closed);
     }
 }
 impl Drop for InstanceServer {
     fn drop(&mut self) {
-        self.stop.signal();
+        self.shutdown();
     }
 }
 /// Worker-only. Acknowledgement means queued at the receiver; the frontend still must
@@ -133,7 +278,32 @@ impl Drop for InstanceServer {
 pub fn send_files(endpoint: &InstanceEndpoint, request: &OpenFiles, timeout: Duration) -> io::Result<()> {
     endpoint.validate()?;
     let b = request.encode()?;
-    platform::send(endpoint, &b, timeout)
+    platform::send(endpoint, &b, timeout).map(drop)
+}
+
+/// Why [`send_files_and_wait`] returned without an outcome.
+#[derive(Debug)]
+pub enum WaitError {
+    /// Nothing was admitted: same errors as [`send_files`] (`NotFound` or
+    /// `ConnectionRefused` mean there is no primary).
+    NotDelivered(io::Error),
+    /// The primary accepted the request, then vanished before reporting.
+    Lost(io::Error),
+}
+/// Worker-only. Sends `request` (its `wait` token must be set), then blocks until the
+/// primary reports it finished or disappears. `timeout` bounds connect and admission.
+pub fn send_files_and_wait(
+    endpoint: &InstanceEndpoint,
+    request: &OpenFiles,
+    timeout: Duration,
+) -> Result<WaitOutcome, WaitError> {
+    if request.wait.is_none() {
+        return Err(WaitError::NotDelivered(invalid("IPC wait token")));
+    }
+    endpoint.validate().map_err(WaitError::NotDelivered)?;
+    let b = request.encode().map_err(WaitError::NotDelivered)?;
+    let connection = platform::send(endpoint, &b, timeout).map_err(WaitError::NotDelivered)?;
+    connection.outcome().map_err(WaitError::Lost)
 }
 
 #[cfg(test)]
@@ -155,6 +325,25 @@ mod tests {
         server.shutdown();
         server.finished.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kw90_wait_table_admits_each_token_once_is_bounded_and_closes() {
+        let waits = Waits::new();
+        assert!(waits.admit(0).is_none(), "0 means no wait");
+        let first = waits.admit(1).unwrap();
+        assert!(waits.admit(1).is_none(), "a token is one launch");
+        let others: Vec<_> = (2..=MAX_WAITS as u64).map(|token| waits.admit(token).unwrap()).collect();
+        assert!(waits.admit(1000).is_none(), "the table is bounded");
+        waits.complete(1, WaitOutcome::OpenFailed);
+        assert_eq!(first.try_recv().unwrap(), WaitOutcome::OpenFailed);
+        waits.complete(1, WaitOutcome::Closed);
+        waits.complete(999, WaitOutcome::Closed);
+        assert!(waits.admit(1).is_some(), "a completed slot is free again");
+        waits.complete_all(WaitOutcome::Closed);
+        assert!(others.iter().all(|rx| rx.try_recv() == Ok(WaitOutcome::Closed)));
+        assert!(waits.admit(77).is_none(), "nothing is parked on a closed primary");
+        assert!(waits.drain(Duration::from_millis(10)), "no thread is parked");
     }
 }
 
@@ -358,44 +547,61 @@ mod platform {
         }
         Ok(())
     }
+    /// Only the first instance carries FILE_FLAG_FIRST_PIPE_INSTANCE: that is the
+    /// single-owner guard. Later instances replace a connection parked by `--wait`.
+    /// Every instance must state the same maximum: a listener plus the parked waits.
+    fn create_pipe(name: &[u16], user: &User, first: bool) -> io::Result<Handle> {
+        let sddl = wide(&format!("D:P(A;;GA;;;{})", user.text()?));
+        let mut sd = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION, &mut sd, null_mut())
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let _descriptor = Local(sd);
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        Handle::new(unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 },
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                MAX_WAITS as u32 + 2,
+                MAX_IPC_BYTES as u32 + 4,
+                MAX_IPC_BYTES as u32 + 4,
+                250,
+                &attrs,
+            )
+        })
+    }
+    /// A parked launcher's end of the pipe: outcome, the client's receipt (a pipe
+    /// disconnect discards unread output), then release.
+    fn finish(pipe: Handle, outcome: WaitOutcome) {
+        let deadline = Instant::now() + 4 * IO_TIMEOUT;
+        let _ = write(pipe.0, null_mut(), &[outcome.byte()], deadline)
+            .and_then(|()| read(pipe.0, null_mut(), &mut [0], deadline));
+        unsafe {
+            DisconnectNamedPipe(pipe.0);
+        }
+    }
     pub fn serve(
         e: InstanceEndpoint,
         stop: Signal,
         ready: SyncSender<io::Result<()>>,
         tx: SyncSender<OpenFiles>,
+        waits: Arc<Waits>,
     ) -> io::Result<()> {
-        let init = (|| {
+        let init: io::Result<(Handle, User, Vec<u16>)> = (|| {
             let user = User::current()?;
             let name = name(&e, &user)?;
-            let sddl = wide(&format!("D:P(A;;GA;;;{})", user.text()?));
-            let mut sd = null_mut();
-            if unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION, &mut sd, null_mut())
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            let _descriptor = Local(sd);
-            let attrs = SECURITY_ATTRIBUTES {
-                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: sd,
-                bInheritHandle: 0,
-            };
-            let pipe = Handle::new(unsafe {
-                CreateNamedPipeW(
-                    name.as_ptr(),
-                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                    1,
-                    MAX_IPC_BYTES as u32 + 4,
-                    MAX_IPC_BYTES as u32 + 4,
-                    250,
-                    &attrs,
-                )
-            })?;
-            Ok((pipe, user))
+            let pipe = create_pipe(&name, &user, true)?;
+            Ok((pipe, user, name))
         })();
-        let (pipe, user) = match init {
+        let (mut pipe, user, name) = match init {
             Ok(v) => v,
             Err(e) => {
                 let _ = ready.try_send(Err(io::Error::new(e.kind(), e.to_string())));
@@ -422,7 +628,9 @@ mod platform {
                 Err(e) => return Err(e),
             }
             let deadline = Instant::now() + IO_TIMEOUT;
-            let _ = (|| {
+            // A wait request keeps this instance connected; `next` takes over listening.
+            let mut parked = None;
+            let result = (|| {
                 authenticate(pipe.0, false, &user)?;
                 let mut header = [0u8; 4];
                 read(pipe.0, stop.0.0, &mut header, deadline)?;
@@ -433,19 +641,56 @@ mod platform {
                 let mut b = vec![0; n];
                 read(pipe.0, stop.0.0, &mut b, deadline)?;
                 let request = OpenFiles::decode(&b)?;
-                let accepted = tx.try_send(request).is_ok();
+                let accepted = match request.wait {
+                    None => tx.try_send(request).is_ok(),
+                    Some(token) => match (waits.admit(token), create_pipe(&name, &user, false)) {
+                        (Some(rx), Ok(next)) if tx.try_send(request).is_ok() => {
+                            parked = Some((token, rx, next));
+                            true
+                        }
+                        (admitted, _) => {
+                            if admitted.is_some() {
+                                waits.forget(token);
+                            }
+                            false
+                        }
+                    },
+                };
                 write(pipe.0, stop.0.0, &[u8::from(accepted)], deadline)?;
                 // Named-pipe disconnect discards unread output. Wait for the
                 // client's receipt under the same deadline, never FlushFileBuffers.
                 let mut received = [0];
                 read(pipe.0, stop.0.0, &mut received, deadline)
             })();
-            unsafe {
-                DisconnectNamedPipe(pipe.0);
+            match (result, parked) {
+                (Ok(()), Some((token, rx, next))) => {
+                    let connected = std::mem::replace(&mut pipe, next);
+                    waits.park(token, rx, move |outcome| finish(connected, outcome));
+                }
+                (result, parked) => {
+                    if let (Err(_), Some((token, ..))) = (result, parked) {
+                        waits.forget(token);
+                    }
+                    unsafe {
+                        DisconnectNamedPipe(pipe.0);
+                    }
+                }
             }
         }
     }
-    pub fn send(e: &InstanceEndpoint, b: &[u8], timeout: Duration) -> io::Result<()> {
+    /// The launcher's end after admission: it keeps the pipe only to learn the outcome.
+    pub struct Connection(Handle);
+    impl Connection {
+        pub fn outcome(self) -> io::Result<WaitOutcome> {
+            let deadline = Instant::now().checked_add(WAIT_LIMIT).ok_or_else(|| invalid("IPC timeout"))?;
+            let mut byte = [0];
+            read(self.0.0, null_mut(), &mut byte, deadline)?;
+            let outcome = WaitOutcome::from_byte(byte[0])?;
+            let _ = write(self.0.0, null_mut(), &[1], deadline);
+            Ok(outcome)
+        }
+    }
+    pub fn send(e: &InstanceEndpoint, b: &[u8], timeout: Duration) -> io::Result<Connection> {
         let user = User::current()?;
         let name = name(e, &user)?;
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| invalid("IPC timeout"))?;
@@ -482,7 +727,7 @@ mod platform {
         if ack != [1] {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "instance inbox full"));
         }
-        Ok(())
+        Ok(Connection(pipe))
     }
 }
 
@@ -568,11 +813,17 @@ mod platform {
             }
         }
     }
+    /// A parked launcher's end of the socket: the outcome, then close. Unlike a
+    /// named pipe, a closed socket still delivers bytes already written.
+    fn finish(mut stream: UnixStream, outcome: WaitOutcome) {
+        let _ = write_deadline(&mut stream, &[outcome.byte()], Instant::now() + 4 * IO_TIMEOUT);
+    }
     pub fn serve(
         e: InstanceEndpoint,
         stop: UnixStream,
         ready: SyncSender<io::Result<()>>,
         tx: SyncSender<OpenFiles>,
+        waits: Arc<Waits>,
     ) -> io::Result<()> {
         let init = (|| {
             let directory = dir(&e);
@@ -634,7 +885,8 @@ mod platform {
             // Use readiness and one absolute deadline for every frame operation.
             stream.set_nonblocking(true)?;
             let deadline = Instant::now() + IO_TIMEOUT;
-            let _ = (|| {
+            let mut parked = None;
+            let result = (|| {
                 authenticate(stream.as_raw_fd())?;
                 let mut h = [0u8; 4];
                 read_deadline(&mut stream, &mut h, deadline)?;
@@ -645,10 +897,37 @@ mod platform {
                 let mut b = vec![0; n];
                 read_deadline(&mut stream, &mut b, deadline)?;
                 let request = OpenFiles::decode(&b)?;
-                let accepted = tx.try_send(request).is_ok();
-                write_deadline(&mut stream, &[u8::from(accepted)], deadline)?;
-                Ok::<_, io::Error>(())
+                let accepted = match request.wait {
+                    None => tx.try_send(request).is_ok(),
+                    Some(token) => match waits.admit(token) {
+                        Some(rx) if tx.try_send(request).is_ok() => {
+                            parked = Some((token, rx));
+                            true
+                        }
+                        Some(_) => {
+                            waits.forget(token);
+                            false
+                        }
+                        None => false,
+                    },
+                };
+                write_deadline(&mut stream, &[u8::from(accepted)], deadline)
             })();
+            match (result, parked) {
+                (Ok(()), Some((token, rx))) => waits.park(token, rx, move |outcome| finish(stream, outcome)),
+                (Err(_), Some((token, _))) => waits.forget(token),
+                _ => {}
+            }
+        }
+    }
+    /// The launcher's end after admission: it keeps the socket only to learn the outcome.
+    pub struct Connection(UnixStream);
+    impl Connection {
+        pub fn outcome(mut self) -> io::Result<WaitOutcome> {
+            let deadline = Instant::now().checked_add(WAIT_LIMIT).ok_or_else(|| invalid("IPC timeout"))?;
+            let mut byte = [0];
+            read_deadline(&mut self.0, &mut byte, deadline)?;
+            WaitOutcome::from_byte(byte[0])
         }
     }
     #[cfg(target_os = "linux")]
@@ -687,7 +966,7 @@ mod platform {
         }
         Ok(())
     }
-    pub fn send(e: &InstanceEndpoint, b: &[u8], timeout: Duration) -> io::Result<()> {
+    pub fn send(e: &InstanceEndpoint, b: &[u8], timeout: Duration) -> io::Result<Connection> {
         if timeout.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "IPC timeout"));
         }
@@ -706,7 +985,7 @@ mod platform {
         if ack != [1] {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "instance inbox full"));
         }
-        Ok(())
+        Ok(Connection(s))
     }
     // Preserve the original error and its OS code. Development builds identify
     // which platform operation failed; release builds retain no diagnostic I/O.

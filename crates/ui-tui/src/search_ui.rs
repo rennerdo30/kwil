@@ -311,6 +311,7 @@ impl SearchHost {
             }
             let request = kwil_core_workspace::instance::OpenFiles {
                 files: vec![kwil_core_workspace::instance::OpenFile { path, line: Some(line_number), column: Some(1) }],
+                wait: None,
             };
             self.origin = None;
             if let Err(error) = view.open_files(request) {
@@ -1465,6 +1466,7 @@ mod tests {
         h.view
             .open_files(kwil_core_workspace::instance::OpenFiles {
                 files: vec![kwil_core_workspace::instance::OpenFile { path: path.clone(), line: None, column: None }],
+                wait: None,
             })
             .unwrap();
         h.until(|h| h.view.editor().is_some_and(|e| e.document().path() == Some(path.as_path())));
@@ -1611,6 +1613,7 @@ mod tests {
         h.view
             .open_files(kwil_core_workspace::instance::OpenFiles {
                 files: vec![kwil_core_workspace::instance::OpenFile { path: path.clone(), line: None, column: None }],
+                wait: None,
             })
             .unwrap();
         h.until(|h| h.view.editor().is_some_and(|e| e.document().path() == Some(path.as_path())));

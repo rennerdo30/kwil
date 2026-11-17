@@ -1,6 +1,8 @@
 //! Startup ownership and a bounded bridge from local IPC to either frontend.
 //! Socket/pipe I/O happens before the event loop or on the dedicated IPC workers.
-use kwil_core_workspace::instance::{InstanceEndpoint, InstanceServer, OpenFiles, send_files};
+use kwil_core_workspace::instance::{
+    InstanceEndpoint, InstanceServer, OpenFiles, WaitError, WaitOutcome, Waits, send_files, send_files_and_wait,
+};
 use kwil_view_model::document_worker::ExternalOpen;
 use std::{
     cell::RefCell,
@@ -57,6 +59,84 @@ pub fn try_forward(endpoint: &InstanceEndpoint, files: &OpenFiles) -> io::Result
     }
 }
 
+/// Process exit codes of `kwil --wait` (0 is success).
+pub const EXIT_OPEN_FAILED: u8 = 1;
+pub const EXIT_PRIMARY_LOST: u8 = 3;
+/// How long a launcher gives a freshly started editor to open its endpoint.
+const PRIMARY_START_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The end of a `kwil --wait` hand-off.
+#[derive(Debug)]
+pub enum WaitResult {
+    /// The running editor reported the files finished.
+    Finished(WaitOutcome),
+    /// Nobody owns the endpoint; nothing was sent.
+    NoPrimary,
+    /// The editor accepted the files and then exited or crashed.
+    Lost(io::Error),
+    /// The editor could not be reached or refused the request.
+    Refused(io::Error),
+}
+impl WaitResult {
+    /// The exit code and message for a finished hand-off; None when there was no editor.
+    pub fn exit(&self) -> Option<(u8, Option<String>)> {
+        match self {
+            Self::Finished(WaitOutcome::Closed) => Some((0, None)),
+            Self::Finished(WaitOutcome::OpenFailed) => {
+                Some((EXIT_OPEN_FAILED, Some("a file could not be opened".into())))
+            }
+            Self::Lost(error) => {
+                Some((EXIT_PRIMARY_LOST, Some(format!("Kwil exited before the file was closed ({error})"))))
+            }
+            Self::Refused(error) => Some((1, Some(format!("cannot contact the running instance: {error}")))),
+            Self::NoPrimary => None,
+        }
+    }
+}
+
+/// A token unique to this launch; the primary keys its parked launchers by it.
+pub fn wait_token() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos() as u64 ^ elapsed.as_secs());
+    ((u64::from(std::process::id()) << 32) | (nanos & 0xffff_ffff)).max(1)
+}
+
+/// Sends `files` (carrying a wait token) to the running editor and blocks until
+/// every file is closed, the editor quits, or it dies.
+pub fn forward_and_wait(endpoint: &InstanceEndpoint, files: &OpenFiles) -> WaitResult {
+    match send_files_and_wait(endpoint, files, CONNECT_TIMEOUT) {
+        Ok(outcome) => WaitResult::Finished(outcome),
+        Err(WaitError::NotDelivered(error)) if absent_owner(&error) => WaitResult::NoPrimary,
+        Err(WaitError::NotDelivered(error)) => WaitResult::Refused(error),
+        Err(WaitError::Lost(error)) => WaitResult::Lost(error),
+    }
+}
+
+/// No editor runs: start one detached, so the launcher can return when the
+/// files close while the editor stays open, then wait on it like on any other.
+/// `exited` reports a started editor that is already gone.
+pub fn wait_on_started_primary(
+    endpoint: &InstanceEndpoint,
+    files: &OpenFiles,
+    mut exited: impl FnMut() -> Option<String>,
+) -> WaitResult {
+    let deadline = Instant::now() + PRIMARY_START_TIMEOUT;
+    loop {
+        match forward_and_wait(endpoint, files) {
+            WaitResult::NoPrimary => {}
+            result => return result,
+        }
+        if let Some(why) = exited() {
+            return WaitResult::Refused(io::Error::other(why));
+        }
+        if Instant::now() >= deadline {
+            return WaitResult::Refused(io::Error::new(io::ErrorKind::TimedOut, "Kwil did not start in time"));
+        }
+        std::thread::park_timeout(Duration::from_millis(25));
+    }
+}
+
 fn absent_owner(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
 }
@@ -64,6 +144,8 @@ fn absent_owner(error: &io::Error) -> bool {
 /// The caller has not entered a UI event loop yet. Concurrent first launches
 /// race on the backend's OS ownership primitive, never on file existence.
 pub fn claim(endpoint: InstanceEndpoint, files: &OpenFiles) -> io::Result<Start> {
+    // A winner of the start race cannot be waited on from here (this launch would
+    // return at once); the caller reports the lost race and the user runs it again.
     let server = InstanceServer::spawn(endpoint.clone())?;
     match server.ready.recv_timeout(Duration::from_millis(500)) {
         Ok(Ok(())) => Ok(Start::Primary(Owner::new(server))),
@@ -71,7 +153,11 @@ pub fn claim(endpoint: InstanceEndpoint, files: &OpenFiles) -> io::Result<Start>
             server.shutdown();
             // Another first launch may have won between connect and bind.
             // The peer is still authenticated by send_files.
-            if forward_after_claim_loss(&endpoint, files).is_ok() { Ok(Start::Forwarded) } else { Err(error) }
+            if files.wait.is_none() && forward_after_claim_loss(&endpoint, files).is_ok() {
+                Ok(Start::Forwarded)
+            } else {
+                Err(error)
+            }
         }
         Err(error) => {
             server.shutdown();
@@ -136,6 +222,11 @@ pub struct Owner {
     stopped: Arc<AtomicBool>,
 }
 impl Owner {
+    /// Where the workspace reports that a `--wait` launcher's files are closed.
+    pub fn waits(&self) -> Arc<Waits> {
+        self.server.waits.clone()
+    }
+
     fn new(mut server: InstanceServer) -> Self {
         let (_, empty) = std::sync::mpsc::channel();
         let requests = std::mem::replace(&mut server.requests, empty);
@@ -182,9 +273,14 @@ impl Drop for Owner {
         let _route = self.route.state.lock().unwrap_or_else(|error| error.into_inner());
         self.stopped.store(true, Ordering::Release);
         self.route.changed.notify_all();
+        // Tells parked `--wait` launchers the editor quit normally (a crash
+        // never reaches here, and they report it as lost).
         self.server.shutdown();
         // Backend shutdown drops the request sender and wakes the blocking relay.
         // No event-loop thread waits on a filesystem operation or thread join.
+        // The one bounded exception: at process exit, and only while a `--wait`
+        // launcher is parked, give it a moment to receive its answer.
+        self.server.waits.drain(Duration::from_millis(500));
     }
 }
 
@@ -226,6 +322,71 @@ fn deliver(route: &Arc<Route>, stopped: &AtomicBool, mut request: OpenFiles) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn wait_request() -> OpenFiles {
+        OpenFiles {
+            files: vec![kwil_core_workspace::instance::OpenFile {
+                path: std::env::temp_dir().join("COMMIT_EDITMSG"),
+                line: None,
+                column: None,
+            }],
+            wait: Some(wait_token()),
+        }
+    }
+
+    #[test]
+    fn kw90_wait_exit_codes_separate_closed_failed_lost_and_absent() {
+        assert_eq!(WaitResult::Finished(WaitOutcome::Closed).exit(), Some((0, None)));
+        let failed = WaitResult::Finished(WaitOutcome::OpenFailed).exit().unwrap();
+        assert_eq!(failed.0, EXIT_OPEN_FAILED);
+        assert!(failed.1.unwrap().contains("could not be opened"));
+        let lost = WaitResult::Lost(io::Error::from(io::ErrorKind::UnexpectedEof)).exit().unwrap();
+        assert_eq!(lost.0, EXIT_PRIMARY_LOST);
+        assert!(lost.1.unwrap().contains("exited before the file was closed"));
+        assert_ne!(EXIT_PRIMARY_LOST, EXIT_OPEN_FAILED, "Git and scripts can tell a crash from a failed open");
+        assert!(WaitResult::Refused(io::Error::from(io::ErrorKind::TimedOut)).exit().unwrap().0 != 0);
+        assert!(WaitResult::NoPrimary.exit().is_none(), "no editor is not an outcome: the caller starts one");
+        assert_ne!(wait_token(), 0);
+    }
+
+    #[test]
+    fn kw90_waiting_on_a_started_editor_gives_up_when_it_is_gone_and_otherwise_waits_for_it() {
+        let root = std::env::temp_dir().join(format!("kwil-kw90-app-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let endpoint =
+            InstanceEndpoint { runtime_directory: root.clone(), namespace: format!("kw90-{}", std::process::id()) };
+        let request = wait_request();
+        // The editor process died before it opened its endpoint: report that, do not hang.
+        let result = wait_on_started_primary(&endpoint, &request, || Some("gone".into()));
+        assert!(matches!(result, WaitResult::Refused(_)), "{result:?}");
+        // The editor opens its endpoint a moment later: the launcher then waits for the files.
+        let mut server = None;
+        let mut polls = 0;
+        let (started, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::scope(|scope| {
+            let launcher = scope.spawn(|| {
+                wait_on_started_primary(&endpoint, &request, || {
+                    polls += 1;
+                    if server.is_none() {
+                        let started_server = InstanceServer::spawn(endpoint.clone()).unwrap();
+                        started_server.ready.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+                        let _ = started.send(started_server.waits.clone());
+                        server = Some(started_server);
+                    }
+                    None
+                })
+            });
+            let waits = receiver.recv_timeout(Duration::from_secs(10)).expect("editor start");
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!launcher.is_finished(), "the launcher waits while the files are open");
+            waits.complete(request.wait.unwrap(), WaitOutcome::Closed);
+            launcher.join().unwrap()
+        });
+        assert!(matches!(waiter, WaitResult::Finished(WaitOutcome::Closed)), "{waiter:?}");
+        assert!(polls >= 1);
+        drop(server);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn instance_errors_never_treat_busy_or_foreign_owners_as_absent() {
         for kind in [
@@ -252,6 +413,7 @@ mod tests {
                 line: Some(9),
                 column: Some(2),
             }],
+            wait: None,
         };
         let original = expected.clone();
         let open: ExternalOpen = Box::new(move |request| {
@@ -330,6 +492,7 @@ mod tests {
                 line: Some(20),
                 column: Some(7),
             }],
+            wait: None,
         };
         let (disconnected, saw_disconnect) = std::sync::mpsc::sync_channel(1);
         route.install(Box::new(move |request| {
