@@ -36,8 +36,6 @@ pub(super) struct Context {
     items: Vec<Item>,
     rows: Vec<Rect>,
     selected: usize,
-    /// The last selection change came from the keyboard: the row shows the focus ring.
-    keyboard: bool,
     surface: Option<(usize, usize, u64)>,
     /// Set for a tab's context menu: the tab it acts on.
     tab: Option<SessionDocumentId>,
@@ -295,7 +293,6 @@ impl App {
             && index != self.context.selected
         {
             self.context.selected = index;
-            self.context.keyboard = false;
             self.menu_dirty = true;
             self.request_frame();
         }
@@ -303,9 +300,6 @@ impl App {
     pub(super) fn context_key(&mut self, event: &HostKey<'_>) -> bool {
         if !self.context.is_open() {
             return false;
-        }
-        if matches!(event.logical_key, Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp)) {
-            self.context.keyboard = true;
         }
         match event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_context(),
@@ -397,14 +391,7 @@ pub(super) fn draw(
         }
         let rect = Rect { x: area.x + frame, y, w: width.saturating_sub(2 * frame), h: row };
         let chosen = index == context.selected;
-        desktop::row(
-            pixels,
-            size.0,
-            rect,
-            desktop::RowState::new(chosen, false).focused(chosen && context.keyboard),
-            &colors,
-            &sizes,
-        );
+        desktop::row(pixels, size.0, rect, desktop::RowState::new(chosen, false), &colors, &sizes);
         let edge = sizes.check.min(rect.h);
         icons::draw(
             pixels,

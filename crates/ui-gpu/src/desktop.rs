@@ -770,21 +770,18 @@ pub(super) fn keycaps(
     pen
 }
 
-/// What a row shows. `focused` is keyboard focus: the row is where Enter or
-/// Space acts, and gets the focus ring on top of its other state.
+/// What a row shows. A list's keyboard position is its selected row (the
+/// Selection fill plus the accent indicator), so rows never draw a focus
+/// ring: mouse and keyboard highlights look the same in every list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct RowState {
     pub selected: bool,
     pub hovered: bool,
-    pub focused: bool,
 }
 
 impl RowState {
     pub fn new(selected: bool, hovered: bool) -> Self {
-        Self { selected, hovered, focused: false }
-    }
-    pub fn focused(self, focused: bool) -> Self {
-        Self { focused, ..self }
+        Self { selected, hovered }
     }
 }
 
@@ -797,7 +794,6 @@ pub(super) struct RowLook {
     pub hover: u32,
     pub selected: u32,
     pub accent: u32,
-    pub ring: u32,
     pub radius: usize,
 }
 
@@ -807,7 +803,6 @@ impl RowLook {
             hover: chrome::hover_color(ground, c.fg),
             selected: chrome::selected_color(ground, c.selection),
             accent: c.accent,
-            ring: c.focus_ring,
             radius,
         }
     }
@@ -830,15 +825,11 @@ pub(super) fn row_fill(buf: &mut [u32], stride: usize, rect: Rect, state: RowSta
     }
 }
 
-/// The one list-row painter: hover tint, or selection with the accent
-/// indicator, plus the focus ring when the keyboard is here.
+/// The one list-row painter: hover tint, or selection with the accent indicator.
 pub(super) fn row_in(buf: &mut [u32], stride: usize, rect: Rect, state: RowState, look: &RowLook, s: &Sizes) {
     row_fill(buf, stride, rect, state, look);
     if state.selected {
         row_indicator(buf, stride, rect, look, s);
-    }
-    if state.focused {
-        chrome::ring(buf, stride, rect, look.radius, s.focus, look.ring);
     }
 }
 
@@ -855,10 +846,10 @@ pub(super) fn nav_row(buf: &mut [u32], stride: usize, rect: Rect, state: RowStat
 
 /// Keyboard focus ring: accent, `Sizes::focus` thick, inside `rect` so the
 /// widget's own damage always covers it, following the widget's `radius`.
-/// `over` is the fill it sits on; an accent fill takes the foreground colour
-/// so the ring never vanishes into it.
+/// `over` is the fill it sits on; an accent fill takes the on-accent text
+/// colour (readable on accent by construction), so the ring stays visible.
 pub(super) fn focus_ring(buf: &mut [u32], stride: usize, rect: Rect, radius: usize, over: u32, c: &Colors, s: &Sizes) {
-    let color = if over == c.accent || over == c.accent_hover { c.fg } else { c.focus_ring };
+    let color = if over == c.accent || over == c.accent_hover { c.on_accent } else { c.focus_ring };
     chrome::ring(buf, stride, rect, radius, s.focus, color);
 }
 
@@ -1199,8 +1190,8 @@ mod tests {
                 pixels
             };
             let (with, without) = (paint(true), paint(false));
-            // An accent-filled button takes the foreground ring so it stays visible.
-            let ring = if style == Style::Primary { c.fg } else { c.focus_ring };
+            // An accent-filled button takes the on-accent ring so it stays visible.
+            let ring = if style == Style::Primary { c.on_accent } else { c.focus_ring };
             let at = |pixels: &[u32], dy: usize| pixels[(rect.y + dy) * w + rect.x + rect.w / 2];
             for dy in 0..s.focus {
                 assert_eq!(at(&with, dy), ring, "{style:?}: ring row {dy}");
@@ -1234,32 +1225,17 @@ mod tests {
     }
 
     #[test]
-    fn a_focused_row_keeps_its_selected_look_and_adds_a_ring_inside_its_rounded_rectangle() {
+    fn keyboard_and_pointer_highlights_paint_the_same_row() {
+        // A list's keyboard position is its selected row; no extra ring.
         let (w, h) = (120, 60);
         let c = colors();
         let s = Sizes::new(&Metrics::new(1.0));
         let rect = Rect { x: 10, y: 10, w: 100, h: s.list_row };
-        for (selected, hovered) in [(false, false), (false, true), (true, false)] {
-            let paint = |focused: bool| {
-                let mut pixels = vec![0x123456; w * h];
-                row(&mut pixels, w, rect, RowState::new(selected, hovered).focused(focused), &c, &s);
-                pixels
-            };
-            let (with, without) = (paint(true), paint(false));
-            let top = |pixels: &[u32]| pixels[rect.y * w + rect.x + rect.w / 2];
-            let ring = c.focus_ring;
-            assert_eq!(top(&with), ring, "selected {selected} hovered {hovered}: ring on the top edge");
-            assert_ne!(top(&without), ring, "selected {selected} hovered {hovered}: no ring unless focused");
-            let middle = (rect.y + rect.h / 2) * w + rect.x + rect.w / 2;
-            assert_eq!(with[middle], without[middle], "the ring is an outline, never a fill");
-            // The ring follows the corner radius: the extreme corner pixel stays untouched.
-            assert_eq!(with[rect.y * w + rect.x], 0x123456, "square ring corner");
-            for (i, (a, b)) in with.iter().zip(&without).enumerate() {
-                if !rect.contains((i % w, i / w)) {
-                    assert_eq!(a, b, "the ring leaked outside the row at {i}");
-                }
-            }
-        }
+        let mut pixels = vec![0x123456; w * h];
+        row(&mut pixels, w, rect, RowState::new(true, false), &c, &s);
+        let top = pixels[rect.y * w + rect.x + rect.w / 2];
+        assert_ne!(top, c.focus_ring, "a selected row has no focus ring on its edge");
+        assert_eq!(top, chrome::selected_color(c.surface, c.selection), "the edge is the selected fill");
     }
 
     #[test]

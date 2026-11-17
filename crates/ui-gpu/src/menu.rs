@@ -783,17 +783,8 @@ pub(super) fn draw_dropdown(
     for &(index, row) in &dropdown.rows {
         let Some(&Item(label, command)) = entries.get(index) else { continue };
         let usable = enabled(available, command);
-        // The highlight is the keyboard target when the list was opened from
-        // the keyboard, which owns the list; it then also shows the ring.
         let highlighted = item == Some(index) && usable;
-        desktop::row(
-            pixels,
-            stride,
-            row,
-            desktop::RowState::new(highlighted, false).focused(highlighted && keyboard),
-            &c,
-            &s,
-        );
+        desktop::row(pixels, stride, row, desktop::RowState::new(highlighted, false), &c, &s);
         let color = if usable { c.fg } else { c.disabled };
         let baseline = font.baseline(row.y, row.h);
         let name = text(label);
@@ -1162,6 +1153,15 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropdown_rows_use_the_menu_item_token_on_every_platform() {
+        for scale in [1.0, 1.25, 2.0] {
+            let m = Metrics::new(scale);
+            let item = MENUS.iter().flat_map(|menu| menu.entries).find(|e| matches!(e, Item(..))).unwrap();
+            assert_eq!(entry_height(item, &m), desktop::Sizes::new(&m).menu_item, "dropdown row at {scale}");
+        }
+    }
 
     fn all(_: &str) -> bool {
         true
