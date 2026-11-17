@@ -152,7 +152,8 @@ impl App {
                 "Build",
                 format!(
                     "{} ({})",
-                    option_env!("KWIL_BUILD_COMMIT").unwrap_or("development"),
+                    // A 12-digit commit prefix identifies the build and stays readable.
+                    option_env!("KWIL_BUILD_COMMIT").map_or("development", |commit| &commit[..commit.len().min(12)]),
                     if cfg!(debug_assertions) { "debug" } else { "release" }
                 ),
             ),

@@ -1318,9 +1318,11 @@ fn scalar_row(
         let tag = Rect { x: pen + s.gap, w: (title.x + title.w).saturating_sub(pen + s.gap), ..title };
         desktop::label(pixels, stride, font.small(), tag, row.spec.category.title(), c.faint);
     }
-    for (line, text) in desktop::wrap(font, row.spec.description, text_w, 2).iter().enumerate() {
+    // Descriptions are secondary: the small face, muted, so names stand out.
+    let note = font.small();
+    for (line, text) in desktop::wrap(note, row.spec.description, text_w, 2).iter().enumerate() {
         let y = title.y + s.text + line * small;
-        desktop::label(pixels, stride, font, Rect { x: left, y, w: text_w, h: small }, text, c.muted);
+        desktop::label(pixels, stride, note, Rect { x: left, y, w: text_w, h: small }, text, c.muted);
     }
     if reset_w > 0 {
         let target = Target::Reset { index, id };
@@ -1658,7 +1660,7 @@ fn panel_row(
             c.accent,
         );
         let desc = Rect { w: text_end.saturating_sub(left), ..line2 };
-        desktop::label(pixels, stride, font, desc, &row.description, c.muted);
+        desktop::label(pixels, stride, font.small(), desc, &row.description, c.muted);
         return;
     }
     // First line: title left, current value right.
@@ -1687,7 +1689,7 @@ fn panel_row(
         desc = Rect { x: end + s.gap, w: (desc.x + desc.w).saturating_sub(end + s.gap), ..desc };
     }
     if desc.w > m.dip(80.0) {
-        desktop::label(pixels, stride, font, desc, &row.description, c.muted);
+        desktop::label(pixels, stride, font.small(), desc, &row.description, c.muted);
     }
 }
 

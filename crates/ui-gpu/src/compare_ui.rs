@@ -186,7 +186,7 @@ fn grouped(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -294,7 +294,7 @@ pub(super) fn draw_header(
 }
 
 fn chip_width(font: &mut font::UiFont, text: &str, on: bool, s: &desktop::Sizes) -> usize {
-    font.measure(text, 400) + 2 * s.md + if on { s.lg } else { 0 }
+    font.measure(text, 400) + 2 * s.md + if on { s.lg + s.xs } else { 0 }
 }
 
 /// Name, then its muted tag. The tag says which side this is, so it keeps its
@@ -344,7 +344,7 @@ fn draw_chip(
     if on {
         let center = ((x + s.sm) as f32, (chip.y + chip.h / 2) as f32);
         icons::draw(pixels, stride, icons::Icon::Check, center, s.lg, c.accent);
-        x += s.lg;
+        x += s.lg + s.xs;
     }
     let clip = Rect { x, w: (chip.x + chip.w).saturating_sub(x + s.md), ..chip };
     desktop::label(pixels, stride, font, clip, text, if on { c.fg } else { c.muted });
@@ -361,7 +361,8 @@ fn draw_collapsed(pixels: &mut [u32], width: usize, row: Rect, hidden: usize, ui
     let Some(font) = ui else { return };
     let size = (font.px as usize).min(row.h).max(1);
     let muted = chrome::mix(band, fg(), 0xa8);
-    let center = (gutter.saturating_sub(size) as f32 + size as f32 / 2.0, (row.y + row.h / 2) as f32);
+    let gap = size / 3;
+    let center = (gutter.saturating_sub(size + gap) as f32 + size as f32 / 2.0, (row.y + row.h / 2) as f32);
     icons::draw(pixels, width, icons::Icon::Down, center, size, muted);
     let unit = if hidden == 1 { "unchanged line" } else { "unchanged lines" };
     let clip = Rect { x: gutter, w: width.saturating_sub(gutter), ..row };
