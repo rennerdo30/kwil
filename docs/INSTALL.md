@@ -147,10 +147,12 @@ prompt, before you close the tab. Both `kwil.com --wait` and `kwil --wait` hold
 the terminal (cmd, PowerShell, Git Bash) until then. If Kwil is already open it
 takes the files into that window and the other tabs stay; otherwise it starts
 Kwil, which stays open after the command returns. It exits with 0 when the files
-closed (or you quit Kwil), 1 if a file could not be opened and 3 if Kwil crashed
-or was killed while waiting. In the terminal UI (`--tui`, or over SSH) Kwil is
-the editor itself and the command returns when you quit it. `--wait` needs at
-least one file. On macOS and Linux `kwil --wait` works the same way.
+closed (or you quit Kwil after they were shown), 1 if a file could not be opened
+or Kwil quit before showing it, and 3 if Kwil crashed or was killed while
+waiting, so Git never continues with a message you did not see. In the terminal
+UI (`--tui`, or over SSH) Kwil is the editor itself and the command returns when
+you quit it. `--wait` needs at least one file and cannot be combined with
+`--new-window`. On macOS and Linux `kwil --wait` works the same way.
 
 macOS and Linux need none of this: `scripts/install.sh` links
 `~/.local/bin/kwil`, so the choice is not shown there. The script does not edit

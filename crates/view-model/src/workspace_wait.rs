@@ -21,7 +21,8 @@ impl WaitWatch {
     /// Watches the tabs opened for `token`. Without a sink (no instance server)
     /// nobody is waiting, so nothing is kept.
     pub(crate) fn watch(&mut self, token: u64, tabs: Vec<DocumentId>, session: &Session) {
-        if self.sink.is_some() {
+        if let Some(sink) = &self.sink {
+            sink.shown(token);
             self.pending.push((token, tabs));
             self.settle(session);
         }
