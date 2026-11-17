@@ -682,6 +682,16 @@ fn run_workspace_with_terminal_init(
                                 }
                                 true
                             }
+                            KeyResult::CommandLine(request) => {
+                                use kwil_core_commands::command_line as cl;
+                                // The GUI's code path; refused in tests and isolated runs.
+                                let sender = tx.clone();
+                                let started = cl::spawn(request, cl::gate(false, cfg!(test)), move |result| {
+                                    let _ = sender.send(Msg::Notice(result.map_or_else(|e| e, |r| r.message)));
+                                });
+                                view.set_notice(started.map_or_else(|why| why, |()| "Updating your PATH…".into()));
+                                true
+                            }
                             KeyResult::CheckUpdate => {
                                 let sender = tx.clone();
                                 let started = kwil_update::spawn_check(env!("CARGO_PKG_VERSION"), move |message| {
@@ -1897,6 +1907,7 @@ enum KeyResult {
     Theme(&'static str),
     RetryWrap,
     CheckUpdate,
+    CommandLine(kwil_core_commands::command_line::Request),
     BodyInvoke(kwil_core_commands::vim::Invocation, bool),
     BodyExecute(&'static str, CommandArgs, u32),
     Settings,
@@ -2440,6 +2451,11 @@ fn invoke(
     }
     if matches!(call.id, "update.check" | "update.apply") {
         return KeyResult::CheckUpdate;
+    }
+    match call.id {
+        "commandLine.add" => return KeyResult::CommandLine(kwil_core_commands::command_line::Request::Register),
+        "commandLine.remove" => return KeyResult::CommandLine(kwil_core_commands::command_line::Request::Unregister),
+        _ => {}
     }
     if call.id.starts_with("log.") {
         if !view.is_log_document() {

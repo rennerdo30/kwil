@@ -22,16 +22,20 @@ publisher.
 Run `kwil-<version>-windows-<arch>-setup.exe` as your normal user; it needs no
 administrator rights. It installs `kwil.exe` and `kwil.com` to
 `%LOCALAPPDATA%\Programs\Kwil`, adds a Start menu shortcut and an Installed
-apps entry. It does not change PATH or default apps; the first-run page offers
-file-type registration ("Open with").
+apps entry. The setup itself does not change your PATH or default apps. Kwil
+offers two optional, per-user steps instead, on its first-run page and later in
+Settings > Files and file types: "Open with" file-type registration, and "Use
+Kwil from the command line and Win+R" (see [Command line](#command-line-windows)).
+Nothing is written unless you choose it.
 
 Kwil updates itself in place (see [Updates](UPDATES.md)) and keeps the version
 in Installed apps current. Close Kwil before installing over an existing copy;
 the setup asks if it is still running.
 
 Uninstall through Settings > Apps > Installed apps. The uninstaller first
-removes Kwil's "Open with" entries (`kwil --unregister-file-types`, the same
-as "Remove all" on the file-types page), then the installed files, shortcut and
+removes Kwil's "Open with" entries, its Win+R entry and its folder from your
+user PATH (`kwil --unregister-file-types`; the file-type part is the same as
+"Remove all" on the file-types page), then the installed files, shortcut and
 entry. Settings and recovery data in `%APPDATA%\kwil` stay, including
 `settings.toml` and `workspace/session.kws`. Unknown files you put in the
 installation folder also stay. Silent use:
@@ -86,8 +90,10 @@ Windows installs the complete `kwil.exe`/`kwil.com` pair under
 `%LOCALAPPDATA%/Programs/Kwil/vX.Y.Z`. It adds that directory to the current
 PowerShell process's PATH only and prints the executable path for later use.
 No persistent environment, shell profile, administrator settings or file
-associations are changed. Run the printed path or manually add its directory to
-your PATH if desired. The first-run UI separately offers file-type registration.
+associations are changed. Run the printed path, or run `kwil.com
+--register-command-line` from that folder to put it on your user PATH (see
+[Command line](#command-line-windows)). The first-run UI separately offers
+file-type registration and the command-line choice.
 
 Linux/macOS install under `~/.local/share/kwil/vX.Y.Z` with a
 `~/.local/bin/kwil` symlink. Add `~/.local/bin` manually if it is not already on
@@ -99,6 +105,38 @@ user-managed removal or the existing installation's update mechanism.
 To uninstall a script installation, remove its version directory and the Unix
 symlink, if present. Keep your settings/recovery data. Unregister any file types
 through Settings before removing the executable if you enabled them.
+
+## Command line (Windows)
+
+"Use Kwil from the command line and Win+R" makes `kwil` work in a new terminal
+and in Win+R (Start > Run) without typing a path. It is per user, needs no
+administrator rights and is off until you choose it:
+
+- on the first-run page (next to "Open with"); the choice is not pre-ticked;
+- in Settings > Files and file types, a switch that shows the real state;
+- from the command palette: "Add Kwil to PATH" and "Remove Kwil from PATH";
+- from a terminal: `kwil.com --register-command-line`.
+
+It writes two things for the folder `kwil.exe` runs from: an App Paths entry
+(`HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\kwil.exe`, which
+Win+R uses) and that folder at the end of your user PATH
+(`HKCU\Environment`, keeping its existing type and every other entry). Running
+it again changes nothing. Open a new terminal afterwards: `kwil` then starts
+`kwil.com`, because `.COM` comes before `.EXE` in `PATHEXT`.
+
+Turn it off with the same switch, the "Remove Kwil from PATH" command, or
+`kwil.com --unregister-file-types` (which the uninstaller runs). Removal takes
+out only this install's App Paths entry (an entry that points at another Kwil is
+left alone) and only this folder from PATH; other entries and their order are
+unchanged. A portable copy registers the folder it runs from; temporary
+folders, network paths and linked folders (junctions, symbolic links) are
+refused, as for file types. Registering a second Kwil replaces the Win+R entry
+of the first. If you registered a folder and then move or delete it, turn the
+switch off from a Kwil that still exists, or remove the entries by hand.
+
+macOS and Linux need none of this: `scripts/install.sh` links
+`~/.local/bin/kwil`, so the choice is not shown there. The script does not edit
+shell profiles; add `~/.local/bin` to your PATH if your system does not.
 
 ## Linking
 

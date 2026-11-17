@@ -121,6 +121,9 @@ commands! {
     },
     "Update" => {
         "update.check" => "Check for Updates", "update.apply" => "Apply Update"
+    },
+    "Command line" => {
+        "commandLine.add" => "Add Kwil to PATH", "commandLine.remove" => "Remove Kwil from PATH"
     }
 }
 

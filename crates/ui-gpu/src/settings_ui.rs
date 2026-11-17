@@ -83,6 +83,8 @@ pub(super) enum Target {
     },
     /// Entry row of a page hosted inside the settings window.
     OpenHosted,
+    /// The "Use Kwil from the command line" switch (Windows).
+    CommandLine,
     /// Opaque target owned by the hosted page (constructed by `filetypes_ui`).
     #[allow(dead_code)]
     Hosted(u32),
@@ -152,6 +154,8 @@ pub(super) struct View {
     pub caret: Option<Rect>,
     /// The hosted page is showing instead of the setting list.
     pub hosted: bool,
+    /// The command-line switch, set by the owner of the state before each paint.
+    pub command_line: Option<command_line_ui::Row>,
     /// Window size and monitor scale of the last paint.
     surface: Option<Surface>,
     /// Card-only repaint (hover, wheel).
@@ -376,6 +380,7 @@ enum Step {
     Choose { index: usize, id: &'static str, value: &'static str },
     Hosted(bool),
     HostedTarget(u32),
+    CommandLine,
 }
 
 /// Clicks never change the destination of a scalar draft, capture, staged
@@ -462,6 +467,7 @@ fn plan(target: Target, s: &State) -> Vec<Step> {
             vec![Step::Panel(PanelInput::ReviewPage { index, pages })]
         }
         Target::OpenHosted if scalar && !drafting => vec![Step::Hosted(true)],
+        Target::CommandLine if scalar && !drafting => vec![Step::CommandLine],
         Target::Hosted(code) if s.hosted => vec![Step::HostedTarget(code)],
         _ => Vec::new(),
     }
@@ -1160,7 +1166,12 @@ fn scalar_page(
         source.category().is_none_or(|category| category == Category::Files)
             && query.split_whitespace().all(|word| page.keywords().contains(word.to_lowercase().as_str()))
     });
-    let total = rows.len() + usize::from(hosted_row.is_some());
+    // The command-line switch is listed beside the hosted entry, in the same places.
+    let command_line = view.command_line.clone().filter(|_| {
+        source.category().is_none_or(|category| category == Category::Files)
+            && query.split_whitespace().all(|word| COMMAND_LINE_KEYWORDS.contains(word.to_lowercase().as_str()))
+    });
+    let total = rows.len() + usize::from(hosted_row.is_some()) + usize::from(command_line.is_some());
     let title = if !query.is_empty() {
         format!("Results for “{}”", desktop::visible(query, 64))
     } else {
@@ -1202,11 +1213,16 @@ fn scalar_page(
         let index = view.scroll + slot;
         let r =
             Rect { x: layout.rows.x, y: layout.rows.y + slot * layout.row_h, w: width, h: layout.row_h - s.hairline };
-        if index == rows.len() {
-            if let Some(page) = hosted_row {
+        if index >= rows.len() {
+            let extra = index - rows.len();
+            if let (Some(page), 0) = (hosted_row, extra) {
                 hosted_entry(pixels, stride, font, r, page, view.hover, editing.is_some(), c, s, &mut view.hits);
+            } else if let Some(row) = command_line.as_ref().filter(|_| extra == usize::from(hosted_row.is_some())) {
+                command_line_entry(pixels, stride, font, m, r, layout.stacked, row, editing.is_some(), view, c, s);
+            } else {
+                break;
             }
-            break;
+            continue;
         }
         let Some(row) = rows.get(index) else { break };
         let is_selected = index == selected;
@@ -1248,6 +1264,53 @@ fn hosted_entry(
     let chevron = (r.x as f32 + r.w as f32 - s.pad as f32 * 1.5, r.y as f32 + r.h as f32 / 2.0);
     desktop::icon(pixels, stride, Icon::Forward, chevron, s.icon, c.muted, c.surface, s);
     hits.push(r, Target::OpenHosted);
+}
+
+const COMMAND_LINE_KEYWORDS: &str = "command line terminal shell path win+r run use kwil";
+
+/// "Use Kwil from the command line and Win+R": a real switch over the real state.
+#[allow(clippy::too_many_arguments)]
+fn command_line_entry(
+    pixels: &mut [u32],
+    stride: usize,
+    font: &mut font::UiFont,
+    m: &Metrics,
+    r: Rect,
+    stacked: bool,
+    row: &command_line_ui::Row,
+    editing: bool,
+    view: &mut View,
+    c: &Colors,
+    s: &Sizes,
+) {
+    let v = m.dip(12.0);
+    let small = m.dip(18.0);
+    let left = r.x + s.pad + s.gap;
+    let (control, text_w) = if stacked {
+        let y = r.y + v + s.text + 2 * small + s.gap;
+        (Rect { x: left, y, w: m.dip(120.0).min(r.w), h: s.control }, r.w.saturating_sub(left - r.x + s.pad))
+    } else {
+        // Same column as every other switch on this page.
+        let w = m.dip(300.0).min(r.w * 2 / 5);
+        let control = Rect { x: r.x + r.w - s.pad - w, y: r.y + (r.h - s.control) / 2, w, h: s.control };
+        (control, control.x.saturating_sub(left + s.pad))
+    };
+    let hovered = view.hover == Some(Target::CommandLine) && !editing && !row.busy;
+    desktop::row(pixels, stride, r, false, hovered, c, s);
+    let title = Rect { x: left, y: r.y + v, w: text_w, h: s.text };
+    desktop::label(pixels, stride, font, title, "Use Kwil from the command line and Win+R", c.fg);
+    let lines = [("Adds Kwil to your user PATH, for terminals and Win+R.", c.muted)];
+    let detail = (row.detail.as_str(), if row.problem { c.error } else { c.faint });
+    for (line, (text, color)) in lines.iter().copied().chain(std::iter::once(detail)).enumerate() {
+        let y = title.y + s.text + line * small;
+        for wrapped in desktop::wrap(font, text, text_w, 1) {
+            desktop::label(pixels, stride, font, Rect { x: left, y, w: text_w, h: small }, &wrapped, color);
+        }
+    }
+    desktop::switch(pixels, stride, font, control, row.on, hovered, c, s);
+    if !row.busy {
+        view.hits.push(control, Target::CommandLine);
+    }
 }
 
 /// One schema row. Returns the caret of its draft field.
@@ -2127,6 +2190,10 @@ impl App {
                     self.settings_hosted_click(code);
                     Ok(())
                 }
+                Step::CommandLine => {
+                    self.command_line_toggle();
+                    Ok(())
+                }
             };
             if let Err(error) = result {
                 self.view.set_notice(format!("Settings: {error}"));
@@ -2209,6 +2276,7 @@ impl App {
         }
         if id == "view.settings" {
             self.start_registration();
+            self.command_line_refresh();
         }
         if let Some(palette) = &mut self.palette {
             let _ = palette.input(kwil_view_model::palette_session::PaletteInput::Cancel);
@@ -2876,6 +2944,7 @@ mod tests {
             Target::PanelChange { index: 0, print: 1 },
             Target::PanelRemove { index: 0, print: 1 },
             Target::OpenHosted,
+            Target::CommandLine,
         ];
         let scalar_draft = State { editing: true, ..State::default() };
         let capture =
@@ -2906,6 +2975,8 @@ mod tests {
             [Step::Panel(PanelInput::Next)]
         ));
         assert!(plan(Target::EntryColumn(EditColumn::Key), &entry).is_empty(), "the focused field is no-op");
+        // Outside a draft the switch is one real action, not a settings edit.
+        assert!(matches!(plan(Target::CommandLine, &State::default()).as_slice(), [Step::CommandLine]));
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub(super) enum Action {
     Back,
     Skip,
     FileType(u32),
+    /// Tick or untick "Use Kwil from the command line and Win+R".
+    CommandLine,
 }
 
 #[derive(Default)]
@@ -20,6 +22,8 @@ pub(super) struct WelcomeView {
     pub scroll: usize,
     pub problem: Option<String>,
     pub focus: usize,
+    /// The command-line choice, set by the owner of the state before each paint.
+    pub command_line: Option<command_line_ui::Row>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,7 +65,7 @@ pub(super) fn draw(
         desktop::label(pixels, w, font.heading(), Rect { h: header.min(inner.h), ..inner }, title, c.fg);
     }
     let content_y = (inner.y + header).min(footer.y);
-    let content = Rect { y: content_y, h: footer.y.saturating_sub(content_y + s.gap), ..inner };
+    let mut content = Rect { y: content_y, h: footer.y.saturating_sub(content_y + s.gap), ..inner };
     if model.stage() == welcome::Stage::About {
         draw_about(pixels, w, font, content, &c, &s, metrics);
         view.rows = (1, 1);
@@ -77,6 +81,13 @@ pub(super) fn draw(
         desktop::button(pixels, w, font, skip, "Not now", Style::Subtle, false, &c, &s);
         view.hits.push(skip, Action::Skip);
     } else {
+        // The command-line choice sits under the file-type step, always visible.
+        let choice = view.command_line.clone().filter(|_| content.h > s.control * 4).map(|row| {
+            let height = s.control + s.text + s.gap;
+            let choice = Rect { y: content.y + content.h - height, h: height, ..content };
+            content.h -= height + s.gap;
+            (choice, row)
+        });
         if let Some(page) = page {
             page.ui.setup = true;
             let mut hits = Hits::default();
@@ -102,6 +113,10 @@ pub(super) fn draw(
                 );
             }
         }
+        if let Some((choice, row)) = choice {
+            draw_command_line_choice(pixels, w, font, choice, &row, &c, &s);
+            view.hits.push(choice, Action::CommandLine);
+        }
         let bw = metrics.dip(125.0).min(footer.w / 2);
         let back = Rect { w: bw, ..footer };
         desktop::button(pixels, w, font, back, "Back", Style::Secondary, false, &c, &s);
@@ -126,6 +141,35 @@ pub(super) fn draw(
         }
     }
     Some(area)
+}
+
+/// Checkbox, title and one state line. The whole block is the click target.
+fn draw_command_line_choice(
+    pixels: &mut [u32],
+    stride: usize,
+    font: &mut font::UiFont,
+    area: Rect,
+    row: &command_line_ui::Row,
+    c: &Colors,
+    s: &Sizes,
+) {
+    desktop::hline(pixels, stride, area.x, area.y, area.w, c, s);
+    let line = Rect { y: area.y + s.gap, h: s.control, ..area };
+    let boxed = desktop::checkbox(
+        pixels,
+        stride,
+        font,
+        line,
+        "Use Kwil from the command line and Win+R",
+        row.on,
+        false,
+        !row.busy,
+        c,
+        s,
+    );
+    let x = boxed.x + boxed.w + s.gap;
+    let detail = Rect { x, y: line.y + line.h, w: area.w.saturating_sub(x - area.x), h: s.text };
+    desktop::label(pixels, stride, font, detail, &row.detail, if row.problem { c.error } else { c.muted });
 }
 
 fn draw_about(
@@ -472,6 +516,7 @@ impl App {
             Action::Next => {
                 self.welcome.next();
                 self.start_registration();
+                self.command_line_refresh();
             }
             Action::Back => {
                 self.welcome.back();
@@ -480,6 +525,7 @@ impl App {
                 }
             }
             Action::Skip => self.welcome.skip_registration(),
+            Action::CommandLine => self.command_line_toggle(),
             Action::FileType(code) => {
                 if let Some(page) = &mut self.file_types {
                     page.click(code);
@@ -515,6 +561,11 @@ impl App {
         }
         if was_visible && !self.welcome.visible() {
             let _ = self.proxy.send_event(UserEvent::OpenExternal);
+            let applied = matches!(
+                self.file_types.as_ref().map(|page| page.service.registration_status()),
+                Some(kwil_view_model::file_type_registration::RegistrationStatus::Applied { .. })
+            );
+            self.command_line_apply_default(applied);
         }
     }
 }
