@@ -636,7 +636,10 @@ fn key_route<'a>(
 }
 
 /// Compact display of a value inside a field or summary.
-pub(super) fn value_text(value: &SettingValue) -> String {
+pub(super) fn value_text(kind: SettingKind, value: &SettingValue) -> String {
+    if let Some(size) = kind.size_text(value) {
+        return size;
+    }
     match value {
         SettingValue::Bool(value) => if *value { "On" } else { "Off" }.into(),
         SettingValue::Integer(value) => value.to_string(),
@@ -1430,7 +1433,14 @@ fn scalar_row(
             view.hits.push(control, target);
             None
         }
-        (SettingKind::Integer | SettingKind::Float | SettingKind::Text | SettingKind::Strings, value) => {
+        (
+            SettingKind::Integer
+            | SettingKind::Bytes { .. }
+            | SettingKind::Float
+            | SettingKind::Text
+            | SettingKind::Strings,
+            value,
+        ) => {
             if let Some(text) = draft {
                 let button = s.control;
                 let field = Rect { w: control.w.saturating_sub(2 * (button + s.gap / 2)), ..control };
@@ -1478,7 +1488,7 @@ fn scalar_row(
                 caret
             } else {
                 let target = Target::Edit { index, id };
-                let shown = value_text(value);
+                let shown = value_text(row.spec.kind, value);
                 let field = Field {
                     text: &shown,
                     cursor: 0,
@@ -1499,7 +1509,7 @@ fn scalar_row(
             let bw = desktop::button_width(font, "Edit", s).min(control.w);
             let button = Rect { x: control.x + control.w - bw, w: bw, ..control };
             let summary = Rect { w: control.w.saturating_sub(bw + s.gap), ..control };
-            desktop::label_right(pixels, stride, font, summary, &value_text(value), c.muted);
+            desktop::label_right(pixels, stride, font, summary, &value_text(row.spec.kind, value), c.muted);
             desktop::button(
                 pixels,
                 stride,
@@ -1613,6 +1623,12 @@ fn panel_page(
             .unwrap_or_default();
         return entry_sheet(pixels, stride, font, m, layout, edit, (key_label, value_label), &help, view, c, s);
     }
+    let mut layout = layout;
+    if kind == SettingsPanel::Keymap {
+        // One line per shortcut: name and keys; details only when selected.
+        layout.row_h = s.list_row_tall;
+        layout.visible = (layout.rows.h / layout.row_h).max(1);
+    }
     let detail = format!("{} {unit}", meta.total.saturating_sub(usize::from(kind != SettingsPanel::Keymap)));
     page_heading(pixels, stride, font, layout.heading, meta.title, &detail, true, view.hover, c, s, &mut view.hits);
     let total = meta.total;
@@ -1640,7 +1656,11 @@ fn panel_page(
         let hovered = hover_row == Some(index);
         desktop::row(pixels, stride, r, desktop::RowState::new(row.selected, hovered), c, s);
         view.hits.push(r, Target::PanelRow { index, print });
-        panel_row(pixels, stride, font, m, r, kind, index, print, row, row.selected || hovered, view, c, s);
+        if kind == SettingsPanel::Keymap {
+            keymap_row(pixels, stride, font, r, index, print, row, row.selected || hovered, view, c, s);
+        } else {
+            panel_row(pixels, stride, font, m, r, kind, index, print, row, row.selected || hovered, view, c, s);
+        }
     }
     desktop::scroll_thumb(
         pixels,
@@ -1680,16 +1700,9 @@ fn panel_row(
     let mut text_end = right;
     if actions {
         let change = Target::PanelChange { index, print };
-        let label = if row.add {
-            "Add"
-        } else if kind == SettingsPanel::Keymap {
-            "Change"
-        } else {
-            "Edit"
-        };
+        let label = if row.add { "Add" } else { "Edit" };
         let remove = match kind {
             _ if row.add => None,
-            SettingsPanel::Keymap => Some("Reset"),
             SettingsPanel::Formatters => None,
             _ => Some("Remove"),
         };
@@ -1699,8 +1712,7 @@ fn panel_row(
             let w = desktop::button_width(font, text, s);
             x = x.saturating_sub(w);
             let rect = Rect { x, w, ..line2 };
-            let style = if kind == SettingsPanel::Keymap { Style::Subtle } else { Style::Danger };
-            desktop::button(pixels, stride, font, rect, text, style, hover == Some(target), false, c, s);
+            desktop::button(pixels, stride, font, rect, text, Style::Danger, hover == Some(target), false, c, s);
             view.hits.push(rect, target);
             x = x.saturating_sub(s.gap);
         }
@@ -1735,16 +1747,7 @@ fn panel_row(
         let tag = Rect { x: pen + s.gap, w: (title.x + title.w).saturating_sub(pen + s.gap), ..title };
         desktop::label(pixels, stride, font, tag, &row.source, c.faint);
     }
-    if kind == SettingsPanel::Keymap {
-        if row.value.is_empty() {
-            desktop::label_right(pixels, stride, font, value_rect, "Unbound", c.faint);
-        } else {
-            let w = desktop::keycaps_width(font, &row.value, s, value_rect.w);
-            desktop::keycaps(pixels, stride, font, value_rect, value_rect.x + value_rect.w - w, &row.value, c, s);
-        }
-    } else {
-        desktop::label_right(pixels, stride, font, value_rect, &row.value, c.muted);
-    }
+    desktop::label_right(pixels, stride, font, value_rect, &row.value, c.muted);
     let mut desc = Rect { w: text_end.saturating_sub(left), ..line2 };
     if !row.conflicts.is_empty() {
         let text = count(row.conflicts.len(), "conflict", "conflicts");
@@ -1753,6 +1756,97 @@ fn panel_row(
     }
     if desc.w > m.dip(80.0) {
         desktop::label(pixels, stride, font.small(), desc, &row.description, c.muted);
+    }
+}
+
+/// What one keymap row says. Every row: the command name, its keys (None
+/// reads "Unbound"), a conflict count and a "User" tag for custom shortcuts.
+/// Only the selected row adds the category and command id; the footer names
+/// the keys that act on it.
+#[derive(Debug, PartialEq, Eq)]
+struct KeymapRowText<'a> {
+    title: &'a str,
+    keys: Option<&'a str>,
+    conflicts: Option<String>,
+    custom: bool,
+    detail: Option<&'a str>,
+}
+
+fn keymap_row_text(row: &PanelRow) -> KeymapRowText<'_> {
+    KeymapRowText {
+        title: &row.title,
+        keys: (!row.value.is_empty()).then_some(row.value.as_str()),
+        conflicts: (!row.conflicts.is_empty()).then(|| count(row.conflicts.len(), "conflict", "conflicts")),
+        custom: row.source == "User",
+        detail: (row.selected && !row.description.is_empty()).then_some(row.description.as_str()),
+    }
+}
+
+/// One line: name, conflict count, tag and (selected) details on the left;
+/// keys anchored at the right edge, with Change and Reset to their left on the
+/// selected or hovered row, so the keys never move.
+#[allow(clippy::too_many_arguments)]
+fn keymap_row(
+    pixels: &mut [u32],
+    stride: usize,
+    font: &mut font::UiFont,
+    r: Rect,
+    index: usize,
+    print: u64,
+    row: &PanelRow,
+    actions: bool,
+    view: &mut View,
+    c: &Colors,
+    s: &Sizes,
+) {
+    let text = keymap_row_text(row);
+    let left = r.x + s.pad + s.gap;
+    let right = r.x + r.w - s.pad;
+    let mut end = match text.keys {
+        Some(keys) => {
+            let w = desktop::keycaps_width(font, keys, s, r.w / 3);
+            desktop::keycaps(pixels, stride, font, Rect { x: right - w, w, ..r }, right - w, keys, c, s)
+                .min(right)
+                .saturating_sub(w)
+        }
+        None => {
+            let slot = Rect { x: r.x + r.w / 2, w: right.saturating_sub(r.x + r.w / 2), ..r };
+            desktop::label_right(pixels, stride, font.small(), slot, "Unbound", c.muted)
+        }
+    };
+    // On a narrow row the name wins: Change and Reset appear only when the
+    // title keeps its room (Enter and Delete still act on the selected row).
+    let buttons: usize =
+        ["Reset", "Change"].into_iter().map(|label| desktop::button_width(font, label, s) + s.gap).sum();
+    let title_min = font.measure(text.title, usize::MAX).min(4 * s.control);
+    if actions && end.saturating_sub(left) >= buttons + title_min + s.gap {
+        let y = r.y + r.h.saturating_sub(s.control) / 2;
+        for (text, target, style) in [
+            ("Reset", Target::PanelRemove { index, print }, Style::Subtle),
+            ("Change", Target::PanelChange { index, print }, Style::Secondary),
+        ] {
+            let w = desktop::button_width(font, text, s);
+            let x = end.saturating_sub(s.gap + w).max(left);
+            let rect = Rect { x, y, w: end.saturating_sub(s.gap).saturating_sub(x).min(w), h: s.control };
+            desktop::button(pixels, stride, font, rect, text, style, view.hover == Some(target), false, c, s);
+            view.hits.push(rect, target);
+            end = x;
+        }
+    }
+    let end = end.saturating_sub(s.gap);
+    let mut pen =
+        desktop::label(pixels, stride, font, Rect { x: left, w: end.saturating_sub(left), ..r }, text.title, c.fg);
+    let small = [
+        text.conflicts.as_deref().map(|t| (t, c.error)),
+        text.custom.then_some(("User", c.faint)),
+        text.detail.map(|t| (t, c.muted)),
+    ];
+    for (label, color) in small.into_iter().flatten() {
+        let x = pen + s.gap;
+        if x + s.gap >= end {
+            break;
+        }
+        pen = desktop::label(pixels, stride, font.small(), Rect { x, w: end - x, ..r }, label, color);
     }
 }
 
@@ -3146,6 +3240,35 @@ mod tests {
         let (_, area) = paint(&source, (240, 160), 1.0, &mut tiny);
         assert!(tiny.hits.len() == 0, "the compact card offers no stale targets");
         assert!(area.is_some_and(|a| a.w <= 240));
+    }
+
+    /// KW-92: a keymap row is its name and keys ("Unbound" when none); only
+    /// the selected row adds the category and command id, and no row repeats
+    /// the key hints, which the footer states once.
+    #[test]
+    fn keymap_rows_show_category_and_id_only_on_the_selected_row() {
+        let doc = SettingsDocument::parse("[[bindings]]\nkeys='alt+f12'\ncommand='file.save'\n").unwrap();
+        let mut panel = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        panel.search(&doc, "file.").unwrap();
+        for step in 0..3 {
+            let window = panel.window(&doc, 0, 64).unwrap();
+            assert_eq!(window.rows.iter().filter(|row| row.selected).count(), 1);
+            let (mut unbound, mut custom) = (false, false);
+            for row in &window.rows {
+                let text = keymap_row_text(row);
+                assert_eq!(text.title, row.title);
+                assert_eq!(text.keys, (!row.value.is_empty()).then_some(row.value.as_str()), "{}", row.title);
+                unbound |= text.keys.is_none();
+                custom |= text.custom;
+                let id = row.command.expect("keymap rows name their command");
+                let category = kwil_core_commands::command(id).unwrap().category;
+                let expected = format!("{category} · {id}");
+                assert_eq!(text.detail, row.selected.then_some(expected.as_str()), "step {step}: {}", row.title);
+                assert!(!row.description.contains("Enter"), "rows never repeat key hints: {}", row.description);
+            }
+            assert!(unbound && custom, "the filtered list has an unbound and a custom shortcut");
+            panel.input(&doc, PanelInput::Next).unwrap();
+        }
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! Navigable settings panel; filesystem work belongs to SettingsSession.
 use super::*;
-use kwil_core_commands::settings_ui::SettingValue;
+use kwil_core_commands::settings_ui::{SettingKind, SettingValue};
 use kwil_view_model::palette_session::{display_text, text_window};
 use kwil_view_model::settings_panels::{EditColumn, PanelInput};
 use kwil_view_model::settings_session::{SettingsInput, SettingsSession};
 
-fn value_text(value: &SettingValue) -> String {
+fn value_text(kind: SettingKind, value: &SettingValue) -> String {
+    if let Some(size) = kind.size_text(value) {
+        return size;
+    }
     match value {
         SettingValue::Bool(value) => if *value { "On" } else { "Off" }.into(),
         SettingValue::Integer(value) => value.to_string(),
@@ -167,13 +170,13 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
             ));
             input.text
         } else {
-            value_text(&row.current)
+            value_text(row.spec.kind, &row.current)
         };
         line((index - first + 2) as u16, format!("{}: {}", row.spec.title, value), index == host.selected());
     }
     if let Some(row) = rows.get(host.selected()) {
         line(height - 4, row.spec.description.into(), false);
-        line(height - 3, format!("Default: {}", value_text(&row.default)), false);
+        line(height - 3, format!("Default: {}", value_text(row.spec.kind, &row.default)), false);
     }
     line(height - 2, host.status().into(), false);
     line(height - 1, "Enter: edit  /: search  Delete: reset  Ctrl+S: save  Esc: back".into(), false);
@@ -233,22 +236,16 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
         caret = Some((area.x + 1 + (label.len() + input.cursor).min(columns - 1) as u16, area.y + area.height - 4));
     } else if let Some(capture) = &window.capture {
         line(area.height - 4, format!("Keys: {}", if capture.is_empty() { "Press keys..." } else { capture }), true);
-        line(area.height - 3, "Enter accepts a captured chord; Esc cancels".into(), false);
     } else if let Some(row) = window.rows.iter().find(|row| row.selected) {
         line(area.height - 4, row.description.clone(), false);
         line(area.height - 3, format!("Default: {}", row.default), false);
     }
+    // The status line carries the shared per-state key hint (or a save
+    // message), so there is one footer; only conflict review adds its keys.
     line(area.height - 2, host.status().into(), false);
-    line(
-        area.height - 1,
-        if window.proposal.is_none() {
-            "Enter edit/apply  Delete reset/remove  Esc back"
-        } else {
-            "Up/Down review conflicts  Enter replace  Esc cancel"
-        }
-        .into(),
-        false,
-    );
+    if window.proposal.is_some() {
+        line(area.height - 1, "Up/Down review conflicts  Enter replace  Esc cancel".into(), false);
+    }
     if let Some(caret) = caret {
         frame.set_cursor_position(caret);
     }
