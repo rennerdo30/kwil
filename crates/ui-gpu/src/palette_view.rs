@@ -67,11 +67,14 @@ pub(super) fn cleared_query(query: &str) -> &'static str {
     }
 }
 
+/// Card width: genuinely screen-specific, so it stays a named constant here.
+const WIDTH_DIP: f64 = 640.0;
+
 /// Top of the card: below the menu and tab strip, as an anchored command bar.
 fn card(size: (usize, usize), m: &Metrics, s: &Sizes, rows: usize) -> Option<(Rect, usize)> {
-    let w = size.0.saturating_sub(2 * s.gap).min(m.dip(640.0));
+    let w = size.0.saturating_sub(2 * s.gap).min(m.dip(WIDTH_DIP));
     let top = (m.menu + m.tabs + s.gap).min(size.1 / 4);
-    let row_h = m.dip(36.0);
+    let row_h = s.list_row;
     let chrome = s.pad + s.control + s.gap + s.gap + s.footer;
     let room = size.1.saturating_sub(top + s.gap + chrome);
     let visible = (room / row_h).min(12).min(rows.max(1)).max(1);
@@ -144,7 +147,7 @@ pub(super) fn draw(
     }
     let list_top = field.y + field.h + s.gap;
     desktop::hline(pixels, stride, inner.x, list_top, inner.w, &c, &s);
-    let row_h = m.dip(36.0);
+    let row_h = s.list_row;
     let selected = palette.selected().unwrap_or(0);
     if view.shown != Some((selected, visible)) {
         view.first = desktop::reveal(view.first, selected, visible, rows.len());

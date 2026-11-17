@@ -254,7 +254,7 @@ impl HostedPage for Page {
         let list = Rect { x: area.x, y, w: area.w, h: bottom_y.saturating_sub(y) };
         let cell_w = (s.control * 9).min(list.w.saturating_sub(s.thumb + s.gap)).max(1);
         let columns = (list.w.saturating_sub(s.thumb + s.gap) / cell_w).max(1);
-        let row_h = s.nav;
+        let row_h = s.list_row;
         let all = lines(self.service.selection(), columns);
         let visible = (list.h / row_h).max(1);
         self.ui.scroll = self.ui.scroll.min(all.len().saturating_sub(visible));
@@ -408,7 +408,7 @@ impl Page {
             vec!["Scroll for all types · Open with only".into()]
         };
         let total = rows.len() + 3 + notes.len();
-        let visible = top.h / s.nav.max(1);
+        let visible = top.h / s.list_row.max(1);
         self.ui.scroll = self.ui.scroll.min(total.saturating_sub(visible.max(1)));
         self.ui.rows = (visible.max(1), total);
         for slot in 0..visible {
@@ -416,7 +416,12 @@ impl Page {
             if index >= total {
                 break;
             }
-            let row = Rect { x: top.x, y: top.y + slot * s.nav, w: top.w.saturating_sub(s.thumb + s.gap), h: s.nav };
+            let row = Rect {
+                x: top.x,
+                y: top.y + slot * s.list_row,
+                w: top.w.saturating_sub(s.thumb + s.gap),
+                h: s.list_row,
+            };
             if index < notes.len() {
                 desktop::label(buf, stride, font, row, &notes[index], c.muted);
                 continue;

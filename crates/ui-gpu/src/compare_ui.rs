@@ -1,5 +1,6 @@
 //! Side-by-side read-only body; all source reads and refinement are worker-owned.
 use super::*;
+use kwil_core_commands::theme::UiRole;
 use kwil_view_model::compare_session::{Action, Kind, Session};
 use std::sync::Arc;
 
@@ -120,6 +121,12 @@ pub(super) fn draw(
     };
     let half = width / 2;
     let gutter = 6 * font.cw;
+    // Line fills are the theme's diff roles over the editor background; a
+    // changed word is the same role pushed further from it, keeping its hue.
+    let theme = theme_ui::chrome();
+    let (added, removed) =
+        (theme_ui::rgb_over_background(&theme, UiRole::Added), theme_ui::rgb_over_background(&theme, UiRole::Removed));
+    let word_fill = |role: u32| chrome::emphasize(bg(), role);
     for (index, row) in page.rows.iter().take(rows).enumerate().filter(|(index, _)| dirty(*index)) {
         let y = index * font.ch;
         if row.hidden > 0 {
@@ -138,12 +145,9 @@ pub(super) fn draw(
         }
         for side in 0..2 {
             let x = side * half;
-            let light = bg() > 0x808080;
             let color = match (row.kind, side) {
-                (Kind::Delete | Kind::Modify, 0) if light => 0xf9dde1,
-                (Kind::Insert | Kind::Modify, 1) if light => 0xdff2e2,
-                (Kind::Delete | Kind::Modify, 0) => 0x38252b,
-                (Kind::Insert | Kind::Modify, 1) => 0x20392e,
+                (Kind::Delete | Kind::Modify, 0) => removed,
+                (Kind::Insert | Kind::Modify, 1) => added,
                 _ => bg(),
             };
             fill(pixels, width, Rect { x, y, w: half, h: font.ch }, color);
@@ -158,12 +162,7 @@ pub(super) fn draw(
                     .get(words.partition_point(|r| r.end <= cell.bytes.start))
                     .is_some_and(|r| r.start < cell.bytes.end)
                 {
-                    let word_bg = match (light, side) {
-                        (true, 0) => 0xf0a9b7,
-                        (true, _) => 0xade1b7,
-                        (false, 0) => 0x783947,
-                        _ => 0x326748,
-                    };
+                    let word_bg = word_fill(color);
                     let cx = x + gutter + cell.column * font.cw;
                     fill(pixels, width, Rect { x: cx, y, w: cell.width * font.cw, h: font.ch }, word_bg);
                     draw_text(pixels, width, font, cx, y, cell.text.as_bytes(), cell.width, fg(), word_bg);
@@ -208,6 +207,62 @@ mod tests {
             );
         }
         assert!(pixels.iter().any(|p| *p != bg()));
+    }
+
+    fn session_with_one_change() -> Session {
+        use kwil_view_model::compare_session::{Page, Row};
+        let mut session = Session::default();
+        session.page.replace(Page {
+            rows: vec![Row {
+                left: Some(0),
+                right: Some(0),
+                kind: Kind::Modify,
+                text: [b"old".to_vec(), b"new".to_vec()],
+                words: [std::iter::once(0..3).collect(), std::iter::once(0..3).collect()],
+                hidden: 0,
+            }],
+            top: 0,
+            total: 1,
+            changes: 1,
+            ignore_whitespace: false,
+            collapsed: false,
+            right_title: String::new(),
+        });
+        session
+    }
+
+    #[test]
+    fn diff_rows_use_the_theme_diff_roles_in_the_dark_and_light_themes() {
+        use kwil_core_commands::theme::{Scheme, Theme};
+        let Some(mut font) = Font::load(14.0) else { return };
+        let previous = theme_ui::chrome();
+        for scheme in [Scheme::Dark, Scheme::Light] {
+            let theme = Arc::new(Theme::builtin(scheme));
+            theme_ui::select(theme.clone());
+            let session = session_with_one_change();
+            let width = 800;
+            let mut pixels = vec![0; width * font.ch];
+            draw(&session, &mut pixels, width, &mut font, |_| true);
+            let last = |side: usize| pixels[(side + 1) * width / 2 - 2];
+            assert_eq!(last(0), theme_ui::rgb(&theme, UiRole::Removed), "{scheme:?} left fill is the removed role");
+            assert_eq!(last(1), theme_ui::rgb(&theme, UiRole::Added), "{scheme:?} right fill is the added role");
+            let word = |side: usize| pixels[side * width / 2 + 6 * font.cw + 1];
+            assert_ne!(word(0), last(0), "{scheme:?} changed words are stronger than the line");
+            assert_ne!(word(1), last(1));
+        }
+        // An imported theme's translucent diff role is composited, not painted opaque.
+        let mut theme = Theme::builtin(Scheme::Dark);
+        let translucent = kwil_core_commands::theme::Rgba(0x9b, 0xb9, 0x55, 0x33);
+        theme.set_ui(UiRole::Added, translucent);
+        let theme = Arc::new(theme);
+        theme_ui::select(theme.clone());
+        let width = 800;
+        let mut pixels = vec![0; width * font.ch];
+        draw(&session_with_one_change(), &mut pixels, width, &mut font, |_| true);
+        let kwil_core_commands::theme::Rgba(r, g, b, _) = translucent.over(theme.ui().get(UiRole::Background));
+        let expected = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        assert_eq!(pixels[width - 2], expected, "translucent added role is composited over the background");
+        theme_ui::select(previous);
     }
 
     #[test]

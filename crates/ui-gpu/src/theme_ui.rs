@@ -87,7 +87,7 @@ pub(super) fn draw(
     let width = m.dip(620.0).min(size.0.saturating_sub(2 * s.gap));
     let top = m.menu + m.tabs + s.gap;
     let fixed = s.header + s.control + 3 * s.gap + 2 * s.footer;
-    let visible = ((size.1.saturating_sub(top + fixed + s.gap)) / s.nav.max(1)).min(10).min(rows.len());
+    let visible = ((size.1.saturating_sub(top + fixed + s.gap)) / s.list_row.max(1)).min(10).min(rows.len());
     if width < m.dip(200.0) || size.1 < top + fixed {
         return None;
     }
@@ -95,7 +95,7 @@ pub(super) fn draw(
         x: (size.0 - width) / 2,
         y: top,
         w: width,
-        h: fixed + if host.importing() { 0 } else { visible * s.nav },
+        h: fixed + if host.importing() { 0 } else { visible * s.list_row },
     };
     desktop::card(pixels, size.0, area, &c, &s);
     let inner = Rect { x: area.x + s.pad, y: area.y, w: area.w.saturating_sub(2 * s.pad), h: s.header };
@@ -132,7 +132,7 @@ pub(super) fn draw(
     let first = host.selected().saturating_sub(visible.saturating_sub(1));
     if !host.importing() {
         for (index, entry) in rows.iter().enumerate().skip(first).take(visible) {
-            let row = Rect { y: field.y + field.h + s.gap + (index - first) * s.nav, h: s.nav, ..inner };
+            let row = Rect { y: field.y + field.h + s.gap + (index - first) * s.list_row, h: s.list_row, ..inner };
             desktop::row(pixels, size.0, row, index == host.selected(), false, &c, &s);
             desktop::label(
                 pixels,
@@ -160,6 +160,14 @@ pub(super) fn draw(
 
 pub(super) fn rgb(theme: &Theme, role: UiRole) -> u32 {
     let Rgba(r, g, b, _) = theme.ui().get(role);
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
+
+/// `role` composited over the editor background. Imported themes often give
+/// fill roles (diff lines) a translucent alpha; dropping it paints them opaque.
+pub(super) fn rgb_over_background(theme: &Theme, role: UiRole) -> u32 {
+    let ui = theme.ui();
+    let Rgba(r, g, b, _) = ui.get(role).over(ui.get(UiRole::Background));
     (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
 }
 

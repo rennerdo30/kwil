@@ -3158,7 +3158,9 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
     let columns = w.saturating_sub(gutter + BAR) / font.cw;
     if let (Ok(range), Ok(selections), Some(line)) =
         (editor.line_range(absolute_row), editor.selection_ranges(absolute_row), view.line(row))
+        && !selections.is_empty()
     {
+        let selection = theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::Selection);
         for cell in text::cells(line, columns, font.tab_size()) {
             let source =
                 range.start + horizontal + cell.bytes.start as u64..range.start + horizontal + cell.bytes.end as u64;
@@ -3173,7 +3175,7 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
             for y in row * font.ch..(row + 1) * font.ch {
                 for x in gutter + start * font.cw..gutter + end * font.cw {
                     let pixel = &mut buf[y * w + x];
-                    *pixel = ((*pixel & 0xfefefe) >> 1) + 0x183454;
+                    *pixel = font::blend(*pixel, selection, 100);
                 }
             }
         }
@@ -3672,13 +3674,9 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.palette_dirty |= self.palette.as_ref().is_some_and(|palette| palette.model().is_open());
                 self.palette_dirty |= self.settings_panel.as_ref().is_some_and(|panel| panel.is_open());
-                if matches!(tile.key.bg, tabs::ACTIVE | tabs::INACTIVE) {
-                    font.accept(tile);
-                    self.chrome_dirty = true;
-                    Damage::default()
-                } else {
-                    glyph_damage(font, tile, self.view.rows())
-                }
+                // Chrome text uses the UI face; the editor face only draws body
+                // rows, so a finished tile damages the rows that waited for it.
+                glyph_damage(font, tile, self.view.rows())
             }
             UserEvent::SessionChanged(detected) => {
                 #[cfg(feature = "gpu")]

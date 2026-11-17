@@ -1541,7 +1541,8 @@ pub(super) fn layout(source: kwil_view_model::TabArea, m: &Metrics, open: bool) 
     } else {
         3
     };
-    let height = ((rows + 1) * m.dip(32.0) + (rows + 3) * m.dip(4.0) + m.dip(20.0)).min(source.height);
+    let s = Sizes::new(m);
+    let height = ((rows + 1) * s.control + (rows + 3) * s.xs + s.text).min(source.height);
     Layout {
         bar: Some(Rect { x: source.x, y: source.y, w: source.width, h: height }),
         body: kwil_view_model::TabArea { y: source.y.saturating_add(height), height: source.height - height, ..source },
@@ -1601,8 +1602,9 @@ pub(super) fn draw(
     host.geometry_epoch = host.input_epoch;
     let c = Colors::new(theme);
     let mut s = Sizes::new(m);
-    s.gap = m.dip(4.0);
-    s.inner = m.dip(6.0);
+    // A denser filter bar: the tight end of the spacing scale.
+    s.gap = s.xs;
+    s.inner = s.xs + s.xxs;
     chrome::fill_clipped(pixels, size.0, r, c.sidebar);
     let inner = inset(r, s.gap);
     let rows = if width >= m.dip(1200.0) {
@@ -1780,10 +1782,11 @@ pub(super) fn draw_body(
     let gutter_columns = GUTTER_COLS.max(digits + 1).min(stride / font.cw.max(1));
     let gutter = gutter_columns * font.cw;
     let columns = stride.saturating_sub(gutter) / font.cw.max(1);
+    let selected_bg =
+        chrome::selected_color(bg(), theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::Selection));
     for (index, row) in rows.iter().enumerate().take(height / font.ch.max(1)) {
         let y = index * font.ch;
-        let row_bg =
-            if host.focus == Target::Results && index == host.selected { chrome::mix(bg(), fg(), 0x12) } else { bg() };
+        let row_bg = if host.focus == Target::Results && index == host.selected { selected_bg } else { bg() };
         fill(pixels, stride, Rect { x: 0, y, w: gutter, h: font.ch }, gutter_bg());
         fill(pixels, stride, Rect { x: gutter, y, w: stride - gutter, h: font.ch }, row_bg);
         let number = format!(

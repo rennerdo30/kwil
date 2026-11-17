@@ -356,6 +356,9 @@ fn reveal(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Menu width: genuinely screen-specific, so it stays a named constant here.
+const WIDTH_DIP: f64 = 280.0;
+
 pub(super) fn draw(
     context: &mut Context,
     pixels: &mut [u32],
@@ -369,9 +372,8 @@ pub(super) fn draw(
     }
     let colors = desktop::Colors::new(theme);
     let sizes = desktop::Sizes::new(ui);
-    let row = ui.dip(32.0);
-    let pad = ui.dip(8.0);
-    let width = ui.dip(280.0).min(size.0);
+    let (row, pad) = (sizes.menu_item, sizes.sm);
+    let width = ui.dip(WIDTH_DIP).min(size.0);
     let height = (context.items.len() * row + 2 * pad).min(size.1);
     let area = Rect {
         x: context.anchor.0.min(size.0.saturating_sub(width)),
@@ -388,16 +390,16 @@ pub(super) fn draw(
         }
         let rect = Rect { x: area.x + pad, y, w: width.saturating_sub(2 * pad), h: row };
         if index == context.selected {
-            chrome::fill_clipped(pixels, size.0, rect, colors.control_hover);
+            chrome::round_rect(pixels, size.0, rect, sizes.radius, colors.selected);
         }
-        let edge = ui.dip(18.0).min(rect.h);
+        let edge = sizes.check.min(rect.h);
         icons::draw(
             pixels,
             size.0,
             item.icon,
             ((rect.x + pad + edge / 2) as f32, (rect.y + rect.h / 2) as f32),
             edge,
-            if item.enabled { colors.fg } else { colors.faint },
+            if item.enabled { colors.fg } else { colors.disabled },
         );
         let text_rect = Rect { x: rect.x + edge + 2 * pad, w: rect.w.saturating_sub(edge + 2 * pad), ..rect };
         desktop::label(
@@ -406,7 +408,7 @@ pub(super) fn draw(
             font,
             desktop::inset(text_rect, pad / 2),
             &item.label,
-            if item.enabled { colors.fg } else { colors.faint },
+            if item.enabled { colors.fg } else { colors.disabled },
         );
         context.rows.push(rect);
     }

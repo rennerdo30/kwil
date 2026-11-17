@@ -716,7 +716,7 @@ fn frame(size: (usize, usize), m: &Metrics, s: &Sizes) -> Option<Frame> {
     let p = s.gap + s.gap / 2;
     let nav_w = m.dip(236.0);
     // The rail needs every category row; otherwise a compact stepper is used.
-    let rail_h = p + s.control + p + (CATEGORIES.len() + 1) * s.nav + p;
+    let rail_h = p + s.control + p + (CATEGORIES.len() + 1) * s.list_row + p;
     if w >= m.dip(700.0) && body >= rail_h {
         let nav = Rect { x: inner.x, y: top, w: nav_w, h: body };
         let search = Rect { x: nav.x + p, y: nav.y + p, w: nav.w - 2 * p, h: s.control };
@@ -806,7 +806,7 @@ pub(super) fn draw(
         let p = s.gap + s.gap / 2;
         let mut y = f.search.y + f.search.h + p;
         for category in std::iter::once(None).chain(CATEGORIES.iter().copied().map(Some)) {
-            let rect = Rect { x: nav.x + s.gap, y, w: nav.w - 2 * s.gap, h: s.nav };
+            let rect = Rect { x: nav.x + s.gap, y, w: nav.w - 2 * s.gap, h: s.list_row };
             let target = Target::Category(category);
             let selected = source.category() == category && !hosted_open;
             desktop::nav_row(pixels, stride, rect, selected, hover == Some(target) && !editing, &c, &s);
@@ -842,7 +842,7 @@ pub(super) fn draw(
             };
             desktop::label(pixels, stride, font, text, title, if selected { c.fg } else { c.muted });
             view.hits.push(rect, target);
-            y += s.nav;
+            y += s.list_row;
         }
     }
     if let Some(stepper) = f.stepper {
