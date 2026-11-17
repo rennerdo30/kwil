@@ -347,8 +347,8 @@ pub(super) fn pretty(keys: &str) -> String {
                     }
                     "plus" => "Plus".to_owned(),
                     "escape" | "esc" => "Esc".to_owned(),
-                    "pageup" => "PgUp".to_owned(),
-                    "pagedown" => "PgDn".to_owned(),
+                    "pageup" | "pgup" => "PgUp".to_owned(),
+                    "pagedown" | "pgdn" => "PgDn".to_owned(),
                     "delete" => "Del".to_owned(),
                     other => {
                         let mut chars = other.chars();

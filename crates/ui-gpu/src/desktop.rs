@@ -864,10 +864,11 @@ pub(super) fn focus_ring(buf: &mut [u32], stride: usize, rect: Rect, radius: usi
 
 /// Frame of a menu or dropdown list: rounded `card_radius`, a hairline border
 /// and the surface fill. Popups sit over content that the host restores
-/// before every repaint, so unlike `card` the corners blend instead of
-/// painting the editor backdrop. Rows inside it start `Sizes::xs` in.
+/// before every repaint, so unlike `card` it never paints the editor backdrop;
+/// its outer corner is hard-edged so repainting it over itself changes nothing
+/// (the harness checks that). Rows inside it start `Sizes::xs` in.
 pub(super) fn popup(buf: &mut [u32], stride: usize, rect: Rect, c: &Colors, s: &Sizes) {
-    chrome::round_rect(buf, stride, rect, s.card_radius, c.border);
+    chrome::round_rect_hard(buf, stride, rect, s.card_radius, c.border);
     chrome::round_rect(buf, stride, inset(rect, s.hairline), s.fill_radius(s.card_radius), c.surface);
 }
 
@@ -1212,6 +1213,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_popup_repaints_to_the_same_pixels_and_blends_nothing_at_its_corner() {
+        // The host may draw a popup again over its own pixels; the first
+        // paint over content must equal the repaint over the first paint.
+        let (w, h) = (120, 90);
+        let c = colors();
+        let s = Sizes::new(&Metrics::new(2.0));
+        let rect = Rect { x: 10, y: 10, w: 100, h: 70 };
+        let mut once = vec![0x445566; w * h];
+        popup(&mut once, w, rect, &c, &s);
+        let mut twice = once.clone();
+        popup(&mut twice, w, rect, &c, &s);
+        assert_eq!(once, twice, "a second paint changed pixels");
+        assert_eq!(once[rect.y * w + rect.x], 0x445566, "the extreme corner shows the content, not the frame");
+        assert_eq!(once[rect.y * w + rect.x + rect.w / 2], c.border, "hairline border on the edge");
+        assert_eq!(once[(rect.y + s.hairline) * w + rect.x + rect.w / 2], c.surface, "surface inside it");
     }
 
     #[test]

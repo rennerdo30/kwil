@@ -468,6 +468,24 @@ fn rounded_coverage(px: f32, py: f32, r: Rect, radius: usize) -> f32 {
     (0.5 - outside).clamp(0.0, 1.0)
 }
 
+/// Rounded rectangle without anti-aliasing: a pixel is painted whole or not at
+/// all. It never blends with what is under it, so repainting the same
+/// rectangle gives the same pixels; popups use it for their outer edge.
+pub(super) fn round_rect_hard(buf: &mut [u32], stride: usize, r: Rect, radius: usize, color: u32) {
+    let radius = radius.min(r.w / 2).min(r.h / 2);
+    for y in r.y..(r.y + r.h).min(rows(buf, stride)) {
+        let corner_row = y < r.y + radius || y >= r.y + r.h - radius;
+        for x in r.x..(r.x + r.w).min(stride) {
+            let inside = !corner_row
+                || (x >= r.x + radius && x < r.x + r.w - radius)
+                || rounded_coverage(x as f32 + 0.5, y as f32 + 0.5, r, radius) >= 0.5;
+            if inside {
+                buf[y * stride + x] = color;
+            }
+        }
+    }
+}
+
 /// Hollow rounded outline of `thickness` pixels drawn inside `r`, anti-aliased
 /// on both edges and blended over what is there. Nothing leaves `r`.
 pub(super) fn ring(buf: &mut [u32], stride: usize, r: Rect, radius: usize, thickness: usize, color: u32) {
