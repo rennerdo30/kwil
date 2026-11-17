@@ -2506,7 +2506,7 @@ impl App {
             }
         }
         if projection_owns_body && body_changed {
-            log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source, &self.view);
+            log_ui::draw_body(&self.logs, body_pixels, bw, font, projection_source, &self.view, &self.ui);
             tabs::composite(body_pixels, bw, pixels, w, body, Rect { x: 0, y: 0, w: bw, h: bh });
             damage.push(tabs::rect(body));
         }
@@ -2771,7 +2771,8 @@ impl App {
         }
         if let Some(font) = self.ui_font.as_mut() {
             if self.themes.is_open() {
-                self.palette_area = theme_ui::draw(&self.themes, &mut self.theme_hits, pixels, (w, h), font, &self.ui);
+                self.palette_area =
+                    theme_ui::draw(&self.themes, &mut self.theme_hits, pixels, (w, h), font, &self.ui, self.pointer);
                 if let Some(area) = self.palette_area {
                     damage.push(area);
                 }

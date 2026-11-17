@@ -1601,10 +1601,9 @@ pub(super) fn draw(
     host.surface = Surface::new(size, m);
     host.geometry_epoch = host.input_epoch;
     let c = Colors::new(theme);
-    let mut s = Sizes::new(m);
     // A denser filter bar: the tight end of the spacing scale.
-    s.gap = s.xs;
-    s.inner = s.xs + s.xxs;
+    let s = Sizes::new(m);
+    let s = Sizes { gap: s.xs, inner: s.xs, ..s };
     chrome::fill_clipped(pixels, size.0, r, c.sidebar);
     let inner = inset(r, s.gap);
     let rows = if width >= m.dip(1200.0) {
@@ -1665,12 +1664,12 @@ pub(super) fn draw(
         "Unknown",
         host.keep_unknown,
         host.hover == Some(Target::Unknown),
+        host.focus == Target::Unknown,
         true,
         &c,
         &s,
     );
     host.geometry.push(unknown, Target::Unknown);
-    focus_ring(pixels, size.0, unknown, host.focus == Target::Unknown, &c, &s);
     for (index, (target, text)) in [(Target::Apply, "Apply"), (Target::Clear, "Clear")].into_iter().enumerate() {
         let rect = Rect {
             x: unknown.x + unknown.w + s.gap + index * (m.dip(64.0) + s.gap),
@@ -1715,7 +1714,6 @@ pub(super) fn draw(
         if focused {
             host.caret = caret;
         }
-        focus_ring(pixels, size.0, rect, focused && edit.all, &c, &s);
         host.geometry.push(rect, Target::Field(field));
     }
     let query_y = inner.y + rows * (s.control + s.gap);
@@ -1768,6 +1766,7 @@ pub(super) fn draw_body(
     font: &mut Font,
     current: Option<Source>,
     view: &View,
+    ui: &chrome::Metrics,
 ) -> bool {
     if !host.open {
         return false;
@@ -1782,13 +1781,19 @@ pub(super) fn draw_body(
     let gutter_columns = GUTTER_COLS.max(digits + 1).min(stride / font.cw.max(1));
     let gutter = gutter_columns * font.cw;
     let columns = stride.saturating_sub(gutter) / font.cw.max(1);
-    let selected_bg =
-        chrome::selected_color(bg(), theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::Selection));
+    // The shared row painter over the editor ground. Grid cells are square and
+    // repaint their own background, so the row is square here and its accent
+    // indicator is drawn last, in the gutter's trailing column.
+    let (colors, sizes) = (desktop::Colors::new(&theme_ui::chrome()), desktop::Sizes::new(ui));
+    let look = desktop::RowLook::on(&colors, bg(), 0);
     for (index, row) in rows.iter().enumerate().take(height / font.ch.max(1)) {
         let y = index * font.ch;
-        let row_bg = if host.focus == Target::Results && index == host.selected { selected_bg } else { bg() };
+        let chosen = host.focus == Target::Results && index == host.selected;
+        let row_bg = if chosen { look.selected } else { bg() };
+        let row_rect = Rect { x: gutter, y, w: stride - gutter, h: font.ch };
         fill(pixels, stride, Rect { x: 0, y, w: gutter, h: font.ch }, gutter_bg());
-        fill(pixels, stride, Rect { x: gutter, y, w: stride - gutter, h: font.ch }, row_bg);
+        fill(pixels, stride, row_rect, bg());
+        desktop::row_fill(pixels, stride, row_rect, desktop::RowState::new(chosen, false), &look);
         let number = format!(
             "{:>width$}{}",
             row.line.saturating_add(1),
@@ -1851,6 +1856,11 @@ pub(super) fn draw_body(
             }
         }
     }
+    if host.focus == Target::Results && host.selected < rows.len().min(height / font.ch.max(1)) {
+        let edge = sizes.indicator.min(gutter);
+        let rect = Rect { x: gutter - edge, y: host.selected * font.ch, w: edge, h: font.ch };
+        desktop::row_indicator(pixels, stride, rect, &look, &sizes);
+    }
     true
 }
 
@@ -1887,22 +1897,12 @@ fn draw_button(
         text,
         if primary { Style::Primary } else { Style::Secondary },
         enabled && host.hover == Some(target),
+        host.focus == target,
         c,
         s,
     );
     if enabled {
         host.geometry.push(rect, target);
-    }
-    focus_ring(pixels, stride, rect, host.focus == target, c, s);
-}
-fn focus_ring(pixels: &mut [u32], stride: usize, rect: Rect, focused: bool, c: &Colors, s: &Sizes) {
-    if focused && rect.w > 2 * s.inner && rect.h > 2 * s.focus {
-        chrome::fill_clipped(
-            pixels,
-            stride,
-            Rect { x: rect.x + s.inner, y: rect.y + rect.h - s.focus, w: rect.w - 2 * s.inner, h: s.hairline },
-            c.accent,
-        );
     }
 }
 

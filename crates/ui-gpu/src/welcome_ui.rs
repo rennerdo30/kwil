@@ -24,6 +24,8 @@ pub(super) struct WelcomeView {
     pub focus: usize,
     /// The command-line choice, set by the owner of the state before each paint.
     pub command_line: Option<command_line_ui::Row>,
+    /// Action under the pointer, for button hover.
+    pub hover: Option<Action>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -49,6 +51,8 @@ pub(super) fn draw(
     let height = h;
     let area = Rect { x: (w - width) / 2, y: (h - height) / 2, w: width, h: height };
     view.area = Some(area);
+    let hover = view.hover;
+    let hot = |action: Action| hover == Some(action);
     chrome::fill_clipped(pixels, w, area, c.surface);
     let inner = desktop::inset(area, metrics.dip(32.0).min(width / 4));
     let footer_h = s.control.min(inner.h);
@@ -75,10 +79,10 @@ pub(super) fn draw(
             w: metrics.dip(180.0).min(footer.w),
             ..footer
         };
-        desktop::button(pixels, w, font, button, "Continue", Style::Primary, false, &c, &s);
+        desktop::button(pixels, w, font, button, "Continue", Style::Primary, hot(Action::Next), false, &c, &s);
         view.hits.push(button, Action::Next);
         let skip = Rect { w: metrics.dip(120.0).min(footer.w / 3), ..footer };
-        desktop::button(pixels, w, font, skip, "Not now", Style::Subtle, false, &c, &s);
+        desktop::button(pixels, w, font, skip, "Not now", Style::Subtle, hot(Action::Skip), false, &c, &s);
         view.hits.push(skip, Action::Skip);
     } else {
         // The command-line choice sits under the file-type step, always visible.
@@ -119,26 +123,22 @@ pub(super) fn draw(
         }
         let bw = metrics.dip(125.0).min(footer.w / 2);
         let back = Rect { w: bw, ..footer };
-        desktop::button(pixels, w, font, back, "Back", Style::Secondary, false, &c, &s);
+        desktop::button(pixels, w, font, back, "Back", Style::Secondary, hot(Action::Back), false, &c, &s);
         view.hits.push(back, Action::Back);
         let skip = Rect { x: footer.x + footer.w - bw, w: bw, ..footer };
         let label = if model.stage() == welcome::Stage::Registering { "Working…" } else { "Skip for now" };
-        desktop::button(pixels, w, font, skip, label, Style::Subtle, false, &c, &s);
+        desktop::button(pixels, w, font, skip, label, Style::Subtle, hot(Action::Skip), false, &c, &s);
         if model.stage() != welcome::Stage::Registering {
             view.hits.push(skip, Action::Skip);
         }
     }
     view.focus = view.focus.min(view.hits.iter().count().saturating_sub(1));
-    if let Some((rect, _)) = view.hits.iter().nth(view.focus) {
-        let t = s.focus.min(rect.w).min(rect.h);
-        for edge in [
-            Rect { h: t, ..*rect },
-            Rect { y: rect.y + rect.h - t, h: t, ..*rect },
-            Rect { w: t, ..*rect },
-            Rect { x: rect.x + rect.w - t, w: t, ..*rect },
-        ] {
-            chrome::fill_clipped(pixels, w, edge, c.accent);
-        }
+    if let Some((rect, action)) = view.hits.iter().nth(view.focus) {
+        // No keyboard-origin signal exists, so the dialog's keyboard target
+        // (the one Enter activates) always shows the ring. Continue is the
+        // one accent-filled button.
+        let over = if *action == Action::Next { c.accent } else { c.surface };
+        desktop::focus_ring(pixels, w, *rect, s.radius, over, &c, &s);
     }
     Some(area)
 }
@@ -162,6 +162,7 @@ fn draw_command_line_choice(
         line,
         "Use Kwil from the command line and Win+R",
         row.on,
+        false,
         false,
         !row.busy,
         c,
@@ -236,7 +237,7 @@ fn draw_about(
         let height = m.dip(126.0);
         for (i, (title, detail)) in features.iter().enumerate() {
             let card = Rect { x: area.x + i * (width + gap), y, w: width, h: height };
-            desktop::row(pixels, stride, card, false, false, c, s);
+            desktop::row(pixels, stride, card, desktop::RowState::new(false, false), c, s);
             let content = desktop::inset(card, m.dip(14.0));
             chrome::fill_clipped(
                 pixels,
@@ -407,6 +408,12 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
+                let hover = self.welcome_view.hits.at(self.pointer);
+                if hover != self.welcome_view.hover {
+                    self.welcome_view.hover = hover;
+                    self.welcome_view.paint.request();
+                    self.request_frame();
+                }
                 true
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {

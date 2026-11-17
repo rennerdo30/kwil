@@ -3,7 +3,7 @@
 //! keymap. Alt or F10 focuses the bar, arrows/Enter/Escape navigate, and a
 //! click outside dismisses it. Drawing is damage-only like the palette card.
 use super::*;
-use chrome::{Hover, Metrics};
+use chrome::{Hover, Metrics, tok};
 use kwil_core_commands::{Binding, Context, KeyChord, Keymap, Mode, Preset, Resolution};
 use kwil_view_model::TabArea;
 use std::collections::HashMap;
@@ -347,8 +347,8 @@ pub(super) fn pretty(keys: &str) -> String {
                     }
                     "plus" => "Plus".to_owned(),
                     "escape" | "esc" => "Esc".to_owned(),
-                    "pageup" => "PgUp".to_owned(),
-                    "pagedown" => "PgDn".to_owned(),
+                    "pageup" | "pgup" => "PgUp".to_owned(),
+                    "pagedown" | "pgdn" => "PgDn".to_owned(),
                     "delete" => "Del".to_owned(),
                     other => {
                         let mut chars = other.chars();
@@ -394,7 +394,7 @@ pub(super) struct Tool {
 }
 pub(super) fn toolbar(area: TabArea, titles: &[TabArea], m: &Metrics, available: &Available) -> Vec<Tool> {
     let first = titles.last().map_or(area.x, |r| r.x + r.width).saturating_add(m.xxl);
-    let width = m.dip(30.0);
+    let width = m.dip(tok::MENU_BAR);
     let mut end = area.x + area.width;
     let mut tools = Vec::with_capacity(7);
     for (icon, command) in [
@@ -422,6 +422,10 @@ pub(super) fn toolbar(area: TabArea, titles: &[TabArea], m: &Metrics, available:
     tools
 }
 
+/// Markdown mode buttons: room needed for text labels, and one labelled button.
+const LABELLED_TOOLS_DIP: f64 = 260.0;
+const LABELLED_TOOL_DIP: f64 = 84.0;
+
 pub(super) fn markdown_tools(
     tools: &mut Vec<Tool>,
     area: TabArea,
@@ -432,8 +436,8 @@ pub(super) fn markdown_tools(
     let start = titles.last().map_or(area.x, |r| r.x + r.width).saturating_add(m.xxl);
     let end = tools.iter().map(|tool| tool.rect.x).min().unwrap_or(area.x + area.width).saturating_sub(m.xxl);
     let available = end.saturating_sub(start);
-    let labels = available >= m.dip(260.0);
-    let width = if labels { m.dip(84.0) } else { m.dip(30.0) };
+    let labels = available >= m.dip(LABELLED_TOOLS_DIP);
+    let width = if labels { m.dip(LABELLED_TOOL_DIP) } else { m.dip(tok::MENU_BAR) };
     if available < width * 3 {
         return;
     }
@@ -518,13 +522,13 @@ fn entry_height(entry: &Entry, m: &Metrics) -> usize {
 /// None when every entry fits.
 fn scroll_room(menu: usize, y: usize, window_h: usize, m: &Metrics) -> Option<usize> {
     let entries = MENUS[menu].entries;
-    let full = 2 * m.radius + entries.iter().map(|e| entry_height(e, m)).sum::<usize>();
+    let full = 2 * m.xs + entries.iter().map(|e| entry_height(e, m)).sum::<usize>();
     let limit = window_h.saturating_sub(y);
-    (full > limit).then(|| limit.saturating_sub(2 * m.radius + 2 * arrow_height(m)))
+    (full > limit).then(|| limit.saturating_sub(2 * m.xs + 2 * arrow_height(m)))
 }
 
 fn arrow_height(m: &Metrics) -> usize {
-    m.dip(14.0)
+    m.dip(tok::LG)
 }
 
 /// Smallest first entry from which the rest of the list fits in `room`.
@@ -562,7 +566,8 @@ pub(super) fn layout_rows(
     scroll: usize,
 ) -> Dropdown {
     let entries = MENUS[menu].entries;
-    let frame = m.radius;
+    // Rows start `xs` inside the popup frame, concentric with its corner.
+    let frame = m.xs;
     let full = 2 * frame + entries.iter().map(|e| entry_height(e, m)).sum::<usize>();
     let height = full.min(window_h.saturating_sub(y));
     let area = Rect { x, y, w: width, h: height };
@@ -605,14 +610,14 @@ pub(super) fn layout_rows(
 }
 
 pub(super) fn title_areas(area: TabArea, m: &Metrics, font: Option<&mut font::UiFont>) -> Vec<TabArea> {
-    let pad = m.dip(9.0);
-    let mut x = area.x + m.dip(4.0);
+    let pad = m.dip(tok::SM);
+    let mut x = area.x + m.dip(tok::XS);
     let mut font = font;
     MENUS
         .iter()
         .map(|menu| {
             let label = text(menu.title);
-            let width = font.as_deref_mut().map_or(label.len() * m.dip(8.0), |font| font.width(&label)) + 2 * pad;
+            let width = font.as_deref_mut().map_or(label.len() * m.dip(tok::SM), |font| font.width(&label)) + 2 * pad;
             let title = TabArea { x, y: area.y, width, height: area.height };
             x += width;
             title
@@ -630,15 +635,17 @@ pub(super) fn dropdown(
     scroll: usize,
 ) -> Dropdown {
     let (mut label_w, mut key_w) = (0, 0);
+    let sizes = desktop::Sizes::new(m);
     for entry in MENUS[menu].entries {
         if let Item(label, command) = entry {
             label_w = label_w.max(font.width(&text(label)));
-            key_w = key_w.max(labels.get(command).map_or(0, |key| font.width(key)));
+            key_w =
+                key_w.max(labels.get(command).map_or(0, |key| desktop::keycaps_width(font, key, &sizes, usize::MAX)));
         }
     }
     let keys = if key_w > 0 { m.xxl + key_w } else { 0 };
     let content = m.md + label_w + keys + m.md;
-    let width = (content + 2 * m.radius).max(m.menu_min).min(window.0);
+    let width = (content + 2 * m.xs).max(m.menu_min).min(window.0);
     let x = title.x.min(window.0.saturating_sub(width));
     layout_rows(menu, (x, title.y + title.height), width, window.1, m, scroll)
 }
@@ -701,12 +708,12 @@ pub(super) fn draw_bar(
             pixels,
             stride,
             tool.icon,
-            ((r.x + if tool.label.is_some() { m.dip(14.0) } else { r.w / 2 }) as f32, (r.y + r.h / 2) as f32),
-            m.dip(18.0),
+            ((r.x + if tool.label.is_some() { m.dip(tok::MD) } else { r.w / 2 }) as f32, (r.y + r.h / 2) as f32),
+            m.dip(tok::LG),
             if tool.enabled { fg } else { chrome::disabled_color(bg, fg) },
         );
         if let Some(label) = tool.label {
-            font.draw(pixels, stride, r, r.x + m.dip(28.0), baseline, label, fg);
+            font.draw(pixels, stride, r, r.x + m.dip(tok::XL), baseline, label, fg);
         }
     }
 }
@@ -725,7 +732,7 @@ fn underline(
 ) {
     if let Some((_, index)) = mnemonic(label) {
         let (offset, width) = font.offset_of(&text(label), index);
-        let y = baseline + m.dip(2.0).min(font.descent.max(1));
+        let y = baseline + m.dip(tok::XXS).min(font.descent.max(1));
         let line = Rect { x: x + offset, y, w: width, h: m.line };
         if line.y + line.h <= clip.y + clip.h {
             chrome::fill_clipped(pixels, stride, line, color);
@@ -744,24 +751,15 @@ pub(super) fn draw_dropdown(
     theme: &kwil_core_commands::theme::Theme,
     m: &Metrics,
 ) {
-    use kwil_core_commands::theme::UiRole;
     let State::Open { menu, item, keyboard } = bar.state else { return };
     let Some(entries) = MENUS.get(menu).filter(|_| dropdown.menu == menu).map(|menu| menu.entries) else {
         return;
     };
-    let bg = theme_ui::rgb(theme, UiRole::PanelBackground);
-    let fg = theme_ui::rgb(theme, UiRole::PanelForeground);
-    let border = theme_ui::rgb(theme, UiRole::Border);
-    let highlight = chrome::selected_color(bg, theme_ui::rgb(theme, UiRole::Selection));
+    let c = desktop::Colors::new(theme);
+    let s = desktop::Sizes::new(m);
     let area = dropdown.area;
-    chrome::fill_clipped(pixels, stride, area, border);
-    let inner = Rect {
-        x: area.x + m.line,
-        y: area.y + m.line,
-        w: area.w.saturating_sub(2 * m.line),
-        h: area.h.saturating_sub(2 * m.line),
-    };
-    chrome::fill_clipped(pixels, stride, inner, bg);
+    desktop::popup(pixels, stride, area, &c, &s);
+    let inner = desktop::inset(area, s.hairline);
     for separator in &dropdown.separators {
         let line = Rect {
             x: separator.x + m.md / 2,
@@ -769,27 +767,25 @@ pub(super) fn draw_dropdown(
             w: separator.w.saturating_sub(m.md),
             h: m.line,
         };
-        chrome::fill_clipped(pixels, stride, line, chrome::mix(bg, border, 0xc0));
+        chrome::fill_clipped(pixels, stride, line, chrome::mix(c.surface, c.border, 0xc0));
     }
     // Chevrons mark entries hidden above or below a list taller than the window.
     let stroke = (1.25 * m.scale as f32).max(1.0);
-    let muted = chrome::mix(bg, fg, 0x90);
     for (strip, up) in [(dropdown.up, true), (dropdown.down, false)] {
         if let Some(strip) = strip {
             let (cx, cy) = (strip.x as f32 + strip.width as f32 / 2.0, strip.y as f32 + strip.height as f32 / 2.0);
             let (h, q) = (m.glyph as f32 / 2.0, m.glyph as f32 / 4.0);
             let (tip, tail) = if up { (cy - q, cy + q) } else { (cy + q, cy - q) };
-            chrome::line(pixels, stride, (cx - h, tail), (cx, tip), stroke, muted);
-            chrome::line(pixels, stride, (cx, tip), (cx + h, tail), stroke, muted);
+            chrome::line(pixels, stride, (cx - h, tail), (cx, tip), stroke, c.muted);
+            chrome::line(pixels, stride, (cx, tip), (cx + h, tail), stroke, c.muted);
         }
     }
     for &(index, row) in &dropdown.rows {
         let Some(&Item(label, command)) = entries.get(index) else { continue };
         let usable = enabled(available, command);
-        if item == Some(index) && usable {
-            chrome::round_rect(pixels, stride, row, m.radius, highlight);
-        }
-        let color = if usable { fg } else { chrome::disabled_color(bg, fg) };
+        let highlighted = item == Some(index) && usable;
+        desktop::row(pixels, stride, row, desktop::RowState::new(highlighted, false), &c, &s);
+        let color = if usable { c.fg } else { c.disabled };
         let baseline = font.baseline(row.y, row.h);
         let name = text(label);
         let x = row.x + m.md;
@@ -798,9 +794,12 @@ pub(super) fn draw_dropdown(
             underline(pixels, stride, font, inner, x, baseline, label, color, m);
         }
         if let Some(keys) = bar.labels.get(command) {
-            let width = font.width(keys);
-            let key_color = if usable { chrome::mix(bg, fg, 0xa8) } else { chrome::disabled_color(bg, fg) };
-            font.draw(pixels, stride, inner, (row.x + row.w).saturating_sub(m.md + width), baseline, keys, key_color);
+            // Accelerators are keycaps, as in the palette; a disabled item's
+            // caps lose their fill and dim their text.
+            let caps = desktop::Colors { fg: color, control: if usable { c.control } else { c.surface }, ..c };
+            let width = desktop::keycaps_width(font, keys, &s, row.w / 2);
+            let at = Rect { x: (row.x + row.w).saturating_sub(m.md + width), y: row.y, w: width, h: row.h };
+            desktop::keycaps(pixels, stride, font, at, at.x, keys, &caps, &s);
         }
     }
 }
@@ -1156,11 +1155,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dropdown_and_context_menu_rows_are_one_token() {
+    fn dropdown_rows_use_the_menu_item_token_on_every_platform() {
         for scale in [1.0, 1.25, 2.0] {
             let m = Metrics::new(scale);
             let item = MENUS.iter().flat_map(|menu| menu.entries).find(|e| matches!(e, Item(..))).unwrap();
-            assert_eq!(entry_height(item, &m), desktop::Sizes::new(&m).menu_item, "menu bar dropdown row at {scale}");
+            assert_eq!(entry_height(item, &m), desktop::Sizes::new(&m).menu_item, "dropdown row at {scale}");
         }
     }
 

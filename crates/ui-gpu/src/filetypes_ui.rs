@@ -218,7 +218,7 @@ impl HostedPage for Page {
         let current = PRESETS.iter().position(|(preset, _)| *preset == self.service.selection().preset());
         if let Some(segments) = desktop::segments(font, bar, &labels, s) {
             let hovered = (0..PRESETS.len()).find(|i| hot(PRESET | *i as u32));
-            desktop::segmented(buf, stride, font, &segments, &labels, current, hovered, c, s);
+            desktop::segmented(buf, stride, font, &segments, &labels, current, hovered, None, c, s);
             for (i, rect) in segments.iter().enumerate() {
                 hits.push(*rect, Target::Hosted(PRESET | i as u32));
             }
@@ -246,7 +246,7 @@ impl HostedPage for Page {
             s,
         );
         hits.push(field, Target::Hosted(FIELD));
-        desktop::button(buf, stride, font, add, "Add", Style::Secondary, hot(ADD), c, s);
+        desktop::button(buf, stride, font, add, "Add", Style::Secondary, hot(ADD), false, c, s);
         hits.push(add, Target::Hosted(ADD));
         y += s.control + s.gap;
         let bottom_y = self.draw_actions(buf, stride, font, area, c, s, hover, hits);
@@ -276,7 +276,7 @@ impl HostedPage for Page {
                         let code = GROUP | *group as u32;
                         let w = desktop::button_width(font, label, s);
                         let b = Rect { x: pen + s.gap, y: r.y + (r.h - s.control) / 2, w, h: s.control };
-                        desktop::button(buf, stride, font, b, label, Style::Subtle, hot(code), c, s);
+                        desktop::button(buf, stride, font, b, label, Style::Subtle, hot(code), false, c, s);
                         hits.push(b, Target::Hosted(code));
                     }
                 }
@@ -292,7 +292,7 @@ impl HostedPage for Page {
                         let Some(extension) = extension else { continue };
                         let checked = self.service.selection().contains(&extension);
                         let text = type_label(&self.service, &extension);
-                        desktop::checkbox(buf, stride, font, cell, &text, checked, hot(*code), true, c, s);
+                        desktop::checkbox(buf, stride, font, cell, &text, checked, hot(*code), false, true, c, s);
                         hits.push(cell, Target::Hosted(*code));
                     }
                 }
@@ -356,6 +356,7 @@ impl Page {
                 label,
                 if active { style } else { Style::Subtle },
                 hover == Some(code),
+                false,
                 c,
                 s,
             );
@@ -449,7 +450,7 @@ impl Page {
                         } else {
                             Style::Secondary
                         };
-                        desktop::button(buf, stride, font, r, label, style, hover == Some(code), c, s);
+                        desktop::button(buf, stride, font, r, label, style, hover == Some(code), false, c, s);
                         hits.push(r, Target::Hosted(code));
                     }
                 }
@@ -475,7 +476,7 @@ impl Page {
                     );
                     hits.push(field, Target::Hosted(FIELD));
                     let add = Rect { x: field.x + field.w + s.gap, w: add_w, ..field };
-                    desktop::button(buf, stride, font, add, "Add", Style::Secondary, hover == Some(ADD), c, s);
+                    desktop::button(buf, stride, font, add, "Add", Style::Secondary, hover == Some(ADD), false, c, s);
                     hits.push(add, Target::Hosted(ADD));
                 }
                 _ => match &rows[index - 4] {
@@ -509,6 +510,7 @@ impl Page {
                                     &type_label(&self.service, &extension),
                                     self.service.selection().contains(&extension),
                                     hover == Some(*code),
+                                    false,
                                     true,
                                     c,
                                     s,

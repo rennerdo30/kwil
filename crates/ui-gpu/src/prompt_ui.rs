@@ -208,7 +208,14 @@ fn draw_card(
             for (index, path) in recent.iter().enumerate().skip(view.first).take(visible) {
                 let r = Rect { x: list.x, y, w: rows_w, h: row_h };
                 let target = Target::Recent(index + 1);
-                desktop::row(pixels, stride, r, chosen == Some(index), view.hover == Some(target), &c, &s);
+                desktop::row(
+                    pixels,
+                    stride,
+                    r,
+                    desktop::RowState::new(chosen == Some(index), view.hover == Some(target)),
+                    &c,
+                    &s,
+                );
                 let number = Rect { x: r.x + s.pad, w: number_w, ..r };
                 desktop::label(pixels, stride, font, number, &(index + 1).to_string(), c.muted);
                 let name =
@@ -262,6 +269,7 @@ fn draw_card(
                     "Browse…",
                     Style::Secondary,
                     view.hover == Some(Target::Browse),
+                    false,
                     &c,
                     &s,
                 );
@@ -286,13 +294,35 @@ fn draw_card(
         let bw = desktop::button_width(font, text, &s);
         x = x.saturating_sub(bw);
         let r = Rect { x, w: bw, ..buttons };
-        desktop::button(pixels, stride, font, r, text, Style::Primary, view.hover == Some(Target::Submit), &c, &s);
+        desktop::button(
+            pixels,
+            stride,
+            font,
+            r,
+            text,
+            Style::Primary,
+            view.hover == Some(Target::Submit),
+            false,
+            &c,
+            &s,
+        );
         view.hits.push(r, Target::Submit);
         x = x.saturating_sub(s.gap);
     }
     let bw = desktop::button_width(font, "Cancel", &s);
     let r = Rect { x: x.saturating_sub(bw), w: bw, ..buttons };
-    desktop::button(pixels, stride, font, r, "Cancel", Style::Secondary, view.hover == Some(Target::Cancel), &c, &s);
+    desktop::button(
+        pixels,
+        stride,
+        font,
+        r,
+        "Cancel",
+        Style::Secondary,
+        view.hover == Some(Target::Cancel),
+        false,
+        &c,
+        &s,
+    );
     view.hits.push(r, Target::Cancel);
     Some(area)
 }
