@@ -1,9 +1,7 @@
-# Kwil 0.1.0-beta.8
-
-Draft notes for the next candidate. Artifacts and packaged native gates are not yet qualified.
+# Kwil 0.1.0-beta.9
 
 An early beta for evaluation and feedback. This is not an RC or a claim that the
-full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.8/docs/SPEC.md)
+full [v1 specification](https://github.com/rennerdo30/kwil/blob/v0.1.0-beta.9/docs/SPEC.md)
 is complete. Test with copies of important files.
 
 ## Downloads and installation
@@ -30,18 +28,47 @@ without independent signature verification. beta.2 copies update to
 this release by themselves; frozen beta.1 copies must be replaced manually. Stable download installers do not
 select betas.
 
-## Unreleased
+## Changes since beta.8
 
-- macOS and Linux zip archives
-- **macOS release process:** the next candidate can be signed and notarized on
-  the owner's Mac, then verified before publication. Bare executables are not
-  stapled and need an online first-launch check. This does not change beta.8's
-  already published unsigned assets.
+- **Use Kwil from the command line (Windows):** the first-run page, Settings →
+  Files, the palette ("Add Kwil to PATH") and `kwil --register-command-line`
+  offer to put Kwil on your user PATH and register it for Win+R. Then `kwil
+  file.txt` works in any new terminal and Win+R `kwil` opens the editor. Nothing
+  changes unless you choose it; uninstalling removes it again and leaves your
+  other PATH entries untouched.
+- **Kwil as Git's editor:** `kwil --wait FILE` returns only when you close the
+  file, so `git config --global core.editor "kwil --wait"` (or `kwil.com
+  --wait`) works. If Kwil is already open the file appears there; otherwise Kwil
+  starts and stays open afterwards. It exits with an error when the file could
+  not be opened or Kwil quit before showing it, so Git never continues with a
+  message you did not see.
+- **A consistent interface:** menus, the context menu, the palette, search and
+  log results share one look for highlighted rows and one popup frame; buttons,
+  switches and segments show a keyboard focus ring; spacing, sizes and hover
+  states follow one scale in every screen and in light and dark themes.
+- **Easier to read:** compare shows a header with the change count, toggles for
+  whitespace and unchanged lines, and which side is the editor and which is the
+  saved file. About lists its details in a clean grid (Copy diagnostics keeps
+  the full build id). Settings pages have distinct icons, the keymap shows one
+  line per command, file types show just the extension, sizes read as "64 MB",
+  and status messages use plain words.
+- **Compare uses your theme:** added and removed lines take the theme's diff
+  colours, including translucent colours from imported themes.
+- **Search:** regular expressions now match across large files and very long
+  lines.
 - **Replace in files:** use Matches or Alt+Enter on a selected preview file to
   inspect and exclude individual matches. Alt+Enter returns to the file list.
   Apply and cancellation report file counts, exclusions and failures.
+- **Log watching:** following a growing UTF-8 log and filtering long lines with
+  a regular expression stay fast; the terminal UI has the same log controls.
+- **Encodings:** ISO-2022-JP files open and save.
+- **Markdown:** large documents preview page by page near what you are reading.
+- **Screen readers (Windows):** the UI Automation provider is checked against
+  the real Windows API and keeps the last line's text.
+- **Packages:** macOS and Linux zip archives besides tar.gz. The macOS builds of
+  this beta are still unsigned.
 
-## Changes since beta.7
+## Changes in beta.8
 
 - **Settings take effect:** ten settings that were saved but not yet used now
   change Kwil's behaviour, and so does smooth scrolling. Values are checked
