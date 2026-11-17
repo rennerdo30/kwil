@@ -129,7 +129,7 @@ pub(super) fn draw(
     desktop::label(
         pixels,
         stride,
-        font,
+        font.title(),
         Rect { x: header.x + 3 * s.icon, w: header.w.saturating_sub(3 * s.icon), ..header },
         "Language",
         c.fg,
@@ -178,7 +178,7 @@ pub(super) fn draw(
     }
     let footer = Rect { x: area.x + s.pad, y: area.y + area.h - s.footer, w: area.w - 2 * s.pad, h: s.footer };
     desktop::hline(pixels, stride, area.x, footer.y, area.w, &c, &s);
-    desktop::label(pixels, stride, font, footer, "↑ ↓ select · Enter apply · Esc close", c.muted);
+    desktop::label(pixels, stride, font.small(), footer, "↑ ↓ select · Enter apply · Esc close", c.muted);
     state.painted = Some((Surface::new(size, m), state.generation));
     Some(area)
 }

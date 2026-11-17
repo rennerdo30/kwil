@@ -64,6 +64,9 @@ pub struct Session {
     busy: bool,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pub notice: String,
+    /// The right side is the active tab's own saved file (Compare with Saved),
+    /// not another file the user picked.
+    pub against_saved: bool,
 }
 pub struct Page {
     pub rows: Vec<Row>,
@@ -172,7 +175,7 @@ fn failure(error: diff::DiffError) -> String {
             "Comparison exceeds the diff limits (262,144 total lines, 1 MiB per line, 64 MiB total text)".into()
         }
         diff::DiffError::Cancelled => "Comparison cancelled".into(),
-        diff::DiffError::Read(kind) => format!("Comparison source could not be read: {kind}"),
+        diff::DiffError::Read(kind) => format!("Couldn't read the file to compare: {kind}"),
     }
 }
 impl State {
@@ -403,9 +406,9 @@ impl Session {
     }
     fn send(&mut self, request: Request) -> io::Result<()> {
         if self.busy {
-            return Err(io::Error::other("Comparison is working; try again shortly"));
+            return Err(io::Error::other("Still comparing; try again in a moment"));
         }
-        self.worker()?.tx.try_send(request).map_err(|_| io::Error::other("Comparison worker is unavailable"))?;
+        self.worker()?.tx.try_send(request).map_err(|_| io::Error::other("Compare is unavailable"))?;
         self.busy = true;
         Ok(())
     }
@@ -492,6 +495,7 @@ impl Workspace {
         self.compare.source = Some(source);
         self.compare.page = None;
         self.compare.notice.clear();
+        self.compare.against_saved = false;
         Ok(())
     }
     pub fn compare_command(&mut self, id: &str) -> bool {
@@ -507,7 +511,8 @@ impl Workspace {
                 .editor()
                 .and_then(|e| e.document().path().map(std::path::Path::to_path_buf))
                 .ok_or_else(|| io::Error::other("Save the current tab before comparing with disk"))
-                .and_then(|path| self.compare_path(path)),
+                .and_then(|path| self.compare_path(path))
+                .map(|()| self.compare.against_saved = true),
             "compare.close" => {
                 self.compare.close();
                 Ok(())

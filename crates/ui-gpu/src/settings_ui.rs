@@ -818,7 +818,9 @@ pub(super) fn draw(
                 &s,
             );
             let glyph = match category {
-                Some(Category::Editor | Category::Keymap) => icons::Icon::Text,
+                Some(Category::Editor) => icons::Icon::Text,
+                Some(Category::Keymap) => icons::Icon::Keyboard,
+                Some(Category::Advanced) => icons::Icon::Sliders,
                 Some(Category::Appearance) => {
                     if theme.scheme() == kwil_core_commands::theme::Scheme::Dark {
                         icons::Icon::Moon
@@ -842,11 +844,7 @@ pub(super) fn draw(
             );
             let text =
                 Rect { x: rect.x + s.pad + m.dip(24.0), w: rect.w.saturating_sub(s.pad + s.gap + m.dip(24.0)), ..rect };
-            let title = if category == Some(Category::Appearance) {
-                "Appearance"
-            } else {
-                category.map_or("All settings", Category::title)
-            };
+            let title = category.map_or("All settings", Category::title);
             desktop::label(pixels, stride, font, text, title, if selected { c.fg } else { c.muted });
             view.hits.push(rect, target);
             y += s.list_row;
@@ -1093,14 +1091,13 @@ fn page_heading(
         hits.push(button, Target::Back);
         x += s.control + s.gap;
     }
-    let detail_w = if detail.is_empty() { 0 } else { font.measure(detail, r.w / 3) };
+    // Title size heads the page; the count is a small, muted aside.
+    let detail_w = if detail.is_empty() { 0 } else { font.small().measure(detail, r.w / 3) };
     let title_rect = Rect { x, y: r.y, w: (r.x + r.w).saturating_sub(x + detail_w + s.gap), h: r.h };
-    desktop::label(pixels, stride, font, title_rect, title, c.fg);
-    // Accent rule under the page title: hierarchy without a second font size.
-    let under = Rect { x, y: r.y + r.h - s.focus - s.hairline, w: s.pad * 2, h: s.focus };
-    chrome::round_rect(pixels, stride, under, s.focus / 2, c.accent);
+    desktop::label(pixels, stride, font.title(), title_rect, title, c.fg);
     if detail_w > 0 {
-        desktop::label_right(pixels, stride, font, Rect { x: r.x + r.w - detail_w, w: detail_w, ..r }, detail, c.muted);
+        let detail_rect = Rect { x: r.x + r.w - detail_w, w: detail_w, ..r };
+        desktop::label_right(pixels, stride, font.small(), detail_rect, detail, c.muted);
     }
 }
 
@@ -1319,7 +1316,7 @@ fn scalar_row(
     let pen = desktop::label(pixels, stride, font, title, row.spec.title, c.fg);
     if source.category().is_none() || !source.query().is_empty() {
         let tag = Rect { x: pen + s.gap, w: (title.x + title.w).saturating_sub(pen + s.gap), ..title };
-        desktop::label(pixels, stride, font, tag, row.spec.category.title(), c.faint);
+        desktop::label(pixels, stride, font.small(), tag, row.spec.category.title(), c.faint);
     }
     for (line, text) in desktop::wrap(font, row.spec.description, text_w, 2).iter().enumerate() {
         let y = title.y + s.text + line * small;

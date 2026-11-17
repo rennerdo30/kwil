@@ -17,12 +17,12 @@ pub(super) mod tok {
     pub const LG: f64 = 16.0;
     pub const XL: f64 = 24.0;
     pub const XXL: f64 = 32.0;
-    /// Type scale; `BODY` is the menu, tab, status and overlay text.
-    /// `SMALL` and `TITLE` get a font face only where a screen first uses them.
-    #[allow(dead_code)]
+    /// Type scale, one rule for every screen: `DISPLAY` names the app (about,
+    /// welcome); `TITLE` heads a card or page; `BODY` is menu, tab, status,
+    /// row and control text; `SMALL` is secondary: hints, counts, key hints.
+    /// Hierarchy is size and colour only (one regular weight).
     pub const SMALL: f64 = 13.0;
     pub const BODY: f64 = 15.0;
-    #[allow(dead_code)]
     pub const TITLE: f64 = 18.0;
     pub const DISPLAY: f64 = 30.0;
     /// Heights.
@@ -331,6 +331,7 @@ pub(super) enum Hover {
     Previous,
     Next,
     Status(usize),
+    CompareToggle(compare_ui::Toggle),
     VerticalThumb,
     HorizontalThumb,
 }

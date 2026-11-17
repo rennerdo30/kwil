@@ -371,7 +371,12 @@ pub struct UiFont {
     glyphs: HashMap<char, UiGlyph>,
     /// Coverage bytes retained by `glyphs`.
     bytes: usize,
+    /// Type-scale faces (`tok::DISPLAY`, `TITLE`, `SMALL`) and the same-DPI
+    /// monospace. Only the display face is prepared eagerly; the others
+    /// rasterize glyphs on first use, so they cost nothing at startup.
     heading: Option<Box<UiFont>>,
+    title: Option<Box<UiFont>>,
+    small: Option<Box<UiFont>>,
     monospace: Option<Box<UiFont>>,
     #[cfg(test)]
     rasterized: usize,
@@ -402,12 +407,18 @@ impl UiFont {
         Some(font)
     }
     fn from_face(face: UiFace, px: f32) -> Option<UiFont> {
+        use crate::chrome::tok;
         let mut font = Self::single_face(face.clone(), px)?;
-        font.heading = Some(Box::new(Self::single_face(
-            face,
-            px * (crate::chrome::tok::DISPLAY / crate::chrome::tok::BODY) as f32,
-        )?));
+        let scaled = |size: f64| px * (size / tok::BODY) as f32;
+        font.title = Self::lazy(face.clone(), scaled(tok::TITLE)).map(Box::new);
+        font.small = Self::lazy(face.clone(), scaled(tok::SMALL)).map(Box::new);
+        font.heading = Some(Box::new(Self::single_face(face, scaled(tok::DISPLAY))?));
         Some(font)
+    }
+    /// A face whose glyphs are rasterized only when first drawn.
+    fn lazy(face: UiFace, px: f32) -> Option<UiFont> {
+        let px = if px.is_finite() { px.clamp(4.0, 160.0) } else { 14.0 };
+        Self::bare(face, px)
     }
     fn single_face(face: UiFace, px: f32) -> Option<UiFont> {
         let px = if px.is_finite() { px.clamp(4.0, 160.0) } else { 14.0 };
@@ -416,9 +427,14 @@ impl UiFont {
     // Editor zoom already supplies bounded physical pixels (up to 256),
     // independently of chrome's smaller size limit.
     fn at_pixels(face: UiFace, px: f32) -> Option<UiFont> {
+        let mut font = Self::bare(face, px)?;
+        font.prepare((' '..='~').chain(['…', '●', '×']));
+        Some(font)
+    }
+    fn bare(face: UiFace, px: f32) -> Option<UiFont> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let metrics = face.font().metrics(&[]).scale(px);
-        let mut font = UiFont {
+        let font = UiFont {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             face,
             fallback: None,
@@ -430,11 +446,12 @@ impl UiFont {
             glyphs: HashMap::new(),
             bytes: 0,
             heading: None,
+            title: None,
+            small: None,
             monospace: None,
             #[cfg(test)]
             rasterized: 0,
         };
-        font.prepare((' '..='~').chain(['…', '●', '×']));
         Some(font)
     }
 
@@ -446,32 +463,45 @@ impl UiFont {
         font.install_symbols(self.symbols.clone());
         font.fallback = self.fallback.clone();
         font.fallback_state = self.fallback_state;
-        if let Some(mono) = &mut font.monospace {
-            mono.fallback = self.fallback.clone();
-            mono.fallback_state = self.fallback_state;
-        }
-        if let Some(heading) = &mut font.heading {
-            heading.fallback = self.fallback.clone();
-            heading.fallback_state = self.fallback_state;
+        for face in font.faces_mut() {
+            face.fallback = self.fallback.clone();
+            face.fallback_state = self.fallback_state;
         }
         Some(font)
     }
 
+    /// The nested type-scale and monospace faces (never `self`).
+    fn faces(&self) -> impl Iterator<Item = &UiFont> {
+        [&self.heading, &self.title, &self.small, &self.monospace].into_iter().flatten().map(|face| &**face)
+    }
+    fn faces_mut(&mut self) -> impl Iterator<Item = &mut UiFont> {
+        [&mut self.heading, &mut self.title, &mut self.small, &mut self.monospace]
+            .into_iter()
+            .flatten()
+            .map(|face| &mut **face)
+    }
+
     fn install_symbols(&mut self, face: Option<UiFace>) {
         self.symbols = face.clone();
-        if let Some(font) = &mut self.heading {
+        for font in self.faces_mut() {
             font.symbols = face.clone();
-        }
-        if let Some(font) = &mut self.monospace {
-            font.symbols = face;
         }
     }
     /// Same-DPI monospace loaded with the chrome face on its font worker.
     pub(super) fn monospace(&mut self) -> &mut Self {
         if self.monospace.is_some() { self.monospace.as_deref_mut().unwrap() } else { self }
     }
+    /// `tok::DISPLAY`: the about name and welcome headings.
     pub(super) fn heading(&mut self) -> &mut Self {
         if self.heading.is_some() { self.heading.as_deref_mut().unwrap() } else { self }
+    }
+    /// `tok::TITLE`: card and page titles.
+    pub(super) fn title(&mut self) -> &mut Self {
+        if self.title.is_some() { self.title.as_deref_mut().unwrap() } else { self }
+    }
+    /// `tok::SMALL`: secondary hints, counts and key hints.
+    pub(super) fn small(&mut self) -> &mut Self {
+        if self.small.is_some() { self.small.as_deref_mut().unwrap() } else { self }
     }
 
     /// Identity of this face; fallback results are bound only to the face
@@ -500,8 +530,7 @@ impl UiFont {
     /// True once per font when a glyph was missing and no fallback was tried.
     pub fn take_fallback_request(&mut self) -> bool {
         let wanted = self.fallback_state == Fallback::Wanted
-            || self.heading.as_ref().is_some_and(|font| font.fallback_state == Fallback::Wanted)
-            || self.monospace.as_ref().is_some_and(|font| font.fallback_state == Fallback::Wanted);
+            || self.faces().any(|font| font.fallback_state == Fallback::Wanted);
         if wanted {
             self.fallback_state = Fallback::Requested;
         }
@@ -514,10 +543,7 @@ impl UiFont {
         self.install_shared_fallback(faces.text.and_then(|(data, index)| UiFace::from_data(data, index)));
     }
     fn install_shared_fallback(&mut self, face: Option<UiFace>) {
-        if let Some(font) = &mut self.heading {
-            font.install_shared_fallback(face.clone());
-        }
-        if let Some(font) = &mut self.monospace {
+        for font in self.faces_mut() {
             font.install_shared_fallback(face.clone());
         }
         self.fallback = face;
@@ -526,9 +552,6 @@ impl UiFont {
         let charmap = self.face.font().charmap();
         self.glyphs.retain(|c, _| c.is_ascii() || charmap.map(*c) != 0);
         self.bytes = self.glyphs.values().map(|g| g.alpha.len()).sum();
-        if let Some(heading) = &mut self.heading {
-            heading.install_shared_fallback(self.fallback.clone());
-        }
     }
     pub(super) fn copy_fallback_from(&mut self, other: &Self) {
         if other.symbols.is_some() {

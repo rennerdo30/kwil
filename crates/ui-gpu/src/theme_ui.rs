@@ -100,14 +100,8 @@ pub(super) fn draw(
     };
     desktop::card(pixels, size.0, area, &c, &s);
     let inner = Rect { x: area.x + s.pad, y: area.y, w: area.w.saturating_sub(2 * s.pad), h: s.header };
-    desktop::label(
-        pixels,
-        size.0,
-        font,
-        inner,
-        if host.importing() { "Import Theme" } else { "Select Theme — live preview" },
-        c.fg,
-    );
+    let title = if host.importing() { "Import theme" } else { "Select theme" };
+    desktop::label(pixels, size.0, font.title(), inner, title, c.fg);
     let field = Rect { y: inner.y + s.header, h: s.control, ..inner };
     desktop::text_field(
         pixels,
@@ -154,7 +148,7 @@ pub(super) fn draw(
     desktop::label(
         pixels,
         size.0,
-        font,
+        font.small(),
         Rect { y: footer.y + s.footer, ..footer },
         "↑ ↓ preview · Enter apply and save · Esc restore",
         c.muted,
