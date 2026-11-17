@@ -457,7 +457,18 @@ fn draw_files(
         let target = Target::Field(field);
         let w = desktop::button_width(font, label(field), &s);
         let rect = Rect { x, y, w: w.min(close.x.saturating_sub(x + s.gap / 2)), h: s.control };
-        desktop::button(pixels, stride, font, rect, label(field), Style::Secondary, view.hover == Some(target), &c, &s);
+        desktop::button(
+            pixels,
+            stride,
+            font,
+            rect,
+            label(field),
+            Style::Secondary,
+            view.hover == Some(target),
+            false,
+            &c,
+            &s,
+        );
         view.hits.push(rect, target);
         x += w + s.gap / 2;
     }
@@ -553,15 +564,10 @@ fn draw_files(
     for index in first..(first + layout.rows).min(view.rows.len()) {
         let row = &view.rows[index];
         let rect = Rect { x: inner.x, y, w: inner.w, h: 2 * s.text + s.gap / 2 };
-        let bg = if index == panel.selected() {
-            c.selected
-        } else if view.hover == Some(Target::Row(index)) {
-            c.hover
-        } else {
-            c.surface
-        };
-        fill(pixels, stride, rect, bg);
-        let clip = inset(rect, s.gap / 2);
+        let state = desktop::RowState::new(index == panel.selected(), view.hover == Some(Target::Row(index)));
+        desktop::row(pixels, stride, rect, state, &c, &s);
+        // Text starts past the accent indicator.
+        let clip = Rect { x: rect.x + s.sm, w: rect.w.saturating_sub(2 * s.sm), ..inset(rect, s.gap / 2) };
         let text = font.fit(&row.label, clip.w);
         font.draw(
             pixels,
@@ -684,7 +690,7 @@ fn replacement_button(
     sizes: &Sizes,
 ) {
     if enabled {
-        desktop::button(pixels, stride, font, rect, text, Style::Secondary, hovered, colors, sizes);
+        desktop::button(pixels, stride, font, rect, text, Style::Secondary, hovered, false, colors, sizes);
     } else {
         chrome::round_rect(pixels, stride, rect, sizes.radius, colors.border);
         chrome::round_rect(pixels, stride, inset(rect, sizes.hairline), sizes.radius, colors.control);

@@ -61,7 +61,7 @@ pub(super) fn frame(
         .map(|name| match font.as_deref_mut() {
             // Only up to the widest tab matters; long names are never measured in full.
             Some(font) => font.measure(name, m.tab_max),
-            None => name.chars().count() * m.dip(7.0),
+            None => name.chars().count() * m.dip(chrome::tok::SM),
         })
         .map(|width| width + s.xl)
         .collect();

@@ -142,7 +142,14 @@ pub(super) fn draw(
             w: area.w - 2 * s.hairline,
             h: s.list_row,
         };
-        desktop::row(pixels, stride, row, index == state.selected, state.hover == Some(index), &c, &s);
+        desktop::row(
+            pixels,
+            stride,
+            row,
+            desktop::RowState::new(index == state.selected, state.hover == Some(index)),
+            &c,
+            &s,
+        );
         state.hits.push(row, index);
         let label = Rect { x: row.x + s.pad + 2 * s.icon, w: row.w.saturating_sub(2 * s.pad + 2 * s.icon), ..row };
         if item.selected {
