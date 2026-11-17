@@ -190,6 +190,14 @@ pub fn locate(current_exe: &Path) -> Result<Install, CommandLineError> {
     use std::os::windows::fs::MetadataExt;
     let folder = current_exe.parent().ok_or_else(|| CommandLineError("Kwil's own folder is unknown.".into()))?;
     let folder = validate_folder(folder, &temp_dirs())?;
+    // A drive letter can still be a mapped network share. `validate_folder`
+    // guarantees the text starts with `X:\`.
+    let root: Vec<u16> = folder[..3].encode_utf16().chain([0]).collect();
+    const DRIVE_REMOTE: u32 = 4; // GetDriveTypeW: a network share
+    let drive = unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) };
+    if drive == DRIVE_REMOTE {
+        return err("Kwil is in a network or device location. Move it to a folder on a local drive first.");
+    }
     let install = Install { exe: format!("{folder}\\kwil.exe"), folder };
     let mut current = PathBuf::new();
     for component in Path::new(&install.folder).components() {
@@ -252,6 +260,18 @@ impl Outcome {
     }
 }
 
+/// Windows ignores an environment value longer than 32,767 UTF-16 units.
+const MAX_PATH_UNITS: usize = 32_767;
+
+fn path_fits(text: Option<&str>) -> Result<(), CommandLineError> {
+    match text {
+        Some(text) if text.encode_utf16().count() > MAX_PATH_UNITS => {
+            err("Your PATH is already at the Windows length limit, so Kwil was not added. Remove unused entries first.")
+        }
+        _ => Ok(()),
+    }
+}
+
 fn read_path(registry: &mut impl Registry) -> Result<Option<Value>, CommandLineError> {
     registry.read(ENVIRONMENT_SUBKEY, PATH_VALUE)
 }
@@ -266,8 +286,10 @@ pub fn status(registry: &mut impl Registry, install: &Install) -> Result<Status,
 /// the install being registered now.
 pub fn register(registry: &mut impl Registry, install: &Install) -> Result<Outcome, CommandLineError> {
     let mut outcome = Outcome::default();
-    // Read first: an unexpected PATH type stops everything before any write.
-    let path = read_path(registry)?;
+    // Read first: an unexpected PATH type or a PATH already at Windows' length
+    // limit stops everything before any write.
+    let current = read_path(registry)?.map(|value| value.text).unwrap_or_default();
+    path_fits(path_with(&current, &install.folder).as_deref())?;
     if registry.read(APP_PATHS_SUBKEY, "")?.as_ref() != Some(&Value::sz(&install.exe)) {
         registry.write(APP_PATHS_SUBKEY, "", &Value::sz(&install.exe))?;
         outcome.app_paths_changed = true;
@@ -276,8 +298,12 @@ pub fn register(registry: &mut impl Registry, install: &Install) -> Result<Outco
         registry.write(APP_PATHS_SUBKEY, PATH_VALUE, &Value::sz(&install.folder))?;
         outcome.app_paths_changed = true;
     }
+    // Read again right before writing, so an edit another program made
+    // meanwhile (setx, an installer) is kept.
+    let path = read_path(registry)?;
     let (kind, current) = path.map_or((ValueKind::ExpandSz, String::new()), |value| (value.kind, value.text));
     if let Some(text) = path_with(&current, &install.folder) {
+        path_fits(Some(&text))?;
         registry.write(ENVIRONMENT_SUBKEY, PATH_VALUE, &Value { kind, text })?;
         registry.environment_changed();
         outcome.path_changed = true;
@@ -416,6 +442,7 @@ pub mod native {
     /// 128 KiB is four times the largest legal environment value.
     const MAX_VALUE_BYTES: u32 = 128 * 1024;
     const BROADCAST_TIMEOUT_MS: u32 = 1000;
+    const BROADCAST_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
     /// Every isolated root must live here, so a typo cannot reach real keys.
     pub const ISOLATED_PREFIX: &str = r"Software\Kwil-test-";
 
@@ -594,20 +621,28 @@ pub mod native {
             if !self.broadcast {
                 return;
             }
-            let mut result = 0usize;
-            // Bounded, and hung windows are skipped. The answer does not matter:
-            // new terminals read the registry themselves.
-            unsafe {
-                SendMessageTimeoutW(
-                    HWND_BROADCAST,
-                    WM_SETTINGCHANGE,
-                    0,
-                    wide("Environment").as_ptr() as isize,
-                    SMTO_ABORTIFHUNG,
-                    BROADCAST_TIMEOUT_MS,
-                    &mut result,
-                );
-            }
+            // Each window may use the per-window timeout, so the broadcast runs
+            // on its own thread and the caller waits at most BROADCAST_BUDGET
+            // (the uninstaller gives this command 10 s). The answer does not
+            // matter: new terminals read the registry themselves.
+            let (done, finished) = std::sync::mpsc::channel();
+            let _ = std::thread::Builder::new().name("kwil-path-broadcast".into()).spawn(move || {
+                let name = wide("Environment");
+                let mut result = 0usize;
+                unsafe {
+                    SendMessageTimeoutW(
+                        HWND_BROADCAST,
+                        WM_SETTINGCHANGE,
+                        0,
+                        name.as_ptr() as isize,
+                        SMTO_ABORTIFHUNG,
+                        BROADCAST_TIMEOUT_MS,
+                        &mut result,
+                    );
+                }
+                let _ = done.send(());
+            });
+            let _ = finished.recv_timeout(BROADCAST_BUDGET);
         }
     }
 }
@@ -730,6 +765,16 @@ mod tests {
     }
 
     #[test]
+    fn a_path_at_the_length_limit_is_refused_before_any_write() {
+        let long = r"C:\x;".repeat(MAX_PATH_UNITS / 5);
+        let mut fake = Fake::with_path(ValueKind::ExpandSz, &long);
+        assert!(register(&mut fake, &install()).is_err());
+        assert_eq!(fake.path().map(|v| v.text.as_str()), Some(long.as_str()), "PATH untouched");
+        assert!(fake.app_paths().is_none(), "nothing written before the refusal");
+        assert_eq!(fake.broadcasts, 0);
+    }
+
+    #[test]
     fn register_keeps_the_path_type_and_every_other_entry() {
         for kind in [ValueKind::ExpandSz, ValueKind::Sz] {
             let original = r"%USERPROFILE%\bin;C:\Tools;";
@@ -839,6 +884,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // Backslash paths only split into folders on Windows.
     fn lenient_lookup_recognises_an_install_that_would_no_longer_be_accepted() {
         let found = locate_existing(Path::new(r"C:\Users\ada\AppData\Local\Temp\Kwil\kwil.com")).unwrap();
         assert_eq!(found.exe, r"C:\Users\ada\AppData\Local\Temp\Kwil\kwil.exe");

@@ -241,18 +241,9 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
     if args.unregister_file_types {
         use kwil_view_model::file_type_registration::RemoveAllOutcome;
-        // The command-line registration goes first and independently: a refusal
-        // in one part never hides the other. Both run on Windows only.
-        let mut command_line_failed = false;
-        if kwil_ui_gpu::COMMAND_LINE_SUPPORTED {
-            match kwil_ui_gpu::command_line_registration(false) {
-                Ok(message) => println!("{message}"),
-                Err(e) => {
-                    eprintln!("kwil: cannot remove Kwil from your PATH: {e}");
-                    command_line_failed = true;
-                }
-            }
-        }
+        // File types first: the uninstaller gives this command 10 s and the
+        // PATH broadcast is the part that may wait. A refusal in one part never
+        // hides the other.
         let file_types = match kwil_ui_gpu::remove_file_types(std::time::Duration::from_secs(60)) {
             Ok(RemoveAllOutcome::NothingRegistered) => {
                 println!("No Kwil file types are registered");
@@ -267,6 +258,16 @@ fn run_app(console_launcher: bool) -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+        let mut command_line_failed = false;
+        if kwil_ui_gpu::COMMAND_LINE_SUPPORTED {
+            match kwil_ui_gpu::command_line_registration(false) {
+                Ok(message) => println!("{message}"),
+                Err(e) => {
+                    eprintln!("kwil: cannot remove Kwil from your PATH: {e}");
+                    command_line_failed = true;
+                }
+            }
+        }
         return if command_line_failed { ExitCode::FAILURE } else { file_types };
     }
 
