@@ -1,11 +1,14 @@
 //! Navigable settings panel; filesystem work belongs to SettingsSession.
 use super::*;
-use kwil_core_commands::settings_ui::SettingValue;
+use kwil_core_commands::settings_ui::{SettingKind, SettingValue};
 use kwil_view_model::palette_session::{display_text, text_window};
 use kwil_view_model::settings_panels::{EditColumn, PanelInput};
 use kwil_view_model::settings_session::{SettingsInput, SettingsSession};
 
-fn value_text(value: &SettingValue) -> String {
+fn value_text(kind: SettingKind, value: &SettingValue) -> String {
+    if let Some(size) = kind.size_text(value) {
+        return size;
+    }
     match value {
         SettingValue::Bool(value) => if *value { "On" } else { "Off" }.into(),
         SettingValue::Integer(value) => value.to_string(),
@@ -167,13 +170,13 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, host: &SettingsSession) {
             ));
             input.text
         } else {
-            value_text(&row.current)
+            value_text(row.spec.kind, &row.current)
         };
         line((index - first + 2) as u16, format!("{}: {}", row.spec.title, value), index == host.selected());
     }
     if let Some(row) = rows.get(host.selected()) {
         line(height - 4, row.spec.description.into(), false);
-        line(height - 3, format!("Default: {}", value_text(&row.default)), false);
+        line(height - 3, format!("Default: {}", value_text(row.spec.kind, &row.default)), false);
     }
     line(height - 2, host.status().into(), false);
     line(height - 1, "Enter: edit  /: search  Delete: reset  Ctrl+S: save  Esc: back".into(), false);

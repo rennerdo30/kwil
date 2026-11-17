@@ -350,6 +350,24 @@ impl SettingsPanelController {
     pub fn is_confirming(&self) -> bool {
         matches!(self.state, State::Confirm(_, _))
     }
+    /// The keys that act now, for the settings footer: one plain line per
+    /// state, so it is never wrong for the stage the user is in.
+    pub fn hint(&self) -> &'static str {
+        match &self.state {
+            State::Confirm(_, _) => "Enter confirm · Esc cancel",
+            State::Capture { .. } => "Press the new shortcut · Esc cancel",
+            State::Edit(edit) if edit.column == EditColumn::Key => "Enter next · Tab switch field · Esc cancel",
+            State::Edit(_) => "Enter save · Tab switch field · Esc cancel",
+            State::Browse => match (self.panel, self.query.value.is_empty()) {
+                (SettingsPanel::Keymap, true) => "Enter change · Delete reset · Esc back",
+                (SettingsPanel::Keymap, false) => "Enter change · Delete reset · Esc clear search",
+                (SettingsPanel::Formatters, true) => "Enter edit · Esc back",
+                (SettingsPanel::Formatters, false) => "Enter edit · Esc clear search",
+                (_, true) => "Enter edit · Delete remove · Esc back",
+                (_, false) => "Enter edit · Delete remove · Esc clear search",
+            },
+        }
+    }
     pub fn confirmation(&self) -> &[KeyConflict] {
         match &self.state {
             State::Confirm(_, conflicts) => conflicts,
@@ -634,10 +652,8 @@ impl SettingsPanelController {
                         };
                         let mut view = base_row(row.command.title.into(), binding.keys.clone());
                         view.command = Some(row.command.id);
-                        view.description = format!(
-                            "{} · {} · Enter captures, Delete restores defaults",
-                            row.command.category, row.command.id
-                        );
+                        // Shown on the selected row only; the footer names the keys.
+                        view.description = format!("{} · {}", row.command.category, row.command.id);
                         view.default = defaults.clone();
                         view.source = source.into();
                         view.context = binding.context;
@@ -848,6 +864,44 @@ mod tests {
             press(&mut panel, &doc, key("escape"));
             assert!(!panel.is_capturing());
         }
+    }
+
+    /// KW-92: the footer names the keys that act in each stage, in plain words.
+    #[test]
+    fn panel_hint_names_the_keys_for_each_stage() {
+        let doc = SettingsDocument::parse(
+            "[[bindings]]\nkeys='alt+f12'\ncommand='file.open'\ncontext='palette'\nmode='insert'\n",
+        )
+        .unwrap();
+        let mut keymap = SettingsPanelController::new(SettingsPanel::Keymap, &doc).unwrap();
+        assert_eq!(keymap.hint(), "Enter change · Delete reset · Esc back");
+        keymap.search(&doc, "alt+f12").unwrap();
+        assert_eq!(keymap.hint(), "Enter change · Delete reset · Esc clear search");
+        press(&mut keymap, &doc, PanelInput::Accept);
+        assert!(keymap.is_capturing());
+        assert_eq!(keymap.hint(), "Press the new shortcut · Esc cancel");
+        press(&mut keymap, &doc, PanelInput::Accept); // records Enter
+        assert_eq!(keymap.hint(), "Press the new shortcut · Esc cancel");
+        press(&mut keymap, &doc, PanelInput::Accept); // Enter conflicts with palette.accept
+        assert!(keymap.is_confirming());
+        assert_eq!(keymap.hint(), "Enter confirm · Esc cancel");
+        press(&mut keymap, &doc, PanelInput::Cancel);
+        assert_eq!(keymap.hint(), "Enter change · Delete reset · Esc clear search");
+
+        let mut types = SettingsPanelController::new(SettingsPanel::FileTypes, &doc).unwrap();
+        assert_eq!(types.hint(), "Enter edit · Delete remove · Esc back");
+        types.search(&doc, "no existing row matches this").unwrap();
+        assert_eq!(types.hint(), "Enter edit · Delete remove · Esc clear search");
+        press(&mut types, &doc, PanelInput::Accept); // the Add row starts at its key
+        assert_eq!(types.hint(), "Enter next · Tab switch field · Esc cancel");
+        press(&mut types, &doc, PanelInput::Text("kw"));
+        press(&mut types, &doc, PanelInput::Accept);
+        assert_eq!(types.hint(), "Enter save · Tab switch field · Esc cancel");
+        press(&mut types, &doc, PanelInput::Next);
+        assert_eq!(types.hint(), "Enter next · Tab switch field · Esc cancel");
+
+        let formatters = SettingsPanelController::new(SettingsPanel::Formatters, &doc).unwrap();
+        assert_eq!(formatters.hint(), "Enter edit · Esc back", "formatter fields cannot be removed");
     }
 
     fn press(panel: &mut SettingsPanelController, doc: &SettingsDocument, input: PanelInput<'_>) -> Option<PanelEdit> {

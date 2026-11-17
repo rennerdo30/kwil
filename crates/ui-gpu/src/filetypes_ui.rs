@@ -109,14 +109,37 @@ fn status_text(service: &FileTypeRegistration) -> (String, bool) {
     }
 }
 
-fn type_label(service: &FileTypeRegistration, extension: &Extension) -> String {
-    let state =
-        match service.registered().filter(|_| !matches!(service.registration_status(), RegistrationStatus::Pending)) {
-            Some(types) if types.contains(extension) => "In Open with",
-            Some(_) => "Not registered",
-            None => "Not checked",
-        };
-    format!(".{} · {state}", extension.as_str())
+/// Whether the last known status names this type as registered. Unknown and
+/// pending states are not claimed either way; the count line says which.
+fn registered(service: &FileTypeRegistration, extension: &Extension) -> bool {
+    service
+        .registered()
+        .filter(|_| !matches!(service.registration_status(), RegistrationStatus::Pending))
+        .is_some_and(|types| types.contains(extension))
+}
+
+/// One rule for every type: the checkbox reads ".ext"; a registered type adds
+/// a quiet accent "registered" after it. Unregistered types carry no label.
+#[allow(clippy::too_many_arguments)]
+fn type_cell(
+    buf: &mut [u32],
+    stride: usize,
+    font: &mut font::UiFont,
+    cell: Rect,
+    service: &FileTypeRegistration,
+    extension: &Extension,
+    hovered: bool,
+    c: &Colors,
+    s: &Sizes,
+) {
+    let label = format!(".{}", extension.as_str());
+    let checked = service.selection().contains(extension);
+    let check = desktop::checkbox(buf, stride, font, cell, &label, checked, hovered, false, true, c, s);
+    if registered(service, extension) {
+        let x = check.x + check.w + s.gap + font.measure(&label, cell.w) + s.gap;
+        let mark = Rect { x, w: (cell.x + cell.w).saturating_sub(x), ..cell };
+        desktop::label(buf, stride, font.small(), mark, "registered", c.accent);
+    }
 }
 
 /// Page-local state: custom-extension draft and scroll. Everything else is
@@ -276,7 +299,7 @@ impl HostedPage for Page {
                         let code = GROUP | *group as u32;
                         let w = desktop::button_width(font, label, s);
                         let b = Rect { x: pen + s.gap, y: r.y + (r.h - s.control) / 2, w, h: s.control };
-                        desktop::button(buf, stride, font, b, label, Style::Subtle, hot(code), false, c, s);
+                        desktop::button(buf, stride, font, b, label, Style::Link, hot(code), false, c, s);
                         hits.push(b, Target::Hosted(code));
                     }
                 }
@@ -290,9 +313,7 @@ impl HostedPage for Page {
                             _ => self.service.selection().extensions().get((code & !MASK) as usize).cloned(),
                         };
                         let Some(extension) = extension else { continue };
-                        let checked = self.service.selection().contains(&extension);
-                        let text = type_label(&self.service, &extension);
-                        desktop::checkbox(buf, stride, font, cell, &text, checked, hot(*code), false, true, c, s);
+                        type_cell(buf, stride, font, cell, &self.service, &extension, hot(*code), c, s);
                         hits.push(cell, Target::Hosted(*code));
                     }
                 }
@@ -502,19 +523,7 @@ impl Page {
                             if let Some(extension) = extension {
                                 let width = row.w / columns;
                                 let r = Rect { x: row.x + i * width, w: width.saturating_sub(s.gap), ..row };
-                                desktop::checkbox(
-                                    buf,
-                                    stride,
-                                    font,
-                                    r,
-                                    &type_label(&self.service, &extension),
-                                    self.service.selection().contains(&extension),
-                                    hover == Some(*code),
-                                    false,
-                                    true,
-                                    c,
-                                    s,
-                                );
+                                type_cell(buf, stride, font, r, &self.service, &extension, hover == Some(*code), c, s);
                                 hits.push(r, Target::Hosted(*code));
                             }
                         }

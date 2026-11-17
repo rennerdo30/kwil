@@ -264,8 +264,7 @@ fn draw_about(
     if y + s.text * 3 <= area.y + area.h {
         desktop::label(pixels, stride, font, Rect { y, h: s.text, ..area }, welcome::TECHNOLOGY[0], c.accent);
         y += s.text + m.dip(4.0);
-        let detail = "Rust underneath. Shared piece-tree text, sparse indexes and bounded workers. Native, event-driven rendering redraws only what changes.";
-        for line in desktop::wrap(font, detail, area.w, 3) {
+        for line in desktop::wrap(font, welcome::TECHNOLOGY[1], area.w, 3) {
             if y + s.text <= area.y + area.h {
                 desktop::label(pixels, stride, font, Rect { y, h: s.text, ..area }, &line, c.muted);
                 y += s.text;

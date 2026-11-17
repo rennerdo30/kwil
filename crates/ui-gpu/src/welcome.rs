@@ -16,9 +16,7 @@ pub const BENEFITS: &[&str] = &[
 ];
 pub const TECHNOLOGY: &[&str] = &[
     "Built for speed",
-    "Persistent piece trees share unchanged text between edits.",
-    "Sparse indexes and bounded workers process the ranges you need.",
-    "Event-driven rendering redraws changed areas, with no idle frames.",
+    "Even huge files open in a moment, and Kwil redraws only what changes, so typing and scrolling stay smooth.",
 ];
 
 /// Whether the first-run "use Kwil from the command line and Win+R" choice starts
