@@ -26,15 +26,14 @@ pub(super) struct Colors {
     pub backdrop: u32,
     pub surface: u32,
     pub sidebar: u32,
-    /// Hover and selected rows on the sidebar colour.
-    pub nav_hover: u32,
-    pub nav_selected: u32,
     pub control: u32,
     pub control_hover: u32,
     /// State ramp (`chrome::ramp`), each over the surface a row or control sits on.
     pub hover: u32,
     pub pressed: u32,
     pub selected: u32,
+    /// The theme's selection role; rows blend it over their own ground.
+    pub selection: u32,
     /// Focus ring colour; drawn `Sizes::focus` thick.
     pub focus_ring: u32,
     pub fg: u32,
@@ -61,13 +60,12 @@ impl Colors {
             backdrop: rgb(UiRole::Background),
             surface,
             sidebar: panel,
-            nav_hover: chrome::hover_color(panel, fg),
-            nav_selected: chrome::selected_color(panel, rgb(UiRole::Selection)),
             control,
             control_hover: chrome::hover_color(control, fg),
             hover: chrome::hover_color(surface, fg),
             pressed: chrome::pressed_color(surface, fg),
             selected: chrome::selected_color(surface, rgb(UiRole::Selection)),
+            selection: rgb(UiRole::Selection),
             focus_ring: rgb(UiRole::Accent),
             fg,
             muted: chrome::mix(surface, fg, 0xa8),
@@ -471,6 +469,7 @@ pub(super) fn button(
     text: &str,
     style: Style,
     hovered: bool,
+    focused: bool,
     c: &Colors,
     s: &Sizes,
 ) {
@@ -494,6 +493,9 @@ pub(super) fn button(
     let width = font.measure(&fitted, clip.w);
     let baseline = font.baseline(rect.y, rect.h);
     font.draw(buf, stride, clip, clip.x + (clip.w - width) / 2, baseline, &fitted, fg);
+    if focused {
+        focus_ring(buf, stride, rect, s.radius, bg, c, s);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,6 +565,7 @@ pub(super) fn switch(
     rect: Rect,
     on: bool,
     hovered: bool,
+    focused: bool,
     c: &Colors,
     s: &Sizes,
 ) -> Rect {
@@ -582,6 +585,9 @@ pub(super) fn switch(
         chrome::round_rect(buf, stride, inset(track, s.hairline), radius.saturating_sub(s.hairline), fill);
         let cx = track.x as f32 + h as f32 / 2.0;
         chrome::disc(buf, stride, (cx, cy), knob, c.muted);
+    }
+    if focused {
+        focus_ring(buf, stride, track, radius, if on { c.accent } else { c.control }, c, s);
     }
     let text = Rect { x: track.x + track.w + s.gap, y: rect.y, w: rect.w.saturating_sub(track.w + s.gap), h: rect.h };
     label(buf, stride, font, text, if on { "On" } else { "Off" }, c.muted);
@@ -619,6 +625,7 @@ pub(super) fn segmented(
     options: &[&str],
     selected: Option<usize>,
     hovered: Option<usize>,
+    focused: Option<usize>,
     c: &Colors,
     s: &Sizes,
 ) {
@@ -652,6 +659,10 @@ pub(super) fn segmented(
         let baseline = font.baseline(rect.y, rect.h);
         font.draw(buf, stride, clip, clip.x + (clip.w - width) / 2, baseline, &text, fg);
     }
+    if let Some(index) = focused.filter(|index| *index < rects.len()) {
+        let over = if selected == Some(index) { c.accent } else { c.control };
+        focus_ring(buf, stride, rects[index], s.radius, over, c, s);
+    }
 }
 
 /// Checkbox at the left of `rect`, label after it. Returns the box rectangle.
@@ -666,6 +677,7 @@ pub(super) fn checkbox(
     text: &str,
     checked: bool,
     hovered: bool,
+    focused: bool,
     enabled: bool,
     c: &Colors,
     s: &Sizes,
@@ -687,6 +699,9 @@ pub(super) fn checkbox(
         chrome::round_rect(buf, stride, r, s.radius, if enabled { c.muted } else { c.disabled });
         let fill = if hovered && enabled { c.control_hover } else { c.control };
         chrome::round_rect(buf, stride, inset(r, s.hairline), s.fill_radius(s.radius), fill);
+    }
+    if focused && enabled {
+        focus_ring(buf, stride, r, s.radius, if checked { c.accent } else { c.control }, c, s);
     }
     let text_rect = Rect { x: r.x + size + s.gap, y: rect.y, w: rect.w.saturating_sub(size + s.gap), h: rect.h };
     label(buf, stride, font, text_rect, text, if enabled { c.fg } else { c.disabled });
@@ -755,38 +770,105 @@ pub(super) fn keycaps(
     pen
 }
 
-/// List or navigation row background: hover tint, or selection with an accent
-/// indicator at the leading edge.
-pub(super) fn row(buf: &mut [u32], stride: usize, rect: Rect, selected: bool, hovered: bool, c: &Colors, s: &Sizes) {
-    if selected {
-        chrome::round_rect(buf, stride, rect, s.radius, c.selected);
-        let h = (rect.h / 2).max(1);
-        let bar = Rect { x: rect.x, y: rect.y + (rect.h - h) / 2, w: s.indicator.min(rect.w), h };
-        chrome::round_rect(buf, stride, bar, s.pill(s.indicator), c.accent);
-    } else if hovered {
-        chrome::round_rect(buf, stride, rect, s.radius, c.hover);
+/// What a row shows. `focused` is keyboard focus: the row is where Enter or
+/// Space acts, and gets the focus ring on top of its other state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RowState {
+    pub selected: bool,
+    pub hovered: bool,
+    pub focused: bool,
+}
+
+impl RowState {
+    pub fn new(selected: bool, hovered: bool) -> Self {
+        Self { selected, hovered, focused: false }
+    }
+    pub fn focused(self, focused: bool) -> Self {
+        Self { focused, ..self }
     }
 }
 
-/// Row background on the sidebar colour.
-pub(super) fn nav_row(
-    buf: &mut [u32],
-    stride: usize,
-    rect: Rect,
-    selected: bool,
-    hovered: bool,
-    c: &Colors,
-    s: &Sizes,
-) {
-    chrome::fill_clipped(buf, stride, rect, c.sidebar);
-    if selected {
-        chrome::round_rect(buf, stride, rect, s.radius, c.nav_selected);
-        let h = (rect.h / 2).max(1);
-        let bar = Rect { x: rect.x, y: rect.y + (rect.h - h) / 2, w: s.indicator.min(rect.w), h };
-        chrome::round_rect(buf, stride, bar, s.pill(s.indicator), c.accent);
-    } else if hovered {
-        chrome::round_rect(buf, stride, rect, s.radius, c.nav_hover);
+/// The ground a row sits on and the corner shape it takes there. Every list
+/// (palette, menus, settings, sidebar, search and log results) derives its
+/// hover and selected tint from the same ramp over its own ground, so a
+/// selected row is the Selection role plus the accent indicator everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RowLook {
+    pub hover: u32,
+    pub selected: u32,
+    pub accent: u32,
+    pub ring: u32,
+    pub radius: usize,
+}
+
+impl RowLook {
+    pub fn on(c: &Colors, ground: u32, radius: usize) -> Self {
+        Self {
+            hover: chrome::hover_color(ground, c.fg),
+            selected: chrome::selected_color(ground, c.selection),
+            accent: c.accent,
+            ring: c.focus_ring,
+            radius,
+        }
     }
+}
+
+/// Accent bar at the leading edge of a selected row.
+pub(super) fn row_indicator(buf: &mut [u32], stride: usize, rect: Rect, look: &RowLook, s: &Sizes) {
+    let h = (rect.h / 2).max(1);
+    let bar = Rect { x: rect.x, y: rect.y + (rect.h - h) / 2, w: s.indicator.min(rect.w), h };
+    chrome::round_rect(buf, stride, bar, s.pill(s.indicator), look.accent);
+}
+
+/// Row tint only: the selection or hover fill without the indicator or ring,
+/// for lists whose text is painted on a grid that would overwrite them.
+pub(super) fn row_fill(buf: &mut [u32], stride: usize, rect: Rect, state: RowState, look: &RowLook) {
+    if state.selected {
+        chrome::round_rect(buf, stride, rect, look.radius, look.selected);
+    } else if state.hovered {
+        chrome::round_rect(buf, stride, rect, look.radius, look.hover);
+    }
+}
+
+/// The one list-row painter: hover tint, or selection with the accent
+/// indicator, plus the focus ring when the keyboard is here.
+pub(super) fn row_in(buf: &mut [u32], stride: usize, rect: Rect, state: RowState, look: &RowLook, s: &Sizes) {
+    row_fill(buf, stride, rect, state, look);
+    if state.selected {
+        row_indicator(buf, stride, rect, look, s);
+    }
+    if state.focused {
+        chrome::ring(buf, stride, rect, look.radius, s.focus, look.ring);
+    }
+}
+
+/// List row on a card or popup surface.
+pub(super) fn row(buf: &mut [u32], stride: usize, rect: Rect, state: RowState, c: &Colors, s: &Sizes) {
+    row_in(buf, stride, rect, state, &RowLook::on(c, c.surface, s.radius), s);
+}
+
+/// Row on the sidebar colour: the same painter over the sidebar ground.
+pub(super) fn nav_row(buf: &mut [u32], stride: usize, rect: Rect, state: RowState, c: &Colors, s: &Sizes) {
+    chrome::fill_clipped(buf, stride, rect, c.sidebar);
+    row_in(buf, stride, rect, state, &RowLook::on(c, c.sidebar, s.radius), s);
+}
+
+/// Keyboard focus ring: accent, `Sizes::focus` thick, inside `rect` so the
+/// widget's own damage always covers it, following the widget's `radius`.
+/// `over` is the fill it sits on; an accent fill takes the foreground colour
+/// so the ring never vanishes into it.
+pub(super) fn focus_ring(buf: &mut [u32], stride: usize, rect: Rect, radius: usize, over: u32, c: &Colors, s: &Sizes) {
+    let color = if over == c.accent || over == c.accent_hover { c.fg } else { c.focus_ring };
+    chrome::ring(buf, stride, rect, radius, s.focus, color);
+}
+
+/// Frame of a menu or dropdown list: rounded `card_radius`, a hairline border
+/// and the surface fill. Popups sit over content that the host restores
+/// before every repaint, so unlike `card` the corners blend instead of
+/// painting the editor backdrop. Rows inside it start `Sizes::xs` in.
+pub(super) fn popup(buf: &mut [u32], stride: usize, rect: Rect, c: &Colors, s: &Sizes) {
+    chrome::round_rect(buf, stride, rect, s.card_radius, c.border);
+    chrome::round_rect(buf, stride, inset(rect, s.hairline), s.fill_radius(s.card_radius), c.surface);
 }
 
 /// Thin overlay scroll thumb for a list of `total` rows showing `visible` from
@@ -911,7 +993,7 @@ mod tests {
                 let width = font.width(text) + 2 * s.pad;
                 let rect = Rect { x: 0, y: 0, w: width, h: s.control };
                 let mut actual = vec![c.surface; width * rect.h];
-                button(&mut actual, width, &mut font, rect, text, Style::Subtle, false, &c, &s);
+                button(&mut actual, width, &mut font, rect, text, Style::Subtle, false, false, &c, &s);
                 let mut expected = vec![c.surface; actual.len()];
                 let text_width = font.width(text);
                 font.draw(&mut expected, width, rect, (width - text_width) / 2, font.baseline(0, rect.h), text, c.fg);
@@ -1087,15 +1169,75 @@ mod tests {
         let rect = Rect { x: 10, y: 10, w: 80, h: 32 };
         let mut first = vec![0x123456; w * h];
         card(&mut first, w, rect, &c, &s);
-        row(&mut first, w, inset(rect, 4), true, false, &c, &s);
+        row(&mut first, w, inset(rect, 4), RowState::new(true, false), &c, &s);
         let mut second = first.clone();
         card(&mut second, w, rect, &c, &s);
-        row(&mut second, w, inset(rect, 4), true, false, &c, &s);
+        row(&mut second, w, inset(rect, 4), RowState::new(true, false), &c, &s);
         assert_eq!(first, second, "a second paint changed pixels");
         for y in 0..h {
             for x in 0..w {
                 if !rect.contains((x, y)) {
                     assert_eq!(first[y * w + x], 0x123456, "paint leaked at {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_focused_button_paints_the_ring_and_an_unfocused_one_does_not() {
+        let mut font = font::UiFont::load(15.0).expect("Windows chrome face");
+        let c = colors();
+        let s = Sizes::new(&Metrics::new(1.0));
+        let (w, h) = (160, 60);
+        let rect = Rect { x: 20, y: 12, w: 120, h: s.control };
+        for style in [Style::Primary, Style::Secondary, Style::Danger, Style::Subtle] {
+            let mut paint = |focused| {
+                let mut pixels = vec![c.surface; w * h];
+                button(&mut pixels, w, &mut font, rect, "Save", style, false, focused, &c, &s);
+                pixels
+            };
+            let (with, without) = (paint(true), paint(false));
+            // An accent-filled button takes the foreground ring so it stays visible.
+            let ring = if style == Style::Primary { c.fg } else { c.focus_ring };
+            let at = |pixels: &[u32], dy: usize| pixels[(rect.y + dy) * w + rect.x + rect.w / 2];
+            for dy in 0..s.focus {
+                assert_eq!(at(&with, dy), ring, "{style:?}: ring row {dy}");
+                assert_ne!(at(&without, dy), ring, "{style:?}: an unfocused button has no ring at row {dy}");
+            }
+            assert_ne!(at(&with, s.focus), ring, "{style:?}: the ring is {} thick, not a fill", s.focus);
+            for (i, (a, b)) in with.iter().zip(&without).enumerate() {
+                if !rect.contains((i % w, i / w)) {
+                    assert_eq!(a, b, "{style:?}: the ring leaked outside the button at {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_focused_row_keeps_its_selected_look_and_adds_a_ring_inside_its_rounded_rectangle() {
+        let (w, h) = (120, 60);
+        let c = colors();
+        let s = Sizes::new(&Metrics::new(1.0));
+        let rect = Rect { x: 10, y: 10, w: 100, h: s.list_row };
+        for (selected, hovered) in [(false, false), (false, true), (true, false)] {
+            let paint = |focused: bool| {
+                let mut pixels = vec![0x123456; w * h];
+                row(&mut pixels, w, rect, RowState::new(selected, hovered).focused(focused), &c, &s);
+                pixels
+            };
+            let (with, without) = (paint(true), paint(false));
+            let top = |pixels: &[u32]| pixels[rect.y * w + rect.x + rect.w / 2];
+            let ring = c.focus_ring;
+            assert_eq!(top(&with), ring, "selected {selected} hovered {hovered}: ring on the top edge");
+            assert_ne!(top(&without), ring, "selected {selected} hovered {hovered}: no ring unless focused");
+            let middle = (rect.y + rect.h / 2) * w + rect.x + rect.w / 2;
+            assert_eq!(with[middle], without[middle], "the ring is an outline, never a fill");
+            // The ring follows the corner radius: the extreme corner pixel stays untouched.
+            assert_eq!(with[rect.y * w + rect.x], 0x123456, "square ring corner");
+            for (i, (a, b)) in with.iter().zip(&without).enumerate() {
+                if !rect.contains((i % w, i / w)) {
+                    assert_eq!(a, b, "the ring leaked outside the row at {i}");
                 }
             }
         }

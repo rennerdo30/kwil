@@ -809,7 +809,14 @@ pub(super) fn draw(
             let rect = Rect { x: nav.x + s.gap, y, w: nav.w - 2 * s.gap, h: s.list_row };
             let target = Target::Category(category);
             let selected = source.category() == category && !hosted_open;
-            desktop::nav_row(pixels, stride, rect, selected, hover == Some(target) && !editing, &c, &s);
+            desktop::nav_row(
+                pixels,
+                stride,
+                rect,
+                desktop::RowState::new(selected, hover == Some(target) && !editing),
+                &c,
+                &s,
+            );
             let glyph = match category {
                 Some(Category::Editor | Category::Keymap) => icons::Icon::Text,
                 Some(Category::Appearance) => {
@@ -961,19 +968,22 @@ pub(super) fn draw(
     }
     if let Some(combo) = &view.combo {
         let row_h = s.control;
-        let height = combo.choices.len() * row_h + s.hairline * 2;
+        let height = combo.choices.len() * row_h + s.xs * 2;
         let y = (combo.anchor.y + combo.anchor.h + s.gap / 2).min(size.1.saturating_sub(height + s.gap));
         let area = Rect { x: combo.anchor.x, y, w: combo.anchor.w, h: height };
-        desktop::card(pixels, stride, area, &c, &s);
+        desktop::popup(pixels, stride, area, &c, &s);
         for (i, value) in combo.choices.iter().copied().enumerate() {
-            let rect = Rect {
-                x: area.x + s.hairline,
-                y: area.y + s.hairline + i * row_h,
-                w: area.w.saturating_sub(2 * s.hairline),
-                h: row_h,
-            };
+            let rect =
+                Rect { x: area.x + s.xs, y: area.y + s.xs + i * row_h, w: area.w.saturating_sub(2 * s.xs), h: row_h };
             let target = Target::Choice { index: combo.index, id: combo.id, value };
-            desktop::nav_row(pixels, stride, rect, i == combo.selected, view.hover == Some(target), &c, &s);
+            desktop::row(
+                pixels,
+                stride,
+                rect,
+                desktop::RowState::new(i == combo.selected, view.hover == Some(target)),
+                &c,
+                &s,
+            );
             desktop::label(
                 pixels,
                 stride,
@@ -1039,6 +1049,7 @@ fn footer(
         label,
         Style::Subtle,
         view.hover == Some(Target::OpenFile) && !editing,
+        false,
         c,
         s,
     );
@@ -1130,6 +1141,7 @@ fn loading_page(
                 "Open settings file",
                 Style::Primary,
                 hover == Some(Target::OpenFile),
+                false,
                 c,
                 s,
             );
@@ -1210,10 +1222,20 @@ fn scalar_page(
         }
         let Some(row) = rows.get(index) else { break };
         let is_selected = index == selected;
-        desktop::row(pixels, stride, r, is_selected, hover_row == Some(index) && editing.is_none(), c, s);
+        desktop::row(
+            pixels,
+            stride,
+            r,
+            desktop::RowState::new(is_selected, hover_row == Some(index) && editing.is_none()),
+            c,
+            s,
+        );
         view.hits.push(r, Target::Row { index, id: row.spec.id });
         let draft = editing.filter(|_| is_selected);
-        caret = scalar_row(pixels, stride, font, m, r, layout.stacked, index, row, source, draft, view, c, s).or(caret);
+        // The selected row is where Space and Enter act; its control shows the ring.
+        let focus = is_selected && editing.is_none();
+        caret = scalar_row(pixels, stride, font, m, r, layout.stacked, index, row, source, draft, focus, view, c, s)
+            .or(caret);
     }
     desktop::scroll_thumb(
         pixels,
@@ -1241,7 +1263,7 @@ fn hosted_entry(
     s: &Sizes,
     hits: &mut Hits<Target>,
 ) {
-    desktop::row(pixels, stride, r, false, hover == Some(Target::OpenHosted) && !editing, c, s);
+    desktop::row(pixels, stride, r, desktop::RowState::new(false, hover == Some(Target::OpenHosted) && !editing), c, s);
     let text = Rect { x: r.x + s.pad, y: r.y + s.gap + s.gap / 2, w: r.w.saturating_sub(4 * s.pad), h: s.text };
     desktop::label(pixels, stride, font, text, page.title(), c.fg);
     desktop::label(pixels, stride, font, Rect { y: text.y + s.text, ..text }, &page.summary(), c.muted);
@@ -1263,6 +1285,7 @@ fn scalar_row(
     row: &SettingsRow,
     source: &dyn Source,
     draft: Option<&str>,
+    focused: bool,
     view: &mut View,
     c: &Colors,
     s: &Sizes,
@@ -1304,13 +1327,24 @@ fn scalar_row(
     }
     if reset_w > 0 {
         let target = Target::Reset { index, id };
-        desktop::button(pixels, stride, font, reset, "Reset", Style::Subtle, hover == Some(target) && !busy, c, s);
+        desktop::button(
+            pixels,
+            stride,
+            font,
+            reset,
+            "Reset",
+            Style::Subtle,
+            hover == Some(target) && !busy,
+            false,
+            c,
+            s,
+        );
         view.hits.push(reset, target);
     }
     match (row.spec.kind, &row.current) {
         (SettingKind::Bool, SettingValue::Bool(on)) => {
             let target = Target::Toggle { index, id };
-            desktop::switch(pixels, stride, font, control, *on, hover == Some(target) && !busy, c, s);
+            desktop::switch(pixels, stride, font, control, *on, hover == Some(target) && !busy, focused, c, s);
             view.hits.push(control, target);
             None
         }
@@ -1325,6 +1359,7 @@ fn scalar_row(
                 choice_label(value),
                 Style::Secondary,
                 hover == Some(target),
+                focused,
                 c,
                 s,
             );
@@ -1411,6 +1446,7 @@ fn scalar_row(
                 "Edit",
                 Style::Secondary,
                 hover == Some(target) && !busy,
+                false,
                 c,
                 s,
             );
@@ -1540,7 +1576,7 @@ fn panel_page(
             Rect { x: layout.rows.x, y: layout.rows.y + slot * layout.row_h, w: width, h: layout.row_h - s.hairline };
         let print = fingerprint(row);
         let hovered = hover_row == Some(index);
-        desktop::row(pixels, stride, r, row.selected, hovered, c, s);
+        desktop::row(pixels, stride, r, desktop::RowState::new(row.selected, hovered), c, s);
         view.hits.push(r, Target::PanelRow { index, print });
         panel_row(pixels, stride, font, m, r, kind, index, print, row, row.selected || hovered, view, c, s);
     }
@@ -1602,14 +1638,14 @@ fn panel_row(
             x = x.saturating_sub(w);
             let rect = Rect { x, w, ..line2 };
             let style = if kind == SettingsPanel::Keymap { Style::Subtle } else { Style::Danger };
-            desktop::button(pixels, stride, font, rect, text, style, hover == Some(target), c, s);
+            desktop::button(pixels, stride, font, rect, text, style, hover == Some(target), false, c, s);
             view.hits.push(rect, target);
             x = x.saturating_sub(s.gap);
         }
         let w = desktop::button_width(font, label, s);
         x = x.saturating_sub(w);
         let rect = Rect { x, w, ..line2 };
-        desktop::button(pixels, stride, font, rect, label, Style::Secondary, hover == Some(change), c, s);
+        desktop::button(pixels, stride, font, rect, label, Style::Secondary, hover == Some(change), false, c, s);
         view.hits.push(rect, change);
         text_end = x.saturating_sub(s.gap);
     }
@@ -1678,7 +1714,7 @@ fn sheet_buttons(
         let w = desktop::button_width(font, text, s);
         x = x.saturating_sub(w);
         let r = Rect { x, y, w, h: s.control };
-        desktop::button(pixels, stride, font, r, text, Style::Primary, hover == Some(target), c, s);
+        desktop::button(pixels, stride, font, r, text, Style::Primary, hover == Some(target), false, c, s);
         hits.push(r, target);
         x = x.saturating_sub(s.gap);
     }
@@ -1686,7 +1722,7 @@ fn sheet_buttons(
     let w = desktop::button_width(font, text, s);
     x = x.saturating_sub(w);
     let r = Rect { x, y, w, h: s.control };
-    desktop::button(pixels, stride, font, r, text, Style::Secondary, hover == Some(target), c, s);
+    desktop::button(pixels, stride, font, r, text, Style::Secondary, hover == Some(target), false, c, s);
     hits.push(r, target);
 }
 

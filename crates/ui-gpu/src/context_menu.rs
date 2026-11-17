@@ -36,6 +36,8 @@ pub(super) struct Context {
     items: Vec<Item>,
     rows: Vec<Rect>,
     selected: usize,
+    /// The last selection change came from the keyboard: the row shows the focus ring.
+    keyboard: bool,
     surface: Option<(usize, usize, u64)>,
     /// Set for a tab's context menu: the tab it acts on.
     tab: Option<SessionDocumentId>,
@@ -293,6 +295,7 @@ impl App {
             && index != self.context.selected
         {
             self.context.selected = index;
+            self.context.keyboard = false;
             self.menu_dirty = true;
             self.request_frame();
         }
@@ -300,6 +303,9 @@ impl App {
     pub(super) fn context_key(&mut self, event: &HostKey<'_>) -> bool {
         if !self.context.is_open() {
             return false;
+        }
+        if matches!(event.logical_key, Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp)) {
+            self.context.keyboard = true;
         }
         match event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_context(),
@@ -372,26 +378,33 @@ pub(super) fn draw(
     }
     let colors = desktop::Colors::new(theme);
     let sizes = desktop::Sizes::new(ui);
-    let (row, pad) = (sizes.menu_item, sizes.sm);
+    // Rows sit `xs` inside the popup frame, like the menu bar's dropdown.
+    let (row, frame, pad) = (sizes.menu_item, sizes.xs, sizes.sm);
     let width = ui.dip(WIDTH_DIP).min(size.0);
-    let height = (context.items.len() * row + 2 * pad).min(size.1);
+    let height = (context.items.len() * row + 2 * frame).min(size.1);
     let area = Rect {
         x: context.anchor.0.min(size.0.saturating_sub(width)),
         y: context.anchor.1.min(size.1.saturating_sub(height)),
         w: width,
         h: height,
     };
-    desktop::card(pixels, size.0, area, &colors, &sizes);
+    desktop::popup(pixels, size.0, area, &colors, &sizes);
     context.rows.clear();
     for (index, item) in context.items.iter().enumerate() {
-        let y = area.y + pad + index * row;
+        let y = area.y + frame + index * row;
         if y + row > area.y + area.h {
             break;
         }
-        let rect = Rect { x: area.x + pad, y, w: width.saturating_sub(2 * pad), h: row };
-        if index == context.selected {
-            chrome::round_rect(pixels, size.0, rect, sizes.radius, colors.selected);
-        }
+        let rect = Rect { x: area.x + frame, y, w: width.saturating_sub(2 * frame), h: row };
+        let chosen = index == context.selected;
+        desktop::row(
+            pixels,
+            size.0,
+            rect,
+            desktop::RowState::new(chosen, false).focused(chosen && context.keyboard),
+            &colors,
+            &sizes,
+        );
         let edge = sizes.check.min(rect.h);
         icons::draw(
             pixels,
@@ -419,6 +432,66 @@ pub(super) fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dropdown and the context menu are one popup: the same frame, the
+    /// same inset, the same item height and the same selected-row colour. It
+    /// draws both, so a menu that drifts from the shared row or popup fails.
+    #[test]
+    #[cfg(windows)]
+    fn dropdown_and_context_menu_share_one_popup_row_height_and_selected_colour() {
+        let (app, _events) = crate::search_ui::host_dispatch_tests::host("x");
+        let source = (app.view.active_id(), 0, 0);
+        let theme = theme_ui::chrome();
+        let mut font = font::UiFont::load(15.0).expect("Windows chrome face");
+        let c = desktop::Colors::new(&theme);
+        for scale in [1.0, 1.25, 2.0] {
+            let m = chrome::Metrics::new(scale);
+            let s = desktop::Sizes::new(&m);
+            let (w, h) = (m.dip(800.0), m.dip(800.0));
+            let edit = menu::title_for('e').unwrap();
+            let mut bar = menu::MenuBar::default();
+            bar.refresh_labels(kwil_core_commands::Preset::VsCode, &[], kwil_core_commands::Mode::Insert);
+            bar.state = menu::State::Open { menu: edit, item: Some(1), keyboard: false };
+            let available = menu::Available { editor: true, ..Default::default() };
+            let title = kwil_view_model::TabArea { x: m.dip(60.0), y: 0, width: m.dip(60.0), height: m.menu };
+            let list = menu::dropdown(edit, title, (w, h), &m, &mut font, &bar.labels, 0);
+            let mut dropdown_pixels = vec![c.backdrop; w * h];
+            menu::draw_dropdown(&bar, &list, &available, &mut dropdown_pixels, w, &mut font, &theme, &m);
+            let mut context = Context {
+                source: Some(source),
+                anchor: (m.dip(300.0), m.dip(100.0)),
+                selected: 1,
+                items: (0..4)
+                    .map(|i| Item {
+                        label: format!("Item {i}"),
+                        action: Action::Command("edit.undo"),
+                        enabled: true,
+                        icon: icons::Icon::Undo,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mut context_pixels = vec![c.backdrop; w * h];
+            let area = draw(&mut context, &mut context_pixels, (w, h), &mut font, &m, &theme).unwrap();
+            assert!(list.rows.len() > 2 && context.rows.len() == 4, "both menus laid out rows at {scale}");
+            for row in list.rows.iter().map(|(_, row)| row).chain(&context.rows) {
+                assert_eq!(row.h, s.menu_item, "item height at {scale}");
+            }
+            // A pixel at the right end of a row, clear of text, keycaps and indicator.
+            let sample = |pixels: &[u32], row: Rect| pixels[(row.y + row.h / 2) * w + row.x + row.w - 2];
+            let row_of = |index: usize| list.rows.iter().find(|(i, _)| *i == index).unwrap().1;
+            assert_eq!(sample(&dropdown_pixels, row_of(1)), c.selected, "dropdown selected row at {scale}");
+            assert_eq!(sample(&context_pixels, context.rows[1]), c.selected, "context selected row at {scale}");
+            assert_eq!(sample(&dropdown_pixels, row_of(0)), c.surface, "dropdown plain row at {scale}");
+            assert_eq!(sample(&context_pixels, context.rows[0]), c.surface, "context plain row at {scale}");
+            // One frame: a hairline border in the border role, rows inset by the same step.
+            let top = |pixels: &[u32], area: Rect| pixels[area.y * w + area.x + area.w / 2];
+            assert_eq!(top(&dropdown_pixels, list.area), c.border, "dropdown frame at {scale}");
+            assert_eq!(top(&context_pixels, area), c.border, "context frame at {scale}");
+            assert_eq!(row_of(1).x - list.area.x, context.rows[1].x - area.x, "row inset at {scale}");
+            assert_eq!(row_of(1).x - list.area.x, s.xs, "the inset is the xs step at {scale}");
+        }
+    }
 
     #[test]
     fn right_click_on_a_tab_opens_the_tab_menu_and_acts_on_that_tab() {

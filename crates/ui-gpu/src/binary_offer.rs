@@ -8,13 +8,16 @@ pub(super) struct Prompt {
     pub ticket: Ticket,
     pub epoch: u64,
     pub native: bool,
+    /// Keyboard target; Enter confirms it.
     selected: usize,
+    /// Button under the pointer.
+    hover: Option<usize>,
     surface: Option<(usize, usize, u64)>,
     buttons: [Option<Rect>; 3],
 }
 impl Prompt {
     pub fn new(offer: Offer, epoch: u64) -> Self {
-        Self { ticket: offer.ticket, epoch, native: false, selected: 0, surface: None, buttons: [None; 3] }
+        Self { ticket: offer.ticket, epoch, native: false, selected: 0, hover: None, surface: None, buttons: [None; 3] }
     }
 }
 const CHOICES: [Choice; 3] = [Choice::Hex, Choice::Text, Choice::Cancel];
@@ -155,7 +158,15 @@ impl App {
                 });
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize)
+                self.pointer = (position.x.max(0.0) as usize, position.y.max(0.0) as usize);
+                let pointer = self.pointer;
+                if let Some(close_dialog::Ticket::Binary(prompt)) = self.close_dialog.as_mut() {
+                    let hover = prompt.buttons.iter().position(|area| area.is_some_and(|area| area.contains(pointer)));
+                    if hover != prompt.hover {
+                        prompt.hover = hover;
+                        self.apply(Damage { status: true, ..Default::default() });
+                    }
+                }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let surface = (self.size.0, self.size.1, self.ui.scale.to_bits());
@@ -220,17 +231,10 @@ pub(super) fn draw(
     line.y += s.text + s.gap;
     for (i, label) in ["Hex (H) — original bytes", "Text (T)", "Cancel (Esc)"].into_iter().enumerate() {
         let button = Rect { y: line.y, h: s.control, ..inner };
-        desktop::button(
-            pixels,
-            size.0,
-            font,
-            button,
-            label,
-            if prompt.selected == i { desktop::Style::Primary } else { desktop::Style::Secondary },
-            false,
-            &c,
-            &s,
-        );
+        // Hex is the primary action; the keyboard target is shown by the focus ring.
+        let style = if i == 0 { desktop::Style::Primary } else { desktop::Style::Secondary };
+        let (hovered, focused) = (prompt.hover == Some(i), prompt.selected == i);
+        desktop::button(pixels, size.0, font, button, label, style, hovered, focused, &c, &s);
         prompt.buttons[i] = Some(button);
         line.y += s.control + s.gap;
     }

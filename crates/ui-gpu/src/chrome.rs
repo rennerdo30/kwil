@@ -85,7 +85,8 @@ pub(super) struct Metrics {
     pub min_thumb: usize,
     /// Gap between track edge and thumb.
     pub inset: usize,
-    /// Spacing-scale steps shared with `desktop::Sizes` (`md`, `xxl`).
+    /// Spacing-scale steps shared with `desktop::Sizes` (`xs`, `md`, `xxl`).
+    pub xs: usize,
     pub md: usize,
     pub close: usize,
     pub glyph: usize,
@@ -121,6 +122,7 @@ impl Metrics {
             bar: d(16.0),
             min_thumb: d(32.0),
             inset: d(tok::INDICATOR),
+            xs: d(tok::XS),
             md: d(tok::MD),
             close: d(20.0),
             glyph: d(8.0),
@@ -452,6 +454,41 @@ pub(super) fn round_rect(buf: &mut [u32], stride: usize, r: Rect, radius: usize,
             let coverage = (rad + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
             if coverage > 0.0 {
                 *pixel = mix(*pixel, color, (coverage * 255.0) as u8);
+            }
+        }
+    }
+}
+
+/// Coverage (0..=1) of the pixel centre `(px, py)` inside `r` with corner `radius`.
+fn rounded_coverage(px: f32, py: f32, r: Rect, radius: usize) -> f32 {
+    let rad = (radius.min(r.w / 2).min(r.h / 2)) as f32;
+    let (cx, cy) = (r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0);
+    let (dx, dy) = ((px - cx).abs() - (r.w as f32 / 2.0 - rad), (py - cy).abs() - (r.h as f32 / 2.0 - rad));
+    let outside = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - rad;
+    (0.5 - outside).clamp(0.0, 1.0)
+}
+
+/// Hollow rounded outline of `thickness` pixels drawn inside `r`, anti-aliased
+/// on both edges and blended over what is there. Nothing leaves `r`.
+pub(super) fn ring(buf: &mut [u32], stride: usize, r: Rect, radius: usize, thickness: usize, color: u32) {
+    let t = thickness.min(r.w / 2).min(r.h / 2);
+    if t == 0 {
+        return;
+    }
+    let inner = Rect { x: r.x + t, y: r.y + t, w: r.w - 2 * t, h: r.h - 2 * t };
+    for y in r.y..(r.y + r.h).min(rows(buf, stride)) {
+        for x in r.x..(r.x + r.w).min(stride) {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let outer = rounded_coverage(px, py, r, radius);
+            let hole = if inner.w == 0 || inner.h == 0 {
+                0.0
+            } else {
+                rounded_coverage(px, py, inner, radius.saturating_sub(t))
+            };
+            let alpha = outer * (1.0 - hole);
+            if alpha > 0.0 {
+                let dst = &mut buf[y * stride + x];
+                *dst = mix(*dst, color, (alpha * 255.0) as u8);
             }
         }
     }

@@ -212,6 +212,7 @@ pub(super) fn draw(
     font: &mut font::UiFont,
     ui: &chrome::Metrics,
     theme: &kwil_core_commands::theme::Theme,
+    pointer: (usize, usize),
 ) {
     let colors = desktop::Colors::new(theme);
     let sizes = desktop::Sizes::new(ui);
@@ -280,7 +281,18 @@ pub(super) fn draw(
             break;
         }
         let r = Rect { x, y, w: width, h: sizes.control.min(size.1.saturating_sub(y)) };
-        desktop::button(pixels, size.0, font, r, label, desktop::Style::Secondary, false, &colors, &sizes);
+        desktop::button(
+            pixels,
+            size.0,
+            font,
+            r,
+            label,
+            desktop::Style::Secondary,
+            r.contains(pointer),
+            false,
+            &colors,
+            &sizes,
+        );
         state.hits.push((r, action));
         x += width + sizes.gap;
     }

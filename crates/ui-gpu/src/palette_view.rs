@@ -163,7 +163,7 @@ pub(super) fn draw(
     for (slot, row) in rows.iter().enumerate().skip(view.first).take(visible) {
         let r = Rect { x: list.x, y: list.y + (slot - view.first) * row_h, w: list.w, h: row_h };
         let chosen = palette.selected() == Some(slot);
-        desktop::row(pixels, stride, r, chosen, view.hover == Some(slot), &c, &s);
+        desktop::row(pixels, stride, r, desktop::RowState::new(chosen, view.hover == Some(slot)), &c, &s);
         view.hits.push(r, Hit::Row(slot));
         view.painted.push(row.action.clone());
         let text = Rect { x: r.x + s.pad, w: r.w.saturating_sub(2 * s.pad), ..r };

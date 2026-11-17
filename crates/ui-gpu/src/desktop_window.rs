@@ -309,6 +309,7 @@ impl App {
                     font,
                     &dialog.metrics,
                     theme,
+                    dialog.pointer,
                 );
             }
             Kind::Welcome => {

@@ -76,6 +76,7 @@ pub(super) fn draw(
     size: (usize, usize),
     font: &mut font::UiFont,
     m: &chrome::Metrics,
+    pointer: (usize, usize),
 ) -> Option<Rect> {
     hits.clear();
     if !host.is_open() {
@@ -133,7 +134,10 @@ pub(super) fn draw(
     if !host.importing() {
         for (index, entry) in rows.iter().enumerate().skip(first).take(visible) {
             let row = Rect { y: field.y + field.h + s.gap + (index - first) * s.list_row, h: s.list_row, ..inner };
-            desktop::row(pixels, size.0, row, index == host.selected(), false, &c, &s);
+            // Hovering a row selects it (live preview); the pointer still marks a
+            // row that the next paint has not selected yet.
+            let state = desktop::RowState::new(index == host.selected(), row.contains(pointer));
+            desktop::row(pixels, size.0, row, state, &c, &s);
             desktop::label(
                 pixels,
                 size.0,
