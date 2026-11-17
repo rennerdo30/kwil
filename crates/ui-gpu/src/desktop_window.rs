@@ -314,6 +314,7 @@ impl App {
             }
             Kind::Welcome => {
                 self.welcome_view.paint.take();
+                self.welcome_view.command_line = self.command_line.row(true);
                 welcome_ui::draw(
                     &self.welcome,
                     &mut self.welcome_view,
@@ -327,6 +328,7 @@ impl App {
             }
             Kind::Settings => {
                 self.settings_view.paint.take();
+                self.settings_view.command_line = self.command_line.row(false);
                 if let Some(panel) = self.settings_panel.as_ref().filter(|panel| panel.is_open()) {
                     if let Some(page) = &mut self.file_types {
                         page.ui.setup = false;

@@ -985,6 +985,7 @@ pub(crate) mod host_dispatch_tests {
                 registration_path: None,
                 registration_starting: false,
                 registration_prep: None,
+                command_line: Default::default(),
                 settings_panel: None,
                 settings_epoch: 0,
                 settings_file_pending: false,

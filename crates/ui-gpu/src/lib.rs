@@ -13,6 +13,7 @@ mod binary_offer;
 mod chrome;
 mod clipboard;
 mod close_dialog;
+mod command_line_ui;
 mod compare_ui;
 mod context_menu;
 mod desktop;
@@ -48,6 +49,18 @@ mod palette_view;
 mod prompt_ui;
 mod registration_host;
 pub use registration_host::remove_file_types;
+
+/// Whether this platform offers the command-line registration (Windows only).
+pub const COMMAND_LINE_SUPPORTED: bool = kwil_core_commands::command_line::SUPPORTED;
+
+/// `kwil --register-command-line` (`add`) and the uninstaller's cleanup through
+/// `--unregister-file-types` (`!add`): the same function the first-run choice,
+/// the settings switch and the palette commands run. Returns the sentence to print.
+pub fn command_line_registration(add: bool) -> Result<String, String> {
+    use kwil_core_commands::command_line as cl;
+    let request = if add { cl::Request::Register } else { cl::Request::Unregister };
+    cl::run(request, cl::gate(false, cfg!(test))).map(|report| report.message)
+}
 mod scrollbar;
 mod search_ui;
 mod search_view;
@@ -184,6 +197,7 @@ enum UserEvent {
     SettingsPanelReady,
     WelcomeReady,
     RegistrationReady,
+    CommandLine(kwil_core_commands::command_line::Request, Result<kwil_core_commands::command_line::Report, String>),
     RegistrationStarted(
         notification::Delivery<Result<Box<kwil_view_model::file_type_registration::FileTypeRegistration>, String>>,
     ),
@@ -238,6 +252,7 @@ impl UserEvent {
             | Self::UiFallbackReady(_, _)
             | Self::GlyphReady(_, _)
             | Self::SettingsReady(_, _)
+            | Self::CommandLine(_, _)
             | Self::MarkdownReady(_) => Policy::Value,
             Self::SessionChanged(_) | Self::WindowPlacementProgress | Self::DroppedFile(_) => Policy::Intent,
             #[cfg(windows)]
@@ -277,6 +292,7 @@ impl UserEvent {
             Self::SettingsPanelReady => "SettingsPanelReady",
             Self::WelcomeReady => "WelcomeReady",
             Self::RegistrationReady => "RegistrationReady",
+            Self::CommandLine(_, _) => "CommandLine",
             Self::RegistrationStarted(_) => "RegistrationStarted",
             Self::DocumentReady => "DocumentReady",
             Self::OpenExternal => "OpenExternal",
@@ -544,6 +560,7 @@ struct App {
     welcome_view: welcome_ui::WelcomeView,
     welcome_worker: Option<welcome::Worker>,
     file_types: Option<filetypes_ui::Page>,
+    command_line: command_line_ui::State,
     registration_path: Option<std::path::PathBuf>,
     registration_starting: bool,
     registration_prep: Option<std::thread::JoinHandle<()>>,
@@ -747,6 +764,7 @@ pub fn run_workspace_with_external_open(
                 registration_path: None,
                 registration_starting: false,
                 registration_prep: None,
+                command_line: Default::default(),
                 frontend_document,
                 frontend_epoch,
                 opts,
@@ -2721,6 +2739,7 @@ impl App {
                 page.ui.setup = false;
             }
             let hosted = self.file_types.as_mut().map(|page| page as &mut dyn settings_ui::HostedPage);
+            self.settings_view.command_line = self.command_line.row(false);
             self.palette_area = settings_ui::draw(
                 panel,
                 pixels,
@@ -2736,6 +2755,7 @@ impl App {
                 damage.push(area);
             }
         }
+        self.welcome_view.command_line = self.command_line.row(true);
         if self.desktop_dispatch
             && let Some(ui_font) = self.ui_font.as_mut()
             && let Some(area) = welcome_ui::draw(
@@ -3787,6 +3807,7 @@ impl ApplicationHandler<UserEvent> for App {
                 Damage { full: true, status: true, ..Default::default() }
             }
             UserEvent::RegistrationStarted(result) => self.adopt_registration_notification(result),
+            UserEvent::CommandLine(request, result) => self.command_line_done(request, result),
             UserEvent::SettingsPath(path) => {
                 self.registration_path = path.as_ref().ok().cloned();
                 if self.welcome_worker.is_none() {

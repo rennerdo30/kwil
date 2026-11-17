@@ -11,11 +11,13 @@ From beta.3 on, Windows gets a conventional per-user NSIS setup
 The bare binaries stay, because the updater (`crates/update`) downloads them.
 
 - Per user, no admin rights: `%LOCALAPPDATA%\Programs\Kwil`, Start menu
-  shortcut, `HKCU` Installed apps entry. No PATH or default-app changes.
+  shortcut, `HKCU` Installed apps entry. The setup makes no PATH or default-app
+  changes; Kwil itself offers its PATH and Win+R registration on first run and in
+  Settings, and only when chosen (KW-90, `docs/INSTALL.md`).
 - Updates stay with Kwil's own updater; it keeps the entry's `DisplayVersion`
   current. The setup has no update logic of its own.
-- Uninstall runs `kwil --unregister-file-types` ("Remove all") before removing
-  the installed files; settings stay.
+- Uninstall runs `kwil --unregister-file-types` ("Remove all", plus the PATH and
+  Win+R entries) before removing the installed files; settings stay.
 - Every package carries `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` from
   cargo-about (`about.toml`).
 - Verification: the release workflow installs, runs and uninstalls the x64 setup

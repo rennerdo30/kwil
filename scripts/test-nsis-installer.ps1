@@ -19,8 +19,9 @@ $dir = Join-Path $env:LOCALAPPDATA 'Programs\Kwil'
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kwil'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Kwil.lnk'
 $data = Join-Path $env:APPDATA 'kwil'
+$appPathsKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\kwil.exe'
 # Do not overwrite a runner profile or installation provided by someone else.
-foreach ($path in $dir, $key, $shortcut, $data) {
+foreach ($path in $dir, $key, $shortcut, $data, $appPathsKey) {
     if (Test-Path -LiteralPath $path) { throw "Expected a fresh disposable runner: $path exists" }
 }
 
@@ -107,8 +108,54 @@ foreach ($file in 'kwil.exe', 'kwil.com', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.tx
 Assert (Test-Path (Join-Path $dir '.renner-install.ini')) 'shared template ownership record'
 Assert-Version $Version
 Assert (Test-Path $shortcut) 'Start menu shortcut'
+
+# KW-90: command-line registration on the disposable runner's own profile. The
+# user PATH is read raw (unexpanded) so the registry text and type are compared.
+function Get-UserPath {
+    $environment = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+    try {
+        $value = $environment.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $kind = if ($null -eq $value) { $null } else { $environment.GetValueKind('Path') }
+        return [pscustomobject]@{ Text = $value; Kind = $kind }
+    } finally { $environment.Dispose() }
+}
+function Assert-PathRestored($Before, [string]$Stage) {
+    $now = Get-UserPath
+    if ($null -eq $Before.Text) {
+        Assert ([string]::IsNullOrEmpty($now.Text)) "$Stage leaves the user PATH empty or absent"
+    } else {
+        Assert ($now.Text -ceq $Before.Text) "$Stage restores the user PATH byte for byte"
+        Assert ($now.Kind -eq $Before.Kind) "$Stage keeps the PATH value type $($Before.Kind)"
+    }
+    Assert (!(Test-Path -LiteralPath $appPathsKey)) "$Stage removes the App Paths entry"
+}
+function Assert-CommandLineRegistered($Before) {
+    $now = Get-UserPath
+    Assert (($now.Text -split ';' | Where-Object { $_.TrimEnd([char]92) -ieq $dir }).Count -eq 1) 'install folder is on the user PATH exactly once'
+    if ($null -ne $Before.Text) {
+        Assert ($now.Text.StartsWith($Before.Text)) 'every earlier PATH entry is untouched and in order'
+        Assert ($now.Kind -eq $Before.Kind) "the PATH value type stays $($Before.Kind)"
+    } else {
+        Assert ($now.Kind -eq 'ExpandString') 'a new PATH value is REG_EXPAND_SZ'
+    }
+    $appPaths = Get-Item -LiteralPath $appPathsKey
+    Assert ($appPaths.GetValue('') -ieq (Join-Path $dir 'kwil.exe')) 'App Paths default is kwil.exe (Win+R)'
+    Assert ($appPaths.GetValue('Path') -ieq $dir) 'App Paths Path is the install folder'
+}
+$pathBefore = Get-UserPath
+$registered = Invoke-Bounded (Join-Path $dir 'kwil.com') @('--register-command-line') 30
+Assert ($registered -clike 'Kwil is on your PATH.*') "kwil.com --register-command-line: $registered"
+Assert-CommandLineRegistered $pathBefore
+$pathAfter = Get-UserPath
+$again = Invoke-Bounded (Join-Path $dir 'kwil.com') @('--register-command-line') 30
+Assert ($again -ceq 'Kwil is already on your PATH.') "second register changes nothing: $again"
+Assert ((Get-UserPath).Text -ceq $pathAfter.Text) 'second register leaves the PATH text unchanged'
 $unregister = Invoke-Bounded (Join-Path $dir 'kwil.com') @('--unregister-file-types') 30 -RegistrationCleanup
 Write-Host "ok: kwil.com --unregister-file-types: $unregister"
+Assert-PathRestored $pathBefore 'kwil.com --unregister-file-types'
+# The uninstaller must do the same without being asked separately.
+Invoke-Bounded (Join-Path $dir 'kwil.com') @('--register-command-line') 30 | Write-Host
+Assert-CommandLineRegistered $pathBefore
 
 # The uninstaller copies itself to %TEMP% and returns at once; wait for the
 # entry to disappear instead.
@@ -119,6 +166,7 @@ Assert (!(Test-Path $key)) 'Installed apps entry removed'
 while ((Test-Path $dir) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
 Assert (!(Test-Path $dir)) 'install folder removed'
 Assert (!(Test-Path $shortcut)) 'Start menu shortcut removed'
+Assert-PathRestored $pathBefore 'uninstall'
 Assert-UserData 'uninstall'
 # Every check passed; do not leak the last native exit code into the step.
 exit 0
