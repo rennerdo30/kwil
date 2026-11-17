@@ -236,22 +236,16 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, host: &SettingsSession, area: Rect
         caret = Some((area.x + 1 + (label.len() + input.cursor).min(columns - 1) as u16, area.y + area.height - 4));
     } else if let Some(capture) = &window.capture {
         line(area.height - 4, format!("Keys: {}", if capture.is_empty() { "Press keys..." } else { capture }), true);
-        line(area.height - 3, "Enter accepts a captured chord; Esc cancels".into(), false);
     } else if let Some(row) = window.rows.iter().find(|row| row.selected) {
         line(area.height - 4, row.description.clone(), false);
         line(area.height - 3, format!("Default: {}", row.default), false);
     }
+    // The status line carries the shared per-state key hint (or a save
+    // message), so there is one footer; only conflict review adds its keys.
     line(area.height - 2, host.status().into(), false);
-    line(
-        area.height - 1,
-        if window.proposal.is_none() {
-            "Enter edit/apply  Delete reset/remove  Esc back"
-        } else {
-            "Up/Down review conflicts  Enter replace  Esc cancel"
-        }
-        .into(),
-        false,
-    );
+    if window.proposal.is_some() {
+        line(area.height - 1, "Up/Down review conflicts  Enter replace  Esc cancel".into(), false);
+    }
     if let Some(caret) = caret {
         frame.set_cursor_position(caret);
     }

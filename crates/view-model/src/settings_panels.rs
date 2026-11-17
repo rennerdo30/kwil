@@ -355,7 +355,8 @@ impl SettingsPanelController {
     pub fn hint(&self) -> &'static str {
         match &self.state {
             State::Confirm(_, _) => "Enter confirm · Esc cancel",
-            State::Capture { .. } => "Press the new shortcut · Esc cancel",
+            State::Capture { keys, .. } if keys.is_empty() => "Press the new shortcut · Esc cancel",
+            State::Capture { .. } => "Enter use shortcut · press another key to add a chord · Esc cancel",
             State::Edit(edit) if edit.column == EditColumn::Key => "Enter next · Tab switch field · Esc cancel",
             State::Edit(_) => "Enter save · Tab switch field · Esc cancel",
             State::Browse => match (self.panel, self.query.value.is_empty()) {
@@ -881,7 +882,7 @@ mod tests {
         assert!(keymap.is_capturing());
         assert_eq!(keymap.hint(), "Press the new shortcut · Esc cancel");
         press(&mut keymap, &doc, PanelInput::Accept); // records Enter
-        assert_eq!(keymap.hint(), "Press the new shortcut · Esc cancel");
+        assert_eq!(keymap.hint(), "Enter use shortcut · press another key to add a chord · Esc cancel");
         press(&mut keymap, &doc, PanelInput::Accept); // Enter conflicts with palette.accept
         assert!(keymap.is_confirming());
         assert_eq!(keymap.hint(), "Enter confirm · Esc cancel");

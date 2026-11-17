@@ -1814,7 +1814,12 @@ fn keymap_row(
             desktop::label_right(pixels, stride, font.small(), slot, "Unbound", c.muted)
         }
     };
-    if actions {
+    // On a narrow row the name wins: Change and Reset appear only when the
+    // title keeps its room (Enter and Delete still act on the selected row).
+    let buttons: usize =
+        ["Reset", "Change"].into_iter().map(|label| desktop::button_width(font, label, s) + s.gap).sum();
+    let title_min = font.measure(text.title, usize::MAX).min(4 * s.control);
+    if actions && end.saturating_sub(left) >= buttons + title_min + s.gap {
         let y = r.y + r.h.saturating_sub(s.control) / 2;
         for (text, target, style) in [
             ("Reset", Target::PanelRemove { index, print }, Style::Subtle),
