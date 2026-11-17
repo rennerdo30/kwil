@@ -157,7 +157,7 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
     // A separate window is its own session, not the editor a launcher can wait
     // on; kwil.com would return as soon as that window appears.
     if a.wait && (a.new_window || a.restore_window.is_some()) {
-        return Err("--wait cannot be combined with --new-window".into());
+        return Err("--wait cannot be combined with --new-window or --restore-window".into());
     }
     if a.tui && a.renderer.is_some() {
         return Err("--renderer selects the GUI backend, not the terminal UI".into());

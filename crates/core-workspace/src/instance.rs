@@ -167,7 +167,9 @@ impl Waits {
         Some(rx)
     }
     fn forget(&self, token: u64) {
-        self.lock().slots.remove(&token);
+        let mut state = self.lock();
+        state.slots.remove(&token);
+        state.shown.remove(&token);
     }
     /// Hands the connection to a thread that writes the outcome once it is known.
     fn park(

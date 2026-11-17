@@ -157,8 +157,8 @@ fn kw93_launcher_fails_when_the_editor_quits_before_showing_the_file() {
     let file = scratch.file();
     let mut launcher = scratch.launcher(&["--hidden", "--wait", file.to_str().unwrap()]);
     server.requests.recv_timeout(LIMIT).unwrap();
-    // Let the server park the waiter first; a shutdown racing the park drops the
-    // connection instead, which the launcher reports as exit 3 (also not success).
+    // Let the server park the waiter first, so the launcher hears the outcome
+    // byte; a shutdown before the park would drop the connection (exit 3).
     assert!(exit_within(&mut launcher, Duration::from_millis(500)).is_none());
     server.shutdown();
     assert!(server.waits.drain(LIMIT));
