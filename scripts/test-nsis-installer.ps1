@@ -13,6 +13,10 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
     throw 'Runs only on disposable GitHub-hosted Windows runners; never on the owner PC.'
 }
 if ([bool]$PreviousSetup -ne [bool]$PreviousVersion) { throw 'Pass both PreviousSetup and PreviousVersion.' }
+# Start setups by full path: release.yml passes a relative one, and the setup's
+# own path checks see the path it was started with.
+$Setup = (Resolve-Path -LiteralPath $Setup).Path
+if ($PreviousSetup) { $PreviousSetup = (Resolve-Path -LiteralPath $PreviousSetup).Path }
 if ($PreviousVersion -and $PreviousVersion -eq $Version) { throw 'Upgrade must use a different previous version.' }
 $env:KWIL_NO_UPDATE = '1'
 $dir = Join-Path $env:LOCALAPPDATA 'Programs\Kwil'

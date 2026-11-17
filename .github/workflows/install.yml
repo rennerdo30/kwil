@@ -77,6 +77,25 @@ jobs:
           path: |
             packages/*-setup.exe
             ${{ runner.temp }}/kwil-setup.png
+  # release.yml installs the candidate setup fresh; the job above only ever
+  # installs it over a published one. Same package, a clean runner, no upgrade.
+  fresh-setup:
+    needs: static-windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: kwil-nsis-lifecycle
+          path: lifecycle
+      - name: Fresh install, run and uninstall
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          $setup = @(Get-ChildItem lifecycle -Recurse -Filter "kwil-$version-windows-x64-setup.exe")
+          if ($setup.Count -ne 1) { throw "Expected one x64 setup, found $($setup.Count)" }
+          ./scripts/test-nsis-installer.ps1 -Setup $setup[0].FullName -Version $version
   fixtures:
     strategy:
       matrix:
