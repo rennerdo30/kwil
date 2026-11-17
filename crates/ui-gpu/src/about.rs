@@ -168,9 +168,19 @@ impl App {
             ("License", "MIT".into()),
         ]
     }
+    /// Copied into bug reports, so it keeps the full commit and the full URL
+    /// that the screen shortens.
     pub(super) fn diagnostics(&self) -> String {
         let mut text = format!("Kwil {}\n", env!("CARGO_PKG_VERSION"));
         for (key, value) in self.about_facts() {
+            let value = match key {
+                "Build" => match option_env!("KWIL_BUILD_COMMIT") {
+                    Some(commit) => value.replacen(&commit[..commit.len().min(12)], commit, 1),
+                    None => value,
+                },
+                "Website" => WEBSITE.into(),
+                _ => value,
+            };
             text.push_str(&format!("{key}: {value}\n"));
         }
         text
@@ -238,7 +248,9 @@ pub(super) fn grid(
     width: usize,
     gap: usize,
 ) -> (usize, Vec<Line>) {
-    let keys = facts.iter().map(|(key, _)| font.measure(key, width / 3)).max().unwrap_or(0);
+    // Keys are never cut: the column fits the widest key, capped at half the
+    // card only on very narrow windows (platform faces differ in width).
+    let keys = facts.iter().map(|(key, _)| font.measure(key, width / 2)).max().unwrap_or(0);
     let column = keys + gap;
     let mut lines = Vec::new();
     for (key, value) in facts {
@@ -372,6 +384,10 @@ mod tests {
         assert!(text.starts_with(&format!("Kwil {}\n", env!("CARGO_PKG_VERSION"))));
         assert_eq!(text.matches("github.com/rennerdo30/kwil").count(), 1);
         assert!(text.contains("Build:") && text.contains("Renderer:") && text.contains("License: MIT"));
+        assert!(text.contains(&format!("Website: {WEBSITE}\n")), "the copy keeps the full URL");
+        if let Some(commit) = option_env!("KWIL_BUILD_COMMIT") {
+            assert!(text.contains(commit), "the copy keeps the full commit, the screen shows 12 digits");
+        }
     }
 
     #[test]
