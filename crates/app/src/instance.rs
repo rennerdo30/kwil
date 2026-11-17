@@ -361,8 +361,8 @@ mod tests {
         // The editor opens its endpoint a moment later: the launcher then waits for the files.
         let mut server = None;
         let mut polls = 0;
+        let (started, receiver) = std::sync::mpsc::channel();
         let waiter = std::thread::scope(|scope| {
-            let (started, receiver) = std::sync::mpsc::channel();
             let launcher = scope.spawn(|| {
                 wait_on_started_primary(&endpoint, &request, || {
                     polls += 1;

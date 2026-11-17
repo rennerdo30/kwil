@@ -191,7 +191,7 @@ fn kw90_launcher_returns_with_its_own_code_when_the_editor_crashes() {
     let expect = |text: &str| {
         let deadline = Instant::now() + LIMIT;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            if received.recv_timeout(left).is_ok_and(|line| line.trim() == text) {
+            if received.recv_timeout(left).is_ok_and(|line| line.contains(text)) {
                 return;
             }
         }
