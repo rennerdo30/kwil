@@ -652,7 +652,7 @@ fn option_chip(
     s: &Sizes,
 ) {
     let bg = if on {
-        chrome::mix(c.surface, c.accent, 0x50)
+        c.selected
     } else if hovered {
         c.hover
     } else {

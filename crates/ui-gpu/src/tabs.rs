@@ -7,10 +7,6 @@ use chrome::{Hover, Metrics};
 use kwil_core_commands::settings::TabLayout;
 use kwil_view_model::{TabArea, TabGeometry};
 
-/// Card row backgrounds still used by the palette and settings overlays.
-pub(super) const ACTIVE: u32 = 0x192a43;
-pub(super) const INACTIVE: u32 = 0x101d31;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Frame {
     pub geometry: TabGeometry,
@@ -59,6 +55,7 @@ pub(super) fn frame(
             }
         })
         .collect();
+    let s = desktop::Sizes::new(m);
     let labels: Vec<usize> = names
         .iter()
         .map(|name| match font.as_deref_mut() {
@@ -66,7 +63,7 @@ pub(super) fn frame(
             Some(font) => font.measure(name, m.tab_max),
             None => name.chars().count() * m.dip(7.0),
         })
-        .map(|width| width + m.dip(22.0))
+        .map(|width| width + s.xl)
         .collect();
     let ids: Vec<_> = tabs.iter().map(|tab| tab.id).collect();
     let active = ids.iter().position(|id| *id == view.active_id());
@@ -112,6 +109,7 @@ pub(super) fn draw(
     let (strip_bg, active_bg) = (color(UiRole::TabBackground), color(UiRole::ActiveTabBackground));
     let (fg, active_fg) = (color(UiRole::TabForeground), color(UiRole::ActiveTabForeground));
     let (accent, border) = (color(UiRole::Accent), color(UiRole::Border));
+    let s = desktop::Sizes::new(m);
     let g = &frame.geometry;
     let strip = rect(g.chrome);
     let horizontal = frame.kind == TabLayout::Horizontal;
@@ -130,7 +128,7 @@ pub(super) fn draw(
         let bg = if slot.active {
             active_bg
         } else if hovered {
-            chrome::mix(strip_bg, fg, 0x16)
+            chrome::hover_color(strip_bg, fg)
         } else {
             strip_bg
         };
@@ -141,15 +139,15 @@ pub(super) fn draw(
         } else {
             chrome::mix(strip_bg, fg, 0xb4)
         };
-        let gap = m.dip(2.0);
+        let gap = s.xxs;
         if horizontal && slot.active {
             // The active tab is a raised sheet joined to the editor below it:
             // rounded top corners, square bottom, no hairline underneath.
-            let sheet = Rect { x: area.x + gap, y: area.y + m.dip(4.0), w: area.w.saturating_sub(2 * gap), h: 0 };
+            let sheet = Rect { x: area.x + gap, y: area.y + s.xs, w: area.w.saturating_sub(2 * gap), h: 0 };
             let sheet = Rect { h: (area.y + area.h).saturating_sub(sheet.y), ..sheet };
-            top_rounded(pixels, stride, sheet, m.dip(6.0), bg);
+            top_rounded(pixels, stride, sheet, s.card_radius, bg);
         } else if horizontal && hovered {
-            let inset = m.dip(5.0).min(area.h / 4);
+            let inset = s.xs.min(area.h / 4);
             let pill = Rect {
                 x: area.x + gap,
                 y: area.y + inset,
@@ -158,7 +156,7 @@ pub(super) fn draw(
             };
             chrome::round_rect(pixels, stride, pill, m.radius, bg);
         } else if slot.active || hovered {
-            let inset = m.dip(3.0);
+            let inset = m.inset;
             let pill = Rect {
                 x: area.x + inset,
                 y: area.y + inset / 2,
@@ -169,7 +167,7 @@ pub(super) fn draw(
             if slot.active {
                 let h = area.h / 2;
                 let bar = Rect { x: pill.x, y: area.y + (area.h - h) / 2, w: m.indicator, h };
-                chrome::round_rect(pixels, stride, bar, m.indicator / 2, accent);
+                chrome::round_rect(pixels, stride, bar, s.pill(m.indicator), accent);
             }
         }
         if !slot.active && horizontal && !hovered {
@@ -199,12 +197,12 @@ pub(super) fn draw(
                 pixels,
                 stride,
                 icon,
-                ((area.x + m.pad + m.dip(8.0)) as f32, (area.y + area.h / 2) as f32),
-                m.dip(16.0),
+                ((area.x + m.md + s.sm) as f32, (area.y + area.h / 2) as f32),
+                s.lg,
                 text_fg,
             );
-            let left = area.x + m.pad + m.dip(22.0);
-            let room = close.x.saturating_sub(left + m.dip(4.0));
+            let left = area.x + m.md + s.xl;
+            let room = close.x.saturating_sub(left + s.xs);
             let label = font.fit(title, room);
             let baseline = font.baseline(area.y, area.h);
             font.draw(pixels, stride, area, left, baseline, &label, text_fg);
@@ -212,18 +210,18 @@ pub(super) fn draw(
         let close_hovered = frame.hover == Hover::Close(index);
         if frame.dirty.get(index).copied().unwrap_or(false) && !close_hovered {
             let center = (close.x as f32 + close.width as f32 / 2.0, close.y as f32 + close.height as f32 / 2.0);
-            chrome::disc(pixels, stride, center, m.dip(4.0) as f32, text_fg);
+            chrome::disc(pixels, stride, center, s.xs as f32, text_fg);
         } else {
             if close_hovered {
-                chrome::round_rect(pixels, stride, rect(close), m.radius, chrome::mix(bg, fg, 0x34));
+                chrome::round_rect(pixels, stride, rect(close), m.radius, chrome::pressed_color(bg, fg));
             }
-            let mark = if slot.active || hovered { text_fg } else { chrome::mix(strip_bg, fg, 0x78) };
+            let mark = if slot.active || hovered { text_fg } else { chrome::mix(strip_bg, fg, chrome::ramp::FAINT) };
             icons::draw(
                 pixels,
                 stride,
                 icons::Icon::Close,
                 ((close.x + close.width / 2) as f32, (close.y + close.height / 2) as f32),
-                m.dip(16.0),
+                s.lg,
                 mark,
             );
         }
@@ -237,7 +235,7 @@ pub(super) fn draw(
         let r = rect(area);
         chrome::fill_clipped(pixels, stride, r, strip_bg);
         if enabled && frame.hover == hover {
-            let inset = m.dip(4.0).min(r.h / 4);
+            let inset = s.xs.min(r.h / 4);
             chrome::round_rect(
                 pixels,
                 stride,
@@ -248,16 +246,16 @@ pub(super) fn draw(
                     h: r.h.saturating_sub(2 * inset),
                 },
                 m.radius,
-                chrome::mix(strip_bg, fg, 0x2c),
+                chrome::hover_color(strip_bg, fg),
             );
         }
-        let mark = if enabled { fg } else { chrome::mix(strip_bg, fg, 0x50) };
+        let mark = if enabled { fg } else { chrome::disabled_color(strip_bg, fg) };
         icons::draw(
             pixels,
             stride,
             if left { icons::Icon::Back } else { icons::Icon::Forward },
             ((area.x + area.width / 2) as f32, (area.y + area.height / 2) as f32),
-            m.dip(16.0),
+            s.lg,
             mark,
         );
     }

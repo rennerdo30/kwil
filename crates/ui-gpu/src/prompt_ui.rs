@@ -68,17 +68,20 @@ impl View {
 
 const RECENT_ROWS: usize = 10;
 
+/// Card width: genuinely screen-specific, so it stays a named constant here.
+const WIDTH_DIP: f64 = 600.0;
+
 /// Card rectangle and visible Recent rows. Title and action rows are
 /// reserved first; the list gets what is left, so ten recents never push the
 /// card off a small window. Rows beyond it scroll (wheel, ↑/↓, or typing the
 /// row's number).
 fn layout(size: (usize, usize), m: &Metrics, s: &Sizes, recent: Option<usize>) -> Option<(Rect, usize)> {
-    let w = size.0.saturating_sub(2 * s.gap).min(m.dip(600.0));
+    let w = size.0.saturating_sub(2 * s.gap).min(m.dip(WIDTH_DIP));
     let top = (m.menu + m.tabs + s.gap).min(size.1 / 4);
     let chrome = s.header + s.pad + s.control + s.pad;
     let (body, visible) = match recent {
         Some(count) => {
-            let row_h = m.dip(44.0);
+            let row_h = s.list_row_tall;
             let room = size.1.saturating_sub(top + chrome + s.gap);
             let visible = (room / row_h).min(count.clamp(1, RECENT_ROWS));
             (visible * row_h, visible)
@@ -153,7 +156,7 @@ fn draw_card(
     view.area = None;
     let c = Colors::new(theme);
     let s = Sizes::new(m);
-    let row_h = m.dip(44.0);
+    let row_h = s.list_row_tall;
     let listing = (kind == FilePromptKind::Recent || !kind.choices().is_empty()).then_some(recent.len());
     let (area, visible) = layout(size, m, &s, listing)?;
     if view.generation != generation {

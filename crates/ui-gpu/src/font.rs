@@ -403,7 +403,10 @@ impl UiFont {
     }
     fn from_face(face: UiFace, px: f32) -> Option<UiFont> {
         let mut font = Self::single_face(face.clone(), px)?;
-        font.heading = Some(Box::new(Self::single_face(face, px * 2.0)?));
+        font.heading = Some(Box::new(Self::single_face(
+            face,
+            px * (crate::chrome::tok::DISPLAY / crate::chrome::tok::BODY) as f32,
+        )?));
         Some(font)
     }
     fn single_face(face: UiFace, px: f32) -> Option<UiFont> {

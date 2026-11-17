@@ -85,12 +85,12 @@ fn card(size: (usize, usize), anchor: Rect, m: &chrome::Metrics, count: usize) -
     let width = m.dip(320.0).min(size.0.saturating_sub(2 * s.gap));
     let bottom = anchor.y.min(size.1).saturating_sub(s.gap);
     let fixed = s.header + s.footer + 2 * s.hairline;
-    let visible = bottom.saturating_sub(s.gap + fixed) / s.nav.max(1);
+    let visible = bottom.saturating_sub(s.gap + fixed) / s.list_row.max(1);
     let visible = visible.min(10).min(count);
     if width < m.dip(180.0) || visible == 0 {
         return None;
     }
-    let height = fixed + visible * s.nav;
+    let height = fixed + visible * s.list_row;
     let right = (anchor.x + anchor.w).min(size.0.saturating_sub(s.gap));
     let x = right.saturating_sub(width).max(s.gap);
     Some((Rect { x, y: bottom - height, w: width, h: height }, visible))
@@ -138,9 +138,9 @@ pub(super) fn draw(
     for (index, item) in state.rows.iter().enumerate().skip(state.first).take(visible) {
         let row = Rect {
             x: area.x + s.hairline,
-            y: area.y + s.header + s.hairline + (index - state.first) * s.nav,
+            y: area.y + s.header + s.hairline + (index - state.first) * s.list_row,
             w: area.w - 2 * s.hairline,
-            h: s.nav,
+            h: s.list_row,
         };
         desktop::row(pixels, stride, row, index == state.selected, state.hover == Some(index), &c, &s);
         state.hits.push(row, index);

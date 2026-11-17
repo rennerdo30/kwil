@@ -5,8 +5,73 @@ use super::*;
 use kwil_core_commands::settings::TabLayout;
 use kwil_view_model::{SessionDocumentId, TabAction, TabArea, TabGeometry, TabSlot};
 
+/// The one UI token table, in DIPs. `Metrics` and `desktop::Sizes` both read
+/// these values, so no number has two names; they are scaled by the monitor
+/// DPI only and never follow editor zoom.
+pub(super) mod tok {
+    /// Spacing scale.
+    pub const XXS: f64 = 2.0;
+    pub const XS: f64 = 4.0;
+    pub const SM: f64 = 8.0;
+    pub const MD: f64 = 12.0;
+    pub const LG: f64 = 16.0;
+    pub const XL: f64 = 24.0;
+    pub const XXL: f64 = 32.0;
+    /// Type scale; `BODY` is the menu, tab, status and overlay text.
+    /// `SMALL` and `TITLE` get a font face only where a screen first uses them.
+    #[allow(dead_code)]
+    pub const SMALL: f64 = 13.0;
+    pub const BODY: f64 = 15.0;
+    #[allow(dead_code)]
+    pub const TITLE: f64 = 18.0;
+    pub const DISPLAY: f64 = 30.0;
+    /// Heights.
+    pub const TEXT: f64 = 20.0;
+    pub const CONTROL: f64 = 32.0;
+    pub const MENU_ITEM: f64 = 32.0;
+    pub const LIST_ROW: f64 = 36.0;
+    pub const LIST_ROW_TALL: f64 = 44.0;
+    pub const MENU_BAR: f64 = 30.0;
+    pub const TAB_STRIP: f64 = 35.0;
+    pub const STATUS: f64 = 26.0;
+    /// Radii: controls, rows and chips; cards, menus, popups and the tab sheet.
+    pub const RADIUS_SM: f64 = 4.0;
+    pub const RADIUS_MD: f64 = 8.0;
+    /// Accent indicator on a selected row or tab, and the scrollbar thumb inset.
+    pub const INDICATOR: f64 = 3.0;
+}
+
 /// Logical size of menu, tab and status text.
-pub(super) const UI_TEXT_DIP: f64 = 15.0;
+pub(super) const UI_TEXT_DIP: f64 = tok::BODY;
+
+/// Interaction state ramp: how far a state colour moves from the surface it
+/// sits on toward the foreground (or, for `SELECTED`, toward the selection
+/// role). Every painter derives hover, pressed, selected, disabled and faint
+/// colours from these amounts, on card surfaces and on theme-coloured chrome
+/// alike, so light and dark themes get the same hierarchy.
+pub(super) mod ramp {
+    pub const HOVER: u8 = 0x10;
+    pub const PRESSED: u8 = 0x1c;
+    pub const SELECTED: u8 = 0xa0;
+    pub const DISABLED: u8 = 0x66;
+    pub const FAINT: u8 = 0x7a;
+}
+
+pub(super) fn hover_color(bg: u32, fg: u32) -> u32 {
+    mix(bg, fg, ramp::HOVER)
+}
+
+pub(super) fn pressed_color(bg: u32, fg: u32) -> u32 {
+    mix(bg, fg, ramp::PRESSED)
+}
+
+pub(super) fn selected_color(bg: u32, selection: u32) -> u32 {
+    mix(bg, selection, ramp::SELECTED)
+}
+
+pub(super) fn disabled_color(bg: u32, fg: u32) -> u32 {
+    mix(bg, fg, ramp::DISABLED)
+}
 
 /// Physical pixel sizes for one monitor scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,7 +85,8 @@ pub(super) struct Metrics {
     pub min_thumb: usize,
     /// Gap between track edge and thumb.
     pub inset: usize,
-    pub pad: usize,
+    /// Spacing-scale steps shared with `desktop::Sizes` (`md`, `xxl`).
+    pub md: usize,
     pub close: usize,
     pub glyph: usize,
     pub indicator: usize,
@@ -32,7 +98,7 @@ pub(super) struct Metrics {
     pub item: usize,
     pub separator: usize,
     pub menu_min: usize,
-    pub gap: usize,
+    pub xxl: usize,
     pub radius: usize,
     pub line: usize,
 }
@@ -49,26 +115,26 @@ impl Metrics {
         let d = |dip: f64| ((dip * scale).round() as usize).max(1);
         Self {
             scale,
-            menu: d(30.0),
-            tabs: d(35.0),
-            status: d(26.0),
+            menu: d(tok::MENU_BAR),
+            tabs: d(tok::TAB_STRIP),
+            status: d(tok::STATUS),
             bar: d(16.0),
             min_thumb: d(32.0),
-            inset: d(3.0),
-            pad: d(12.0),
+            inset: d(tok::INDICATOR),
+            md: d(tok::MD),
             close: d(20.0),
             glyph: d(8.0),
-            indicator: d(2.0),
+            indicator: d(tok::INDICATOR),
             tab_min: d(96.0),
             tab_max: d(240.0),
             nav: d(28.0),
             side: d(220.0),
-            row: d(32.0),
-            item: d(28.0),
+            row: d(tok::CONTROL),
+            item: d(tok::MENU_ITEM),
             separator: d(9.0),
             menu_min: d(240.0),
-            gap: d(32.0),
-            radius: d(4.0),
+            xxl: d(tok::XXL),
+            radius: d(tok::RADIUS_SM),
             line: d(1.0),
         }
     }
@@ -123,7 +189,7 @@ fn close_inset(m: &Metrics, height: usize) -> usize {
 
 /// Natural width of a horizontal tab whose label is `label` pixels wide.
 pub(super) fn tab_width(m: &Metrics, label: usize) -> usize {
-    (m.pad + label + m.pad / 2 + m.close + close_inset(m, m.tabs)).clamp(m.tab_min, m.tab_max)
+    (m.md + label + m.md / 2 + m.close + close_inset(m, m.tabs)).clamp(m.tab_min, m.tab_max)
 }
 
 /// Builds the shared tab model from chrome metrics. `labels` holds the UI
@@ -222,7 +288,7 @@ pub(super) fn tab_geometry(
                 let area = TabArea { x: strip.x, y: strip.y + nav + local * row, width: strip.width, height: row };
                 let size = m.close.min(row).min(strip.width);
                 let close = TabArea {
-                    x: area.x + strip.width.saturating_sub(m.pad / 2 + size),
+                    x: area.x + strip.width.saturating_sub(m.md / 2 + size),
                     y: area.y + (row - size) / 2,
                     width: size,
                     height: size,
@@ -335,6 +401,17 @@ pub(super) fn window_title(view: &Workspace) -> String {
     }
 }
 
+/// `role` pushed as far past `base` as it already differs from it, per
+/// channel and clamped. A changed word is the diff role's own hue, only
+/// stronger, on the dark and light themes alike.
+pub(super) fn emphasize(base: u32, role: u32) -> u32 {
+    let channel = |shift: u32| {
+        let (b, r) = (i32::from((base >> shift) as u8), i32::from((role >> shift) as u8));
+        ((2 * r - b).clamp(0, 255) as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
 pub(super) fn mix(bg: u32, fg: u32, amount: u8) -> u32 {
     font::blend(bg, fg, amount)
 }
@@ -439,25 +516,25 @@ pub(super) fn draw_status(
         return hits;
     }
     let baseline = font.baseline(area.y, area.height);
-    let field_pad = m.dip(8.0);
-    let mut right = area.x + area.width.saturating_sub(m.pad / 2);
+    let field_pad = m.dip(tok::SM);
+    let mut right = area.x + area.width.saturating_sub(m.md / 2);
     for (index, segment) in segments.iter().enumerate().rev() {
         let dropdown = segment.command == Some("file.setType");
-        let arrow = if dropdown { m.dip(16.0) } else { 0 };
+        let arrow = if dropdown { m.dip(tok::LG) } else { 0 };
         let width = font.width(&segment.text) + 2 * field_pad + arrow;
-        if width + m.pad > right.saturating_sub(area.x) {
+        if width + m.md > right.saturating_sub(area.x) {
             break;
         }
         let field = Rect { x: right - width, y: area.y, w: width, h: area.height };
         if let Some(command) = segment.command {
             if hover == Hover::Status(index) {
-                let inset = m.dip(3.0).min(area.height / 4);
+                let inset = m.inset.min(area.height / 4);
                 round_rect(
                     pixels,
                     stride,
                     Rect { x: field.x, y: field.y + inset, w: field.w, h: field.h - 2 * inset },
                     m.radius,
-                    mix(bg, fg, 0x2c),
+                    hover_color(bg, fg),
                 );
             }
             hits.push((field, index, command));
@@ -470,15 +547,15 @@ pub(super) fn draw_status(
                 stride,
                 icons::Icon::Down,
                 ((field.x + field.w - field_pad - arrow / 2) as f32, (field.y + field.h / 2) as f32),
-                m.dip(12.0),
+                m.dip(tok::MD),
                 color,
             );
         }
         right = field.x;
     }
     if !notice.is_empty() {
-        let left = area.x + m.pad;
-        let room = right.saturating_sub(left + m.pad);
+        let left = area.x + m.md;
+        let room = right.saturating_sub(left + m.md);
         let text = font.fit(notice, room);
         font.draw(pixels, stride, rect, left, baseline, &text, fg);
     }

@@ -26,15 +26,26 @@ pub(super) struct Colors {
     pub backdrop: u32,
     pub surface: u32,
     pub sidebar: u32,
+    /// Hover and selected rows on the sidebar colour.
+    pub nav_hover: u32,
+    pub nav_selected: u32,
     pub control: u32,
     pub control_hover: u32,
+    /// State ramp (`chrome::ramp`), each over the surface a row or control sits on.
     pub hover: u32,
+    pub pressed: u32,
     pub selected: u32,
+    /// Focus ring colour; drawn `Sizes::focus` thick.
+    pub focus_ring: u32,
     pub fg: u32,
     pub muted: u32,
     pub faint: u32,
+    /// Text and glyphs of a control that cannot act.
+    pub disabled: u32,
     pub border: u32,
     pub accent: u32,
+    /// Accent surface under the pointer; accents need the pressed step to read.
+    pub accent_hover: u32,
     pub on_accent: u32,
     pub error: u32,
 }
@@ -45,41 +56,64 @@ impl Colors {
         let panel = rgb(UiRole::PanelBackground);
         let fg = rgb(UiRole::PanelForeground);
         let surface = chrome::mix(panel, fg, 0x0a);
+        let control = chrome::mix(panel, fg, 0x16);
         Self {
             backdrop: rgb(UiRole::Background),
             surface,
             sidebar: panel,
-            control: chrome::mix(panel, fg, 0x16),
-            control_hover: chrome::mix(panel, fg, 0x24),
-            hover: chrome::mix(surface, fg, 0x10),
-            selected: chrome::mix(surface, rgb(UiRole::Selection), 0xa0),
+            nav_hover: chrome::hover_color(panel, fg),
+            nav_selected: chrome::selected_color(panel, rgb(UiRole::Selection)),
+            control,
+            control_hover: chrome::hover_color(control, fg),
+            hover: chrome::hover_color(surface, fg),
+            pressed: chrome::pressed_color(surface, fg),
+            selected: chrome::selected_color(surface, rgb(UiRole::Selection)),
+            focus_ring: rgb(UiRole::Accent),
             fg,
             muted: chrome::mix(surface, fg, 0xa8),
-            faint: chrome::mix(surface, fg, 0x5c),
+            faint: chrome::mix(surface, fg, chrome::ramp::FAINT),
+            disabled: chrome::disabled_color(surface, fg),
             border: rgb(UiRole::Border),
             accent: rgb(UiRole::Accent),
+            accent_hover: chrome::pressed_color(rgb(UiRole::Accent), fg),
             on_accent: panel,
             error: rgb(UiRole::Error),
         }
     }
 }
 
-/// Physical sizes for one monitor scale.
+/// Physical sizes for one monitor scale: the DIP token table (`chrome::tok`)
+/// scaled by the monitor DPI. Editor zoom never reaches them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Sizes {
     pub hairline: usize,
+    /// Spacing scale: 2, 4, 8, 12, 16, 24, 32 DIP.
+    pub xxs: usize,
+    pub xs: usize,
+    pub sm: usize,
+    pub md: usize,
+    pub lg: usize,
+    pub xl: usize,
+    pub xxl: usize,
+    /// Radii: controls, rows and chips (`radius`, the small step); cards,
+    /// menus, popups and the tab sheet (`card_radius`, the medium step). A
+    /// pill is `pill(height)`; an inner fill is `fill_radius(outer)`.
     pub radius: usize,
     pub card_radius: usize,
-    /// Outer padding of a card section.
+    /// Outer padding of a card section (`lg`).
     pub pad: usize,
     /// Inner padding of a control.
     pub inner: usize,
+    /// Gap between siblings (`sm`).
     pub gap: usize,
     /// Height of fields and buttons: a comfortable click target.
     pub control: usize,
-    /// Sidebar and list navigation rows.
-    pub nav: usize,
-    /// One line of 14 DIP chrome text.
+    /// Dropdown and context menu items.
+    pub menu_item: usize,
+    /// Palette, picker and settings navigation rows; `list_row_tall` holds two lines.
+    pub list_row: usize,
+    pub list_row_tall: usize,
+    /// One line of chrome text.
     pub text: usize,
     pub header: usize,
     pub footer: usize,
@@ -94,26 +128,47 @@ pub(super) struct Sizes {
 
 impl Sizes {
     pub fn new(m: &Metrics) -> Self {
+        use chrome::tok;
+        let spacing = [tok::XXS, tok::XS, tok::SM, tok::MD, tok::LG, tok::XL, tok::XXL].map(|dip| m.dip(dip));
         Self {
             hairline: m.line,
-            radius: m.dip(4.0),
-            card_radius: m.dip(8.0),
-            pad: m.dip(16.0),
+            xxs: spacing[0],
+            xs: spacing[1],
+            sm: spacing[2],
+            md: spacing[3],
+            lg: spacing[4],
+            xl: spacing[5],
+            xxl: spacing[6],
+            radius: m.dip(tok::RADIUS_SM),
+            card_radius: m.dip(tok::RADIUS_MD),
+            pad: spacing[4],
             inner: m.dip(10.0),
-            gap: m.dip(8.0),
-            control: m.dip(32.0),
-            nav: m.dip(36.0),
-            text: m.dip(20.0),
+            gap: spacing[2],
+            control: m.dip(tok::CONTROL),
+            menu_item: m.dip(tok::MENU_ITEM),
+            list_row: m.dip(tok::LIST_ROW),
+            list_row_tall: m.dip(tok::LIST_ROW_TALL),
+            text: m.dip(tok::TEXT),
             header: m.dip(52.0),
             footer: m.dip(40.0),
             switch_w: m.dip(40.0),
             switch_h: m.dip(20.0),
             check: m.dip(18.0),
-            focus: m.dip(2.0),
-            indicator: m.dip(3.0),
+            focus: m.dip(tok::XXS),
+            indicator: m.dip(tok::INDICATOR),
             icon: m.dip(10.0),
-            thumb: m.dip(4.0),
+            thumb: m.dip(tok::XS),
         }
+    }
+
+    /// Radius of a fully rounded end for a control `h` tall.
+    pub fn pill(&self, h: usize) -> usize {
+        h / 2
+    }
+
+    /// Radius of the fill inside a one-hairline border of radius `outer`.
+    pub fn fill_radius(&self, outer: usize) -> usize {
+        outer.saturating_sub(self.hairline)
     }
 }
 
@@ -198,7 +253,7 @@ impl Surface {
 pub(super) fn card(buf: &mut [u32], stride: usize, rect: Rect, c: &Colors, s: &Sizes) {
     chrome::fill_clipped(buf, stride, rect, c.backdrop);
     chrome::round_rect(buf, stride, rect, s.card_radius, c.border);
-    chrome::round_rect(buf, stride, inset(rect, s.hairline), s.card_radius.saturating_sub(s.hairline), c.surface);
+    chrome::round_rect(buf, stride, inset(rect, s.hairline), s.fill_radius(s.card_radius), c.surface);
 }
 
 pub(super) fn hline(buf: &mut [u32], stride: usize, x: usize, y: usize, w: usize, c: &Colors, s: &Sizes) {
@@ -328,7 +383,7 @@ pub(super) fn text_field(
     let border = if field.focused { c.accent } else { c.border };
     chrome::round_rect(buf, stride, rect, s.radius, border);
     let bg = if field.hovered && !field.focused { c.control_hover } else { c.control };
-    chrome::round_rect(buf, stride, inset(rect, s.hairline), s.radius.saturating_sub(s.hairline), bg);
+    chrome::round_rect(buf, stride, inset(rect, s.hairline), s.fill_radius(s.radius), bg);
     if field.focused {
         // Windows 11 field focus: a thicker accent edge along the bottom.
         let y = (rect.y + rect.h).saturating_sub(s.focus + s.hairline);
@@ -336,7 +391,7 @@ pub(super) fn text_field(
             buf,
             stride,
             Rect { x: rect.x + s.radius, y, w: rect.w.saturating_sub(2 * s.radius), h: s.focus },
-            c.accent,
+            c.focus_ring,
         );
     }
     let mut left = rect.x + s.inner;
@@ -420,7 +475,7 @@ pub(super) fn button(
     s: &Sizes,
 ) {
     let (bg, fg, edge) = match style {
-        Style::Primary => (if hovered { chrome::mix(c.accent, c.fg, 0x30) } else { c.accent }, c.on_accent, None),
+        Style::Primary => (if hovered { c.accent_hover } else { c.accent }, c.on_accent, None),
         Style::Secondary => (if hovered { c.control_hover } else { c.control }, c.fg, Some(c.border)),
         Style::Danger => (if hovered { c.control_hover } else { c.control }, c.error, Some(c.border)),
         Style::Subtle => (if hovered { c.hover } else { c.surface }, c.fg, None),
@@ -428,7 +483,7 @@ pub(super) fn button(
     match edge {
         Some(edge) => {
             chrome::round_rect(buf, stride, rect, s.radius, edge);
-            chrome::round_rect(buf, stride, inset(rect, s.hairline), s.radius.saturating_sub(s.hairline), bg);
+            chrome::round_rect(buf, stride, inset(rect, s.hairline), s.fill_radius(s.radius), bg);
         }
         // A resting subtle button is text on whatever row it sits on.
         None if style == Style::Subtle && !hovered => {}
@@ -493,7 +548,7 @@ pub(super) fn icon_button(
     if hovered && enabled {
         chrome::round_rect(buf, stride, rect, s.radius, bg);
     }
-    let color = if enabled { c.fg } else { c.faint };
+    let color = if enabled { c.fg } else { c.disabled };
     let center = (rect.x as f32 + rect.w as f32 / 2.0, rect.y as f32 + rect.h as f32 / 2.0);
     icon(buf, stride, kind, center, s.icon.min(rect.w / 2).min(rect.h / 2).max(1), color, bg, s);
 }
@@ -513,11 +568,11 @@ pub(super) fn switch(
 ) -> Rect {
     let (w, h) = (s.switch_w.min(rect.w), s.switch_h.min(rect.h));
     let track = Rect { x: rect.x, y: rect.y + (rect.h - h) / 2, w, h };
-    let radius = h / 2;
+    let radius = s.pill(h);
     let knob = (h as f32 / 2.0 - s.focus as f32 * 1.5).max(1.0) * if hovered { 1.12 } else { 1.0 };
     let cy = track.y as f32 + h as f32 / 2.0;
     if on {
-        let fill = if hovered { chrome::mix(c.accent, c.fg, 0x30) } else { c.accent };
+        let fill = if hovered { c.accent_hover } else { c.accent };
         chrome::round_rect(buf, stride, track, radius, fill);
         let cx = (track.x + track.w) as f32 - h as f32 / 2.0;
         chrome::disc(buf, stride, (cx, cy), knob, c.on_accent);
@@ -575,12 +630,12 @@ pub(super) fn segmented(
         h: first.h + 2 * s.hairline,
     };
     chrome::round_rect(buf, stride, outer, s.radius, c.border);
-    chrome::round_rect(buf, stride, inset(outer, s.hairline), s.radius.saturating_sub(s.hairline), c.control);
+    chrome::round_rect(buf, stride, inset(outer, s.hairline), s.fill_radius(s.radius), c.control);
     for (index, (rect, option)) in rects.iter().zip(options).enumerate() {
         let chosen = selected == Some(index);
         let fg = if chosen {
             if hovered == Some(index) {
-                chrome::round_rect(buf, stride, *rect, s.radius, chrome::mix(c.accent, c.fg, 0x30));
+                chrome::round_rect(buf, stride, *rect, s.radius, c.accent_hover);
             } else {
                 chrome::round_rect(buf, stride, *rect, s.radius, c.accent);
             }
@@ -619,9 +674,9 @@ pub(super) fn checkbox(
     let r = Rect { x: rect.x, y: rect.y + (rect.h - size) / 2, w: size, h: size };
     if checked {
         let fill = if !enabled {
-            c.faint
+            c.disabled
         } else if hovered {
-            chrome::mix(c.accent, c.fg, 0x30)
+            c.accent_hover
         } else {
             c.accent
         };
@@ -629,12 +684,12 @@ pub(super) fn checkbox(
         let center = (r.x as f32 + size as f32 / 2.0, r.y as f32 + size as f32 / 2.0);
         icon(buf, stride, Icon::Check, center, size / 2, c.on_accent, fill, s);
     } else {
-        chrome::round_rect(buf, stride, r, s.radius, if enabled { c.muted } else { c.faint });
+        chrome::round_rect(buf, stride, r, s.radius, if enabled { c.muted } else { c.disabled });
         let fill = if hovered && enabled { c.control_hover } else { c.control };
-        chrome::round_rect(buf, stride, inset(r, s.hairline), s.radius.saturating_sub(s.hairline), fill);
+        chrome::round_rect(buf, stride, inset(r, s.hairline), s.fill_radius(s.radius), fill);
     }
     let text_rect = Rect { x: r.x + size + s.gap, y: rect.y, w: rect.w.saturating_sub(size + s.gap), h: rect.h };
-    label(buf, stride, font, text_rect, text, if enabled { c.fg } else { c.faint });
+    label(buf, stride, font, text_rect, text, if enabled { c.fg } else { c.disabled });
     r
 }
 
@@ -692,7 +747,7 @@ pub(super) fn keycaps(
             let chip = Rect { x: pen, y, w, h };
             chrome::round_rect(buf, stride, chip, s.radius, c.border);
             let inner = Rect { h: h.saturating_sub(s.hairline * 2), ..inset(chip, s.hairline) };
-            chrome::round_rect(buf, stride, inner, s.radius.saturating_sub(s.hairline), c.control);
+            chrome::round_rect(buf, stride, inner, s.fill_radius(s.radius), c.control);
             font.draw(buf, stride, chip, pen + s.inner / 2, baseline, part, c.fg);
             pen += w;
         }
@@ -707,7 +762,7 @@ pub(super) fn row(buf: &mut [u32], stride: usize, rect: Rect, selected: bool, ho
         chrome::round_rect(buf, stride, rect, s.radius, c.selected);
         let h = (rect.h / 2).max(1);
         let bar = Rect { x: rect.x, y: rect.y + (rect.h - h) / 2, w: s.indicator.min(rect.w), h };
-        chrome::round_rect(buf, stride, bar, s.indicator / 2, c.accent);
+        chrome::round_rect(buf, stride, bar, s.pill(s.indicator), c.accent);
     } else if hovered {
         chrome::round_rect(buf, stride, rect, s.radius, c.hover);
     }
@@ -725,12 +780,12 @@ pub(super) fn nav_row(
 ) {
     chrome::fill_clipped(buf, stride, rect, c.sidebar);
     if selected {
-        chrome::round_rect(buf, stride, rect, s.radius, chrome::mix(c.sidebar, c.fg, 0x18));
+        chrome::round_rect(buf, stride, rect, s.radius, c.nav_selected);
         let h = (rect.h / 2).max(1);
         let bar = Rect { x: rect.x, y: rect.y + (rect.h - h) / 2, w: s.indicator.min(rect.w), h };
-        chrome::round_rect(buf, stride, bar, s.indicator / 2, c.accent);
+        chrome::round_rect(buf, stride, bar, s.pill(s.indicator), c.accent);
     } else if hovered {
-        chrome::round_rect(buf, stride, rect, s.radius, chrome::mix(c.sidebar, c.fg, 0x0e));
+        chrome::round_rect(buf, stride, rect, s.radius, c.nav_hover);
     }
 }
 
@@ -757,7 +812,7 @@ pub(super) fn scroll_thumb(
     let max_first = total - visible;
     let y = track.y + (room as u128 * first.min(max_first) as u128 / max_first.max(1) as u128) as usize;
     let thumb = Rect { x: track.x + track.w.saturating_sub(s.thumb), y, w: s.thumb.min(track.w), h };
-    chrome::round_rect(buf, stride, thumb, s.thumb / 2, c.faint);
+    chrome::round_rect(buf, stride, thumb, s.pill(s.thumb), c.faint);
 }
 
 /// First visible index that keeps `selected` inside a window of `visible`
@@ -884,10 +939,69 @@ mod tests {
     }
 
     #[test]
+    fn metrics_and_sizes_read_one_token_table() {
+        use chrome::tok;
+        for scale in [0.5, 1.0, 1.25, 1.5, 2.0, 3.0] {
+            let (m, s) = (Metrics::new(scale), Sizes::new(&Metrics::new(scale)));
+            // Every number that both structs expose is one token, never two.
+            assert_eq!((m.md, m.xxl, m.radius), (s.md, s.xxl, s.radius), "spacing and radius at {scale}");
+            assert_eq!((m.item, m.row, m.indicator), (s.menu_item, s.control, s.indicator), "heights at {scale}");
+            assert_eq!((s.gap, s.pad, s.focus, s.thumb), (s.sm, s.lg, s.xxs, s.xs), "semantic names stay aliases");
+            assert_eq!(s.text, m.dip(tok::TEXT));
+            assert_eq!(m.text_px(), (tok::BODY * m.scale) as f32);
+        }
+        let s = Sizes::new(&Metrics::new(1.0));
+        let scale = [s.xxs, s.xs, s.sm, s.md, s.lg, s.xl, s.xxl];
+        assert_eq!(scale, [2, 4, 8, 12, 16, 24, 32]);
+        assert_eq!((s.menu_item, s.list_row, s.list_row_tall), (32, 36, 44));
+        assert_eq!((s.radius, s.card_radius, s.fill_radius(s.radius), s.pill(s.control)), (4, 8, 3, 16));
+    }
+
+    #[test]
+    fn state_ramp_is_shared_by_cards_and_theme_coloured_chrome() {
+        for theme in [theme_ui::chrome(), std::sync::Arc::new(Theme::builtin(kwil_core_commands::theme::Scheme::Light))]
+        {
+            let c = Colors::new(&theme);
+            let fg = c.fg;
+            assert_eq!(c.hover, chrome::mix(c.surface, fg, chrome::ramp::HOVER));
+            assert_eq!(c.pressed, chrome::pressed_color(c.surface, fg));
+            assert_eq!(c.disabled, chrome::disabled_color(c.surface, fg));
+            assert_eq!(c.focus_ring, c.accent);
+            assert_eq!(c.faint, chrome::mix(c.surface, fg, 0x7a));
+            // Hover < pressed < selected on the same surface, and disabled text still reads as text.
+            let distance = |a: u32, b: u32| {
+                (0..3).map(|i| (i32::from((a >> (8 * i)) as u8) - i32::from((b >> (8 * i)) as u8)).abs()).sum::<i32>()
+            };
+            let (h, p) = (distance(c.surface, c.hover), distance(c.surface, c.pressed));
+            assert!(0 < h && h < p, "hover {h} then pressed {p}");
+            assert!(distance(c.surface, c.disabled) > distance(c.surface, c.faint) / 2);
+        }
+    }
+
+    #[test]
+    fn emphasized_diff_fill_keeps_the_role_hue_and_stays_inside_the_channel_range() {
+        for scheme in [kwil_core_commands::theme::Scheme::Dark, kwil_core_commands::theme::Scheme::Light] {
+            let theme = Theme::builtin(scheme);
+            let base = theme_ui::rgb(&theme, UiRole::Background);
+            for role in [UiRole::Added, UiRole::Removed] {
+                let line = theme_ui::rgb(&theme, role);
+                let word = chrome::emphasize(base, line);
+                assert_ne!(word, line, "a changed word is stronger than its line");
+                // Further from the editor background than the line fill is, on every channel.
+                for shift in [16, 8, 0] {
+                    let d = |v: u32| i32::from((v >> shift) as u8);
+                    assert!((d(word) - d(base)).abs() >= (d(line) - d(base)).abs());
+                }
+            }
+        }
+        assert_eq!(chrome::emphasize(0x000000, 0xff8000), 0xffff00, "clamped, never wrapped");
+    }
+
+    #[test]
     fn sizes_follow_monitor_dpi_only() {
         let (one, two) = (Sizes::new(&Metrics::new(1.0)), Sizes::new(&Metrics::new(2.0)));
         assert_eq!(two.control, 2 * one.control);
-        assert!(one.control >= 32 && one.nav >= 32, "comfortable click targets at 100%");
+        assert!(one.control >= 32 && one.list_row >= 32, "comfortable click targets at 100%");
         let fractional = Sizes::new(&Metrics::new(1.25));
         assert_eq!(fractional.control, 40);
     }
