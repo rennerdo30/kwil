@@ -281,6 +281,9 @@ impl App {
                 if self.dispatch_theme(command) {
                     return;
                 }
+                if self.dispatch_command_line(command) {
+                    return;
+                }
                 if matches!(command, "update.check" | "update.apply") {
                     let proxy = self.proxy.clone();
                     let started = kwil_update::spawn_check(env!("CARGO_PKG_VERSION"), move |message| {

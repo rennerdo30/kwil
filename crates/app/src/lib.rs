@@ -29,7 +29,8 @@ Options:
   --new-window Open a separate window with its own saved session
   --renderer auto|cpu|gpu  Select the GUI rendering backend (overrides settings)
   --update     Check for an update now and install it
-  --unregister-file-types  Remove Kwil from \"Open with\" (Windows; the uninstaller runs this)
+  --register-command-line  Add Kwil to your user PATH and Win+R (Windows; no administrator needed)
+  --unregister-file-types  Remove Kwil from \"Open with\", your PATH and Win+R (Windows; the uninstaller runs this)
   --version    Print the version
   -h, --help   Print this help
   --           Treat following arguments as literal file names
@@ -47,6 +48,7 @@ struct Args {
     restore_window: Option<String>,
     update: bool,
     unregister_file_types: bool,
+    register_command_line: bool,
     renderer: Option<kwil_ui_gpu::RenderBackend>,
     files: Vec<FileArgument>,
 }
@@ -121,6 +123,7 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
             }
             Some("--update") => a.update = true,
             Some("--unregister-file-types") => a.unregister_file_types = true,
+            Some("--register-command-line") => a.register_command_line = true,
             Some("--version" | "-V") => {
                 println!("kwil {VERSION}");
                 std::process::exit(0);
@@ -224,9 +227,24 @@ fn run_app(console_launcher: bool) -> ExitCode {
             },
         };
     }
+    if args.register_command_line {
+        return match kwil_ui_gpu::command_line_registration(true) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("kwil: cannot add Kwil to your PATH: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.unregister_file_types {
         use kwil_view_model::file_type_registration::RemoveAllOutcome;
-        return match kwil_ui_gpu::remove_file_types(std::time::Duration::from_secs(60)) {
+        // File types first: the uninstaller gives this command 10 s and the
+        // PATH broadcast is the part that may wait. A refusal in one part never
+        // hides the other.
+        let file_types = match kwil_ui_gpu::remove_file_types(std::time::Duration::from_secs(60)) {
             Ok(RemoveAllOutcome::NothingRegistered) => {
                 println!("No Kwil file types are registered");
                 ExitCode::SUCCESS
@@ -240,6 +258,17 @@ fn run_app(console_launcher: bool) -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+        let mut command_line_failed = false;
+        if kwil_ui_gpu::COMMAND_LINE_SUPPORTED {
+            match kwil_ui_gpu::command_line_registration(false) {
+                Ok(message) => println!("{message}"),
+                Err(e) => {
+                    eprintln!("kwil: cannot remove Kwil from your PATH: {e}");
+                    command_line_failed = true;
+                }
+            }
+        }
+        return if command_line_failed { ExitCode::FAILURE } else { file_types };
     }
 
     let make_view = || match args.files.first() {
@@ -594,6 +623,18 @@ mod isolation_tests {
             vec!["--new-window", "--restore-window", "window-123"],
         ] {
             assert!(parse_args_values(arguments.into_iter().map(Into::into)).is_err());
+        }
+    }
+
+    #[test]
+    fn command_line_registration_is_an_explicit_flag_and_documented_in_help() {
+        let args = parse_args_values(["--register-command-line"].into_iter().map(Into::into)).unwrap();
+        assert!(args.register_command_line && !args.unregister_file_types && args.files.is_empty());
+        assert!(!parse_args_values(std::iter::empty()).unwrap().register_command_line, "never on by default");
+        let literal = parse_args_values(["--".into(), "--register-command-line".into()].into_iter()).unwrap();
+        assert!(!literal.register_command_line && literal.files.len() == 1, "a file name is not a flag");
+        for text in ["--register-command-line", "your user PATH", "Win+R", "--unregister-file-types"] {
+            assert!(HELP.contains(text), "HELP must mention {text}");
         }
     }
 

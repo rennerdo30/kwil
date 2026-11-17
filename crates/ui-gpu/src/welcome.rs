@@ -21,6 +21,12 @@ pub const TECHNOLOGY: &[&str] = &[
     "Event-driven rendering redraws changed areas, with no idle frames.",
 ];
 
+/// Whether the first-run "use Kwil from the command line and Win+R" choice starts
+/// ticked. Off for now: the owner decides whether it is pre-checked. A ticked
+/// default is applied only after the file-type step finishes and the user never
+/// touched the choice; nothing is written merely because the page is shown.
+pub const COMMAND_LINE_PRESELECTED: bool = false;
+
 const MARKER: &[u8] = b"kwil-welcome-v1\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

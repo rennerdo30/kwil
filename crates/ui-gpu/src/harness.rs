@@ -139,6 +139,11 @@ pub(crate) enum Step {
     PaletteProbe(u8),
     WelcomeProbe,
     WelcomeDismiss,
+    /// KW-90: show the command-line choice as "off" (no native read in hidden runs).
+    CommandLineSeed,
+    /// KW-90: choosing it in a hidden run is refused before any registry access.
+    CommandLineWelcomeRefused,
+    CommandLineSettingsRefused,
     FileTypesSetup,
     FileTypesRegister,
     FileTypesExtend(bool),
@@ -317,6 +322,21 @@ pub(crate) fn start(proxy: super::HostProxy) {
             (100, Step::PaletteOpen),
             (300, Step::UsabilityCapture("palette.bmp")),
             (100, Step::PaletteClose),
+            (100, Step::End),
+        ];
+        let command_line = [
+            (1800, Step::WelcomeProbe),
+            (100, Step::CommandLineSeed),
+            (100, Step::WelcomeNext),
+            (300, Step::UsabilityCapture("command-line-welcome.bmp")),
+            (100, Step::CommandLineWelcomeRefused),
+            (100, Step::WelcomeSkip),
+            (100, Step::SettingsOpen),
+            (100, Step::SettingsCategory(3)),
+            (100, Step::CommandLineSeed),
+            (300, Step::UsabilityCapture("command-line-settings.bmp")),
+            (100, Step::CommandLineSettingsRefused),
+            (100, Step::SettingsClose),
             (100, Step::End),
         ];
         let welcome = [
@@ -766,6 +786,8 @@ pub(crate) fn start(proxy: super::HostProxy) {
             resize.as_slice()
         } else if std::env::var_os("KWIL_FILETYPES_PROBE").is_some() {
             file_types.as_slice()
+        } else if std::env::var_os("KWIL_COMMAND_LINE_PROBE").is_some() {
+            command_line.as_slice()
         } else if std::env::var("KWIL_WELCOME_PROBE").as_deref() == Ok("dismiss") {
             welcome_dismiss.as_slice()
         } else if std::env::var_os("KWIL_WELCOME_PROBE").is_some() {
@@ -1533,6 +1555,35 @@ fn step_inner(app: &mut App, el: &ActiveEventLoop, step: Step) {
             assert!(app.view.editor().unwrap().document().revision() > revision);
         }
         Step::WelcomeProbe => welcome_probe(app, el),
+        Step::CommandLineSeed => {
+            assert!(app.opts.hidden);
+            app.command_line.seed_for_harness(false);
+            app.welcome_view.hits = Default::default();
+            app.settings_epoch = app.settings_epoch.wrapping_add(1);
+            app.palette_redraw();
+        }
+        Step::CommandLineWelcomeRefused => {
+            let supported = kwil_core_commands::command_line::SUPPORTED;
+            assert_eq!(app.command_line.row(true).is_some(), supported, "the choice is shown on Windows only");
+            if supported {
+                app.welcome_action(super::welcome_ui::Action::CommandLine);
+                assert!(app.view.status_text().contains("disabled in hidden test mode"), "{}", app.view.status_text());
+                assert!(app.command_line.problem().is_some_and(|p| p.contains("hidden test mode")));
+                assert!(!app.command_line.row(true).unwrap().on, "a refused request changes nothing");
+            }
+            app.command_line.seed_for_harness(false);
+            println!("kw90 command-line choice refused in hidden mode; no registry access");
+        }
+        Step::CommandLineSettingsRefused => {
+            if kwil_core_commands::command_line::SUPPORTED {
+                app.command_line_toggle();
+                assert!(app.command_line.problem().is_some_and(|p| p.contains("hidden test mode")));
+                assert!(
+                    app.dispatch_command_line("commandLine.add") && app.dispatch_command_line("commandLine.remove")
+                );
+                assert!(!app.command_line.row(false).unwrap().on, "the palette commands are refused the same way");
+            }
+        }
         Step::WelcomeDismiss => {
             use winit::event::WindowEvent;
             assert_eq!(app.welcome.stage(), super::welcome::Stage::About);
