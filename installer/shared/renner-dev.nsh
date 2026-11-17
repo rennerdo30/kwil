@@ -164,7 +164,15 @@ Function ${Prefix}RD_CheckFile
 FunctionEnd
 
 Function ${Prefix}RD_ValidateDirectory
-  GetFullPathName $INSTDIR "$INSTDIR"
+  ; NSIS GetFullPathName empties a path that does not exist yet, which is every
+  ; fresh install. The Win32 call canonicalises without touching the disk.
+  System::Call 'kernel32::GetFullPathNameW(w "$INSTDIR", i ${NSIS_MAX_STRLEN}, w .r0, p 0)i.r1'
+  ${If} $1 > 0
+  ${AndIf} $1 < ${NSIS_MAX_STRLEN}
+    StrCpy $INSTDIR $0
+  ${Else}
+    StrCpy $INSTDIR ""
+  ${EndIf}
   ${GetRoot} "$INSTDIR" $0
   ${If} $INSTDIR == ""
   ${OrIf} $INSTDIR == $0
