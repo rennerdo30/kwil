@@ -1,6 +1,6 @@
 //! Command palette and file finder card: a query field with a mode-aware
-//! placeholder, result rows with categories and real shortcut keycaps, and a
-//! quiet hint line. Text is the DPI chrome face; editor zoom never applies.
+//! placeholder, result rows with their real shortcut keycaps (none when
+//! unbound), and a quiet hint line. Text is the DPI chrome face; editor zoom never applies.
 //! Matching, discovery and actions stay in the palette host (`palette_ui`).
 use super::*;
 use chrome::Metrics;
@@ -167,25 +167,14 @@ pub(super) fn draw(
         view.hits.push(r, Hit::Row(slot));
         view.painted.push(row.action.clone());
         let text = Rect { x: r.x + s.pad, w: r.w.saturating_sub(2 * s.pad), ..r };
-        // Right side: shortcut keycaps for commands, else the category.
-        let keys = match row.action {
-            PaletteAction::Command(id) => labels.get(id).filter(|keys| !keys.is_empty()),
-            _ => None,
-        };
-        let right_w = match keys {
-            Some(keys) => desktop::keycaps_width(font, keys, &s, text.w / 3),
-            None => font.measure(&row.category, text.w / 3),
-        };
+        // One rule: the right slot holds the row's shortcut, or nothing.
+        let keys = shortcut(&row.action, labels);
+        let right_w = keys.map_or(0, |keys| desktop::keycaps_width(font, keys, &s, text.w / 3));
         let title = Rect { w: text.w.saturating_sub(right_w + s.pad), ..text };
         desktop::label(pixels, stride, font, title, &row.title, c.fg);
-        let right = Rect { x: text.x + text.w - right_w, w: right_w, ..text };
-        match keys {
-            Some(keys) => {
-                desktop::keycaps(pixels, stride, font, right, right.x, keys, &c, &s);
-            }
-            None => {
-                desktop::label_right(pixels, stride, font, right, &row.category, c.faint);
-            }
+        if let Some(keys) = keys {
+            let right = Rect { x: text.x + text.w - right_w, w: right_w, ..text };
+            desktop::keycaps(pixels, stride, font, right, right.x, keys, &c, &s);
         }
     }
     desktop::scroll_thumb(
@@ -207,6 +196,15 @@ pub(super) fn draw(
     };
     desktop::label(pixels, stride, font.small(), footer, hint, c.faint);
     Some(area)
+}
+
+/// The keys shown at the right of a palette row: a command's current
+/// shortcut, else nothing (unbound commands, files, tabs, go-to).
+fn shortcut<'a>(action: &PaletteAction, labels: &'a HashMap<&'static str, String>) -> Option<&'a str> {
+    match action {
+        PaletteAction::Command(id) => labels.get(id).map(String::as_str).filter(|keys| !keys.is_empty()),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -483,5 +481,23 @@ mod tests {
         assert!(!view.paint.pending(), "no idle repeat");
         assert!(view.track((0, 0), palette.rows(), surface), "leaving the rows clears the hover");
         assert_eq!(view.hover, None);
+    }
+
+    /// KW-92: the right slot is the shortcut or empty. Unbound commands and
+    /// files, tabs and go-to rows never fill it with their category.
+    #[test]
+    fn the_right_slot_holds_only_a_shortcut() {
+        let labels: HashMap<&'static str, String> =
+            [("file.save", "ctrl+s".to_owned()), ("file.close", String::new())].into_iter().collect();
+        assert_eq!(shortcut(&PaletteAction::Command("file.save"), &labels), Some("ctrl+s"));
+        for action in [
+            PaletteAction::Command("file.close"),
+            PaletteAction::Command("file.openFolder"),
+            PaletteAction::OpenFile("notes.txt".into()),
+            PaletteAction::ActivateTab(1),
+            PaletteAction::GoTo { line: 1, column: 1 },
+        ] {
+            assert_eq!(shortcut(&action, &labels), None, "{action:?}");
+        }
     }
 }

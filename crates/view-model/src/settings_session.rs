@@ -803,7 +803,12 @@ impl SettingsSession {
                 None
             }
             _ => {
-                let text = match row.current {
+                // Sizes open as their display text ("64 MB"), which parses back exactly.
+                let current = match row.spec.kind.size_text(&row.current) {
+                    Some(size) => SettingValue::Text(size),
+                    None => row.current,
+                };
+                let text = match current {
                     SettingValue::Integer(v) => v.to_string(),
                     SettingValue::Float(v) => v.to_string(),
                     SettingValue::Text(v) => v,
@@ -833,6 +838,10 @@ impl SettingsSession {
         let text = &edit.input.text;
         let value = match edit.kind {
             SettingKind::Integer => SettingValue::Integer(text.parse().map_err(|_| "enter a whole number")?),
+            SettingKind::Bytes { min, max } => {
+                let bytes = kwil_core_commands::byte_size::parse_size_within(text, min, max)?;
+                SettingValue::Integer(i64::try_from(bytes).map_err(|_| "size is too large")?)
+            }
             SettingKind::Float => SettingValue::Float(text.parse().map_err(|_| "enter a number")?),
             SettingKind::Text => SettingValue::Text(text.clone()),
             SettingKind::Strings => {
@@ -1032,8 +1041,8 @@ impl SettingsSession {
             "Loading settings…".into()
         } else if self.is_dirty() {
             "Unsaved settings".into()
-        } else if self.panel.is_some() {
-            "Enter to edit or confirm; Escape cancels a stage, query, then panel".into()
+        } else if let Some(panel) = &self.panel {
+            panel.hint().into()
         } else if self.editing.is_some() {
             "Enter to save; Escape to cancel (lists: one string per line)".into()
         } else {

@@ -3,6 +3,7 @@
 //! No frontend or document buffer is owned by this crate. The optional settings
 //! worker performs I/O only after the host explicitly starts it.
 pub mod associations;
+pub mod byte_size;
 pub mod command_line;
 pub mod key;
 pub mod keymap;

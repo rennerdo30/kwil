@@ -580,7 +580,7 @@ impl App {
                                 format!(
                                     "{}: {}. {}",
                                     row.spec.title,
-                                    settings_ui::value_text(&row.current),
+                                    settings_ui::value_text(row.spec.kind, &row.current),
                                     row.spec.description
                                 ),
                                 Target::Setting(index),

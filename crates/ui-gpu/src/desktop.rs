@@ -447,6 +447,8 @@ pub(super) enum Style {
     Secondary,
     Subtle,
     Danger,
+    /// An inline action that reads as a link: accent text, no frame at rest.
+    Link,
 }
 
 /// Keep the full control height for accents and descenders. Inner padding
@@ -478,6 +480,7 @@ pub(super) fn button(
         Style::Secondary => (if hovered { c.control_hover } else { c.control }, c.fg, Some(c.border)),
         Style::Danger => (if hovered { c.control_hover } else { c.control }, c.error, Some(c.border)),
         Style::Subtle => (if hovered { c.hover } else { c.surface }, c.fg, None),
+        Style::Link => (if hovered { c.hover } else { c.surface }, c.accent, None),
     };
     match edge {
         Some(edge) => {
@@ -485,7 +488,7 @@ pub(super) fn button(
             chrome::round_rect(buf, stride, inset(rect, s.hairline), s.fill_radius(s.radius), bg);
         }
         // A resting subtle button is text on whatever row it sits on.
-        None if style == Style::Subtle && !hovered => {}
+        None if matches!(style, Style::Subtle | Style::Link) && !hovered => {}
         None => chrome::round_rect(buf, stride, rect, s.radius, bg),
     }
     let clip = button_clip(rect, s.inner);

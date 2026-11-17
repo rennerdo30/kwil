@@ -78,6 +78,12 @@ pub enum SettingValue {
 pub enum SettingKind {
     Bool,
     Integer,
+    /// An integer number of bytes, shown and entered as a human size
+    /// ("64 MB"); `min..=max` matches the settings validation.
+    Bytes {
+        min: u64,
+        max: u64,
+    },
     Float,
     Text,
     Choice(&'static [&'static str]),
@@ -94,6 +100,17 @@ pub struct SettingSpec {
     pub description: &'static str,
     pub kind: SettingKind,
     read: fn(&Settings) -> SettingValue,
+}
+impl SettingKind {
+    /// Display text when the kind shows its value in another unit than stored.
+    pub fn size_text(self, value: &SettingValue) -> Option<String> {
+        match (self, value) {
+            (Self::Bytes { .. }, SettingValue::Integer(bytes)) => {
+                Some(crate::byte_size::format_size(u64::try_from(*bytes).unwrap_or(0)))
+            }
+            _ => None,
+        }
+    }
 }
 impl SettingSpec {
     fn current(&self, settings: &Settings) -> SettingValue {
@@ -235,8 +252,8 @@ pub const SCHEMA: &[SettingSpec] = &[
         "files.small_file_threshold_bytes",
         "Small file threshold",
         Files,
-        "Resident limit from 0 to 67108864 bytes. Applies on next open.",
-        SettingKind::Integer,
+        "Resident limit from 0 B to 64 MB. Applies on next open.",
+        SettingKind::Bytes { min: 0, max: 64 << 20 },
         |s| SettingValue::Integer(s.files.small_file_threshold_bytes.min(i64::MAX as u64) as i64)
     ),
     spec!("files.backup", "Backup", Files, "Keep a backup when saving.", SettingKind::Bool, |s| SettingValue::Bool(
@@ -361,8 +378,8 @@ pub const SCHEMA: &[SettingSpec] = &[
         "undo.memory_limit_bytes",
         "Undo memory",
         Advanced,
-        "Undo memory from 1 to 536870912 bytes. Applies live.",
-        SettingKind::Integer,
+        "Undo memory from 1 B to 512 MB. Applies live.",
+        SettingKind::Bytes { min: 1, max: 512 << 20 },
         |s| SettingValue::Integer(s.undo.memory_limit_bytes.min(i64::MAX as u64) as i64)
     ),
     spec!(
@@ -401,8 +418,8 @@ pub const SCHEMA: &[SettingSpec] = &[
         "syntax.full_parse_limit_bytes",
         "Full parse limit",
         Advanced,
-        "Full parse limit from 0 to 20971520 bytes. Above it use viewport highlighting. Applies live.",
-        SettingKind::Integer,
+        "Full parse limit from 0 B to 20 MB. Above it use viewport highlighting. Applies live.",
+        SettingKind::Bytes { min: 0, max: 20 << 20 },
         |s| SettingValue::Integer(s.syntax.full_parse_limit_bytes.min(i64::MAX as u64) as i64)
     ),
     spec!("log.follow", "Follow log", Advanced, "Follow appended log output.", SettingKind::Bool, |s| {
@@ -548,7 +565,7 @@ impl SettingsDocument {
         }
         let valid = match (&spec.kind, &new) {
             (SettingKind::Bool, SettingValue::Bool(_))
-            | (SettingKind::Integer, SettingValue::Integer(_))
+            | (SettingKind::Integer | SettingKind::Bytes { .. }, SettingValue::Integer(_))
             | (SettingKind::Float, SettingValue::Float(_))
             | (SettingKind::Text, SettingValue::Text(_))
             | (SettingKind::Strings, SettingValue::Strings(_)) => true,
