@@ -7,7 +7,11 @@ commit is available. Its original SHA-256 is
 The adjacent MIT license is retained. This is the shared template, not a new
 installer design.
 
-Two optional macro calls are the only local template changes:
+One fix and two optional macro calls are the only local template changes. The
+fix (2026-11-17, Pair Desk KW-94 and the matching `general` report):
+`RD_ValidateDirectory` canonicalises `$INSTDIR` with `kernel32::GetFullPathNameW`
+instead of NSIS `GetFullPathName`, which empties a folder that does not exist
+yet and so aborted every fresh install. The macro calls:
 
 - `RD_VALIDATE_LEGACY`: Kwil's adapter recognizes its shipped NSIS installs,
   which predate the shared ownership record. Keeps the existing `Kwil` registry
