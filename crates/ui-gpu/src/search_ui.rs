@@ -1045,6 +1045,7 @@ pub(crate) mod host_dispatch_tests {
                 menu_dirty: false,
                 hover: chrome::Hover::None,
                 status_hits: Vec::new(),
+                compare_header: Default::default(),
                 window_title: String::new(),
                 #[cfg(feature = "frame-harness")]
                 metrics: Default::default(),

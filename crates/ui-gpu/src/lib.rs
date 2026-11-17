@@ -636,6 +636,8 @@ struct App {
     hover: chrome::Hover,
     /// Clickable status fields as drawn: area, segment index, command.
     status_hits: Vec<(Rect, usize, &'static str)>,
+    /// Header above the compare panes; painted only when its content changes.
+    compare_header: compare_ui::Header,
     window_title: String,
     #[cfg(feature = "frame-harness")]
     metrics: harness::Metrics,
@@ -835,6 +837,7 @@ pub fn run_workspace_with_external_open(
                 menu_dirty: false,
                 hover: chrome::Hover::None,
                 status_hits: Vec::new(),
+                compare_header: compare_ui::Header::default(),
                 window_title: String::new(),
                 #[cfg(feature = "frame-harness")]
                 metrics: Default::default(),
@@ -871,7 +874,7 @@ pub fn run_workspace_with_external_open(
             Ok(worker) => Some(worker),
             Err(error) => {
                 let _ =
-                    app.proxy.send_event(UserEvent::Notice(format!("Window placement worker unavailable: {error}")));
+                    app.proxy.send_event(UserEvent::Notice(format!("Window position won't be remembered: {error}")));
                 None
             }
         };
@@ -1172,6 +1175,15 @@ impl App {
 
     /// Chrome comes from DPI metrics; only the text grid uses the editor font.
     fn body_area(&self) -> kwil_view_model::TabArea {
+        compare_ui::layout(self.reserved_body_area(), &self.ui, self.view.compare.open).1
+    }
+
+    /// The compare header, reserved above the compare body while it is open.
+    fn compare_bar(&self) -> Option<Rect> {
+        compare_ui::layout(self.reserved_body_area(), &self.ui, self.view.compare.open).0
+    }
+
+    fn reserved_body_area(&self) -> kwil_view_model::TabArea {
         let mut area = chrome::layout(self.size, &self.ui, self.settings.tabs.layout).body;
         if !self.view.hex_active() && self.markdown_mode() == markdown_ui::Mode::Split {
             area.width /= 2;
@@ -1345,6 +1357,7 @@ impl App {
         let button = self.menu.toolbar.iter().any(|tool| tool.enabled && tool.rect.contains(pointer))
             || self.menu.titles.iter().any(|area| area.contains(pointer.0, pointer.1))
             || self.status_hits.iter().any(|(area, _, _)| area.contains(pointer))
+            || self.compare_toggle_at(pointer).is_some()
             || self.menu.dropdown.as_ref().is_some_and(|list| list.area.contains(pointer));
         if let Some(drag) = self.drag {
             if drag.vertical { winit::window::CursorIcon::NsResize } else { winit::window::CursorIcon::EwResize }
@@ -1369,6 +1382,8 @@ impl App {
                 .iter()
                 .find(|(rect, _, _)| rect.contains((x, y)))
                 .map_or(chrome::Hover::None, |(_, index, _)| chrome::Hover::Status(*index))
+        } else if let Some(toggle) = self.compare_toggle_at((x, y)) {
+            chrome::Hover::CompareToggle(toggle)
         } else {
             self.thumb_hover().unwrap_or_default()
         };
@@ -1911,7 +1926,7 @@ impl App {
             return true;
         }
         if self.logs.owns_body() {
-            self.view.set_notice("Leave log view to format the document".into());
+            self.view.set_notice("Close the log view to format".into());
             self.apply(Damage { status: true, ..Default::default() });
             return true;
         }
@@ -2296,6 +2311,8 @@ impl App {
             segments.push(chrome::language_segment(host.language_status(&self.view)));
         }
         let title = chrome::window_title(&self.view);
+        let compare_bar = self.compare_bar();
+        let compare_left = if compare_bar.is_some() { self.compare_left_title() } else { String::new() };
         let dragging = self.drag.map(|drag| drag.vertical);
         let hover = self.hover;
         let theme = &theme_ui::chrome();
@@ -2511,7 +2528,7 @@ impl App {
             damage.push(tabs::rect(body));
         }
         if self.view.compare.open && body_changed {
-            compare_ui::draw(&self.view.compare, body_pixels, bw, font, |row| {
+            compare_ui::draw(&self.view.compare, body_pixels, bw, font, self.ui_font.as_mut(), |row| {
                 p.full || p.rows.contains(&row) || document_rows().any(|dirty| dirty == row)
             });
             for row in
@@ -2563,6 +2580,32 @@ impl App {
             );
             if !p.full {
                 damage.push(tabs::rect(lay.status));
+            }
+        }
+        if let (Some(bar), Some(ui_font)) = (compare_bar, self.ui_font.as_mut()) {
+            let hover = match hover {
+                chrome::Hover::CompareToggle(toggle) => Some(toggle),
+                _ => None,
+            };
+            // Its own content key covers hover and page changes; only a full
+            // paint or an overlay restore wipes its pixels from outside.
+            let force = p.full || content_restored;
+            let header = &mut self.compare_header;
+            if let Some(area) = compare_ui::draw_header(
+                header,
+                &self.view.compare,
+                &compare_left,
+                pixels,
+                w,
+                bar,
+                ui_font,
+                theme,
+                &self.ui,
+                hover,
+                force,
+            ) && !p.full
+            {
+                damage.push(area);
             }
         }
         if body_changed || p.status || search_dirty {
@@ -3635,7 +3678,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Ok(Some(palette)) => self.palette = Some(palette),
                     Ok(None) => {}
                     Err(error) => {
-                        self.view.set_notice(format!("Palette: {error}"));
+                        self.view.set_notice(format!("Command palette unavailable: {error}"));
                     }
                 }
                 Damage { status: true, ..Default::default() }
@@ -3737,7 +3780,10 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.view.set_notice(format!("Setup could not be remembered: {error}"));
                                 }
                                 if let Some(path) = completion.retained_temporary {
-                                    self.view.set_notice(format!("Setup cleanup retained: {}", path.display()));
+                                    self.view.set_notice(format!(
+                                        "Couldn't remove setup file {}",
+                                        path.file_name().unwrap_or_default().to_string_lossy()
+                                    ));
                                 }
                             }
                         }
@@ -3833,7 +3879,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(path) = open_path {
                     if let Err(error) = self.view.open_path(path) {
-                        self.view.set_notice(format!("Open settings: {error}"));
+                        self.view.set_notice(format!("Couldn't open settings: {error}"));
                     }
                     self.sync_file_ui();
                     self.apply(Damage { full: true, status: true, ..Default::default() });
@@ -4143,6 +4189,17 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 WindowEvent::MouseInput { state, button, .. }
+                    if self.compare_bar().is_some_and(|bar| bar.contains(self.pointer)) =>
+                {
+                    if *state == ElementState::Pressed
+                        && *button == MouseButton::Left
+                        && let Some(toggle) = self.compare_toggle_at(self.pointer)
+                    {
+                        self.dispatch_compare(toggle.command());
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput { state, button, .. }
                     if self.body_area().contains(self.pointer.0, self.pointer.1) =>
                 {
                     if *state == ElementState::Pressed && *button == MouseButton::Left {
@@ -4170,6 +4227,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.close_language();
                 self.status_hits.clear();
+                self.compare_header.hits = Default::default();
                 self.drag = None;
                 self.selecting = false;
                 self.pending_resize = Some(latest);
@@ -4467,7 +4525,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if self.settings_open() && self.settings_epoch == epoch {
                             self.settings_input(kwil_view_model::settings_session::SettingsInput::Text(&text));
                         } else {
-                            self.view.set_notice("IME settings input cancelled: its destination changed".into());
+                            self.view.set_notice("Typing cancelled: the setting changed".into());
                         }
                         (Damage::default(), false)
                     }
@@ -4481,7 +4539,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if self.goto_epoch == epoch {
                             self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text));
                         } else {
-                            self.view.set_notice("Go to Line composition cancelled: input changed".into());
+                            self.view.set_notice("Typing cancelled: Go to Line changed".into());
                         }
                         (Damage { status: true, ..Default::default() }, false)
                     }
@@ -4494,10 +4552,7 @@ impl ApplicationHandler<UserEvent> for App {
                             self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text));
                             (Damage::default(), false)
                         } else {
-                            (
-                                self.view.set_notice("IME palette input cancelled: the query changed or closed".into()),
-                                false,
-                            )
+                            (self.view.set_notice("Typing cancelled: the palette changed".into()), false)
                         }
                     }
                     destination => {

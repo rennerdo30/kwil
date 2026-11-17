@@ -99,7 +99,7 @@ impl App {
                 "edit.cut" => icons::Icon::Cut,
                 "edit.copy" => icons::Icon::Copy,
                 "edit.paste" => icons::Icon::Paste,
-                _ => icons::Icon::Text,
+                _ => icons::Icon::SelectAll,
             };
             items.push(Item { label: label.into(), action: Action::Command(command), enabled, icon });
         }

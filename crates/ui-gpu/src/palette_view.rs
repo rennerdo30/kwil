@@ -205,7 +205,7 @@ pub(super) fn draw(
     } else {
         "Searching…     Esc  Close"
     };
-    desktop::label(pixels, stride, font, footer, hint, c.faint);
+    desktop::label(pixels, stride, font.small(), footer, hint, c.faint);
     Some(area)
 }
 
@@ -277,7 +277,7 @@ impl App {
             self.composing = false;
         }
         if let Err(error) = result {
-            let damage = self.view.set_notice(format!("Palette: {error:?}"));
+            let damage = self.view.set_notice(format!("Palette: {}", palette_ui::query_error(&error)));
             self.apply(damage);
         }
         self.palette_redraw();

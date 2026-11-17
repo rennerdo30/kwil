@@ -529,7 +529,11 @@ impl App {
             {
                 segments.push(chrome::language_segment(host.language_status(&self.view)));
             }
-            let status = std::iter::once(notice)
+            // The compare summary moved from the status bar into the compare
+            // header; screen readers still hear it in the live status region.
+            let compare = if self.view.compare.open { self.view.compare.header() } else { String::new() };
+            let status = std::iter::once(compare)
+                .chain(std::iter::once(notice))
                 .chain(segments.into_iter().map(|s| s.text))
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()

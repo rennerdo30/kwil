@@ -710,6 +710,7 @@ pub(super) fn checkbox(
 
 /// Width of keycaps for `keys` ("ctrl+s ctrl+k"), at most `cap` pixels.
 pub(super) fn keycaps_width(font: &mut font::UiFont, keys: &str, s: &Sizes, cap: usize) -> usize {
+    let font = font.small();
     let mut used = 0usize;
     for (chord_index, chord) in menu::pretty(&visible(keys, 128)).split(' ').take(8).enumerate() {
         if chord_index > 0 {
@@ -740,6 +741,8 @@ pub(super) fn keycaps(
     c: &Colors,
     s: &Sizes,
 ) -> usize {
+    // Key names are secondary to the command they trigger: the small face.
+    let font = font.small();
     let h = (s.text + s.focus).min(clip.h);
     let y = clip.y + (clip.h - h) / 2;
     let right = clip.x + clip.w;

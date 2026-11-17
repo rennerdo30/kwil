@@ -45,13 +45,20 @@ impl Category {
     pub fn title(self) -> &'static str {
         match self {
             Self::Editor => "Editor",
-            Self::Appearance => "Appearance / Themes",
+            Self::Appearance => "Appearance",
             Self::Keymap => "Keymap",
             Self::Files => "Files and file types",
             Self::Search => "Search",
             Self::Updates => "Updates",
             Self::Remote => "Remote mode",
             Self::Advanced => "Advanced",
+        }
+    }
+    /// The title plus words people search for that the title no longer says.
+    fn search_words(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance themes",
+            other => other.title(),
         }
     }
 }
@@ -1238,7 +1245,7 @@ impl SettingsMenu {
             .filter(|(_, s)| {
                 self.category.is_none_or(|c| c == s.category)
                     && self.query.split_whitespace().all(|q| {
-                        format!("{} {} {} {}", s.id, s.title, s.description, s.category.title())
+                        format!("{} {} {} {}", s.id, s.title, s.description, s.category.search_words())
                             .to_lowercase()
                             .contains(q)
                     })

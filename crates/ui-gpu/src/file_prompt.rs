@@ -202,7 +202,7 @@ impl App {
             match palette.refresh_tabs(&self.view) {
                 Ok(changed) => self.palette_dirty |= changed,
                 Err(error) => {
-                    self.view.set_notice(format!("Palette: {error:?}"));
+                    self.view.set_notice(format!("Palette: {}", palette_ui::query_error(&error)));
                 }
             }
         }

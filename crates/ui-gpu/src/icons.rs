@@ -26,6 +26,9 @@ pub(super) enum Icon {
     Copy,
     Paste,
     Filter,
+    Keyboard,
+    Sliders,
+    SelectAll,
 }
 const ALL: &[Icon] = &[
     Icon::Close,
@@ -51,6 +54,9 @@ const ALL: &[Icon] = &[
     Icon::Copy,
     Icon::Paste,
     Icon::Filter,
+    Icon::Keyboard,
+    Icon::Sliders,
+    Icon::SelectAll,
 ];
 #[derive(Clone, Copy)]
 enum Primitive {
@@ -165,6 +171,10 @@ mod tests {
             Icon::Settings,
             Icon::Markdown,
             Icon::Split,
+            Icon::Text,
+            Icon::Keyboard,
+            Icon::Sliders,
+            Icon::SelectAll,
         ] {
             let mask = cache.get(icon, 24);
             assert!(mask.alpha.iter().any(|a| *a > 0));

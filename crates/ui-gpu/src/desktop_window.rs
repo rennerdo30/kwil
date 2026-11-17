@@ -300,10 +300,10 @@ impl App {
         let Some(font) = dialog.font.as_mut() else { return true };
         match dialog.kind {
             Kind::About => {
-                let diagnostics = self.diagnostics();
+                let facts = self.about_facts();
                 about::draw(
                     &mut self.about,
-                    &diagnostics,
+                    &facts,
                     &mut dialog.gfx.pixels,
                     dialog.size,
                     font,
