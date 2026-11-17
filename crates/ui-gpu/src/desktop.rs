@@ -994,7 +994,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(chrome::emphasize(0x000000, 0xff8000), 0xffff00, "clamped, never wrapped");
+        // A saturated role near the channel limit keeps its hue: red stays twice green.
+        let word = chrome::emphasize(0x000000, 0xc06000);
+        let (r, g) = ((word >> 16) & 0xff, (word >> 8) & 0xff);
+        assert!(r == 0xff && r.abs_diff(2 * g) <= 2, "hue kept, got {word:06x}");
     }
 
     #[test]

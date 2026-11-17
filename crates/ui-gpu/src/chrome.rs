@@ -401,15 +401,24 @@ pub(super) fn window_title(view: &Workspace) -> String {
     }
 }
 
-/// `role` pushed as far past `base` as it already differs from it, per
-/// channel and clamped. A changed word is the diff role's own hue, only
-/// stronger, on the dark and light themes alike.
+/// `role` pushed further from `base` along the same direction: the offset
+/// grows 2.5 times, scaled down evenly so no channel leaves 0..=255. Keeping
+/// the direction keeps the hue (a per-channel clamp would turn orange into
+/// yellow). A changed word is its diff line's colour, only stronger.
 pub(super) fn emphasize(base: u32, role: u32) -> u32 {
-    let channel = |shift: u32| {
-        let (b, r) = (i32::from((base >> shift) as u8), i32::from((role >> shift) as u8));
-        ((2 * r - b).clamp(0, 255) as u32) << shift
-    };
-    channel(16) | channel(8) | channel(0)
+    let parts = |v: u32| [16u32, 8, 0].map(|shift| f32::from((v >> shift) as u8));
+    let (b, r) = (parts(base), parts(role));
+    let mut t = 2.5_f32;
+    for i in 0..3 {
+        let d = r[i] - b[i];
+        if d > 0.0 {
+            t = t.min((255.0 - b[i]) / d);
+        } else if d < 0.0 {
+            t = t.min(b[i] / -d);
+        }
+    }
+    let t = t.max(1.0);
+    (0..3).fold(0, |acc, i| (acc << 8) | (b[i] + (r[i] - b[i]) * t).round().clamp(0.0, 255.0) as u32)
 }
 
 pub(super) fn mix(bg: u32, fg: u32, amount: u8) -> u32 {

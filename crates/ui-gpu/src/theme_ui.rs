@@ -163,6 +163,14 @@ pub(super) fn rgb(theme: &Theme, role: UiRole) -> u32 {
     (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
 }
 
+/// `role` composited over the editor background. Imported themes often give
+/// fill roles (diff lines) a translucent alpha; dropping it paints them opaque.
+pub(super) fn rgb_over_background(theme: &Theme, role: UiRole) -> u32 {
+    let ui = theme.ui();
+    let Rgba(r, g, b, _) = ui.get(role).over(ui.get(UiRole::Background));
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

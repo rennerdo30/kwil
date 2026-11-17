@@ -3158,6 +3158,7 @@ fn draw_editor_marks(buf: &mut [u32], w: usize, font: &Font, view: &View, row: u
     let columns = w.saturating_sub(gutter + BAR) / font.cw;
     if let (Ok(range), Ok(selections), Some(line)) =
         (editor.line_range(absolute_row), editor.selection_ranges(absolute_row), view.line(row))
+        && !selections.is_empty()
     {
         let selection = theme_ui::rgb(&theme_ui::chrome(), kwil_core_commands::theme::UiRole::Selection);
         for cell in text::cells(line, columns, font.tab_size()) {
