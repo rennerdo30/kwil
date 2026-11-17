@@ -4531,10 +4531,7 @@ impl ApplicationHandler<UserEvent> for App {
                             self.palette_input(kwil_view_model::palette_session::PaletteInput::Text(&text));
                             (Damage::default(), false)
                         } else {
-                            (
-                                self.view.set_notice("Typing cancelled: the palette changed".into()),
-                                false,
-                            )
+                            (self.view.set_notice("Typing cancelled: the palette changed".into()), false)
                         }
                     }
                     destination => {

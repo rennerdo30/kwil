@@ -529,8 +529,8 @@ impl UiFont {
     }
     /// True once per font when a glyph was missing and no fallback was tried.
     pub fn take_fallback_request(&mut self) -> bool {
-        let wanted = self.fallback_state == Fallback::Wanted
-            || self.faces().any(|font| font.fallback_state == Fallback::Wanted);
+        let wanted =
+            self.fallback_state == Fallback::Wanted || self.faces().any(|font| font.fallback_state == Fallback::Wanted);
         if wanted {
             self.fallback_state = Fallback::Requested;
         }

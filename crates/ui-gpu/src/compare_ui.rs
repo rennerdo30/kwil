@@ -355,7 +355,14 @@ const EXPAND_HINT: &str = "Click to expand";
 /// A collapsed run of unchanged lines: a full-width quiet band in the chrome
 /// face with a chevron, so it reads as a control and not as file text. The
 /// label keeps the chrome size at any editor zoom; the row clips it.
-fn draw_collapsed(pixels: &mut [u32], width: usize, row: Rect, hidden: usize, ui: Option<&mut font::UiFont>, gutter: usize) {
+fn draw_collapsed(
+    pixels: &mut [u32],
+    width: usize,
+    row: Rect,
+    hidden: usize,
+    ui: Option<&mut font::UiFont>,
+    gutter: usize,
+) {
     let band = chrome::mix(bg(), fg(), chrome::ramp::HOVER);
     fill(pixels, width, row, band);
     let Some(font) = ui else { return };

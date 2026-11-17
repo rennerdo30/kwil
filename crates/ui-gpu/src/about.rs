@@ -378,7 +378,11 @@ mod tests {
     fn about_grid_aligns_values_in_one_column_and_wraps_instead_of_cutting() {
         let Some(mut font) = font::UiFont::load(15.0) else { return };
         let long = "GPU (DirectX 12) · an adapter name long enough to need a second line here";
-        let facts = vec![("Build", "development (debug)".to_owned()), ("Renderer setting", "GPU".into()), ("Renderer", long.into())];
+        let facts = vec![
+            ("Build", "development (debug)".to_owned()),
+            ("Renderer setting", "GPU".into()),
+            ("Renderer", long.into()),
+        ];
         let width = 360;
         let (column, lines) = grid(&mut font, &facts, width, 16);
         let widest = font.measure("Renderer setting", width);
@@ -422,9 +426,8 @@ mod tests {
         assert!(!has(pad, pad + column, top, top + line, c.fg), "the key is not foreground");
         assert!(has(pad + column, size.0 - pad, top, top + line, c.fg), "the value is foreground");
         // The name is drawn in the display face: taller ink than body text.
-        let name_rows = (pad..pad + edge).filter(|y| {
-            pixels[y * size.0 + pad + edge..y * size.0 + size.0 / 2].iter().any(|p| *p != c.surface)
-        });
+        let name_rows = (pad..pad + edge)
+            .filter(|y| pixels[y * size.0 + pad + edge..y * size.0 + size.0 / 2].iter().any(|p| *p != c.surface));
         assert!(name_rows.count() > m.dip(chrome::tok::BODY), "name and version stand out");
     }
 }
