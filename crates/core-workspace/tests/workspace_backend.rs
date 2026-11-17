@@ -944,6 +944,8 @@ fn kw90_a_waiter_returns_when_the_primary_exits() {
     let waiter = start_waiter(&endpoint, OpenFiles { files: vec![wait_file(&temp)], wait: Some(7) });
     server.requests.recv_timeout(TIMEOUT).unwrap();
     assert!(waiter.recv_timeout(Duration::from_millis(300)).is_err());
+    // The editor showed the file (KW-93: only a shown request may report success).
+    server.waits.shown(7);
     // Quitting normally answers every parked launcher: success, not a hang.
     server.shutdown();
     assert_eq!(waiter.recv_timeout(TIMEOUT).unwrap().unwrap(), WaitOutcome::Closed);

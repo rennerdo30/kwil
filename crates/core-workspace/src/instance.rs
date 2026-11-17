@@ -141,6 +141,9 @@ pub struct Waits {
 #[derive(Default)]
 struct WaitState {
     slots: HashMap<u64, SyncSender<WaitOutcome>>,
+    /// Tokens whose files were opened in the editor. Only these can have been
+    /// edited, so only these count as closed when the primary quits.
+    shown: std::collections::HashSet<u64>,
     live: usize,
     closed: bool,
 }
@@ -164,7 +167,9 @@ impl Waits {
         Some(rx)
     }
     fn forget(&self, token: u64) {
-        self.lock().slots.remove(&token);
+        let mut state = self.lock();
+        state.slots.remove(&token);
+        state.shown.remove(&token);
     }
     /// Hands the connection to a thread that writes the outcome once it is known.
     fn park(
@@ -188,18 +193,31 @@ impl Waits {
             self.lock().live -= 1;
         }
     }
+    /// The files of `token` are open in the editor, so the user can edit them.
+    pub fn shown(&self, token: u64) {
+        let mut state = self.lock();
+        if state.slots.contains_key(&token) {
+            state.shown.insert(token);
+        }
+    }
     /// Reports that the request with `token` is finished. Unknown tokens are ignored.
     pub fn complete(&self, token: u64, outcome: WaitOutcome) {
-        if let Some(tx) = self.lock().slots.remove(&token) {
+        let mut state = self.lock();
+        state.shown.remove(&token);
+        if let Some(tx) = state.slots.remove(&token) {
             let _ = tx.try_send(outcome);
         }
     }
-    /// The primary is quitting normally: every parked launcher returns success.
+    /// The primary is quitting. Launchers whose files were shown get `outcome`;
+    /// a request the user never saw (the editor failed to start, or quit before
+    /// it arrived) reports `OpenFailed`, so Git never proceeds with an unedited
+    /// message.
     pub fn complete_all(&self, outcome: WaitOutcome) {
         let mut state = self.lock();
         state.closed = true;
-        for (_, tx) in state.slots.drain() {
-            let _ = tx.try_send(outcome);
+        let shown = std::mem::take(&mut state.shown);
+        for (token, tx) in state.slots.drain() {
+            let _ = tx.try_send(if shown.contains(&token) { outcome } else { WaitOutcome::OpenFailed });
         }
     }
     /// Waits until every parked launcher has been told. Exit path only; bounded.
@@ -340,8 +358,15 @@ mod tests {
         waits.complete(1, WaitOutcome::Closed);
         waits.complete(999, WaitOutcome::Closed);
         assert!(waits.admit(1).is_some(), "a completed slot is free again");
+        // Token 2 was shown to the user; the others never reached the editor.
+        waits.shown(2);
         waits.complete_all(WaitOutcome::Closed);
-        assert!(others.iter().all(|rx| rx.try_recv() == Ok(WaitOutcome::Closed)));
+        let (shown, unseen) = others.split_first().unwrap();
+        assert_eq!(shown.try_recv(), Ok(WaitOutcome::Closed), "a shown file closes normally");
+        assert!(
+            unseen.iter().all(|rx| rx.try_recv() == Ok(WaitOutcome::OpenFailed)),
+            "a request the user never saw must not tell Git the edit is done"
+        );
         assert!(waits.admit(77).is_none(), "nothing is parked on a closed primary");
         assert!(waits.drain(Duration::from_millis(10)), "no thread is parked");
     }

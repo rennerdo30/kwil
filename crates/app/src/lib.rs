@@ -154,6 +154,11 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
     if a.wait && a.files.is_empty() {
         return Err("--wait needs at least one file to wait for".into());
     }
+    // A separate window is its own session, not the editor a launcher can wait
+    // on; kwil.com would return as soon as that window appears.
+    if a.wait && (a.new_window || a.restore_window.is_some()) {
+        return Err("--wait cannot be combined with --new-window or --restore-window".into());
+    }
     if a.tui && a.renderer.is_some() {
         return Err("--renderer selects the GUI backend, not the terminal UI".into());
     }
@@ -731,6 +736,8 @@ mod isolation_tests {
         let args = parse_args_values(["--wait", "COMMIT_EDITMSG"].into_iter().map(Into::into)).unwrap();
         assert!(args.wait && args.files.len() == 1);
         assert!(!parse_args_values(["file.txt"].into_iter().map(Into::into)).unwrap().wait, "never on by default");
+        let error = parse_args_values(["--wait", "--new-window", "a.txt"].into_iter().map(Into::into)).err().unwrap();
+        assert!(error.contains("--new-window"), "{error}");
         let literal = parse_args_values(["--", "--wait"].into_iter().map(Into::into)).unwrap();
         assert!(!literal.wait && literal.files.len() == 1, "a file name is not a flag");
         for text in ["--wait", "core.editor", "kwil --wait"] {
