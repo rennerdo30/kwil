@@ -6,6 +6,9 @@ changes and its known limitations.
 
 ## Published
 
+- **0.1.0-beta.8**, published 2026-11-02 from `7a8d743`: settings take effect,
+  incremental file-type registration, faster command palette, compare of any
+  size, formatting fixes, faster macOS start; beta.7 updated itself to it.
 - **0.1.0-beta.7**, published 2026-11-02 from main `4509ee8`: hot exit and
   session restore, single instance, compressed files, hex editor, screen reader
   support, TUI Markdown and log commands; beta.6 updated itself to it.
@@ -24,11 +27,12 @@ changes and its known limitations.
   files match the published checksums.
 - **0.1.0-beta.1** was never published; its tag stays as history.
 
-## Next candidate: 0.1.0-beta.8
+## Next candidate: 0.1.0-beta.9
 
-Settings take effect, incremental file-type registration, faster command
-palette, compare of any size, formatting fixes, faster macOS start, renderer
-fix, homepage.
+Command line and Win+R on Windows, `kwil --wait` for Git, one consistent and
+easier-to-read interface, theme-coloured compare, regex search across large
+files and long lines, replace-in-files exclusions, ISO-2022-JP, Markdown preview
+paging for large documents.
 
 ## In beta.3
 

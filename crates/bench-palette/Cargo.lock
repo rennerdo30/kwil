@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-commands"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "fuzzy-matcher",
  "kwil-core-search",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-runtime"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-search"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "globset",
  "grep-matcher",
@@ -425,12 +425,13 @@ dependencies = [
  "kwil-core-workspace",
  "memchr",
  "regex",
+ "regex-automata",
  "regex-syntax",
 ]
 
 [[package]]
 name = "kwil-core-text"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -442,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "kwil-core-workspace"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "bzip2",
  "flate2",
