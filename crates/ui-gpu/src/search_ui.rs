@@ -637,6 +637,7 @@ impl App {
             // endpoints. Reuse the indexed, deferred CLI line navigation.
             match self.view.open_files(OpenFiles {
                 files: vec![OpenFile { path: path.clone(), line: Some(*line_number), column: Some(1) }],
+                wait: None,
             }) {
                 Ok(()) => {
                     self.search_origin = Origin::capture(&self.view);

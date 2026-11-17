@@ -764,7 +764,7 @@ mod tests {
         let (open, inbox) = kwil_view_model::document_worker::external_open_channel(move || {
             wake_sender.send(Msg::OpenExternal).map_err(|_| std::io::Error::other("test TUI closed"))
         });
-        let request = OpenFiles { files: vec![OpenFile { path: path.clone(), line: None, column: None }] };
+        let request = OpenFiles { files: vec![OpenFile { path: path.clone(), line: None, column: None }], wait: None };
         let mut gate = crate::ExternalGate::default();
         f.view.file_command("file.open").unwrap();
         f.view.file_prompt_mut().unwrap().text = "captured prompt".into();
@@ -817,6 +817,7 @@ mod tests {
         closing.until("accepted exit", |f| f.view.wants_exit());
         let exit_request = OpenFiles {
             files: vec![OpenFile { path: closing.root.join("never-open-after-exit"), line: None, column: None }],
+            wait: None,
         };
         open(exit_request).unwrap();
         assert!(matches!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), Msg::OpenExternal));

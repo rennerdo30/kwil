@@ -1028,6 +1028,7 @@ mod tests {
         let requested = std::env::temp_dir().join("kwil-unstarted-accepted-input.txt");
         app.external_open.as_ref().unwrap()(OpenFiles {
             files: vec![OpenFile { path: requested.clone(), line: Some(7), column: Some(3) }],
+            wait: None,
         })
         .unwrap();
         let super::super::App {
@@ -1065,7 +1066,8 @@ mod tests {
         assert_eq!(failure.status(), Status::ExternalPending);
         assert!(failure.external_requests_pending());
         assert!(failure.external_producer.is_some(), "pending refusal retains the original producer");
-        let rejected = OpenFiles { files: vec![OpenFile { path: requested.clone(), line: None, column: None }] };
+        let rejected =
+            OpenFiles { files: vec![OpenFile { path: requested.clone(), line: None, column: None }], wait: None };
         let error = failure.external_producer.as_ref().unwrap()(rejected).unwrap_err();
         assert!(matches!(error, std::sync::mpsc::TrySendError::Disconnected(_)));
         // The test becomes the explicit owner of this accepted scalar request;
@@ -1098,7 +1100,7 @@ mod tests {
         let requested = std::env::temp_dir().join("kwil-unstarted-racing-input.txt");
         let path = requested.clone();
         let sender = std::thread::spawn(move || {
-            producer(OpenFiles { files: vec![OpenFile { path, line: Some(9), column: None }] }).unwrap();
+            producer(OpenFiles { files: vec![OpenFile { path, line: Some(9), column: None }], wait: None }).unwrap();
             producer
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();

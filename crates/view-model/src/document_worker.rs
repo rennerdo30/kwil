@@ -4831,7 +4831,7 @@ mod tests {
         });
         assert!(!inbox.has_pending());
         let path = std::env::temp_dir().join("kwil-virtual-日本語.txt");
-        let request = OpenFiles { files: vec![OpenFile { path, line: Some(3), column: Some(5) }] };
+        let request = OpenFiles { files: vec![OpenFile { path, line: Some(3), column: Some(5) }], wait: None };
         for _ in 0..16 {
             open(request.clone()).unwrap();
         }
@@ -4848,7 +4848,8 @@ mod tests {
         open(rejected).unwrap();
         assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(inbox.drain(), vec![request.clone()]);
-        let malformed = OpenFiles { files: vec![OpenFile { path: "relative.txt".into(), line: None, column: None }] };
+        let malformed =
+            OpenFiles { files: vec![OpenFile { path: "relative.txt".into(), line: None, column: None }], wait: None };
         assert!(matches!(open(malformed.clone()), Err(TrySendError::Disconnected(r)) if r == malformed));
         drop(inbox);
         assert!(matches!(open(request.clone()), Err(TrySendError::Disconnected(r)) if r == request));
@@ -4876,6 +4877,7 @@ mod tests {
                 OpenFile { path: first_path, line: Some(7), column: Some(3) },
                 OpenFile { path: second_path, line: Some(11), column: Some(5) },
             ],
+            wait: None,
         };
         open(request.clone()).unwrap();
         open(request.clone()).unwrap();
@@ -4917,6 +4919,7 @@ mod tests {
                 line: Some(2),
                 column: Some(4),
             }],
+            wait: None,
         };
         let admitted = request.clone();
         let producer = std::thread::spawn(move || {

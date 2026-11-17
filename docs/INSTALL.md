@@ -134,6 +134,24 @@ refused, as for file types. Registering a second Kwil replaces the Win+R entry
 of the first. If you registered a folder and then move or delete it, turn the
 switch off from a Kwil that still exists, or remove the entries by hand.
 
+**Use Kwil as Git's editor.** With Kwil on your PATH, Git, `crontab -e` and other
+programs that start an editor can use it:
+
+    git config --global core.editor "kwil.com --wait"      (or "kwil --wait")
+    set EDITOR=kwil.com --wait                              (cmd; PowerShell: $env:EDITOR = "kwil.com --wait")
+
+`--wait` opens the files and returns only when every one of them is closed, so
+Git reads the file after you finished. Close the tab (or quit Kwil) and Git
+continues. Kwil never saves for you: save, or choose Discard in the usual close
+prompt, before you close the tab. Both `kwil.com --wait` and `kwil --wait` hold
+the terminal (cmd, PowerShell, Git Bash) until then. If Kwil is already open it
+takes the files into that window and the other tabs stay; otherwise it starts
+Kwil, which stays open after the command returns. It exits with 0 when the files
+closed (or you quit Kwil), 1 if a file could not be opened and 3 if Kwil crashed
+or was killed while waiting. In the terminal UI (`--tui`, or over SSH) Kwil is
+the editor itself and the command returns when you quit it. `--wait` needs at
+least one file. On macOS and Linux `kwil --wait` works the same way.
+
 macOS and Linux need none of this: `scripts/install.sh` links
 `~/.local/bin/kwil`, so the choice is not shown there. The script does not edit
 shell profiles; add `~/.local/bin` to your PATH if your system does not.

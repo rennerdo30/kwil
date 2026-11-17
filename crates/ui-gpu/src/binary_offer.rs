@@ -558,7 +558,8 @@ mod tests {
         app.view.file_command("file.open").unwrap();
         app.sync_file_ui();
         let prompt = app.view.native_file_prompt().unwrap();
-        open_external(OpenFiles { files: vec![OpenFile { path: path.clone(), line: None, column: None }] }).unwrap();
+        open_external(OpenFiles { files: vec![OpenFile { path: path.clone(), line: None, column: None }], wait: None })
+            .unwrap();
         assert_eq!(app.external_open_event(), Damage::default());
         assert!(app.external_inbox.has_pending());
         assert!(app.view.native_file_prompt_is_current(&prompt));
@@ -575,7 +576,8 @@ mod tests {
         let offer = app.view.binary_offer().unwrap();
         let text_path = root.join("after.txt");
         std::fs::write(&text_path, b"external text").unwrap();
-        open_external(OpenFiles { files: vec![OpenFile { path: text_path, line: None, column: None }] }).unwrap();
+        open_external(OpenFiles { files: vec![OpenFile { path: text_path, line: None, column: None }], wait: None })
+            .unwrap();
         assert_eq!(app.external_open_event(), Damage::default());
         assert_eq!(app.view.binary_offer(), Some(offer));
         assert!(app.external_inbox.has_pending());

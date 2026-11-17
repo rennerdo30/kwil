@@ -27,6 +27,8 @@ Options:
   --gui        Force the window UI
   --tui        Force the terminal UI
   --new-window Open a separate window with its own saved session
+  --wait       Return only when every given file is closed, for programs that start an
+               editor (Git: git config --global core.editor \"kwil --wait\")
   --renderer auto|cpu|gpu  Select the GUI rendering backend (overrides settings)
   --update     Check for an update now and install it
   --register-command-line  Add Kwil to your user PATH and Win+R (Windows; no administrator needed)
@@ -45,6 +47,7 @@ struct Args {
     tui: bool,
     hidden: bool,
     new_window: bool,
+    wait: bool,
     restore_window: Option<String>,
     update: bool,
     unregister_file_types: bool,
@@ -113,6 +116,7 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
             // Agent and test runs: window composed but never shown (Windows).
             Some("--hidden") => a.hidden = true,
             Some("--new-window") => a.new_window = true,
+            Some("--wait") => a.wait = true,
             Some("--restore-window") => {
                 let id =
                     arguments.next().and_then(|id| id.into_string().ok()).ok_or("missing saved window identity")?;
@@ -146,6 +150,9 @@ fn parse_args_values(mut arguments: impl Iterator<Item = std::ffi::OsString>) ->
     }
     if a.new_window && a.restore_window.is_some() {
         return Err("--new-window and --restore-window exclude each other".into());
+    }
+    if a.wait && a.files.is_empty() {
+        return Err("--wait needs at least one file to wait for".into());
     }
     if a.tui && a.renderer.is_some() {
         return Err("--renderer selects the GUI backend, not the terminal UI".into());
@@ -285,6 +292,7 @@ fn run_app(console_launcher: bool) -> ExitCode {
                 column: file.column,
             })
             .collect(),
+        wait: args.wait.then(instance::wait_token),
     };
     if let Err(error) = requests.encode() {
         eprintln!("kwil: {error}");
@@ -329,7 +337,16 @@ fn run_app(console_launcher: bool) -> ExitCode {
             }
         }
     };
-    if let Some(endpoint) = &endpoint {
+    if let Some(endpoint) = &endpoint
+        && args.wait
+    {
+        // Hand the files to the running editor and stay until they are closed.
+        speed_mark("IPC wait");
+        let result = instance::forward_and_wait(endpoint, &requests);
+        if let Some(code) = wait_exit(&result) {
+            return code;
+        }
+    } else if let Some(endpoint) = &endpoint {
         speed_mark("IPC connect");
         match instance::try_forward(endpoint, &requests) {
             Ok(true) => {
@@ -362,6 +379,29 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
     #[allow(unused_mut)]
     let mut use_gui = frontend == Frontend::Gui;
+    if args.wait
+        && use_gui
+        && let Some(endpoint) = &endpoint
+    {
+        // No editor runs yet. A window that held its launcher until the whole
+        // window closed would keep Git waiting after the file's tab is closed.
+        // Servers and CI that must never start a window set this variable.
+        if std::env::var_os("KWIL_NO_DETACHED_EDITOR").is_some() {
+            eprintln!("kwil: no running instance to wait on, and KWIL_NO_DETACHED_EDITOR forbids starting one");
+            return ExitCode::FAILURE;
+        }
+        let mut child = match spawn_primary(&args, console_launcher) {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("kwil: cannot start the editor: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let result = instance::wait_on_started_primary(endpoint, &requests, || {
+            child.try_wait().ok().flatten().map(|status| format!("Kwil exited with {status} before it started"))
+        });
+        return wait_exit(&result).unwrap_or(ExitCode::FAILURE);
+    }
     #[cfg(windows)]
     if console_launcher && use_gui {
         match windows::launch_gui() {
@@ -415,7 +455,12 @@ fn run_app(console_launcher: bool) -> ExitCode {
         }
     };
     let mut workspace = match Workspace::try_new(view) {
-        ControlFlow::Continue(workspace) => workspace,
+        ControlFlow::Continue(mut workspace) => {
+            if let Some(owner) = &instance_owner {
+                workspace.set_wait_sink(owner.waits());
+            }
+            workspace
+        }
         ControlFlow::Break(refusal) => {
             // Fatal process exit retains the original input or partial
             // workspace. This is not successful source retirement.
@@ -530,6 +575,47 @@ fn run_app(console_launcher: bool) -> ExitCode {
     }
 }
 
+/// Reports the end of a `--wait` hand-off; None when no editor was running.
+fn wait_exit(result: &instance::WaitResult) -> Option<ExitCode> {
+    let (code, message) = result.exit()?;
+    if let Some(message) = message {
+        eprintln!("kwil: {message}");
+    }
+    Some(ExitCode::from(code))
+}
+
+/// Starts the editor detached from this launcher and its console, so closing the
+/// terminal or ending the waiting launcher never ends the editor.
+fn spawn_primary(args: &Args, console_launcher: bool) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let mut exe = std::env::current_exe()?;
+    // The console launcher is kwil.com; the window lives in its sibling kwil.exe.
+    if cfg!(windows) && console_launcher {
+        exe.set_file_name("kwil.exe");
+    }
+    let mut command = Command::new(exe);
+    command.arg("--gui");
+    if args.hidden {
+        command.arg("--hidden");
+    }
+    if let Some(renderer) = args.renderer {
+        command.args(["--renderer", renderer.as_str()]);
+    }
+    command.env_remove("KWIL_CONSOLE_LAUNCH").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        command.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn()
+}
+
 fn speed_mark(_label: &str) {
     #[cfg(feature = "startup-bench")]
     kwil_ui_gpu::trace_startup(_label);
@@ -561,7 +647,7 @@ fn remaining_initial_files(
     // The first request already owns initial_argument_view, including its
     // deferred position. Only later CLI files belong to the delivery callback.
     // Forwarding to an existing instance continues to use the complete batch.
-    kwil_core_workspace::instance::OpenFiles { files: requests.files.iter().skip(1).cloned().collect() }
+    kwil_core_workspace::instance::OpenFiles { files: requests.files.iter().skip(1).cloned().collect(), wait: None }
 }
 
 fn initial_delivery(requests: kwil_core_workspace::instance::OpenFiles) -> Box<dyn FnOnce(kwil_ui_gpu::ExternalOpen)> {
@@ -639,6 +725,20 @@ mod isolation_tests {
     }
 
     #[test]
+    fn kw90_wait_needs_a_file_stays_literal_after_dashes_and_is_documented_for_git() {
+        let error = parse_args_values(["--wait"].into_iter().map(Into::into)).err().unwrap();
+        assert!(error.contains("--wait needs at least one file"), "{error}");
+        let args = parse_args_values(["--wait", "COMMIT_EDITMSG"].into_iter().map(Into::into)).unwrap();
+        assert!(args.wait && args.files.len() == 1);
+        assert!(!parse_args_values(["file.txt"].into_iter().map(Into::into)).unwrap().wait, "never on by default");
+        let literal = parse_args_values(["--", "--wait"].into_iter().map(Into::into)).unwrap();
+        assert!(!literal.wait && literal.files.len() == 1, "a file name is not a flag");
+        for text in ["--wait", "core.editor", "kwil --wait"] {
+            assert!(HELP.contains(text), "HELP must mention {text}");
+        }
+    }
+
+    #[test]
     fn new_window_flag_is_distinct_from_a_literal_file_name() {
         let args = parse_args_values(["--new-window".into(), "file.txt".into()].into_iter()).unwrap();
         assert!(args.new_window);
@@ -672,6 +772,7 @@ mod isolation_tests {
                     OpenFile { path: first.clone(), line: Some(2), column: Some(3) },
                     OpenFile { path: later.clone(), line: Some(2), column: Some(3) },
                 ],
+                wait: None,
             };
             let view =
                 initial_argument_view(&FileArgument { path: first.clone(), line: Some(2), column: Some(3) }).unwrap();
@@ -716,7 +817,10 @@ mod isolation_tests {
                 );
                 // A genuine later open of that same native path remains valid.
                 workspace
-                    .open_files(OpenFiles { files: vec![OpenFile { path: first, line: None, column: None }] })
+                    .open_files(OpenFiles {
+                        files: vec![OpenFile { path: first, line: None, column: None }],
+                        wait: None,
+                    })
                     .unwrap();
                 await_initial(&mut workspace, &mut transport, &receiver, |w| w.binary_offer().is_some());
                 let offer = workspace.binary_offer().unwrap();
