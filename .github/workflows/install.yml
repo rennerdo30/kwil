@@ -71,7 +71,7 @@ jobs:
           ./scripts/test-nsis-installer.ps1 -Setup (Resolve-Path "packages/kwil-$version-windows-x64-setup.exe") -Version $version -PreviousSetup (Resolve-Path "previous/$asset") -PreviousVersion $previous -CapturePath "$env:RUNNER_TEMP/kwil-setup.png"
       - name: Retain setup and native welcome-page capture
         if: always() && matrix.target == 'x86_64-pc-windows-msvc'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: kwil-nsis-lifecycle
           path: |

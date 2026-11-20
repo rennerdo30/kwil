@@ -75,4 +75,4 @@ windows-sys = { version = "0.61.2", features = [
 libc = "0.2"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
-rfd = "0.17.2"
+rfd = "0.18.0"
